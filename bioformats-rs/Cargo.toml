@@ -15,6 +15,12 @@ members = [
     "crates/bioformats-metaimage",
     "crates/bioformats-lif",
     "crates/bioformats-nd2",
+    "crates/bioformats-dicom",
+    "crates/bioformats-nifti",
+    "crates/bioformats-gatan",
+    "crates/bioformats-lsm",
+    "crates/bioformats-metamorph",
+    "crates/bioformats-micromanager",
 ]
 resolver = "2"
 

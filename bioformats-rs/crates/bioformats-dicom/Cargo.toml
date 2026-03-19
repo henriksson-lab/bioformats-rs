@@ -1,0 +1,9 @@
+[package]
+name = "bioformats-dicom"
+version = "0.1.0"
+edition = "2021"
+description = "DICOM format reader (medical imaging)"
+
+[dependencies]
+bioformats-common = { path = "../bioformats-common" }
+log = { workspace = true }

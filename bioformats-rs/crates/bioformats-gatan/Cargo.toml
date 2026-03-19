@@ -1,0 +1,9 @@
+[package]
+name = "bioformats-gatan"
+version = "0.1.0"
+edition = "2021"
+description = "Gatan DM3/DM4 format reader (electron microscopy)"
+
+[dependencies]
+bioformats-common = { path = "../bioformats-common" }
+log = { workspace = true }

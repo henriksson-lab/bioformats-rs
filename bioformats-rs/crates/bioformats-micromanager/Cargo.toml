@@ -1,0 +1,10 @@
+[package]
+name = "bioformats-micromanager"
+version = "0.1.0"
+edition = "2021"
+description = "MicroManager format reader (open-source microscopy)"
+
+[dependencies]
+bioformats-common = { path = "../bioformats-common" }
+bioformats-tiff   = { path = "../bioformats-tiff" }
+log = { workspace = true }

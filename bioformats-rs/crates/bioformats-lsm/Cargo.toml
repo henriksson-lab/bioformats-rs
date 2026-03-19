@@ -1,0 +1,10 @@
+[package]
+name = "bioformats-lsm"
+version = "0.1.0"
+edition = "2021"
+description = "Zeiss LSM format reader (confocal microscopy)"
+
+[dependencies]
+bioformats-common = { path = "../bioformats-common" }
+bioformats-tiff   = { path = "../bioformats-tiff" }
+log = { workspace = true }

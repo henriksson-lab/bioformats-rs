@@ -20,5 +20,11 @@ bioformats-nrrd      = { path = "../bioformats-nrrd" }
 bioformats-metaimage = { path = "../bioformats-metaimage" }
 bioformats-lif       = { path = "../bioformats-lif" }
 bioformats-nd2       = { path = "../bioformats-nd2" }
+bioformats-dicom     = { path = "../bioformats-dicom" }
+bioformats-nifti     = { path = "../bioformats-nifti" }
+bioformats-gatan     = { path = "../bioformats-gatan" }
+bioformats-lsm       = { path = "../bioformats-lsm" }
+bioformats-metamorph = { path = "../bioformats-metamorph" }
+bioformats-micromanager = { path = "../bioformats-micromanager" }
 thiserror = { workspace = true }
 log = { workspace = true }

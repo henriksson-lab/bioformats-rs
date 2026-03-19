@@ -26,6 +26,9 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(bioformats_nrrd::NrrdReader::new()),
         Box::new(bioformats_metaimage::MetaImageReader::new()),
         Box::new(bioformats_ics::IcsReader::new()),
+        Box::new(bioformats_dicom::DicomReader::new()),
+        Box::new(bioformats_nifti::NiftiReader::new()),
+        Box::new(bioformats_gatan::GatanReader::new()),
         // Generic raster wrappers (via image crate)
         Box::new(bioformats_raster::gif_reader()),
         Box::new(bioformats_raster::webp_reader()),
@@ -34,6 +37,10 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(bioformats_raster::exr_reader()),
         Box::new(bioformats_raster::dds_reader()),
         Box::new(bioformats_raster::farbfeld_reader()),
+        // Extension-only TIFF-based formats (no distinct magic bytes)
+        Box::new(bioformats_lsm::LsmReader::new()),
+        Box::new(bioformats_metamorph::MetamorphReader::new()),
+        Box::new(bioformats_micromanager::MicromanagerReader::new()),
         // Extension-only (no magic bytes)
         Box::new(bioformats_raster::tga_reader()),
     ]

@@ -1,5 +1,5 @@
-mod ifd;
-mod parser;
+pub mod ifd;
+pub mod parser;
 mod reader;
 mod compression;
 mod writer;

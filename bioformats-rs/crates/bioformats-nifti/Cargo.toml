@@ -1,0 +1,10 @@
+[package]
+name = "bioformats-nifti"
+version = "0.1.0"
+edition = "2021"
+description = "NIfTI-1 and Analyze 7.5 format reader (neuroimaging)"
+
+[dependencies]
+bioformats-common = { path = "../bioformats-common" }
+flate2 = { workspace = true }
+log = { workspace = true }
