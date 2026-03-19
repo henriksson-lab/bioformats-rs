@@ -1,8 +1,8 @@
 [package]
-name = "bioformats-ome"
+name = "bioformats-legacy"
 version = "0.1.0"
 edition = "2021"
-description = "OME-XML format reader (inline Base64 pixel data)"
+description = "Legacy format readers: Kodak BIP, PICT, Woolz"
 
 [dependencies]
 bioformats-common = { path = "../bioformats-common" }

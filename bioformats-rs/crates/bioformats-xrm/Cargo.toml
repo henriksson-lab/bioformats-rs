@@ -1,8 +1,8 @@
 [package]
-name = "bioformats-ome"
+name = "bioformats-xrm"
 version = "0.1.0"
 edition = "2021"
-description = "OME-XML format reader (inline Base64 pixel data)"
+description = "Zeiss XRM X-ray tomography format reader"
 
 [dependencies]
 bioformats-common = { path = "../bioformats-common" }

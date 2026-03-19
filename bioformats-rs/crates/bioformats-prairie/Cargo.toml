@@ -1,9 +1,9 @@
 [package]
-name = "bioformats-ome"
+name = "bioformats-prairie"
 version = "0.1.0"
 edition = "2021"
-description = "OME-XML format reader (inline Base64 pixel data)"
 
 [dependencies]
 bioformats-common = { path = "../bioformats-common" }
+bioformats-tiff = { path = "../bioformats-tiff" }
 log = { workspace = true }

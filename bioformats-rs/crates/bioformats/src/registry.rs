@@ -14,6 +14,11 @@ pub struct ImageReader {
 fn all_readers() -> Vec<Box<dyn FormatReader>> {
     vec![
         // Dedicated readers first (most precise magic bytes)
+        Box::new(bioformats_zip::ZipReader::new()),
+        Box::new(bioformats_viff::ViffReader::new()),
+        Box::new(bioformats_mias::Al3dReader::new()),
+        Box::new(bioformats_perkinelmer::OpenlabRawReader::new()),
+        Box::new(bioformats_incell::InCellReader::new()),
         Box::new(bioformats_tiff::TiffReader::new()),
         Box::new(bioformats_png::PngReader::new()),
         Box::new(bioformats_jpeg::JpegReader::new()),
@@ -53,14 +58,62 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(bioformats_norpix::IplabReader::new()),
         Box::new(bioformats_ome::OmeXmlReader::new()),
         Box::new(bioformats_olympus::OifReader::new()),
+        // Magic-byte detected formats
+        Box::new(bioformats_pcx::PcxReader::new()),
+        Box::new(bioformats_photoshop::PsdReader::new()),
+        Box::new(bioformats_aim::AimReader::new()),
+        // Prairie/Leica XML+TIFF series (magic-byte detection via XML content)
+        Box::new(bioformats_prairie::PrairieReader::new()),
+        Box::new(bioformats_prairie::LeicaTcsReader::new()),
+        // EPS/PostScript
+        Box::new(bioformats_eps::EpsReader::new()),
         // Extension-only TIFF-based formats (no distinct magic bytes)
         Box::new(bioformats_lsm::LsmReader::new()),
         Box::new(bioformats_metamorph::MetamorphReader::new()),
         Box::new(bioformats_micromanager::MicromanagerReader::new()),
+        // Whole-slide TIFF wrappers (extension-only)
+        Box::new(bioformats_svs::WholeSlideTiffReader::new()),
         // Extension-only Inveon (hdr+img pair, extension-only detection)
         Box::new(bioformats_clinical::InveonReader::new()),
+        // SimFCS FLIM (extension-only)
+        Box::new(bioformats_simfcs::SimfcsReader::new()),
+        Box::new(bioformats_simfcs::LambertFlimReader::new()),
+        // AFM formats (extension-only)
+        Box::new(bioformats_afm::TopoMetrixReader::new()),
+        Box::new(bioformats_afm::UnisokuReader::new()),
+        // LIM / TillVision (extension-only)
+        Box::new(bioformats_lim::LimReader::new()),
+        Box::new(bioformats_lim::TillVisionReader::new()),
+        // AIM/ISQ extension-only fallback
+        // DM2 (extension-only, Gatan)
+        Box::new(bioformats_gatan::Dm2Reader::new()),
         // Extension-only (no magic bytes)
         Box::new(bioformats_raster::tga_reader()),
+        // New format readers (extension-only)
+        Box::new(bioformats_fake::FakeReader::new()),
+        Box::new(bioformats_visitech::VisitechReader::new()),
+        Box::new(bioformats_perkinelmer::PerkinElmerReader::new()),
+        Box::new(bioformats_perkinelmer::PhotonDynamicsReader::new()),
+        Box::new(bioformats_mias::CellWorxReader::new()),
+        Box::new(bioformats_mias::OxfordInstrumentsReader::new()),
+        // FEI SER (magic-byte detected: 0x97 0x01)
+        Box::new(bioformats_mias::FeiSerReader::new()),
+        // AVI video (RIFF magic)
+        Box::new(bioformats_avi::AviReader::new()),
+        // Leica LEI confocal (magic ILIS / 0x49494949)
+        Box::new(bioformats_lei::LeiReader::new()),
+        // PerkinElmer FLEX HCS (TIFF-based)
+        Box::new(bioformats_flex::FlexReader::new()),
+        // Bruker OPUS FTIR (magic 0x0A 0x00-0x02)
+        Box::new(bioformats_opus::BrukerOpusReader::new()),
+        // Extension-only readers
+        Box::new(bioformats_volocity::VolocityReader::new()),
+        Box::new(bioformats_volocity::NikonNisReader::new()),
+        Box::new(bioformats_opus::IssFlimReader::new()),
+        Box::new(bioformats_legacy::KodakBipReader::new()),
+        Box::new(bioformats_legacy::WoolzReader::new()),
+        Box::new(bioformats_legacy::PictReader::new()),
+        Box::new(bioformats_xrm::XrmReader::new()),
     ]
 }
 

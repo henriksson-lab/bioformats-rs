@@ -568,3 +568,130 @@ impl FormatReader for GatanReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
+
+// ── Gatan DM2 Reader ──────────────────────────────────────────────────────────
+
+pub struct Dm2Reader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    data_offset: u64,
+}
+
+impl Dm2Reader {
+    pub fn new() -> Self {
+        Dm2Reader { path: None, meta: None, data_offset: 32 }
+    }
+}
+
+impl Default for Dm2Reader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for Dm2Reader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        path.extension().and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("dm2"))
+            .unwrap_or(false)
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // Extension-only detection for DM2
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let mut header = [0u8; 32];
+        f.read_exact(&mut header).map_err(BioFormatsError::Io)?;
+
+        let width = i32::from_le_bytes([header[4], header[5], header[6], header[7]]).max(1) as u32;
+        let height = i32::from_le_bytes([header[8], header[9], header[10], header[11]]).max(1) as u32;
+        let dm_data_type = i32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+
+        let pixel_type = dm_pixel_type(dm_data_type);
+        let bps = dm_bytes_per_pixel(dm_data_type);
+
+        let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
+        meta_map.insert("dm_data_type".into(), MetadataValue::Int(dm_data_type as i64));
+
+        let meta = ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type,
+            bits_per_pixel: (bps * 8) as u8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: meta_map,
+            lookup_table: None,
+        };
+
+        self.meta = Some(meta);
+        self.data_offset = 32;
+        self.path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.data_offset = 32;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let bps = meta.pixel_type.bytes_per_sample();
+        let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
+        let file_offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(file_offset)).map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; plane_bytes];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        Ok(buf)
+    }
+
+    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().unwrap();
+        let bps = meta.pixel_type.bytes_per_sample();
+        let row_bytes = meta.size_x as usize * bps;
+        let out_row = w as usize * bps;
+        let mut out = Vec::with_capacity(h as usize * out_row);
+        for row in 0..h as usize {
+            let src = &full[(y as usize + row) * row_bytes..];
+            let s = x as usize * bps;
+            out.extend_from_slice(&src[s..s + out_row]);
+        }
+        Ok(out)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
+        let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}

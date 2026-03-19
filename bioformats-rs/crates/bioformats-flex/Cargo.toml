@@ -1,9 +1,10 @@
 [package]
-name = "bioformats-ome"
+name = "bioformats-flex"
 version = "0.1.0"
 edition = "2021"
-description = "OME-XML format reader (inline Base64 pixel data)"
+description = "PerkinElmer FLEX HCS format reader (TIFF-based)"
 
 [dependencies]
 bioformats-common = { path = "../bioformats-common" }
+bioformats-tiff   = { path = "../bioformats-tiff" }
 log = { workspace = true }

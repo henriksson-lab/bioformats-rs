@@ -33,11 +33,35 @@ members = [
     "crates/bioformats-norpix",
     "crates/bioformats-ome",
     "crates/bioformats-hamamatsu",
+    "crates/bioformats-pcx",
+    "crates/bioformats-photoshop",
+    "crates/bioformats-simfcs",
+    "crates/bioformats-svs",
+    "crates/bioformats-prairie",
+    "crates/bioformats-eps",
+    "crates/bioformats-afm",
+    "crates/bioformats-lim",
+    "crates/bioformats-aim",
+    "crates/bioformats-zip",
+    "crates/bioformats-fake",
+    "crates/bioformats-viff",
+    "crates/bioformats-incell",
+    "crates/bioformats-visitech",
+    "crates/bioformats-perkinelmer",
+    "crates/bioformats-mias",
+    "crates/bioformats-avi",
+    "crates/bioformats-lei",
+    "crates/bioformats-flex",
+    "crates/bioformats-volocity",
+    "crates/bioformats-opus",
+    "crates/bioformats-legacy",
+    "crates/bioformats-xrm",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 thiserror = "1"
+zip = "2"
 byteorder = "1"
 flate2 = "1"
 weezl = "0.1"

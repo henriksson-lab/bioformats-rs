@@ -1,9 +1,10 @@
 [package]
-name = "bioformats-ome"
+name = "bioformats-volocity"
 version = "0.1.0"
 edition = "2021"
-description = "OME-XML format reader (inline Base64 pixel data)"
+description = "Volocity .mvd2 and Nikon NIS format readers"
 
 [dependencies]
 bioformats-common = { path = "../bioformats-common" }
+bioformats-tiff   = { path = "../bioformats-tiff" }
 log = { workspace = true }
