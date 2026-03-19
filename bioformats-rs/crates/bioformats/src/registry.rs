@@ -15,6 +15,10 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
     vec![
         // Dedicated readers first (most precise magic bytes)
         Box::new(bioformats_zip::ZipReader::new()),
+        Box::new(bioformats_imaris::ImarisReader::new()),
+        // HDF5-based formats (extension-only, must come after ImarisReader magic check)
+        Box::new(bioformats_cellh5::CellH5Reader::new()),  // .ch5
+        Box::new(bioformats_bdv::BdvReader::new()),        // .h5
         Box::new(bioformats_viff::ViffReader::new()),
         Box::new(bioformats_mias::Al3dReader::new()),
         Box::new(bioformats_perkinelmer::OpenlabRawReader::new()),
@@ -114,6 +118,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(bioformats_legacy::WoolzReader::new()),
         Box::new(bioformats_legacy::PictReader::new()),
         Box::new(bioformats_xrm::XrmReader::new()),
+        Box::new(bioformats_zvi::ZviReader::new()),
         // TIFF-based whole-slide / variant formats (extension-only)
         Box::new(bioformats_tiff_wrappers::NdpiReader::new()),
         Box::new(bioformats_tiff_wrappers::LeicaScnReader::new()),

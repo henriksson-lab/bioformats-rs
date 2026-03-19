@@ -1,0 +1,11 @@
+[package]
+name = "bioformats-zvi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bioformats-common = { path = "../bioformats-common" }
+cfb = { workspace = true }
+flate2 = { workspace = true }
+jpeg-decoder = { workspace = true }
+log = { workspace = true }

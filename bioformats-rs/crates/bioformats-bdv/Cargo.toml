@@ -1,0 +1,10 @@
+[package]
+name = "bioformats-bdv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bioformats-common = { path = "../bioformats-common" }
+hdf5              = { workspace = true }
+quick-xml         = { workspace = true }
+log               = { workspace = true }

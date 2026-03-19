@@ -65,10 +65,15 @@ members = [
     "crates/bioformats-camera2",
     "crates/bioformats-flim2",
     "crates/bioformats-misc4",
+    "crates/bioformats-imaris",
+    "crates/bioformats-bdv",
+    "crates/bioformats-cellh5",
+    "crates/bioformats-zvi",
 ]
 resolver = "2"
 
 [workspace.dependencies]
+hdf5 = { package = "hdf5-metno", version = "0.12" }
 thiserror = "1"
 zip = "2"
 byteorder = "1"
@@ -81,3 +86,4 @@ image = { version = "0.25", default-features = false }
 log = "0.4"
 quick-xml = "0.37"
 encoding_rs = "0.8"
+cfb = "0.10"

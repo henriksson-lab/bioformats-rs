@@ -70,5 +70,9 @@ bioformats-spm           = { path = "../bioformats-spm" }
 bioformats-camera2       = { path = "../bioformats-camera2" }
 bioformats-flim2         = { path = "../bioformats-flim2" }
 bioformats-misc4         = { path = "../bioformats-misc4" }
+bioformats-imaris        = { path = "../bioformats-imaris" }
+bioformats-bdv           = { path = "../bioformats-bdv" }
+bioformats-cellh5        = { path = "../bioformats-cellh5" }
+bioformats-zvi           = { path = "../bioformats-zvi" }
 thiserror = { workspace = true }
 log = { workspace = true }
