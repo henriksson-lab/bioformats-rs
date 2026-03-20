@@ -232,7 +232,7 @@ The TIFF writer supports None, Deflate, and LZW compression, and writes valid mu
 - **CZI**: JPEG-XR compression
 - **Phase 3+**: HDF5/N5/Zarr, DICOM, NetCDF, Olympus OIF/OIB, Andor SIF, and the remainder of the Bio-Formats format list
 - **Write support** for LIF, ND2, CZI
-- **OME-XML** structured metadata output
+- **OME-XML** structured metadata output (basic support added for CZI, OME-TIFF, OME-XML via `reader.ome_metadata()`)
 - **Pyramid writing** for tiled multi-resolution TIFF
 
 ## Comparison with Java Bio-Formats
@@ -245,6 +245,18 @@ The TIFF writer supports None, Deflate, and LZW compression, and writes valid mu
 | Metadata output | OME-XML string | Structured Rust types |
 | Write support | Most formats | TIFF, PNG, JPEG, BMP, TGA, ICS, MRC, FITS, NRRD, MetaImage |
 | Pyramid / tiled read | ✓ | ✓ (TIFF) |
+
+### Performance
+
+Reading all pixel data from a 512×512 2-channel OME-TIFF (`tubhiswt_C0.ome.tif`, Bio-Formats 8.6.0 vs Rust release build, macOS, 3 warmup + 10 measured iterations):
+
+| | Time | Throughput |
+|--|------|-----------|
+| Java Bio-Formats | 22.1 ms | 11.6 MiB/s |
+| bioformats-rs | 1.6 ms | 171.3 MiB/s |
+| **Speedup** | **13.9×** | |
+
+Reproduce with `./bench/run.sh` from the repo root (requires `java` and `bioformats_package.jar` in the repo root).
 
 ## License
 
