@@ -57,7 +57,6 @@ impl Default for TiffWriter {
 
 fn write_le_u16(w: &mut impl Write, v: u16) -> std::io::Result<()> { w.write_all(&v.to_le_bytes()) }
 fn write_le_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> { w.write_all(&v.to_le_bytes()) }
-fn write_le_u64(w: &mut impl Write, v: u64) -> std::io::Result<()> { w.write_all(&v.to_le_bytes()) }
 
 /// Returns (TIFF type code, bytes per element)
 fn short_type() -> (u16, u32) { (3, 2) }
@@ -71,14 +70,6 @@ struct Entry {
     count: u32,
     /// Either the value inline (≤ 4 bytes) as a u32, or an offset into the file.
     value_or_offset: u32,
-}
-
-/// Write one 12-byte IFD entry.
-fn write_entry(w: &mut impl Write, e: &Entry) -> std::io::Result<()> {
-    write_le_u16(w, e.tag)?;
-    write_le_u16(w, e.typ)?;
-    write_le_u32(w, e.count)?;
-    write_le_u32(w, e.value_or_offset)
 }
 
 /// Write a SHORT entry with a single value stored inline.
@@ -205,7 +196,6 @@ impl FormatWriter for TiffWriter {
         // Each IFD may need extra data (BitsPerSample array if spp>1, rational for resolution).
 
         let plane_count = self.plane_strips.len();
-        let mut next_ifd_offset: u32 = 0; // will be filled back-to-front
 
         // We collect the IFDs in reverse so we can chain them.
         // Gather byte blobs for each IFD.

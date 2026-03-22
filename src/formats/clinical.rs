@@ -36,9 +36,6 @@ use crate::common::reader::FormatReader;
 fn r_i16_be(b: &[u8], off: usize) -> i16 {
     i16::from_be_bytes([b[off], b[off+1]])
 }
-fn r_i32_be(b: &[u8], off: usize) -> i32 {
-    i32::from_be_bytes([b[off], b[off+1], b[off+2], b[off+3]])
-}
 
 pub struct Ecat7Reader {
     path: Option<PathBuf>,

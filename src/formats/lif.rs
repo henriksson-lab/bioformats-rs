@@ -13,7 +13,6 @@
 //! - Then: repeating memory blocks (magic=0x70 int32, skip 4, 0x2a byte,
 //!         length int32/int64, 0x2a, UTF-16 block ID, raw image data)
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -22,8 +21,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader as XmlReader;
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
-use crate::common::pixel_type::PixelType;
+use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
 
 const LIF_MAGIC: u8 = 0x70;
@@ -42,14 +40,12 @@ struct MemBlock {
 
 #[derive(Debug, Default, Clone)]
 struct LifSeries {
-    name: String,
     size_x: u32,
     size_y: u32,
     size_z: u32,
     size_c: u32,
     size_t: u32,
     bits_per_pixel: u8,
-    is_rgb: bool,
     block_id: String,
     channel_bytes_list: Vec<u64>, // byte sizes per channel/plane
 }
@@ -66,12 +62,6 @@ fn read_i32_le(f: &mut File) -> std::io::Result<i32> {
     let mut b = [0u8; 4];
     f.read_exact(&mut b)?;
     Ok(i32::from_le_bytes(b))
-}
-
-fn read_u64_le(f: &mut File) -> std::io::Result<u64> {
-    let mut b = [0u8; 8];
-    f.read_exact(&mut b)?;
-    Ok(u64::from_le_bytes(b))
 }
 
 /// Read a UTF-16LE string prefixed with a u32 character count.
@@ -177,8 +167,6 @@ fn parse_xml_metadata(xml: &str) -> Result<Vec<LifSeries>> {
     let mut series_list: Vec<LifSeries> = Vec::new();
     let mut current: Option<LifSeries> = None;
     let mut in_image = false;
-    let mut in_channel_desc = false;
-
     let mut reader = XmlReader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -189,13 +177,12 @@ fn parse_xml_metadata(xml: &str) -> Result<Vec<LifSeries>> {
                 match name.as_str() {
                     "ELEMENT" => {
                         // <Element Name="..."> is a top-level element (series or folder)
-                        if let Some(attr) = e.attributes().find_map(|a| {
-                            let a = a.ok()?;
-                            if a.key.as_ref() == b"Name" { Some(a.value.to_vec()) } else { None }
-                        }) {
-                            let series_name = String::from_utf8_lossy(&attr).into_owned();
+                        let has_name = e.attributes().any(|a| {
+                            a.map(|a| a.key.as_ref() == b"Name").unwrap_or(false)
+                        });
+                        if has_name {
                             in_image = true;
-                            current = Some(LifSeries { name: series_name, ..Default::default() });
+                            current = Some(LifSeries::default());
                         }
                     }
                     "DIMDES" | "DIMENSIONDESCRIPTION" => {
@@ -222,7 +209,6 @@ fn parse_xml_metadata(xml: &str) -> Result<Vec<LifSeries>> {
                         }
                     }
                     "CHANNELDESCRIPTION" => {
-                        in_channel_desc = true;
                         if in_image {
                             if let Some(ref mut s) = current {
                                 s.size_c += 1;

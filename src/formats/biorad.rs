@@ -17,7 +17,6 @@ const HEADER_SIZE: u64 = 76;
 const FILE_ID: i16 = 12345;
 
 fn r_i16(b: &[u8], off: usize) -> i16 { i16::from_le_bytes([b[off], b[off+1]]) }
-fn r_u16(b: &[u8], off: usize) -> u16 { u16::from_le_bytes([b[off], b[off+1]]) }
 fn r_f32(b: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([b[off], b[off+1], b[off+2], b[off+3]])
 }

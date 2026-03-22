@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom, Read};
-use std::path::{Path, PathBuf};
+use std::io::BufReader;
+use std::path::Path;
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::read_bytes_at;
@@ -38,12 +38,10 @@ struct IfdInfo {
     color_map: Option<(Vec<u16>, Vec<u16>, Vec<u16>)>,
     jpeg_tables: Option<Vec<u8>>,
     image_description: Option<String>,
-    is_little_endian: bool,
 }
 
 /// Open TIFF file handle.
 struct TiffFile {
-    path: PathBuf,
     parser: TiffParser<BufReader<File>>,
     ifds: Vec<Ifd>,
 }
@@ -76,12 +74,8 @@ impl TiffReader {
         }
     }
 
-    fn ensure_open(&self) -> Result<&TiffFile> {
-        self.file.as_ref().ok_or(BioFormatsError::NotInitialized)
-    }
-
     /// Extract `IfdInfo` from a raw `Ifd`.
-    fn ifd_info(ifd: &Ifd, little_endian: bool) -> Result<IfdInfo> {
+    fn ifd_info(ifd: &Ifd, _little_endian: bool) -> Result<IfdInfo> {
         let width = ifd.image_width().ok_or_else(|| {
             BioFormatsError::Format("IFD missing ImageWidth".into())
         })?;
@@ -168,7 +162,6 @@ impl TiffReader {
             color_map,
             jpeg_tables,
             image_description,
-            is_little_endian: little_endian,
         })
     }
 
@@ -176,7 +169,6 @@ impl TiffReader {
     /// Heuristic: IFDs with the same (width, height, spp, bps) form one series.
     fn build_series(ifds: &[Ifd], little_endian: bool) -> Vec<TiffSeries> {
         use crate::common::metadata::ImageMetadata;
-        use crate::common::pixel_type::PixelType;
 
         // Parse infos for all IFDs (skip ones that fail)
         let infos: Vec<(usize, IfdInfo)> = ifds
@@ -501,7 +493,6 @@ impl crate::common::reader::FormatReader for TiffReader {
 
         // We need to read IFDs. Move parser into a temporary to call read_ifds.
         let mut tf = TiffFile {
-            path: path.to_path_buf(),
             parser,
             ifds: Vec::new(),
         };

@@ -64,6 +64,7 @@ const DM_TYPE_STRING: u32 = 18;
 const DM_TYPE_ARRAY:  u32 = 20;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum DmValue {
     Int(i64),
     Uint(u64),
@@ -133,21 +134,8 @@ impl<R: Read + Seek> DmReader<R> {
         self.r.read_exact(&mut b)?;
         Ok(u64::from_be_bytes(b))
     }
-    fn read_be_i32(&mut self) -> std::io::Result<i32> {
-        Ok(self.read_be_u32()? as i32)
-    }
-
     /// Tag count: uint32 for DM3, uint64 for DM4
     fn read_tag_count(&mut self) -> std::io::Result<u64> {
-        if self.dm4 {
-            self.read_be_u64()
-        } else {
-            Ok(self.read_be_u32()? as u64)
-        }
-    }
-
-    /// Size field: uint32 for DM3, uint64 for DM4
-    fn read_size(&mut self) -> std::io::Result<u64> {
         if self.dm4 {
             self.read_be_u64()
         } else {

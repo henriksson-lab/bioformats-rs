@@ -85,7 +85,6 @@ impl FormatReader for FitsReader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut bitpix: i64 = 8;
-        let mut naxis = 0i64;
         let mut dims: Vec<u32> = Vec::new();
         let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
         let mut found_end = false;
@@ -107,7 +106,7 @@ impl FormatReader for FitsReader {
                         if let Some(v) = val.and_then(parse_int_value) { bitpix = v; }
                     }
                     "NAXIS" => {
-                        if let Some(v) = val.and_then(parse_int_value) { naxis = v; }
+                        if let Some(v) = val.and_then(parse_int_value) { let _ = v; }
                     }
                     k if k.starts_with("NAXIS") => {
                         if let Some(v) = val.and_then(parse_int_value) {

@@ -72,10 +72,6 @@ fn read_u16_h(buf: &[u8], off: usize, le: bool) -> u16 {
     let b = [buf[off], buf[off + 1]];
     if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) }
 }
-fn read_i32(buf: &[u8], off: usize, le: bool) -> i32 {
-    let b = [buf[off], buf[off + 1], buf[off + 2], buf[off + 3]];
-    if le { i32::from_le_bytes(b) } else { i32::from_be_bytes(b) }
-}
 fn read_f32(buf: &[u8], off: usize, le: bool) -> f32 {
     let b = [buf[off], buf[off + 1], buf[off + 2], buf[off + 3]];
     if le { f32::from_le_bytes(b) } else { f32::from_be_bytes(b) }

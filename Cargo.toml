@@ -5,6 +5,7 @@ edition = "2021"
 description = "Pure Rust reimplementation of Bio-Formats — read/write scientific image formats"
 license = "GPL 2.0 with some BSD components"
 homepage = "https://www.openmicroscopy.org/bio-formats/"
+exclude = ["java-bioformats/", "*.jar", "bench/", "old/", "test/", "convo.txt"]
 
 [workspace]
 resolver = "2"

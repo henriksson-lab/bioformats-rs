@@ -166,13 +166,9 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
     let mut max_c = 0i32;
     let mut max_t = 0i32;
     let mut pixel_type = 0i32;
-    let mut spp = 1u32;
 
     for e in &entries {
         pixel_type = e.pixel_type;
-        let (pt, s) = czi_pixel_type(e.pixel_type);
-        let _ = pt;
-        spp = s;
         if let Some(&(_, sz)) = e.dims.get("X") { if sz as u32 > max_x { max_x = sz as u32; } }
         if let Some(&(_, sz)) = e.dims.get("Y") { if sz as u32 > max_y { max_y = sz as u32; } }
         if let Some(&(start, _)) = e.dims.get("Z") { if start > max_z { max_z = start; } }
@@ -181,7 +177,7 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
     }
 
     let (pt, s) = czi_pixel_type(pixel_type);
-    spp = s;
+    let spp = s;
 
     Ok(CziParsed {
         meta_xml,
