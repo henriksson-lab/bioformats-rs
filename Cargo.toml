@@ -3,7 +3,7 @@ name = "bioformats"
 version = "0.1.0"
 edition = "2021"
 description = "Pure Rust reimplementation of Bio-Formats — read/write scientific image formats"
-license = "LICENSE.txt"
+license-file = "LICENSE.txt"
 homepage = "https://www.openmicroscopy.org/bio-formats/"
 exclude = ["java-bioformats/", "*.jar", "bench/", "old/", "test/", "convo.txt"]
 
