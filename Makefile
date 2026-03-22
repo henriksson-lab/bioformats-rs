@@ -1,2 +1,2 @@
 loc:
-	wc -l crates/*/*/*rs
+	wc -l src/*rs  src/*/*rs
