@@ -74,6 +74,40 @@ pub fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
     zstd::decode_all(data).map_err(BioFormatsError::Io)
 }
 
+/// Decompress JPEG 2000 data (JP2 or J2K codestream).
+pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
+    use jpeg2k::Image as J2kImage;
+    let image = J2kImage::from_bytes(data)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e}")))?;
+    let components = image.components();
+    if components.is_empty() {
+        return Err(BioFormatsError::Codec("JPEG 2000: no components".into()));
+    }
+    let width = components[0].width() as usize;
+    let height = components[0].height() as usize;
+    let n_components = components.len();
+
+    // Determine bytes per sample from the first component's precision
+    let prec = components[0].precision() as usize;
+    let bps = if prec <= 8 { 1 } else if prec <= 16 { 2 } else { 4 };
+
+    let mut out = Vec::with_capacity(width * height * n_components * bps);
+    // Interleave components pixel by pixel (RGBRGB...)
+    for y in 0..height {
+        for x in 0..width {
+            for c in 0..n_components {
+                let val = components[c].data()[y * width + x];
+                match bps {
+                    1 => out.push(val as u8),
+                    2 => out.extend_from_slice(&(val as u16).to_le_bytes()),
+                    _ => out.extend_from_slice(&val.to_le_bytes()),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Apply TIFF horizontal differencing predictor (predictor = 2).
 /// Modifies `data` in-place. `samples_per_pixel` is the number of components.
 pub fn undo_horizontal_differencing(data: &mut [u8], samples_per_pixel: usize) {

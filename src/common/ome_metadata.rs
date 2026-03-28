@@ -10,6 +10,10 @@
 #[derive(Debug, Clone, Default)]
 pub struct OmeMetadata {
     pub images: Vec<OmeImage>,
+    pub instruments: Vec<OmeInstrument>,
+    pub experimenters: Vec<OmeExperimenter>,
+    pub rois: Vec<OmeROI>,
+    pub annotations: Vec<OmeAnnotation>,
 }
 
 /// Metadata for one image series.
@@ -27,6 +31,12 @@ pub struct OmeImage {
     pub time_increment: Option<f64>,
     pub channels: Vec<OmeChannel>,
     pub planes: Vec<OmePlane>,
+    /// Reference to an instrument (index into `OmeMetadata::instruments`).
+    pub instrument_ref: Option<usize>,
+    /// Reference to an objective (index into the instrument's objectives).
+    pub objective_ref: Option<usize>,
+    /// Per-channel light paths.
+    pub light_paths: Vec<OmeLightPath>,
 }
 
 /// Per-channel metadata.
@@ -43,6 +53,132 @@ pub struct OmeChannel {
     pub excitation_wavelength: Option<f64>,
 }
 
+/// Instrument metadata (microscope, objectives, detectors, light sources).
+#[derive(Debug, Clone, Default)]
+pub struct OmeInstrument {
+    pub id: Option<String>,
+    pub microscope_model: Option<String>,
+    pub microscope_manufacturer: Option<String>,
+    pub objectives: Vec<OmeObjective>,
+    pub detectors: Vec<OmeDetector>,
+    pub light_sources: Vec<OmeLightSource>,
+    pub filters: Vec<OmeFilter>,
+    pub dichroics: Vec<OmeDichroic>,
+}
+
+/// Objective lens metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OmeObjective {
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub manufacturer: Option<String>,
+    /// Nominal magnification (e.g. 40.0 for 40×).
+    pub nominal_magnification: Option<f64>,
+    /// Calibrated magnification.
+    pub calibrated_magnification: Option<f64>,
+    /// Numerical aperture.
+    pub lens_na: Option<f64>,
+    /// Immersion medium (e.g. "Oil", "Water", "Air").
+    pub immersion: Option<String>,
+    /// Correction type (e.g. "PlanApo", "PlanFluor").
+    pub correction: Option<String>,
+    /// Working distance (micrometres).
+    pub working_distance: Option<f64>,
+}
+
+/// Detector metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OmeDetector {
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub manufacturer: Option<String>,
+    /// Detector type (e.g. "CCD", "PMT", "EMCCD", "sCMOS").
+    pub detector_type: Option<String>,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
+}
+
+/// Light source metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OmeLightSource {
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub manufacturer: Option<String>,
+    /// Light source type (e.g. "Laser", "Arc", "LED", "Filament").
+    pub light_source_type: Option<String>,
+    /// Power (milliwatts).
+    pub power: Option<f64>,
+}
+
+/// Optical filter metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OmeFilter {
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub manufacturer: Option<String>,
+    pub filter_type: Option<String>,
+    /// Wavelength range: cut-in (nm).
+    pub cut_in: Option<f64>,
+    /// Wavelength range: cut-out (nm).
+    pub cut_out: Option<f64>,
+}
+
+/// Dichroic mirror metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OmeDichroic {
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub manufacturer: Option<String>,
+}
+
+/// Light path: the combination of filters and dichroics used for a channel.
+#[derive(Debug, Clone, Default)]
+pub struct OmeLightPath {
+    pub excitation_filter_ids: Vec<String>,
+    pub dichroic_id: Option<String>,
+    pub emission_filter_ids: Vec<String>,
+}
+
+/// Region of interest.
+#[derive(Debug, Clone, Default)]
+pub struct OmeROI {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub shapes: Vec<OmeShape>,
+}
+
+/// A single shape within an ROI.
+#[derive(Debug, Clone)]
+pub enum OmeShape {
+    Rectangle { x: f64, y: f64, width: f64, height: f64, the_z: Option<u32>, the_t: Option<u32>, the_c: Option<u32> },
+    Ellipse { x: f64, y: f64, radius_x: f64, radius_y: f64, the_z: Option<u32>, the_t: Option<u32>, the_c: Option<u32> },
+    Point { x: f64, y: f64, the_z: Option<u32>, the_t: Option<u32>, the_c: Option<u32> },
+    Line { x1: f64, y1: f64, x2: f64, y2: f64, the_z: Option<u32>, the_t: Option<u32>, the_c: Option<u32> },
+    Polygon { points: Vec<(f64, f64)>, the_z: Option<u32>, the_t: Option<u32>, the_c: Option<u32> },
+    Polyline { points: Vec<(f64, f64)>, the_z: Option<u32>, the_t: Option<u32>, the_c: Option<u32> },
+}
+
+/// Experimenter metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OmeExperimenter {
+    pub id: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub email: Option<String>,
+    pub institution: Option<String>,
+}
+
+/// Annotation (key-value or structured).
+#[derive(Debug, Clone)]
+pub enum OmeAnnotation {
+    /// Simple key-value string annotation.
+    MapAnnotation { id: Option<String>, namespace: Option<String>, values: Vec<(String, String)> },
+    /// Comment annotation.
+    CommentAnnotation { id: Option<String>, namespace: Option<String>, value: String },
+    /// Tag annotation.
+    TagAnnotation { id: Option<String>, namespace: Option<String>, value: String },
+}
+
 /// Per-plane metadata.
 #[derive(Debug, Clone, Default)]
 pub struct OmePlane {
@@ -56,6 +192,115 @@ pub struct OmePlane {
     pub position_x: Option<f64>,
     pub position_y: Option<f64>,
     pub position_z: Option<f64>,
+}
+
+// ─── Serialisation ───────────────────────────────────────────────────────────
+
+impl OmeMetadata {
+    /// Serialize to OME-XML string suitable for embedding in a TIFF ImageDescription tag.
+    pub fn to_ome_xml(&self, meta: &crate::metadata::ImageMetadata) -> String {
+        use std::fmt::Write;
+        let mut xml = String::new();
+        let _ = write!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+        let _ = write!(xml, r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">"#);
+
+        for (i, img) in self.images.iter().enumerate() {
+            let _ = write!(xml, r#"<Image ID="Image:{i}" Name="{}">"#,
+                xml_escape(img.name.as_deref().unwrap_or(&format!("Series {i}"))));
+
+            if let Some(desc) = &img.description {
+                let _ = write!(xml, "<Description>{}</Description>", xml_escape(desc));
+            }
+
+            // Pixels element
+            let dim_order = format!("{:?}", meta.dimension_order);
+            let pt_str = ome_pixel_type_str(meta.pixel_type);
+            let _ = write!(xml,
+                r#"<Pixels ID="Pixels:{i}" DimensionOrder="{dim_order}" Type="{pt_str}" SizeX="{}" SizeY="{}" SizeZ="{}" SizeC="{}" SizeT="{}""#,
+                meta.size_x, meta.size_y, meta.size_z, meta.size_c, meta.size_t);
+
+            if let Some(v) = img.physical_size_x {
+                let _ = write!(xml, r#" PhysicalSizeX="{v}" PhysicalSizeXUnit="µm""#);
+            }
+            if let Some(v) = img.physical_size_y {
+                let _ = write!(xml, r#" PhysicalSizeY="{v}" PhysicalSizeYUnit="µm""#);
+            }
+            if let Some(v) = img.physical_size_z {
+                let _ = write!(xml, r#" PhysicalSizeZ="{v}" PhysicalSizeZUnit="µm""#);
+            }
+            if let Some(v) = img.time_increment {
+                let _ = write!(xml, r#" TimeIncrement="{v}" TimeIncrementUnit="s""#);
+            }
+            xml.push('>');
+
+            // Channels
+            for (ci, ch) in img.channels.iter().enumerate() {
+                let _ = write!(xml, r#"<Channel ID="Channel:{i}:{ci}" SamplesPerPixel="{}""#,
+                    ch.samples_per_pixel);
+                if let Some(name) = &ch.name {
+                    let _ = write!(xml, r#" Name="{}""#, xml_escape(name));
+                }
+                if let Some(c) = ch.color {
+                    let _ = write!(xml, r#" Color="{c}""#);
+                }
+                if let Some(v) = ch.emission_wavelength {
+                    let _ = write!(xml, r#" EmissionWavelength="{v}""#);
+                }
+                if let Some(v) = ch.excitation_wavelength {
+                    let _ = write!(xml, r#" ExcitationWavelength="{v}""#);
+                }
+                xml.push_str("/>");
+            }
+
+            // Planes
+            for plane in &img.planes {
+                let _ = write!(xml,
+                    r#"<Plane TheZ="{}" TheC="{}" TheT="{}""#,
+                    plane.the_z, plane.the_c, plane.the_t);
+                if let Some(v) = plane.delta_t {
+                    let _ = write!(xml, r#" DeltaT="{v}""#);
+                }
+                if let Some(v) = plane.exposure_time {
+                    let _ = write!(xml, r#" ExposureTime="{v}""#);
+                }
+                if let Some(v) = plane.position_x {
+                    let _ = write!(xml, r#" PositionX="{v}""#);
+                }
+                if let Some(v) = plane.position_y {
+                    let _ = write!(xml, r#" PositionY="{v}""#);
+                }
+                if let Some(v) = plane.position_z {
+                    let _ = write!(xml, r#" PositionZ="{v}""#);
+                }
+                xml.push_str("/>");
+            }
+
+            xml.push_str("</Pixels></Image>");
+        }
+
+        xml.push_str("</OME>");
+        xml
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;").replace('\'', "&apos;")
+}
+
+fn ome_pixel_type_str(pt: crate::pixel::PixelType) -> &'static str {
+    use crate::pixel::PixelType;
+    match pt {
+        PixelType::Bit => "bit",
+        PixelType::Int8 => "int8",
+        PixelType::Uint8 => "uint8",
+        PixelType::Int16 => "int16",
+        PixelType::Uint16 => "uint16",
+        PixelType::Int32 => "int32",
+        PixelType::Uint32 => "uint32",
+        PixelType::Float32 => "float",
+        PixelType::Float64 => "double",
+    }
 }
 
 // ─── Parsers ──────────────────────────────────────────────────────────────────
@@ -74,6 +319,7 @@ impl OmeMetadata {
             .collect();
         OmeMetadata {
             images: vec![OmeImage { channels, ..Default::default() }],
+            ..Default::default()
         }
     }
 
@@ -133,10 +379,11 @@ impl OmeMetadata {
                 name, description,
                 physical_size_x, physical_size_y, physical_size_z, time_increment,
                 channels, planes,
+                ..Default::default()
             });
         }
 
-        OmeMetadata { images }
+        OmeMetadata { images, ..Default::default() }
     }
 
     /// Parse Zeiss CZI metadata XML into structured metadata.
@@ -148,7 +395,7 @@ impl OmeMetadata {
             channels: czi_channels(xml),
             ..Default::default()
         };
-        OmeMetadata { images: vec![image] }
+        OmeMetadata { images: vec![image], ..Default::default() }
     }
 }
 

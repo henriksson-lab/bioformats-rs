@@ -29,6 +29,8 @@ pub struct TiffWriter {
     /// (strip_offset, strip_byte_count) recorded per plane as they are written.
     plane_strips: Vec<(u64, u64)>,
     planes_written: u32,
+    /// Optional OME-XML to embed in the first IFD's ImageDescription.
+    ome_xml: Option<String>,
 }
 
 impl TiffWriter {
@@ -40,12 +42,27 @@ impl TiffWriter {
             file: None,
             plane_strips: Vec::new(),
             planes_written: 0,
+            ome_xml: None,
         }
     }
 
     pub fn with_compression(mut self, c: WriteCompression) -> Self {
         self.compression = c;
         self
+    }
+
+    /// Set OME-XML to embed in the TIFF ImageDescription tag, producing an OME-TIFF.
+    pub fn with_ome_xml(mut self, xml: String) -> Self {
+        self.ome_xml = Some(xml);
+        self
+    }
+
+    /// Convenience: set OME metadata from an `OmeMetadata` struct.
+    /// Must be called after `set_metadata` so the pixel metadata is available.
+    pub fn set_ome_metadata(&mut self, ome: &crate::common::ome_metadata::OmeMetadata) {
+        if let Some(meta) = &self.meta {
+            self.ome_xml = Some(ome.to_ome_xml(meta));
+        }
     }
 }
 
@@ -202,6 +219,7 @@ impl FormatWriter for TiffWriter {
         struct IfdBlob {
             ifd_bytes: Vec<u8>,
             extra_bytes: Vec<u8>,
+            desc_offset: u32,
         }
 
         let mut ifd_blobs: Vec<IfdBlob> = Vec::with_capacity(plane_count);
@@ -229,6 +247,21 @@ impl FormatWriter for TiffWriter {
                     extra.extend_from_slice(&bps.to_le_bytes());
                 }
                 bps_entry = Entry { tag: 258, typ: short_type().0, count: spp as u32, value_or_offset: 0 /* filled later */ };
+            }
+
+            // ImageDescription (OME-XML) for the first IFD only
+            let desc_offset = extra.len() as u32;
+            let desc_bytes: Option<Vec<u8>> = if plane_idx == 0 {
+                self.ome_xml.as_ref().map(|xml| {
+                    let mut b = xml.as_bytes().to_vec();
+                    b.push(0); // NUL terminator for ASCII tag
+                    b
+                })
+            } else {
+                None
+            };
+            if let Some(ref db) = desc_bytes {
+                extra.extend_from_slice(db);
             }
 
             // XResolution and YResolution rationals (72/1)
@@ -261,6 +294,16 @@ impl FormatWriter for TiffWriter {
                 entries.push(short_entry(339, sf));
             }
 
+            // ImageDescription (tag 270) for OME-TIFF
+            if let Some(ref db) = desc_bytes {
+                entries.push(Entry {
+                    tag: 270,
+                    typ: 2, // ASCII
+                    count: db.len() as u32,
+                    value_or_offset: 0, // patched later
+                });
+            }
+
             entries.sort_by_key(|e| e.tag);
 
             // We'll write the IFD blob (we don't know the file offset yet, so we record
@@ -280,7 +323,7 @@ impl FormatWriter for TiffWriter {
             // Append next IFD placeholder (4 bytes)
             ifd_bytes.extend_from_slice(&0u32.to_le_bytes());
 
-            ifd_blobs.push(IfdBlob { ifd_bytes, extra_bytes: extra });
+            ifd_blobs.push(IfdBlob { ifd_bytes, extra_bytes: extra, desc_offset });
 
             // Remember what we need to patch later:
             // - BitsPerSample offset (if spp > 1)
@@ -338,6 +381,11 @@ impl FormatWriter for TiffWriter {
                         // YResolution
                         let bps_extra_bytes = if spp > 1 { spp as u64 * 2 } else { 0 };
                         let abs_off = (extra_file_off + bps_extra_bytes + 8) as u32;
+                        blob.ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                    }
+                    270 => {
+                        // ImageDescription — offset into extra data
+                        let abs_off = (extra_file_off + blob.desc_offset as u64) as u32;
                         blob.ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     // StripOffsets / StripByteCounts are already absolute (set from plane_strips)

@@ -24,6 +24,7 @@ encoding_rs  = "0.8"
 cfb          = "0.10"
 byteorder    = "1"
 image        = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "gif", "tga", "webp", "pnm", "hdr", "exr", "dds", "ff"] }
+jpeg2k       = { version = "0.10", default-features = false, features = ["openjp2"] }
 
 [[bench]]
 name = "read_ome_tiff"

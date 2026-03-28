@@ -3,59 +3,11 @@
 //! Includes FlowSightReader with basic binary header inspection and many
 //! extension-only placeholder readers.
 
-use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
-use crate::common::pixel_type::PixelType;
+use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-fn placeholder_meta() -> ImageMetadata {
-    ImageMetadata {
-        size_x: 512,
-        size_y: 512,
-        size_z: 1,
-        size_c: 1,
-        size_t: 1,
-        pixel_type: PixelType::Uint8,
-        bits_per_pixel: 8,
-        image_count: 1,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: true,
-        resolution_count: 1,
-        series_metadata: HashMap::new(),
-        lookup_table: None,
-    }
-}
-
-fn placeholder_meta_u16_small() -> ImageMetadata {
-    ImageMetadata {
-        size_x: 64,
-        size_y: 64,
-        size_z: 1,
-        size_c: 1,
-        size_t: 1,
-        pixel_type: PixelType::Uint16,
-        bits_per_pixel: 16,
-        image_count: 1,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: true,
-        resolution_count: 1,
-        series_metadata: HashMap::new(),
-        lookup_table: None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Macros
@@ -93,10 +45,10 @@ macro_rules! placeholder_reader {
 
             fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
 
-            fn set_id(&mut self, path: &Path) -> Result<()> {
-                self.path = Some(path.to_path_buf());
-                self.meta = Some(placeholder_meta());
-                Ok(())
+            fn set_id(&mut self, _path: &Path) -> Result<()> {
+                Err(BioFormatsError::UnsupportedFormat(
+                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                ))
             }
 
             fn close(&mut self) -> Result<()> {
@@ -117,29 +69,22 @@ macro_rules! placeholder_reader {
                 self.meta.as_ref().expect("set_id not called")
             }
 
-            fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-                let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-                if plane_index >= meta.image_count {
-                    return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-                }
-                Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize])
+            fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+                Err(BioFormatsError::UnsupportedFormat(
+                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                ))
             }
 
-            fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-                let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-                if plane_index >= meta.image_count {
-                    return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-                }
-                Ok(vec![0u8; w as usize * h as usize])
+            fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+                Err(BioFormatsError::UnsupportedFormat(
+                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                ))
             }
 
-            fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-                let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-                let tw = meta.size_x.min(256);
-                let th = meta.size_y.min(256);
-                let tx = (meta.size_x - tw) / 2;
-                let ty = (meta.size_y - th) / 2;
-                self.open_bytes_region(plane_index, tx, ty, tw, th)
+            fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+                Err(BioFormatsError::UnsupportedFormat(
+                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                ))
             }
         }
     };
@@ -178,10 +123,10 @@ macro_rules! placeholder_reader_u16_small {
 
             fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
 
-            fn set_id(&mut self, path: &Path) -> Result<()> {
-                self.path = Some(path.to_path_buf());
-                self.meta = Some(placeholder_meta_u16_small());
-                Ok(())
+            fn set_id(&mut self, _path: &Path) -> Result<()> {
+                Err(BioFormatsError::UnsupportedFormat(
+                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                ))
             }
 
             fn close(&mut self) -> Result<()> {
@@ -202,29 +147,22 @@ macro_rules! placeholder_reader_u16_small {
                 self.meta.as_ref().expect("set_id not called")
             }
 
-            fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-                let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-                if plane_index >= meta.image_count {
-                    return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-                }
-                Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * 2])
+            fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+                Err(BioFormatsError::UnsupportedFormat(
+                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                ))
             }
 
-            fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-                let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-                if plane_index >= meta.image_count {
-                    return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-                }
-                Ok(vec![0u8; w as usize * h as usize * 2])
+            fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+                Err(BioFormatsError::UnsupportedFormat(
+                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                ))
             }
 
-            fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-                let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-                let tw = meta.size_x.min(256);
-                let th = meta.size_y.min(256);
-                let tx = (meta.size_x - tw) / 2;
-                let ty = (meta.size_y - th) / 2;
-                self.open_bytes_region(plane_index, tx, ty, tw, th)
+            fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+                Err(BioFormatsError::UnsupportedFormat(
+                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                ))
             }
         }
     };
@@ -261,17 +199,10 @@ impl FormatReader for FlowSightReader {
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
 
-    fn set_id(&mut self, path: &Path) -> Result<()> {
-        // Attempt to peek at first 4 bytes (informational only)
-        let _magic: Option<[u8; 4]> = std::fs::File::open(path)
-            .ok()
-            .and_then(|mut f| {
-                let mut buf = [0u8; 4];
-                f.read_exact(&mut buf).ok().map(|_| buf)
-            });
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(placeholder_meta_u16_small());
-        Ok(())
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "FlowSight CIF format reading is not yet implemented".to_string()
+        ))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -292,29 +223,22 @@ impl FormatReader for FlowSightReader {
         self.meta.as_ref().expect("set_id not called")
     }
 
-    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * 2])
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "FlowSight CIF format reading is not yet implemented".to_string()
+        ))
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Ok(vec![0u8; w as usize * h as usize * 2])
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "FlowSight CIF format reading is not yet implemented".to_string()
+        ))
     }
 
-    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "FlowSight CIF format reading is not yet implemented".to_string()
+        ))
     }
 }
 

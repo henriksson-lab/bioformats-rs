@@ -26,6 +26,23 @@ fn writer_for(path: &Path) -> Option<Box<dyn FormatWriter>> {
 }
 
 impl ImageWriter {
+    /// Write an OME-TIFF file with embedded OME-XML metadata.
+    pub fn save_ome_tiff(
+        path: &Path,
+        meta: &ImageMetadata,
+        ome: &crate::common::ome_metadata::OmeMetadata,
+        planes: &[Vec<u8>],
+    ) -> Result<()> {
+        let ome_xml = ome.to_ome_xml(meta);
+        let mut w = crate::tiff::TiffWriter::new().with_ome_xml(ome_xml);
+        w.set_metadata(meta)?;
+        w.set_id(path)?;
+        for (i, plane) in planes.iter().enumerate() {
+            w.save_bytes(i as u32, plane)?;
+        }
+        w.close()
+    }
+
     /// Convenience: write all planes in one call.
     pub fn save(path: &Path, meta: &ImageMetadata, planes: &[Vec<u8>]) -> Result<()> {
         let mut w = writer_for(path).ok_or_else(|| {

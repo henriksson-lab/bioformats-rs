@@ -1,2 +1,5 @@
 loc:
-	wc -l src/*rs  src/*/*rs
+	find src tests -name '*.rs' | xargs wc -l
+
+gitaddall:
+	git add src 

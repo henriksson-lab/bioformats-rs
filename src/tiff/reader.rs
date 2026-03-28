@@ -49,9 +49,12 @@ struct TiffFile {
 /// A TIFF series groups IFDs that belong together (e.g., Z-stack stored as multiple IFDs).
 #[derive(Debug, Clone)]
 pub struct TiffSeries {
-    /// IFD indices belonging to this series.
+    /// IFD indices belonging to this series (into `TiffFile::ifds`).
     pub ifd_indices: Vec<usize>,
     pub metadata: crate::common::metadata::ImageMetadata,
+    /// Sub-resolution pyramid levels. Each entry is a list of IFD indices for
+    /// one resolution level (smaller than the main). Level 0 = main (ifd_indices).
+    pub sub_resolutions: Vec<Vec<usize>>,
 }
 
 pub struct TiffReader {
@@ -246,9 +249,71 @@ impl TiffReader {
                     );
                 }
 
-                TiffSeries { ifd_indices, metadata: meta }
+                TiffSeries { ifd_indices, metadata: meta, sub_resolutions: Vec::new() }
             })
             .collect()
+    }
+
+    /// Parse SubIFD chains for pyramid support.
+    /// For each series, check the first IFD for a SUB_IFD tag (330).
+    /// If present, read sub-IFDs and store them as sub-resolution levels.
+    fn parse_sub_ifds(&mut self) -> Result<()> {
+        let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+
+        for series in &mut self.series {
+            if series.ifd_indices.is_empty() {
+                continue;
+            }
+            // Check the first IFD of this series for SubIFD offsets
+            let first_ifd_idx = series.ifd_indices[0];
+            let sub_ifd_offsets: Vec<u64> = {
+                let ifd = &file.ifds[first_ifd_idx];
+                let offsets = ifd.get_vec_u64(tag::SUB_IFD);
+                if offsets.is_empty() {
+                    continue;
+                }
+                offsets
+            };
+
+            // Read sub-IFDs and add them to the ifds array
+            let mut sub_res_levels: Vec<Vec<usize>> = Vec::new();
+            for offset in &sub_ifd_offsets {
+                let (sub_ifd, _next) = file.parser.read_ifd(*offset)?;
+                // Verify the sub-IFD is a valid image (has width/height)
+                if sub_ifd.image_width().is_none() {
+                    continue;
+                }
+                let sub_idx = file.ifds.len();
+                file.ifds.push(sub_ifd);
+                sub_res_levels.push(vec![sub_idx]);
+            }
+
+            if !sub_res_levels.is_empty() {
+                series.sub_resolutions = sub_res_levels;
+                series.metadata.resolution_count = 1 + series.sub_resolutions.len() as u32;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the IFD index for a given plane, taking current resolution into account.
+    fn resolve_ifd_index(&self, plane_index: u32) -> Result<usize> {
+        let s = &self.series[self.current_series];
+        if self.current_resolution == 0 {
+            // Main resolution
+            s.ifd_indices.get(plane_index as usize)
+                .copied()
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
+        } else {
+            // Sub-resolution level (1-based index into sub_resolutions)
+            let level = self.current_resolution - 1;
+            let sub = s.sub_resolutions.get(level).ok_or_else(|| {
+                BioFormatsError::Format(format!("resolution level {} out of range", self.current_resolution))
+            })?;
+            sub.get(plane_index as usize)
+                .copied()
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
+        }
     }
 
     /// Read raw bytes for one plane from the file.
@@ -514,6 +579,8 @@ impl crate::common::reader::FormatReader for TiffReader {
         self.file = Some(tf);
         self.current_series = 0;
         self.current_resolution = 0;
+        // Parse SubIFD chains for pyramid support
+        self.parse_sub_ifds()?;
         Ok(())
     }
 
@@ -545,13 +612,11 @@ impl crate::common::reader::FormatReader for TiffReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let (w, h, ifd_index) = {
-            let s = &self.series[self.current_series];
-            let ifd_index = *s.ifd_indices.get(plane_index as usize).ok_or(
-                BioFormatsError::PlaneOutOfRange(plane_index),
-            )?;
-            (s.metadata.size_x, s.metadata.size_y, ifd_index)
-        };
+        let ifd_index = self.resolve_ifd_index(plane_index)?;
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let ifd = &file.ifds[ifd_index];
+        let w = ifd.image_width().unwrap_or(0);
+        let h = ifd.image_length().unwrap_or(0);
         self.read_plane_bytes(ifd_index, 0, 0, w, h)
     }
 
@@ -563,24 +628,17 @@ impl crate::common::reader::FormatReader for TiffReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let ifd_index = {
-            let s = &self.series[self.current_series];
-            *s.ifd_indices.get(plane_index as usize).ok_or(
-                BioFormatsError::PlaneOutOfRange(plane_index),
-            )?
-        };
+        let ifd_index = self.resolve_ifd_index(plane_index)?;
         self.read_plane_bytes(ifd_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         // Return a small center crop (max 256x256) as a thumbnail.
-        let (w, h, ifd_index) = {
-            let s = &self.series[self.current_series];
-            let ifd_index = *s.ifd_indices.get(plane_index as usize).ok_or(
-                BioFormatsError::PlaneOutOfRange(plane_index),
-            )?;
-            (s.metadata.size_x, s.metadata.size_y, ifd_index)
-        };
+        let ifd_index = self.resolve_ifd_index(plane_index)?;
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let ifd = &file.ifds[ifd_index];
+        let w = ifd.image_width().unwrap_or(0);
+        let h = ifd.image_length().unwrap_or(0);
         let tw = w.min(256);
         let th = h.min(256);
         let tx = (w - tw) / 2;
@@ -589,9 +647,24 @@ impl crate::common::reader::FormatReader for TiffReader {
     }
 
     fn resolution_count(&self) -> usize {
-        // Count sub-IFD levels if present; for now return series count
-        // (real pyramid detection would use SubIFD tag chains)
-        1
+        let s = &self.series[self.current_series];
+        1 + s.sub_resolutions.len()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        let s = &self.series[self.current_series];
+        let max = 1 + s.sub_resolutions.len();
+        if level >= max {
+            return Err(BioFormatsError::Format(format!(
+                "resolution level {} out of range (max {})", level, max - 1
+            )));
+        }
+        self.current_resolution = level;
+        Ok(())
+    }
+
+    fn resolution(&self) -> usize {
+        self.current_resolution
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {

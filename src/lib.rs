@@ -43,6 +43,11 @@ pub use pixel::PixelType;
 pub use reader::FormatReader;
 pub use registry::ImageReader;
 pub use writer_registry::ImageWriter;
-pub use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata, OmePlane};
+pub use crate::common::ome_metadata::{
+    OmeChannel, OmeImage, OmeMetadata, OmePlane,
+    OmeInstrument, OmeObjective, OmeDetector, OmeLightSource,
+    OmeFilter, OmeDichroic, OmeLightPath,
+    OmeROI, OmeShape, OmeExperimenter, OmeAnnotation,
+};
 pub use crate::common::writer::FormatWriter;
 pub use crate::tiff::{TiffWriter, WriteCompression};
