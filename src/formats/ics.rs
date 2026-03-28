@@ -186,7 +186,7 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         is_rgb,
         is_interleaved: false,
         is_indexed: false,
-        is_little_endian: true, // ICS is usually LE; TODO: check byte_order field
+        is_little_endian: hdr.byte_order.first().copied().unwrap_or(1) == 1, // [1,2,...] = LE, [4,3,...] = BE
         resolution_count: 1,
         series_metadata,
         lookup_table: None,

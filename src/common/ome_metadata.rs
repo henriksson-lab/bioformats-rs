@@ -210,12 +210,102 @@ impl OmeMetadata {
         let _ = write!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
         let _ = write!(xml, r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">"#);
 
+        // Instrument elements
+        for (ii, inst) in self.instruments.iter().enumerate() {
+            let default_inst_id = format!("Instrument:{ii}");
+            let inst_id = inst.id.as_deref().unwrap_or(&default_inst_id);
+            let _ = write!(xml, r#"<Instrument ID="{}">"#, xml_escape(inst_id));
+
+            if inst.microscope_model.is_some() || inst.microscope_manufacturer.is_some() {
+                let _ = write!(xml, "<Microscope");
+                if let Some(m) = &inst.microscope_model {
+                    let _ = write!(xml, r#" Model="{}""#, xml_escape(m));
+                }
+                if let Some(m) = &inst.microscope_manufacturer {
+                    let _ = write!(xml, r#" Manufacturer="{}""#, xml_escape(m));
+                }
+                xml.push_str("/>");
+            }
+
+            for (oi, obj) in inst.objectives.iter().enumerate() {
+                let default_obj_id = format!("Objective:{ii}:{oi}");
+                let obj_id = obj.id.as_deref().unwrap_or(&default_obj_id);
+                let _ = write!(xml, r#"<Objective ID="{}""#, xml_escape(obj_id));
+                if let Some(v) = &obj.model { let _ = write!(xml, r#" Model="{}""#, xml_escape(v)); }
+                if let Some(v) = &obj.manufacturer { let _ = write!(xml, r#" Manufacturer="{}""#, xml_escape(v)); }
+                if let Some(v) = obj.nominal_magnification { let _ = write!(xml, r#" NominalMagnification="{v}""#); }
+                if let Some(v) = obj.calibrated_magnification { let _ = write!(xml, r#" CalibratedMagnification="{v}""#); }
+                if let Some(v) = obj.lens_na { let _ = write!(xml, r#" LensNA="{v}""#); }
+                if let Some(v) = &obj.immersion { let _ = write!(xml, r#" Immersion="{}""#, xml_escape(v)); }
+                if let Some(v) = &obj.correction { let _ = write!(xml, r#" Correction="{}""#, xml_escape(v)); }
+                if let Some(v) = obj.working_distance { let _ = write!(xml, r#" WorkingDistance="{v}""#); }
+                xml.push_str("/>");
+            }
+
+            for (di, det) in inst.detectors.iter().enumerate() {
+                let default_det_id = format!("Detector:{ii}:{di}");
+                let det_id = det.id.as_deref().unwrap_or(&default_det_id);
+                let _ = write!(xml, r#"<Detector ID="{}""#, xml_escape(det_id));
+                if let Some(v) = &det.model { let _ = write!(xml, r#" Model="{}""#, xml_escape(v)); }
+                if let Some(v) = &det.detector_type { let _ = write!(xml, r#" Type="{}""#, xml_escape(v)); }
+                if let Some(v) = det.gain { let _ = write!(xml, r#" Gain="{v}""#); }
+                xml.push_str("/>");
+            }
+
+            for ls in &inst.light_sources {
+                let ls_tag = ls.light_source_type.as_deref().unwrap_or("GenericExcitationSource");
+                let ls_id = ls.id.as_deref().unwrap_or("LightSource:0");
+                let _ = write!(xml, r#"<{ls_tag} ID="{}""#, xml_escape(ls_id));
+                if let Some(v) = &ls.model { let _ = write!(xml, r#" Model="{}""#, xml_escape(v)); }
+                if let Some(v) = ls.power { let _ = write!(xml, r#" Power="{v}""#); }
+                xml.push_str("/>");
+            }
+
+            for fi in &inst.filters {
+                let f_id = fi.id.as_deref().unwrap_or("Filter:0");
+                let _ = write!(xml, r#"<Filter ID="{}""#, xml_escape(f_id));
+                if let Some(v) = &fi.model { let _ = write!(xml, r#" Model="{}""#, xml_escape(v)); }
+                if let Some(v) = &fi.filter_type { let _ = write!(xml, r#" Type="{}""#, xml_escape(v)); }
+                if let Some(v) = fi.cut_in { let _ = write!(xml, r#" CutIn="{v}""#); }
+                if let Some(v) = fi.cut_out { let _ = write!(xml, r#" CutOut="{v}""#); }
+                xml.push_str("/>");
+            }
+
+            for dc in &inst.dichroics {
+                let d_id = dc.id.as_deref().unwrap_or("Dichroic:0");
+                let _ = write!(xml, r#"<Dichroic ID="{}""#, xml_escape(d_id));
+                if let Some(v) = &dc.model { let _ = write!(xml, r#" Model="{}""#, xml_escape(v)); }
+                xml.push_str("/>");
+            }
+
+            xml.push_str("</Instrument>");
+        }
+
         for (i, img) in self.images.iter().enumerate() {
             let _ = write!(xml, r#"<Image ID="Image:{i}" Name="{}">"#,
                 xml_escape(img.name.as_deref().unwrap_or(&format!("Series {i}"))));
 
             if let Some(desc) = &img.description {
                 let _ = write!(xml, "<Description>{}</Description>", xml_escape(desc));
+            }
+
+            // InstrumentRef
+            if let Some(inst_idx) = img.instrument_ref {
+                if let Some(inst) = self.instruments.get(inst_idx) {
+                    let default_id = format!("Instrument:{inst_idx}");
+                    let inst_id = inst.id.as_deref().unwrap_or(&default_id);
+                    let _ = write!(xml, r#"<InstrumentRef ID="{}"/>"#, xml_escape(inst_id));
+                }
+            }
+            // ObjectiveSettings
+            if let (Some(inst_idx), Some(obj_idx)) = (img.instrument_ref, img.objective_ref) {
+                if let Some(inst) = self.instruments.get(inst_idx) {
+                    if let Some(obj) = inst.objectives.get(obj_idx) {
+                        let default_id = format!("Objective:{inst_idx}:{obj_idx}");
+                        let obj_id = obj.id.as_deref().unwrap_or(&default_id);
+                        let _ = write!(xml, r#"<ObjectiveSettings ID="{}"/>"#, xml_escape(obj_id));
+                    }
+                }
             }
 
             // Pixels element
@@ -256,6 +346,20 @@ impl OmeMetadata {
                     let _ = write!(xml, r#" ExcitationWavelength="{v}""#);
                 }
                 xml.push_str("/>");
+            }
+
+            // Modulo annotations
+            if let Some(m) = &img.modulo_z {
+                let _ = write!(xml, r#"<ModuloAlongZ Type="{}" Start="{}" Step="{}" End="{}" Unit="{}"/>"#,
+                    xml_escape(&m.modulo_type), m.start, m.step, m.end, xml_escape(&m.unit));
+            }
+            if let Some(m) = &img.modulo_c {
+                let _ = write!(xml, r#"<ModuloAlongC Type="{}" Start="{}" Step="{}" End="{}" Unit="{}"/>"#,
+                    xml_escape(&m.modulo_type), m.start, m.step, m.end, xml_escape(&m.unit));
+            }
+            if let Some(m) = &img.modulo_t {
+                let _ = write!(xml, r#"<ModuloAlongT Type="{}" Start="{}" Step="{}" End="{}" Unit="{}"/>"#,
+                    xml_escape(&m.modulo_type), m.start, m.step, m.end, xml_escape(&m.unit));
             }
 
             // Planes
