@@ -37,6 +37,12 @@ pub struct OmeImage {
     pub objective_ref: Option<usize>,
     /// Per-channel light paths.
     pub light_paths: Vec<OmeLightPath>,
+    /// Modulo annotation for Z (sub-dimensions within Z).
+    pub modulo_z: Option<crate::metadata::ModuloAnnotation>,
+    /// Modulo annotation for C (sub-dimensions within C).
+    pub modulo_c: Option<crate::metadata::ModuloAnnotation>,
+    /// Modulo annotation for T (sub-dimensions within T).
+    pub modulo_t: Option<crate::metadata::ModuloAnnotation>,
 }
 
 /// Per-channel metadata.
@@ -374,11 +380,14 @@ impl OmeMetadata {
 
             let channels = pixels_xml.map(parse_channels).unwrap_or_default();
             let planes   = pixels_xml.map(parse_planes).unwrap_or_default();
+            let modulo_z = pixels_xml.and_then(|px| parse_modulo(px, "Z"));
+            let modulo_c = pixels_xml.and_then(|px| parse_modulo(px, "C"));
+            let modulo_t = pixels_xml.and_then(|px| parse_modulo(px, "T"));
 
             images.push(OmeImage {
                 name, description,
                 physical_size_x, physical_size_y, physical_size_z, time_increment,
-                channels, planes,
+                channels, planes, modulo_z, modulo_c, modulo_t,
                 ..Default::default()
             });
         }
@@ -445,6 +454,21 @@ fn parse_channels(pixels_xml: &str) -> Vec<OmeChannel> {
             excitation_wavelength: xml_attr(tag, "ExcitationWavelength").and_then(|s| s.parse().ok()),
         }
     }).collect()
+}
+
+fn parse_modulo(pixels_xml: &str, dim: &str) -> Option<crate::metadata::ModuloAnnotation> {
+    let tag_name = format!("ModuloAlong{}", dim);
+    let pos = all_tag_positions(pixels_xml, &tag_name).into_iter().next()?;
+    let t = start_tag_at(pixels_xml, pos);
+    Some(crate::metadata::ModuloAnnotation {
+        parent_dimension: dim.to_string(),
+        modulo_type: xml_attr(t, "Type").unwrap_or_default(),
+        start: xml_attr(t, "Start").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        step: xml_attr(t, "Step").and_then(|s| s.parse().ok()).unwrap_or(1.0),
+        end: xml_attr(t, "End").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        unit: xml_attr(t, "Unit").unwrap_or_default(),
+        labels: Vec::new(),
+    })
 }
 
 fn parse_planes(pixels_xml: &str) -> Vec<OmePlane> {
