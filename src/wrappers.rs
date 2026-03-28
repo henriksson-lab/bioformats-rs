@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::common::error::Result;
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::ome_metadata::OmeMetadata;
+use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
 // ── ChannelSeparator ────────────────────────────────────────────────────────
@@ -369,6 +370,137 @@ impl FormatReader for DimensionSwapper {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(self.remap_plane(plane_index))
+    }
+
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
+    fn resolution(&self) -> usize { self.inner.resolution() }
+    fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
+}
+
+// ── MinMaxCalculator ────────────────────────────────────────────────────────
+
+/// Computes per-channel min/max pixel values, caching results after first read.
+///
+/// After reading a plane, the min/max values for each channel are available
+/// via `channel_min_max()`. Values are lazily computed — only planes that have
+/// been read contribute to the statistics.
+pub struct MinMaxCalculator {
+    inner: Box<dyn FormatReader>,
+    /// Per-channel (min, max) as f64. Updated on each `open_bytes` call.
+    channel_stats: Vec<(f64, f64)>,
+}
+
+impl MinMaxCalculator {
+    pub fn new(inner: Box<dyn FormatReader>) -> Self {
+        MinMaxCalculator { inner, channel_stats: Vec::new() }
+    }
+
+    /// Return per-channel (min, max) values computed so far.
+    pub fn channel_min_max(&self) -> &[(f64, f64)] {
+        &self.channel_stats
+    }
+
+    fn update_stats(&mut self, data: &[u8]) {
+        let meta = self.inner.metadata();
+        let nc = meta.size_c as usize;
+        let bps = meta.pixel_type.bytes_per_sample();
+        let pt = meta.pixel_type;
+        let interleaved = meta.is_interleaved && meta.is_rgb;
+
+        while self.channel_stats.len() < nc {
+            self.channel_stats.push((f64::INFINITY, f64::NEG_INFINITY));
+        }
+
+        if interleaved && bps > 0 {
+            let pixel_bytes = nc * bps;
+            let n_pixels = data.len() / pixel_bytes;
+            for i in 0..n_pixels {
+                for c in 0..nc {
+                    let offset = i * pixel_bytes + c * bps;
+                    let val = read_sample(data, offset, pt);
+                    let (ref mut mn, ref mut mx) = self.channel_stats[c];
+                    if val < *mn { *mn = val; }
+                    if val > *mx { *mx = val; }
+                }
+            }
+        } else if bps > 0 {
+            let n_samples = data.len() / bps;
+            let (ref mut mn, ref mut mx) = self.channel_stats[0];
+            for i in 0..n_samples {
+                let val = read_sample(data, i * bps, pt);
+                if val < *mn { *mn = val; }
+                if val > *mx { *mx = val; }
+            }
+        }
+    }
+}
+
+fn read_sample(data: &[u8], offset: usize, pt: PixelType) -> f64 {
+    match pt {
+        PixelType::Uint8 => data[offset] as f64,
+        PixelType::Int8 => data[offset] as i8 as f64,
+        PixelType::Uint16 => {
+            u16::from_le_bytes([data[offset], data[offset + 1]]) as f64
+        }
+        PixelType::Int16 => {
+            i16::from_le_bytes([data[offset], data[offset + 1]]) as f64
+        }
+        PixelType::Uint32 => {
+            u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as f64
+        }
+        PixelType::Int32 => {
+            i32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as f64
+        }
+        PixelType::Float32 => {
+            f32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as f64
+        }
+        PixelType::Float64 => {
+            f64::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3],
+                data[offset+4], data[offset+5], data[offset+6], data[offset+7]])
+        }
+        PixelType::Bit => if data[offset] != 0 { 1.0 } else { 0.0 },
+    }
+}
+
+impl FormatReader for MinMaxCalculator {
+    fn is_this_type_by_name(&self, path: &Path) -> bool { self.inner.is_this_type_by_name(path) }
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool { self.inner.is_this_type_by_bytes(header) }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.channel_stats.clear();
+        self.inner.set_id(path)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.channel_stats.clear();
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize { self.inner.series_count() }
+
+    fn set_series(&mut self, series: usize) -> Result<()> {
+        self.channel_stats.clear();
+        self.inner.set_series(series)
+    }
+
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let data = self.inner.open_bytes(plane_index)?;
+        self.update_stats(&data);
+        Ok(data)
+    }
+
+    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let data = self.inner.open_bytes_region(plane_index, x, y, w, h)?;
+        self.update_stats(&data);
+        Ok(data)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(plane_index)
     }
 
     fn resolution_count(&self) -> usize { self.inner.resolution_count() }

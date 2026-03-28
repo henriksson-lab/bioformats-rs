@@ -36,6 +36,7 @@ pub mod pixel;
 pub mod reader;
 pub mod registry;
 pub mod memoizer;
+pub mod stitcher;
 pub mod wrappers;
 pub mod writer_registry;
 
@@ -53,5 +54,6 @@ pub use crate::common::ome_metadata::{
 };
 pub use crate::common::writer::FormatWriter;
 pub use crate::tiff::{TiffWriter, WriteCompression};
-pub use crate::wrappers::{ChannelSeparator, ChannelMerger, DimensionSwapper};
+pub use crate::wrappers::{ChannelSeparator, ChannelMerger, DimensionSwapper, MinMaxCalculator};
 pub use crate::memoizer::Memoizer;
+pub use crate::stitcher::FileStitcher;

@@ -42,6 +42,7 @@ pub fn decompress(
         }
         Compression::Zstd => decompress_zstd(data)?,
         Compression::Jpeg2000 => decompress_jpeg2000(data)?,
+        Compression::JpegXR => decompress_jpegxr(data)?,
         Compression::Ccitt => {
             return Err(BioFormatsError::UnsupportedFormat(
                 "CCITT compression not yet supported".into(),

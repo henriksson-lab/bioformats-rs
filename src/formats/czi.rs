@@ -206,8 +206,8 @@ fn decompress_subblock(data: &[u8], compression: i32) -> Result<Vec<u8>> {
             let mut dec = Decoder::with_tiff_size_switch(BitOrder::Msb, 8);
             dec.decode(data).map_err(|e| BioFormatsError::Codec(e.to_string()))
         }
-        4 => { // JPEG-XR — not yet supported
-            Err(BioFormatsError::UnsupportedFormat("CZI: JPEG-XR compression not yet supported".into()))
+        4 => { // JPEG-XR
+            crate::common::codec::decompress_jpegxr(data)
         }
         5 | 6 => { // Zstd
             zstd::decode_all(data).map_err(BioFormatsError::Io)

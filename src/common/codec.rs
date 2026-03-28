@@ -108,6 +108,59 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Decompress JPEG-XR data.
+///
+/// Requires the `jpegxr` feature flag: `cargo build --features jpegxr`
+#[cfg(feature = "jpegxr")]
+pub fn decompress_jpegxr(data: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Cursor;
+    let cursor = Cursor::new(data);
+    let mut decoder = jpegxr::ImageDecode::with_reader(cursor)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR: {e}")))?;
+    let (width, height) = decoder.get_size()
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR size: {e}")))?;
+    let format = decoder.get_pixel_format()
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR format: {e}")))?;
+
+    // Determine bytes per pixel from the pixel format
+    let bpp: usize = match format {
+        jpegxr::PixelFormat::PixelFormat8bppGray => 1,
+        jpegxr::PixelFormat::PixelFormat16bppGray => 2,
+        jpegxr::PixelFormat::PixelFormat32bppGrayFloat => 4,
+        jpegxr::PixelFormat::PixelFormat24bppRGB => 3,
+        jpegxr::PixelFormat::PixelFormat24bppBGR => 3,
+        jpegxr::PixelFormat::PixelFormat32bppBGRA => 4,
+        jpegxr::PixelFormat::PixelFormat32bppRGBA => 4,
+        jpegxr::PixelFormat::PixelFormat48bppRGB => 6,
+        jpegxr::PixelFormat::PixelFormat64bppRGBA => 8,
+        _ => 3, // fallback: assume 3 bytes per pixel
+    };
+    let row_bytes = width as usize * bpp;
+    let stride = (row_bytes + 3) & !3; // 4-byte aligned
+    let mut buf = vec![0u8; stride * height as usize];
+    decoder.copy_all(&mut buf, stride)
+        .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR decode: {e}")))?;
+
+    // Remove stride padding if needed
+    if stride != row_bytes {
+        let mut out = Vec::with_capacity(row_bytes * height as usize);
+        for y in 0..height as usize {
+            out.extend_from_slice(&buf[y * stride..y * stride + row_bytes]);
+        }
+        Ok(out)
+    } else {
+        Ok(buf)
+    }
+}
+
+/// Placeholder for JPEG-XR when the feature is not enabled.
+#[cfg(not(feature = "jpegxr"))]
+pub fn decompress_jpegxr(_data: &[u8]) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "JPEG-XR support requires the 'jpegxr' feature: cargo build --features jpegxr".into()
+    ))
+}
+
 /// Apply TIFF horizontal differencing predictor (predictor = 2).
 /// Modifies `data` in-place. `samples_per_pixel` is the number of components.
 pub fn undo_horizontal_differencing(data: &mut [u8], samples_per_pixel: usize) {

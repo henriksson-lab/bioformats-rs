@@ -199,12 +199,94 @@ impl FormatReader for NdpiReader {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Leica SCN whole-slide
+// 2. Leica SCN whole-slide — enriched reader
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Leica SCN whole-slide image (TIFF-based, `.scn`).
-    pub struct LeicaScnReader;
-    extensions: ["scn"];
+/// Leica SCN whole-slide image (TIFF-based, `.scn`).
+///
+/// Parses Leica XML metadata from the ImageDescription tag to extract
+/// magnification, pixel size, and scanner info.
+pub struct LeicaScnReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl LeicaScnReader {
+    pub fn new() -> Self {
+        LeicaScnReader { inner: crate::tiff::TiffReader::new() }
+    }
+
+    fn enrich_metadata(&mut self) {
+        let desc = {
+            let series = self.inner.series_list();
+            if series.is_empty() { return; }
+            series[0].metadata.series_metadata.get("ImageDescription")
+                .and_then(|v| if let crate::common::metadata::MetadataValue::String(s) = v {
+                    Some(s.clone())
+                } else { None })
+        };
+        let Some(desc) = desc else { return };
+        // Leica SCN stores XML with <scn ...> root element
+        if !desc.contains("<scn") && !desc.contains("<SCN") { return; }
+
+        let mut vendor = std::collections::HashMap::new();
+
+        // Extract objectiveMagnification from XML
+        let lower = desc.to_ascii_lowercase();
+        if let Some(pos) = lower.find("objectivemagnification") {
+            // Look for the value in nearby attribute or element text
+            let rest = &desc[pos..];
+            if let Some(eq) = rest.find('=') {
+                let val_start = &rest[eq + 1..];
+                let val = val_start.trim_start_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
+                let end = val.find(|c: char| c == '"' || c == '\'' || c == '<' || c == '/' || c.is_whitespace())
+                    .unwrap_or(val.len());
+                if let Ok(mag) = val[..end].parse::<f64>() {
+                    vendor.insert("leica.objective_magnification".to_string(),
+                        crate::common::metadata::MetadataValue::Float(mag));
+                }
+            }
+        }
+
+        let series = self.inner.series_list_mut();
+        if let Some(s) = series.first_mut() {
+            for (k, v) in vendor {
+                s.metadata.series_metadata.insert(k, v);
+            }
+        }
+    }
+}
+
+impl Default for LeicaScnReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for LeicaScnReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("scn"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)?;
+        self.enrich_metadata();
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,12 +344,90 @@ tiff_wrapper! {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Olympus Fluoview FV300 (`.tif`)
+// 9. Olympus Fluoview FV300 (`.tif`) — enriched reader
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Olympus Fluoview FV300 TIFF (`.tif`).
-    pub struct FluoviewTiffReader;
-    extensions: ["tif"];
+/// Olympus Fluoview FV300 TIFF (`.tif`).
+///
+/// Enriches metadata from the ImageDescription tag which may contain
+/// Fluoview-specific key=value pairs like `[Acquisition Parameters]`.
+pub struct FluoviewTiffReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl FluoviewTiffReader {
+    pub fn new() -> Self {
+        FluoviewTiffReader { inner: crate::tiff::TiffReader::new() }
+    }
+
+    fn enrich_metadata(&mut self) {
+        let desc = {
+            let series = self.inner.series_list();
+            if series.is_empty() { return; }
+            series[0].metadata.series_metadata.get("ImageDescription")
+                .and_then(|v| if let crate::common::metadata::MetadataValue::String(s) = v {
+                    Some(s.clone())
+                } else { None })
+        };
+        let Some(desc) = desc else { return };
+        if !desc.contains("[Acquisition Parameters]") && !desc.contains("FluoView") { return; }
+
+        let mut vendor = std::collections::HashMap::new();
+        // Parse INI-style key=value pairs
+        for line in desc.lines() {
+            let line = line.trim();
+            if let Some((key, val)) = line.split_once('=') {
+                let key = key.trim();
+                let val = val.trim();
+                if !key.is_empty() && !key.starts_with('[') {
+                    vendor.insert(
+                        format!("fluoview.{}", key),
+                        crate::common::metadata::MetadataValue::String(val.to_string()),
+                    );
+                }
+            }
+        }
+
+        let series = self.inner.series_list_mut();
+        if let Some(s) = series.first_mut() {
+            for (k, v) in vendor {
+                s.metadata.series_metadata.insert(k, v);
+            }
+        }
+    }
+}
+
+impl Default for FluoviewTiffReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for FluoviewTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("tif"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)?;
+        self.enrich_metadata();
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------

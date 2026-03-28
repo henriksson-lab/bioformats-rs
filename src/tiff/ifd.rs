@@ -44,6 +44,7 @@ pub enum Compression {
     DeflateOld,
     Zstd,
     Jpeg2000,
+    JpegXR,
     Unknown(u16),
 }
 
@@ -56,6 +57,7 @@ impl From<u16> for Compression {
             6 => Compression::Jpeg,
             7 => Compression::JpegNew,
             8 => Compression::Deflate,
+            22610 => Compression::JpegXR,
             32773 => Compression::PackBits,
             32946 => Compression::DeflateOld,
             34712 => Compression::Jpeg2000,
