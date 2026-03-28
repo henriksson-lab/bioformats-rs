@@ -1,5 +1,5 @@
 /// The primitive data type of each sample in a pixel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PixelType {
     Int8,
     Uint8,

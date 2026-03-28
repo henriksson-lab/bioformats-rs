@@ -12,6 +12,9 @@ pub struct ImageReader {
     inner: Box<dyn FormatReader>,
 }
 
+/// Returns all registered format readers. Used internally by `ImageReader` and `Memoizer`.
+pub fn all_readers_pub() -> Vec<Box<dyn FormatReader>> { all_readers() }
+
 fn all_readers() -> Vec<Box<dyn FormatReader>> {
     vec![
         // Dedicated readers first (most precise magic bytes)

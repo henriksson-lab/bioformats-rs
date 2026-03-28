@@ -25,6 +25,8 @@ cfb          = "0.10"
 byteorder    = "1"
 image        = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "gif", "tga", "webp", "pnm", "hdr", "exr", "dds", "ff"] }
 jpeg2k       = { version = "0.10", default-features = false, features = ["openjp2"] }
+serde         = { version = "1", features = ["derive"] }
+bincode       = "1"
 
 [[bench]]
 name = "read_ome_tiff"
