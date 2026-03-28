@@ -91,6 +91,9 @@ impl FormatReader for BioRadReader {
             resolution_count: 1,
             series_metadata: meta_map,
             lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.npic = npic;
         self.bytes_per_pixel = bpp;

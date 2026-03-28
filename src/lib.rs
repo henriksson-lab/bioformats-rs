@@ -41,7 +41,7 @@ pub mod wrappers;
 pub mod writer_registry;
 
 pub use error::{BioFormatsError, Result};
-pub use metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
+pub use metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue, MetadataLevel, MetadataOptions, ModuloAnnotation};
 pub use pixel::PixelType;
 pub use reader::FormatReader;
 pub use registry::ImageReader;

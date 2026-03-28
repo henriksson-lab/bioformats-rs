@@ -98,6 +98,9 @@ impl FormatReader for Ecat7Reader {
             is_little_endian: false, // ECAT7 is big-endian
             resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.data_offset = 1024;
         self.path = Some(path.to_path_buf());
@@ -248,6 +251,9 @@ impl FormatReader for InveonReader {
             is_rgb: false, is_interleaved: false, is_indexed: false,
             is_little_endian: true, resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.hdr_path = Some(hdr_path);
         self.img_path = Some(img_path);
@@ -411,6 +417,9 @@ impl FormatReader for FdfReader {
             is_rgb: false, is_interleaved: false, is_indexed: false,
             is_little_endian: true, resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.data_offset = data_offset;
         self.path = Some(path.to_path_buf());

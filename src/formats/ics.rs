@@ -190,6 +190,9 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         resolution_count: 1,
         series_metadata,
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     })
 }
 

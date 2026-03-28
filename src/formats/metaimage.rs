@@ -215,6 +215,9 @@ impl FormatReader for MetaImageReader {
             resolution_count: 1,
             series_metadata,
             lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.header = Some(hdr);
         self.path = Some(path.to_path_buf());

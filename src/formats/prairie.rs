@@ -103,6 +103,9 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         resolution_count: 1,
         series_metadata: HashMap::new(),
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     };
 
     Ok((meta, tiff_files))
@@ -268,6 +271,9 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         resolution_count: 1,
         series_metadata: HashMap::new(),
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     };
 
     Ok((meta, tiff_files))

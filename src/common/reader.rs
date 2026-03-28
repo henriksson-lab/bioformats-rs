@@ -1,6 +1,6 @@
 use std::path::Path;
 use crate::error::Result;
-use crate::metadata::ImageMetadata;
+use crate::common::metadata::{ImageMetadata, MetadataOptions};
 use super::ome_metadata::OmeMetadata;
 
 /// Core trait that every format reader must implement.
@@ -19,6 +19,12 @@ pub trait FormatReader: Send + Sync {
     fn resolution_count(&self) -> usize { 1 }
     fn set_resolution(&mut self, _level: usize) -> Result<()> { Ok(()) }
     fn resolution(&self) -> usize { 0 }
+
+    /// Set metadata parsing options. Must be called before `set_id`.
+    /// Default: parse all metadata.
+    fn set_metadata_options(&mut self, _options: MetadataOptions) {
+        // Default: ignore — readers that support levels can override
+    }
     /// Return structured OME metadata.
     ///
     /// Equivalent to Java Bio-Formats `reader.setMetadataStore(service.createOMEXMLMetadata())`.

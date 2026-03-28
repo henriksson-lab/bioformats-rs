@@ -134,6 +134,9 @@ impl FormatReader for AviReader {
             is_rgb, is_interleaved: is_rgb, is_indexed: false,
             is_little_endian: true, resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.frame_offsets = frame_offsets;
         self.bytes_per_pixel = bpp as usize;

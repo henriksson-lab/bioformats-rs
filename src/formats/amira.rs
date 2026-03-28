@@ -115,6 +115,9 @@ impl FormatReader for AmiraReader {
             is_rgb: false, is_interleaved: false, is_indexed: false,
             is_little_endian: le, resolution_count: 1,
             series_metadata: HashMap::new(), lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.data_offset = data_offset;
         self.path = Some(path.to_path_buf());
@@ -256,6 +259,9 @@ impl FormatReader for SpiderReader {
                 m
             },
             lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.data_offset = data_offset;
         self.path = Some(path.to_path_buf());

@@ -89,6 +89,9 @@ fn parse_visitech(path: &Path) -> Result<ImageMetadata> {
         resolution_count: 1,
         series_metadata: HashMap::new(),
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     })
 }
 

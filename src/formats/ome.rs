@@ -205,6 +205,9 @@ impl FormatReader for OmeXmlReader {
             is_little_endian: little_endian,
             resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.planes = planes;
         self.path = Some(path.to_path_buf());

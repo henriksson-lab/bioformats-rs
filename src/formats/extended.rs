@@ -35,6 +35,9 @@ fn placeholder_meta() -> ImageMetadata {
         resolution_count: 1,
         series_metadata: HashMap::new(),
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     }
 }
 
@@ -56,6 +59,9 @@ fn placeholder_meta_u16(w: u32, h: u32) -> ImageMetadata {
         resolution_count: 1,
         series_metadata: HashMap::new(),
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     }
 }
 
@@ -650,6 +656,9 @@ impl FormatReader for CellomicsReader {
             resolution_count: 1,
             series_metadata: HashMap::new(),
             lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         Ok(())
     }

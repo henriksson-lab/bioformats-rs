@@ -161,6 +161,9 @@ impl FormatReader for SdtReader {
             is_rgb: false, is_interleaved: false, is_indexed: false,
             is_little_endian: true, resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.data_offset = data_offset;
         self.n_time = adc_re;

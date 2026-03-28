@@ -136,6 +136,9 @@ fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
         resolution_count: n_resolutions as u32,
         series_metadata: meta_map,
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     };
 
     Ok((meta, n_resolutions, bytes_per_sample))

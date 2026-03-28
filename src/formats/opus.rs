@@ -75,6 +75,9 @@ impl FormatReader for BrukerOpusReader {
             is_rgb: false, is_interleaved: false, is_indexed: false,
             is_little_endian: true, resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.data_offset = 512;
         self.path = Some(path.to_path_buf());
@@ -168,6 +171,9 @@ impl FormatReader for IssFlimReader {
             is_rgb: false, is_interleaved: false, is_indexed: false,
             is_little_endian: true, resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.data_offset = 256;
         self.path = Some(path.to_path_buf());

@@ -311,6 +311,9 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
             .map(|(k, v)| (k.clone(), MetadataValue::String(v.clone())))
             .collect(),
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     };
 
     if !a.transfer_syntax.is_empty() {
@@ -468,4 +471,178 @@ impl FormatReader for DicomReader {
         }
         Some(ome)
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DICOM Writer — Secondary Capture
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use std::io::{BufWriter, Write};
+
+/// DICOM Secondary Capture writer.
+///
+/// Produces valid DICOM files with Explicit VR Little Endian transfer syntax.
+/// Generates minimal UIDs for patient/study/series/instance.
+pub struct DicomWriter {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    planes: Vec<Vec<u8>>,
+}
+
+impl DicomWriter {
+    pub fn new() -> Self {
+        DicomWriter { path: None, meta: None, planes: Vec::new() }
+    }
+}
+
+impl Default for DicomWriter {
+    fn default() -> Self { Self::new() }
+}
+
+/// Write an Explicit VR LE data element.
+fn write_elem(w: &mut impl Write, group: u16, elem: u16, vr: &[u8; 2], data: &[u8]) -> std::io::Result<()> {
+    w.write_all(&group.to_le_bytes())?;
+    w.write_all(&elem.to_le_bytes())?;
+    w.write_all(vr)?;
+    if vr_has_long_length(vr) {
+        w.write_all(&[0u8; 2])?; // reserved
+        w.write_all(&(data.len() as u32).to_le_bytes())?;
+    } else {
+        w.write_all(&(data.len() as u16).to_le_bytes())?;
+    }
+    w.write_all(data)?;
+    // Pad odd-length values
+    if data.len() % 2 != 0 {
+        w.write_all(&[0x20])?; // space padding for strings
+    }
+    Ok(())
+}
+
+fn write_elem_str(w: &mut impl Write, group: u16, elem: u16, vr: &[u8; 2], s: &str) -> std::io::Result<()> {
+    let mut data = s.as_bytes().to_vec();
+    if data.len() % 2 != 0 { data.push(0x20); } // pad to even
+    write_elem(w, group, elem, vr, &data)
+}
+
+fn write_elem_u16(w: &mut impl Write, group: u16, elem: u16, v: u16) -> std::io::Result<()> {
+    write_elem(w, group, elem, b"US", &v.to_le_bytes())
+}
+
+/// Generate a simple UID based on timestamp + counter.
+fn generate_uid(suffix: u32) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis()).unwrap_or(0);
+    // Root: 1.2.826.0.1 (dummy OID prefix for generated UIDs)
+    format!("1.2.826.0.1.{ts}.{suffix}")
+}
+
+impl crate::common::writer::FormatWriter for DicomWriter {
+    fn is_this_type(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("dcm") | Some("dicom"))
+    }
+
+    fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        self.meta = Some(meta.clone());
+        self.planes.clear();
+        Ok(())
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+        self.planes.push(data.to_vec());
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
+
+        let f = File::create(&path).map_err(BioFormatsError::Io)?;
+        let mut w = BufWriter::new(f);
+
+        // 128-byte preamble + DICM magic
+        w.write_all(&[0u8; 128]).map_err(BioFormatsError::Io)?;
+        w.write_all(b"DICM").map_err(BioFormatsError::Io)?;
+
+        let uid_study = generate_uid(1);
+        let uid_series = generate_uid(2);
+        let uid_instance = generate_uid(3);
+        let uid_sop_class = "1.2.840.10008.5.1.4.1.1.7"; // Secondary Capture
+
+        // File Meta Information (group 0002)
+        // First write meta elements to a buffer to compute group length
+        let mut meta_buf: Vec<u8> = Vec::new();
+        write_elem(&mut meta_buf, 0x0002, 0x0001, b"OB", &[0x00, 0x01]).unwrap(); // FileMetaVersion
+        write_elem_str(&mut meta_buf, 0x0002, 0x0002, b"UI", uid_sop_class).unwrap(); // MediaStorageSOPClassUID
+        write_elem_str(&mut meta_buf, 0x0002, 0x0003, b"UI", &uid_instance).unwrap(); // MediaStorageSOPInstanceUID
+        write_elem_str(&mut meta_buf, 0x0002, 0x0010, b"UI", "1.2.840.10008.1.2.1").unwrap(); // TransferSyntax = Explicit VR LE
+        write_elem_str(&mut meta_buf, 0x0002, 0x0012, b"UI", "1.2.826.0.1").unwrap(); // ImplementationClassUID
+
+        // Group length element
+        write_elem(&mut w, 0x0002, 0x0000, b"UL", &(meta_buf.len() as u32).to_le_bytes()).map_err(BioFormatsError::Io)?;
+        w.write_all(&meta_buf).map_err(BioFormatsError::Io)?;
+
+        // Patient module
+        write_elem_str(&mut w, 0x0010, 0x0010, b"PN", "Anonymous").map_err(BioFormatsError::Io)?;
+        write_elem_str(&mut w, 0x0010, 0x0020, b"LO", "0").map_err(BioFormatsError::Io)?;
+
+        // Study module
+        write_elem_str(&mut w, 0x0020, 0x000D, b"UI", &uid_study).map_err(BioFormatsError::Io)?;
+        write_elem_str(&mut w, 0x0020, 0x0010, b"SH", "1").map_err(BioFormatsError::Io)?;
+
+        // Series module
+        write_elem_str(&mut w, 0x0020, 0x000E, b"UI", &uid_series).map_err(BioFormatsError::Io)?;
+        write_elem_str(&mut w, 0x0020, 0x0011, b"IS", "1").map_err(BioFormatsError::Io)?;
+
+        // SOP Common
+        write_elem_str(&mut w, 0x0008, 0x0016, b"UI", uid_sop_class).map_err(BioFormatsError::Io)?;
+        write_elem_str(&mut w, 0x0008, 0x0018, b"UI", &uid_instance).map_err(BioFormatsError::Io)?;
+
+        // Image module
+        let bps = meta.bits_per_pixel as u16;
+        let spp = if meta.is_rgb { meta.size_c as u16 } else { 1 };
+        let photometric = if meta.is_rgb { "RGB" } else { "MONOCHROME2" };
+        let pixel_rep: u16 = match meta.pixel_type {
+            PixelType::Int8 | PixelType::Int16 | PixelType::Int32 => 1,
+            _ => 0,
+        };
+
+        write_elem_u16(&mut w, 0x0028, 0x0002, spp).map_err(BioFormatsError::Io)?; // SamplesPerPixel
+        write_elem_str(&mut w, 0x0028, 0x0004, b"CS", photometric).map_err(BioFormatsError::Io)?;
+        write_elem_u16(&mut w, 0x0028, 0x0010, meta.size_y as u16).map_err(BioFormatsError::Io)?; // Rows
+        write_elem_u16(&mut w, 0x0028, 0x0011, meta.size_x as u16).map_err(BioFormatsError::Io)?; // Columns
+        write_elem_u16(&mut w, 0x0028, 0x0100, bps).map_err(BioFormatsError::Io)?; // BitsAllocated
+        write_elem_u16(&mut w, 0x0028, 0x0101, bps).map_err(BioFormatsError::Io)?; // BitsStored
+        write_elem_u16(&mut w, 0x0028, 0x0102, bps - 1).map_err(BioFormatsError::Io)?; // HighBit
+        write_elem_u16(&mut w, 0x0028, 0x0103, pixel_rep).map_err(BioFormatsError::Io)?; // PixelRepresentation
+
+        if self.planes.len() > 1 {
+            write_elem_str(&mut w, 0x0028, 0x0008, b"IS", &self.planes.len().to_string())
+                .map_err(BioFormatsError::Io)?; // NumberOfFrames
+        }
+
+        // Pixel Data (7FE0,0010)
+        let total_bytes: usize = self.planes.iter().map(|p| p.len()).sum();
+        w.write_all(&0x7FE0u16.to_le_bytes()).map_err(BioFormatsError::Io)?;
+        w.write_all(&0x0010u16.to_le_bytes()).map_err(BioFormatsError::Io)?;
+        w.write_all(b"OW").map_err(BioFormatsError::Io)?;
+        w.write_all(&[0u8; 2]).map_err(BioFormatsError::Io)?; // reserved
+        w.write_all(&(total_bytes as u32).to_le_bytes()).map_err(BioFormatsError::Io)?;
+        for plane in &self.planes {
+            w.write_all(plane).map_err(BioFormatsError::Io)?;
+        }
+
+        w.flush().map_err(BioFormatsError::Io)?;
+        self.planes.clear();
+        Ok(())
+    }
+
+    fn can_do_stacks(&self) -> bool { true }
 }

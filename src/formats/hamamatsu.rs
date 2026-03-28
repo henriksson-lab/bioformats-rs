@@ -86,6 +86,9 @@ impl FormatReader for DcimgReader {
             is_rgb: false, is_interleaved: false, is_indexed: false,
             is_little_endian: true, resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.data_offset = if header_size > 64 { header_size } else { 64 };
         self.bytes_per_row = bpr;

@@ -107,6 +107,9 @@ impl FormatReader for ImagicReader {
             is_rgb: false, is_interleaved: false, is_indexed: false,
             is_little_endian: true, resolution_count: 1,
             series_metadata: meta_map, lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         });
         self.bytes_per_sample = pixel_type.bytes_per_sample();
         self.hed_path = Some(hed_path);

@@ -259,6 +259,9 @@ impl TiffReader {
                     resolution_count: 1,
                     series_metadata: HashMap::new(),
                     lookup_table,
+                    modulo_z: None,
+                    modulo_c: None,
+                    modulo_t: None,
                 };
 
                 // Store image description in metadata

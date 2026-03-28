@@ -115,6 +115,9 @@ fn parse_cellh5(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
             resolution_count: 1,
             series_metadata: meta_map,
             lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
         };
         return Ok((meta, channel_paths));
     }
@@ -174,6 +177,9 @@ fn parse_cellh5(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
         resolution_count: 1,
         series_metadata: meta_map,
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     };
 
     Ok((meta, channel_paths))

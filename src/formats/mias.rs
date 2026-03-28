@@ -35,6 +35,9 @@ fn simple_meta(w: u32, h: u32, z: u32, pt: PixelType) -> ImageMetadata {
         resolution_count: 1,
         series_metadata: HashMap::new(),
         lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     }
 }
 
