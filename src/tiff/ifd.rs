@@ -161,6 +161,21 @@ impl IfdValue {
         }
     }
 
+    pub fn as_vec_f32(&self) -> Option<&[f32]> {
+        match self {
+            IfdValue::Float(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            IfdValue::Float(v) if !v.is_empty() => Some(v[0] as f64),
+            IfdValue::Double(v) if !v.is_empty() => Some(v[0]),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             IfdValue::Ascii(s) => Some(s.as_str()),

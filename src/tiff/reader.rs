@@ -77,6 +77,26 @@ impl TiffReader {
         }
     }
 
+    /// Access the series list for vendor-specific wrappers.
+    pub fn series_list(&self) -> &[TiffSeries] {
+        &self.series
+    }
+
+    /// Access the series list mutably (for enriching metadata in wrappers).
+    pub fn series_list_mut(&mut self) -> &mut [TiffSeries] {
+        &mut self.series
+    }
+
+    /// Access a raw IFD by index (for extracting vendor-specific tags).
+    pub fn ifd(&self, index: usize) -> Option<&Ifd> {
+        self.file.as_ref().and_then(|f| f.ifds.get(index))
+    }
+
+    /// Get the embedded OME-XML string, if any.
+    pub fn ome_xml_str(&self) -> Option<&str> {
+        self.ome_xml.as_deref()
+    }
+
     /// Extract `IfdInfo` from a raw `Ifd`.
     fn ifd_info(ifd: &Ifd, _little_endian: bool) -> Result<IfdInfo> {
         let width = ifd.image_width().ok_or_else(|| {

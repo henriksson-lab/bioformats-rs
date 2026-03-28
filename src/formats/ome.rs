@@ -263,3 +263,137 @@ impl FormatReader for OmeXmlReader {
         self.raw_xml.as_deref().map(crate::common::ome_metadata::OmeMetadata::from_ome_xml)
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OME-XML Writer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Base64 encoder (standard alphabet, with padding).
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// OME-XML standalone writer (`.ome` files with Base64-encoded pixel data).
+pub struct OmeXmlWriter {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    planes: Vec<Vec<u8>>,
+    ome: Option<crate::common::ome_metadata::OmeMetadata>,
+}
+
+impl OmeXmlWriter {
+    pub fn new() -> Self {
+        OmeXmlWriter { path: None, meta: None, planes: Vec::new(), ome: None }
+    }
+
+    /// Set optional OME metadata (channels, physical sizes, etc.).
+    pub fn set_ome_metadata(&mut self, ome: crate::common::ome_metadata::OmeMetadata) {
+        self.ome = Some(ome);
+    }
+}
+
+impl Default for OmeXmlWriter {
+    fn default() -> Self { Self::new() }
+}
+
+impl crate::common::writer::FormatWriter for OmeXmlWriter {
+    fn is_this_type(&self, path: &Path) -> bool {
+        let name = path.file_name().and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase())
+            .unwrap_or_default();
+        name.ends_with(".ome") || name.ends_with(".ome.xml")
+    }
+
+    fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        self.meta = Some(meta.clone());
+        self.planes.clear();
+        Ok(())
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+        self.planes.push(data.to_vec());
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
+
+        let ome = self.ome.take().unwrap_or_else(|| {
+            crate::common::ome_metadata::OmeMetadata::from_image_metadata(&meta)
+        });
+
+        // Build OME-XML with inline BinData
+        use std::fmt::Write;
+        let mut xml = String::new();
+        let _ = write!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+        let _ = write!(xml, r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">"#);
+
+        let pt_str = match meta.pixel_type {
+            PixelType::Bit => "bit", PixelType::Int8 => "int8", PixelType::Uint8 => "uint8",
+            PixelType::Int16 => "int16", PixelType::Uint16 => "uint16",
+            PixelType::Int32 => "int32", PixelType::Uint32 => "uint32",
+            PixelType::Float32 => "float", PixelType::Float64 => "double",
+        };
+        let dim_order = format!("{:?}", meta.dimension_order);
+
+        // Image element
+        let img_name = ome.images.first()
+            .and_then(|i| i.name.as_deref())
+            .unwrap_or("Image 0");
+        let _ = write!(xml, r#"<Image ID="Image:0" Name="{img_name}">"#);
+        let _ = write!(xml,
+            r#"<Pixels ID="Pixels:0" DimensionOrder="{dim_order}" Type="{pt_str}" SizeX="{}" SizeY="{}" SizeZ="{}" SizeC="{}" SizeT="{}" BigEndian="{}">"#,
+            meta.size_x, meta.size_y, meta.size_z, meta.size_c, meta.size_t,
+            !meta.is_little_endian);
+
+        // Channels
+        if let Some(img) = ome.images.first() {
+            for (ci, ch) in img.channels.iter().enumerate() {
+                let _ = write!(xml, r#"<Channel ID="Channel:0:{ci}" SamplesPerPixel="{}"/>"#,
+                    ch.samples_per_pixel);
+            }
+        }
+
+        // BinData for each plane
+        for plane in &self.planes {
+            let b64 = base64_encode(plane);
+            let _ = write!(xml,
+                r#"<BinData xmlns="http://www.openmicroscopy.org/Schemas/BinaryFile/2016-06" Length="{}" BigEndian="{}">{}</BinData>"#,
+                plane.len(), !meta.is_little_endian, b64);
+        }
+
+        xml.push_str("</Pixels></Image></OME>");
+
+        fs::write(&path, xml.as_bytes()).map_err(BioFormatsError::Io)?;
+        self.planes.clear();
+        Ok(())
+    }
+
+    fn can_do_stacks(&self) -> bool { true }
+}

@@ -383,7 +383,39 @@ impl OmeMetadata {
             });
         }
 
-        OmeMetadata { images, ..Default::default() }
+        // Parse <Instrument> elements (top-level, siblings of <Image>)
+        let instruments = parse_instruments(xml);
+
+        // Resolve InstrumentRef/ObjectiveRef for each image
+        for (i, img_start) in all_tag_positions(xml, "Image").into_iter().enumerate() {
+            if i >= images.len() { break; }
+            let img_end = lower_xml[img_start..].find("</image>")
+                .map(|p| p + img_start + "</image>".len())
+                .unwrap_or(xml.len());
+            let img_xml = &xml[img_start..img_end];
+
+            // <InstrumentRef ID="Instrument:0"/>
+            if let Some(pos) = all_tag_positions(img_xml, "InstrumentRef").into_iter().next() {
+                let tag = start_tag_at(img_xml, pos);
+                if let Some(ref_id) = xml_attr(tag, "ID") {
+                    images[i].instrument_ref = instruments.iter().position(|inst| {
+                        inst.id.as_deref() == Some(ref_id.as_str())
+                    });
+                }
+            }
+            // <ObjectiveSettings ID="Objective:0:0"/>
+            if let Some(pos) = all_tag_positions(img_xml, "ObjectiveSettings").into_iter().next() {
+                let tag = start_tag_at(img_xml, pos);
+                if let Some(ref_id) = xml_attr(tag, "ID") {
+                    if let Some(inst_idx) = images[i].instrument_ref {
+                        images[i].objective_ref = instruments[inst_idx].objectives.iter()
+                            .position(|obj| obj.id.as_deref() == Some(ref_id.as_str()));
+                    }
+                }
+            }
+        }
+
+        OmeMetadata { images, instruments, ..Default::default() }
     }
 
     /// Parse Zeiss CZI metadata XML into structured metadata.
@@ -427,6 +459,101 @@ fn parse_planes(pixels_xml: &str) -> Vec<OmePlane> {
             position_x:   xml_attr(tag, "PositionX").and_then(|s| s.parse().ok()),
             position_y:   xml_attr(tag, "PositionY").and_then(|s| s.parse().ok()),
             position_z:   xml_attr(tag, "PositionZ").and_then(|s| s.parse().ok()),
+        }
+    }).collect()
+}
+
+// ─── Instrument parsing ──────────────────────────────────────────────────────
+
+fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
+    let lower = xml.to_ascii_lowercase();
+    all_tag_positions(xml, "Instrument").into_iter().map(|pos| {
+        let tag = start_tag_at(xml, pos);
+        let id = xml_attr(tag, "ID");
+
+        let inst_end = lower[pos..].find("</instrument>")
+            .map(|e| pos + e + "</instrument>".len())
+            .unwrap_or(xml.len());
+        let inst_xml = &xml[pos..inst_end];
+
+        // Microscope
+        let microscope_model = all_tag_positions(inst_xml, "Microscope")
+            .into_iter().next()
+            .and_then(|p| xml_attr(start_tag_at(inst_xml, p), "Model"));
+        let microscope_manufacturer = all_tag_positions(inst_xml, "Microscope")
+            .into_iter().next()
+            .and_then(|p| xml_attr(start_tag_at(inst_xml, p), "Manufacturer"));
+
+        // Objectives
+        let objectives = all_tag_positions(inst_xml, "Objective").into_iter().map(|p| {
+            let t = start_tag_at(inst_xml, p);
+            OmeObjective {
+                id: xml_attr(t, "ID"),
+                model: xml_attr(t, "Model"),
+                manufacturer: xml_attr(t, "Manufacturer"),
+                nominal_magnification: xml_attr(t, "NominalMagnification").and_then(|s| s.parse().ok()),
+                calibrated_magnification: xml_attr(t, "CalibratedMagnification").and_then(|s| s.parse().ok()),
+                lens_na: xml_attr(t, "LensNA").and_then(|s| s.parse().ok()),
+                immersion: xml_attr(t, "Immersion"),
+                correction: xml_attr(t, "Correction"),
+                working_distance: xml_attr(t, "WorkingDistance").and_then(|s| s.parse().ok()),
+            }
+        }).collect();
+
+        // Detectors
+        let detectors = all_tag_positions(inst_xml, "Detector").into_iter().map(|p| {
+            let t = start_tag_at(inst_xml, p);
+            OmeDetector {
+                id: xml_attr(t, "ID"),
+                model: xml_attr(t, "Model"),
+                manufacturer: xml_attr(t, "Manufacturer"),
+                detector_type: xml_attr(t, "Type"),
+                gain: xml_attr(t, "Gain").and_then(|s| s.parse().ok()),
+                offset: xml_attr(t, "Offset").and_then(|s| s.parse().ok()),
+            }
+        }).collect();
+
+        // Light sources (Laser, Arc, Filament, LightEmittingDiode, GenericExcitationSource)
+        let mut light_sources = Vec::new();
+        for ls_tag in &["Laser", "Arc", "Filament", "LightEmittingDiode", "GenericExcitationSource"] {
+            for p in all_tag_positions(inst_xml, ls_tag) {
+                let t = start_tag_at(inst_xml, p);
+                light_sources.push(OmeLightSource {
+                    id: xml_attr(t, "ID"),
+                    model: xml_attr(t, "Model"),
+                    manufacturer: xml_attr(t, "Manufacturer"),
+                    light_source_type: Some(ls_tag.to_string()),
+                    power: xml_attr(t, "Power").and_then(|s| s.parse().ok()),
+                });
+            }
+        }
+
+        // Filters
+        let filters = all_tag_positions(inst_xml, "Filter").into_iter().map(|p| {
+            let t = start_tag_at(inst_xml, p);
+            OmeFilter {
+                id: xml_attr(t, "ID"),
+                model: xml_attr(t, "Model"),
+                manufacturer: xml_attr(t, "Manufacturer"),
+                filter_type: xml_attr(t, "Type"),
+                cut_in: xml_attr(t, "CutIn").and_then(|s| s.parse().ok()),
+                cut_out: xml_attr(t, "CutOut").and_then(|s| s.parse().ok()),
+            }
+        }).collect();
+
+        // Dichroics
+        let dichroics = all_tag_positions(inst_xml, "Dichroic").into_iter().map(|p| {
+            let t = start_tag_at(inst_xml, p);
+            OmeDichroic {
+                id: xml_attr(t, "ID"),
+                model: xml_attr(t, "Model"),
+                manufacturer: xml_attr(t, "Manufacturer"),
+            }
+        }).collect();
+
+        OmeInstrument {
+            id, microscope_model, microscope_manufacturer,
+            objectives, detectors, light_sources, filters, dichroics,
         }
     }).collect()
 }
