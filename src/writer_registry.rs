@@ -23,6 +23,7 @@ fn writer_for(path: &Path) -> Option<Box<dyn FormatWriter>> {
         Box::new(crate::formats::metaimage::MetaImageWriter::new()),
         Box::new(crate::formats::ome::OmeXmlWriter::new()),
         Box::new(crate::formats::dicom::DicomWriter::new()),
+        Box::new(crate::formats::avi::AviWriter::new()),
     ];
     writers.into_iter().find(|w| w.is_this_type(path))
 }
