@@ -225,6 +225,24 @@ pub struct OmeScreen {
     pub protocol_description: Option<String>,
 }
 
+/// Experiment metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OmeExperiment {
+    pub id: Option<String>,
+    pub experiment_type: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Dataset metadata — a named collection of images.
+#[derive(Debug, Clone, Default)]
+pub struct OmeDataset {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// Indices into OmeMetadata::images that belong to this dataset.
+    pub image_refs: Vec<usize>,
+}
+
 /// Per-plane metadata.
 #[derive(Debug, Clone, Default)]
 pub struct OmePlane {

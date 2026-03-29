@@ -53,6 +53,7 @@ pub use crate::common::ome_metadata::{
     OmeFilter, OmeDichroic, OmeLightPath,
     OmeROI, OmeShape, OmeExperimenter, OmeAnnotation,
     OmePlate, OmeWell, OmeWellSample, OmeScreen,
+    OmeExperiment, OmeDataset,
 };
 pub use crate::common::writer::FormatWriter;
 pub use crate::tiff::{TiffWriter, WriteCompression};

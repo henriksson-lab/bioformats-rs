@@ -530,13 +530,78 @@ impl FormatReader for L2dReader {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Canon RAW (CR2 / CRW / CR3) — extension-only placeholder
+// 4. Canon RAW (CR2 / CRW / CR3) — TIFF wrapper
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Canon RAW format placeholder reader (`.cr2`, `.crw`, `.cr3`).
-    pub struct CanonRawReader;
-    extensions: ["cr2", "crw", "cr3"];
-    magic_bytes: false;
+/// Canon RAW format reader (`.cr2`, `.crw`, `.cr3`).
+///
+/// CR2 files are valid TIFF files; this reader delegates to `TiffReader`.
+pub struct CanonRawReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl CanonRawReader {
+    pub fn new() -> Self {
+        CanonRawReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for CanonRawReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for CanonRawReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("cr2") | Some("crw") | Some("cr3"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -550,13 +615,70 @@ placeholder_reader! {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Santa Barbara Instrument Group — extension-only placeholder
+// 6. Santa Barbara Instrument Group — FITS wrapper
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Santa Barbara Instrument Group format placeholder reader (`.fts`).
-    pub struct SbigReader;
-    extensions: ["fts"];
-    magic_bytes: false;
+/// Santa Barbara Instrument Group reader (`.fts`).
+///
+/// SBIG .fts files use the FITS format; this reader delegates to `FitsReader`.
+pub struct SbigReader {
+    inner: crate::formats::fits::FitsReader,
+}
+
+impl SbigReader {
+    pub fn new() -> Self {
+        SbigReader { inner: crate::formats::fits::FitsReader::new() }
+    }
+}
+
+impl Default for SbigReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for SbigReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("fts"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
 }
 
 // ---------------------------------------------------------------------------

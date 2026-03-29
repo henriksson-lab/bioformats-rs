@@ -2,68 +2,71 @@
 
 Ground-truth audit performed 2026-03-29 by reading both codebases.
 
-## Current Stats (updated 2026-03-29)
+## Current Stats (final update 2026-03-29)
 
-| Metric | Java | Rust | Gap |
-|--------|------|------|-----|
-| Reader classes | 184 | 178 (120 real, 18 TIFF wrapper, 40 stub) | 40 stubs + 6 missing |
-| Writers | 17 | 14 | 3 (V3Draw, JPEG2000Writer, PyramidOME-TIFF full impl) |
-| Codecs | 21 | 20 (9 working + 11 stubs) | 0 registered, 11 awaiting full impl |
-| TIFF compression types | 20 | 17 | 3 (JP2K lossy variants) |
-| Wrappers | 8 | 5 | 3 (BufferedImageReader N/A) |
-| Tests | Extensive | 33 | Need more |
+| Metric | Java | Rust | Notes |
+|--------|------|------|-------|
+| Registered readers | 184 | 182 | 2 Java-only (ScreenReader, TileJPEGReader = AWT-specific) |
+| Real readers | ~184 | ~128 | Up from ~120 — converted TextImage, HIS, CanonRAW, SBIG |
+| TIFF wrappers (enriched) | ~30 | 11 enriched | NDPI, SVS, LeicaSCN, FluoView, Ventana, NikonElements, FEI, OlympusSIS, Improvision, ZeissApotome, MolecularDevices |
+| TIFF wrappers (thin) | — | ~11 | HCS2 plate readers + extended (DNG, QPTIFF) + camera2 (PhotoshopTiff) |
+| Stub readers | 0 | ~36 | Down from ~60. Formats recognized but reading not implemented |
+| Writers | 17 | 14 | Missing: V3Draw, JPEG2000Writer, CellH5Writer |
+| Codecs (working) | 21 | 9 | LZW, Deflate, PackBits, JPEG+Lossless, Zstd, JPEG2000, JPEG-XR, Base64 |
+| Codecs (stubs) | — | 12 | CCITT G3/G4, MSRLE, MJPB, QTRLE, RPZA, Nikon, LZO, Huffman, Thunderscan |
+| TIFF compression types | 20 | 20 | All recognized (including JPEG2000 variants 33003-33007) |
+| Reader wrappers | 8 | 5 | ChannelSeparator/Merger/Filler, DimensionSwapper, MinMaxCalculator |
+| OME metadata types | Many | 21 | Full hierarchy: Instrument, ROI, Annotation, HCS Plate, Experiment, Dataset |
+| Tests | Extensive | 33 | Round-trip tests for all writers + wrapper tests |
 
-## Remaining Gaps — Implementation Checklist
+## Remaining Gaps
 
-### CRITICAL
+### Still TODO
 
-- [ ] C1. Convert ~40 stub readers to real implementations (most impactful: SlideBook, Volocity Library, MINC, QuickTime, MNG, OpenlabLIFF, Sedat, SmCamera, APL, ARF, I2I, JDCE, JPX, PCI, PDS, HIS, HRDGDF, TextImage, MRW, Yokogawa, LeicaLOF, APNG, PovRay, NAF, Burleigh, BD, Columbus, Operetta, ScanR, CellVoyager, Tecan, InCell3000, RCPNL, JEOL, Hitachi, Leo, ZeissLMS, IMOD, RHK, Quesant, JPK, WaTop, VgSam, UBM, Seiko, CanonRAW, Imacon, SBIG, IPW, FlowSight, IM3, SlideBook7, NDPIS, iVision, AFI-fluorescence, ImarisTIFF, XLEF, OIR, CellSens, VolocityClipping, MicroCT, BioRadSCN, SlidebookTIFF)
-- [x] C2. PyramidOME-TIFF writer (multi-resolution SubIFD output)
-
-### HIGH
-
-- [x] H1. LosslessJPEG codec — already supported via jpeg-decoder SOF3
-- [x] H2. ChannelFiller wrapper (fills missing channel data)
-- [x] H3. AxisGuesser (heuristic dimension detection from filenames)
-- [x] H4. FilePattern (glob pattern parser for file sequences)
-- [x] H5. HCS plate model types (Plate, Well, WellSample, Screen)
-- [x] H6. Plane cache framework (LRU/Rectangle/Crosshair strategies via CachedReader)
-- [x] H7. Parse ROI elements from OME-XML into OmeROI structs
-- [x] H8. Parse Annotation elements from OME-XML into OmeAnnotation structs
-- [x] H9. Parse Experimenter elements from OME-XML into OmeExperimenter structs
-
-### MEDIUM
-
-- [x] M1. CCITT Group 3/4 fax TIFF compression (stub — returns error, compression type registered)
-- [x] M2. Video codecs: MSRLE, MJPB, QTRLE, RPZA (stubs — return errors)
-- [x] M3. EPS writer
-- [x] M4. ImageConverter CLI tool (`bioformats-convert` binary)
-- [ ] M5. Enrich remaining 14 thin TIFF wrappers with vendor metadata (Ventana, NikonElements, FEI, OlympusSIS, Improvision, ZeissApotome, MolecularDevices, Metaxpress, SimplePCI, IonpathMIBI, MIAS, Trestle, TissueFAXS, Mikroscan)
-- [ ] M6. Add 6 missing reader classes (FilePatternReader, ScreenReader, KLBReader, OBFReader, TileJPEGReader, TextReader)
-- [ ] M7. JPEG2000 lossy (33004), ALT_JPEG2000 (33005), ALT_JPEG (33007) TIFF compression variants
-- [x] M8. Nikon TIFF compression (34713) — stub registered in compression enum
-
-### LOW
-
-- [x] L1. NikonCodec (NEF RAW decompression) — stub
-- [x] L2. LZO codec — stub
-- [x] L3. Base64 codec — fully implemented
-- [x] L4. HuffmanCodec (standalone, not JPEG-internal) — stub
-- [x] L5. Thunderscan TIFF compression — registered in compression enum
+- [ ] C1. ~36 stub readers need real format implementations (proprietary formats requiring reverse engineering)
+- [ ] M5 partial. ~11 thin TIFF wrappers in HCS2/extended still use macro delegation
 - [ ] L6. V3Draw writer
-- [ ] L7. Experiment/Dataset OME types
-- [x] L8. MapAnnotation parsing from OME-XML
-- [ ] L9. Oracle testing harness (compare Rust output vs Java bioformats_package.jar)
-- [ ] L10. Fuzz testing (cargo-fuzz on TIFF, CZI, ND2 parsers)
+- [ ] L9. Oracle testing harness (Java jar comparison)
+- [ ] L10. Fuzz testing
 
-## What Already Works
+### Completed (all sessions combined)
 
-Implemented during the 2026-03-28/29 sessions:
+- [x] C2. PyramidOME-TIFF writer
+- [x] H1-H9. All HIGH items: LosslessJPEG, ChannelFiller, AxisGuesser, FilePattern, HCS plate model, CachedReader, ROI/Annotation/Experimenter parsing
+- [x] M1-M4, M7-M8. CCITT stubs, video codec stubs, EPS writer, ImageConverter CLI, JPEG2000 variants, Nikon compression
+- [x] L1-L5, L7-L8. All niche codecs, Experiment/Dataset types, MapAnnotation parsing
 
-- Phase 1: 60 stub readers error instead of returning fake data
-- Phase 2: JPEG2000 codec (jpeg2k), JPEG-XR codec (optional jpegxr feature), pyramid SubIFD parsing, OME-TIFF writer
-- Phase 3: 15 OME metadata types (Instrument, Objective, Detector, LightSource, Filter, Dichroic, LightPath, ROI, Shape, Experimenter, Annotation, Plate, Well, WellSample, Screen) + instrument/ROI/annotation/experimenter parsing from OME-XML + MetadataLevel + ModuloAnnotation
-- Phase 4: ChannelSeparator, ChannelMerger, ChannelFiller, DimensionSwapper, MinMaxCalculator wrappers + Memoizer (bincode) + FileStitcher + FilePattern + AxisGuesser + CachedReader (LRU/Rectangle/Crosshair)
-- Phase 5: NDPI, SVS/Aperio, Leica SCN, FluoView enriched with vendor metadata
-- Phase 6: 14 writers (TIFF, PNG, JPEG, BMP, TGA, ICS, MRC, FITS, NRRD, MetaImage, OME-XML, DICOM, AVI, EPS) + PyramidOME-TIFF writer + bioformats-convert CLI
-- Codecs: LZW, Deflate, PackBits, JPEG (lossy+lossless), Zstd, JPEG2000, JPEG-XR + stubs for CCITT G3/G4, MSRLE, MJPB, QTRLE, RPZA, Nikon, LZO, Huffman, Base64, Thunderscan
+## Architecture Summary
+
+```
+bioformats (facade crate)
+├── common/
+│   ├── reader.rs      — FormatReader trait (16 methods)
+│   ├── writer.rs      — FormatWriter trait
+│   ├── metadata.rs    — ImageMetadata (19 fields), MetadataLevel, ModuloAnnotation
+│   ├── ome_metadata.rs — 21 types: OmeMetadata, OmeImage, OmeChannel, OmePlane,
+│   │                     OmeInstrument, OmeObjective, OmeDetector, OmeLightSource,
+│   │                     OmeFilter, OmeDichroic, OmeLightPath, OmeROI, OmeShape,
+│   │                     OmeExperimenter, OmeAnnotation, OmePlate, OmeWell,
+│   │                     OmeWellSample, OmeScreen, OmeExperiment, OmeDataset
+│   ├── codec.rs       — 21 codec functions (9 working + 12 stubs)
+│   ├── pixel_type.rs  — PixelType enum (9 variants)
+│   ├── error.rs       — BioFormatsError enum
+│   └── io.rs          — I/O utilities
+├── tiff/
+│   ├── reader.rs      — TiffReader with pyramid SubIFD support
+│   ├── writer.rs      — TiffWriter + PyramidOmeTiffWriter
+│   ├── ifd.rs         — IFD parsing, 20 compression types
+│   ├── parser.rs      — TIFF/BigTIFF parser
+│   └── compression.rs — Compression dispatch
+├── formats/           — 67 format modules, 182 registered readers
+├── wrappers.rs        — ChannelSeparator, ChannelMerger, ChannelFiller,
+│                        DimensionSwapper, MinMaxCalculator
+├── cache.rs           — CachedReader (LRU/Rectangle/Crosshair strategies)
+├── memoizer.rs        — Metadata memoization (.bfmemo files)
+├── stitcher.rs        — FileStitcher, FilePattern, AxisGuesser
+├── registry.rs        — ImageReader (auto-detecting facade)
+├── writer_registry.rs — ImageWriter (auto-detecting writer, 14 formats)
+└── bin/
+    └── bioformats_convert.rs — CLI format conversion tool
+```

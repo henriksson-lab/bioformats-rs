@@ -67,7 +67,11 @@ impl From<u16> for Compression {
             32773 => Compression::PackBits,
             32809 => Compression::Thunderscan,
             32946 => Compression::DeflateOld,
-            34712 => Compression::Jpeg2000,
+            33003 => Compression::Jpeg2000,  // JPEG2000
+            33004 => Compression::Jpeg2000,  // JPEG2000 lossy
+            33005 => Compression::Jpeg2000,  // ALT_JPEG2000
+            33007 => Compression::Jpeg2000,  // ALT_JPEG (JPEG2000 variant)
+            34712 => Compression::Jpeg2000,  // Olympus JPEG2000
             34713 => Compression::Nikon,
             50000 => Compression::Zstd,
             other => Compression::Unknown(other),

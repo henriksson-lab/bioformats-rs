@@ -230,6 +230,10 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::misc4::HisReader::new()),
         Box::new(crate::formats::misc4::HrdgdfReader::new()),
         Box::new(crate::formats::misc4::TextImageReader::new()),
+        Box::new(crate::formats::misc4::FilePatternReaderStub::new()),
+        Box::new(crate::formats::misc4::KlbReader::new()),
+        Box::new(crate::formats::misc4::ObfReader::new()),
+        Box::new(crate::formats::misc::TextReader::new()),
     ]
 }
 

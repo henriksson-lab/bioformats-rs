@@ -338,3 +338,13 @@ placeholder_reader! {
     extensions: ["smc"];
     magic_bytes: false;
 }
+
+// ---------------------------------------------------------------------------
+// 10. Plain text image
+// ---------------------------------------------------------------------------
+placeholder_reader! {
+    /// Plain text image reader placeholder (`.txt`).
+    pub struct TextReader;
+    extensions: ["txt"];
+    magic_bytes: false;
+}
