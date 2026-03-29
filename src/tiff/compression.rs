@@ -48,6 +48,20 @@ pub fn decompress(
                 "CCITT compression not yet supported".into(),
             ))
         }
+        Compression::Group3Fax => {
+            return decompress_ccitt_group3(data, 0, 0);
+        }
+        Compression::Group4Fax => {
+            return decompress_ccitt_group4(data, 0, 0);
+        }
+        Compression::Thunderscan => {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Thunderscan compression not yet supported".into(),
+            ))
+        }
+        Compression::Nikon => {
+            return decompress_nikon(data, 0, 0, 0);
+        }
         Compression::Unknown(c) => {
             return Err(BioFormatsError::UnsupportedFormat(format!(
                 "Unknown TIFF compression code {}",

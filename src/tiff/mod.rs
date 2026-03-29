@@ -5,4 +5,4 @@ mod compression;
 mod writer;
 
 pub use reader::TiffReader;
-pub use writer::{TiffWriter, WriteCompression};
+pub use writer::{TiffWriter, PyramidOmeTiffWriter, WriteCompression};

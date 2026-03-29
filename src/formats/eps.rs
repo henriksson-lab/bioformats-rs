@@ -153,3 +153,128 @@ impl FormatReader for EpsReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
+
+// ---------------------------------------------------------------------------
+// EPS Writer
+// ---------------------------------------------------------------------------
+
+use std::io::Write;
+use crate::common::writer::FormatWriter;
+
+pub struct EpsWriter {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    planes: Vec<Vec<u8>>,
+}
+
+impl EpsWriter {
+    pub fn new() -> Self {
+        EpsWriter { path: None, meta: None, planes: Vec::new() }
+    }
+}
+
+impl Default for EpsWriter {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatWriter for EpsWriter {
+    fn is_this_type(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("eps") | Some("epsi") | Some("ps"))
+    }
+
+    fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        self.meta = Some(meta.clone());
+        self.planes.clear();
+        Ok(())
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.meta.as_ref().ok_or_else(|| {
+            BioFormatsError::Format("set_metadata must be called before set_id".into())
+        })?;
+        self.path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        if self.planes.is_empty() {
+            return Err(BioFormatsError::Format("no planes written".into()));
+        }
+
+        let width = meta.size_x;
+        let height = meta.size_y;
+        let spp = meta.size_c as usize;
+
+        // Only 8-bit grayscale or RGB supported
+        if meta.pixel_type != PixelType::Uint8 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "EPS writer supports only 8-bit pixel data".into(),
+            ));
+        }
+        if spp != 1 && spp != 3 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "EPS writer supports grayscale (1) or RGB (3), got spp={}", spp
+            )));
+        }
+
+        let row_bytes = width as usize * spp;
+        let bits = 8u32;
+        let data = &self.planes[0];
+
+        let mut f = std::fs::File::create(path).map_err(BioFormatsError::Io)?;
+
+        writeln!(f, "%!PS-Adobe-3.0 EPSF-3.0").map_err(BioFormatsError::Io)?;
+        writeln!(f, "%%BoundingBox: 0 0 {} {}", width, height).map_err(BioFormatsError::Io)?;
+        writeln!(f, "%%EndComments").map_err(BioFormatsError::Io)?;
+
+        if spp == 1 {
+            // Grayscale: use `image` operator
+            writeln!(
+                f,
+                "{} {} {} [{} 0 0 -{} 0 {}]",
+                width, height, bits, width, height, height
+            )
+            .map_err(BioFormatsError::Io)?;
+            writeln!(f, "{{currentfile {} string readhexstring pop}}", row_bytes * 2)
+                .map_err(BioFormatsError::Io)?;
+            writeln!(f, "image").map_err(BioFormatsError::Io)?;
+        } else {
+            // RGB: use `colorimage` operator
+            writeln!(
+                f,
+                "{} {} {} [{} 0 0 -{} 0 {}]",
+                width, height, bits, width, height, height
+            )
+            .map_err(BioFormatsError::Io)?;
+            writeln!(f, "{{currentfile {} string readhexstring pop}}", row_bytes * 2)
+                .map_err(BioFormatsError::Io)?;
+            writeln!(f, "false 3 colorimage").map_err(BioFormatsError::Io)?;
+        }
+
+        // Hex-encode pixel data
+        for byte in data.iter() {
+            write!(f, "{:02X}", byte).map_err(BioFormatsError::Io)?;
+        }
+        writeln!(f).map_err(BioFormatsError::Io)?;
+
+        writeln!(f, "showpage").map_err(BioFormatsError::Io)?;
+        writeln!(f, "%%EOF").map_err(BioFormatsError::Io)?;
+
+        self.path = None;
+        self.meta = None;
+        self.planes.clear();
+        Ok(())
+    }
+
+    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+        self.planes.push(data.to_vec());
+        Ok(())
+    }
+
+    fn can_do_stacks(&self) -> bool { false }
+}

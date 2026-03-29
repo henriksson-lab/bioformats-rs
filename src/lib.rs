@@ -27,6 +27,7 @@
 //! ImageWriter::save(Path::new("out.tif"), &meta, &[data]).unwrap();
 //! ```
 
+pub mod cache;
 pub mod common;
 pub mod tiff;
 pub mod error;
@@ -51,9 +52,11 @@ pub use crate::common::ome_metadata::{
     OmeInstrument, OmeObjective, OmeDetector, OmeLightSource,
     OmeFilter, OmeDichroic, OmeLightPath,
     OmeROI, OmeShape, OmeExperimenter, OmeAnnotation,
+    OmePlate, OmeWell, OmeWellSample, OmeScreen,
 };
 pub use crate::common::writer::FormatWriter;
 pub use crate::tiff::{TiffWriter, WriteCompression};
-pub use crate::wrappers::{ChannelSeparator, ChannelMerger, DimensionSwapper, MinMaxCalculator};
+pub use crate::wrappers::{ChannelSeparator, ChannelMerger, ChannelFiller, DimensionSwapper, MinMaxCalculator};
+pub use crate::cache::{CachedReader, CacheStrategy};
 pub use crate::memoizer::Memoizer;
-pub use crate::stitcher::FileStitcher;
+pub use crate::stitcher::{FileStitcher, FilePattern, FilePatternBlock, AxisGuesser, AxisType};

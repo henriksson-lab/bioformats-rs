@@ -63,7 +63,7 @@ pub fn decompress_packbits(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decompress JPEG data.
+/// Decompress JPEG data (both lossy and lossless/SOF3 variants).
 pub fn decompress_jpeg(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = jpeg_decoder::Decoder::new(data);
     decoder.decode().map_err(|e| BioFormatsError::Codec(e.to_string()))
@@ -158,6 +158,101 @@ pub fn decompress_jpegxr(data: &[u8]) -> Result<Vec<u8>> {
 pub fn decompress_jpegxr(_data: &[u8]) -> Result<Vec<u8>> {
     Err(BioFormatsError::UnsupportedFormat(
         "JPEG-XR support requires the 'jpegxr' feature: cargo build --features jpegxr".into()
+    ))
+}
+
+// ---- CCITT fax compression stubs ----
+
+/// Decompress CCITT Group 3 (T.4) 1-bit fax compression.
+pub fn decompress_ccitt_group3(_data: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "CCITT Group 3 fax decompression not yet implemented".into(),
+    ))
+}
+
+/// Decompress CCITT Group 4 (T.6) 1-bit fax compression.
+pub fn decompress_ccitt_group4(_data: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "CCITT Group 4 fax decompression not yet implemented".into(),
+    ))
+}
+
+// ---- Video codec stubs ----
+
+/// Microsoft Run-Length Encoding for AVI.
+pub fn decompress_msrle(_data: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "MSRLE video codec not yet implemented".into(),
+    ))
+}
+
+/// Motion JPEG-B codec.
+pub fn decompress_mjpb(_data: &[u8]) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "Motion JPEG-B codec not yet implemented".into(),
+    ))
+}
+
+/// QuickTime RLE codec.
+pub fn decompress_qtrle(_data: &[u8], _width: u32, _height: u32, _bpp: u32) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "QuickTime RLE codec not yet implemented".into(),
+    ))
+}
+
+/// Apple RPZA video codec.
+pub fn decompress_rpza(_data: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "Apple RPZA video codec not yet implemented".into(),
+    ))
+}
+
+// ---- Niche codec stubs ----
+
+/// Nikon NEF lossy compression.
+pub fn decompress_nikon(_data: &[u8], _width: u32, _height: u32, _bpp: u32) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "Nikon NEF codec not yet implemented".into(),
+    ))
+}
+
+/// LZO decompression.
+pub fn decompress_lzo(_data: &[u8]) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "LZO codec not yet implemented".into(),
+    ))
+}
+
+/// Standard Base64 decoding.
+pub fn codec_base64_decode(data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in data {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\n' | b'\r' | b' ' => continue,
+            _ => continue,
+        };
+        buf = (buf << 6) | val as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Standalone Huffman codec.
+pub fn decompress_huffman(_data: &[u8]) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(
+        "Standalone Huffman codec not yet implemented".into(),
     ))
 }
 

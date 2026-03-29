@@ -14,6 +14,8 @@ pub struct OmeMetadata {
     pub experimenters: Vec<OmeExperimenter>,
     pub rois: Vec<OmeROI>,
     pub annotations: Vec<OmeAnnotation>,
+    pub plates: Vec<OmePlate>,
+    pub screens: Vec<OmeScreen>,
 }
 
 /// Metadata for one image series.
@@ -183,6 +185,44 @@ pub enum OmeAnnotation {
     CommentAnnotation { id: Option<String>, namespace: Option<String>, value: String },
     /// Tag annotation.
     TagAnnotation { id: Option<String>, namespace: Option<String>, value: String },
+}
+
+/// High-Content Screening plate metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OmePlate {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub rows: u32,
+    pub columns: u32,
+    pub wells: Vec<OmeWell>,
+}
+
+/// A well in an HCS plate.
+#[derive(Debug, Clone, Default)]
+pub struct OmeWell {
+    pub id: Option<String>,
+    pub row: u32,
+    pub column: u32,
+    pub well_samples: Vec<OmeWellSample>,
+}
+
+/// A field/site within a well.
+#[derive(Debug, Clone, Default)]
+pub struct OmeWellSample {
+    pub id: Option<String>,
+    pub index: u32,
+    /// Reference to an Image (index into OmeMetadata::images).
+    pub image_ref: Option<usize>,
+    pub position_x: Option<f64>,
+    pub position_y: Option<f64>,
+}
+
+/// Screen metadata (collection of plates).
+#[derive(Debug, Clone, Default)]
+pub struct OmeScreen {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub protocol_description: Option<String>,
 }
 
 /// Per-plane metadata.
@@ -528,7 +568,32 @@ impl OmeMetadata {
             }
         }
 
-        OmeMetadata { images, instruments, ..Default::default() }
+        // Parse <Experimenter> elements (top-level, exclude ExperimenterGroup/ExperimenterRef)
+        let experimenters = all_tag_positions(xml, "Experimenter").into_iter()
+            .filter(|&pos| {
+                let tag = start_tag_at(xml, pos);
+                let tag_lower = tag.to_ascii_lowercase();
+                !tag_lower.starts_with("<experimentergroup") && !tag_lower.starts_with("<experimenterref")
+            })
+            .map(|pos| {
+                let tag = start_tag_at(xml, pos);
+                OmeExperimenter {
+                    id: xml_attr(tag, "ID"),
+                    first_name: xml_attr(tag, "FirstName"),
+                    last_name: xml_attr(tag, "LastName"),
+                    email: xml_attr(tag, "Email"),
+                    institution: xml_attr(tag, "Institution"),
+                }
+            })
+            .collect();
+
+        // Parse <ROI> elements
+        let rois = parse_rois(xml);
+
+        // Parse <StructuredAnnotations> block
+        let annotations = parse_structured_annotations(xml);
+
+        OmeMetadata { images, instruments, experimenters, rois, annotations, ..Default::default() }
     }
 
     /// Parse Zeiss CZI metadata XML into structured metadata.
@@ -684,6 +749,193 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
             objectives, detectors, light_sources, filters, dichroics,
         }
     }).collect()
+}
+
+// ─── ROI parsing ────────────────────────────────────────────────────────────
+
+fn parse_rois(xml: &str) -> Vec<OmeROI> {
+    let lower = xml.to_ascii_lowercase();
+    all_tag_positions(xml, "ROI").into_iter().map(|pos| {
+        let tag = start_tag_at(xml, pos);
+        let id = xml_attr(tag, "ID");
+        let name = xml_attr(tag, "Name");
+
+        let roi_end = lower[pos..].find("</roi>")
+            .map(|e| pos + e + "</roi>".len())
+            .unwrap_or(xml.len());
+        let roi_xml = &xml[pos..roi_end];
+
+        // Find the <Union> block containing shapes
+        let union_xml = {
+            let roi_lower = roi_xml.to_ascii_lowercase();
+            let u_start = roi_lower.find("<union");
+            let u_end = roi_lower.find("</union>");
+            match (u_start, u_end) {
+                (Some(s), Some(e)) => &roi_xml[s..e + "</union>".len()],
+                _ => roi_xml,
+            }
+        };
+
+        let mut shapes = Vec::new();
+
+        // Rectangle
+        for sp in all_tag_positions(union_xml, "Rectangle") {
+            let t = start_tag_at(union_xml, sp);
+            let x = xml_attr(t, "X").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let y = xml_attr(t, "Y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let w = xml_attr(t, "Width").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let h = xml_attr(t, "Height").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let the_z = xml_attr(t, "TheZ").and_then(|s| s.parse().ok());
+            let the_t = xml_attr(t, "TheT").and_then(|s| s.parse().ok());
+            let the_c = xml_attr(t, "TheC").and_then(|s| s.parse().ok());
+            shapes.push(OmeShape::Rectangle { x, y, width: w, height: h, the_z, the_t, the_c });
+        }
+
+        // Ellipse
+        for sp in all_tag_positions(union_xml, "Ellipse") {
+            let t = start_tag_at(union_xml, sp);
+            let x = xml_attr(t, "X").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let y = xml_attr(t, "Y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let rx = xml_attr(t, "RadiusX").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let ry = xml_attr(t, "RadiusY").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let the_z = xml_attr(t, "TheZ").and_then(|s| s.parse().ok());
+            let the_t = xml_attr(t, "TheT").and_then(|s| s.parse().ok());
+            let the_c = xml_attr(t, "TheC").and_then(|s| s.parse().ok());
+            shapes.push(OmeShape::Ellipse { x, y, radius_x: rx, radius_y: ry, the_z, the_t, the_c });
+        }
+
+        // Point
+        for sp in all_tag_positions(union_xml, "Point") {
+            let t = start_tag_at(union_xml, sp);
+            let x = xml_attr(t, "X").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let y = xml_attr(t, "Y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let the_z = xml_attr(t, "TheZ").and_then(|s| s.parse().ok());
+            let the_t = xml_attr(t, "TheT").and_then(|s| s.parse().ok());
+            let the_c = xml_attr(t, "TheC").and_then(|s| s.parse().ok());
+            shapes.push(OmeShape::Point { x, y, the_z, the_t, the_c });
+        }
+
+        // Line
+        for sp in all_tag_positions(union_xml, "Line") {
+            let t = start_tag_at(union_xml, sp);
+            let x1 = xml_attr(t, "X1").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let y1 = xml_attr(t, "Y1").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let x2 = xml_attr(t, "X2").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let y2 = xml_attr(t, "Y2").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let the_z = xml_attr(t, "TheZ").and_then(|s| s.parse().ok());
+            let the_t = xml_attr(t, "TheT").and_then(|s| s.parse().ok());
+            let the_c = xml_attr(t, "TheC").and_then(|s| s.parse().ok());
+            shapes.push(OmeShape::Line { x1, y1, x2, y2, the_z, the_t, the_c });
+        }
+
+        // Polygon
+        for sp in all_tag_positions(union_xml, "Polygon") {
+            let t = start_tag_at(union_xml, sp);
+            let points = parse_points_attr(xml_attr(t, "Points").as_deref().unwrap_or(""));
+            let the_z = xml_attr(t, "TheZ").and_then(|s| s.parse().ok());
+            let the_t = xml_attr(t, "TheT").and_then(|s| s.parse().ok());
+            let the_c = xml_attr(t, "TheC").and_then(|s| s.parse().ok());
+            shapes.push(OmeShape::Polygon { points, the_z, the_t, the_c });
+        }
+
+        // Polyline
+        for sp in all_tag_positions(union_xml, "Polyline") {
+            let t = start_tag_at(union_xml, sp);
+            let points = parse_points_attr(xml_attr(t, "Points").as_deref().unwrap_or(""));
+            let the_z = xml_attr(t, "TheZ").and_then(|s| s.parse().ok());
+            let the_t = xml_attr(t, "TheT").and_then(|s| s.parse().ok());
+            let the_c = xml_attr(t, "TheC").and_then(|s| s.parse().ok());
+            shapes.push(OmeShape::Polyline { points, the_z, the_t, the_c });
+        }
+
+        OmeROI { id, name, shapes }
+    }).collect()
+}
+
+/// Parse an OME Points attribute string like "1.5,2.5 3.0,4.0 5.5,6.5".
+fn parse_points_attr(s: &str) -> Vec<(f64, f64)> {
+    s.split_whitespace()
+        .filter_map(|pair| {
+            let mut parts = pair.split(',');
+            let x = parts.next()?.parse::<f64>().ok()?;
+            let y = parts.next()?.parse::<f64>().ok()?;
+            Some((x, y))
+        })
+        .collect()
+}
+
+// ─── Annotation parsing ─────────────────────────────────────────────────────
+
+fn parse_structured_annotations(xml: &str) -> Vec<OmeAnnotation> {
+    let lower = xml.to_ascii_lowercase();
+    let sa_start = match lower.find("<structuredannotations") {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let sa_end = lower[sa_start..].find("</structuredannotations>")
+        .map(|e| sa_start + e + "</structuredannotations>".len())
+        .unwrap_or(xml.len());
+    let sa_xml = &xml[sa_start..sa_end];
+
+    let mut annotations = Vec::new();
+
+    // MapAnnotation
+    for pos in all_tag_positions(sa_xml, "MapAnnotation") {
+        let tag = start_tag_at(sa_xml, pos);
+        let id = xml_attr(tag, "ID");
+        let namespace = xml_attr(tag, "Namespace");
+        let ann_lower = sa_xml[pos..].to_ascii_lowercase();
+        let ann_end = ann_lower.find("</mapannotation>")
+            .map(|e| pos + e + "</mapannotation>".len())
+            .unwrap_or(sa_xml.len());
+        let ann_xml = &sa_xml[pos..ann_end];
+
+        // Parse <Value><M K="key">value</M></Value> entries
+        let mut values = Vec::new();
+        for m_pos in all_tag_positions(ann_xml, "M") {
+            let m_tag = start_tag_at(ann_xml, m_pos);
+            if let Some(key) = xml_attr(m_tag, "K") {
+                // Get inner text between > and </M>
+                let after_tag = m_pos + m_tag.len();
+                let m_lower = ann_xml[after_tag..].to_ascii_lowercase();
+                if let Some(close) = m_lower.find("</m>") {
+                    let val = ann_xml[after_tag..after_tag + close].trim().to_string();
+                    values.push((key, val));
+                }
+            }
+        }
+        annotations.push(OmeAnnotation::MapAnnotation { id, namespace, values });
+    }
+
+    // CommentAnnotation
+    for pos in all_tag_positions(sa_xml, "CommentAnnotation") {
+        let tag = start_tag_at(sa_xml, pos);
+        let id = xml_attr(tag, "ID");
+        let namespace = xml_attr(tag, "Namespace");
+        let ann_lower = sa_xml[pos..].to_ascii_lowercase();
+        let ann_end = ann_lower.find("</commentannotation>")
+            .map(|e| pos + e + "</commentannotation>".len())
+            .unwrap_or(sa_xml.len());
+        let ann_xml = &sa_xml[pos..ann_end];
+        let value = xml_inner_text(ann_xml, "Value").unwrap_or_default();
+        annotations.push(OmeAnnotation::CommentAnnotation { id, namespace, value });
+    }
+
+    // TagAnnotation
+    for pos in all_tag_positions(sa_xml, "TagAnnotation") {
+        let tag = start_tag_at(sa_xml, pos);
+        let id = xml_attr(tag, "ID");
+        let namespace = xml_attr(tag, "Namespace");
+        let ann_lower = sa_xml[pos..].to_ascii_lowercase();
+        let ann_end = ann_lower.find("</tagannotation>")
+            .map(|e| pos + e + "</tagannotation>".len())
+            .unwrap_or(sa_xml.len());
+        let ann_xml = &sa_xml[pos..ann_end];
+        let value = xml_inner_text(ann_xml, "Value").unwrap_or_default();
+        annotations.push(OmeAnnotation::TagAnnotation { id, namespace, value });
+    }
+
+    annotations
 }
 
 // ─── CZI XML helpers ──────────────────────────────────────────────────────────

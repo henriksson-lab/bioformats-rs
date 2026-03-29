@@ -1,7 +1,8 @@
 //! Reader wrappers that transform pixel data or metadata on the fly.
 //!
 //! Equivalent to Java Bio-Formats' `ReaderWrapper` hierarchy:
-//! `ChannelSeparator`, `ChannelMerger`, `DimensionSwapper`.
+//! `ChannelSeparator`, `ChannelMerger`, `ChannelFiller`, `DimensionSwapper`,
+//! `MinMaxCalculator`.
 
 use std::path::Path;
 use crate::common::error::Result;
@@ -503,6 +504,87 @@ impl FormatReader for MinMaxCalculator {
         self.inner.open_thumb_bytes(plane_index)
     }
 
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
+    fn resolution(&self) -> usize { self.inner.resolution() }
+    fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
+}
+
+// ── ChannelFiller ───────────────────────────────────────────────────────────
+
+/// Fills missing channel data when a format reports more channels than it
+/// actually provides pixel data for.
+///
+/// If an image claims `size_c = 3` but each plane only contains data for fewer
+/// channels, ChannelFiller pads the output with zeros for the missing channels.
+pub struct ChannelFiller {
+    inner: Box<dyn FormatReader>,
+    fill_to: Option<u32>,
+    adjusted_meta: Option<ImageMetadata>,
+}
+
+impl ChannelFiller {
+    pub fn new(inner: Box<dyn FormatReader>) -> Self {
+        ChannelFiller { inner, fill_to: None, adjusted_meta: None }
+    }
+
+    /// Force output to have exactly `n` interleaved channels, zero-padding extras.
+    pub fn with_channels(mut self, n: u32) -> Self {
+        self.fill_to = Some(n);
+        self
+    }
+
+    fn rebuild_meta(&mut self) {
+        if let Some(target_c) = self.fill_to {
+            let meta = self.inner.metadata();
+            if target_c != meta.size_c {
+                let mut adjusted = meta.clone();
+                adjusted.size_c = target_c;
+                adjusted.is_rgb = target_c >= 3;
+                self.adjusted_meta = Some(adjusted);
+                return;
+            }
+        }
+        self.adjusted_meta = None;
+    }
+
+    fn fill_data(&self, data: Vec<u8>, target_c: u32) -> Vec<u8> {
+        let meta = self.inner.metadata();
+        let actual_c = meta.size_c as usize;
+        let target = target_c as usize;
+        if actual_c >= target { return data; }
+        let bps = meta.pixel_type.bytes_per_sample();
+        if bps == 0 || !meta.is_interleaved { return data; }
+        let src_pixel = actual_c * bps;
+        let dst_pixel = target * bps;
+        let n_pixels = data.len() / src_pixel;
+        let mut out = vec![0u8; n_pixels * dst_pixel];
+        for i in 0..n_pixels {
+            out[i * dst_pixel..i * dst_pixel + src_pixel]
+                .copy_from_slice(&data[i * src_pixel..i * src_pixel + src_pixel]);
+        }
+        out
+    }
+}
+
+impl FormatReader for ChannelFiller {
+    fn is_this_type_by_name(&self, path: &Path) -> bool { self.inner.is_this_type_by_name(path) }
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool { self.inner.is_this_type_by_bytes(header) }
+    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path)?; self.rebuild_meta(); Ok(()) }
+    fn close(&mut self) -> Result<()> { self.adjusted_meta = None; self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s)?; self.rebuild_meta(); Ok(()) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.adjusted_meta.as_ref().unwrap_or_else(|| self.inner.metadata()) }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        let data = self.inner.open_bytes(p)?;
+        Ok(if let Some(c) = self.fill_to { self.fill_data(data, c) } else { data })
+    }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let data = self.inner.open_bytes_region(p, x, y, w, h)?;
+        Ok(if let Some(c) = self.fill_to { self.fill_data(data, c) } else { data })
+    }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
     fn resolution_count(&self) -> usize { self.inner.resolution_count() }
     fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
     fn resolution(&self) -> usize { self.inner.resolution() }

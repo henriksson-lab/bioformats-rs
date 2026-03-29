@@ -249,3 +249,230 @@ impl FormatReader for FileStitcher {
         reader.open_thumb_bytes(local_plane)
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FilePattern — parse and match file name patterns
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A parsed file pattern that can match and enumerate file sequences.
+///
+/// Equivalent to Java Bio-Formats' `FilePattern` class.
+///
+/// # Pattern Syntax
+/// Given a filename like `img_t003_c002.tif`, FilePattern detects numeric
+/// blocks and generates the pattern `img_t<000-NNN>_c<000-MMM>.tif`.
+#[derive(Debug, Clone)]
+pub struct FilePattern {
+    /// Directory containing the files.
+    pub dir: PathBuf,
+    /// Prefix before the first numeric block.
+    pub prefix: String,
+    /// Suffix after the last numeric block (including extension).
+    pub suffix: String,
+    /// Numeric blocks: (prefix_before_block, digit_width, min_value, max_value).
+    pub blocks: Vec<FilePatternBlock>,
+}
+
+/// One numeric block in a file pattern.
+#[derive(Debug, Clone)]
+pub struct FilePatternBlock {
+    /// Text between this block and the previous one (or start of name).
+    pub separator: String,
+    /// Number of digits (for zero-padding).
+    pub width: usize,
+    /// Range of values found.
+    pub min: u64,
+    pub max: u64,
+    /// All values found (sorted).
+    pub values: Vec<u64>,
+}
+
+impl FilePattern {
+    /// Parse a file pattern from a single exemplar file.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let filename = path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| BioFormatsError::Format("Invalid filename".into()))?;
+
+        // Find all numeric runs in the filename
+        let chars: Vec<char> = filename.chars().collect();
+        let mut runs: Vec<(usize, usize)> = Vec::new(); // (start, end) of each numeric run
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_ascii_digit() {
+                let start = i;
+                while i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+                runs.push((start, i));
+            } else {
+                i += 1;
+            }
+        }
+
+        if runs.is_empty() {
+            return Ok(FilePattern {
+                dir,
+                prefix: filename.to_string(),
+                suffix: String::new(),
+                blocks: Vec::new(),
+            });
+        }
+
+        // Build blocks
+        let mut blocks = Vec::new();
+        let mut last_end = 0;
+        for &(start, end) in &runs {
+            let separator: String = chars[last_end..start].iter().collect();
+            let width = end - start;
+            let val_str: String = chars[start..end].iter().collect();
+            let val: u64 = val_str.parse().unwrap_or(0);
+            blocks.push(FilePatternBlock {
+                separator,
+                width,
+                min: val,
+                max: val,
+                values: vec![val],
+            });
+            last_end = end;
+        }
+        let suffix: String = chars[last_end..].iter().collect();
+        let prefix = String::new(); // prefix is captured in first block's separator
+
+        // Scan directory to find all matching files and expand ranges
+        let mut pattern = FilePattern { dir: dir.clone(), prefix, suffix: suffix.clone(), blocks };
+        pattern.scan_directory()?;
+        Ok(pattern)
+    }
+
+    /// Scan the directory and expand block ranges based on found files.
+    fn scan_directory(&mut self) -> Result<()> {
+        let entries = std::fs::read_dir(&self.dir).map_err(BioFormatsError::Io)?;
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if !name_str.ends_with(&self.suffix) { continue; }
+
+            // Try to match each block
+            if let Some(values) = self.match_filename(&name_str) {
+                for (i, val) in values.into_iter().enumerate() {
+                    if i < self.blocks.len() {
+                        let block = &mut self.blocks[i];
+                        if val < block.min { block.min = val; }
+                        if val > block.max { block.max = val; }
+                        if !block.values.contains(&val) {
+                            block.values.push(val);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort values
+        for block in &mut self.blocks {
+            block.values.sort();
+        }
+        Ok(())
+    }
+
+    /// Try to extract numeric values from a filename that matches this pattern.
+    fn match_filename(&self, name: &str) -> Option<Vec<u64>> {
+        let mut pos = 0;
+        let mut values = Vec::new();
+        for block in &self.blocks {
+            // Match separator
+            if !name[pos..].starts_with(&block.separator) { return None; }
+            pos += block.separator.len();
+            // Extract digits
+            let digit_start = pos;
+            while pos < name.len() && name.as_bytes()[pos].is_ascii_digit() { pos += 1; }
+            if pos == digit_start { return None; }
+            let val: u64 = name[digit_start..pos].parse().ok()?;
+            values.push(val);
+        }
+        // Match suffix
+        if &name[pos..] != self.suffix { return None; }
+        Some(values)
+    }
+
+    /// Generate all filenames matching this pattern.
+    pub fn filenames(&self) -> Vec<PathBuf> {
+        if self.blocks.is_empty() {
+            return vec![self.dir.join(format!("{}{}", self.prefix, self.suffix))];
+        }
+        self.enumerate_blocks(0, String::new())
+    }
+
+    fn enumerate_blocks(&self, block_idx: usize, current: String) -> Vec<PathBuf> {
+        if block_idx >= self.blocks.len() {
+            let name = format!("{}{}", current, self.suffix);
+            return vec![self.dir.join(name)];
+        }
+        let block = &self.blocks[block_idx];
+        let mut results = Vec::new();
+        for &val in &block.values {
+            let next = format!("{}{}{:0>width$}", current, block.separator, val, width = block.width);
+            results.extend(self.enumerate_blocks(block_idx + 1, next));
+        }
+        results
+    }
+
+    /// Total number of files in this pattern.
+    pub fn file_count(&self) -> usize {
+        self.blocks.iter().map(|b| b.values.len()).product::<usize>().max(1)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AxisGuesser — heuristic dimension detection from filenames
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Axis type for a numeric block in a filename pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxisType {
+    Z,
+    Channel,
+    Time,
+    Series,
+    Unknown,
+}
+
+/// Heuristic axis guesser — infers which dimension each numeric block in a
+/// filename pattern represents.
+///
+/// Equivalent to Java Bio-Formats' `AxisGuesser`.
+pub struct AxisGuesser;
+
+impl AxisGuesser {
+    /// Guess axis types for each block in a FilePattern.
+    pub fn guess(pattern: &FilePattern) -> Vec<AxisType> {
+        pattern.blocks.iter().map(|block| {
+            Self::guess_from_separator(&block.separator)
+        }).collect()
+    }
+
+    /// Infer axis type from the text preceding a numeric block.
+    fn guess_from_separator(sep: &str) -> AxisType {
+        let lower = sep.to_ascii_lowercase();
+        // Check for common axis indicators
+        if lower.contains('z') || lower.contains("slice") || lower.contains("depth")
+            || lower.contains("sec") || lower.contains("plane") {
+            return AxisType::Z;
+        }
+        if lower.contains('c') && !lower.contains("tc")
+            || lower.contains("ch") || lower.contains("channel")
+            || lower.contains("wave") || lower.contains("lambda") {
+            return AxisType::Channel;
+        }
+        if lower.contains('t') || lower.contains("time") || lower.contains("frame")
+            || lower.contains("tp") || lower.contains("point") {
+            return AxisType::Time;
+        }
+        if lower.contains('s') || lower.contains("series") || lower.contains("pos")
+            || lower.contains("stage") || lower.contains("well") || lower.contains("field") {
+            return AxisType::Series;
+        }
+        AxisType::Unknown
+    }
+}

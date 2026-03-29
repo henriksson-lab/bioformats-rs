@@ -32,6 +32,10 @@ jpegxr        = { version = "0.3", optional = true }
 [features]
 jpegxr = ["dep:jpegxr"]
 
+[[bin]]
+name = "bioformats-convert"
+path = "src/bin/bioformats_convert.rs"
+
 [[bench]]
 name = "read_ome_tiff"
 harness = false

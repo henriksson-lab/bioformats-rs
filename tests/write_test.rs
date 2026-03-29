@@ -1,5 +1,4 @@
 use bioformats::{ImageMetadata, ImageReader, ImageWriter, PixelType};
-use std::path::Path;
 
 fn temp_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("bioformats_test_{}", name))
