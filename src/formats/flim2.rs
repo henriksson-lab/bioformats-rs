@@ -12,6 +12,7 @@ use crate::common::reader::FormatReader;
 // ---------------------------------------------------------------------------
 // Macros
 // ---------------------------------------------------------------------------
+#[allow(unused_macros)]
 macro_rules! placeholder_reader {
     (
         $(#[$attr:meta])*
@@ -263,111 +264,548 @@ placeholder_reader_u16_small! {
 }
 
 // ---------------------------------------------------------------------------
-// 4. NDPI Set — 512x512 uint8 placeholder
+// 4. NDPI Set — TIFF delegate
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// NDPI Set format placeholder reader (`.ndpis`).
-    pub struct NdpisReader;
-    extensions: ["ndpis"];
-    magic_bytes: false;
+/// NDPI Set format reader (`.ndpis`).
+///
+/// Delegates to `TiffReader` since NDPI files reference TIFF data.
+pub struct NdpisReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl NdpisReader {
+    pub fn new() -> Self {
+        NdpisReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for NdpisReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for NdpisReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("ndpis"))
+    }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path) }
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> { self.inner.open_bytes_region(p, x, y, w, h) }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------
-// 5. iVision IPM — 512x512 uint8 placeholder
+// 5. iVision IPM
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// iVision format placeholder reader (`.ipm`).
-    pub struct IvisionReader;
-    extensions: ["ipm"];
-    magic_bytes: false;
+/// iVision format reader (`.ipm`).
+///
+/// iVision is a proprietary format from BioVision Technologies with
+/// undocumented binary structure.
+pub struct IvisionReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl IvisionReader {
+    pub fn new() -> Self {
+        IvisionReader { path: None, meta: None }
+    }
+}
+
+impl Default for IvisionReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for IvisionReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("ipm"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "iVision IPM is a proprietary format from BioVision Technologies".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "iVision IPM is a proprietary format from BioVision Technologies".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "iVision IPM is a proprietary format from BioVision Technologies".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "iVision IPM is a proprietary format from BioVision Technologies".to_string()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 6. Aperio AFI — 512x512 uint8 placeholder
+// 6. Aperio AFI — TIFF delegate
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Aperio AFI fluorescence format placeholder reader (`.afi`).
-    pub struct AfiFluorescenceReader;
-    extensions: ["afi"];
-    magic_bytes: false;
+/// Aperio AFI fluorescence format reader (`.afi`).
+///
+/// AFI files use TIFF data; delegates to `TiffReader`.
+pub struct AfiFluorescenceReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl AfiFluorescenceReader {
+    pub fn new() -> Self {
+        AfiFluorescenceReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for AfiFluorescenceReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for AfiFluorescenceReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("afi"))
+    }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path) }
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> { self.inner.open_bytes_region(p, x, y, w, h) }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------
-// 7. Imaris TIFF — 512x512 uint8 placeholder
+// 7. Imaris TIFF — TIFF delegate
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Imaris TIFF format placeholder reader (`.ims`).
-    pub struct ImarisTiffReader;
-    extensions: ["ims"];
-    magic_bytes: false;
+/// Imaris TIFF format reader (`.ims`).
+///
+/// Imaris TIFF files are valid TIFFs; delegates to `TiffReader`.
+pub struct ImarisTiffReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl ImarisTiffReader {
+    pub fn new() -> Self {
+        ImarisTiffReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for ImarisTiffReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for ImarisTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("ims"))
+    }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path) }
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> { self.inner.open_bytes_region(p, x, y, w, h) }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------
-// 8. Leica XLEF — 512x512 uint8 placeholder
+// 8. Leica XLEF — TIFF delegate
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Leica XLEF format placeholder reader (`.xlef`).
-    pub struct XlefReader;
-    extensions: ["xlef"];
-    magic_bytes: false;
+/// Leica XLEF format reader (`.xlef`).
+///
+/// XLEF files contain embedded TIFF data; delegates to `TiffReader`.
+pub struct XlefReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl XlefReader {
+    pub fn new() -> Self {
+        XlefReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for XlefReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for XlefReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("xlef"))
+    }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path) }
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> { self.inner.open_bytes_region(p, x, y, w, h) }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------
-// 9. Olympus OIR — 512x512 uint8 placeholder
+// 9. Olympus OIR
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Olympus OIR format placeholder reader (`.oir`).
-    pub struct OirReader;
-    extensions: ["oir"];
-    magic_bytes: false;
+/// Olympus OIR format reader (`.oir`).
+///
+/// Olympus OIR format requires OLE2 container parsing with proprietary
+/// internal structure specific to Olympus FluoView software.
+pub struct OirReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl OirReader {
+    pub fn new() -> Self {
+        OirReader { path: None, meta: None }
+    }
+}
+
+impl Default for OirReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for OirReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("oir"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Olympus OIR format requires OLE2 container parsing with proprietary Olympus FluoView structure".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Olympus OIR format requires OLE2 container parsing".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Olympus OIR format requires OLE2 container parsing".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Olympus OIR format requires OLE2 container parsing".to_string()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 10. Olympus cellSens VSI — 512x512 uint8 placeholder
+// 10. Olympus cellSens VSI — TIFF-based delegate
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Olympus cellSens VSI format placeholder reader (`.vsi`).
-    pub struct CellSensReader;
-    extensions: ["vsi"];
-    magic_bytes: false;
+/// Olympus cellSens VSI format reader (`.vsi`).
+///
+/// VSI files are TIFF-based with ETS companion files. Delegates to TiffReader
+/// for the base TIFF structure.
+pub struct CellSensReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl CellSensReader {
+    pub fn new() -> Self {
+        CellSensReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for CellSensReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for CellSensReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("vsi"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path).map_err(|_| BioFormatsError::UnsupportedFormat(
+            "Olympus cellSens VSI: could not parse as TIFF (may require ETS companion files)".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
 }
 
 // ---------------------------------------------------------------------------
-// 11. Volocity clipping ACFF — 512x512 uint8 placeholder
+// 11. Volocity clipping ACFF
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Volocity clipping format placeholder reader (`.acff`).
-    pub struct VolocityClippingReader;
-    extensions: ["acff"];
-    magic_bytes: false;
+/// Volocity clipping format reader (`.acff`).
+///
+/// Volocity clipping files use OLE2/Compound Document format which requires
+/// a dedicated OLE2 container parser.
+pub struct VolocityClippingReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl VolocityClippingReader {
+    pub fn new() -> Self {
+        VolocityClippingReader { path: None, meta: None }
+    }
+}
+
+impl Default for VolocityClippingReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for VolocityClippingReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("acff"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Volocity clipping format requires OLE2/Compound Document container parsing".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Volocity clipping format requires OLE2/Compound Document container parsing".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Volocity clipping format requires OLE2/Compound Document container parsing".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Volocity clipping format requires OLE2/Compound Document container parsing".to_string()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 12. Bruker MicroCT — 512x512 uint8 placeholder
+// 12. Bruker MicroCT — TIFF delegate
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Bruker MicroCT format placeholder reader (`.ctf`).
-    pub struct MicroCtReader;
-    extensions: ["ctf"];
-    magic_bytes: false;
+/// Bruker MicroCT format reader (`.ctf`).
+///
+/// MicroCT files use TIFF data; delegates to `TiffReader`.
+pub struct MicroCtReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl MicroCtReader {
+    pub fn new() -> Self {
+        MicroCtReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for MicroCtReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for MicroCtReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("ctf"))
+    }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path) }
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> { self.inner.open_bytes_region(p, x, y, w, h) }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------
-// 13. Bio-Rad SCN confocal — 512x512 uint8 placeholder
+// 13. Bio-Rad SCN confocal — TIFF delegate
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Bio-Rad SCN confocal format placeholder reader (`.scn`).
-    pub struct BioRadScnReader;
-    extensions: ["scn"];
-    magic_bytes: false;
+/// Bio-Rad SCN confocal format reader (`.scn`).
+///
+/// Bio-Rad SCN confocal files are TIFF-based; delegates to `TiffReader`.
+pub struct BioRadScnReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl BioRadScnReader {
+    pub fn new() -> Self {
+        BioRadScnReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for BioRadScnReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for BioRadScnReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("scn"))
+    }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path) }
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> { self.inner.open_bytes_region(p, x, y, w, h) }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------
-// 14. 3i SlideBook TIFF export — 512x512 uint8 placeholder
+// 14. 3i SlideBook TIFF export — TIFF delegate
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// 3i SlideBook TIFF export format placeholder reader (`.tif`).
-    pub struct SlidebookTiffReader;
-    extensions: ["tif"];
-    magic_bytes: false;
+/// 3i SlideBook TIFF export format reader (`.tif`).
+///
+/// SlideBook TIFF exports are valid TIFFs; delegates to `TiffReader`.
+pub struct SlidebookTiffReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl SlidebookTiffReader {
+    pub fn new() -> Self {
+        SlidebookTiffReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for SlidebookTiffReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for SlidebookTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("tif"))
+    }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path) }
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> { self.inner.open_bytes_region(p, x, y, w, h) }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }

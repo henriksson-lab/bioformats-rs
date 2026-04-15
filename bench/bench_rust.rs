@@ -6,12 +6,11 @@
 use std::path::Path;
 use std::time::Instant;
 
-use bioformats_common::reader::FormatReader;
-use bioformats_tiff::TiffReader;
+use bioformats::FormatReader;
+use bioformats::ImageReader;
 
 fn read_all(path: &Path) -> usize {
-    let mut reader = TiffReader::new();
-    reader.set_id(path).unwrap();
+    let mut reader = ImageReader::open(path).unwrap();
     let count = reader.metadata().image_count;
     let mut total = 0usize;
     for i in 0..count {

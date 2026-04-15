@@ -9,6 +9,7 @@ exclude = ["java-bioformats/", "*.jar", "bench/", "old/", "test/", "convo.txt"]
 
 [workspace]
 resolver = "2"
+exclude = ["bench"]
 
 [dependencies]
 thiserror    = "1"
@@ -28,9 +29,11 @@ jpeg2k       = { version = "0.10", default-features = false, features = ["openjp
 serde         = { version = "1", features = ["derive"] }
 bincode       = "1"
 jpegxr        = { version = "0.3", optional = true }
+openslide-pure-rs = { path = "/home/mahogny/github/claude/openslide-rs", optional = true }
 
 [features]
 jpegxr = ["dep:jpegxr"]
+openslide = ["dep:openslide-pure-rs"]
 
 [[bin]]
 name = "bioformats-convert"

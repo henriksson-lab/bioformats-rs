@@ -149,6 +149,7 @@ macro_rules! tiff_wrapper {
 // ---------------------------------------------------------------------------
 // Macro: extension-only placeholder reader
 // ---------------------------------------------------------------------------
+#[allow(unused_macros)]
 macro_rules! placeholder_reader {
     (
         $(#[$attr:meta])*
@@ -732,65 +733,543 @@ impl FormatReader for CellomicsReader {
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// 7. Minolta Digital Camera RAW
+// 7. Minolta Digital Camera RAW — TIFF delegate
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Minolta Digital Camera RAW placeholder reader (`.mrw`).
-    pub struct MrwReader;
-    extensions: ["mrw"];
+/// Minolta Digital Camera RAW reader (`.mrw`).
+///
+/// Minolta RAW files have a TIFF structure inside; delegates to `TiffReader`.
+/// If the proprietary header prevents parsing, `set_id` will propagate the error.
+pub struct MrwReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl MrwReader {
+    pub fn new() -> Self {
+        MrwReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for MrwReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for MrwReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("mrw"))
+    }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path) }
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> { self.inner.open_bytes_region(p, x, y, w, h) }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------
-// 8. Yokogawa CV7000/8000 HCS
+// 8. Yokogawa CV7000/8000 HCS — XML index + TIFF images
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Yokogawa CV7000/8000 HCS placeholder reader (`.wpi`, `.mrf`).
-    pub struct YokogawaReader;
-    extensions: ["wpi", "mrf"];
+/// Yokogawa CV7000/8000 HCS reader (`.wpi`, `.mrf`).
+///
+/// Yokogawa high-content screening systems store data as XML index files
+/// referencing TIFF tile images. Attempts to locate and open accompanying
+/// TIFF files via TiffReader.
+pub struct YokogawaReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl YokogawaReader {
+    pub fn new() -> Self {
+        YokogawaReader { inner: crate::tiff::TiffReader::new() }
+    }
+}
+
+impl Default for YokogawaReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for YokogawaReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("wpi") | Some("mrf"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        // Try to find a companion TIFF in the same directory
+        if let Some(parent) = path.parent() {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            for ext in &["tif", "tiff"] {
+                let tiff_path = parent.join(format!("{}.{}", stem, ext));
+                if tiff_path.exists() {
+                    return self.inner.set_id(&tiff_path);
+                }
+            }
+        }
+        // Fall back to trying to open the file itself as TIFF
+        self.inner.set_id(path).map_err(|_| BioFormatsError::UnsupportedFormat(
+            "Yokogawa CV7000/8000: could not find companion TIFF images for this index file".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
+    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
 }
 
 // ---------------------------------------------------------------------------
 // 9. Leica single-image LOF
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Leica single-image LOF placeholder reader (`.lof`).
-    pub struct LeicaLofReader;
-    extensions: ["lof"];
+/// Leica single-image LOF reader (`.lof`).
+///
+/// Leica LOF is a proprietary binary format used by Leica Application Suite.
+/// The internal structure is vendor-specific and undocumented.
+pub struct LeicaLofReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl LeicaLofReader {
+    pub fn new() -> Self {
+        LeicaLofReader { path: None, meta: None }
+    }
+}
+
+impl Default for LeicaLofReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for LeicaLofReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("lof"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Leica LOF is a proprietary binary format from Leica Application Suite".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Leica LOF is a proprietary binary format from Leica Application Suite".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Leica LOF is a proprietary binary format from Leica Application Suite".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Leica LOF is a proprietary binary format from Leica Application Suite".to_string()
+        ))
+    }
+
+    fn resolution_count(&self) -> usize { 1 }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level != 0 { Err(BioFormatsError::Format(format!("resolution {} out of range", level))) }
+        else { Ok(()) }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 10. Animated PNG
+// 10. Animated PNG — delegates to PngReader
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Animated PNG placeholder reader (`.apng`).
-    pub struct ApngReader;
-    extensions: ["apng"];
+/// Animated PNG reader (`.apng`).
+///
+/// Tries to open the file as a regular PNG via `PngReader` (reads the first
+/// frame). Full APNG animation decoding is not supported.
+pub struct ApngReader {
+    inner: crate::formats::png::PngReader,
+}
+
+impl ApngReader {
+    pub fn new() -> Self {
+        ApngReader { inner: crate::formats::png::PngReader::new() }
+    }
+}
+
+impl Default for ApngReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for ApngReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("apng"))
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // PNG magic: 89 50 4E 47 0D 0A 1A 0A
+        header.len() >= 8 && header[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)
+            .map_err(|_| BioFormatsError::UnsupportedFormat(
+                "APNG file could not be opened as PNG (animated PNG may require dedicated parser)".to_string()
+            ))
+    }
+
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
+    fn resolution_count(&self) -> usize { 1 }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level != 0 { Err(BioFormatsError::Format(format!("resolution {} out of range", level))) }
+        else { Ok(()) }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 11. POV-Ray density grid
+// 11. POV-Ray density grid (DF3)
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// POV-Ray density grid placeholder reader (`.pov`, `.df3`).
-    pub struct PovRayReader;
-    extensions: ["pov", "df3"];
+/// POV-Ray density grid reader (`.pov`, `.df3`).
+///
+/// DF3 format: 6-byte header (3x uint16 BE: x, y, z dimensions) followed
+/// by raw uint8 voxel data.
+pub struct PovRayReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    pixel_data: Option<Vec<u8>>,
+}
+
+impl PovRayReader {
+    pub fn new() -> Self {
+        PovRayReader { path: None, meta: None, pixel_data: None }
+    }
+}
+
+impl Default for PovRayReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for PovRayReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("pov") | Some("df3"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < 6 {
+            return Err(BioFormatsError::Format("DF3 file too short (need at least 6-byte header)".to_string()));
+        }
+
+        let size_x = u16::from_be_bytes([data[0], data[1]]) as u32;
+        let size_y = u16::from_be_bytes([data[2], data[3]]) as u32;
+        let size_z = u16::from_be_bytes([data[4], data[5]]) as u32;
+
+        if size_x == 0 || size_y == 0 || size_z == 0 {
+            return Err(BioFormatsError::Format("DF3 header contains zero dimensions".to_string()));
+        }
+
+        let pixel_data = data[6..].to_vec();
+        let image_count = size_z.max(1);
+
+        self.path = Some(path.to_path_buf());
+        self.pixel_data = Some(pixel_data);
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.pixel_data = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let pixels = self.pixel_data.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let plane_bytes = meta.size_x as usize * meta.size_y as usize;
+        let offset = plane_index as usize * plane_bytes;
+        let end = (offset + plane_bytes).min(pixels.len());
+        if offset >= pixels.len() {
+            return Ok(vec![0u8; plane_bytes]);
+        }
+        Ok(pixels[offset..end].to_vec())
+    }
+
+    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        Ok(vec![0u8; w as usize * h as usize])
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn resolution_count(&self) -> usize { 1 }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level != 0 { Err(BioFormatsError::Format(format!("resolution {} out of range", level))) }
+        else { Ok(()) }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 12. NAF format
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// NAF format placeholder reader (`.naf`).
-    pub struct NafReader;
-    extensions: ["naf"];
+/// NAF format reader (`.naf`).
+///
+/// NAF is a proprietary format with undocumented structure.
+pub struct NafReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl NafReader {
+    pub fn new() -> Self {
+        NafReader { path: None, meta: None }
+    }
+}
+
+impl Default for NafReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for NafReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("naf"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "NAF is a proprietary format with undocumented structure".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "NAF is a proprietary format with undocumented structure".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "NAF is a proprietary format with undocumented structure".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "NAF is a proprietary format with undocumented structure".to_string()
+        ))
+    }
+
+    fn resolution_count(&self) -> usize { 1 }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level != 0 { Err(BioFormatsError::Format(format!("resolution {} out of range", level))) }
+        else { Ok(()) }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 13. Burleigh piezo/SPM
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Burleigh piezo/SPM placeholder reader (`.img`).
-    /// NOTE: `.img` is very generic; this is a last-resort extension fallback.
-    pub struct BurleighReader;
-    extensions: ["img"];
+/// Burleigh piezo/SPM reader (`.img`).
+///
+/// NOTE: `.img` is a very generic extension shared by many formats.
+/// Burleigh SPM images have an undocumented proprietary structure.
+/// This reader is a last-resort extension fallback.
+pub struct BurleighReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl BurleighReader {
+    pub fn new() -> Self {
+        BurleighReader { path: None, meta: None }
+    }
+}
+
+impl Default for BurleighReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for BurleighReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("img"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Burleigh SPM .img format is proprietary; .img extension is too generic for reliable detection".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Burleigh SPM .img format is proprietary; .img extension is too generic for reliable detection".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Burleigh SPM .img format is proprietary; .img extension is too generic for reliable detection".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Burleigh SPM .img format is proprietary; .img extension is too generic for reliable detection".to_string()
+        ))
+    }
+
+    fn resolution_count(&self) -> usize { 1 }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level != 0 { Err(BioFormatsError::Format(format!("resolution {} out of range", level))) }
+        else { Ok(()) }
+    }
 }

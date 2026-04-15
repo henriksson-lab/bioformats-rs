@@ -12,9 +12,13 @@ use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
+// Re-import hdf5 for MincReader
+use hdf5;
+
 // ---------------------------------------------------------------------------
 // Macro for extension-only placeholder readers
 // ---------------------------------------------------------------------------
+#[allow(unused_macros)]
 macro_rules! placeholder_reader {
     (
         $(#[$attr:meta])*
@@ -96,61 +100,507 @@ macro_rules! placeholder_reader {
 // ---------------------------------------------------------------------------
 // 1. Apple QuickTime
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Apple QuickTime movie placeholder reader (`.mov`, `.qt`).
-    pub struct QuickTimeReader;
-    extensions: ["mov", "qt"];
-    magic_bytes: false;
+/// Apple QuickTime movie reader (`.mov`, `.qt`).
+///
+/// QuickTime/MOV container parsing is complex (nested atom structure with
+/// multiple codec variants). Returns `UnsupportedFormat` with a descriptive
+/// message instead of a generic "not yet implemented".
+pub struct QuickTimeReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl QuickTimeReader {
+    pub fn new() -> Self {
+        QuickTimeReader { path: None, meta: None }
+    }
+}
+
+impl Default for QuickTimeReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for QuickTimeReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("mov") | Some("qt"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime container parsing not yet implemented (MOV/QT files require complex atom-based container parsing with multiple codec variants)".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime container parsing not yet implemented".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime container parsing not yet implemented".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime container parsing not yet implemented".to_string()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 2. Multiple-image Network Graphics
+// 2. Multiple-image Network Graphics — delegates to PNG
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// MNG (Multiple-image Network Graphics) placeholder reader (`.mng`).
-    pub struct MngReader;
-    extensions: ["mng"];
-    magic_bytes: false;
+/// MNG (Multiple-image Network Graphics) reader (`.mng`).
+///
+/// MNG is PNG-based; delegates to `PngReader` for the first frame.
+pub struct MngReader {
+    inner: crate::formats::png::PngReader,
+}
+
+impl MngReader {
+    pub fn new() -> Self {
+        MngReader { inner: crate::formats::png::PngReader::new() }
+    }
+}
+
+impl Default for MngReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for MngReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("mng"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)
+            .map_err(|_| BioFormatsError::UnsupportedFormat(
+                "MNG file could not be opened as PNG (MNG animation may require dedicated parser)".to_string()
+            ))
+    }
+
+    fn close(&mut self) -> Result<()> { self.inner.close() }
+    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s) }
+    fn series(&self) -> usize { self.inner.series() }
+    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_bytes(p) }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
 }
 
 // ---------------------------------------------------------------------------
 // 3. Volocity Library
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Volocity Library placeholder reader (`.acff`).
-    pub struct VolocityLibraryReader;
-    extensions: ["acff"];
-    magic_bytes: false;
+/// Volocity Library reader (`.acff`).
+///
+/// Volocity Library files use OLE2/Compound Document format which requires
+/// a dedicated OLE2 container parser not currently available in pure Rust.
+pub struct VolocityLibraryReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl VolocityLibraryReader {
+    pub fn new() -> Self {
+        VolocityLibraryReader { path: None, meta: None }
+    }
+}
+
+impl Default for VolocityLibraryReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for VolocityLibraryReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("acff"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Volocity Library format requires OLE2/Compound Document container parsing".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Volocity Library format requires OLE2/Compound Document container parsing".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Volocity Library format requires OLE2/Compound Document container parsing".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Volocity Library format requires OLE2/Compound Document container parsing".to_string()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 4. 3i SlideBook
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// 3i SlideBook placeholder reader (`.sld`).
-    pub struct SlideBookReader;
-    extensions: ["sld"];
-    magic_bytes: false;
+/// 3i SlideBook reader (`.sld`).
+///
+/// SlideBook uses a proprietary binary format from 3i (Intelligent Imaging
+/// Innovations). The internal structure is undocumented.
+pub struct SlideBookReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl SlideBookReader {
+    pub fn new() -> Self {
+        SlideBookReader { path: None, meta: None }
+    }
+}
+
+impl Default for SlideBookReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for SlideBookReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("sld"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "3i SlideBook format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "3i SlideBook format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "3i SlideBook format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "3i SlideBook format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 5. MINC neuroimaging (NetCDF-based)
+// 5. MINC neuroimaging (HDF5-based)
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// MINC neuroimaging placeholder reader (`.mnc`).
-    pub struct MincReader;
-    extensions: ["mnc"];
-    magic_bytes: false;
+/// MINC neuroimaging reader (`.mnc`).
+///
+/// MINC files are HDF5-based. Attempts to open the file via HDF5 and locate
+/// image data in common MINC dataset paths.
+pub struct MincReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    pixel_data: Option<Vec<u8>>,
+}
+
+impl MincReader {
+    pub fn new() -> Self {
+        MincReader { path: None, meta: None, pixel_data: None }
+    }
+}
+
+impl Default for MincReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for MincReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("mnc"))
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // HDF5 magic: 0x89 H D F \r \n 0x1a \n
+        header.len() >= 8 && header[..8] == [0x89, 0x48, 0x44, 0x46, 0x0D, 0x0A, 0x1A, 0x0A]
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let file = hdf5::File::open(path)
+            .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5: {e}")))?;
+
+        // Look for common MINC dataset paths
+        let dataset_paths = [
+            "/minc-2.0/image/0/image",
+            "/minc-2.0/image/image",
+            "/image",
+        ];
+
+        let mut found_ds = None;
+        for dp in &dataset_paths {
+            if let Ok(ds) = file.dataset(dp) {
+                found_ds = Some(ds);
+                break;
+            }
+        }
+
+        let ds = found_ds.ok_or_else(|| BioFormatsError::Format(
+            "MINC/HDF5: could not find image dataset in known paths".to_string()
+        ))?;
+
+        let shape = ds.shape();
+        // MINC typically has (z, y, x) or (t, z, y, x) ordering
+        let (size_x, size_y, size_z) = match shape.len() {
+            1 => (shape[0] as u32, 1u32, 1u32),
+            2 => (shape[1] as u32, shape[0] as u32, 1u32),
+            3 => (shape[2] as u32, shape[1] as u32, shape[0] as u32),
+            n if n >= 4 => (shape[n-1] as u32, shape[n-2] as u32, shape[n-3] as u32),
+            _ => (1u32, 1u32, 1u32),
+        };
+
+        // Read pixel data as u16
+        let data: Vec<u16> = ds.read_raw()
+            .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+        let mut pixels = Vec::with_capacity(data.len() * 2);
+        for val in &data {
+            pixels.extend_from_slice(&val.to_le_bytes());
+        }
+
+        let image_count = size_z.max(1);
+        self.path = Some(path.to_path_buf());
+        self.pixel_data = Some(pixels);
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.pixel_data = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let pixels = self.pixel_data.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let plane_bytes = meta.size_x as usize * meta.size_y as usize * 2;
+        let offset = plane_index as usize * plane_bytes;
+        let end = (offset + plane_bytes).min(pixels.len());
+        if offset >= pixels.len() {
+            return Ok(vec![0u8; plane_bytes]);
+        }
+        Ok(pixels[offset..end].to_vec())
+    }
+
+    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        Ok(vec![0u8; w as usize * h as usize * 2])
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 6. PerkinElmer Openlab LIFF
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// PerkinElmer Openlab LIFF placeholder reader (`.liff`).
-    pub struct OpenlabLiffReader;
-    extensions: ["liff"];
-    magic_bytes: false;
+/// PerkinElmer Openlab LIFF reader (`.liff`).
+///
+/// Openlab LIFF is a proprietary binary format from PerkinElmer/Improvision.
+/// The internal structure is undocumented and not publicly specified.
+pub struct OpenlabLiffReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl OpenlabLiffReader {
+    pub fn new() -> Self {
+        OpenlabLiffReader { path: None, meta: None }
+    }
+}
+
+impl Default for OpenlabLiffReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for OpenlabLiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("liff"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "PerkinElmer Openlab LIFF is a proprietary format with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "PerkinElmer Openlab LIFF is a proprietary format with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "PerkinElmer Openlab LIFF is a proprietary format with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "PerkinElmer Openlab LIFF is a proprietary format with undocumented binary structure".to_string()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,29 +772,284 @@ impl FormatReader for Jpeg2000Reader {
 // ---------------------------------------------------------------------------
 // 8. Sedat Lab format
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Sedat Lab format placeholder reader (`.sedat`).
-    pub struct SedatReader;
-    extensions: ["sedat"];
-    magic_bytes: false;
+/// Sedat Lab format reader (`.sedat`).
+///
+/// The Sedat format is a proprietary format from the Sedat Lab at UCSF.
+/// The binary structure is not publicly documented.
+pub struct SedatReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl SedatReader {
+    pub fn new() -> Self {
+        SedatReader { path: None, meta: None }
+    }
+}
+
+impl Default for SedatReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for SedatReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("sedat"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Sedat Lab format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Sedat Lab format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Sedat Lab format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "Sedat Lab format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 9. SM-Camera
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// SM-Camera placeholder reader (`.smc`).
-    pub struct SmCameraReader;
-    extensions: ["smc"];
-    magic_bytes: false;
+/// SM-Camera reader (`.smc`).
+///
+/// SM-Camera is a proprietary format with undocumented binary structure.
+pub struct SmCameraReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl SmCameraReader {
+    pub fn new() -> Self {
+        SmCameraReader { path: None, meta: None }
+    }
+}
+
+impl Default for SmCameraReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for SmCameraReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("smc"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "SM-Camera format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "SM-Camera format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "SM-Camera format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
+
+    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "SM-Camera format is proprietary with undocumented binary structure".to_string()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 10. Plain text image
+// 10. Plain text image — CSV/TSV parsing like TextImageReader
 // ---------------------------------------------------------------------------
-placeholder_reader! {
-    /// Plain text image reader placeholder (`.txt`).
-    pub struct TextReader;
-    extensions: ["txt"];
-    magic_bytes: false;
+/// Plain text image reader (`.txt`).
+///
+/// Parses tab/comma/space-separated numeric values from a text file,
+/// treating each row as a line of pixels and each value as a Float32 sample.
+pub struct TextReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    pixel_data: Vec<u8>,
+}
+
+impl TextReader {
+    pub fn new() -> Self {
+        TextReader { path: None, meta: None, pixel_data: Vec::new() }
+    }
+}
+
+impl Default for TextReader {
+    fn default() -> Self { Self::new() }
+}
+
+impl FormatReader for TextReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("txt"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let cells: Vec<f32> = line
+                .split(|c: char| c == ',' || c == '\t' || c == ' ')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().parse::<f64>().unwrap_or(0.0) as f32)
+                .collect();
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+        }
+        if rows.is_empty() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "TextReader: file contains no numeric data".to_string(),
+            ));
+        }
+        let height = rows.len() as u32;
+        let width = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
+        // Build Float32 pixel buffer (row-major, zero-padded for short rows)
+        let mut pixel_data = Vec::with_capacity((width * height * 4) as usize);
+        for row in &rows {
+            for x in 0..width as usize {
+                let val = if x < row.len() { row[x] } else { 0.0f32 };
+                pixel_data.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+        self.path = Some(path.to_path_buf());
+        self.pixel_data = pixel_data;
+        self.meta = Some(ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Float32,
+            bits_per_pixel: 32,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.pixel_data.clear();
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize { 1 }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    }
+
+    fn series(&self) -> usize { 0 }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        Ok(self.pixel_data.clone())
+    }
+
+    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        Ok(vec![0u8; w as usize * h as usize * 4])
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
 }

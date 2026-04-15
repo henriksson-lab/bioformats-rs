@@ -8,5 +8,4 @@ name = "bench_rust"
 path = "bench_rust.rs"
 
 [dependencies]
-bioformats-tiff   = { path = "../bioformats-rs/crates/bioformats-tiff" }
-bioformats-common = { path = "../bioformats-rs/crates/bioformats-common" }
+bioformats = { path = ".." }

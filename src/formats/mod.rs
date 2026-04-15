@@ -44,6 +44,7 @@ pub mod nifti;
 pub mod norpix;
 pub mod nrrd;
 pub mod olympus;
+pub mod openslide_reader;
 pub mod ome;
 pub mod opus;
 pub mod pcx;

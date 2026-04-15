@@ -79,6 +79,9 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::lsm::LsmReader::new()),
         Box::new(crate::formats::metamorph::MetamorphReader::new()),
         Box::new(crate::formats::micromanager::MicromanagerReader::new()),
+        // OpenSlide-based whole-slide formats (MRXS, VMS, BIF, etc.)
+        #[cfg(feature = "openslide")]
+        Box::new(crate::formats::openslide_reader::OpenSlideReader::new()),
         // Whole-slide TIFF wrappers (extension-only)
         Box::new(crate::formats::svs::WholeSlideTiffReader::new()),
         // Extension-only Inveon (hdr+img pair, extension-only detection)
@@ -245,16 +248,19 @@ impl ImageReader {
         // 1. Magic bytes
         for mut r in all_readers() {
             if r.is_this_type_by_bytes(&header) {
-                r.set_id(path)?;
-                return Ok(ImageReader { inner: r });
+                if r.set_id(path).is_ok() {
+                    return Ok(ImageReader { inner: r });
+                }
+                // If set_id fails, try the next reader
             }
         }
 
         // 2. Extension fallback
         for mut r in all_readers() {
             if r.is_this_type_by_name(path) {
-                r.set_id(path)?;
-                return Ok(ImageReader { inner: r });
+                if r.set_id(path).is_ok() {
+                    return Ok(ImageReader { inner: r });
+                }
             }
         }
 
