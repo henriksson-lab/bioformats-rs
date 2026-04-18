@@ -4,9 +4,7 @@ A pure-Rust reimplementation of [Bio-Formats](https://www.openmicroscopy.org/bio
 — a library for reading (and writing) scientific image formats used in microscopy, medical imaging, and astronomy.
 No JVM, no native dependencies.
 
-**This package is experimental and a minimum of testing has been performed. The code need not be correct.**
-
-**Please provide any improvements to the original Java Bioformats library which is the authorative implementation.**
+**This package is still under development**
 
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code!

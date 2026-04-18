@@ -1,0 +1,540 @@
+# ccc_mapping.toml — mapping between Rust bioformats-rs and upstream Java Bio-Formats.
+#
+# Used by: ccc-rs compare / missing / constants-diff / order-annotate.
+# Rust = this crate's symbol, other = the Java class/method name.
+#
+# ccc-rs already folds snake_case ↔ camelCase and strips trivial suffixes, so only
+# non-trivial mismatches are listed here. Matches it would already make on its own
+# (e.g. AviReader ↔ AVIReader, open_bytes ↔ openBytes) are intentionally omitted.
+
+# ─── Core API traits / classes ────────────────────────────────────────────────
+
+[[entries]]
+rust  = "FormatReader"
+other = "IFormatReader"
+
+[[entries]]
+rust  = "FormatWriter"
+other = "IFormatWriter"
+
+[[entries]]
+rust  = "ImageMetadata"
+other = "CoreMetadata"
+
+[[entries]]
+rust  = "BioFormatsError"
+other = "FormatException"
+
+[[entries]]
+rust  = "CachedReader"
+other = "ReaderWrapper"
+
+# ─── Zeiss-family readers (Rust drops the "Zeiss" prefix) ─────────────────────
+
+[[entries]]
+rust  = "LsmReader"
+other = "ZeissLSMReader"
+
+[[entries]]
+rust  = "CziReader"
+other = "ZeissCZIReader"
+
+[[entries]]
+rust  = "ZviReader"
+other = "ZeissZVIReader"
+
+[[entries]]
+rust  = "XrmReader"
+other = "ZeissXRMReader"
+
+# ─── Olympus / Leica / Nikon renames ──────────────────────────────────────────
+
+[[entries]]
+rust  = "OifReader"
+other = "FV1000Reader"
+
+[[entries]]
+rust  = "LeicaTcsReader"
+other = "TCSReader"
+
+[[entries]]
+rust  = "LeicaLofReader"
+other = "LOFReader"
+
+[[entries]]
+rust  = "NikonNisReader"
+other = "NikonReader"
+
+# ─── Gatan / Bruker / Photoshop ───────────────────────────────────────────────
+
+[[entries]]
+rust  = "Dm2Reader"
+other = "GatanDM2Reader"
+
+[[entries]]
+rust  = "BrukerOpusReader"
+other = "BrukerReader"
+
+# ─── Whole-slide / HCS readers ────────────────────────────────────────────────
+
+[[entries]]
+rust  = "WholeSlideTiffReader"
+other = "SVSReader"
+
+[[entries]]
+rust  = "YokogawaReader"
+other = "CV7000Reader"
+
+[[entries]]
+rust  = "MiasTiffReader"
+other = "MIASReader"
+
+[[entries]]
+rust  = "OpenlabLiffReader"
+other = "OpenlabReader"
+
+[[entries]]
+rust  = "KodakBipReader"
+other = "KodakReader"
+
+# VolocityLibraryReader has no dedicated Java counterpart (Java's VolocityReader
+# handles both the library and standalone variants), and mapping it here would
+# consume the Java class and leave Rust's VolocityReader unmatched — so it is
+# left to the matcher's "no counterpart" outcome.
+
+# ─── FLIM / flow cytometry / microscopy ───────────────────────────────────────
+
+[[entries]]
+rust  = "LambertFlimReader"
+other = "LiFlimReader"
+
+[[entries]]
+rust  = "PicoQuantReader"
+other = "PQBinReader"
+
+[[entries]]
+rust  = "AfiFluorescenceReader"
+other = "AFIReader"
+
+[[entries]]
+rust  = "FeiSerReader"
+other = "FEIReader"
+
+[[entries]]
+rust  = "Al3dReader"
+other = "AliconaReader"
+
+[[entries]]
+rust  = "FdfReader"
+other = "VarianFDFReader"
+
+[[entries]]
+rust  = "NorpixReader"
+other = "SEQReader"
+
+[[entries]]
+rust  = "AndorSifReader"
+other = "SIFReader"
+
+[[entries]]
+rust  = "QuickTimeReader"
+other = "QTReader"
+
+[[entries]]
+rust  = "MolecularDevicesTiffReader"
+other = "MetamorphTiffReader"
+
+[[entries]]
+rust  = "TextImageReader"
+other = "TextReader"
+
+# ─── Writers ──────────────────────────────────────────────────────────────────
+
+[[entries]]
+rust  = "OmeXmlWriter"
+other = "OMEXMLWriter"
+
+[[entries]]
+rust  = "PyramidOmeTiffWriter"
+other = "PyramidOMETiffWriter"
+
+# ─── Method-level pins for the most heavily-overloaded API methods ────────────
+#
+# Every reader defines openBytes/setId/isThisType/initFile/close/getOptimalTile*,
+# so a bare-name match would be ambiguous across ~180 readers. Pin the ones where
+# the class itself was renamed above; for classes whose names already match
+# (AviReader ↔ AVIReader etc.) ccc-rs's fingerprint/name matcher handles the
+# methods without help. "open_bytes" is the primary hot-path method and the one
+# most worth comparing, so we pin it per renamed class.
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "LsmReader"
+other       = "openBytes"
+other_class = "ZeissLSMReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "CziReader"
+other       = "openBytes"
+other_class = "ZeissCZIReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "ZviReader"
+other       = "openBytes"
+other_class = "ZeissZVIReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "XrmReader"
+other       = "openBytes"
+other_class = "ZeissXRMReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "OifReader"
+other       = "openBytes"
+other_class = "FV1000Reader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "LeicaTcsReader"
+other       = "openBytes"
+other_class = "TCSReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "LeicaLofReader"
+other       = "openBytes"
+other_class = "LOFReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "Dm2Reader"
+other       = "openBytes"
+other_class = "GatanDM2Reader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "BrukerOpusReader"
+other       = "openBytes"
+other_class = "BrukerReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "WholeSlideTiffReader"
+other       = "openBytes"
+other_class = "SVSReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "YokogawaReader"
+other       = "openBytes"
+other_class = "CV7000Reader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "MiasTiffReader"
+other       = "openBytes"
+other_class = "MIASReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "NorpixReader"
+other       = "openBytes"
+other_class = "SEQReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "AndorSifReader"
+other       = "openBytes"
+other_class = "SIFReader"
+
+[[entries]]
+rust        = "open_bytes"
+rust_class  = "QuickTimeReader"
+other       = "openBytes"
+other_class = "QTReader"
+
+# is_this_type is the other method we want reliably paired, since it drives
+# format auto-detection and is where magic-byte divergences show up.
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "LsmReader"
+other       = "isThisType"
+other_class = "ZeissLSMReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "CziReader"
+other       = "isThisType"
+other_class = "ZeissCZIReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "ZviReader"
+other       = "isThisType"
+other_class = "ZeissZVIReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "XrmReader"
+other       = "isThisType"
+other_class = "ZeissXRMReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "OifReader"
+other       = "isThisType"
+other_class = "FV1000Reader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "LeicaTcsReader"
+other       = "isThisType"
+other_class = "TCSReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "LeicaLofReader"
+other       = "isThisType"
+other_class = "LOFReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "Dm2Reader"
+other       = "isThisType"
+other_class = "GatanDM2Reader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "BrukerOpusReader"
+other       = "isThisType"
+other_class = "BrukerReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "WholeSlideTiffReader"
+other       = "isThisType"
+other_class = "SVSReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "NorpixReader"
+other       = "isThisType"
+other_class = "SEQReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "AndorSifReader"
+other       = "isThisType"
+other_class = "SIFReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "YokogawaReader"
+other       = "isThisType"
+other_class = "CV7000Reader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "MiasTiffReader"
+other       = "isThisType"
+other_class = "MIASReader"
+
+[[entries]]
+rust        = "is_this_type"
+rust_class  = "QuickTimeReader"
+other       = "isThisType"
+other_class = "QTReader"
+
+# set_id is the FormatReader initialize-for-a-file entry point — in Rust it is
+# the heaviest method per reader (metadata parse, series build-up, OME-XML).
+# Pinning per renamed class prevents a trivially-overriding Java setId from
+# stealing the pair.
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "LsmReader"
+other       = "setId"
+other_class = "ZeissLSMReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "CziReader"
+other       = "setId"
+other_class = "ZeissCZIReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "ZviReader"
+other       = "setId"
+other_class = "ZeissZVIReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "XrmReader"
+other       = "setId"
+other_class = "ZeissXRMReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "OifReader"
+other       = "setId"
+other_class = "FV1000Reader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "LeicaTcsReader"
+other       = "setId"
+other_class = "TCSReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "LeicaLofReader"
+other       = "setId"
+other_class = "LOFReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "Dm2Reader"
+other       = "setId"
+other_class = "GatanDM2Reader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "BrukerOpusReader"
+other       = "setId"
+other_class = "BrukerReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "WholeSlideTiffReader"
+other       = "setId"
+other_class = "SVSReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "YokogawaReader"
+other       = "setId"
+other_class = "CV7000Reader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "MiasTiffReader"
+other       = "setId"
+other_class = "MIASReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "NorpixReader"
+other       = "setId"
+other_class = "SEQReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "AndorSifReader"
+other       = "setId"
+other_class = "SIFReader"
+
+[[entries]]
+rust        = "set_id"
+rust_class  = "QuickTimeReader"
+other       = "setId"
+other_class = "QTReader"
+
+# close — per-reader cleanup; Java classes commonly override it to null out
+# format-specific caches, and those overrides are heavily documented — without
+# pinning, a trivial Rust close() pairs with an unrelated bulky Java close().
+
+[[entries]]
+rust        = "close"
+rust_class  = "LsmReader"
+other       = "close"
+other_class = "ZeissLSMReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "CziReader"
+other       = "close"
+other_class = "ZeissCZIReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "ZviReader"
+other       = "close"
+other_class = "ZeissZVIReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "XrmReader"
+other       = "close"
+other_class = "ZeissXRMReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "OifReader"
+other       = "close"
+other_class = "FV1000Reader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "LeicaTcsReader"
+other       = "close"
+other_class = "TCSReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "LeicaLofReader"
+other       = "close"
+other_class = "LOFReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "Dm2Reader"
+other       = "close"
+other_class = "GatanDM2Reader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "BrukerOpusReader"
+other       = "close"
+other_class = "BrukerReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "WholeSlideTiffReader"
+other       = "close"
+other_class = "SVSReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "YokogawaReader"
+other       = "close"
+other_class = "CV7000Reader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "MiasTiffReader"
+other       = "close"
+other_class = "MIASReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "NorpixReader"
+other       = "close"
+other_class = "SEQReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "AndorSifReader"
+other       = "close"
+other_class = "SIFReader"
+
+[[entries]]
+rust        = "close"
+rust_class  = "QuickTimeReader"
+other       = "close"
+other_class = "QTReader"
