@@ -1,0 +1,5 @@
+external-fixtures/data/
+external-fixtures/logs/
+__pycache__/
+*.py[cod]
+*.class
