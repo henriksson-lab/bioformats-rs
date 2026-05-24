@@ -35,12 +35,18 @@ pub struct PrairieReader {
 
 impl PrairieReader {
     pub fn new() -> Self {
-        PrairieReader { path: None, meta: None, tiff_files: Vec::new() }
+        PrairieReader {
+            path: None,
+            meta: None,
+            tiff_files: Vec::new(),
+        }
     }
 }
 
 impl Default for PrairieReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
@@ -60,9 +66,21 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
             if let Some(key) = extract_attr(line, "key") {
                 if let Some(val) = extract_attr(line, "value") {
                     match key {
-                        "pixelsPerLine" => { if let Ok(v) = val.parse::<u32>() { width = v; } }
-                        "linesPerFrame" => { if let Ok(v) = val.parse::<u32>() { height = v; } }
-                        "bitDepth" => { if let Ok(v) = val.parse::<u32>() { bits = v; } }
+                        "pixelsPerLine" => {
+                            if let Ok(v) = val.parse::<u32>() {
+                                width = v;
+                            }
+                        }
+                        "linesPerFrame" => {
+                            if let Ok(v) = val.parse::<u32>() {
+                                height = v;
+                            }
+                        }
+                        "bitDepth" => {
+                            if let Ok(v) = val.parse::<u32>() {
+                                bits = v;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -113,7 +131,8 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
 
 impl FormatReader for PrairieReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("xml"))
             .unwrap_or(false)
     }
@@ -150,11 +169,19 @@ impl FormatReader for PrairieReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -166,7 +193,12 @@ impl FormatReader for PrairieReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         if self.tiff_files.is_empty() {
-            return Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample()]);
+            return Ok(vec![
+                0u8;
+                meta.size_x as usize
+                    * meta.size_y as usize
+                    * meta.pixel_type.bytes_per_sample()
+            ]);
         }
         let tiff_path = self.tiff_files[plane_index as usize % self.tiff_files.len()].clone();
         let mut tiff = crate::tiff::TiffReader::new();
@@ -174,7 +206,14 @@ impl FormatReader for PrairieReader {
         tiff.open_bytes(0)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();
@@ -209,12 +248,18 @@ pub struct LeicaTcsReader {
 
 impl LeicaTcsReader {
     pub fn new() -> Self {
-        LeicaTcsReader { path: None, meta: None, tiff_files: Vec::new() }
+        LeicaTcsReader {
+            path: None,
+            meta: None,
+            tiff_files: Vec::new(),
+        }
     }
 }
 
 impl Default for LeicaTcsReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
@@ -231,17 +276,21 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         // Parse <Image Width="N" Height="N"> elements
         if line.contains("<Image") {
             if let Some(w) = extract_attr(line, "Width") {
-                if let Ok(v) = w.parse::<u32>() { width = v; }
+                if let Ok(v) = w.parse::<u32>() {
+                    width = v;
+                }
             }
             if let Some(h) = extract_attr(line, "Height") {
-                if let Ok(v) = h.parse::<u32>() { height = v; }
+                if let Ok(v) = h.parse::<u32>() {
+                    height = v;
+                }
             }
         }
 
         // Collect attachment files
         if line.contains("<Attachment") || line.contains("FileName") {
-            if let Some(fname) = extract_attr_owned(line, "Name")
-                .or_else(|| extract_attr_owned(line, "FileName"))
+            if let Some(fname) =
+                extract_attr_owned(line, "Name").or_else(|| extract_attr_owned(line, "FileName"))
             {
                 if fname.to_ascii_lowercase().ends_with(".tif")
                     || fname.to_ascii_lowercase().ends_with(".tiff")
@@ -281,7 +330,8 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
 
 impl FormatReader for LeicaTcsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("xml"))
             .unwrap_or(false)
     }
@@ -317,11 +367,19 @@ impl FormatReader for LeicaTcsReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -341,7 +399,14 @@ impl FormatReader for LeicaTcsReader {
         tiff.open_bytes(0)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();

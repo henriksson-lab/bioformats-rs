@@ -1,135 +1,189 @@
-# TODO — toward read/write parity with Java Bio-Formats
+# TODO - broad translation audit
 
-Goal: bioformats-rs should read and write every data stream the upstream Java
-implementation handles. Items below are grouped from "probably incorrect pixel
-output today" down to "feature gap, errors cleanly".
+This backlog was rebuilt from a broad code audit on 2026-05-24, with parallel
+review slices for TIFF, vendor formats, and API/wrapper/writer behavior.
+It was triaged again on 2026-05-24 to deprecate or merge stale older backlog
+items after recent TIFF, OME, CZI, AVI, DICOM, ND2, and LSM fixes.
 
-Most entries come from a cross-language audit against the Java tree using
-`ccc-rs compare/missing/constants-diff` (with `ccc_mapping.toml`) plus targeted
-reading of both implementations. See FEATURES.md for the inventory of declared
-stubs.
+Priorities:
 
-## 1. Translation bugs (wrong or missing pixel logic)
+- P0: likely wrong pixels, panics, infinite loops, or misleading public API.
+- P1: important format parity gaps or malformed output risks.
+- P2: lower-risk compatibility, coverage, documentation, and long-term parity.
 
-- [ ] **LsmReader::open_bytes — missing channel-split path**
-  - `src/formats/lsm.rs:238` delegates to `inner.open_bytes` only.
-  - Java `ZeissLSMReader.openBytes` (components/formats-gpl/…/ZeissLSMReader.java:393–435) takes a second path when `splitPlanes && getSizeC() > 1 && ifds.size() == getSizeZ() * getSizeT()`: loads one IFD buffer per (Z,T) and emits per-channel bytes via `ImageTools.splitChannels`.
-  - Result today: multi-channel LSMs where one IFD holds all channels return interleaved/incorrect bytes.
+## P1 - format parity and output integrity
 
-- [ ] **CziReader::open_bytes — missing mosaic/tile assembly and pyramid selection**
-  - `src/formats/czi.rs:314` reads a single subblock and trims/pads to the plane size.
-  - Java `ZeissCZIReader.openBytes` (~105 LOC, cognitive 92) assembles mosaic tiles, honours pyramid resolution level, and supports X/Y subregions.
-  - Result today: multi-tile or multi-resolution CZI datasets render incorrectly (missing tiles, no crop honoured).
+- [ ] **Fix fixture-backed reader failures from the 2026-05-24 smoke audit.**
+  A bounded external smoke set was downloaded with
+  `python3 external-fixtures/scripts/download_ome_samples.py --set ome-tiff-smoke --set png-smoke --set amiramesh-smoke --set gatan-smoke --set ecat7-smoke --set mrc-smoke --set czi-smoke --set dicom-smoke --set nrrd-smoke --set cellomics-smoke --set sdt-smoke --max-bytes 60000000 --max-total-bytes 350000000`.
+  Passing formats are covered by
+  `tests/external_fixtures_test.rs::external_multi_format_smoke_set_opens_and_reads_first_plane`.
+  Remaining failures to translate/fix are:
+  the NRRD sidecar manifest/download changes need to be exercised by
+  downloading the detached raw sidecars before NRRD can be promoted to passing
+  external smoke coverage.
+  Completed from this item: CZI smoke files open/read all 63 reported planes
+  as `672x512`; DICOM/J2KI smoke files open/read JPEG 2000 first planes;
+  SDT opens/reads the first `512x512` FLIM plane from the 8192-plane smoke
+  file; Cellomics `.DIB` opens/reads as `512x512`, one 16-bit plane; Gatan
+  `.dm4` opens/reads as `1024x1024`, one 32-bit plane; and ECAT7 now matches
+  Java for the small fixture at `512x512`, 10 planes.
 
-- [ ] **TIFF decompress — real strip dimensions not threaded through**
-  - `src/tiff/compression.rs:46–64` calls `decompress_ccitt_group3/4`, `decompress_nikon` with width/height = `0, 0` (and bpp = `0` for Nikon).
-  - Even after the stub bodies in `src/common/codec.rs:167,174,213` are implemented, these codecs need the actual strip/tile dimensions from the IFD (`image_width`, `image_length`, `bits_per_sample`). Plumb them through `decompress()`'s signature.
+- [ ] **Add real CZI mosaic/pyramid fixture coverage.**
+  `src/formats/czi.rs` now assembles synthetic multi-subblock mosaic planes,
+  supports cropped regions via assembled planes, and selects synthetic pyramid
+  levels keyed by the CZI `R` dimension. Remaining work is validating those
+  paths against real Zeiss CZI fixtures, including any pyramid files that do
+  not expose resolution levels through `R`. A fixture-backed audit on
+  2026-05-24 downloaded `czi-smoke`; all three real smoke files now open and
+  read every reported plane with Java-matching dimensions and byte counts.
+  Add real fixtures with known expected pixels/metadata before replacing the
+  synthetic-only coverage:
+  `czi_mosaic_tiles.czi` should contain multiple subblocks for one logical
+  plane with non-zero X/Y tile offsets and expected full-plane plus cropped
+  region bytes, and `czi_pyramid_r_levels.czi`/`czi_pyramid_non_r_levels.czi`
+  should expose at least two resolution levels with asserted dimensions and
+  pixels, including one pyramid encoding that does not advertise levels solely
+  through the `R` dimension.
 
-- [ ] **Reader `close` methods that don't null out format-specific state**
-  - `missing --stub-loc-ratio 0.2` flagged ~30 one-line `close` implementations.
-  - Safe where `close` just forwards to an `inner` reader. **Not safe** on readers that hold their own owned state (path, meta, parsed caches) — e.g. `LsmReader`, `CziReader`, `ZviReader`, `XrmReader`, `VolocityReader`, `MicromanagerReader`. Java's equivalents (e.g. `SVSReader.close` at SVSReader.java:228–249) null per-file fields so `setId` on a second file starts clean.
-  - Action: audit each non-forwarding reader's `close` — anything held in `self` that is file-specific must be reset.
+- [ ] **Add real ND2 frame metadata/component fixtures.**
+  `src/formats/nd2.rs` no longer strips `data.len() - expected` blindly: it
+  now decodes exact raw payloads, explicit 8-byte/4096-byte framed payloads,
+  zlib streams, JPEG2000 signatures, XML `value="..."` attributes, cropped
+  sensor rectangles from grabber-camera metadata, non-contiguous chunk maps,
+  and gapped chunk scans; it rejects unknown oversized frame encodings. The
+  current external ND2 regression set opens and reads the first plane with
+  dimensions/byte counts matching Java Bio-Formats for `BF007.nd2`,
+  `Exception_2.nd2`, `MeOh_high_fluo_003.nd2`, and `header_test2.nd2`.
+  To complete this item, add real ND2 fixtures covering all of:
+  per-plane metadata/attributes varying by `ImageDataSeq|N` with asserted OME
+  metadata/original metadata values, multi-component layouts where `uiComp > 1`
+  and channel/interleaving can be asserted from pixels, and a valid
+  JPEG2000-compressed ND2 frame whose decoded bytes are known.
 
-- [ ] **Verify wrapping-reader method delegation is complete**
-  - `WholeSlideTiffReader` (`src/formats/svs.rs`) and similar TIFF-wrapper readers forward many methods to `inner`. Java SVS mirrors this pattern, so delegation is fine *if complete*. Confirm each of: `is_this_type_by_bytes`, `set_series`, `resolution_count`, `set_resolution`, `open_thumb_bytes` matches the Java counterpart's behaviour (not just compiles).
+- [ ] **Add real MRC/CCP4/IMOD orientation fixture coverage.**
+  `src/formats/mrc.rs` now has synthetic unit coverage for the row-order
+  heuristics: legacy lower-left-origin row flipping, no flip when `MAPR` is not
+  the Y axis, and no flip when Y origin/start metadata indicates the first
+  stored row is already the top edge. A broad local fixture audit on 2026-05-24
+  found no real `.mrc`, `.mrcs`, `.ccp4`, `.map`, or `.rec` fixtures in this
+  checkout outside build outputs, and no matching members/files in
+  `bioformats_package.jar` or the checked-out
+  `java-bioformats/{artifacts,components,jar}` tree. Public OME samples are now
+  tracked by `external-fixtures/manifests/ome_sample_roots.tsv` and can be
+  fetched into ignored local storage with
+  `python3 external-fixtures/scripts/download_ome_samples.py --category mrc`.
+  To complete this item, add real fixtures with known expected pixels/metadata
+  for all of:
+  a legacy lower-left-origin MRC requiring a row flip, a top-origin or top-start
+  MRC that must not flip, a CCP4/MRC2014 file with non-default `MAPC/MAPR/MAPS`
+  to assert logical X/Y/Z dimensions and physical-size axis remapping, and an
+  IMOD `.rec` fixture that exercises IMOD mode-0 signedness plus row-order
+  metadata.
 
-## 2. Incomplete parsers (reader opens file but drops metadata)
+## P2 - compatibility, coverage, and long-term parity
 
-Signal: `constants-diff` showed 100+ magic strings/tag names present only on the Java side per function. Rust reads pixels but skips optional metadata the Java reader stores in `originalMetadata`.
+- [ ] **Implement remaining codec stubs.**
+  JPEG2000, optional JPEG-XR, and MSRLE RLE8 support exist. A local-only audit
+  on 2026-05-24 found no existing Rust dependency or local fixture that can
+  safely validate the remaining stubs in `src/common/codec.rs`: CCITT Group 3,
+  CCITT Group 4, Nikon NEF, Motion JPEG-B, QuickTime RLE, Apple RPZA, LZO, and
+  standalone Huffman. `Cargo.toml`/`Cargo.lock` currently provide JPEG, JPEG
+  2000, optional JPEG-XR, zstd, deflate, and LZW/PackBits support, but no fax,
+  Nikon, LZO, QuickTime RLE, RPZA, or standalone Huffman decoder. The only
+  remaining stubs reached through registered TIFF decompression dispatch
+  (`src/tiff/compression.rs`) are CCITT Group 3/4 and Nikon compression code
+  34713; `tests/`, `test/`, and the checked-out `java-bioformats/` tree contain
+  no CCITT fax TIFF, Nikon NEF/NIS compressed TIFF, or known-pixel codec
+  conformance fixture. The checked-out Java `formats-bsd` codec classes for
+  MJPB, QTRLE, RPZA, LZO, Huffman, and MSRLE are adapters around `ome.codecs.*`;
+  the referenced implementation sources are not present locally, so they cannot
+  be ported or validated from this checkout alone. To complete this item, add
+  one of: a CCITT Group 3/4 decoder dependency plus small TIFF or strip-level
+  fixtures with known decoded 1-bit pixels and FillOrder/T4/T6 option coverage;
+  a Nikon NEF compressed TIFF fixture with known raw pixels and enough metadata
+  to validate bpp/predictor behavior; the missing `ome-codecs` implementation
+  sources plus independent known-output fixtures; or dedicated spec-backed
+  fixtures for the non-TIFF video/LZO/Huffman stubs before wiring them into
+  readers.
 
-- [ ] **IPLab (`src/formats/norpix.rs::IplabReader`)** — Java `IPLabReader.parseTags` emits tag names (`fini`, `clut`, `norm`, `roi`, `head`, `mmrc`, `user`, LUT labels, ROI shape codes). Rust parses the pixel payload but not the tag dictionary.
-- [ ] **ZVI (`src/formats/zvi.rs`)** — `parse_zvi` misses Java `ZeissZVIReader.parseImageNames` / tag-code table (constants drift score 73).
-- [ ] **DICOM (`src/formats/dicom.rs::parse_dicom`)** — 94 cognitive points on the Rust side but constants diverge from `DicomReader.parseMDB` (score 107); confirm DICOM tag dictionary coverage.
-- [ ] **CellH5 (`src/formats/cellh5.rs::parse_cellh5`)** — HDF5 attribute/dataset names not in the Rust constants.
-- [ ] **BigDataViewer (`src/formats/bdv.rs::parse_bdv`)** — XML element/attribute names diverge from Java.
-- [ ] **Metamorph MM metadata (`src/formats/metamorph.rs::parse_mm_metadata`)** — key set smaller than `MetamorphReader.getOriginalMetadata`.
+## Deprecated or merged audit items
 
-Re-run after each fix:
+These items came from older audit phrasing and should not be tracked as
+separate active tasks anymore.
+
+- [x] **Improve metadata parity for partially parsed vendor formats.**
+  Completed as a standalone item. IPLab now preserves parsed header fields plus
+  common post-pixel original metadata tags (`note`, `head`, and indexed `clut`);
+  ZVI now preserves per-plane tag IDs plus known tag names/values; CellH5
+  preserves HDF5 attributes/dataset summaries; DICOM has targeted
+  dictionary-name/value decoding for common public tags; BDV preserves
+  companion XML original metadata; and Metamorph preserves UIC4 raw string
+  metadata plus simple key/value entries.
+
+- [x] **Generic "broaden wrapper and writer tests beyond happy paths".**
+  Deprecated as a standalone item. Its concrete coverage requirements are now
+  folded into active tasks for wrapper OME metadata consistency,
+  `ChannelMerger` indexing, `DimensionSwapper` bounds, min/max endianness,
+  writer plane validation, and region validation.
+
+- [x] **Standalone "surface structural TIFF tag decode failures".**
+  Merged into active TIFF parser hardening and required strip/tile tag
+  validation. Structural tag failures should be handled while adding checked
+  IFD arithmetic, visited-offset detection, and explicit required-tag errors.
+
+- [x] **Broad "OME-TIFF `TiffData` mapping is missing".**
+  Deprecated because embedded OME-TIFF `TiffData` logical-plane mapping now
+  exists. Remaining active work is namespace-aware XML parsing and stronger
+  tokenizer compatibility.
+
+- [x] **Broad "YCbCr returns raw bytes".**
+  Deprecated because 8-bit chunky non-JPEG TIFF YCbCr now decodes to planar RGB.
+  Remaining active work is unsupported tiled/JPEG/subsample edge coverage and
+  compression/predictor test expansion.
+
+- [x] **Broad "CZI ZSTD_1 unsupported".**
+  Deprecated because CZI ZSTD_1 wrapper decoding is implemented. Remaining CZI
+  active work is logical-channel accounting, mosaic/tile assembly, pyramids,
+  and richer metadata.
+
+- [x] **Broad "AVI row padding/BGR conversion missing".**
+  Deprecated because uncompressed DIB row padding, bottom-up order, and BGR/RGB
+  conversion have targeted coverage. Remaining AVI active work is RIFF/index
+  parsing and compressed-stream rejection.
+
+- [x] **Broad "DICOM files without preamble are unsupported".**
+  Deprecated because raw no-preamble explicit VR little-endian datasets are now
+  supported. Remaining DICOM active work is implicit VR fallback, transfer
+  syntax coverage, photometric handling, and pixel-data validation.
+
+- [x] **Broad "ND2 chunk map ignored".**
+  Deprecated because the EOF chunk map is now parsed. Remaining ND2 active work
+  is structured per-frame decoding instead of prefix stripping.
+
+- [x] **Broad "audit synthetic-pixel registered readers".**
+  Completed for the remaining AFM/SPM/SEM readers on 2026-05-24. Header-backed
+  readers now require declared dimensions and sufficient payload bytes before
+  exposing metadata, region reads crop real decoded planes, and heuristic-only
+  raw binary extensions return descriptive `UnsupportedFormat` errors instead
+  of fake metadata or zero-filled pixels.
+
+## Continuous audit commands
+
+Use these after substantive translation changes:
+
+```bash
+HDF5_DIR=/tmp/bioformats-hdf5-root cargo test
+cargo clippy --all-targets --all-features
+git diff --check
 ```
-ccc-rs constants-diff rust.json java.json \
-  --mapping ccc_mapping.toml | grep '^== <reader>'
-```
 
-## 3. Codec stubs (explicit `UnsupportedFormat`)
+For Java parity checks when `java-bioformats/` and `ccc-rs` are available:
 
-In `src/common/codec.rs`, these return "not yet implemented" and block the readers that reach them:
-
-- [ ] `decompress_ccitt_group3` / `decompress_ccitt_group4` — blocks some scanner TIFFs.
-- [ ] `decompress_nikon` — blocks Nikon NEF inside TIFF wrappers.
-- [ ] `decompress_msrle` — blocks AVI MSRLE.
-- [ ] `decompress_mjpb` (Motion JPEG-B) — blocks QuickTime / AVI.
-- [ ] `decompress_rpza`, `decompress_qtrle` — blocks legacy QuickTime.
-- [ ] `decompress_lzo` — used by a couple of proprietary readers.
-- [ ] Thunderscan (inline error in `src/tiff/compression.rs:57`) — rare; safe to keep last.
-
-When implementing any of these, also fix the "real strip dimensions" plumbing (section 1).
-
-## 4. Reader stubs (already listed in FEATURES.md)
-
-25 readers return `UnsupportedFormat` on `set_id`. Filling them closes read-side parity directly. Priority order below picks formats that are (a) documented or (b) common in real datasets:
-
-- [ ] `QuickTimeReader` (.mov) — QuickTime atom parser (benefits MJPEG-B too)
-- [ ] `SlideBookReader` (.sld) — reverse-engineered format docs exist
-- [ ] `OirReader` (.oir) — Olympus OIR; needs OLE2 compound-doc reader
-- [ ] `VolocityLibraryReader` / `VolocityClippingReader` (.acff) — OLE2 as above
-- [ ] `XrmReader` (.xrm/.txrm) — OLE2 Zeiss X-ray microscope (shared code with above)
-- [ ] `FlowSightReader` (.cif) — Amnis flow cytometry
-- [ ] `LeicaLofReader` (.lof) — binary format; LIF parser already exists, reuse
-- [ ] Remaining proprietary readers on best-effort basis (see FEATURES.md table)
-
-A single shared OLE2/Compound-Document reader unblocks four of the above.
-
-## 5. Writer gaps
-
-Current writers (14): AVI, BMP, DICOM, EPS, FITS, ICS, JPEG, MetaImage, MRC, NRRD, OMEXML, PNG, Targa, TIFF (+ PyramidOMETiff). Java also ships:
-
-- [ ] `APNGWriter` — animated PNG; Rust has `PngReader` but no animated output.
-- [ ] `CellH5Writer` — HDF5-backed output (needs `hdf5` dep already in features).
-- [ ] `JPEG2000Writer` — needs jpeg2k feature, already optional on reader side.
-- [ ] `OMETiffWriter` — a non-pyramid OME-TIFF writer (current `PyramidOmeTiffWriter` is pyramid-only).
-- [ ] `QTWriter` — paired with QuickTime reader.
-- [ ] `V3DrawWriter` — Vaa3D raw; small and self-contained.
-- [ ] `ImageIOWriter` — Java's generic fallback; Rust has `image` crate, decide whether to add or skip.
-
-## 6. Reader wrappers missing in Rust
-
-Java has 8, Rust has 5 (`ChannelSeparator`, `ChannelMerger`, `ChannelFiller`, `DimensionSwapper`, `MinMaxCalculator`). Missing:
-
-- [ ] `FileStitcher` (Rust has `stitcher.rs` but it's not wired through `ImageReader`).
-- [ ] `Memoizer` as a *wrapper* (Rust has `memoizer.rs` but as standalone `.bfmemo` helper).
-- [ ] `BufferedImageReader` / `ReaderWrapper` base equivalent — decide whether the trait composition in Rust already covers this or whether a shared base wrapper struct is needed.
-
-## 7. Metadata-store gap
-
-`missing` shows Java has extensive `MetadataStore` / `MetadataConverter` /
-`MetadataTools` helpers (populatePixels, verifyMinimumPopulated, createLSID,
-setChannelGlobalMinMax, ModuloAnnotation factories…). Rust's `OmeMetadata`
-covers 21 types but no equivalent populate/verify/merge helpers.
-
-- [ ] Port `MetadataTools.populatePixels` / `populateMetadata` equivalents so readers don't all re-implement OME-XML construction inline.
-- [ ] Port `verifyMinimumPopulated` as a debug-only check.
-- [ ] Port `MetadataConverter.convertMetadata` for writer input.
-- [ ] Wire `ModuloAnnotation` / `OriginalMetadataAnnotation` into OME-XML serialization in `OmeXmlWriter`.
-
-## 8. Continuous audit
-
-Re-run after each change:
-
-```
-# 1. rebuild reports
+```bash
 ccc-rs analyze src                        -l rust --recurse -o rust.json
 ccc-rs analyze java-bioformats/components -l java --recurse -o java.json
-
-# 2. Top deviations — look for new surprises near the top
 ccc-rs compare rust.json java.json --mapping ccc_mapping.toml --top 30
-
-# 3. Stub-likelihood partial matches
 ccc-rs missing rust.json java.json --mapping ccc_mapping.toml --stub-loc-ratio 0.2
-
-# 4. Magic-number / string drift per function
 ccc-rs constants-diff rust.json java.json --mapping ccc_mapping.toml
 ```
-
-When a new reader is added, append its mapping entries to `ccc_mapping.toml`
-(class rename + `open_bytes`/`set_id`/`close`/`is_this_type` pins) to keep the
-diff meaningful.

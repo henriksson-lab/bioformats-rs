@@ -40,7 +40,9 @@ fn parse_sif_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
     loop {
         line.clear();
         let n = reader.read_line(&mut line).map_err(BioFormatsError::Io)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let trimmed = line.trim();
 
         // Look for "Ydet " (height) and "Xdet " (width) labels from older SIF versions
@@ -66,10 +68,15 @@ fn parse_sif_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
                     parts.get(10).and_then(|s| s.parse::<u32>().ok()),
                     parts.get(11).and_then(|s| s.parse::<u32>().ok()),
                 ) {
-                    if w > 0 && h > 0 { width = w; height = h; }
+                    if w > 0 && h > 0 {
+                        width = w;
+                        height = h;
+                    }
                 }
                 if let Some(n) = parts.get(12).and_then(|s| s.parse::<u32>().ok()) {
-                    if n > 0 { num_frames = n; }
+                    if n > 0 {
+                        num_frames = n;
+                    }
                 }
             }
         }
@@ -104,14 +111,25 @@ pub struct AndorSifReader {
 }
 
 impl AndorSifReader {
-    pub fn new() -> Self { AndorSifReader { path: None, meta: None, data_offset: 0 } }
+    pub fn new() -> Self {
+        AndorSifReader {
+            path: None,
+            meta: None,
+            data_offset: 0,
+        }
+    }
 }
 
-impl Default for AndorSifReader { fn default() -> Self { Self::new() } }
+impl Default for AndorSifReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatReader for AndorSifReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("sif"))
             .unwrap_or(false)
     }
@@ -155,29 +173,53 @@ impl FormatReader for AndorSifReader {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<()> { self.path = None; self.meta = None; Ok(()) }
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
     }
-    fn series(&self) -> usize { 0 }
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn series_count(&self) -> usize {
+        1
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         let bps = 4usize; // float32
         let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;
         let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = 4usize;
@@ -186,7 +228,7 @@ impl FormatReader for AndorSifReader {
         let mut out = Vec::with_capacity(h as usize * out_row);
         for r in 0..h as usize {
             let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize*bps .. x as usize*bps + out_row]);
+            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
         }
         Ok(out)
     }

@@ -24,12 +24,17 @@ pub struct SimfcsReader {
 
 impl SimfcsReader {
     pub fn new() -> Self {
-        SimfcsReader { path: None, meta: None }
+        SimfcsReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for SimfcsReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn simfcs_pixel_type(ext: &str) -> Option<PixelType> {
@@ -43,7 +48,9 @@ fn simfcs_pixel_type(ext: &str) -> Option<PixelType> {
 
 impl FormatReader for SimfcsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str())
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("b64") | Some("r64") | Some("i64"))
     }
@@ -53,7 +60,9 @@ impl FormatReader for SimfcsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let ext = path.extension().and_then(|e| e.to_str())
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
         let pixel_type = simfcs_pixel_type(&ext)
@@ -62,7 +71,11 @@ impl FormatReader for SimfcsReader {
         let bps = pixel_type.bytes_per_sample();
         let file_size = fs::metadata(path).map_err(BioFormatsError::Io)?.len() as usize;
         let frame_bytes = 256 * 256 * bps;
-        let n_frames = if frame_bytes > 0 { file_size / frame_bytes } else { 1 };
+        let n_frames = if frame_bytes > 0 {
+            file_size / frame_bytes
+        } else {
+            1
+        };
         let image_count = n_frames.max(1) as u32;
 
         let meta = ImageMetadata {
@@ -98,11 +111,19 @@ impl FormatReader for SimfcsReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -119,13 +140,21 @@ impl FormatReader for SimfcsReader {
 
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = fs::File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();
@@ -159,24 +188,33 @@ pub struct LambertFlimReader {
 
 impl LambertFlimReader {
     pub fn new() -> Self {
-        LambertFlimReader { path: None, meta: None }
+        LambertFlimReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for LambertFlimReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for LambertFlimReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str())
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("asc"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
         // Check for Lambert Instruments ASCII heuristic
-        if header.len() < 8 { return false; }
+        if header.len() < 8 {
+            return false;
+        }
         let s = std::str::from_utf8(&header[..header.len().min(256)]).unwrap_or("");
         s.contains("Lambert") || s.contains("GlobalImages") || s.starts_with('#')
     }
@@ -190,13 +228,21 @@ impl FormatReader for LambertFlimReader {
         for line in content.lines() {
             let line = line.trim();
             if let Some(val) = parse_key_value(line, "X-Resolution") {
-                if let Ok(v) = val.parse::<u32>() { width = v; }
+                if let Ok(v) = val.parse::<u32>() {
+                    width = v;
+                }
             } else if let Some(val) = parse_key_value(line, "Width") {
-                if let Ok(v) = val.parse::<u32>() { width = v; }
+                if let Ok(v) = val.parse::<u32>() {
+                    width = v;
+                }
             } else if let Some(val) = parse_key_value(line, "Y-Resolution") {
-                if let Ok(v) = val.parse::<u32>() { height = v; }
+                if let Ok(v) = val.parse::<u32>() {
+                    height = v;
+                }
             } else if let Some(val) = parse_key_value(line, "Height") {
-                if let Ok(v) = val.parse::<u32>() { height = v; }
+                if let Ok(v) = val.parse::<u32>() {
+                    height = v;
+                }
             }
         }
 
@@ -233,11 +279,19 @@ impl FormatReader for LambertFlimReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -252,7 +306,14 @@ impl FormatReader for LambertFlimReader {
         Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * 4])
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();

@@ -18,6 +18,8 @@ use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
+const CELLH5_METADATA_NODE_LIMIT: usize = 512;
+
 pub struct CellH5Reader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -86,6 +88,145 @@ fn find_image_datasets(file: &hdf5::File) -> Vec<String> {
     paths
 }
 
+fn hdf5_attr_value(attr: &hdf5::Attribute) -> MetadataValue {
+    if let Ok(s) = attr.read_scalar::<hdf5::types::VarLenUnicode>() {
+        return MetadataValue::String(s.as_str().to_string());
+    }
+    if let Ok(s) = attr.read_scalar::<hdf5::types::VarLenAscii>() {
+        return MetadataValue::String(s.as_str().trim_matches('\0').trim().to_string());
+    }
+    if let Ok(s) = attr.read_scalar::<hdf5::types::FixedAscii<64>>() {
+        return MetadataValue::String(s.as_str().trim_matches('\0').trim().to_string());
+    }
+    if let Ok(s) = attr.read_scalar::<hdf5::types::FixedUnicode<64>>() {
+        return MetadataValue::String(s.as_str().trim_matches('\0').trim().to_string());
+    }
+    if let Ok(v) = attr.read_scalar::<i64>() {
+        return MetadataValue::Int(v);
+    }
+    if let Ok(v) = attr.read_scalar::<i32>() {
+        return MetadataValue::Int(v as i64);
+    }
+    if let Ok(v) = attr.read_scalar::<u64>() {
+        return MetadataValue::Int(v.min(i64::MAX as u64) as i64);
+    }
+    if let Ok(v) = attr.read_scalar::<u32>() {
+        return MetadataValue::Int(v as i64);
+    }
+    if let Ok(v) = attr.read_scalar::<f64>() {
+        return MetadataValue::Float(v);
+    }
+    if let Ok(v) = attr.read_scalar::<f32>() {
+        return MetadataValue::Float(v as f64);
+    }
+    if let Ok(v) = attr.read_scalar::<bool>() {
+        return MetadataValue::Bool(v);
+    }
+    if let Ok(bytes) = attr.read_raw::<u8>() {
+        if !bytes.is_empty()
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+        {
+            return MetadataValue::String(
+                String::from_utf8_lossy(&bytes)
+                    .trim_matches('\0')
+                    .trim()
+                    .to_string(),
+            );
+        }
+        return MetadataValue::Bytes(bytes);
+    }
+
+    MetadataValue::String(format!("shape={:?}", attr.shape()))
+}
+
+fn collect_group_attrs(
+    group: &hdf5::Group,
+    path: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    if let Ok(names) = group.attr_names() {
+        for name in names {
+            if let Ok(attr) = group.attr(&name) {
+                meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
+            }
+        }
+    }
+}
+
+fn collect_dataset_metadata(
+    dataset: &hdf5::Dataset,
+    path: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    let dtype_size = dataset.dtype().map(|d| d.size()).unwrap_or(0);
+    meta_map.insert(
+        format!("cellh5_dataset:{path}"),
+        MetadataValue::String(format!(
+            "shape={:?}; dtype_size={dtype_size}",
+            dataset.shape()
+        )),
+    );
+
+    if let Ok(names) = dataset.attr_names() {
+        for name in names {
+            if let Ok(attr) = dataset.attr(&name) {
+                meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
+            }
+        }
+    }
+}
+
+fn collect_file_attrs(file: &hdf5::File, meta_map: &mut HashMap<String, MetadataValue>) {
+    if let Ok(names) = file.attr_names() {
+        for name in names {
+            if let Ok(attr) = file.attr(&name) {
+                meta_map.insert(format!("cellh5_attr:/@{name}"), hdf5_attr_value(&attr));
+            }
+        }
+    }
+}
+
+fn collect_hdf5_metadata(
+    file: &hdf5::File,
+    path: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+    visited: &mut usize,
+) {
+    if *visited >= CELLH5_METADATA_NODE_LIMIT {
+        return;
+    }
+    *visited += 1;
+
+    let group = match file.group(path) {
+        Ok(group) => group,
+        Err(_) => return,
+    };
+    collect_group_attrs(&group, path, meta_map);
+
+    let members = match group.member_names() {
+        Ok(members) => members,
+        Err(_) => return,
+    };
+    for member in members {
+        if *visited >= CELLH5_METADATA_NODE_LIMIT {
+            return;
+        }
+        let child_path = if path == "/" {
+            format!("/{member}")
+        } else {
+            format!("{path}/{member}")
+        };
+        if let Ok(dataset) = file.dataset(&child_path) {
+            *visited += 1;
+            collect_dataset_metadata(&dataset, &child_path, meta_map);
+        } else if file.group(&child_path).is_ok() {
+            collect_hdf5_metadata(file, &child_path, meta_map, visited);
+        }
+    }
+}
+
 fn parse_cellh5(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
     let file = hdf5::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
@@ -94,32 +235,13 @@ fn parse_cellh5(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
 
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
     meta_map.insert("format".into(), MetadataValue::String("CellH5".into()));
+    collect_file_attrs(&file, &mut meta_map);
+    collect_hdf5_metadata(&file, "/", &mut meta_map, &mut 0);
 
     if channel_paths.is_empty() {
-        // Unknown layout — return a minimal placeholder
-        log::warn!("CellH5: no image datasets found, returning placeholder metadata");
-        let meta = ImageMetadata {
-            size_x: 512,
-            size_y: 512,
-            size_z: 1,
-            size_c: 1,
-            size_t: 1,
-            pixel_type: PixelType::Uint16,
-            bits_per_pixel: 16,
-            image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: meta_map,
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        };
-        return Ok((meta, channel_paths));
+        return Err(BioFormatsError::UnsupportedFormat(
+            "CellH5: no image datasets found in supported sample/plate channel layouts".into(),
+        ));
     }
 
     // Inspect the first channel dataset to get dimensions
@@ -142,7 +264,13 @@ fn parse_cellh5(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
             let sx = shape[1] as u32;
             (sx, sy, 1u32, 1u32)
         }
-        _ => (512u32, 512u32, 1u32, 1u32),
+        _ => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "CellH5: unsupported dataset rank {} for {}",
+                shape.len(),
+                channel_paths[0]
+            )));
+        }
     };
 
     // Determine pixel type from dataset dtype size
@@ -258,10 +386,6 @@ impl FormatReader for CellH5Reader {
         let bytes_per_sample = (meta.bits_per_pixel / 8) as usize;
         let plane_bytes = plane_pixels * bytes_per_sample;
 
-        if self.channel_paths.is_empty() {
-            return Ok(vec![0u8; plane_bytes]);
-        }
-
         let sz = meta.size_z as usize;
         let sc = meta.size_c as usize;
         let z = (plane_index as usize) % sz;
@@ -274,8 +398,8 @@ impl FormatReader for CellH5Reader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        let file = hdf5::File::open(&path)
-            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+        let file =
+            hdf5::File::open(&path).map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
         let ds = file
             .dataset(&ds_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
@@ -309,7 +433,9 @@ impl FormatReader for CellH5Reader {
         if offset + plane_bytes <= raw.len() {
             Ok(raw[offset..offset + plane_bytes].to_vec())
         } else {
-            Ok(vec![0u8; plane_bytes])
+            Err(BioFormatsError::Format(format!(
+                "CellH5: dataset {ds_path} is too short for plane {plane_index}"
+            )))
         }
     }
 

@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use crate::common::error::{BioFormatsError, Result};
+use crate::common::io::peek_header;
 use crate::common::metadata::ImageMetadata;
 use crate::common::ome_metadata::OmeMetadata;
 use crate::common::reader::FormatReader;
-use crate::common::io::peek_header;
 
 /// The top-level reader that auto-detects the file format and delegates to the
 /// appropriate format-specific reader.
@@ -13,7 +13,9 @@ pub struct ImageReader {
 }
 
 /// Returns all registered format readers. Used internally by `ImageReader` and `Memoizer`.
-pub fn all_readers_pub() -> Vec<Box<dyn FormatReader>> { all_readers() }
+pub fn all_readers_pub() -> Vec<Box<dyn FormatReader>> {
+    all_readers()
+}
 
 fn all_readers() -> Vec<Box<dyn FormatReader>> {
     vec![
@@ -21,8 +23,8 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::zip::ZipReader::new()),
         Box::new(crate::formats::imaris::ImarisReader::new()),
         // HDF5-based formats (extension-only, must come after ImarisReader magic check)
-        Box::new(crate::formats::cellh5::CellH5Reader::new()),  // .ch5
-        Box::new(crate::formats::bdv::BdvReader::new()),        // .h5
+        Box::new(crate::formats::cellh5::CellH5Reader::new()), // .ch5
+        Box::new(crate::formats::bdv::BdvReader::new()),       // .h5
         Box::new(crate::formats::viff::ViffReader::new()),
         Box::new(crate::formats::mias::Al3dReader::new()),
         Box::new(crate::formats::perkinelmer::OpenlabRawReader::new()),
@@ -138,7 +140,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::tiff_wrappers::FluoviewTiffReader::new()),
         Box::new(crate::formats::tiff_wrappers::MolecularDevicesTiffReader::new()),
         // Misc extension-only / placeholder formats
-        Box::new(crate::formats::misc::Jpeg2000Reader::new()),  // magic-byte detection
+        Box::new(crate::formats::misc::Jpeg2000Reader::new()), // magic-byte detection
         Box::new(crate::formats::misc::QuickTimeReader::new()),
         Box::new(crate::formats::misc::MngReader::new()),
         Box::new(crate::formats::misc::VolocityLibraryReader::new()),
@@ -152,7 +154,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::extended::QptiffReader::new()),
         Box::new(crate::formats::extended::GelReader::new()),
         // Extended formats — binary with magic/structure
-        Box::new(crate::formats::extended::ImspectorReader::new()),  // magic "OMAS_BF_"
+        Box::new(crate::formats::extended::ImspectorReader::new()), // magic "OMAS_BF_"
         Box::new(crate::formats::extended::HamamatsuVmsReader::new()),
         Box::new(crate::formats::extended::CellomicsReader::new()),
         // Extended formats — extension-only placeholders
@@ -244,44 +246,263 @@ impl ImageReader {
     /// Open the file at `path`, detect its format, parse metadata.
     pub fn open(path: &Path) -> Result<Self> {
         let header = peek_header(path, 512).unwrap_or_default();
+        let mut best_error = None;
 
         // 1. Magic bytes
         for mut r in all_readers() {
             if r.is_this_type_by_bytes(&header) {
-                if r.set_id(path).is_ok() {
-                    return Ok(ImageReader { inner: r });
+                match r.set_id(path) {
+                    Ok(()) => return Ok(ImageReader { inner: r }),
+                    Err(err) => remember_set_id_error(&mut best_error, err),
                 }
-                // If set_id fails, try the next reader
             }
         }
 
         // 2. Extension fallback
+        let mut replacing_magic_error = best_error.is_some();
         for mut r in all_readers() {
             if r.is_this_type_by_name(path) {
-                if r.set_id(path).is_ok() {
-                    return Ok(ImageReader { inner: r });
+                match r.set_id(path) {
+                    Ok(()) => return Ok(ImageReader { inner: r }),
+                    Err(err) => {
+                        if replacing_magic_error {
+                            best_error = Some(err);
+                            replacing_magic_error = false;
+                        } else {
+                            remember_set_id_error(&mut best_error, err);
+                        }
+                    }
                 }
             }
         }
 
-        Err(BioFormatsError::UnsupportedFormat(path.display().to_string()))
+        Err(best_error
+            .unwrap_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string())))
     }
 
-    /// Return structured OME metadata if supported by the detected format.
+    /// Return structured OME metadata.
     ///
     /// Equivalent to Java Bio-Formats `reader.setMetadataStore(service.createOMEXMLMetadata())`.
-    /// Returns `Some` for CZI, OME-TIFF, and OME-XML files; `None` for all others.
-    pub fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
-    pub fn series_count(&self) -> usize { self.inner.series_count() }
-    pub fn set_series(&mut self, series: usize) -> Result<()> { self.inner.set_series(series) }
-    pub fn series(&self) -> usize { self.inner.series() }
-    pub fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
-    pub fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> { self.inner.open_bytes(plane_index) }
-    pub fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    /// Returns baseline OME metadata for all readers and enriched metadata for
+    /// formats that parse additional OME-compatible fields.
+    pub fn ome_metadata(&self) -> Option<OmeMetadata> {
+        self.inner.ome_metadata()
+    }
+    pub fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+    pub fn set_series(&mut self, series: usize) -> Result<()> {
+        self.inner.set_series(series)
+    }
+    pub fn series(&self) -> usize {
+        self.inner.series()
+    }
+    pub fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+    pub fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(plane_index)
+    }
+    pub fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         self.inner.open_bytes_region(plane_index, x, y, w, h)
     }
-    pub fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(plane_index) }
-    pub fn resolution_count(&self) -> usize { self.inner.resolution_count() }
-    pub fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
-    pub fn close(&mut self) -> Result<()> { self.inner.close() }
+    pub fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(plane_index)
+    }
+    pub fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    pub fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    pub fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+}
+
+fn remember_set_id_error(best_error: &mut Option<BioFormatsError>, err: BioFormatsError) {
+    match best_error {
+        None => *best_error = Some(err),
+        Some(BioFormatsError::UnsupportedFormat(_))
+            if !matches!(err, BioFormatsError::UnsupportedFormat(_)) =>
+        {
+            *best_error = Some(err);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImageReader;
+    use crate::common::error::BioFormatsError;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_registry_{nanos}_{name}"))
+    }
+
+    #[test]
+    fn open_returns_set_id_error_for_matching_corrupt_file() {
+        let path = temp_path("corrupt.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nnot enough png data").unwrap();
+
+        let err = match ImageReader::open(&path) {
+            Ok(_) => panic!("corrupt PNG unexpectedly opened"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, BioFormatsError::Format(_)),
+            "expected parser error, got {err:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_still_tries_extension_fallback_after_magic_set_id_error() {
+        let path = temp_path("magic_png_but_fake.fake");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nnot enough png data").unwrap();
+
+        let reader = ImageReader::open(&path).expect("fake extension fallback failed");
+
+        assert_eq!(reader.metadata().size_x, 512);
+        assert_eq!(reader.metadata().size_y, 512);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn registered_unsupported_stubs_do_not_open_with_fake_metadata() {
+        for (name, expected) in [
+            (
+                "sample.mvd2",
+                "Volocity MVD2 format reading is not yet implemented",
+            ),
+            (
+                "sample.cif",
+                "FlowSight CIF format reading is not yet implemented",
+            ),
+            ("sample.lof", "Leica LOF is a proprietary binary format"),
+            (
+                "sample.oir",
+                "Olympus OIR format requires OLE2 container parsing",
+            ),
+            (
+                "sample.acff",
+                "Volocity Library format requires OLE2/Compound Document container parsing",
+            ),
+            (
+                "sample.xrm",
+                "Zeiss XRM format reading is not yet implemented",
+            ),
+            (
+                "sample.eps",
+                "EPS/PostScript rasterization requires a PostScript interpreter",
+            ),
+            ("sample.b16", "PCO B16 file is too short"),
+            ("sample.1sc", "Bio-Rad GEL file is too short"),
+            (
+                "sample.l2d",
+                "Hamamatsu L2D image payload decoding is not implemented",
+            ),
+            (
+                "sample.ptu",
+                "PicoQuant TCSPC event stream decoding to image planes is not implemented",
+            ),
+        ] {
+            let path = temp_path(name);
+            std::fs::write(&path, b"not a real image").unwrap();
+
+            let err = match ImageReader::open(&path) {
+                Ok(_) => panic!("placeholder reader opened fake data"),
+                Err(err) => err,
+            };
+
+            assert!(
+                matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains(expected)),
+                "expected unsupported message containing {expected:?}, got {err:?}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn registered_hdf5_readers_reject_unknown_layouts_without_fake_metadata() {
+        for (name, expected) in [
+            (
+                "unknown.ch5",
+                "CellH5: no image datasets found in supported sample/plate channel layouts",
+            ),
+            (
+                "unknown.mnc",
+                "MINC/HDF5: could not find image dataset in known paths",
+            ),
+        ] {
+            let path = temp_path(name);
+            let _file = hdf5::File::create(&path).unwrap();
+            drop(_file);
+
+            let err = match ImageReader::open(&path) {
+                Ok(_) => panic!("HDF5 placeholder reader opened fake data"),
+                Err(err) => err,
+            };
+
+            assert!(
+                matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains(expected)),
+                "expected unsupported message containing {expected:?}, got {err:?}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn zip_reader_rejects_archives_without_delegated_tiff() {
+        let no_image_path = temp_path("no_image.zip");
+        write_zip_entry(&no_image_path, "README.txt", b"not image data");
+
+        let err = match ImageReader::open(&no_image_path) {
+            Ok(_) => panic!("ZIP without TIFF opened"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("does not contain a supported TIFF image entry")),
+            "expected unsupported ZIP message, got {err:?}"
+        );
+        let _ = std::fs::remove_file(&no_image_path);
+
+        let png_path = temp_path("png_only.zip");
+        write_zip_entry(&png_path, "image.png", b"not a png");
+
+        let err = match ImageReader::open(&png_path) {
+            Ok(_) => panic!("ZIP PNG placeholder opened"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("only TIFF entries are currently delegated")),
+            "expected unsupported ZIP image message, got {err:?}"
+        );
+        let _ = std::fs::remove_file(png_path);
+    }
+
+    fn write_zip_entry(path: &PathBuf, name: &str, bytes: &[u8]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(bytes).unwrap();
+        zip.finish().unwrap();
+    }
 }

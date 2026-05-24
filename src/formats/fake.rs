@@ -22,7 +22,10 @@ pub struct FakeReader {
 
 impl FakeReader {
     pub fn new() -> Self {
-        FakeReader { path: None, meta: None }
+        FakeReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
@@ -52,21 +55,41 @@ fn parse_fake_params(path: &Path) -> ImageMetadata {
             let key = key.trim();
             let val = val.trim();
             match key {
-                "sizeX" => { if let Ok(v) = val.parse() { size_x = v; } }
-                "sizeY" => { if let Ok(v) = val.parse() { size_y = v; } }
-                "sizeZ" => { if let Ok(v) = val.parse() { size_z = v; } }
-                "sizeC" => { if let Ok(v) = val.parse() { size_c = v; } }
-                "sizeT" => { if let Ok(v) = val.parse() { size_t = v; } }
+                "sizeX" => {
+                    if let Ok(v) = val.parse() {
+                        size_x = v;
+                    }
+                }
+                "sizeY" => {
+                    if let Ok(v) = val.parse() {
+                        size_y = v;
+                    }
+                }
+                "sizeZ" => {
+                    if let Ok(v) = val.parse() {
+                        size_z = v;
+                    }
+                }
+                "sizeC" => {
+                    if let Ok(v) = val.parse() {
+                        size_c = v;
+                    }
+                }
+                "sizeT" => {
+                    if let Ok(v) = val.parse() {
+                        size_t = v;
+                    }
+                }
                 "pixelType" => {
                     pixel_type = match val.to_ascii_lowercase().as_str() {
-                        "uint8"   => PixelType::Uint8,
-                        "uint16"  => PixelType::Uint16,
-                        "uint32"  => PixelType::Uint32,
-                        "int8"    => PixelType::Int8,
-                        "int16"   => PixelType::Int16,
-                        "int32"   => PixelType::Int32,
-                        "float"   | "float32" => PixelType::Float32,
-                        "double"  | "float64" => PixelType::Float64,
+                        "uint8" => PixelType::Uint8,
+                        "uint16" => PixelType::Uint16,
+                        "uint32" => PixelType::Uint32,
+                        "int8" => PixelType::Int8,
+                        "int16" => PixelType::Int16,
+                        "int32" => PixelType::Int32,
+                        "float" | "float32" => PixelType::Float32,
+                        "double" | "float64" => PixelType::Float64,
                         _ => PixelType::Uint8,
                     };
                 }
@@ -126,13 +149,21 @@ impl FormatReader for FakeReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -160,7 +191,14 @@ impl FormatReader for FakeReader {
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();

@@ -11,6 +11,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 // ---------------------------------------------------------------------------
 // Macro: thin TIFF wrapper
@@ -206,17 +207,23 @@ pub struct InrReader {
 
 impl InrReader {
     pub fn new() -> Self {
-        InrReader { path: None, meta: None }
+        InrReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for InrReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for InrReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("inr"))
@@ -227,19 +234,23 @@ impl FormatReader for InrReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let data = std::fs::read(path)
-            .map_err(BioFormatsError::Io)?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
 
         // Header is first 256 bytes interpreted as ASCII text
-        let header_bytes = if data.len() >= 256 { &data[..256] } else { &data[..] };
+        if data.len() < 256 || !data.starts_with(b"#INRIMAGE-4#{") {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "INR file is missing the 256-byte INRIMAGE-4 header".into(),
+            ));
+        }
+        let header_bytes = &data[..256];
         let header_text = String::from_utf8_lossy(header_bytes);
 
-        let mut size_x: u32 = 512;
-        let mut size_y: u32 = 512;
+        let mut size_x: Option<u32> = None;
+        let mut size_y: Option<u32> = None;
         let mut size_z: u32 = 1;
         let mut size_c: u32 = 1;
-        let mut bpp: u32 = 16;
-        let mut inr_type = InrType::Uint;
+        let mut bpp: Option<u32> = None;
+        let mut inr_type: Option<InrType> = None;
         let mut little_endian = true;
 
         for line in header_text.split('\n') {
@@ -248,18 +259,38 @@ impl FormatReader for InrReader {
                 let key = line[..pos].trim();
                 let val = line[pos + 1..].trim();
                 match key {
-                    "XDIM" => { if let Ok(n) = val.parse::<u32>() { size_x = n; } }
-                    "YDIM" => { if let Ok(n) = val.parse::<u32>() { size_y = n; } }
-                    "ZDIM" => { if let Ok(n) = val.parse::<u32>() { size_z = n; } }
-                    "VDIM" => { if let Ok(n) = val.parse::<u32>() { size_c = n; } }
+                    "XDIM" => {
+                        if let Ok(n) = val.parse::<u32>() {
+                            size_x = Some(n);
+                        }
+                    }
+                    "YDIM" => {
+                        if let Ok(n) = val.parse::<u32>() {
+                            size_y = Some(n);
+                        }
+                    }
+                    "ZDIM" => {
+                        if let Ok(n) = val.parse::<u32>() {
+                            size_z = n;
+                        }
+                    }
+                    "VDIM" => {
+                        if let Ok(n) = val.parse::<u32>() {
+                            size_c = n;
+                        }
+                    }
                     "PIXSIZE" => {
                         // Format: "N bits"
                         if let Some(n_str) = val.split_whitespace().next() {
-                            if let Ok(n) = n_str.parse::<u32>() { bpp = n; }
+                            if let Ok(n) = n_str.parse::<u32>() {
+                                bpp = Some(n);
+                            }
                         }
                     }
                     "TYPE" => {
-                        inr_type = if val.contains("unsigned") || val.contains("fixed") && !val.contains("signed") {
+                        let mut parsed_type = if val.contains("unsigned")
+                            || val.contains("fixed") && !val.contains("signed")
+                        {
                             InrType::Uint
                         } else if val.contains("signed") {
                             InrType::Int
@@ -270,12 +301,13 @@ impl FormatReader for InrReader {
                         };
                         // More precise: check exact values
                         if val == "unsigned fixed" {
-                            inr_type = InrType::Uint;
+                            parsed_type = InrType::Uint;
                         } else if val == "signed fixed" {
-                            inr_type = InrType::Int;
+                            parsed_type = InrType::Int;
                         } else if val == "float" {
-                            inr_type = InrType::Float;
+                            parsed_type = InrType::Float;
                         }
+                        inr_type = Some(parsed_type);
                     }
                     "CPU" => {
                         little_endian = matches!(val, "decm" | "pc");
@@ -288,19 +320,49 @@ impl FormatReader for InrReader {
             }
         }
 
+        let size_x = size_x
+            .filter(|&v| v > 0)
+            .ok_or_else(|| BioFormatsError::UnsupportedFormat("INR header missing XDIM".into()))?;
+        let size_y = size_y
+            .filter(|&v| v > 0)
+            .ok_or_else(|| BioFormatsError::UnsupportedFormat("INR header missing YDIM".into()))?;
+        let bpp = bpp.ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("INR header missing PIXSIZE".into())
+        })?;
+        let inr_type = inr_type
+            .ok_or_else(|| BioFormatsError::UnsupportedFormat("INR header missing TYPE".into()))?;
         let pixel_type = match (bpp, inr_type) {
-            (8, InrType::Uint)  => PixelType::Uint8,
-            (8, InrType::Int)   => PixelType::Uint8,
+            (8, InrType::Uint) => PixelType::Uint8,
+            (8, InrType::Int) => PixelType::Uint8,
             (16, InrType::Uint) => PixelType::Uint16,
-            (16, InrType::Int)  => PixelType::Int16,
+            (16, InrType::Int) => PixelType::Int16,
             (32, InrType::Uint) => PixelType::Uint32,
-            (32, InrType::Int)  => PixelType::Int32,
+            (32, InrType::Int) => PixelType::Int32,
             (32, InrType::Float) => PixelType::Float32,
             (64, InrType::Float) => PixelType::Float64,
-            _ => PixelType::Uint16,
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "INR unsupported pixel size/type combination: {bpp} bits"
+                )));
+            }
         };
 
         let image_count = size_z * size_c;
+        let bps = (bpp / 8) as u64;
+        let expected = 256u64
+            .checked_add(
+                (size_x as u64)
+                    .checked_mul(size_y as u64)
+                    .and_then(|v| v.checked_mul(image_count as u64))
+                    .and_then(|v| v.checked_mul(bps))
+                    .ok_or_else(|| BioFormatsError::Format("INR image size overflows".into()))?,
+            )
+            .ok_or_else(|| BioFormatsError::Format("INR image size overflows".into()))?;
+        if (data.len() as u64) < expected {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "INR pixel payload is shorter than declared dimensions".into(),
+            ));
+        }
 
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
@@ -333,13 +395,21 @@ impl FormatReader for InrReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -355,23 +425,33 @@ impl FormatReader for InrReader {
         let offset = 256u64 + (plane_index as u64) * (plane_bytes as u64);
 
         let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path)
-            .map_err(BioFormatsError::Io)?;
+        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(offset))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         // Read full plane then crop (simple approach)
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("INR", &full, &meta, 1, _x, _y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -383,11 +463,16 @@ impl FormatReader for InrReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
-    fn resolution_count(&self) -> usize { 1 }
+    fn resolution_count(&self) -> usize {
+        1
+    }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         if level != 0 {
-            Err(BioFormatsError::Format(format!("resolution {} out of range", level)))
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
         } else {
             Ok(())
         }
@@ -410,19 +495,23 @@ pub struct VeecoReader {
 
 impl VeecoReader {
     pub fn new() -> Self {
-        VeecoReader { path: None, meta: None, data_offset: 0 }
+        VeecoReader {
+            path: None,
+            meta: None,
+            data_offset: 0,
+        }
     }
 }
 
 impl Default for VeecoReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for VeecoReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         // Match .afm or purely numeric extensions of 1-3 chars (e.g. "001")
         ext.eq_ignore_ascii_case("afm")
             || (ext.len() >= 1 && ext.len() <= 3 && ext.chars().all(|c| c.is_ascii_digit()))
@@ -437,36 +526,74 @@ impl FormatReader for VeecoReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let data = std::fs::read(path)
-            .map_err(BioFormatsError::Io)?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let text = String::from_utf8_lossy(&data).into_owned();
 
-        let mut width: u32 = 512;
-        let mut height: u32 = 512;
-        let mut bpp: u32 = 2;
-        let mut data_offset: usize = 0;
+        let mut width: Option<u32> = None;
+        let mut height: Option<u32> = None;
+        let mut bpp: Option<u32> = None;
+        let mut data_offset: Option<usize> = None;
 
         for line in text.lines() {
             if line.contains("\\Samps/line:") {
                 if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(n) = val.parse::<u32>() { width = n; }
+                    if let Ok(n) = val.parse::<u32>() {
+                        width = Some(n);
+                    }
                 }
             } else if line.contains("\\Number of lines:") {
                 if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(n) = val.parse::<u32>() { height = n; }
+                    if let Ok(n) = val.parse::<u32>() {
+                        height = Some(n);
+                    }
                 }
             } else if line.contains("\\Bytes/pixel:") {
                 if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(n) = val.parse::<u32>() { bpp = n; }
+                    if let Ok(n) = val.parse::<u32>() {
+                        bpp = Some(n);
+                    }
                 }
             } else if line.contains("\\Data offset:") {
                 if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(n) = val.parse::<usize>() { data_offset = n; }
+                    if let Ok(n) = val.parse::<usize>() {
+                        data_offset = Some(n);
+                    }
                 }
             }
         }
 
-        let pixel_type = if bpp == 1 { PixelType::Uint8 } else { PixelType::Uint16 };
+        let width = width.filter(|&v| v > 0).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("Nanoscope header missing Samps/line".into())
+        })?;
+        let height = height.filter(|&v| v > 0).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("Nanoscope header missing Number of lines".into())
+        })?;
+        let bpp = bpp.filter(|&v| v == 1 || v == 2).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "Nanoscope header missing supported Bytes/pixel".into(),
+            )
+        })?;
+        let data_offset = data_offset.ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("Nanoscope header missing Data offset".into())
+        })?;
+        let expected = (data_offset as u64)
+            .checked_add(
+                (width as u64)
+                    .saturating_mul(height as u64)
+                    .saturating_mul(bpp as u64),
+            )
+            .ok_or_else(|| BioFormatsError::Format("Nanoscope plane size overflows".into()))?;
+        if expected > data.len() as u64 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Nanoscope pixel payload is shorter than declared dimensions".into(),
+            ));
+        }
+
+        let pixel_type = if bpp == 1 {
+            PixelType::Uint8
+        } else {
+            PixelType::Uint16
+        };
         let bits_per_pixel = (bpp * 8) as u8;
 
         self.data_offset = data_offset;
@@ -502,13 +629,21 @@ impl FormatReader for VeecoReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -522,22 +657,32 @@ impl FormatReader for VeecoReader {
         let bps = (meta.bits_per_pixel / 8) as usize;
         let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
         let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path)
-            .map_err(BioFormatsError::Io)?;
+        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(self.data_offset as u64))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("Nanoscope", &full, &meta, 1, _x, _y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -549,11 +694,16 @@ impl FormatReader for VeecoReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
-    fn resolution_count(&self) -> usize { 1 }
+    fn resolution_count(&self) -> usize {
+        1
+    }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         if level != 0 {
-            Err(BioFormatsError::Format(format!("resolution {} out of range", level)))
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
         } else {
             Ok(())
         }
@@ -581,14 +731,10 @@ tiff_wrapper! {
 // Helper: compute square dimensions from file size assuming uint16
 // ===========================================================================
 
-/// Given a file size and a data offset, compute square dimensions assuming
-/// uint16 (2 bytes per pixel). Returns (width, height).
-fn raw_uint16_square_dims(file_size: u64, data_offset: u64) -> (u32, u32) {
-    let data_bytes = file_size.saturating_sub(data_offset);
-    let pixel_count = data_bytes / 2;
-    let side = (pixel_count as f64).sqrt() as u32;
-    let side = side.max(1);
-    (side, side)
+fn unsupported_raw_sem(format_name: &str) -> BioFormatsError {
+    BioFormatsError::UnsupportedFormat(format!(
+        "{format_name} binary layout is not implemented; refusing heuristic dimensions"
+    ))
 }
 
 // ===========================================================================
@@ -607,53 +753,36 @@ pub struct JeolReader {
 
 impl JeolReader {
     pub fn new() -> Self {
-        JeolReader { path: None, meta: None, data_offset: 0 }
+        JeolReader {
+            path: None,
+            meta: None,
+            data_offset: 0,
+        }
     }
 }
 
 impl Default for JeolReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for JeolReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("dat"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file_size = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
-        // Assume raw uint16 LE, no header
-        let (w, h) = raw_uint16_square_dims(file_size, 0);
-
-        self.data_offset = 0;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(ImageMetadata {
-            size_x: w,
-            size_y: h,
-            size_z: 1,
-            size_c: 1,
-            size_t: 1,
-            pixel_type: PixelType::Uint16,
-            bits_per_pixel: 16,
-            image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: HashMap::new(),
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
-        Ok(())
+        let _ = path;
+        Err(unsupported_raw_sem("JEOL SEM"))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -663,13 +792,21 @@ impl FormatReader for JeolReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -684,13 +821,21 @@ impl FormatReader for JeolReader {
         let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
         let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.data_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
         let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -708,11 +853,16 @@ impl FormatReader for JeolReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
-    fn resolution_count(&self) -> usize { 1 }
+    fn resolution_count(&self) -> usize {
+        1
+    }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         if level != 0 {
-            Err(BioFormatsError::Format(format!("resolution {} out of range", level)))
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
         } else {
             Ok(())
         }
@@ -735,23 +885,32 @@ pub struct HitachiReader {
 
 impl HitachiReader {
     pub fn new() -> Self {
-        HitachiReader { path: None, meta: None, data_offset: 0 }
+        HitachiReader {
+            path: None,
+            meta: None,
+            data_offset: 0,
+        }
     }
 }
 
 impl Default for HitachiReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for HitachiReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("hiv"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let file_size = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
@@ -771,7 +930,7 @@ impl FormatReader for HitachiReader {
             let h = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
             if w > 0 && w <= 65536 && h > 0 && h <= 65536 {
                 let expected = 512u64 + (w as u64) * (h as u64) * 2;
-                if expected <= file_size + 1024 {
+                if expected <= file_size {
                     width = w;
                     height = h;
                     header_size = 512;
@@ -780,11 +939,9 @@ impl FormatReader for HitachiReader {
         }
 
         if width == 0 || height == 0 {
-            // Fallback: raw uint16 square
-            let (w, h) = raw_uint16_square_dims(file_size, 0);
-            width = w;
-            height = h;
-            header_size = 0;
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Hitachi SEM header missing supported dimensions".into(),
+            ));
         }
 
         self.data_offset = header_size;
@@ -820,13 +977,21 @@ impl FormatReader for HitachiReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -841,19 +1006,31 @@ impl FormatReader for HitachiReader {
         let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
         let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.data_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("Hitachi SEM", &full, &meta, 1, _x, _y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -865,11 +1042,16 @@ impl FormatReader for HitachiReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
-    fn resolution_count(&self) -> usize { 1 }
+    fn resolution_count(&self) -> usize {
+        1
+    }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         if level != 0 {
-            Err(BioFormatsError::Format(format!("resolution {} out of range", level)))
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
         } else {
             Ok(())
         }
@@ -893,23 +1075,32 @@ pub struct LeoReader {
 
 impl LeoReader {
     pub fn new() -> Self {
-        LeoReader { path: None, meta: None, data_offset: 0 }
+        LeoReader {
+            path: None,
+            meta: None,
+            data_offset: 0,
+        }
     }
 }
 
 impl Default for LeoReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for LeoReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("sxm"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let file_size = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
@@ -948,11 +1139,15 @@ impl FormatReader for LeoReader {
                 }
             } else if line_lower.contains("width") {
                 if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(w) = val.parse::<u32>() { width = w; }
+                    if let Ok(w) = val.parse::<u32>() {
+                        width = w;
+                    }
                 }
             } else if line_lower.contains("height") {
                 if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(h) = val.parse::<u32>() { height = h; }
+                    if let Ok(h) = val.parse::<u32>() {
+                        height = h;
+                    }
                 }
             } else if line.contains(":SCANIT_END:") || line.contains("\\*File list end") {
                 // End of header marker — data follows
@@ -968,9 +1163,21 @@ impl FormatReader for LeoReader {
         }
 
         if width == 0 || height == 0 {
-            let (w, h) = raw_uint16_square_dims(file_size, data_off);
-            width = w;
-            height = h;
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Leo/Zeiss SXM header missing image dimensions".into(),
+            ));
+        }
+        let expected = data_off
+            .checked_add(
+                (width as u64)
+                    .saturating_mul(height as u64)
+                    .saturating_mul(2),
+            )
+            .ok_or_else(|| BioFormatsError::Format("Leo/Zeiss SXM plane size overflows".into()))?;
+        if expected > file_size {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Leo/Zeiss SXM pixel payload is shorter than declared dimensions".into(),
+            ));
         }
 
         self.data_offset = data_off;
@@ -1006,13 +1213,21 @@ impl FormatReader for LeoReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -1027,19 +1242,31 @@ impl FormatReader for LeoReader {
         let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
         let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.data_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("Leo/Zeiss SXM", &full, &meta, 1, _x, _y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1051,11 +1278,16 @@ impl FormatReader for LeoReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
-    fn resolution_count(&self) -> usize { 1 }
+    fn resolution_count(&self) -> usize {
+        1
+    }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         if level != 0 {
-            Err(BioFormatsError::Format(format!("resolution {} out of range", level)))
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
         } else {
             Ok(())
         }
@@ -1077,52 +1309,36 @@ pub struct ZeissLmsReader {
 
 impl ZeissLmsReader {
     pub fn new() -> Self {
-        ZeissLmsReader { path: None, meta: None, data_offset: 0 }
+        ZeissLmsReader {
+            path: None,
+            meta: None,
+            data_offset: 0,
+        }
     }
 }
 
 impl Default for ZeissLmsReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for ZeissLmsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("lms"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file_size = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
-        let (w, h) = raw_uint16_square_dims(file_size, 0);
-
-        self.data_offset = 0;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(ImageMetadata {
-            size_x: w,
-            size_y: h,
-            size_z: 1,
-            size_c: 1,
-            size_t: 1,
-            pixel_type: PixelType::Uint16,
-            bits_per_pixel: 16,
-            image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: HashMap::new(),
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
-        Ok(())
+        let _ = path;
+        Err(unsupported_raw_sem("Zeiss LMS"))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1132,13 +1348,21 @@ impl FormatReader for ZeissLmsReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -1153,13 +1377,21 @@ impl FormatReader for ZeissLmsReader {
         let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
         let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.data_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
         let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -1177,11 +1409,16 @@ impl FormatReader for ZeissLmsReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
-    fn resolution_count(&self) -> usize { 1 }
+    fn resolution_count(&self) -> usize {
+        1
+    }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         if level != 0 {
-            Err(BioFormatsError::Format(format!("resolution {} out of range", level)))
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
         } else {
             Ok(())
         }

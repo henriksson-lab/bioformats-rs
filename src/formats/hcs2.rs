@@ -21,8 +21,15 @@ fn find_referenced_tiff(text: &str, dir: &Path) -> Option<PathBuf> {
     // Regex-free: scan for tokens ending with .tif or .tiff
     // We look at every "word" (split on whitespace, quotes, angle brackets, etc.)
     let separators = |c: char| {
-        c == '"' || c == '\'' || c == '<' || c == '>' || c == '='
-            || c == '(' || c == ')' || c == '[' || c == ']'
+        c == '"'
+            || c == '\''
+            || c == '<'
+            || c == '>'
+            || c == '='
+            || c == '('
+            || c == ')'
+            || c == '['
+            || c == ']'
     };
 
     for token in text.split(|c: char| c.is_whitespace() || separators(c)) {
@@ -469,23 +476,32 @@ pub struct TecanReader {
 
 impl TecanReader {
     pub fn new() -> Self {
-        TecanReader { path: None, meta: None, pixel_data: Vec::new() }
+        TecanReader {
+            path: None,
+            meta: None,
+            pixel_data: Vec::new(),
+        }
     }
 }
 
 impl Default for TecanReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for TecanReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("asc"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
@@ -525,10 +541,7 @@ impl FormatReader for TecanReader {
             "format".to_string(),
             MetadataValue::String("Tecan".to_string()),
         );
-        series_metadata.insert(
-            "plate_rows".to_string(),
-            MetadataValue::Int(height as i64),
-        );
+        series_metadata.insert("plate_rows".to_string(), MetadataValue::Int(height as i64));
         series_metadata.insert(
             "plate_columns".to_string(),
             MetadataValue::Int(width as i64),
@@ -567,13 +580,21 @@ impl FormatReader for TecanReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -587,7 +608,14 @@ impl FormatReader for TecanReader {
         Ok(self.pixel_data.clone())
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -616,11 +644,16 @@ impl FormatReader for TecanReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
-    fn resolution_count(&self) -> usize { 1 }
+    fn resolution_count(&self) -> usize {
+        1
+    }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         if level != 0 {
-            Err(BioFormatsError::Format(format!("resolution {} out of range", level)))
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
         } else {
             Ok(())
         }

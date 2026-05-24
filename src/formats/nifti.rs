@@ -66,15 +66,27 @@ struct NiftiHeader {
 
 fn read_i16(buf: &[u8], off: usize, le: bool) -> i16 {
     let b = [buf[off], buf[off + 1]];
-    if le { i16::from_le_bytes(b) } else { i16::from_be_bytes(b) }
+    if le {
+        i16::from_le_bytes(b)
+    } else {
+        i16::from_be_bytes(b)
+    }
 }
 fn read_u16_h(buf: &[u8], off: usize, le: bool) -> u16 {
     let b = [buf[off], buf[off + 1]];
-    if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) }
+    if le {
+        u16::from_le_bytes(b)
+    } else {
+        u16::from_be_bytes(b)
+    }
 }
 fn read_f32(buf: &[u8], off: usize, le: bool) -> f32 {
     let b = [buf[off], buf[off + 1], buf[off + 2], buf[off + 3]];
-    if le { f32::from_le_bytes(b) } else { f32::from_be_bytes(b) }
+    if le {
+        f32::from_le_bytes(b)
+    } else {
+        f32::from_be_bytes(b)
+    }
 }
 
 fn parse_header(buf: &[u8]) -> Result<NiftiHeader> {
@@ -120,7 +132,17 @@ fn parse_header(buf: &[u8]) -> Result<NiftiHeader> {
         .trim_end_matches('\0')
         .to_string();
 
-    Ok(NiftiHeader { ndim, dim, datatype, bitpix, pixdim, vox_offset, magic, little_endian: le, descrip })
+    Ok(NiftiHeader {
+        ndim,
+        dim,
+        datatype,
+        bitpix,
+        pixdim,
+        vox_offset,
+        magic,
+        little_endian: le,
+        descrip,
+    })
 }
 
 fn is_nifti_magic(magic: &[u8; 4]) -> bool {
@@ -135,26 +157,68 @@ fn build_metadata(hdr: &NiftiHeader) -> ImageMetadata {
     let ndim = hdr.ndim.max(1) as usize;
 
     // dim[1]=x, dim[2]=y, dim[3]=z, dim[4]=t, dim[5]=channels (or 5th dim)
-    let size_x = if ndim >= 1 { hdr.dim[0].max(1) as u32 } else { 1 };
-    let size_y = if ndim >= 2 { hdr.dim[1].max(1) as u32 } else { 1 };
-    let size_z = if ndim >= 3 { hdr.dim[2].max(1) as u32 } else { 1 };
-    let size_t = if ndim >= 4 { hdr.dim[3].max(1) as u32 } else { 1 };
-    let size_c = if ndim >= 5 { hdr.dim[4].max(1) as u32 } else { 1 };
+    let size_x = if ndim >= 1 {
+        hdr.dim[0].max(1) as u32
+    } else {
+        1
+    };
+    let size_y = if ndim >= 2 {
+        hdr.dim[1].max(1) as u32
+    } else {
+        1
+    };
+    let size_z = if ndim >= 3 {
+        hdr.dim[2].max(1) as u32
+    } else {
+        1
+    };
+    let size_t = if ndim >= 4 {
+        hdr.dim[3].max(1) as u32
+    } else {
+        1
+    };
+    let size_c = if ndim >= 5 {
+        hdr.dim[4].max(1) as u32
+    } else {
+        1
+    };
 
     let pixel_type = nifti_pixel_type(hdr.datatype);
     let image_count = size_z * size_t * size_c;
 
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
     if !hdr.descrip.is_empty() {
-        meta_map.insert("description".into(), MetadataValue::String(hdr.descrip.clone()));
+        meta_map.insert(
+            "description".into(),
+            MetadataValue::String(hdr.descrip.clone()),
+        );
     }
     meta_map.insert("datatype".into(), MetadataValue::Int(hdr.datatype as i64));
-    let format_name = if is_nifti_magic(&hdr.magic) { "NIfTI-1" } else { "Analyze7.5" };
+    let format_name = if is_nifti_magic(&hdr.magic) {
+        "NIfTI-1"
+    } else {
+        "Analyze7.5"
+    };
     meta_map.insert("format".into(), MetadataValue::String(format_name.into()));
     // Voxel spacings — NIfTI typically stores in mm; expose for OmeMetadata.
-    if hdr.pixdim[0] > 0.0 { meta_map.insert("voxel_size_x_mm".into(), MetadataValue::Float(hdr.pixdim[0] as f64)); }
-    if hdr.pixdim[1] > 0.0 { meta_map.insert("voxel_size_y_mm".into(), MetadataValue::Float(hdr.pixdim[1] as f64)); }
-    if hdr.pixdim[2] > 0.0 { meta_map.insert("voxel_size_z_mm".into(), MetadataValue::Float(hdr.pixdim[2] as f64)); }
+    if hdr.pixdim[0] > 0.0 {
+        meta_map.insert(
+            "voxel_size_x_mm".into(),
+            MetadataValue::Float(hdr.pixdim[0] as f64),
+        );
+    }
+    if hdr.pixdim[1] > 0.0 {
+        meta_map.insert(
+            "voxel_size_y_mm".into(),
+            MetadataValue::Float(hdr.pixdim[1] as f64),
+        );
+    }
+    if hdr.pixdim[2] > 0.0 {
+        meta_map.insert(
+            "voxel_size_z_mm".into(),
+            MetadataValue::Float(hdr.pixdim[2] as f64),
+        );
+    }
 
     ImageMetadata {
         size_x,
@@ -204,7 +268,10 @@ impl NiftiReader {
 
     fn load_raw(&self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let data_path = self.data_path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let data_path = self
+            .data_path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
 
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = (meta.size_x * meta.size_y * meta.size_c) as usize * bps;
@@ -245,7 +312,9 @@ impl FormatReader for NiftiReader {
         let name = path.to_string_lossy().to_ascii_lowercase();
         name.ends_with(".nii")
             || name.ends_with(".nii.gz")
-            || path.extension().and_then(|e| e.to_str())
+            || path
+                .extension()
+                .and_then(|e| e.to_str())
                 .map(|e| e.eq_ignore_ascii_case("hdr"))
                 .unwrap_or(false)
     }
@@ -261,7 +330,8 @@ impl FormatReader for NiftiReader {
         if (le || be) && header.len() >= 348 {
             // Check magic for NIfTI or zeros for Analyze
             let magic = &header[344..348];
-            return magic == b"n+1\0" || magic == b"ni1\0"
+            return magic == b"n+1\0"
+                || magic == b"ni1\0"
                 || magic == [0, 0, 0, 0]
                 || magic == b"ni1 "; // some older files
         }
@@ -277,7 +347,8 @@ impl FormatReader for NiftiReader {
         if is_gz {
             let f = File::open(path).map_err(BioFormatsError::Io)?;
             let mut dec = flate2::read::GzDecoder::new(BufReader::new(f));
-            dec.read_exact(&mut hdr_bytes).map_err(BioFormatsError::Io)?;
+            dec.read_exact(&mut hdr_bytes)
+                .map_err(BioFormatsError::Io)?;
         } else {
             let mut f = File::open(path).map_err(BioFormatsError::Io)?;
             f.read_exact(&mut hdr_bytes).map_err(BioFormatsError::Io)?;
@@ -318,13 +389,21 @@ impl FormatReader for NiftiReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -338,7 +417,14 @@ impl FormatReader for NiftiReader {
         self.load_raw(plane_index)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let spp = meta.size_c as usize;
@@ -368,7 +454,11 @@ impl FormatReader for NiftiReader {
         let mut ome = OmeMetadata::from_image_metadata(meta);
         let img = &mut ome.images[0];
         let get_f = |k: &str| -> Option<f64> {
-            if let Some(MetadataValue::Float(v)) = meta.series_metadata.get(k) { Some(*v) } else { None }
+            if let Some(MetadataValue::Float(v)) = meta.series_metadata.get(k) {
+                Some(*v)
+            } else {
+                None
+            }
         };
         // pixdim stored in mm → convert to µm (×1000)
         img.physical_size_x = get_f("voxel_size_x_mm").map(|v| v * 1000.0);

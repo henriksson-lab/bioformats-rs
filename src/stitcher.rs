@@ -43,7 +43,9 @@ impl FileStitcher {
     pub fn open(path: &Path) -> Result<Self> {
         let files = discover_sequence(path)?;
         if files.is_empty() {
-            return Err(BioFormatsError::Format("No files found for stitching".into()));
+            return Err(BioFormatsError::Format(
+                "No files found for stitching".into(),
+            ));
         }
 
         // Open the first file to get base metadata
@@ -136,7 +138,9 @@ fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
             return Ok(r);
         }
     }
-    Err(BioFormatsError::UnsupportedFormat(path.display().to_string()))
+    Err(BioFormatsError::UnsupportedFormat(
+        path.display().to_string(),
+    ))
 }
 
 /// Discover a file sequence from a single exemplar file.
@@ -145,12 +149,11 @@ fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
 /// E.g., `img_001.tif` → looks for `img_000.tif`, `img_001.tif`, `img_002.tif`, ...
 fn discover_sequence(path: &Path) -> Result<Vec<PathBuf>> {
     let parent = path.parent().unwrap_or(Path::new("."));
-    let stem = path.file_stem()
+    let stem = path
+        .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| BioFormatsError::Format("Invalid filename".into()))?;
-    let ext = path.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     // Find the rightmost numeric run in the stem
     let chars: Vec<char> = stem.chars().collect();
@@ -175,23 +178,35 @@ fn discover_sequence(path: &Path) -> Result<Vec<PathBuf>> {
     let mut matches: Vec<(u64, PathBuf)> = Vec::new();
 
     for entry in entries.flatten() {
-        let entry_ext = entry.path().extension()
+        let entry_ext = entry
+            .path()
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_string();
 
-        if entry_ext != ext { continue; }
+        if entry_ext != ext {
+            continue;
+        }
 
-        let entry_stem = entry.path().file_stem()
+        let entry_stem = entry
+            .path()
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
 
-        if !entry_stem.starts_with(&prefix) { continue; }
-        if !entry_stem.ends_with(&suffix) { continue; }
+        if !entry_stem.starts_with(&prefix) {
+            continue;
+        }
+        if !entry_stem.ends_with(&suffix) {
+            continue;
+        }
 
         let mid = &entry_stem[prefix.len()..entry_stem.len() - suffix.len()];
-        if mid.len() != num_width { continue; }
+        if mid.len() != num_width {
+            continue;
+        }
         if let Ok(n) = mid.parse::<u64>() {
             matches.push((n, entry.path()));
         }
@@ -202,8 +217,12 @@ fn discover_sequence(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 impl FormatReader for FileStitcher {
-    fn is_this_type_by_name(&self, _path: &Path) -> bool { false }
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        false
+    }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         *self = Self::open(path)?;
@@ -219,13 +238,21 @@ impl FormatReader for FileStitcher {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("FileStitcher not initialized")
@@ -237,7 +264,14 @@ impl FormatReader for FileStitcher {
         reader.open_bytes(local_plane)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let (file_idx, local_plane) = self.resolve_plane(plane_index)?;
         let reader = self.ensure_reader(file_idx)?;
         reader.open_bytes_region(local_plane, x, y, w, h)
@@ -291,7 +325,8 @@ impl FilePattern {
     /// Parse a file pattern from a single exemplar file.
     pub fn from_file(path: &Path) -> Result<Self> {
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let filename = path.file_name()
+        let filename = path
+            .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| BioFormatsError::Format("Invalid filename".into()))?;
 
@@ -302,7 +337,9 @@ impl FilePattern {
         while i < chars.len() {
             if chars[i].is_ascii_digit() {
                 let start = i;
-                while i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
                 runs.push((start, i));
             } else {
                 i += 1;
@@ -339,7 +376,12 @@ impl FilePattern {
         let prefix = String::new(); // prefix is captured in first block's separator
 
         // Scan directory to find all matching files and expand ranges
-        let mut pattern = FilePattern { dir: dir.clone(), prefix, suffix: suffix.clone(), blocks };
+        let mut pattern = FilePattern {
+            dir: dir.clone(),
+            prefix,
+            suffix: suffix.clone(),
+            blocks,
+        };
         pattern.scan_directory()?;
         Ok(pattern)
     }
@@ -352,15 +394,21 @@ impl FilePattern {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
 
-            if !name_str.ends_with(&self.suffix) { continue; }
+            if !name_str.ends_with(&self.suffix) {
+                continue;
+            }
 
             // Try to match each block
             if let Some(values) = self.match_filename(&name_str) {
                 for (i, val) in values.into_iter().enumerate() {
                     if i < self.blocks.len() {
                         let block = &mut self.blocks[i];
-                        if val < block.min { block.min = val; }
-                        if val > block.max { block.max = val; }
+                        if val < block.min {
+                            block.min = val;
+                        }
+                        if val > block.max {
+                            block.max = val;
+                        }
                         if !block.values.contains(&val) {
                             block.values.push(val);
                         }
@@ -382,17 +430,25 @@ impl FilePattern {
         let mut values = Vec::new();
         for block in &self.blocks {
             // Match separator
-            if !name[pos..].starts_with(&block.separator) { return None; }
+            if !name[pos..].starts_with(&block.separator) {
+                return None;
+            }
             pos += block.separator.len();
             // Extract digits
             let digit_start = pos;
-            while pos < name.len() && name.as_bytes()[pos].is_ascii_digit() { pos += 1; }
-            if pos == digit_start { return None; }
+            while pos < name.len() && name.as_bytes()[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if pos == digit_start {
+                return None;
+            }
             let val: u64 = name[digit_start..pos].parse().ok()?;
             values.push(val);
         }
         // Match suffix
-        if &name[pos..] != self.suffix { return None; }
+        if &name[pos..] != self.suffix {
+            return None;
+        }
         Some(values)
     }
 
@@ -412,7 +468,13 @@ impl FilePattern {
         let block = &self.blocks[block_idx];
         let mut results = Vec::new();
         for &val in &block.values {
-            let next = format!("{}{}{:0>width$}", current, block.separator, val, width = block.width);
+            let next = format!(
+                "{}{}{:0>width$}",
+                current,
+                block.separator,
+                val,
+                width = block.width
+            );
             results.extend(self.enumerate_blocks(block_idx + 1, next));
         }
         results
@@ -420,7 +482,11 @@ impl FilePattern {
 
     /// Total number of files in this pattern.
     pub fn file_count(&self) -> usize {
-        self.blocks.iter().map(|b| b.values.len()).product::<usize>().max(1)
+        self.blocks
+            .iter()
+            .map(|b| b.values.len())
+            .product::<usize>()
+            .max(1)
     }
 }
 
@@ -447,30 +513,48 @@ pub struct AxisGuesser;
 impl AxisGuesser {
     /// Guess axis types for each block in a FilePattern.
     pub fn guess(pattern: &FilePattern) -> Vec<AxisType> {
-        pattern.blocks.iter().map(|block| {
-            Self::guess_from_separator(&block.separator)
-        }).collect()
+        pattern
+            .blocks
+            .iter()
+            .map(|block| Self::guess_from_separator(&block.separator))
+            .collect()
     }
 
     /// Infer axis type from the text preceding a numeric block.
     fn guess_from_separator(sep: &str) -> AxisType {
         let lower = sep.to_ascii_lowercase();
         // Check for common axis indicators
-        if lower.contains('z') || lower.contains("slice") || lower.contains("depth")
-            || lower.contains("sec") || lower.contains("plane") {
+        if lower.contains('z')
+            || lower.contains("slice")
+            || lower.contains("depth")
+            || lower.contains("sec")
+            || lower.contains("plane")
+        {
             return AxisType::Z;
         }
         if lower.contains('c') && !lower.contains("tc")
-            || lower.contains("ch") || lower.contains("channel")
-            || lower.contains("wave") || lower.contains("lambda") {
+            || lower.contains("ch")
+            || lower.contains("channel")
+            || lower.contains("wave")
+            || lower.contains("lambda")
+        {
             return AxisType::Channel;
         }
-        if lower.contains('t') || lower.contains("time") || lower.contains("frame")
-            || lower.contains("tp") || lower.contains("point") {
+        if lower.contains('t')
+            || lower.contains("time")
+            || lower.contains("frame")
+            || lower.contains("tp")
+            || lower.contains("point")
+        {
             return AxisType::Time;
         }
-        if lower.contains('s') || lower.contains("series") || lower.contains("pos")
-            || lower.contains("stage") || lower.contains("well") || lower.contains("field") {
+        if lower.contains('s')
+            || lower.contains("series")
+            || lower.contains("pos")
+            || lower.contains("stage")
+            || lower.contains("well")
+            || lower.contains("field")
+        {
             return AxisType::Series;
         }
         AxisType::Unknown

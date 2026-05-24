@@ -45,7 +45,9 @@ impl IcsHeader {
         loop {
             let mut line = String::new();
             let n = reader.read_line(&mut line).map_err(BioFormatsError::Io)?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
 
             let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
             if line.eq_ignore_ascii_case("end") {
@@ -55,14 +57,16 @@ impl IcsHeader {
             }
 
             let tokens: Vec<&str> = line.split_ascii_whitespace().collect();
-            if tokens.is_empty() { continue; }
+            if tokens.is_empty() {
+                continue;
+            }
 
             match tokens[0].to_ascii_lowercase().as_str() {
                 "ics_version" if tokens.len() >= 2 => {
                     hdr.version = tokens[1].parse().unwrap_or(1.0);
                 }
                 "filename" if tokens.len() >= 2 => {
-                    hdr.filename = Some(PathBuf::from(tokens[1]));
+                    hdr.filename = Some(PathBuf::from(tokens[1..].join(" ")));
                 }
                 "layout" if tokens.len() >= 3 => match tokens[1].to_ascii_lowercase().as_str() {
                     "order" => {
@@ -81,13 +85,12 @@ impl IcsHeader {
                         "format" => hdr.format = tokens[2].to_ascii_lowercase(),
                         "sign" => hdr.sign = tokens[2].to_ascii_lowercase(),
                         "byte_order" | "byteorder" => {
-                            hdr.byte_order = tokens[2..].iter()
-                                .filter_map(|s| s.parse().ok())
-                                .collect();
+                            hdr.byte_order =
+                                tokens[2..].iter().filter_map(|s| s.parse().ok()).collect();
                         }
                         "compression" if tokens.len() >= 3 => {
-                            hdr.gzip_compressed = tokens[2].contains("gzip")
-                                || tokens[2].contains("gz");
+                            hdr.gzip_compressed =
+                                tokens[2].contains("gzip") || tokens[2].contains("gz");
                         }
                         _ => {}
                     }
@@ -168,10 +171,15 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
     let image_count = size_z * size_t * if size_c == 1 { 1 } else { size_c };
     let is_rgb = size_c == 3;
 
-    let mut series_metadata: HashMap<String, MetadataValue> = hdr.extra.iter()
+    let mut series_metadata: HashMap<String, MetadataValue> = hdr
+        .extra
+        .iter()
         .map(|(k, v)| (k.clone(), MetadataValue::String(v.clone())))
         .collect();
-    series_metadata.insert("ics_version".into(), MetadataValue::Float(hdr.version as f64));
+    series_metadata.insert(
+        "ics_version".into(),
+        MetadataValue::Float(hdr.version as f64),
+    );
 
     Ok(ImageMetadata {
         size_x,
@@ -205,21 +213,52 @@ pub struct IcsReader {
 }
 
 impl IcsReader {
-    pub fn new() -> Self { IcsReader { path: None, meta: None, header: None } }
+    pub fn new() -> Self {
+        IcsReader {
+            path: None,
+            meta: None,
+            header: None,
+        }
+    }
 
     fn data_path(ics_path: &Path, hdr: &IcsHeader) -> PathBuf {
         if hdr.version < 2.0 {
-            // ICS1: companion .ids file
-            let stem = ics_path.file_stem().unwrap_or_default();
-            ics_path.with_file_name(format!("{}.ids", stem.to_string_lossy()))
+            // ICS1: companion data file, named explicitly when available.
+            if let Some(filename) = &hdr.filename {
+                if filename.is_absolute() {
+                    filename.clone()
+                } else {
+                    ics_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new(""))
+                        .join(filename)
+                }
+            } else {
+                let stem = ics_path.file_stem().unwrap_or_default();
+                ics_path.with_file_name(format!("{}.ids", stem.to_string_lossy()))
+            }
         } else {
             ics_path.to_path_buf()
         }
     }
 
+    fn normalize_endianness(&self, mut buf: Vec<u8>) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let bps = meta.pixel_type.bytes_per_sample();
+        if !meta.is_little_endian && bps > 1 {
+            for chunk in buf.chunks_exact_mut(bps) {
+                chunk.reverse();
+            }
+        }
+        Ok(buf)
+    }
+
     fn load_raw_data(&self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let hdr = self.header.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let hdr = self
+            .header
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
         let ics_path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let bytes_per_sample = meta.pixel_type.bytes_per_sample();
@@ -233,30 +272,39 @@ impl IcsReader {
 
         if hdr.gzip_compressed {
             // Decompress all then seek; gzip doesn't support random access
-            f.seek(SeekFrom::Start(hdr.data_offset)).map_err(BioFormatsError::Io)?;
+            f.seek(SeekFrom::Start(hdr.data_offset))
+                .map_err(BioFormatsError::Io)?;
             let mut dec = flate2::read::GzDecoder::new(f);
             let mut all = Vec::new();
             dec.read_to_end(&mut all).map_err(BioFormatsError::Io)?;
             let start = plane_offset as usize;
             let end = start + plane_bytes;
             if end > all.len() {
-                return Err(BioFormatsError::InvalidData("plane out of range in ICS data".into()));
+                return Err(BioFormatsError::InvalidData(
+                    "plane out of range in ICS data".into(),
+                ));
             }
-            Ok(all[start..end].to_vec())
+            self.normalize_endianness(all[start..end].to_vec())
         } else {
-            f.seek(SeekFrom::Start(data_offset)).map_err(BioFormatsError::Io)?;
+            f.seek(SeekFrom::Start(data_offset))
+                .map_err(BioFormatsError::Io)?;
             let mut buf = vec![0u8; plane_bytes];
             f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-            Ok(buf)
+            self.normalize_endianness(buf)
         }
     }
 }
 
-impl Default for IcsReader { fn default() -> Self { Self::new() } }
+impl Default for IcsReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatReader for IcsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("ics"))
             .unwrap_or(false)
     }
@@ -277,15 +325,25 @@ impl FormatReader for IcsReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None; self.meta = None; self.header = None;
+        self.path = None;
+        self.meta = None;
+        self.header = None;
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -299,7 +357,14 @@ impl FormatReader for IcsReader {
         self.load_raw_data(plane_index)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let spp = meta.size_c as usize;
@@ -332,24 +397,38 @@ pub struct IcsWriter {
 }
 
 impl IcsWriter {
-    pub fn new() -> Self { IcsWriter { path: None, meta: None, planes: Vec::new() } }
+    pub fn new() -> Self {
+        IcsWriter {
+            path: None,
+            meta: None,
+            planes: Vec::new(),
+        }
+    }
 }
 
-impl Default for IcsWriter { fn default() -> Self { Self::new() } }
+impl Default for IcsWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatWriter for IcsWriter {
     fn is_this_type(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("ics"))
             .unwrap_or(false)
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
-        self.meta = Some(meta.clone()); Ok(())
+        self.meta = Some(meta.clone());
+        Ok(())
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.meta.as_ref().ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
+        self.meta
+            .as_ref()
+            .ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
         self.path = Some(path.to_path_buf());
         self.planes.clear();
         Ok(())
@@ -375,8 +454,18 @@ impl FormatWriter for IcsWriter {
         };
 
         writeln!(f, "ics_version\t2.0").map_err(BioFormatsError::Io)?;
-        writeln!(f, "filename\t{}", path.file_stem().unwrap_or_default().to_string_lossy()).map_err(BioFormatsError::Io)?;
-        writeln!(f, "layout\tparameters\t{}", 4 + if meta.size_z > 1 { 1 } else { 0 } + if meta.size_t > 1 { 1 } else { 0 }).map_err(BioFormatsError::Io)?;
+        writeln!(
+            f,
+            "filename\t{}",
+            path.file_stem().unwrap_or_default().to_string_lossy()
+        )
+        .map_err(BioFormatsError::Io)?;
+        writeln!(
+            f,
+            "layout\tparameters\t{}",
+            4 + if meta.size_z > 1 { 1 } else { 0 } + if meta.size_t > 1 { 1 } else { 0 }
+        )
+        .map_err(BioFormatsError::Io)?;
 
         let mut order_parts = vec!["bits", "x", "y"];
         let mut size_parts = vec![
@@ -413,5 +502,7 @@ impl FormatWriter for IcsWriter {
         Ok(())
     }
 
-    fn can_do_stacks(&self) -> bool { true }
+    fn can_do_stacks(&self) -> bool {
+        true
+    }
 }

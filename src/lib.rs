@@ -29,35 +29,37 @@
 
 pub mod cache;
 pub mod common;
-pub mod tiff;
 pub mod error;
 pub mod formats;
+pub mod memoizer;
 pub mod metadata;
 pub mod pixel;
 pub mod reader;
 pub mod registry;
-pub mod memoizer;
 pub mod stitcher;
+pub mod tiff;
 pub mod wrappers;
 pub mod writer_registry;
 
+pub use crate::cache::{CacheStrategy, CachedReader};
+pub use crate::common::ome_metadata::{
+    create_lsid, OmeAnnotation, OmeChannel, OmeDataset, OmeDetector, OmeDichroic, OmeExperiment,
+    OmeExperimenter, OmeFilter, OmeImage, OmeInstrument, OmeLightPath, OmeLightSource, OmeMetadata,
+    OmeObjective, OmePlane, OmePlate, OmeROI, OmeScreen, OmeShape, OmeWell, OmeWellSample,
+};
+pub use crate::common::writer::FormatWriter;
+pub use crate::memoizer::Memoizer;
+pub use crate::stitcher::{AxisGuesser, AxisType, FilePattern, FilePatternBlock, FileStitcher};
+pub use crate::tiff::{TiffWriter, WriteCompression};
+pub use crate::wrappers::{
+    ChannelFiller, ChannelMerger, ChannelSeparator, DimensionSwapper, MinMaxCalculator,
+};
 pub use error::{BioFormatsError, Result};
-pub use metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue, MetadataLevel, MetadataOptions, ModuloAnnotation};
+pub use metadata::{
+    DimensionOrder, ImageMetadata, LookupTable, MetadataLevel, MetadataOptions, MetadataValue,
+    ModuloAnnotation,
+};
 pub use pixel::PixelType;
 pub use reader::FormatReader;
 pub use registry::ImageReader;
 pub use writer_registry::ImageWriter;
-pub use crate::common::ome_metadata::{
-    OmeChannel, OmeImage, OmeMetadata, OmePlane,
-    OmeInstrument, OmeObjective, OmeDetector, OmeLightSource,
-    OmeFilter, OmeDichroic, OmeLightPath,
-    OmeROI, OmeShape, OmeExperimenter, OmeAnnotation,
-    OmePlate, OmeWell, OmeWellSample, OmeScreen,
-    OmeExperiment, OmeDataset,
-};
-pub use crate::common::writer::FormatWriter;
-pub use crate::tiff::{TiffWriter, WriteCompression};
-pub use crate::wrappers::{ChannelSeparator, ChannelMerger, ChannelFiller, DimensionSwapper, MinMaxCalculator};
-pub use crate::cache::{CachedReader, CacheStrategy};
-pub use crate::memoizer::Memoizer;
-pub use crate::stitcher::{FileStitcher, FilePattern, FilePatternBlock, AxisGuesser, AxisType};

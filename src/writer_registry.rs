@@ -49,9 +49,8 @@ impl ImageWriter {
 
     /// Convenience: write all planes in one call.
     pub fn save(path: &Path, meta: &ImageMetadata, planes: &[Vec<u8>]) -> Result<()> {
-        let mut w = writer_for(path).ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat(path.display().to_string())
-        })?;
+        let mut w = writer_for(path)
+            .ok_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string()))?;
         w.set_metadata(meta)?;
         w.set_id(path)?;
         for (i, plane) in planes.iter().enumerate() {
@@ -62,9 +61,8 @@ impl ImageWriter {
 
     /// Lower-level: stream planes manually.
     pub fn open(path: &Path, meta: &ImageMetadata) -> Result<Self> {
-        let mut w = writer_for(path).ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat(path.display().to_string())
-        })?;
+        let mut w = writer_for(path)
+            .ok_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string()))?;
         w.set_metadata(meta)?;
         w.set_id(path)?;
         Ok(ImageWriter { inner: w })
@@ -74,5 +72,7 @@ impl ImageWriter {
         self.inner.save_bytes(plane_index, data)
     }
 
-    pub fn close(&mut self) -> Result<()> { self.inner.close() }
+    pub fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
 }

@@ -78,9 +78,19 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
     let mut size_z: u32 = 0;
     let mut size_t: u32 = 0;
     let mut size_c: u32 = 0;
+    let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
+    meta_map.insert(
+        "format".into(),
+        MetadataValue::String("BigDataViewer HDF5".into()),
+    );
 
     if xml_path.exists() {
         if let Ok(xml_str) = std::fs::read_to_string(&xml_path) {
+            meta_map.insert(
+                "bdv_xml_path".into(),
+                MetadataValue::String(xml_path.display().to_string()),
+            );
+            meta_map.insert("bdv_xml".into(), MetadataValue::String(xml_str.clone()));
             // Parse <size>X Y Z</size>
             if let Some(size_str) = xml_find(&xml_str, "size") {
                 let parts: Vec<u32> = size_str
@@ -91,6 +101,7 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
                     size_x = parts[0];
                     size_y = parts[1];
                     size_z = parts[2];
+                    meta_map.insert("bdv_size".into(), MetadataValue::String(size_str));
                 }
             }
             // Parse timepoint range: <first>N</first> ... <last>M</last>
@@ -100,11 +111,17 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
                 let first: u32 = first_str.parse().unwrap_or(0);
                 let last: u32 = last_str.parse().unwrap_or(0);
                 size_t = last.saturating_sub(first) + 1;
+                meta_map.insert(
+                    "bdv_timepoint_first".into(),
+                    MetadataValue::Int(first as i64),
+                );
+                meta_map.insert("bdv_timepoint_last".into(), MetadataValue::Int(last as i64));
             }
             // Count ViewSetup elements
             let vc = xml_count(&xml_str, "ViewSetup");
             if vc > 0 {
                 size_c = vc as u32;
+                meta_map.insert("bdv_view_setup_count".into(), MetadataValue::Int(vc as i64));
             }
         }
     }
@@ -116,9 +133,7 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
             size_t = root_members
                 .iter()
                 .filter(|n| {
-                    n.len() == 6
-                        && n.starts_with('t')
-                        && n[1..].chars().all(|c| c.is_ascii_digit())
+                    n.len() == 6 && n.starts_with('t') && n[1..].chars().all(|c| c.is_ascii_digit())
                 })
                 .count() as u32;
         }
@@ -156,15 +171,25 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
                 size_x = shape[2] as u32;
             }
         }
-        if size_x == 0 { size_x = 512; }
-        if size_y == 0 { size_y = 512; }
-        if size_z == 0 { size_z = 1; }
+        if size_x == 0 {
+            size_x = 512;
+        }
+        if size_y == 0 {
+            size_y = 512;
+        }
+        if size_z == 0 {
+            size_z = 1;
+        }
     }
 
     // ── Count resolution levels from s00/resolutions ────────────────────────
     let n_resolutions: usize = if let Ok(ds) = file.dataset("s00/resolutions") {
         let shape = ds.shape();
-        if !shape.is_empty() && shape[0] > 0 { shape[0] } else { 1 }
+        if !shape.is_empty() && shape[0] > 0 {
+            shape[0]
+        } else {
+            1
+        }
     } else {
         // Fall back: count integer-named children of t00000/s00
         if let Ok(g) = file.group("t00000/s00") {
@@ -173,7 +198,11 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
                     .iter()
                     .filter(|n| n.parse::<usize>().is_ok())
                     .count();
-                if n > 0 { n } else { 1 }
+                if n > 0 {
+                    n
+                } else {
+                    1
+                }
             } else {
                 1
             }
@@ -181,9 +210,6 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
             1
         }
     };
-
-    let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-    meta_map.insert("format".into(), MetadataValue::String("BigDataViewer HDF5".into()));
 
     let image_count = size_z * size_c * size_t;
     let meta = ImageMetadata {
@@ -300,8 +326,8 @@ impl FormatReader for BdvReader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        let file = hdf5::File::open(&path)
-            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+        let file =
+            hdf5::File::open(&path).map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
         let ds = file
             .dataset(&ds_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;

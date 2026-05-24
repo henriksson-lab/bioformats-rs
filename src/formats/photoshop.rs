@@ -21,12 +21,18 @@ pub struct PsdReader {
 
 impl PsdReader {
     pub fn new() -> Self {
-        PsdReader { path: None, meta: None, pixels: None }
+        PsdReader {
+            path: None,
+            meta: None,
+            pixels: None,
+        }
     }
 }
 
 impl Default for PsdReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn read_u16_be(r: &mut impl Read) -> std::io::Result<u16> {
@@ -111,11 +117,13 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
 
     // Skip Color Mode Data section
     let cm_len = read_u32_be(&mut r).map_err(BioFormatsError::Io)? as u64;
-    r.seek(SeekFrom::Current(cm_len as i64)).map_err(BioFormatsError::Io)?;
+    r.seek(SeekFrom::Current(cm_len as i64))
+        .map_err(BioFormatsError::Io)?;
 
     // Skip Image Resources section
     let ir_len = read_u32_be(&mut r).map_err(BioFormatsError::Io)? as u64;
-    r.seek(SeekFrom::Current(ir_len as i64)).map_err(BioFormatsError::Io)?;
+    r.seek(SeekFrom::Current(ir_len as i64))
+        .map_err(BioFormatsError::Io)?;
 
     // Skip Layer and Mask Info section
     let lm_len: u64 = if psb {
@@ -123,7 +131,8 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     } else {
         read_u32_be(&mut r).map_err(BioFormatsError::Io)? as u64
     };
-    r.seek(SeekFrom::Current(lm_len as i64)).map_err(BioFormatsError::Io)?;
+    r.seek(SeekFrom::Current(lm_len as i64))
+        .map_err(BioFormatsError::Io)?;
 
     // Image Data section
     let compression = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
@@ -178,7 +187,8 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     let is_rgb = color_mode == 3;
     let output_channels = if is_rgb { 3usize } else { channels as usize };
     let pixels = if is_rgb && channels >= 3 {
-        let mut interleaved = Vec::with_capacity(width as usize * height as usize * 3 * bytes_per_sample);
+        let mut interleaved =
+            Vec::with_capacity(width as usize * height as usize * 3 * bytes_per_sample);
         for i in 0..(width as usize * height as usize) {
             for c in 0..3usize {
                 let src_off = c * plane_bytes + i * bytes_per_sample;
@@ -220,7 +230,9 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
 
 impl FormatReader for PsdReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str())
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("psd") | Some("psb"))
     }
@@ -244,22 +256,39 @@ impl FormatReader for PsdReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        if plane_index != 0 { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         self.pixels.clone().ok_or(BioFormatsError::NotInitialized)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();

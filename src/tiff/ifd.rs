@@ -28,7 +28,9 @@ pub mod tag {
     pub const SAMPLE_FORMAT: u16 = 339;
     pub const JPEG_TABLES: u16 = 347;
     pub const SUB_IFD: u16 = 330;
+    pub const YCBCR_COEFFICIENTS: u16 = 529;
     pub const YCBCR_SUBSAMPLING: u16 = 530;
+    pub const REFERENCE_BLACK_WHITE: u16 = 532;
 }
 
 /// TIFF compression scheme codes.
@@ -67,11 +69,11 @@ impl From<u16> for Compression {
             32773 => Compression::PackBits,
             32809 => Compression::Thunderscan,
             32946 => Compression::DeflateOld,
-            33003 => Compression::Jpeg2000,  // JPEG2000
-            33004 => Compression::Jpeg2000,  // JPEG2000 lossy
-            33005 => Compression::Jpeg2000,  // ALT_JPEG2000
-            33007 => Compression::Jpeg2000,  // ALT_JPEG (JPEG2000 variant)
-            34712 => Compression::Jpeg2000,  // Olympus JPEG2000
+            33003 => Compression::Jpeg2000, // JPEG2000
+            33004 => Compression::Jpeg2000, // JPEG2000 lossy
+            33005 => Compression::Jpeg2000, // ALT_JPEG2000
+            33007 => Compression::Jpeg2000, // ALT_JPEG (JPEG2000 variant)
+            34712 => Compression::Jpeg2000, // Olympus JPEG2000
             34713 => Compression::Nikon,
             50000 => Compression::Zstd,
             other => Compression::Unknown(other),
@@ -116,7 +118,7 @@ pub enum IfdValue {
     Ascii(String),
     Short(Vec<u16>),
     Long(Vec<u32>),
-    Long8(Vec<u64>),   // BigTIFF
+    Long8(Vec<u64>), // BigTIFF
     Rational(Vec<(u32, u32)>),
     SByte(Vec<i8>),
     Undefined(Vec<u8>),
@@ -125,8 +127,8 @@ pub enum IfdValue {
     SRational(Vec<(i32, i32)>),
     Float(Vec<f32>),
     Double(Vec<f64>),
-    IFD(Vec<u32>),     // IFD offsets stored as LONG
-    IFD8(Vec<u64>),    // BigTIFF IFD offsets
+    IFD(Vec<u32>),  // IFD offsets stored as LONG
+    IFD8(Vec<u64>), // BigTIFF IFD offsets
 }
 
 impl IfdValue {
@@ -261,7 +263,11 @@ impl Ifd {
 
     pub fn bits_per_sample(&self) -> Vec<u16> {
         let v = self.get_vec_u16(tag::BITS_PER_SAMPLE);
-        if v.is_empty() { vec![1] } else { v }
+        if v.is_empty() {
+            vec![1]
+        } else {
+            v
+        }
     }
 
     pub fn planar_configuration(&self) -> u16 {

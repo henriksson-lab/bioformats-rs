@@ -108,27 +108,36 @@ pub struct AplReader {
 
 impl AplReader {
     pub fn new() -> Self {
-        AplReader { path: None, meta: None }
+        AplReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for AplReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for AplReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("apl"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Applied Precision APL is a proprietary format requiring vendor documentation".to_string()
+            "Applied Precision APL is a proprietary format requiring vendor documentation"
+                .to_string(),
         ))
     }
 
@@ -138,13 +147,21 @@ impl FormatReader for AplReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -152,19 +169,29 @@ impl FormatReader for AplReader {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Applied Precision APL is a proprietary format requiring vendor documentation".to_string()
+            "Applied Precision APL is a proprietary format requiring vendor documentation"
+                .to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Applied Precision APL is a proprietary format requiring vendor documentation".to_string()
+            "Applied Precision APL is a proprietary format requiring vendor documentation"
+                .to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Applied Precision APL is a proprietary format requiring vendor documentation".to_string()
+            "Applied Precision APL is a proprietary format requiring vendor documentation"
+                .to_string(),
         ))
     }
 }
@@ -184,28 +211,34 @@ pub struct ArfReader {
 
 impl ArfReader {
     pub fn new() -> Self {
-        ArfReader { path: None, meta: None }
+        ArfReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for ArfReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for ArfReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("arf"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file_len = std::fs::metadata(path)
-            .map_err(BioFormatsError::Io)?
-            .len();
+        let file_len = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
 
         // Assume raw uint16 data; guess square dimensions
         let n_pixels = file_len / 2;
@@ -251,13 +284,21 @@ impl FormatReader for ArfReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -278,7 +319,14 @@ impl FormatReader for ArfReader {
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -309,27 +357,35 @@ pub struct I2iReader {
 
 impl I2iReader {
     pub fn new() -> Self {
-        I2iReader { path: None, meta: None }
+        I2iReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for I2iReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for I2iReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("i2i"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "I2I format is proprietary with undocumented structure".to_string()
+            "I2I format is proprietary with undocumented structure".to_string(),
         ))
     }
 
@@ -339,13 +395,21 @@ impl FormatReader for I2iReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -353,19 +417,26 @@ impl FormatReader for I2iReader {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "I2I format is proprietary with undocumented structure".to_string()
+            "I2I format is proprietary with undocumented structure".to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "I2I format is proprietary with undocumented structure".to_string()
+            "I2I format is proprietary with undocumented structure".to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "I2I format is proprietary with undocumented structure".to_string()
+            "I2I format is proprietary with undocumented structure".to_string(),
         ))
     }
 }
@@ -383,27 +454,35 @@ pub struct JdceReader {
 
 impl JdceReader {
     pub fn new() -> Self {
-        JdceReader { path: None, meta: None }
+        JdceReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for JdceReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for JdceReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("jdce"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "JDCE format is proprietary with undocumented structure".to_string()
+            "JDCE format is proprietary with undocumented structure".to_string(),
         ))
     }
 
@@ -413,13 +492,21 @@ impl FormatReader for JdceReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -427,19 +514,26 @@ impl FormatReader for JdceReader {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "JDCE format is proprietary with undocumented structure".to_string()
+            "JDCE format is proprietary with undocumented structure".to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "JDCE format is proprietary with undocumented structure".to_string()
+            "JDCE format is proprietary with undocumented structure".to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "JDCE format is proprietary with undocumented structure".to_string()
+            "JDCE format is proprietary with undocumented structure".to_string(),
         ))
     }
 }
@@ -456,17 +550,22 @@ pub struct JpxReader {
 
 impl JpxReader {
     pub fn new() -> Self {
-        JpxReader { inner: crate::formats::misc::Jpeg2000Reader::new() }
+        JpxReader {
+            inner: crate::formats::misc::Jpeg2000Reader::new(),
+        }
     }
 }
 
 impl Default for JpxReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for JpxReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("jpx"))
@@ -527,27 +626,35 @@ pub struct PciReader {
 
 impl PciReader {
     pub fn new() -> Self {
-        PciReader { path: None, meta: None }
+        PciReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for PciReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for PciReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("pci"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string()
+            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string(),
         ))
     }
 
@@ -557,13 +664,21 @@ impl FormatReader for PciReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -571,19 +686,26 @@ impl FormatReader for PciReader {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string()
+            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string()
+            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string()
+            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string(),
         ))
     }
 }
@@ -603,23 +725,32 @@ pub struct PdsReader {
 
 impl PdsReader {
     pub fn new() -> Self {
-        PdsReader { path: None, meta: None, data_offset: 0 }
+        PdsReader {
+            path: None,
+            meta: None,
+            data_offset: 0,
+        }
     }
 }
 
 impl Default for PdsReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for PdsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("pds"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
@@ -641,10 +772,18 @@ impl FormatReader for PdsReader {
                 let key = key.trim();
                 let val = val.trim();
                 match key {
-                    "LINES" => { lines = val.parse().unwrap_or(0); }
-                    "LINE_SAMPLES" => { line_samples = val.parse().unwrap_or(0); }
-                    "SAMPLE_BITS" => { sample_bits = val.parse().unwrap_or(8); }
-                    "RECORD_BYTES" => { record_bytes = val.parse().unwrap_or(0); }
+                    "LINES" => {
+                        lines = val.parse().unwrap_or(0);
+                    }
+                    "LINE_SAMPLES" => {
+                        line_samples = val.parse().unwrap_or(0);
+                    }
+                    "SAMPLE_BITS" => {
+                        sample_bits = val.parse().unwrap_or(8);
+                    }
+                    "RECORD_BYTES" => {
+                        record_bytes = val.parse().unwrap_or(0);
+                    }
                     "LABEL_RECORDS" | "^IMAGE" => {
                         // ^IMAGE can be a record number
                         if let Ok(n) = val.parse::<u64>() {
@@ -658,7 +797,7 @@ impl FormatReader for PdsReader {
 
         if lines == 0 || line_samples == 0 {
             return Err(BioFormatsError::Format(
-                "PDS header missing LINES or LINE_SAMPLES keywords".to_string()
+                "PDS header missing LINES or LINE_SAMPLES keywords".to_string(),
             ));
         }
 
@@ -717,13 +856,21 @@ impl FormatReader for PdsReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -738,13 +885,21 @@ impl FormatReader for PdsReader {
         let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.data_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
         let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -777,17 +932,23 @@ pub struct HisReader {
 
 impl HisReader {
     pub fn new() -> Self {
-        HisReader { path: None, meta: None }
+        HisReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for HisReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for HisReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("his"))
@@ -835,13 +996,21 @@ impl FormatReader for HisReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -862,7 +1031,14 @@ impl FormatReader for HisReader {
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -894,27 +1070,35 @@ pub struct HrdgdfReader {
 
 impl HrdgdfReader {
     pub fn new() -> Self {
-        HrdgdfReader { path: None, meta: None }
+        HrdgdfReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for HrdgdfReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for HrdgdfReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("gdf"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "HRDC GDF is a proprietary format with undocumented binary structure".to_string()
+            "HRDC GDF is a proprietary format with undocumented binary structure".to_string(),
         ))
     }
 
@@ -924,13 +1108,21 @@ impl FormatReader for HrdgdfReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -938,19 +1130,26 @@ impl FormatReader for HrdgdfReader {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "HRDC GDF is a proprietary format with undocumented binary structure".to_string()
+            "HRDC GDF is a proprietary format with undocumented binary structure".to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "HRDC GDF is a proprietary format with undocumented binary structure".to_string()
+            "HRDC GDF is a proprietary format with undocumented binary structure".to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "HRDC GDF is a proprietary format with undocumented binary structure".to_string()
+            "HRDC GDF is a proprietary format with undocumented binary structure".to_string(),
         ))
     }
 }
@@ -971,23 +1170,32 @@ pub struct TextImageReader {
 
 impl TextImageReader {
     pub fn new() -> Self {
-        TextImageReader { path: None, meta: None, pixel_data: Vec::new() }
+        TextImageReader {
+            path: None,
+            meta: None,
+            pixel_data: Vec::new(),
+        }
     }
 }
 
 impl Default for TextImageReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for TextImageReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("csv"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
@@ -1054,13 +1262,21 @@ impl FormatReader for TextImageReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -1074,7 +1290,14 @@ impl FormatReader for TextImageReader {
         Ok(self.pixel_data.clone())
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -1106,27 +1329,36 @@ pub struct FilePatternReaderStub {
 
 impl FilePatternReaderStub {
     pub fn new() -> Self {
-        FilePatternReaderStub { path: None, meta: None }
+        FilePatternReaderStub {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for FilePatternReaderStub {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for FilePatternReaderStub {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("pattern"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "FilePattern format requires glob/regex expansion to assemble multi-file datasets".to_string()
+            "FilePattern format requires glob/regex expansion to assemble multi-file datasets"
+                .to_string(),
         ))
     }
 
@@ -1136,13 +1368,21 @@ impl FormatReader for FilePatternReaderStub {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -1150,19 +1390,29 @@ impl FormatReader for FilePatternReaderStub {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "FilePattern format requires glob/regex expansion to assemble multi-file datasets".to_string()
+            "FilePattern format requires glob/regex expansion to assemble multi-file datasets"
+                .to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "FilePattern format requires glob/regex expansion to assemble multi-file datasets".to_string()
+            "FilePattern format requires glob/regex expansion to assemble multi-file datasets"
+                .to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "FilePattern format requires glob/regex expansion to assemble multi-file datasets".to_string()
+            "FilePattern format requires glob/regex expansion to assemble multi-file datasets"
+                .to_string(),
         ))
     }
 }
@@ -1181,27 +1431,36 @@ pub struct KlbReader {
 
 impl KlbReader {
     pub fn new() -> Self {
-        KlbReader { path: None, meta: None }
+        KlbReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for KlbReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for KlbReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("klb"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust".to_string()
+            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust"
+                .to_string(),
         ))
     }
 
@@ -1211,13 +1470,21 @@ impl FormatReader for KlbReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -1225,19 +1492,29 @@ impl FormatReader for KlbReader {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust".to_string()
+            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust"
+                .to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust".to_string()
+            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust"
+                .to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust".to_string()
+            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust"
+                .to_string(),
         ))
     }
 }
@@ -1257,23 +1534,31 @@ pub struct ObfReader {
 
 impl ObfReader {
     pub fn new() -> Self {
-        ObfReader { path: None, meta: None }
+        ObfReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for ObfReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for ObfReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("obf"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
@@ -1287,13 +1572,21 @@ impl FormatReader for ObfReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -1301,19 +1594,26 @@ impl FormatReader for ObfReader {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "OBF format: use ImspectorReader for files with OMAS_BF_ magic".to_string()
+            "OBF format: use ImspectorReader for files with OMAS_BF_ magic".to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "OBF format: use ImspectorReader for files with OMAS_BF_ magic".to_string()
+            "OBF format: use ImspectorReader for files with OMAS_BF_ magic".to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "OBF format: use ImspectorReader for files with OMAS_BF_ magic".to_string()
+            "OBF format: use ImspectorReader for files with OMAS_BF_ magic".to_string(),
         ))
     }
 }

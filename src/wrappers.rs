@@ -4,12 +4,46 @@
 //! `ChannelSeparator`, `ChannelMerger`, `ChannelFiller`, `DimensionSwapper`,
 //! `MinMaxCalculator`.
 
-use std::path::Path;
-use crate::common::error::Result;
+use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
-use crate::common::ome_metadata::OmeMetadata;
+use crate::common::ome_metadata::{OmeChannel, OmeMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use std::path::Path;
+
+fn wrapper_ome_metadata(
+    inner: &dyn FormatReader,
+    adjusted_meta: Option<&ImageMetadata>,
+) -> Option<OmeMetadata> {
+    let mut ome = inner.ome_metadata()?;
+    if let Some(meta) = adjusted_meta {
+        let image_index = inner.series();
+        let image_index = if image_index < ome.images.len() {
+            image_index
+        } else {
+            0
+        };
+        let target = ome.images.get_mut(image_index)?;
+        let existing_channels = target.channels.clone();
+        let samples_per_pixel = if meta.is_rgb { meta.size_c } else { 1 };
+        target.channels = (0..meta.size_c)
+            .map(|i| OmeChannel {
+                name: existing_channels
+                    .get(i as usize)
+                    .and_then(|ch| ch.name.clone()),
+                samples_per_pixel,
+                color: existing_channels.get(i as usize).and_then(|ch| ch.color),
+                emission_wavelength: existing_channels
+                    .get(i as usize)
+                    .and_then(|ch| ch.emission_wavelength),
+                excitation_wavelength: existing_channels
+                    .get(i as usize)
+                    .and_then(|ch| ch.excitation_wavelength),
+            })
+            .collect();
+    }
+    Some(ome)
+}
 
 // ── ChannelSeparator ────────────────────────────────────────────────────────
 
@@ -28,7 +62,10 @@ pub struct ChannelSeparator {
 
 impl ChannelSeparator {
     pub fn new(inner: Box<dyn FormatReader>) -> Self {
-        ChannelSeparator { inner, adjusted_meta: None }
+        ChannelSeparator {
+            inner,
+            adjusted_meta: None,
+        }
     }
 
     fn rebuild_meta(&mut self) {
@@ -58,8 +95,12 @@ impl ChannelSeparator {
 }
 
 impl FormatReader for ChannelSeparator {
-    fn is_this_type_by_name(&self, path: &Path) -> bool { self.inner.is_this_type_by_name(path) }
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool { self.inner.is_this_type_by_bytes(header) }
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        self.inner.is_this_type_by_name(path)
+    }
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        self.inner.is_this_type_by_bytes(header)
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
@@ -72,7 +113,9 @@ impl FormatReader for ChannelSeparator {
         self.inner.close()
     }
 
-    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
         self.inner.set_series(series)?;
@@ -80,17 +123,24 @@ impl FormatReader for ChannelSeparator {
         Ok(())
     }
 
-    fn series(&self) -> usize { self.inner.series() }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.adjusted_meta.as_ref().unwrap_or_else(|| self.inner.metadata())
+        self.adjusted_meta
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let (is_split, nc, bps) = {
             let meta = self.inner.metadata();
-            (meta.is_rgb && meta.is_interleaved && meta.size_c > 1,
-             meta.size_c, meta.pixel_type.bytes_per_sample())
+            (
+                meta.is_rgb && meta.is_interleaved && meta.size_c > 1,
+                meta.size_c,
+                meta.pixel_type.bytes_per_sample(),
+            )
         };
         if is_split {
             let real_plane = plane_index / nc;
@@ -102,11 +152,21 @@ impl FormatReader for ChannelSeparator {
         }
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let (is_split, nc, bps) = {
             let meta = self.inner.metadata();
-            (meta.is_rgb && meta.is_interleaved && meta.size_c > 1,
-             meta.size_c, meta.pixel_type.bytes_per_sample())
+            (
+                meta.is_rgb && meta.is_interleaved && meta.size_c > 1,
+                meta.size_c,
+                meta.pixel_type.bytes_per_sample(),
+            )
         };
         if is_split {
             let real_plane = plane_index / nc;
@@ -121,8 +181,11 @@ impl FormatReader for ChannelSeparator {
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let (is_split, nc, bps) = {
             let meta = self.inner.metadata();
-            (meta.is_rgb && meta.is_interleaved && meta.size_c > 1,
-             meta.size_c, meta.pixel_type.bytes_per_sample())
+            (
+                meta.is_rgb && meta.is_interleaved && meta.size_c > 1,
+                meta.size_c,
+                meta.pixel_type.bytes_per_sample(),
+            )
         };
         if is_split {
             let real_plane = plane_index / nc;
@@ -134,10 +197,18 @@ impl FormatReader for ChannelSeparator {
         }
     }
 
-    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
-    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
-    fn resolution(&self) -> usize { self.inner.resolution() }
-    fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        wrapper_ome_metadata(self.inner.as_ref(), self.adjusted_meta.as_ref())
+    }
 }
 
 // ── ChannelMerger ───────────────────────────────────────────────────────────
@@ -156,12 +227,32 @@ pub struct ChannelMerger {
 
 impl ChannelMerger {
     pub fn new(inner: Box<dyn FormatReader>) -> Self {
-        ChannelMerger { inner, adjusted_meta: None }
+        ChannelMerger {
+            inner,
+            adjusted_meta: None,
+        }
     }
 
-    fn rebuild_meta(&mut self) {
+    fn rebuild_meta(&mut self) -> Result<()> {
         let meta = self.inner.metadata();
         if !meta.is_rgb && !meta.is_interleaved && meta.size_c > 1 && meta.image_count > 1 {
+            if meta.image_count % meta.size_c != 0 {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "cannot merge {} planes into {} channels",
+                    meta.image_count, meta.size_c
+                )));
+            }
+            let expected_count = meta
+                .size_z
+                .checked_mul(meta.size_c)
+                .and_then(|v| v.checked_mul(meta.size_t))
+                .ok_or_else(|| BioFormatsError::InvalidData("Z/C/T plane count overflow".into()))?;
+            if expected_count != meta.image_count {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "metadata Z/C/T plane count {expected_count} does not match image count {}",
+                    meta.image_count
+                )));
+            }
             let mut adjusted = meta.clone();
             adjusted.image_count = meta.image_count / meta.size_c;
             adjusted.is_rgb = true;
@@ -170,11 +261,14 @@ impl ChannelMerger {
         } else {
             self.adjusted_meta = None;
         }
+        Ok(())
     }
 
     /// Interleave N channel buffers into one RGBRGB... buffer.
     fn interleave(channels: &[Vec<u8>], bps: usize) -> Vec<u8> {
-        if channels.is_empty() { return Vec::new(); }
+        if channels.is_empty() {
+            return Vec::new();
+        }
         let nc = channels.len();
         let n_pixels = channels[0].len() / bps;
         let mut out = Vec::with_capacity(n_pixels * nc * bps);
@@ -186,16 +280,53 @@ impl ChannelMerger {
         }
         out
     }
+
+    fn source_plane_for_channel(&self, plane_index: u32, channel: u32) -> Result<u32> {
+        let meta = self.inner.metadata();
+        let target_count = meta
+            .size_z
+            .checked_mul(meta.size_t)
+            .ok_or_else(|| BioFormatsError::InvalidData("Z/T plane count overflow".into()))?;
+        if plane_index >= target_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if channel >= meta.size_c {
+            return Err(BioFormatsError::PlaneOutOfRange(channel));
+        }
+
+        let (z, t) = decompose_plane_without_channel(
+            plane_index,
+            meta.size_z,
+            meta.size_t,
+            meta.dimension_order,
+        );
+        let source = compose_plane(
+            z,
+            channel,
+            t,
+            meta.size_z,
+            meta.size_c,
+            meta.size_t,
+            meta.dimension_order,
+        );
+        if source >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(source));
+        }
+        Ok(source)
+    }
 }
 
 impl FormatReader for ChannelMerger {
-    fn is_this_type_by_name(&self, path: &Path) -> bool { self.inner.is_this_type_by_name(path) }
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool { self.inner.is_this_type_by_bytes(header) }
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        self.inner.is_this_type_by_name(path)
+    }
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        self.inner.is_this_type_by_bytes(header)
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
-        self.rebuild_meta();
-        Ok(())
+        self.rebuild_meta()
     }
 
     fn close(&mut self) -> Result<()> {
@@ -203,29 +334,39 @@ impl FormatReader for ChannelMerger {
         self.inner.close()
     }
 
-    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
         self.inner.set_series(series)?;
-        self.rebuild_meta();
-        Ok(())
+        self.rebuild_meta()
     }
 
-    fn series(&self) -> usize { self.inner.series() }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.adjusted_meta.as_ref().unwrap_or_else(|| self.inner.metadata())
+        self.adjusted_meta
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let (is_merge, nc, bps) = {
             let meta = self.inner.metadata();
-            (self.adjusted_meta.is_some(), meta.size_c, meta.pixel_type.bytes_per_sample())
+            (
+                self.adjusted_meta.is_some(),
+                meta.size_c,
+                meta.pixel_type.bytes_per_sample(),
+            )
         };
         if is_merge {
             let mut channels = Vec::with_capacity(nc as usize);
             for c in 0..nc {
-                channels.push(self.inner.open_bytes(plane_index * nc + c)?);
+                let source = self.source_plane_for_channel(plane_index, c)?;
+                channels.push(self.inner.open_bytes(source)?);
             }
             Ok(Self::interleave(&channels, bps))
         } else {
@@ -233,15 +374,27 @@ impl FormatReader for ChannelMerger {
         }
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let (is_merge, nc, bps) = {
             let meta = self.inner.metadata();
-            (self.adjusted_meta.is_some(), meta.size_c, meta.pixel_type.bytes_per_sample())
+            (
+                self.adjusted_meta.is_some(),
+                meta.size_c,
+                meta.pixel_type.bytes_per_sample(),
+            )
         };
         if is_merge {
             let mut channels = Vec::with_capacity(nc as usize);
             for c in 0..nc {
-                channels.push(self.inner.open_bytes_region(plane_index * nc + c, x, y, w, h)?);
+                let source = self.source_plane_for_channel(plane_index, c)?;
+                channels.push(self.inner.open_bytes_region(source, x, y, w, h)?);
             }
             Ok(Self::interleave(&channels, bps))
         } else {
@@ -252,12 +405,17 @@ impl FormatReader for ChannelMerger {
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let (is_merge, nc, bps) = {
             let meta = self.inner.metadata();
-            (self.adjusted_meta.is_some(), meta.size_c, meta.pixel_type.bytes_per_sample())
+            (
+                self.adjusted_meta.is_some(),
+                meta.size_c,
+                meta.pixel_type.bytes_per_sample(),
+            )
         };
         if is_merge {
             let mut channels = Vec::with_capacity(nc as usize);
             for c in 0..nc {
-                channels.push(self.inner.open_thumb_bytes(plane_index * nc + c)?);
+                let source = self.source_plane_for_channel(plane_index, c)?;
+                channels.push(self.inner.open_thumb_bytes(source)?);
             }
             Ok(Self::interleave(&channels, bps))
         } else {
@@ -265,10 +423,18 @@ impl FormatReader for ChannelMerger {
         }
     }
 
-    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
-    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
-    fn resolution(&self) -> usize { self.inner.resolution() }
-    fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        wrapper_ome_metadata(self.inner.as_ref(), self.adjusted_meta.as_ref())
+    }
 }
 
 // ── DimensionSwapper ────────────────────────────────────────────────────────
@@ -285,7 +451,11 @@ pub struct DimensionSwapper {
 
 impl DimensionSwapper {
     pub fn new(inner: Box<dyn FormatReader>, target_order: DimensionOrder) -> Self {
-        DimensionSwapper { inner, target_order, adjusted_meta: None }
+        DimensionSwapper {
+            inner,
+            target_order,
+            adjusted_meta: None,
+        }
     }
 
     fn rebuild_meta(&mut self) {
@@ -297,26 +467,95 @@ impl DimensionSwapper {
 
     /// Convert a linear plane index from the target dimension order to the
     /// source dimension order.
-    fn remap_plane(&self, plane_index: u32) -> u32 {
+    fn remap_plane(&self, plane_index: u32) -> Result<u32> {
         let meta = self.inner.metadata();
         let (sz, sc, st) = (meta.size_z, meta.size_c, meta.size_t);
+        if sz == 0 || sc == 0 || st == 0 {
+            return Err(BioFormatsError::InvalidData(format!(
+                "zero dimension in Z/C/T sizes: {sz}/{sc}/{st}"
+            )));
+        }
+
+        let plane_count = sz
+            .checked_mul(sc)
+            .and_then(|v| v.checked_mul(st))
+            .ok_or_else(|| BioFormatsError::InvalidData("Z/C/T plane count overflow".into()))?;
+        if plane_index >= plane_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
 
         // Decompose plane_index according to target order
         let (z, c, t) = decompose_plane(plane_index, sz, sc, st, self.target_order);
         // Recompose according to source order
-        compose_plane(z, c, t, sz, sc, st, meta.dimension_order)
+        Ok(compose_plane(z, c, t, sz, sc, st, meta.dimension_order))
     }
 }
 
 /// Decompose a linear plane index into (z, c, t) given a dimension order.
-fn decompose_plane(index: u32, sz: u32, sc: u32, st: u32, order: DimensionOrder) -> (u32, u32, u32) {
+fn decompose_plane(
+    index: u32,
+    sz: u32,
+    sc: u32,
+    st: u32,
+    order: DimensionOrder,
+) -> (u32, u32, u32) {
     match order {
-        DimensionOrder::XYZCT => { let z = index % sz; let c = (index / sz) % sc; let t = index / (sz * sc); (z, c, t) }
-        DimensionOrder::XYZTC => { let z = index % sz; let t = (index / sz) % st; let c = index / (sz * st); (z, c, t) }
-        DimensionOrder::XYCZT => { let c = index % sc; let z = (index / sc) % sz; let t = index / (sc * sz); (z, c, t) }
-        DimensionOrder::XYCTZ => { let c = index % sc; let t = (index / sc) % st; let z = index / (sc * st); (z, c, t) }
-        DimensionOrder::XYTCZ => { let t = index % st; let c = (index / st) % sc; let z = index / (st * sc); (z, c, t) }
-        DimensionOrder::XYTZC => { let t = index % st; let z = (index / st) % sz; let c = index / (st * sz); (z, c, t) }
+        DimensionOrder::XYZCT => {
+            let z = index % sz;
+            let c = (index / sz) % sc;
+            let t = index / (sz * sc);
+            (z, c, t)
+        }
+        DimensionOrder::XYZTC => {
+            let z = index % sz;
+            let t = (index / sz) % st;
+            let c = index / (sz * st);
+            (z, c, t)
+        }
+        DimensionOrder::XYCZT => {
+            let c = index % sc;
+            let z = (index / sc) % sz;
+            let t = index / (sc * sz);
+            (z, c, t)
+        }
+        DimensionOrder::XYCTZ => {
+            let c = index % sc;
+            let t = (index / sc) % st;
+            let z = index / (sc * st);
+            (z, c, t)
+        }
+        DimensionOrder::XYTCZ => {
+            let t = index % st;
+            let c = (index / st) % sc;
+            let z = index / (st * sc);
+            (z, c, t)
+        }
+        DimensionOrder::XYTZC => {
+            let t = index % st;
+            let z = (index / st) % sz;
+            let c = index / (st * sz);
+            (z, c, t)
+        }
+    }
+}
+
+fn decompose_plane_without_channel(
+    index: u32,
+    sz: u32,
+    st: u32,
+    order: DimensionOrder,
+) -> (u32, u32) {
+    match order {
+        DimensionOrder::XYZCT | DimensionOrder::XYZTC | DimensionOrder::XYCZT => {
+            let z = index % sz;
+            let t = index / sz;
+            (z, t)
+        }
+        DimensionOrder::XYCTZ | DimensionOrder::XYTCZ | DimensionOrder::XYTZC => {
+            let t = index % st;
+            let z = index / st;
+            (z, t)
+        }
     }
 }
 
@@ -333,8 +572,12 @@ fn compose_plane(z: u32, c: u32, t: u32, sz: u32, sc: u32, st: u32, order: Dimen
 }
 
 impl FormatReader for DimensionSwapper {
-    fn is_this_type_by_name(&self, path: &Path) -> bool { self.inner.is_this_type_by_name(path) }
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool { self.inner.is_this_type_by_bytes(header) }
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        self.inner.is_this_type_by_name(path)
+    }
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        self.inner.is_this_type_by_bytes(header)
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
@@ -347,7 +590,9 @@ impl FormatReader for DimensionSwapper {
         self.inner.close()
     }
 
-    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
         self.inner.set_series(series)?;
@@ -355,28 +600,50 @@ impl FormatReader for DimensionSwapper {
         Ok(())
     }
 
-    fn series(&self) -> usize { self.inner.series() }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.adjusted_meta.as_ref().unwrap_or_else(|| self.inner.metadata())
+        self.adjusted_meta
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(self.remap_plane(plane_index))
+        let remapped = self.remap_plane(plane_index)?;
+        self.inner.open_bytes(remapped)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(self.remap_plane(plane_index), x, y, w, h)
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let remapped = self.remap_plane(plane_index)?;
+        self.inner.open_bytes_region(remapped, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(self.remap_plane(plane_index))
+        let remapped = self.remap_plane(plane_index)?;
+        self.inner.open_thumb_bytes(remapped)
     }
 
-    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
-    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
-    fn resolution(&self) -> usize { self.inner.resolution() }
-    fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        wrapper_ome_metadata(self.inner.as_ref(), self.adjusted_meta.as_ref())
+    }
 }
 
 // ── MinMaxCalculator ────────────────────────────────────────────────────────
@@ -394,7 +661,10 @@ pub struct MinMaxCalculator {
 
 impl MinMaxCalculator {
     pub fn new(inner: Box<dyn FormatReader>) -> Self {
-        MinMaxCalculator { inner, channel_stats: Vec::new() }
+        MinMaxCalculator {
+            inner,
+            channel_stats: Vec::new(),
+        }
     }
 
     /// Return per-channel (min, max) values computed so far.
@@ -407,6 +677,7 @@ impl MinMaxCalculator {
         let nc = meta.size_c as usize;
         let bps = meta.pixel_type.bytes_per_sample();
         let pt = meta.pixel_type;
+        let little_endian = meta.is_little_endian;
         let interleaved = meta.is_interleaved && meta.is_rgb;
 
         while self.channel_stats.len() < nc {
@@ -419,54 +690,125 @@ impl MinMaxCalculator {
             for i in 0..n_pixels {
                 for c in 0..nc {
                     let offset = i * pixel_bytes + c * bps;
-                    let val = read_sample(data, offset, pt);
+                    let val = read_sample(data, offset, pt, little_endian);
                     let (ref mut mn, ref mut mx) = self.channel_stats[c];
-                    if val < *mn { *mn = val; }
-                    if val > *mx { *mx = val; }
+                    if val < *mn {
+                        *mn = val;
+                    }
+                    if val > *mx {
+                        *mx = val;
+                    }
                 }
             }
         } else if bps > 0 {
             let n_samples = data.len() / bps;
             let (ref mut mn, ref mut mx) = self.channel_stats[0];
             for i in 0..n_samples {
-                let val = read_sample(data, i * bps, pt);
-                if val < *mn { *mn = val; }
-                if val > *mx { *mx = val; }
+                let val = read_sample(data, i * bps, pt, little_endian);
+                if val < *mn {
+                    *mn = val;
+                }
+                if val > *mx {
+                    *mx = val;
+                }
             }
         }
     }
 }
 
-fn read_sample(data: &[u8], offset: usize, pt: PixelType) -> f64 {
+fn read_sample(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -> f64 {
     match pt {
         PixelType::Uint8 => data[offset] as f64,
         PixelType::Int8 => data[offset] as i8 as f64,
         PixelType::Uint16 => {
-            u16::from_le_bytes([data[offset], data[offset + 1]]) as f64
+            let bytes = [data[offset], data[offset + 1]];
+            (if little_endian {
+                u16::from_le_bytes(bytes)
+            } else {
+                u16::from_be_bytes(bytes)
+            }) as f64
         }
         PixelType::Int16 => {
-            i16::from_le_bytes([data[offset], data[offset + 1]]) as f64
+            let bytes = [data[offset], data[offset + 1]];
+            (if little_endian {
+                i16::from_le_bytes(bytes)
+            } else {
+                i16::from_be_bytes(bytes)
+            }) as f64
         }
         PixelType::Uint32 => {
-            u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as f64
+            let bytes = [
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ];
+            (if little_endian {
+                u32::from_le_bytes(bytes)
+            } else {
+                u32::from_be_bytes(bytes)
+            }) as f64
         }
         PixelType::Int32 => {
-            i32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as f64
+            let bytes = [
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ];
+            (if little_endian {
+                i32::from_le_bytes(bytes)
+            } else {
+                i32::from_be_bytes(bytes)
+            }) as f64
         }
         PixelType::Float32 => {
-            f32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as f64
+            let bytes = [
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ];
+            (if little_endian {
+                f32::from_le_bytes(bytes)
+            } else {
+                f32::from_be_bytes(bytes)
+            }) as f64
         }
         PixelType::Float64 => {
-            f64::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3],
-                data[offset+4], data[offset+5], data[offset+6], data[offset+7]])
+            let bytes = [
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ];
+            if little_endian {
+                f64::from_le_bytes(bytes)
+            } else {
+                f64::from_be_bytes(bytes)
+            }
         }
-        PixelType::Bit => if data[offset] != 0 { 1.0 } else { 0.0 },
+        PixelType::Bit => {
+            if data[offset] != 0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
     }
 }
 
 impl FormatReader for MinMaxCalculator {
-    fn is_this_type_by_name(&self, path: &Path) -> bool { self.inner.is_this_type_by_name(path) }
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool { self.inner.is_this_type_by_bytes(header) }
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        self.inner.is_this_type_by_name(path)
+    }
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        self.inner.is_this_type_by_bytes(header)
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.channel_stats.clear();
@@ -478,15 +820,21 @@ impl FormatReader for MinMaxCalculator {
         self.inner.close()
     }
 
-    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
         self.channel_stats.clear();
         self.inner.set_series(series)
     }
 
-    fn series(&self) -> usize { self.inner.series() }
-    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let data = self.inner.open_bytes(plane_index)?;
@@ -494,7 +842,14 @@ impl FormatReader for MinMaxCalculator {
         Ok(data)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let data = self.inner.open_bytes_region(plane_index, x, y, w, h)?;
         self.update_stats(&data);
         Ok(data)
@@ -504,10 +859,235 @@ impl FormatReader for MinMaxCalculator {
         self.inner.open_thumb_bytes(plane_index)
     }
 
-    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
-    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
-    fn resolution(&self) -> usize { self.inner.resolution() }
-    fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        wrapper_ome_metadata(self.inner.as_ref(), None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockReader {
+        meta: ImageMetadata,
+        planes: Vec<Vec<u8>>,
+        ome: Option<OmeMetadata>,
+    }
+
+    impl MockReader {
+        fn new(meta: ImageMetadata, planes: Vec<Vec<u8>>) -> Self {
+            Self {
+                meta,
+                planes,
+                ome: None,
+            }
+        }
+
+        fn with_ome(mut self, ome: OmeMetadata) -> Self {
+            self.ome = Some(ome);
+            self
+        }
+    }
+
+    impl FormatReader for MockReader {
+        fn is_this_type_by_name(&self, _path: &Path) -> bool {
+            true
+        }
+        fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+            true
+        }
+        fn set_id(&mut self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn series_count(&self) -> usize {
+            1
+        }
+        fn set_series(&mut self, _series: usize) -> Result<()> {
+            Ok(())
+        }
+        fn series(&self) -> usize {
+            0
+        }
+        fn metadata(&self) -> &ImageMetadata {
+            &self.meta
+        }
+
+        fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+            self.planes
+                .get(plane_index as usize)
+                .cloned()
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
+        }
+
+        fn open_bytes_region(
+            &mut self,
+            plane_index: u32,
+            _x: u32,
+            _y: u32,
+            _w: u32,
+            _h: u32,
+        ) -> Result<Vec<u8>> {
+            self.open_bytes(plane_index)
+        }
+
+        fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+            self.open_bytes(plane_index)
+        }
+
+        fn ome_metadata(&self) -> Option<OmeMetadata> {
+            self.ome.clone()
+        }
+    }
+
+    #[test]
+    fn minmax_calculator_uses_big_endian_multi_byte_samples() {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = 3;
+        meta.size_y = 1;
+        meta.pixel_type = PixelType::Uint16;
+        meta.bits_per_pixel = 16;
+        meta.is_little_endian = false;
+
+        let data = vec![0x00, 0x02, 0x01, 0x00, 0x00, 0x10];
+        let inner = Box::new(MockReader::new(meta, vec![data]));
+        let mut calc = MinMaxCalculator::new(inner);
+
+        calc.open_bytes(0).expect("open_bytes");
+
+        assert_eq!(calc.channel_min_max(), &[(2.0, 256.0)]);
+    }
+
+    #[test]
+    fn dimension_swapper_rejects_zero_ztc_dimensions() {
+        let mut meta = ImageMetadata::default();
+        meta.size_z = 0;
+        meta.size_c = 1;
+        meta.size_t = 1;
+
+        let inner = Box::new(MockReader::new(meta, vec![vec![0]]));
+        let mut swapper = DimensionSwapper::new(inner, DimensionOrder::XYZTC);
+
+        let err = swapper.open_bytes(0).expect_err("zero Z must be rejected");
+        assert!(matches!(err, BioFormatsError::InvalidData(_)));
+    }
+
+    #[test]
+    fn dimension_swapper_rejects_out_of_range_target_plane() {
+        let mut meta = ImageMetadata::default();
+        meta.size_z = 2;
+        meta.size_c = 2;
+        meta.size_t = 1;
+        meta.dimension_order = DimensionOrder::XYZCT;
+        meta.image_count = 4;
+
+        let planes = vec![vec![0], vec![1], vec![2], vec![3]];
+        let inner = Box::new(MockReader::new(meta, planes));
+        let mut swapper = DimensionSwapper::new(inner, DimensionOrder::XYCZT);
+
+        let err = swapper.open_bytes(4).expect_err("plane 4 is outside 0..4");
+        assert!(matches!(err, BioFormatsError::PlaneOutOfRange(4)));
+    }
+
+    #[test]
+    fn channel_merger_uses_dimension_order_for_source_planes() {
+        let mut meta = ImageMetadata::default();
+        meta.size_z = 2;
+        meta.size_c = 2;
+        meta.size_t = 1;
+        meta.image_count = 4;
+        meta.dimension_order = DimensionOrder::XYZCT;
+        meta.is_rgb = false;
+        meta.is_interleaved = false;
+
+        let planes = vec![vec![10], vec![20], vec![30], vec![40]];
+        let inner = Box::new(MockReader::new(meta, planes));
+        let mut merger = ChannelMerger::new(inner);
+        merger.rebuild_meta().expect("merge metadata");
+
+        let z0 = merger.open_bytes(0).expect("z0");
+        let z1 = merger.open_bytes(1).expect("z1");
+
+        assert_eq!(z0, vec![10, 30]);
+        assert_eq!(z1, vec![20, 40]);
+    }
+
+    #[test]
+    fn channel_merger_rejects_non_divisible_stacks() {
+        let mut meta = ImageMetadata::default();
+        meta.size_z = 1;
+        meta.size_c = 2;
+        meta.size_t = 1;
+        meta.image_count = 3;
+        meta.is_rgb = false;
+        meta.is_interleaved = false;
+
+        let inner = Box::new(MockReader::new(meta, vec![vec![1], vec![2], vec![3]]));
+        let mut merger = ChannelMerger::new(inner);
+
+        let err = merger
+            .rebuild_meta()
+            .expect_err("non-divisible channel stack must fail");
+        assert!(matches!(err, BioFormatsError::InvalidData(_)));
+    }
+
+    #[test]
+    fn channel_separator_updates_ome_channel_samples() {
+        let mut meta = ImageMetadata::default();
+        meta.size_c = 3;
+        meta.image_count = 1;
+        meta.is_rgb = true;
+        meta.is_interleaved = true;
+
+        let mut ome = OmeMetadata::from_image_metadata(&meta);
+        ome.images[0].channels[0].name = Some("red".into());
+        let inner = Box::new(MockReader::new(meta, vec![vec![1, 2, 3]]).with_ome(ome));
+        let mut separator = ChannelSeparator::new(inner);
+
+        separator.rebuild_meta();
+        let ome = separator.ome_metadata().expect("OME metadata");
+
+        assert_eq!(separator.metadata().image_count, 3);
+        assert_eq!(ome.images[0].channels.len(), 3);
+        assert!(ome.images[0]
+            .channels
+            .iter()
+            .all(|ch| ch.samples_per_pixel == 1));
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn channel_filler_updates_ome_channel_count() {
+        let mut meta = ImageMetadata::default();
+        meta.size_c = 1;
+        meta.image_count = 1;
+        meta.is_interleaved = true;
+
+        let ome = OmeMetadata::from_image_metadata(&meta);
+        let inner = Box::new(MockReader::new(meta, vec![vec![7]]).with_ome(ome));
+        let mut filler = ChannelFiller::new(inner).with_channels(3);
+
+        filler.rebuild_meta();
+        let ome = filler.ome_metadata().expect("OME metadata");
+
+        assert_eq!(filler.metadata().size_c, 3);
+        assert_eq!(ome.images[0].channels.len(), 3);
+        assert!(ome.images[0]
+            .channels
+            .iter()
+            .all(|ch| ch.samples_per_pixel == 3));
+    }
 }
 
 // ── ChannelFiller ───────────────────────────────────────────────────────────
@@ -525,7 +1105,11 @@ pub struct ChannelFiller {
 
 impl ChannelFiller {
     pub fn new(inner: Box<dyn FormatReader>) -> Self {
-        ChannelFiller { inner, fill_to: None, adjusted_meta: None }
+        ChannelFiller {
+            inner,
+            fill_to: None,
+            adjusted_meta: None,
+        }
     }
 
     /// Force output to have exactly `n` interleaved channels, zero-padding extras.
@@ -552,9 +1136,13 @@ impl ChannelFiller {
         let meta = self.inner.metadata();
         let actual_c = meta.size_c as usize;
         let target = target_c as usize;
-        if actual_c >= target { return data; }
+        if actual_c >= target {
+            return data;
+        }
         let bps = meta.pixel_type.bytes_per_sample();
-        if bps == 0 || !meta.is_interleaved { return data; }
+        if bps == 0 || !meta.is_interleaved {
+            return data;
+        }
         let src_pixel = actual_c * bps;
         let dst_pixel = target * bps;
         let n_pixels = data.len() / src_pixel;
@@ -568,25 +1156,66 @@ impl ChannelFiller {
 }
 
 impl FormatReader for ChannelFiller {
-    fn is_this_type_by_name(&self, path: &Path) -> bool { self.inner.is_this_type_by_name(path) }
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool { self.inner.is_this_type_by_bytes(header) }
-    fn set_id(&mut self, path: &Path) -> Result<()> { self.inner.set_id(path)?; self.rebuild_meta(); Ok(()) }
-    fn close(&mut self) -> Result<()> { self.adjusted_meta = None; self.inner.close() }
-    fn series_count(&self) -> usize { self.inner.series_count() }
-    fn set_series(&mut self, s: usize) -> Result<()> { self.inner.set_series(s)?; self.rebuild_meta(); Ok(()) }
-    fn series(&self) -> usize { self.inner.series() }
-    fn metadata(&self) -> &ImageMetadata { self.adjusted_meta.as_ref().unwrap_or_else(|| self.inner.metadata()) }
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        self.inner.is_this_type_by_name(path)
+    }
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        self.inner.is_this_type_by_bytes(header)
+    }
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)?;
+        self.rebuild_meta();
+        Ok(())
+    }
+    fn close(&mut self) -> Result<()> {
+        self.adjusted_meta = None;
+        self.inner.close()
+    }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        self.inner.set_series(s)?;
+        self.rebuild_meta();
+        Ok(())
+    }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.adjusted_meta
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
+    }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         let data = self.inner.open_bytes(p)?;
-        Ok(if let Some(c) = self.fill_to { self.fill_data(data, c) } else { data })
+        Ok(if let Some(c) = self.fill_to {
+            self.fill_data(data, c)
+        } else {
+            data
+        })
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let data = self.inner.open_bytes_region(p, x, y, w, h)?;
-        Ok(if let Some(c) = self.fill_to { self.fill_data(data, c) } else { data })
+        Ok(if let Some(c) = self.fill_to {
+            self.fill_data(data, c)
+        } else {
+            data
+        })
     }
-    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(p) }
-    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
-    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
-    fn resolution(&self) -> usize { self.inner.resolution() }
-    fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        wrapper_ome_metadata(self.inner.as_ref(), self.adjusted_meta.as_ref())
+    }
 }

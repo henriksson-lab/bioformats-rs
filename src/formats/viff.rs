@@ -16,7 +16,12 @@ use crate::common::reader::FormatReader;
 const HEADER_SIZE: u64 = 1024;
 
 fn read_u32_be(buf: &[u8], offset: usize) -> u32 {
-    u32::from_be_bytes([buf[offset], buf[offset+1], buf[offset+2], buf[offset+3]])
+    u32::from_be_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
 }
 
 fn parse_viff_header(header: &[u8]) -> Result<ImageMetadata> {
@@ -25,7 +30,7 @@ fn parse_viff_header(header: &[u8]) -> Result<ImageMetadata> {
     }
 
     let height = read_u32_be(header, 40); // row_size
-    let width  = read_u32_be(header, 44); // col_size
+    let width = read_u32_be(header, 44); // col_size
     let channels = read_u32_be(header, 76); // num_data_bands
     let storage_type = read_u32_be(header, 80);
 
@@ -75,7 +80,11 @@ pub struct ViffReader {
 
 impl ViffReader {
     pub fn new() -> Self {
-        ViffReader { path: None, meta: None, data_offset: HEADER_SIZE }
+        ViffReader {
+            path: None,
+            meta: None,
+            data_offset: HEADER_SIZE,
+        }
     }
 }
 
@@ -114,13 +123,21 @@ impl FormatReader for ViffReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -135,13 +152,21 @@ impl FormatReader for ViffReader {
         let plane_bytes = meta.size_x as usize * meta.size_y as usize * meta.size_c as usize * bps;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.data_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();

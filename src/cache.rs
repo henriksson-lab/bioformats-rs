@@ -27,7 +27,9 @@ pub enum CacheStrategy {
 }
 
 impl Default for CacheStrategy {
-    fn default() -> Self { CacheStrategy::Lru(64) }
+    fn default() -> Self {
+        CacheStrategy::Lru(64)
+    }
 }
 
 /// A cached plane reader that wraps a `FormatReader` and caches decoded planes
@@ -61,7 +63,9 @@ impl CachedReader {
     }
 
     /// Number of planes currently cached.
-    pub fn cached_count(&self) -> usize { self.cache.len() }
+    pub fn cached_count(&self) -> usize {
+        self.cache.len()
+    }
 
     /// Clear the cache.
     pub fn clear_cache(&mut self) {
@@ -81,7 +85,9 @@ impl CachedReader {
     }
 
     fn store(&mut self, key: (usize, usize, u32), data: Vec<u8>) {
-        if self.max_planes == 0 { return; }
+        if self.max_planes == 0 {
+            return;
+        }
         self.evict_if_needed();
         // Move to end of access order (most recent)
         self.access_order.retain(|k| k != &key);
@@ -91,8 +97,12 @@ impl CachedReader {
 }
 
 impl FormatReader for CachedReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool { self.inner.is_this_type_by_name(path) }
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool { self.inner.is_this_type_by_bytes(header) }
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        self.inner.is_this_type_by_name(path)
+    }
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        self.inner.is_this_type_by_bytes(header)
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.clear_cache();
@@ -104,14 +114,20 @@ impl FormatReader for CachedReader {
         self.inner.close()
     }
 
-    fn series_count(&self) -> usize { self.inner.series_count() }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
         self.inner.set_series(series)
     }
 
-    fn series(&self) -> usize { self.inner.series() }
-    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let key = self.cache_key(plane_index);
@@ -126,7 +142,14 @@ impl FormatReader for CachedReader {
         Ok(data)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         // Region reads are not cached (different regions of same plane)
         self.inner.open_bytes_region(plane_index, x, y, w, h)
     }
@@ -135,8 +158,16 @@ impl FormatReader for CachedReader {
         self.inner.open_thumb_bytes(plane_index)
     }
 
-    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
-    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
-    fn resolution(&self) -> usize { self.inner.resolution() }
-    fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        self.inner.ome_metadata()
+    }
 }

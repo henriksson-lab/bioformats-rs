@@ -67,12 +67,17 @@ pub struct CellWorxReader {
 
 impl CellWorxReader {
     pub fn new() -> Self {
-        CellWorxReader { path: None, meta: None }
+        CellWorxReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for CellWorxReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_htd(path: &Path) -> Result<ImageMetadata> {
@@ -85,11 +90,27 @@ fn parse_htd(path: &Path) -> Result<ImageMetadata> {
 
     for line in content.lines() {
         let line = line.trim();
-        if let Some(v) = htd_kv(line, "XSites") { if let Ok(n) = v.parse() { x_sites = n; } }
-        else if let Some(v) = htd_kv(line, "YSites") { if let Ok(n) = v.parse() { y_sites = n; } }
-        else if let Some(v) = htd_kv(line, "TimePoints") { if let Ok(n) = v.parse() { timepoints = n; } }
-        else if let Some(v) = htd_kv(line, "ZSteps") { if let Ok(n) = v.parse() { z_steps = n; } }
-        else if let Some(v) = htd_kv(line, "Wavelengths") { if let Ok(n) = v.parse() { wavelengths = n; } }
+        if let Some(v) = htd_kv(line, "XSites") {
+            if let Ok(n) = v.parse() {
+                x_sites = n;
+            }
+        } else if let Some(v) = htd_kv(line, "YSites") {
+            if let Ok(n) = v.parse() {
+                y_sites = n;
+            }
+        } else if let Some(v) = htd_kv(line, "TimePoints") {
+            if let Ok(n) = v.parse() {
+                timepoints = n;
+            }
+        } else if let Some(v) = htd_kv(line, "ZSteps") {
+            if let Ok(n) = v.parse() {
+                z_steps = n;
+            }
+        } else if let Some(v) = htd_kv(line, "Wavelengths") {
+            if let Ok(n) = v.parse() {
+                wavelengths = n;
+            }
+        }
     }
 
     let image_count = x_sites * y_sites * timepoints * z_steps * wavelengths;
@@ -104,16 +125,24 @@ fn htd_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 impl FormatReader for CellWorxReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("htd") | Some("pnl"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         // If .pnl, look for companion .htd
-        let cfg_path = if path.extension().and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pnl")).unwrap_or(false)
+        let cfg_path = if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("pnl"))
+            .unwrap_or(false)
         {
             path.with_extension("htd")
         } else {
@@ -131,23 +160,44 @@ impl FormatReader for CellWorxReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None; self.meta = None; Ok(())
+        self.path = None;
+        self.meta = None;
+        Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         Ok(blank_plane(meta))
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         Ok(region_crop(&full, meta, x, y, w, h))
@@ -155,8 +205,10 @@ impl FormatReader for CellWorxReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256); let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2; let ty = (meta.size_y - th) / 2;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
@@ -173,12 +225,17 @@ pub struct Al3dReader {
 
 impl Al3dReader {
     pub fn new() -> Self {
-        Al3dReader { path: None, meta: None }
+        Al3dReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for Al3dReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_al3d(path: &Path) -> Result<ImageMetadata> {
@@ -187,9 +244,9 @@ fn parse_al3d(path: &Path) -> Result<ImageMetadata> {
         return Err(BioFormatsError::Format("AL3D file too short".into()));
     }
     // Offset 8: width (u32 LE), 12: height (u32 LE), 16: depth (u32 LE)
-    let width  = u32::from_le_bytes([data[8], data[9], data[10], data[11]]).max(1);
+    let width = u32::from_le_bytes([data[8], data[9], data[10], data[11]]).max(1);
     let height = u32::from_le_bytes([data[12], data[13], data[14], data[15]]).max(1);
-    let depth  = u32::from_le_bytes([data[16], data[17], data[18], data[19]]).max(1);
+    let depth = u32::from_le_bytes([data[16], data[17], data[18], data[19]]).max(1);
     // Offset 20: data_type (u16 LE)
     let data_type = u16::from_le_bytes([data[20], data[21]]);
     let pixel_type = match data_type {
@@ -203,7 +260,10 @@ fn parse_al3d(path: &Path) -> Result<ImageMetadata> {
 
 impl FormatReader for Al3dReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("al3d"))
     }
 
@@ -219,31 +279,57 @@ impl FormatReader for Al3dReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None; self.meta = None; Ok(())
+        self.path = None;
+        self.meta = None;
+        Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
         let plane_offset = AL3D_DATA_OFFSET + plane_index as u64 * plane_bytes as u64;
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?.clone();
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(plane_offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(plane_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         Ok(region_crop(&full, meta, x, y, w, h))
@@ -251,8 +337,10 @@ impl FormatReader for Al3dReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256); let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2; let ty = (meta.size_y - th) / 2;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
@@ -267,10 +355,19 @@ pub struct FeiSerReader {
 }
 
 impl FeiSerReader {
-    pub fn new() -> Self { FeiSerReader { path: None, meta: None } }
+    pub fn new() -> Self {
+        FeiSerReader {
+            path: None,
+            meta: None,
+        }
+    }
 }
 
-impl Default for FeiSerReader { fn default() -> Self { Self::new() } }
+impl Default for FeiSerReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn parse_ser(path: &Path) -> Result<ImageMetadata> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
@@ -282,10 +379,12 @@ fn parse_ser(path: &Path) -> Result<ImageMetadata> {
     // Bytes 8-11: total element count (LE u32) — number of frames
     let n_frames = u32::from_le_bytes([data[8], data[9], data[10], data[11]]).max(1);
     // Bytes 24-27: width, 28-31: height (LE u32 at those positions in the tag)
-    let width  = u32::from_le_bytes([data[24], data[25], data[26], data[27]]).max(1);
+    let width = u32::from_le_bytes([data[24], data[25], data[26], data[27]]).max(1);
     let height = if data.len() >= 32 {
         u32::from_le_bytes([data[28], data[29], data[30], data[31]]).max(1)
-    } else { 512 };
+    } else {
+        512
+    };
     let pixel_type = match dtype {
         1 => PixelType::Uint8,
         2 => PixelType::Uint16,
@@ -294,14 +393,17 @@ fn parse_ser(path: &Path) -> Result<ImageMetadata> {
         8 => PixelType::Float64,
         _ => PixelType::Uint16,
     };
-    let width  = if width  > 65535 { 512 } else { width };
+    let width = if width > 65535 { 512 } else { width };
     let height = if height > 65535 { 512 } else { height };
     Ok(simple_meta(width, height, n_frames, pixel_type))
 }
 
 impl FormatReader for FeiSerReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("ser"))
     }
 
@@ -316,21 +418,44 @@ impl FormatReader for FeiSerReader {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<()> { self.path = None; self.meta = None; Ok(()) }
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Ok(())
     }
-    fn series(&self) -> usize { 0 }
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn series_count(&self) -> usize {
+        1
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         Ok(blank_plane(meta))
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         Ok(region_crop(&full, meta, x, y, w, h))
@@ -338,8 +463,10 @@ impl FormatReader for FeiSerReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256); let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2; let ty = (meta.size_y - th) / 2;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
@@ -355,12 +482,17 @@ pub struct OxfordInstrumentsReader {
 
 impl OxfordInstrumentsReader {
     pub fn new() -> Self {
-        OxfordInstrumentsReader { path: None, meta: None }
+        OxfordInstrumentsReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for OxfordInstrumentsReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_oxford(path: &Path) -> Result<ImageMetadata> {
@@ -369,27 +501,32 @@ fn parse_oxford(path: &Path) -> Result<ImageMetadata> {
         return Ok(simple_meta(512, 512, 1, PixelType::Uint16));
     }
     // Offset 4: width (u16 LE), 6: height (u16 LE), 8: data_type (u16 LE)
-    let width  = u16::from_le_bytes([data[4], data[5]]) as u32;
+    let width = u16::from_le_bytes([data[4], data[5]]) as u32;
     let height = u16::from_le_bytes([data[6], data[7]]) as u32;
-    let dtype  = u16::from_le_bytes([data[8], data[9]]);
+    let dtype = u16::from_le_bytes([data[8], data[9]]);
     let pixel_type = match dtype {
         0 => PixelType::Uint8,
         1 => PixelType::Uint16,
         2 => PixelType::Float32,
         _ => PixelType::Uint16,
     };
-    let width  = if width  == 0 { 512 } else { width };
+    let width = if width == 0 { 512 } else { width };
     let height = if height == 0 { 512 } else { height };
     Ok(simple_meta(width, height, 1, pixel_type))
 }
 
 impl FormatReader for OxfordInstrumentsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("top"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let meta = parse_oxford(path)?;
@@ -399,30 +536,56 @@ impl FormatReader for OxfordInstrumentsReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None; self.meta = None; Ok(())
+        self.path = None;
+        self.meta = None;
+        Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index != 0 { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?.clone();
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(OXFORD_DATA_OFFSET)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(OXFORD_DATA_OFFSET))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         Ok(region_crop(&full, meta, x, y, w, h))
@@ -430,8 +593,10 @@ impl FormatReader for OxfordInstrumentsReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256); let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2; let ty = (meta.size_y - th) / 2;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }

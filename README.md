@@ -2,19 +2,18 @@
 
 A pure-Rust reimplementation of [Bio-Formats](https://www.openmicroscopy.org/bio-formats/) 
 — a library for reading (and writing) scientific image formats used in microscopy, medical imaging, and astronomy.
-No JVM, no native dependencies.
 
 **This package is still under development**
 
+* 2026-05-24: started proper audit; plenty left to do on this crate
 
-## This is an LLM-mediated faithful (hopefully) translation, not the original code!
+## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
 
 Most users should probably first see if the existing original code works for them, unless they have reason otherwise. The original source
 may have newer features and it has had more love in terms of fixing bugs. In fact, we aim to replicate bugs if they are present, for the
 sake of reproducibility! (but then we might have added a few more in the process)
 
-There are however cases when you might prefer this Rust version. We generally agree with [this page](https://rewrites.bio/)
-but more specifically:
+There are however cases when you might prefer this Rust version. We generally agree with [this manifesto](https://rewrites.bio/) but more specifically:
 * We have had many issues with ensuring that our software works using existing containers (Docker, PodMan, Singularity). One size does not fit all and it eats our resources trying to keep up with every way of delivering software
 * Common package managers do not work well. It was great when we had a few Linux distributions with stable procedures, but now there are just too many ecosystems (Homebrew, Conda). Conda has an NP-complete resolver which does not scale. Homebrew is only so-stable. And our dependencies in Python still break. These can no longer be considered professional serious options. Meanwhile, Cargo enables multiple versions of packages to be available, even within the same program(!)
 * The future is the web. We deploy software in the web browser, and until now that has meant Javascript. This is a language where even the == operator is broken. Typescript is one step up, but a game changer is the ability to compile Rust code into webassembly, enabling performance and sharing of code with the backend. Translating code to Rust enables new ways of deployment and running code in the browser has especial benefits for science - researchers do not have deep pockets to run servers, so pushing compute to the user enables deployment that otherwise would be impossible
@@ -23,17 +22,14 @@ but more specifically:
 
 But:
 
-* **This approach should still be considered experimental**. The LLM technology is immature and has sharp corners. But there are opportunities to reap, and the genie is not going back to the bottle. This translation is as much aimed to learn how to improve the technology and get feedback on the results.
+* **This approach should still be considered experimental**. The LLM technology is immature and has sharp corners. But there are opportunities to reap, and the genie is not going back into the bottle. This translation is as much aimed to learn how to improve the technology and get feedback on the results.
 * Translations are not endorsed by the original authors unless otherwise noted. **Do not send bug reports to the original developers**. Use our Github issues page instead.
 * **Do not trust the benchmarks on this page**. They are used to help evaluate the translation. If you want improved performance, you generally have to use this code as a library, and use the additional tricks it offers. We generally accept performance losses in order to reduce our dependency issues
 * **Check the original Github pages for information about the package**. This README is kept sparse on purpose. It is not meant to be the primary source of information
+* **If you are the author of the original code and wish to move to Rust, you can obtain ownership of this repository and crate**. Until then, our commitment is to offer an as-faithful-as-possible translation of a snapshot of your code. If we find serious bugs, we will report them to you. Otherwise we will just replicate them, to ensure comparability across studies that claim to use package XYZ v.666. Think of this like a fancy Ubuntu .deb-package of your software - that is how we treat it
 
+This blurb might be out of date. Go to [this page](https://github.com/henriksson-lab/rustification) for the latest information and further information about how we approach translation
 
-
-## License
-
-The license is derived from Bio-formats, as code is derived from this source. License will be reanalyzed after
-full refactoring
 
 ## Quick start
 
@@ -180,8 +176,7 @@ w.close()?;
 Access compression options through the crate-level types:
 
 ```rust
-use bioformats_tiff::{TiffWriter, WriteCompression};
-use bioformats_common::writer::FormatWriter;
+use bioformats::{FormatWriter, TiffWriter, WriteCompression};
 
 let mut writer = TiffWriter::new().with_compression(WriteCompression::Deflate);
 writer.set_metadata(&meta)?;
@@ -195,7 +190,7 @@ writer.close()?;
 Implement this to add a new format:
 
 ```rust
-use bioformats_common::{reader::FormatReader, metadata::ImageMetadata, error::Result};
+use bioformats::{FormatReader, ImageMetadata, Result};
 
 struct MyReader { /* ... */ }
 
@@ -214,29 +209,6 @@ impl FormatReader for MyReader {
 }
 ```
 
-## Workspace structure
-
-```
-├── crates/
-│   ├── bioformats/             # Public facade: ImageReader, ImageWriter, re-exports
-│   ├── bioformats-common/      # Shared: FormatReader/Writer traits, ImageMetadata,
-│   │                           #   PixelType, error types, codecs, endian utils
-│   ├── bioformats-tiff/        # TIFF / OME-TIFF / BigTIFF (from scratch)
-│   ├── bioformats-png/         # PNG
-│   ├── bioformats-jpeg/        # JPEG
-│   ├── bioformats-bmp/         # BMP
-│   ├── bioformats-raster/      # GIF, TGA, WebP, PNM, HDR, EXR, DDS, Farbfeld
-│   ├── bioformats-ics/         # ICS / ICS2 (fluorescence microscopy)
-│   ├── bioformats-mrc/         # MRC / CCP4 (cryo-EM)
-│   ├── bioformats-fits/        # FITS (astronomy)
-│   ├── bioformats-nrrd/        # NRRD (medical imaging)
-│   ├── bioformats-metaimage/   # MHA / MHD MetaImage (ITK/VTK)
-│   ├── bioformats-lif/         # Leica LIF
-│   ├── bioformats-nd2/         # Nikon ND2
-│   └── bioformats-czi/         # Zeiss CZI (ZISRAWFILE)
-```
-
-Core traits (`FormatReader`, `FormatWriter`, `ImageMetadata`, `PixelType`) live in `bioformats-common` so format crates can implement them without circular dependencies.
 
 ## Pixel data layout
 
@@ -255,48 +227,43 @@ let plane = reader.open_bytes(0)?;
 assert_eq!(plane.len(), meta.size_y as usize * row_bytes);
 ```
 
-## TIFF details
-
-The TIFF reader is implemented from scratch (no dependency on the `tiff` crate) to support the full range of bioimaging TIFF variants:
-
-- Classic TIFF (32-bit offsets) and BigTIFF (64-bit offsets)
-- Strip-based and tile-based storage
-- `open_bytes_region` reads only the required strips/tiles
-- Compression: None, LZW, Deflate/Zlib, PackBits, JPEG (old and new style), Zstd
-- Predictor: horizontal differencing for 8-bit and 16-bit data
-- Photometric: MinIsWhite, MinIsBlack, RGB, YCbCr, Palette (with LUT)
-- All pixel types: Uint8/16/32, Int8/16/32, Float32/64, Bit
-
-The TIFF writer supports None, Deflate, and LZW compression, and writes valid multi-IFD files for Z-stacks/time series.
-
 ## Planned (not yet implemented)
 
 - **ND2**: JPEG2000-compressed frames (requires an external J2K decoder)
 - **CZI**: JPEG-XR compression
 - **Write support** for LIF, ND2, CZI, PNM
-- **OME metadata**: `reader.ome_metadata()` returns structured physical sizes, channel names, and plane positions for CZI, OME-TIFF, and OME-XML files; richer parsing (instrument, experimenter) not yet implemented
+- **OME metadata**: `reader.ome_metadata()` returns baseline OME metadata for all readers and enriches it with structured physical sizes, channel names, and plane positions where supported; richer parsing (instrument, experimenter) is partial
 - **Pyramid writing** for tiled multi-resolution TIFF
-
-## Comparison with Java Bio-Formats
-
-| Feature | Java Bio-Formats | bioformats-rs |
-|---------|-----------------|---------------|
-| Formats | 200+ | ~30 with full pixel read support; 150+ registered |
-| JVM dependency | Required | None |
-| Python bindings | Via scyjava | None (pure Rust) |
-| Metadata output | OME-XML / `IMetadata` | `ImageMetadata` (always) + `OmeMetadata` for CZI/OME-TIFF/OME-XML |
-| Write support | Most formats | TIFF, PNG, JPEG, BMP, TGA, ICS, MRC, FITS, NRRD, MetaImage |
-| Pyramid / tiled read | ✓ | ✓ (TIFF) |
 
 ### Performance
 
-Reading all pixel data from a 512×512 2-channel OME-TIFF (`tubhiswt_C0.ome.tif`, Bio-Formats 8.6.0 vs Rust release build, macOS, 3 warmup + 10 measured iterations):
+Reading all planes from each fixture, using one long-lived process per
+implementation with 5 warmup iterations and 20 measured iterations:
 
-| | Time | Throughput |
-|--|------|-----------|
-| Java Bio-Formats | 22.1 ms | 11.6 MiB/s |
-| bioformats-rs | 1.6 ms | 171.3 MiB/s |
-| **Speedup** | **13.9×** | |
+| Fixture | Java Bio-Formats | bioformats-rs | Ratio |
+|---------|-----------------:|--------------:|------:|
+| CZI, `672x512`, 63 planes, 43,352,064 pixel bytes | 177.342 ms | 51.438 ms | 3.45x |
+| OME-TIFF, `test/tubhiswt_C0.ome.tif` | 13.463 ms | 2.432 ms | 5.54x |
 
-Reproduce with `./bench/run.sh` from the repo root (requires `java` and `bioformats_package.jar` in the repo root).
+Reproduce by building the warmup harnesses and running `bench/BfBench.java` and
+`bench/bench_rust.rs` against the same fixture. This measures open + read all
+planes + close per iteration after warmup, not cold JVM startup.
 
+
+
+## How to cite
+
+If you use this package, cite the original Bio-Formats paper:
+
+```text
+Melissa Linkert, Curtis T. Rueden, Chris Allan, Jean-Marie Burel, Will Moore,
+Andrew Patterson, Brian Loranger, Josh Moore, Carlos Neves, Donald MacDonald,
+Aleksandra Tarkowska, Caitlin Sticco, Emma Hill, Mike Rossner, Kevin W.
+Eliceiri, and Jason R. Swedlow (2010) Metadata matters: access to image data
+in the real world. The Journal of Cell Biology 189(5), 777-782.
+doi: 10.1083/jcb.201004104
+```
+
+## License
+
+GPL v2

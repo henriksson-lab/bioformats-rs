@@ -1,1 +1,4 @@
-pub use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataLevel, MetadataOptions, MetadataValue, ModuloAnnotation};
+pub use crate::common::metadata::{
+    DimensionOrder, ImageMetadata, LookupTable, MetadataLevel, MetadataOptions, MetadataValue,
+    ModuloAnnotation,
+};

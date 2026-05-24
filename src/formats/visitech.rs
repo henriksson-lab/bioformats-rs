@@ -20,7 +20,11 @@ pub struct VisitechReader {
 
 impl VisitechReader {
     pub fn new() -> Self {
-        VisitechReader { path: None, meta: None, image_files: Vec::new() }
+        VisitechReader {
+            path: None,
+            meta: None,
+            image_files: Vec::new(),
+        }
     }
 }
 
@@ -36,18 +40,26 @@ fn scan_width_height(data: &[u8]) -> (u32, u32) {
     let mut height = 512u32;
     for token in text.split(|c: char| !c.is_alphanumeric() && c != '=' && c != '-') {
         if let Some(val) = token.strip_prefix("Width=") {
-            if let Ok(v) = val.parse() { width = v; }
+            if let Ok(v) = val.parse() {
+                width = v;
+            }
         } else if let Some(val) = token.strip_prefix("Height=") {
-            if let Ok(v) = val.parse() { height = v; }
+            if let Ok(v) = val.parse() {
+                height = v;
+            }
         }
     }
     // Also try line-by-line
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Width=") {
-            if let Ok(v) = rest.trim().parse() { width = v; }
+            if let Ok(v) = rest.trim().parse() {
+                width = v;
+            }
         } else if let Some(rest) = line.strip_prefix("Height=") {
-            if let Ok(v) = rest.trim().parse() { height = v; }
+            if let Ok(v) = rest.trim().parse() {
+                height = v;
+            }
         }
     }
     (width, height)
@@ -61,12 +73,12 @@ fn parse_visitech(path: &Path) -> Result<ImageMetadata> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let image_count = if let Ok(rd) = std::fs::read_dir(dir) {
         rd.filter_map(|e| e.ok())
-          .filter(|e| {
-              let name = e.file_name();
-              let s = name.to_string_lossy().to_ascii_lowercase();
-              s.ends_with(".tif") || s.ends_with(".tiff")
-          })
-          .count() as u32
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy().to_ascii_lowercase();
+                s.ends_with(".tif") || s.ends_with(".tiff")
+            })
+            .count() as u32
     } else {
         1
     };
@@ -120,9 +132,9 @@ impl FormatReader for VisitechReader {
                 .map(|e| e.path())
                 .filter(|p| {
                     p.extension()
-                     .and_then(|e| e.to_str())
-                     .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
-                     .unwrap_or(false)
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+                        .unwrap_or(false)
                 })
                 .collect();
             files.sort();
@@ -138,13 +150,21 @@ impl FormatReader for VisitechReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -159,7 +179,14 @@ impl FormatReader for VisitechReader {
         Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * bps])
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();

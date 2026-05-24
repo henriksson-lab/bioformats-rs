@@ -29,7 +29,9 @@ fn json_int(json: &str, key: &str) -> Option<i64> {
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(':').map(str::trim_start).unwrap_or(rest);
     // Parse integer (may be negative)
-    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
@@ -55,14 +57,17 @@ fn pixel_type_from_str(s: &str) -> PixelType {
 
 fn parse_mm_metadata(json: &str) -> Result<ImageMetadata> {
     // Find the "Summary" block
-    let summary_start = json.find("\"Summary\"")
-        .ok_or_else(|| BioFormatsError::Format("MicroManager: no Summary key in metadata".into()))?;
+    let summary_start = json.find("\"Summary\"").ok_or_else(|| {
+        BioFormatsError::Format("MicroManager: no Summary key in metadata".into())
+    })?;
     let summary = &json[summary_start..];
 
     let width = json_int(summary, "Width")
-        .ok_or_else(|| BioFormatsError::Format("MicroManager: missing Width".into()))? as u32;
+        .ok_or_else(|| BioFormatsError::Format("MicroManager: missing Width".into()))?
+        as u32;
     let height = json_int(summary, "Height")
-        .ok_or_else(|| BioFormatsError::Format("MicroManager: missing Height".into()))? as u32;
+        .ok_or_else(|| BioFormatsError::Format("MicroManager: missing Height".into()))?
+        as u32;
     let channels = json_int(summary, "Channels").unwrap_or(1).max(1) as u32;
     let slices = json_int(summary, "Slices").unwrap_or(1).max(1) as u32;
     let frames = json_int(summary, "Frames").unwrap_or(1).max(1) as u32;
@@ -74,8 +79,14 @@ fn parse_mm_metadata(json: &str) -> Result<ImageMetadata> {
     let is_rgb = pixel_type_str.starts_with("RGB");
 
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-    meta_map.insert("format".into(), MetadataValue::String("MicroManager".into()));
-    meta_map.insert("pixel_type_str".into(), MetadataValue::String(pixel_type_str));
+    meta_map.insert(
+        "format".into(),
+        MetadataValue::String("MicroManager".into()),
+    );
+    meta_map.insert(
+        "pixel_type_str".into(),
+        MetadataValue::String(pixel_type_str),
+    );
 
     Ok(ImageMetadata {
         size_x: width,
@@ -134,17 +145,19 @@ impl MicromanagerReader {
 }
 
 impl Default for MicromanagerReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for MicromanagerReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let name = path.file_name().and_then(|n| n.to_str())
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
             .map(|n| n.to_ascii_lowercase())
             .unwrap_or_default();
-        name == "metadata.txt"
-            || name.ends_with("_metadata.txt")
-            || name == "metadata.json"
+        name == "metadata.txt" || name.ends_with("_metadata.txt") || name == "metadata.json"
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -155,7 +168,9 @@ impl FormatReader for MicromanagerReader {
         // Read and parse JSON metadata
         let f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut json = String::new();
-        BufReader::new(f).read_to_string(&mut json).map_err(BioFormatsError::Io)?;
+        BufReader::new(f)
+            .read_to_string(&mut json)
+            .map_err(BioFormatsError::Io)?;
 
         let meta = parse_mm_metadata(&json)?;
 
@@ -181,13 +196,21 @@ impl FormatReader for MicromanagerReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -200,7 +223,11 @@ impl FormatReader for MicromanagerReader {
         }
         if let Some(ref mut r) = self.tiff_reader {
             let inner_count = r.metadata().image_count;
-            let inner_idx = if inner_count > 0 { plane_index.min(inner_count - 1) } else { 0 };
+            let inner_idx = if inner_count > 0 {
+                plane_index.min(inner_count - 1)
+            } else {
+                0
+            };
             r.open_bytes(inner_idx)
         } else {
             Err(BioFormatsError::Format(
@@ -209,14 +236,25 @@ impl FormatReader for MicromanagerReader {
         }
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let count = self.meta.as_ref().map(|m| m.image_count).unwrap_or(0);
         if plane_index >= count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         if let Some(ref mut r) = self.tiff_reader {
             let inner_count = r.metadata().image_count;
-            let inner_idx = if inner_count > 0 { plane_index.min(inner_count - 1) } else { 0 };
+            let inner_idx = if inner_count > 0 {
+                plane_index.min(inner_count - 1)
+            } else {
+                0
+            };
             r.open_bytes_region(inner_idx, x, y, w, h)
         } else {
             Err(BioFormatsError::Format(

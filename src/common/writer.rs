@@ -1,6 +1,6 @@
-use std::path::Path;
 use crate::error::Result;
 use crate::metadata::ImageMetadata;
+use std::path::Path;
 
 /// Core trait that every format writer must implement.
 ///
@@ -24,9 +24,15 @@ pub trait FormatWriter: Send + Sync {
     fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()>;
 
     /// True if this writer supports multi-plane (Z/C/T stack) files.
-    fn can_do_stacks(&self) -> bool { true }
+    fn can_do_stacks(&self) -> bool {
+        true
+    }
 
     // --- Multi-series support (optional) ---
-    fn set_series(&mut self, _series: usize) -> Result<()> { Ok(()) }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, _series: usize) -> Result<()> {
+        Ok(())
+    }
+    fn series(&self) -> usize {
+        0
+    }
 }

@@ -21,12 +21,18 @@ pub struct PcxReader {
 
 impl PcxReader {
     pub fn new() -> Self {
-        PcxReader { path: None, meta: None, pixels: None }
+        PcxReader {
+            path: None,
+            meta: None,
+            pixels: None,
+        }
     }
 }
 
 impl Default for PcxReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Decode RLE-encoded PCX row data into `out` buffer.
@@ -133,13 +139,16 @@ fn load_pcx(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
 
 impl FormatReader for PcxReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("pcx"))
             .unwrap_or(false)
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        if header.len() < 2 { return false; }
+        if header.len() < 2 {
+            return false;
+        }
         header[0] == 0x0A && matches!(header[1], 0 | 2 | 3 | 5)
     }
 
@@ -158,22 +167,39 @@ impl FormatReader for PcxReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        if plane_index != 0 { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         self.pixels.clone().ok_or(BioFormatsError::NotInitialized)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let channels = if meta.is_rgb { 3usize } else { 1usize };

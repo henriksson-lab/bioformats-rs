@@ -23,6 +23,12 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
+
+struct ParsedOmeSeries {
+    meta: ImageMetadata,
+    planes: Vec<Vec<u8>>,
+}
 
 // ─── Minimal Base64 decoder ───────────────────────────────────────────────────
 
@@ -38,22 +44,29 @@ const B64_TABLE: [u8; 256] = {
 };
 
 fn base64_decode(input: &str) -> Vec<u8> {
-    let input: Vec<u8> = input.bytes().filter(|&b| !b.is_ascii_whitespace()).collect();
+    let input: Vec<u8> = input
+        .bytes()
+        .filter(|&b| !b.is_ascii_whitespace())
+        .collect();
     let n = input.len();
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
     let mut out = Vec::with_capacity((n / 4) * 3 + 3);
     let mut i = 0;
     while i + 3 < n {
-        let a = B64_TABLE[input[i]   as usize];
-        let b = B64_TABLE[input[i+1] as usize];
-        let c = B64_TABLE[input[i+2] as usize];
-        let d = B64_TABLE[input[i+3] as usize];
-        if a == 255 || b == 255 { break; }
+        let a = B64_TABLE[input[i] as usize];
+        let b = B64_TABLE[input[i + 1] as usize];
+        let c = B64_TABLE[input[i + 2] as usize];
+        let d = B64_TABLE[input[i + 3] as usize];
+        if a == 255 || b == 255 {
+            break;
+        }
         out.push((a << 2) | (b >> 4));
-        if input[i+2] != b'=' && c != 255 {
+        if input[i + 2] != b'=' && c != 255 {
             out.push((b << 4) | (c >> 2));
         }
-        if input[i+3] != b'=' && d != 255 {
+        if input[i + 3] != b'=' && d != 255 {
             out.push((c << 6) | d);
         }
         i += 4;
@@ -76,108 +89,265 @@ fn xml_attr(tag: &str, attr: &str) -> Option<String> {
         Some(inner[..end].to_string())
     } else {
         // Unquoted: read until space or >
-        let end = rest.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '>')
+            .unwrap_or(rest.len());
         Some(rest[..end].to_string())
     }
 }
 
-fn parse_ome_xml(xml: &str) -> Result<(u32, u32, u32, u32, u32, PixelType, u8, bool, DimensionOrder, Vec<Vec<u8>>)> {
-    // Find the <Pixels ...> tag
-    let lower = xml.to_ascii_lowercase();
-    let pixels_start = lower.find("<pixels").ok_or_else(||
-        BioFormatsError::Format("OME-XML: no <Pixels> element".into()))?;
-    let tag_end = xml[pixels_start..].find('>').unwrap_or(xml.len() - pixels_start);
-    let pixels_tag = &xml[pixels_start..pixels_start + tag_end + 1];
+fn tag_local_name(tag: &str) -> &str {
+    tag.rsplit_once(':').map(|(_, local)| local).unwrap_or(tag)
+}
 
-    let size_x = xml_attr(pixels_tag, "SizeX").or_else(|| xml_attr(pixels_tag, "sizex"))
-        .and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
-    let size_y = xml_attr(pixels_tag, "SizeY").or_else(|| xml_attr(pixels_tag, "sizey"))
-        .and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
-    let size_z = xml_attr(pixels_tag, "SizeZ").or_else(|| xml_attr(pixels_tag, "sizez"))
-        .and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
-    let size_c = xml_attr(pixels_tag, "SizeC").or_else(|| xml_attr(pixels_tag, "sizec"))
-        .and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
-    let size_t = xml_attr(pixels_tag, "SizeT").or_else(|| xml_attr(pixels_tag, "sizet"))
-        .and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
+fn start_tag_at(xml: &str, pos: usize) -> &str {
+    let end = xml[pos..]
+        .find('>')
+        .map(|e| pos + e + 1)
+        .unwrap_or(xml.len());
+    &xml[pos..end]
+}
 
-    let type_str = xml_attr(pixels_tag, "Type").or_else(|| xml_attr(pixels_tag, "type"))
-        .unwrap_or_else(|| "uint8".into());
-    let big_endian_str = xml_attr(pixels_tag, "BigEndian").or_else(|| xml_attr(pixels_tag, "bigendian"))
-        .unwrap_or_else(|| "false".into());
-    let is_big_endian = big_endian_str.eq_ignore_ascii_case("true");
+fn start_tag_name(tag: &str) -> Option<&str> {
+    let s = tag.strip_prefix('<')?;
+    let s = s.strip_prefix('/').unwrap_or(s);
+    let s = s.trim_start();
+    let name_end = s
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(s.len());
+    Some(&s[..name_end])
+}
 
-    let dim_order_str = xml_attr(pixels_tag, "DimensionOrder")
-        .or_else(|| xml_attr(pixels_tag, "dimensionorder"))
-        .unwrap_or_else(|| "XYZCT".into());
-    let dim_order = match dim_order_str.to_ascii_uppercase().as_str() {
+fn tag_name_at(xml: &str, pos: usize) -> Option<&str> {
+    start_tag_name(start_tag_at(xml, pos))
+}
+
+fn tag_positions(xml: &str, local_name: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(rel) = xml[search..].find('<') {
+        let pos = search + rel;
+        if xml[pos + 1..].starts_with('/') || xml[pos + 1..].starts_with('!') {
+            search = pos + 1;
+            continue;
+        }
+        if let Some(name) = tag_name_at(xml, pos) {
+            if tag_local_name(name).eq_ignore_ascii_case(local_name) {
+                out.push(pos);
+            }
+        }
+        search = pos + 1;
+    }
+    out
+}
+
+fn end_tag_after(xml: &str, start: usize, local_name: &str) -> usize {
+    let Some(pos) = end_tag_start_after(xml, start, local_name) else {
+        return xml.len();
+    };
+    xml[pos..]
+        .find('>')
+        .map(|e| pos + e + 1)
+        .unwrap_or(xml.len())
+}
+
+fn end_tag_start_after(xml: &str, start: usize, local_name: &str) -> Option<usize> {
+    let mut search = start;
+    while let Some(rel) = xml[search..].find("</") {
+        let pos = search + rel;
+        if let Some(name) = tag_name_at(xml, pos) {
+            if tag_local_name(name).eq_ignore_ascii_case(local_name) {
+                return Some(pos);
+            }
+        }
+        search = pos + 2;
+    }
+    None
+}
+
+fn child_block<'a>(xml: &'a str, local_name: &str) -> Option<&'a str> {
+    let pos = tag_positions(xml, local_name).into_iter().next()?;
+    let end = end_tag_after(xml, pos, local_name);
+    Some(&xml[pos..end])
+}
+
+fn attr_u32(tag: &str, attr: &str, default: u32) -> u32 {
+    xml_attr(tag, attr)
+        .or_else(|| xml_attr(tag, &attr.to_ascii_lowercase()))
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
+fn dimension_order_from_attr(value: &str) -> DimensionOrder {
+    match value.to_ascii_uppercase().as_str() {
         "XYZCT" => DimensionOrder::XYZCT,
         "XYZTC" => DimensionOrder::XYZTC,
         "XYCZT" => DimensionOrder::XYCZT,
         "XYCTZ" => DimensionOrder::XYCTZ,
         "XYTZC" => DimensionOrder::XYTZC,
         "XYTCZ" => DimensionOrder::XYTCZ,
-        _       => DimensionOrder::XYZCT,
-    };
+        _ => DimensionOrder::XYZCT,
+    }
+}
 
-    let (pixel_type, bpp): (PixelType, u8) = match type_str.to_ascii_lowercase().as_str() {
-        "int8"                => (PixelType::Uint8,   8),
-        "uint8"               => (PixelType::Uint8,   8),
-        "int16"               => (PixelType::Int16,  16),
-        "uint16"              => (PixelType::Uint16, 16),
-        "int32"               => (PixelType::Int32,  32),
-        "uint32"              => (PixelType::Uint32, 32),
-        "float"  | "float32"  => (PixelType::Float32, 32),
-        "double" | "float64"  => (PixelType::Float64, 64),
-        _                     => (PixelType::Uint8,   8),
-    };
+fn pixel_type_from_attr(value: &str) -> (PixelType, u8) {
+    match value.to_ascii_lowercase().as_str() {
+        "int8" => (PixelType::Int8, 8),
+        "uint8" => (PixelType::Uint8, 8),
+        "int16" => (PixelType::Int16, 16),
+        "uint16" => (PixelType::Uint16, 16),
+        "int32" => (PixelType::Int32, 32),
+        "uint32" => (PixelType::Uint32, 32),
+        "float" | "float32" => (PixelType::Float32, 32),
+        "double" | "float64" => (PixelType::Float64, 64),
+        _ => (PixelType::Uint8, 8),
+    }
+}
 
-    // Collect all <BinData> blocks
-    let mut planes: Vec<Vec<u8>> = Vec::new();
-    let mut search_start = pixels_start;
-    loop {
-        let lo_tail = &lower[search_start..];
-        let bd_rel = match lo_tail.find("<bindata") {
-            Some(p) => p,
-            None => break,
-        };
-        let bd_abs = search_start + bd_rel;
+fn channel_samples_per_pixel(pixels_xml: &str, size_c: u32) -> Vec<u32> {
+    let mut samples = Vec::new();
+    for pos in tag_positions(pixels_xml, "Channel") {
+        let tag = start_tag_at(pixels_xml, pos);
+        samples.push(
+            xml_attr(tag, "SamplesPerPixel")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
+        );
+    }
+    while samples.len() < size_c as usize {
+        samples.push(1);
+    }
+    samples.truncate(size_c as usize);
+    samples
+}
 
-        // Find where the tag ends (could be <BinData ...>DATA</BinData>)
-        let tag_end_rel = xml[bd_abs..].find('>').unwrap_or(0);
-        let content_start = bd_abs + tag_end_rel + 1;
-
-        // Find </BinData>
-        let close_rel = lower[content_start..].find("</bindata>").unwrap_or(0);
-        let b64_text = &xml[content_start..content_start + close_rel];
-        planes.push(base64_decode(b64_text));
-
-        search_start = content_start + close_rel + 10; // skip past </BinData>
-        if search_start >= xml.len() { break; }
-
-        // Stop at </Pixels>
-        if lower[search_start..].find("</pixels>").map(|p| p < lower[search_start..].find("<bindata").unwrap_or(usize::MAX)).unwrap_or(false) {
-            break;
+fn parse_bindata_blocks(pixels_xml: &str) -> (Vec<Vec<u8>>, Option<String>) {
+    let mut blocks = Vec::new();
+    let mut first_big_endian = None;
+    for pos in tag_positions(pixels_xml, "BinData") {
+        let tag = start_tag_at(pixels_xml, pos);
+        if first_big_endian.is_none() {
+            first_big_endian = xml_attr(tag, "BigEndian").or_else(|| xml_attr(tag, "bigendian"));
         }
+        let content_start = tag
+            .find('>')
+            .map(|e| pos + e + 1)
+            .unwrap_or(pos + tag.len());
+        let content_end = end_tag_start_after(pixels_xml, pos, "BinData").unwrap_or(content_start);
+        let b64_text = pixels_xml.get(content_start..content_end).unwrap_or("");
+        blocks.push(base64_decode(b64_text));
+    }
+    (blocks, first_big_endian)
+}
+
+fn parse_ome_xml_series(xml: &str) -> Result<Vec<ParsedOmeSeries>> {
+    let mut series = Vec::new();
+    for image_pos in tag_positions(xml, "Image") {
+        let image_end = end_tag_after(xml, image_pos, "Image");
+        let image_xml = &xml[image_pos..image_end];
+        let pixels_xml = match child_block(image_xml, "Pixels") {
+            Some(block) => block,
+            None => continue,
+        };
+        let pixels_tag = start_tag_at(pixels_xml, 0);
+
+        let size_x = attr_u32(pixels_tag, "SizeX", 1);
+        let size_y = attr_u32(pixels_tag, "SizeY", 1);
+        let size_z = attr_u32(pixels_tag, "SizeZ", 1);
+        let logical_c = attr_u32(pixels_tag, "SizeC", 1);
+        let size_t = attr_u32(pixels_tag, "SizeT", 1);
+        let type_str = xml_attr(pixels_tag, "Type")
+            .or_else(|| xml_attr(pixels_tag, "type"))
+            .unwrap_or_else(|| "uint8".into());
+        let (pixel_type, bpp) = pixel_type_from_attr(&type_str);
+        let dim_order_str = xml_attr(pixels_tag, "DimensionOrder")
+            .or_else(|| xml_attr(pixels_tag, "dimensionorder"))
+            .unwrap_or_else(|| "XYZCT".into());
+        let dim_order = dimension_order_from_attr(&dim_order_str);
+        let samples = channel_samples_per_pixel(pixels_xml, logical_c);
+        let max_spp = samples.iter().copied().max().unwrap_or(1);
+        let is_rgb = max_spp > 1;
+        let exposed_c = if is_rgb { max_spp } else { logical_c };
+        let image_count = size_z
+            .checked_mul(logical_c)
+            .and_then(|v| v.checked_mul(size_t))
+            .ok_or_else(|| BioFormatsError::Format("OME-XML plane count overflow".into()))?;
+
+        let (planes, first_bindata_big_endian) = parse_bindata_blocks(pixels_xml);
+        let pixels_big_endian =
+            xml_attr(pixels_tag, "BigEndian").or_else(|| xml_attr(pixels_tag, "bigendian"));
+        let is_big_endian = pixels_big_endian
+            .or(first_bindata_big_endian)
+            .map(|s| s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
+        meta_map.insert("format".into(), MetadataValue::String("OME-XML".into()));
+        series.push(ParsedOmeSeries {
+            meta: ImageMetadata {
+                size_x,
+                size_y,
+                size_z,
+                size_c: exposed_c,
+                size_t,
+                pixel_type,
+                bits_per_pixel: bpp,
+                image_count,
+                dimension_order: dim_order,
+                is_rgb,
+                is_interleaved: is_rgb,
+                is_indexed: false,
+                is_little_endian: !is_big_endian,
+                resolution_count: 1,
+                series_metadata: meta_map,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            },
+            planes,
+        });
     }
 
-    Ok((size_x, size_y, size_z, size_c, size_t, pixel_type, bpp, !is_big_endian, dim_order, planes))
+    if series.is_empty() {
+        return Err(BioFormatsError::Format(
+            "OME-XML: no <Pixels> element".into(),
+        ));
+    }
+    Ok(series)
 }
 
 pub struct OmeXmlReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    planes: Vec<Vec<u8>>,
+    series: Vec<ParsedOmeSeries>,
+    current_series: usize,
     raw_xml: Option<String>,
 }
 
 impl OmeXmlReader {
-    pub fn new() -> Self { OmeXmlReader { path: None, meta: None, planes: Vec::new(), raw_xml: None } }
+    pub fn new() -> Self {
+        OmeXmlReader {
+            path: None,
+            series: Vec::new(),
+            current_series: 0,
+            raw_xml: None,
+        }
+    }
 }
-impl Default for OmeXmlReader { fn default() -> Self { Self::new() } }
+impl Default for OmeXmlReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatReader for OmeXmlReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("ome"))
     }
 
@@ -188,52 +358,60 @@ impl FormatReader for OmeXmlReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let xml = fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-        let (size_x, size_y, size_z, size_c, size_t, pixel_type, bpp, little_endian, dim_order, planes)
-            = parse_ome_xml(&xml)?;
+        let series = parse_ome_xml_series(&xml)?;
         self.raw_xml = Some(xml.clone());
-
-        let image_count = size_z * size_c * size_t;
-        let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-        meta_map.insert("format".into(), MetadataValue::String("OME-XML".into()));
-
-        self.meta = Some(ImageMetadata {
-            size_x, size_y, size_z, size_c, size_t,
-            pixel_type, bits_per_pixel: bpp,
-            image_count,
-            dimension_order: dim_order,
-            is_rgb: false, is_interleaved: false, is_indexed: false,
-            is_little_endian: little_endian,
-            resolution_count: 1,
-            series_metadata: meta_map, lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
-        self.planes = planes;
+        self.series = series;
+        self.current_series = 0;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
 
-    fn close(&mut self) -> Result<()> { self.path = None; self.meta = None; self.planes.clear(); self.raw_xml = None; Ok(()) }
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.series.clear();
+        self.current_series = 0;
+        self.raw_xml = None;
+        Ok(())
     }
-    fn series(&self) -> usize { 0 }
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn series_count(&self) -> usize {
+        self.series.len().max(1)
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s >= self.series_count() {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            self.current_series = s;
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        self.current_series
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        &self.series[self.current_series].meta
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
-        if let Some(plane) = self.planes.get(plane_index as usize) {
-            return Ok(plane.clone());
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &series.meta;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let bps = meta.pixel_type.bytes_per_sample();
+        let samples = if meta.is_rgb { meta.size_c as usize } else { 1 };
+        let plane_bytes = (meta.size_x * meta.size_y) as usize * bps * samples;
+        if let Some(plane) = series.planes.get(plane_index as usize) {
+            if series.planes.len() > 1 || plane.len() == plane_bytes {
+                return Ok(plane.clone());
+            }
         }
         // If single BinData block contains all planes, slice it
-        if !self.planes.is_empty() {
-            let bps = meta.pixel_type.bytes_per_sample();
-            let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;
+        if !series.planes.is_empty() {
             let offset = plane_index as usize * plane_bytes;
-            let src = &self.planes[0];
+            let src = &series.planes[0];
             if offset + plane_bytes <= src.len() {
                 return Ok(src[offset..offset + plane_bytes].to_vec());
             }
@@ -241,29 +419,30 @@ impl FormatReader for OmeXmlReader {
         Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize*bps .. x as usize*bps + out_row]);
-        }
-        Ok(out)
+        let meta = self.metadata();
+        crop_full_plane("OME-XML", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self.metadata();
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        self.raw_xml.as_deref().map(crate::common::ome_metadata::OmeMetadata::from_ome_xml)
+        self.raw_xml
+            .as_deref()
+            .map(crate::common::ome_metadata::OmeMetadata::from_ome_xml)
     }
 }
 
@@ -296,6 +475,14 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+fn xml_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// OME-XML standalone writer (`.ome` files with Base64-encoded pixel data).
 pub struct OmeXmlWriter {
     path: Option<PathBuf>,
@@ -306,7 +493,12 @@ pub struct OmeXmlWriter {
 
 impl OmeXmlWriter {
     pub fn new() -> Self {
-        OmeXmlWriter { path: None, meta: None, planes: Vec::new(), ome: None }
+        OmeXmlWriter {
+            path: None,
+            meta: None,
+            planes: Vec::new(),
+            ome: None,
+        }
     }
 
     /// Set optional OME metadata (channels, physical sizes, etc.).
@@ -316,12 +508,16 @@ impl OmeXmlWriter {
 }
 
 impl Default for OmeXmlWriter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl crate::common::writer::FormatWriter for OmeXmlWriter {
     fn is_this_type(&self, path: &Path) -> bool {
-        let name = path.file_name().and_then(|n| n.to_str())
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
             .map(|n| n.to_ascii_lowercase())
             .unwrap_or_default();
         name.ends_with(".ome") || name.ends_with(".ome.xml")
@@ -355,40 +551,66 @@ impl crate::common::writer::FormatWriter for OmeXmlWriter {
         use std::fmt::Write;
         let mut xml = String::new();
         let _ = write!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
-        let _ = write!(xml, r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">"#);
+        let _ = write!(
+            xml,
+            r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">"#
+        );
 
         let pt_str = match meta.pixel_type {
-            PixelType::Bit => "bit", PixelType::Int8 => "int8", PixelType::Uint8 => "uint8",
-            PixelType::Int16 => "int16", PixelType::Uint16 => "uint16",
-            PixelType::Int32 => "int32", PixelType::Uint32 => "uint32",
-            PixelType::Float32 => "float", PixelType::Float64 => "double",
+            PixelType::Bit => "bit",
+            PixelType::Int8 => "int8",
+            PixelType::Uint8 => "uint8",
+            PixelType::Int16 => "int16",
+            PixelType::Uint16 => "uint16",
+            PixelType::Int32 => "int32",
+            PixelType::Uint32 => "uint32",
+            PixelType::Float32 => "float",
+            PixelType::Float64 => "double",
         };
         let dim_order = format!("{:?}", meta.dimension_order);
 
         // Image element
-        let img_name = ome.images.first()
+        let img_name = ome
+            .images
+            .first()
             .and_then(|i| i.name.as_deref())
             .unwrap_or("Image 0");
-        let _ = write!(xml, r#"<Image ID="Image:0" Name="{img_name}">"#);
-        let _ = write!(xml,
+        let _ = write!(
+            xml,
+            r#"<Image ID="Image:0" Name="{}">"#,
+            xml_escape_attr(img_name)
+        );
+        let _ = write!(
+            xml,
             r#"<Pixels ID="Pixels:0" DimensionOrder="{dim_order}" Type="{pt_str}" SizeX="{}" SizeY="{}" SizeZ="{}" SizeC="{}" SizeT="{}" BigEndian="{}">"#,
-            meta.size_x, meta.size_y, meta.size_z, meta.size_c, meta.size_t,
-            !meta.is_little_endian);
+            meta.size_x, meta.size_y, meta.size_z, meta.size_c, meta.size_t, !meta.is_little_endian
+        );
 
         // Channels
         if let Some(img) = ome.images.first() {
             for (ci, ch) in img.channels.iter().enumerate() {
-                let _ = write!(xml, r#"<Channel ID="Channel:0:{ci}" SamplesPerPixel="{}"/>"#,
-                    ch.samples_per_pixel);
+                let _ = write!(
+                    xml,
+                    r#"<Channel ID="Channel:0:{ci}" SamplesPerPixel="{}""#,
+                    ch.samples_per_pixel
+                );
+                if let Some(name) = &ch.name {
+                    let _ = write!(xml, r#" Name="{}""#, xml_escape_attr(name));
+                }
+                xml.push_str("/>");
             }
         }
 
         // BinData for each plane
         for plane in &self.planes {
             let b64 = base64_encode(plane);
-            let _ = write!(xml,
+            let _ = write!(
+                xml,
                 r#"<BinData xmlns="http://www.openmicroscopy.org/Schemas/BinaryFile/2016-06" Length="{}" BigEndian="{}">{}</BinData>"#,
-                plane.len(), !meta.is_little_endian, b64);
+                plane.len(),
+                !meta.is_little_endian,
+                b64
+            );
         }
 
         xml.push_str("</Pixels></Image></OME>");
@@ -398,5 +620,7 @@ impl crate::common::writer::FormatWriter for OmeXmlWriter {
         Ok(())
     }
 
-    fn can_do_stacks(&self) -> bool { true }
+    fn can_do_stacks(&self) -> bool {
+        true
+    }
 }

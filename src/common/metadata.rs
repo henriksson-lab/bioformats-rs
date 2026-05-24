@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use super::pixel_type::PixelType;
+use std::collections::HashMap;
 
 /// Controls how much metadata is parsed during `set_id`.
 ///

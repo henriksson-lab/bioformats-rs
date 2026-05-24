@@ -21,12 +21,18 @@ pub struct AimReader {
 
 impl AimReader {
     pub fn new() -> Self {
-        AimReader { path: None, meta: None, data_offset: 512 }
+        AimReader {
+            path: None,
+            meta: None,
+            data_offset: 512,
+        }
     }
 }
 
 impl Default for AimReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
@@ -37,12 +43,13 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
 
     // Check for ISQ magic
     let is_isq = header.len() >= 20 && &header[..16] == b"CTDATA-HEADER_V1";
-    let is_aim = !is_isq && (
-        (header.len() >= 4 && &header[..4] == b"!AIM") ||
-        path.extension().and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("aim"))
-            .unwrap_or(false)
-    );
+    let is_aim = !is_isq
+        && ((header.len() >= 4 && &header[..4] == b"!AIM")
+            || path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("aim"))
+                .unwrap_or(false));
 
     let (width, height, depth, data_offset) = if is_isq && header.len() >= 44 {
         let w = i32::from_le_bytes([header[28], header[29], header[30], header[31]]).max(1) as u32;
@@ -55,7 +62,7 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
         let mut dims = Vec::new();
         let mut i = 4usize; // skip magic
         while i + 4 <= header.len() && dims.len() < 3 {
-            let v = i32::from_le_bytes([header[i], header[i+1], header[i+2], header[i+3]]);
+            let v = i32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]);
             if v >= 16 && v <= 4096 {
                 dims.push(v as u32);
                 i += 4;
@@ -100,7 +107,9 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
 
 impl FormatReader for AimReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str())
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("aim") | Some("isq"))
     }
@@ -125,11 +134,19 @@ impl FormatReader for AimReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -145,13 +162,21 @@ impl FormatReader for AimReader {
         let file_offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(file_offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(file_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();

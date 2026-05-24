@@ -43,9 +43,7 @@ mod inner {
         }
 
         fn slide(&self) -> Result<&OpenSlide> {
-            self.slide
-                .as_ref()
-                .ok_or(BioFormatsError::NotInitialized)
+            self.slide.as_ref().ok_or(BioFormatsError::NotInitialized)
         }
     }
 
@@ -80,7 +78,10 @@ mod inner {
             let mut resolution_dims = Vec::with_capacity(level_count as usize);
             for level in 0..level_count {
                 let (w, h) = slide.level_dimensions(level).ok_or_else(|| {
-                    BioFormatsError::Format(format!("OpenSlide dims level {}: not available", level))
+                    BioFormatsError::Format(format!(
+                        "OpenSlide dims level {}: not available",
+                        level
+                    ))
                 })?;
                 resolution_dims.push((w as u32, h as u32));
             }

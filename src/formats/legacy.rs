@@ -36,12 +36,17 @@ pub struct KodakBipReader {
 
 impl KodakBipReader {
     pub fn new() -> Self {
-        KodakBipReader { path: None, meta: None }
+        KodakBipReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for KodakBipReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_kodak_bip(path: &Path) -> Result<ImageMetadata> {
@@ -83,11 +88,16 @@ fn parse_kodak_bip(path: &Path) -> Result<ImageMetadata> {
 
 impl FormatReader for KodakBipReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("bip"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let meta = parse_kodak_bip(path)?;
@@ -102,13 +112,21 @@ impl FormatReader for KodakBipReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -116,18 +134,32 @@ impl FormatReader for KodakBipReader {
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index != 0 { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?.clone();
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(KODAK_BIP_HEADER_SIZE)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(KODAK_BIP_HEADER_SIZE))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         Ok(region_crop(&full, meta, x, y, w, h))
@@ -152,25 +184,35 @@ pub struct WoolzReader {
 
 impl WoolzReader {
     pub fn new() -> Self {
-        WoolzReader { path: None, meta: None }
+        WoolzReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for WoolzReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for WoolzReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("wlz"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Woolz format reading is not yet implemented".to_string()
+            "Woolz format reading is not yet implemented".to_string(),
         ))
     }
 
@@ -180,13 +222,21 @@ impl FormatReader for WoolzReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -194,19 +244,26 @@ impl FormatReader for WoolzReader {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Woolz format reading is not yet implemented".to_string()
+            "Woolz format reading is not yet implemented".to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Woolz format reading is not yet implemented".to_string()
+            "Woolz format reading is not yet implemented".to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Woolz format reading is not yet implemented".to_string()
+            "Woolz format reading is not yet implemented".to_string(),
         ))
     }
 }
@@ -220,25 +277,35 @@ pub struct PictReader {
 
 impl PictReader {
     pub fn new() -> Self {
-        PictReader { path: None, meta: None }
+        PictReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for PictReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for PictReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("pict") | Some("pct"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Apple PICT format reading is not yet implemented".to_string()
+            "Apple PICT format reading is not yet implemented".to_string(),
         ))
     }
 
@@ -248,13 +315,21 @@ impl FormatReader for PictReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -262,19 +337,26 @@ impl FormatReader for PictReader {
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Apple PICT format reading is not yet implemented".to_string()
+            "Apple PICT format reading is not yet implemented".to_string(),
         ))
     }
 
-    fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        _plane_index: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Apple PICT format reading is not yet implemented".to_string()
+            "Apple PICT format reading is not yet implemented".to_string(),
         ))
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Apple PICT format reading is not yet implemented".to_string()
+            "Apple PICT format reading is not yet implemented".to_string(),
         ))
     }
 }

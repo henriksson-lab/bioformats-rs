@@ -68,10 +68,14 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).map_err(BioFormatsError::Io)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
 
         let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
 
         if let Some(eq) = trimmed.find('=') {
             let key = trimmed[..eq].trim().to_ascii_uppercase();
@@ -84,7 +88,8 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
                     }
                 }
                 "DIMSIZE" | "DIM_SIZE" => {
-                    sizes = val.split_ascii_whitespace()
+                    sizes = val
+                        .split_ascii_whitespace()
                         .filter_map(|s| s.parse().ok())
                         .collect();
                 }
@@ -99,12 +104,23 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
                         data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
                     }
                 }
-                _ => { extra.insert(key, val.to_string()); }
+                _ => {
+                    extra.insert(key, val.to_string());
+                }
             }
         }
     }
 
-    Ok(MhdHeader { ndims, sizes, pixel_type, little_endian, compressed, data_file, data_offset, extra })
+    Ok(MhdHeader {
+        ndims,
+        sizes,
+        pixel_type,
+        little_endian,
+        compressed,
+        data_file,
+        data_offset,
+        extra,
+    })
 }
 
 // ---- reader -----------------------------------------------------------------
@@ -116,11 +132,20 @@ pub struct MetaImageReader {
 }
 
 impl MetaImageReader {
-    pub fn new() -> Self { MetaImageReader { path: None, meta: None, header: None } }
+    pub fn new() -> Self {
+        MetaImageReader {
+            path: None,
+            meta: None,
+            header: None,
+        }
+    }
 
     fn read_data(&self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let hdr = self.header.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let hdr = self
+            .header
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
         let mhd_path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let bps = meta.pixel_type.bytes_per_sample();
@@ -142,19 +167,23 @@ impl MetaImageReader {
         let mut f = File::open(&data_path).map_err(BioFormatsError::Io)?;
 
         let buf = if hdr.compressed {
-            f.seek(SeekFrom::Start(hdr.data_offset)).map_err(BioFormatsError::Io)?;
+            f.seek(SeekFrom::Start(hdr.data_offset))
+                .map_err(BioFormatsError::Io)?;
             let mut dec = flate2::read::ZlibDecoder::new(f);
             let mut all = Vec::new();
             dec.read_to_end(&mut all).map_err(BioFormatsError::Io)?;
             let start = plane_offset as usize;
             let end = start + plane_bytes;
             if end > all.len() {
-                return Err(BioFormatsError::InvalidData("MetaImage: plane out of range".into()));
+                return Err(BioFormatsError::InvalidData(
+                    "MetaImage: plane out of range".into(),
+                ));
             }
             all[start..end].to_vec()
         } else {
             let offset = hdr.data_offset + plane_offset;
-            f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+            f.seek(SeekFrom::Start(offset))
+                .map_err(BioFormatsError::Io)?;
             let mut buf = vec![0u8; plane_bytes];
             f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
             buf
@@ -163,17 +192,24 @@ impl MetaImageReader {
         // Byte-swap if big-endian
         let mut buf = buf;
         if !hdr.little_endian && bps > 1 {
-            for chunk in buf.chunks_exact_mut(bps) { chunk.reverse(); }
+            for chunk in buf.chunks_exact_mut(bps) {
+                chunk.reverse();
+            }
         }
         Ok(buf)
     }
 }
 
-impl Default for MetaImageReader { fn default() -> Self { Self::new() } }
+impl Default for MetaImageReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatReader for MetaImageReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| matches!(e.to_ascii_lowercase().as_str(), "mha" | "mhd"))
             .unwrap_or(false)
     }
@@ -193,7 +229,9 @@ impl FormatReader for MetaImageReader {
             [] => (1, 1, 1),
         };
         let bps = (hdr.pixel_type.bytes_per_sample() * 8) as u8;
-        let mut series_metadata: HashMap<String, MetadataValue> = hdr.extra.iter()
+        let mut series_metadata: HashMap<String, MetadataValue> = hdr
+            .extra
+            .iter()
             .map(|(k, v)| (k.clone(), MetadataValue::String(v.clone())))
             .collect();
         series_metadata.insert("ndims".into(), MetadataValue::Int(hdr.ndims as i64));
@@ -224,21 +262,45 @@ impl FormatReader for MetaImageReader {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<()> { self.path = None; self.meta = None; self.header = None; Ok(()) }
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.header = None;
+        Ok(())
     }
-    fn series(&self) -> usize { 0 }
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn series_count(&self) -> usize {
+        1
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let count = self.meta.as_ref().map(|m| m.image_count).unwrap_or(0);
-        if plane_index >= count { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index >= count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         self.read_data(plane_index)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();
@@ -269,28 +331,43 @@ pub struct MetaImageWriter {
 }
 
 impl MetaImageWriter {
-    pub fn new() -> Self { MetaImageWriter { path: None, meta: None, planes: Vec::new() } }
+    pub fn new() -> Self {
+        MetaImageWriter {
+            path: None,
+            meta: None,
+            planes: Vec::new(),
+        }
+    }
 }
 
-impl Default for MetaImageWriter { fn default() -> Self { Self::new() } }
+impl Default for MetaImageWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatWriter for MetaImageWriter {
     fn is_this_type(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| matches!(e.to_ascii_lowercase().as_str(), "mha" | "mhd"))
             .unwrap_or(false)
     }
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
-        self.meta = Some(meta.clone()); Ok(())
+        self.meta = Some(meta.clone());
+        Ok(())
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.meta.as_ref().ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
+        self.meta
+            .as_ref()
+            .ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
         self.path = Some(path.to_path_buf());
         self.planes.clear();
         Ok(())
     }
     fn save_bytes(&mut self, _: u32, data: &[u8]) -> Result<()> {
-        self.planes.push(data.to_vec()); Ok(())
+        self.planes.push(data.to_vec());
+        Ok(())
     }
     fn close(&mut self) -> Result<()> {
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
@@ -306,11 +383,14 @@ impl FormatWriter for MetaImageWriter {
         writeln!(w, "ObjectType = Image").map_err(BioFormatsError::Io)?;
         writeln!(w, "NDims = {}", if nz > 1 { 3 } else { 2 }).map_err(BioFormatsError::Io)?;
         if nz > 1 {
-            writeln!(w, "DimSize = {} {} {}", meta.size_x, meta.size_y, nz).map_err(BioFormatsError::Io)?;
+            writeln!(w, "DimSize = {} {} {}", meta.size_x, meta.size_y, nz)
+                .map_err(BioFormatsError::Io)?;
         } else {
-            writeln!(w, "DimSize = {} {}", meta.size_x, meta.size_y).map_err(BioFormatsError::Io)?;
+            writeln!(w, "DimSize = {} {}", meta.size_x, meta.size_y)
+                .map_err(BioFormatsError::Io)?;
         }
-        writeln!(w, "ElementType = {}", meta_type_str(meta.pixel_type)).map_err(BioFormatsError::Io)?;
+        writeln!(w, "ElementType = {}", meta_type_str(meta.pixel_type))
+            .map_err(BioFormatsError::Io)?;
         writeln!(w, "BinaryData = True").map_err(BioFormatsError::Io)?;
         writeln!(w, "BinaryDataByteOrderMSB = False").map_err(BioFormatsError::Io)?;
         writeln!(w, "CompressedData = False").map_err(BioFormatsError::Io)?;
@@ -338,5 +418,7 @@ impl FormatWriter for MetaImageWriter {
         self.planes.clear();
         Ok(())
     }
-    fn can_do_stacks(&self) -> bool { true }
+    fn can_do_stacks(&self) -> bool {
+        true
+    }
 }

@@ -11,6 +11,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -134,36 +135,60 @@ pub struct PcoRawReader {
 
 impl PcoRawReader {
     pub fn new() -> Self {
-        PcoRawReader { path: None, meta: None }
+        PcoRawReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for PcoRawReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for PcoRawReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         matches!(
-            path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
             Some("b16")
         )
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let mut f = std::fs::File::open(path)
-            .map_err(|e| BioFormatsError::Io(e))?;
+        let mut f = std::fs::File::open(path).map_err(|e| BioFormatsError::Io(e))?;
+        let file_size = f.metadata().map_err(BioFormatsError::Io)?.len();
         let mut header = [0u8; 216];
         let n = f.read(&mut header).map_err(|e| BioFormatsError::Io(e))?;
         let (w, h) = if n >= 8 {
             let w = u16::from_le_bytes([header[4], header[5]]) as u32;
             let h = u16::from_le_bytes([header[6], header[7]]) as u32;
-            if w == 0 || h == 0 { (512, 512) } else { (w, h) }
+            if w == 0 || h == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "PCO B16 header contains zero image dimensions".into(),
+                ));
+            } else {
+                (w, h)
+            }
         } else {
-            (512, 512)
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PCO B16 header is too short to contain dimensions".into(),
+            ));
         };
+        let expected = 216u64 + w as u64 * h as u64 * 2;
+        if file_size < expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "PCO B16 file is too short for declared dimensions {w}x{h}"
+            )));
+        }
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x: w,
@@ -182,13 +207,21 @@ impl FormatReader for PcoRawReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -202,18 +235,24 @@ impl FormatReader for PcoRawReader {
         let n_bytes = meta.size_x as usize * meta.size_y as usize * 2;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(|e| BioFormatsError::Io(e))?;
-        f.seek(SeekFrom::Start(216)).map_err(|e| BioFormatsError::Io(e))?;
+        f.seek(SeekFrom::Start(216))
+            .map_err(|e| BioFormatsError::Io(e))?;
         let mut buf = vec![0u8; n_bytes];
         f.read_exact(&mut buf).map_err(|e| BioFormatsError::Io(e))?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Ok(vec![0u8; w as usize * h as usize * 2])
+        crop_full_plane("PCO B16", &full, meta, 1, _x, _y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -240,35 +279,60 @@ pub struct BioRadGelReader {
 
 impl BioRadGelReader {
     pub fn new() -> Self {
-        BioRadGelReader { path: None, meta: None }
+        BioRadGelReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for BioRadGelReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for BioRadGelReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         matches!(
-            path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
             Some("1sc")
         )
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let mut f = std::fs::File::open(path).map_err(|e| BioFormatsError::Io(e))?;
+        let file_size = f.metadata().map_err(BioFormatsError::Io)?.len();
         let mut header = [0u8; 76];
         let n = f.read(&mut header).map_err(|e| BioFormatsError::Io(e))?;
         let (w, h) = if n >= 14 {
             let w = u16::from_be_bytes([header[10], header[11]]) as u32;
             let h = u16::from_be_bytes([header[12], header[13]]) as u32;
-            if w == 0 || h == 0 || w > 32768 || h > 32768 { (512, 512) } else { (w, h) }
+            if w == 0 || h == 0 || w > 32768 || h > 32768 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Bio-Rad GEL header contains invalid image dimensions".into(),
+                ));
+            } else {
+                (w, h)
+            }
         } else {
-            (512, 512)
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Bio-Rad GEL header is too short to contain dimensions".into(),
+            ));
         };
+        let expected = 76u64 + w as u64 * h as u64 * 2;
+        if file_size < expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Bio-Rad GEL file is too short for declared dimensions {w}x{h}"
+            )));
+        }
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x: w,
@@ -287,13 +351,21 @@ impl FormatReader for BioRadGelReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -307,18 +379,24 @@ impl FormatReader for BioRadGelReader {
         let n_bytes = meta.size_x as usize * meta.size_y as usize * 2;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(|e| BioFormatsError::Io(e))?;
-        f.seek(SeekFrom::Start(76)).map_err(|e| BioFormatsError::Io(e))?;
+        f.seek(SeekFrom::Start(76))
+            .map_err(|e| BioFormatsError::Io(e))?;
         let mut buf = vec![0u8; n_bytes];
         f.read_exact(&mut buf).map_err(|e| BioFormatsError::Io(e))?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Ok(vec![0u8; w as usize * h as usize * 2])
+        crop_full_plane("Bio-Rad GEL", &full, meta, 1, _x, _y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -345,63 +423,58 @@ pub struct L2dReader {
 
 impl L2dReader {
     pub fn new() -> Self {
-        L2dReader { path: None, meta: None }
+        L2dReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for L2dReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for L2dReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         matches!(
-            path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
             Some("l2d")
         )
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
         let mut w: u32 = 512;
         let mut h: u32 = 512;
         for line in text.lines() {
             let line = line.trim();
             if let Some(val) = line.strip_prefix("ImageWidth=") {
                 if let Ok(v) = val.trim().parse::<u32>() {
-                    if v > 0 { w = v; }
+                    if v > 0 {
+                        w = v;
+                    }
                 }
             } else if let Some(val) = line.strip_prefix("ImageHeight=") {
                 if let Ok(v) = val.trim().parse::<u32>() {
-                    if v > 0 { h = v; }
+                    if v > 0 {
+                        h = v;
+                    }
                 }
             }
         }
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(ImageMetadata {
-            size_x: w,
-            size_y: h,
-            size_z: 1,
-            size_c: 3,
-            size_t: 1,
-            pixel_type: PixelType::Uint8,
-            bits_per_pixel: 8,
-            image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: true,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: HashMap::new(),
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
-        Ok(())
+        let _ = (w, h);
+        Err(BioFormatsError::UnsupportedFormat(
+            "Hamamatsu L2D image payload decoding is not implemented".into(),
+        ))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -410,13 +483,21 @@ impl FormatReader for L2dReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -427,15 +508,27 @@ impl FormatReader for L2dReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * 3])
+        Err(BioFormatsError::UnsupportedFormat(
+            "Hamamatsu L2D image payload decoding is not implemented".into(),
+        ))
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, _x: u32, _y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        _x: u32,
+        _y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(vec![0u8; w as usize * h as usize * 3])
+        let _ = (plane_index, w, h);
+        Err(BioFormatsError::UnsupportedFormat(
+            "Hamamatsu L2D image payload decoding is not implemented".into(),
+        ))
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -460,23 +553,30 @@ pub struct CanonRawReader {
 
 impl CanonRawReader {
     pub fn new() -> Self {
-        CanonRawReader { inner: crate::tiff::TiffReader::new() }
+        CanonRawReader {
+            inner: crate::tiff::TiffReader::new(),
+        }
     }
 }
 
 impl Default for CanonRawReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for CanonRawReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("cr2") | Some("crw") | Some("cr3"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)
@@ -546,23 +646,30 @@ pub struct SbigReader {
 
 impl SbigReader {
     pub fn new() -> Self {
-        SbigReader { inner: crate::formats::fits::FitsReader::new() }
+        SbigReader {
+            inner: crate::formats::fits::FitsReader::new(),
+        }
     }
 }
 
 impl Default for SbigReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for SbigReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("fts"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)

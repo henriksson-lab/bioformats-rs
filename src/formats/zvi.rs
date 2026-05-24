@@ -14,7 +14,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
@@ -32,6 +32,133 @@ struct ZviPlane {
     z: u32,
     c: u32,
     t: u32,
+}
+
+fn zvi_tag_name(tag_id: u32) -> &'static str {
+    match tag_id {
+        515 => "ImageWidth",
+        516 => "ImageHeight",
+        518 => "PixelType",
+        769 => "Scale Factor for X",
+        770 => "Scale Unit for X",
+        772 => "Scale Factor for Y",
+        773 => "Scale Unit for Y",
+        1025 | 1047 => "Camera Acquisition Time",
+        1284 => "Channel Name",
+        1537 => "Title",
+        1538 => "Author",
+        1540 => "Comments",
+        1553 => "Filename",
+        1793 => "Acquisition Date",
+        1801 => "User Name",
+        _ => "Unknown",
+    }
+}
+
+fn read_zvi_variant(data: &[u8], offset: &mut usize) -> Option<String> {
+    let ty = u16::from_le_bytes(data.get(*offset..*offset + 2)?.try_into().ok()?);
+    *offset += 2;
+    let value = match ty {
+        0 | 1 => String::new(),
+        2 => {
+            let v = i16::from_le_bytes(data.get(*offset..*offset + 2)?.try_into().ok()?);
+            *offset += 2;
+            v.to_string()
+        }
+        3 | 22 => {
+            let v = i32::from_le_bytes(data.get(*offset..*offset + 4)?.try_into().ok()?);
+            *offset += 4;
+            v.to_string()
+        }
+        4 => {
+            let v = f32::from_le_bytes(data.get(*offset..*offset + 4)?.try_into().ok()?);
+            *offset += 4;
+            v.to_string()
+        }
+        5 | 7 => {
+            let v = f64::from_le_bytes(data.get(*offset..*offset + 8)?.try_into().ok()?);
+            *offset += 8;
+            v.to_string()
+        }
+        8 | 69 => {
+            let len = u32::from_le_bytes(data.get(*offset..*offset + 4)?.try_into().ok()?) as usize;
+            *offset += 4;
+            let raw = data.get(*offset..*offset + len)?;
+            *offset += len;
+            String::from_utf8_lossy(raw)
+                .trim_end_matches('\0')
+                .trim()
+                .to_string()
+        }
+        11 => {
+            let v = u16::from_le_bytes(data.get(*offset..*offset + 2)?.try_into().ok()?) != 0;
+            *offset += 2;
+            v.to_string()
+        }
+        19 | 23 => {
+            let v = u32::from_le_bytes(data.get(*offset..*offset + 4)?.try_into().ok()?);
+            *offset += 4;
+            v.to_string()
+        }
+        20 | 21 => {
+            let v = u64::from_le_bytes(data.get(*offset..*offset + 8)?.try_into().ok()?);
+            *offset += 8;
+            v.to_string()
+        }
+        66 => {
+            let len = u16::from_le_bytes(data.get(*offset..*offset + 2)?.try_into().ok()?) as usize;
+            *offset += 2;
+            let raw = data.get(*offset..*offset + len)?;
+            *offset += len;
+            String::from_utf8_lossy(raw)
+                .trim_end_matches('\0')
+                .trim()
+                .to_string()
+        }
+        _ => return None,
+    };
+    Some(value)
+}
+
+fn parse_zvi_tag_stream(data: &[u8], image_num: usize) -> HashMap<String, MetadataValue> {
+    let mut map = HashMap::new();
+    if data.len() < 12 {
+        return map;
+    }
+    let count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    let mut offset = 12;
+    for i in 0..count {
+        let Some(value) = read_zvi_variant(data, &mut offset) else {
+            break;
+        };
+        if offset + 12 > data.len() {
+            break;
+        }
+        offset += 2;
+        let tag_id = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        offset += 10;
+        map.insert(
+            format!("zvi.image.{image_num}.tag.{tag_id}"),
+            MetadataValue::String(value.clone()),
+        );
+        let name = zvi_tag_name(tag_id);
+        if name != "Unknown" {
+            map.insert(
+                format!("zvi.image.{image_num}.{name}"),
+                MetadataValue::String(value),
+            );
+        }
+        map.insert(
+            format!("zvi.image.{image_num}.tag.{i}.id"),
+            MetadataValue::Int(tag_id as i64),
+        );
+    }
+    map
 }
 
 impl ZviReader {
@@ -59,15 +186,17 @@ fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
 }
 
 fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool)> {
-    let mut comp = cfb::open(path)
-        .map_err(|e| BioFormatsError::Format(format!("ZVI CFB open error: {e}")))?;
+    let mut comp =
+        cfb::open(path).map_err(|e| BioFormatsError::Format(format!("ZVI CFB open error: {e}")))?;
 
     // ── Read global image metadata from /Image/CONTENTS ─────────────────────
     let (size_x, size_y, pixel_type, bytes_per_pixel, is_rgb) = {
-        let mut stream = comp.open_stream("/Image/CONTENTS")
+        let mut stream = comp
+            .open_stream("/Image/CONTENTS")
             .map_err(|e| BioFormatsError::Format(format!("ZVI: /Image/CONTENTS missing: {e}")))?;
         let mut data = Vec::new();
-        stream.read_to_end(&mut data)
+        stream
+            .read_to_end(&mut data)
             .map_err(|e| BioFormatsError::Io(e))?;
 
         // Java source: width at offset 0, height at 4, pixel_type at 8 (all u32 LE)
@@ -79,13 +208,13 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool)>
         // 1 = uint8 (grayscale), 2 = uint16, 3 = float32
         // 4 = RGB24 (3 bytes/pixel), 5 = BGR32, 6 = RGBA
         let (pixel_type, bpp, rgb) = match pt_raw {
-            1 => (PixelType::Uint8,  1usize, false),
+            1 => (PixelType::Uint8, 1usize, false),
             2 => (PixelType::Uint16, 2usize, false),
             3 => (PixelType::Float32, 4usize, false),
-            4 => (PixelType::Uint8,  3usize, true),   // RGB24
-            5 => (PixelType::Uint8,  4usize, true),   // BGR32 — treat as RGBA
-            6 => (PixelType::Uint8,  4usize, true),   // RGBA
-            _ => (PixelType::Uint8,  1usize, false),
+            4 => (PixelType::Uint8, 3usize, true), // RGB24
+            5 => (PixelType::Uint8, 4usize, true), // BGR32 — treat as RGBA
+            6 => (PixelType::Uint8, 4usize, true), // RGBA
+            _ => (PixelType::Uint8, 1usize, false),
         };
 
         (w, h, pixel_type, bpp, rgb)
@@ -119,6 +248,7 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool)>
     });
 
     let mut planes: Vec<ZviPlane> = Vec::with_capacity(item_paths.len());
+    let mut series_metadata = HashMap::new();
 
     for stream_path in item_paths {
         let mut stream = match comp.open_stream(&stream_path) {
@@ -130,9 +260,9 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool)>
             continue;
         }
         // First 16 bytes: 4× little-endian u32 → [z, channel, timepoint, tile]
-        let z    = read_u32_le(&data, 0).unwrap_or(0);
-        let c    = read_u32_le(&data, 4).unwrap_or(0);
-        let t    = read_u32_le(&data, 8).unwrap_or(0);
+        let z = read_u32_le(&data, 0).unwrap_or(0);
+        let c = read_u32_le(&data, 4).unwrap_or(0);
+        let t = read_u32_le(&data, 8).unwrap_or(0);
         let tile = read_u32_le(&data, 12).unwrap_or(0);
 
         // Skip tiled data (tile > 0) — not supported in v1
@@ -140,7 +270,29 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool)>
             continue;
         }
 
-        planes.push(ZviPlane { stream_path, z, c, t });
+        planes.push(ZviPlane {
+            stream_path,
+            z,
+            c,
+            t,
+        });
+    }
+
+    for plane in &planes {
+        let image_num = plane
+            .stream_path
+            .trim_start_matches("/Image/Item(")
+            .split(')')
+            .next()
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0);
+        let tag_path = format!("/Image/Item({image_num})/Tags/CONTENTS");
+        if let Ok(mut stream) = comp.open_stream(&tag_path) {
+            let mut data = Vec::new();
+            if stream.read_to_end(&mut data).is_ok() {
+                series_metadata.extend(parse_zvi_tag_stream(&data, image_num));
+            }
+        }
     }
 
     if planes.is_empty() {
@@ -172,7 +324,7 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool)>
         is_indexed: false,
         is_little_endian: true,
         resolution_count: 1,
-        series_metadata: HashMap::new(),
+        series_metadata,
         lookup_table: None,
         modulo_z: None,
         modulo_c: None,
@@ -185,7 +337,9 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool)>
 /// Decode pixel data from a ZVI plane stream (after the 16-byte header).
 fn decode_plane_data(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 16 {
-        return Err(BioFormatsError::Format("ZVI: plane stream too short".into()));
+        return Err(BioFormatsError::Format(
+            "ZVI: plane stream too short".into(),
+        ));
     }
     let payload = &data[16..];
 
@@ -200,10 +354,7 @@ fn decode_plane_data(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     // Check for "WZL" Zlib marker in first 32 bytes
-    let wzl_pos = payload
-        .windows(3)
-        .take(32)
-        .position(|w| w == b"WZL");
+    let wzl_pos = payload.windows(3).take(32).position(|w| w == b"WZL");
     if let Some(pos) = wzl_pos {
         // Skip to after the 8-byte sub-header that follows "WZL"
         let zlib_start = pos + 8;
@@ -223,7 +374,10 @@ fn decode_plane_data(data: &[u8]) -> Result<Vec<u8>> {
 
 impl FormatReader for ZviReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("zvi"))
     }
 
@@ -260,23 +414,35 @@ impl FormatReader for ZviReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
     }
 
-    fn resolution_count(&self) -> usize { 1 }
+    fn resolution_count(&self) -> usize {
+        1
+    }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         if level != 0 {
-            Err(BioFormatsError::Format(format!("ZVI: resolution {level} out of range")))
+            Err(BioFormatsError::Format(format!(
+                "ZVI: resolution {level} out of range"
+            )))
         } else {
             Ok(())
         }
@@ -288,19 +454,26 @@ impl FormatReader for ZviReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
-        let stream_path = self.planes
+        let stream_path = self
+            .planes
             .get(plane_index as usize)
             .map(|p| p.stream_path.clone())
             .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
 
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?.clone();
-        let mut comp = cfb::open(&path)
-            .map_err(|e| BioFormatsError::Format(format!("ZVI CFB open: {e}")))?;
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        let mut comp =
+            cfb::open(&path).map_err(|e| BioFormatsError::Format(format!("ZVI CFB open: {e}")))?;
 
-        let mut stream = comp.open_stream(&stream_path)
+        let mut stream = comp
+            .open_stream(&stream_path)
             .map_err(|e| BioFormatsError::Format(format!("ZVI stream {stream_path}: {e}")))?;
         let mut data = Vec::new();
-        stream.read_to_end(&mut data)
+        stream
+            .read_to_end(&mut data)
             .map_err(|e| BioFormatsError::Io(e))?;
 
         let mut pixels = decode_plane_data(&data)?;
@@ -318,7 +491,14 @@ impl FormatReader for ZviReader {
         Ok(pixels)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bpp = self.bytes_per_pixel;

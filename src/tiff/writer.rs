@@ -67,18 +67,30 @@ impl TiffWriter {
 }
 
 impl Default for TiffWriter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---- helpers ----------------------------------------------------------------
 
-fn write_le_u16(w: &mut impl Write, v: u16) -> std::io::Result<()> { w.write_all(&v.to_le_bytes()) }
-fn write_le_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> { w.write_all(&v.to_le_bytes()) }
+fn write_le_u16(w: &mut impl Write, v: u16) -> std::io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+fn write_le_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
 
 /// Returns (TIFF type code, bytes per element)
-fn short_type() -> (u16, u32) { (3, 2) }
-fn long_type() -> (u16, u32) { (4, 4) }
-fn rational_type() -> (u16, u32) { (5, 8) }
+fn short_type() -> (u16, u32) {
+    (3, 2)
+}
+fn long_type() -> (u16, u32) {
+    (4, 4)
+}
+fn rational_type() -> (u16, u32) {
+    (5, 8)
+}
 
 /// One IFD entry — tag, type, count, value_or_offset.
 struct Entry {
@@ -91,12 +103,22 @@ struct Entry {
 
 /// Write a SHORT entry with a single value stored inline.
 fn short_entry(tag: u16, value: u16) -> Entry {
-    Entry { tag, typ: short_type().0, count: 1, value_or_offset: value as u32 }
+    Entry {
+        tag,
+        typ: short_type().0,
+        count: 1,
+        value_or_offset: value as u32,
+    }
 }
 
 /// Write a LONG entry with a single value stored inline.
 fn long_entry(tag: u16, value: u32) -> Entry {
-    Entry { tag, typ: long_type().0, count: 1, value_or_offset: value }
+    Entry {
+        tag,
+        typ: long_type().0,
+        count: 1,
+        value_or_offset: value,
+    }
 }
 
 fn sample_format(pt: PixelType) -> u16 {
@@ -130,9 +152,10 @@ fn compress(data: &[u8], scheme: WriteCompression) -> Result<Vec<u8>> {
             enc.finish().map_err(BioFormatsError::Io)
         }
         WriteCompression::Lzw => {
-            use weezl::{BitOrder, encode::Encoder};
+            use weezl::{encode::Encoder, BitOrder};
             let mut enc = Encoder::with_tiff_size_switch(BitOrder::Msb, 8);
-            enc.encode(data).map_err(|e| BioFormatsError::Codec(e.to_string()))
+            enc.encode(data)
+                .map_err(|e| BioFormatsError::Codec(e.to_string()))
         }
     }
 }
@@ -143,6 +166,19 @@ fn compression_tag(scheme: WriteCompression) -> u16 {
         WriteCompression::Lzw => 5,
         WriteCompression::Deflate => 8,
     }
+}
+
+fn expected_plane_len(meta: &ImageMetadata) -> Result<usize> {
+    let samples_per_pixel = if meta.is_rgb { meta.size_c.max(1) } else { 1 };
+    let bytes_per_sample = meta.pixel_type.bytes_per_sample() as u64;
+    let len = meta.size_x as u64 * meta.size_y as u64 * samples_per_pixel as u64 * bytes_per_sample;
+    usize::try_from(len).map_err(|_| {
+        BioFormatsError::Format("TIFF writer: expected plane byte count overflows usize".into())
+    })
+}
+
+fn expected_plane_count(meta: &ImageMetadata) -> u32 {
+    meta.image_count.max(1)
 }
 
 // ---- FormatWriter impl -------------------------------------------------------
@@ -190,7 +226,11 @@ impl PyramidOmeTiffWriter {
     /// supplied through `save_bytes` (stored as level 0), and additional
     /// resolution levels via `add_resolution_level`.
     pub fn write_pyramid(&mut self) -> Result<()> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?.clone();
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let f = File::create(path).map_err(BioFormatsError::Io)?;
@@ -202,7 +242,9 @@ impl PyramidOmeTiffWriter {
         write_le_u32(&mut w, 0).map_err(BioFormatsError::Io)?; // placeholder for IFD offset
 
         if self.levels.is_empty() {
-            return Err(BioFormatsError::Format("No resolution levels provided".into()));
+            return Err(BioFormatsError::Format(
+                "No resolution levels provided".into(),
+            ));
         }
 
         let comp_tag = compression_tag(self.compression);
@@ -266,10 +308,20 @@ impl PyramidOmeTiffWriter {
                     short_entry(258, bps),
                     short_entry(259, comp_tag),
                     short_entry(262, photometric),
-                    Entry { tag: 273, typ: long_type().0, count: 1, value_or_offset: strip_offset as u32 },
+                    Entry {
+                        tag: 273,
+                        typ: long_type().0,
+                        count: 1,
+                        value_or_offset: strip_offset as u32,
+                    },
                     short_entry(277, spp),
                     long_entry(278, sub_height),
-                    Entry { tag: 279, typ: long_type().0, count: 1, value_or_offset: strip_byte_count as u32 },
+                    Entry {
+                        tag: 279,
+                        typ: long_type().0,
+                        count: 1,
+                        value_or_offset: strip_byte_count as u32,
+                    },
                     short_entry(284, 1),
                 ];
                 // NewSubfileType = 1 (reduced resolution)
@@ -280,12 +332,17 @@ impl PyramidOmeTiffWriter {
                 entries.sort_by_key(|e| e.tag);
 
                 let entry_count = entries.len() as u16;
-                w.write_all(&entry_count.to_le_bytes()).map_err(BioFormatsError::Io)?;
+                w.write_all(&entry_count.to_le_bytes())
+                    .map_err(BioFormatsError::Io)?;
                 for e in &entries {
-                    w.write_all(&e.tag.to_le_bytes()).map_err(BioFormatsError::Io)?;
-                    w.write_all(&e.typ.to_le_bytes()).map_err(BioFormatsError::Io)?;
-                    w.write_all(&e.count.to_le_bytes()).map_err(BioFormatsError::Io)?;
-                    w.write_all(&e.value_or_offset.to_le_bytes()).map_err(BioFormatsError::Io)?;
+                    w.write_all(&e.tag.to_le_bytes())
+                        .map_err(BioFormatsError::Io)?;
+                    w.write_all(&e.typ.to_le_bytes())
+                        .map_err(BioFormatsError::Io)?;
+                    w.write_all(&e.count.to_le_bytes())
+                        .map_err(BioFormatsError::Io)?;
+                    w.write_all(&e.value_or_offset.to_le_bytes())
+                        .map_err(BioFormatsError::Io)?;
                 }
                 // Next IFD = 0 (sub-IFDs are not chained)
                 write_le_u32(&mut w, 0).map_err(BioFormatsError::Io)?;
@@ -355,23 +412,46 @@ impl PyramidOmeTiffWriter {
             }
 
             // Build entries
-            let mut entries: Vec<Entry> = vec![
-                long_entry(256, meta.size_x),
-                long_entry(257, meta.size_y),
-            ];
+            let mut entries: Vec<Entry> =
+                vec![long_entry(256, meta.size_x), long_entry(257, meta.size_y)];
             if spp == 1 {
                 entries.push(short_entry(258, bps));
             } else {
-                entries.push(Entry { tag: 258, typ: short_type().0, count: spp as u32, value_or_offset: 0 });
+                entries.push(Entry {
+                    tag: 258,
+                    typ: short_type().0,
+                    count: spp as u32,
+                    value_or_offset: 0,
+                });
             }
             entries.push(short_entry(259, comp_tag));
             entries.push(short_entry(262, photometric));
-            entries.push(Entry { tag: 273, typ: long_type().0, count: 1, value_or_offset: strip_offset as u32 });
+            entries.push(Entry {
+                tag: 273,
+                typ: long_type().0,
+                count: 1,
+                value_or_offset: strip_offset as u32,
+            });
             entries.push(short_entry(277, spp));
             entries.push(long_entry(278, meta.size_y));
-            entries.push(Entry { tag: 279, typ: long_type().0, count: 1, value_or_offset: strip_byte_count as u32 });
-            entries.push(Entry { tag: 282, typ: rational_type().0, count: 1, value_or_offset: 0 });
-            entries.push(Entry { tag: 283, typ: rational_type().0, count: 1, value_or_offset: 0 });
+            entries.push(Entry {
+                tag: 279,
+                typ: long_type().0,
+                count: 1,
+                value_or_offset: strip_byte_count as u32,
+            });
+            entries.push(Entry {
+                tag: 282,
+                typ: rational_type().0,
+                count: 1,
+                value_or_offset: 0,
+            });
+            entries.push(Entry {
+                tag: 283,
+                typ: rational_type().0,
+                count: 1,
+                value_or_offset: 0,
+            });
             entries.push(short_entry(284, 1));
             entries.push(short_entry(296, 2));
 
@@ -380,7 +460,12 @@ impl PyramidOmeTiffWriter {
             }
 
             if let Some(ref _db) = desc_bytes {
-                entries.push(Entry { tag: 270, typ: 2, count: desc_bytes.as_ref().unwrap().len() as u32, value_or_offset: 0 });
+                entries.push(Entry {
+                    tag: 270,
+                    typ: 2,
+                    count: desc_bytes.as_ref().unwrap().len() as u32,
+                    value_or_offset: 0,
+                });
             }
 
             // SubIFD tag (330) — IFD type
@@ -420,37 +505,40 @@ impl PyramidOmeTiffWriter {
                 match tag {
                     258 => {
                         let count = u32::from_le_bytes([
-                            ifd_bytes[off+4], ifd_bytes[off+5],
-                            ifd_bytes[off+6], ifd_bytes[off+7]
+                            ifd_bytes[off + 4],
+                            ifd_bytes[off + 5],
+                            ifd_bytes[off + 6],
+                            ifd_bytes[off + 7],
                         ]);
                         if count > 1 {
                             let abs_off = extra_file_off as u32;
-                            ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                            ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                         }
                     }
                     270 => {
                         let abs_off = (extra_file_off + desc_extra_offset as u64) as u32;
-                        ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                        ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     282 => {
                         let bps_extra = if spp > 1 { spp as u64 * 2 } else { 0 };
                         let desc_extra = desc_bytes.as_ref().map(|d| d.len() as u64).unwrap_or(0);
                         let abs_off = (extra_file_off + bps_extra + desc_extra) as u32;
-                        ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                        ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     283 => {
                         let bps_extra = if spp > 1 { spp as u64 * 2 } else { 0 };
                         let desc_extra = desc_bytes.as_ref().map(|d| d.len() as u64).unwrap_or(0);
                         let abs_off = (extra_file_off + bps_extra + desc_extra + 8) as u32;
-                        ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                        ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     330 => {
                         if sub_offsets.len() == 1 {
                             // Inline single offset
-                            ifd_bytes[off+8..off+12].copy_from_slice(&(sub_offsets[0] as u32).to_le_bytes());
+                            ifd_bytes[off + 8..off + 12]
+                                .copy_from_slice(&(sub_offsets[0] as u32).to_le_bytes());
                         } else {
                             let abs_off = (extra_file_off + sub_ifd_extra_offset as u64) as u32;
-                            ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                            ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                         }
                     }
                     _ => {}
@@ -483,14 +571,21 @@ impl PyramidOmeTiffWriter {
 }
 
 impl Default for PyramidOmeTiffWriter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatWriter for PyramidOmeTiffWriter {
     fn is_this_type(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str())
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff") | Some("ome.tif") | Some("ome.tiff"))
+        matches!(
+            ext.as_deref(),
+            Some("tif") | Some("tiff") | Some("ome.tif") | Some("ome.tiff")
+        )
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
@@ -520,12 +615,16 @@ impl FormatWriter for PyramidOmeTiffWriter {
         self.write_pyramid()
     }
 
-    fn can_do_stacks(&self) -> bool { true }
+    fn can_do_stacks(&self) -> bool {
+        true
+    }
 }
 
 impl FormatWriter for TiffWriter {
     fn is_this_type(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str())
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("tif") | Some("tiff") | Some("btf"))
     }
@@ -562,6 +661,20 @@ impl FormatWriter for TiffWriter {
                 self.planes_written, plane_index
             )));
         }
+        let expected_count = expected_plane_count(meta);
+        if plane_index >= expected_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+
+        let expected_len = expected_plane_len(meta)?;
+        if data.len() != expected_len {
+            return Err(BioFormatsError::Format(format!(
+                "TIFF writer: plane {} has {} bytes, expected {}",
+                plane_index,
+                data.len(),
+                expected_len
+            )));
+        }
 
         let compressed = compress(data, self.compression)?;
         let w = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
@@ -571,12 +684,19 @@ impl FormatWriter for TiffWriter {
 
         self.plane_strips.push((offset, compressed.len() as u64));
         self.planes_written += 1;
-        let _ = meta; // used above for validation
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
+        let expected_count = expected_plane_count(&meta);
+        if self.planes_written != expected_count {
+            self.meta = Some(meta);
+            return Err(BioFormatsError::Format(format!(
+                "TIFF writer: wrote {} planes, expected {}",
+                self.planes_written, expected_count
+            )));
+        }
         let w = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
 
         let spp = if meta.is_rgb { meta.size_c } else { 1 } as u16;
@@ -596,6 +716,9 @@ impl FormatWriter for TiffWriter {
             ifd_bytes: Vec<u8>,
             extra_bytes: Vec<u8>,
             desc_offset: u32,
+            bps_offset: u32,
+            xres_offset: u32,
+            yres_offset: u32,
         }
 
         let mut ifd_blobs: Vec<IfdBlob> = Vec::with_capacity(plane_count);
@@ -622,7 +745,12 @@ impl FormatWriter for TiffWriter {
                 for _ in 0..spp {
                     extra.extend_from_slice(&bps.to_le_bytes());
                 }
-                bps_entry = Entry { tag: 258, typ: short_type().0, count: spp as u32, value_or_offset: 0 /* filled later */ };
+                bps_entry = Entry {
+                    tag: 258,
+                    typ: short_type().0,
+                    count: spp as u32,
+                    value_or_offset: 0, /* filled later */
+                };
             }
 
             // ImageDescription (OME-XML) for the first IFD only
@@ -655,12 +783,32 @@ impl FormatWriter for TiffWriter {
                 bps_entry,
                 short_entry(259, comp_tag),
                 short_entry(262, photometric),
-                Entry { tag: 273, typ: long_type().0, count: 1, value_or_offset: strip_offset as u32 },
+                Entry {
+                    tag: 273,
+                    typ: long_type().0,
+                    count: 1,
+                    value_or_offset: strip_offset as u32,
+                },
                 short_entry(277, spp as u16),
                 long_entry(278, meta.size_y), // RowsPerStrip = full image height
-                Entry { tag: 279, typ: long_type().0, count: 1, value_or_offset: strip_byte_count as u32 },
-                Entry { tag: 282, typ: rational_type().0, count: 1, value_or_offset: 0 }, // XResolution
-                Entry { tag: 283, typ: rational_type().0, count: 1, value_or_offset: 0 }, // YResolution
+                Entry {
+                    tag: 279,
+                    typ: long_type().0,
+                    count: 1,
+                    value_or_offset: strip_byte_count as u32,
+                },
+                Entry {
+                    tag: 282,
+                    typ: rational_type().0,
+                    count: 1,
+                    value_or_offset: 0,
+                }, // XResolution
+                Entry {
+                    tag: 283,
+                    typ: rational_type().0,
+                    count: 1,
+                    value_or_offset: 0,
+                }, // YResolution
                 short_entry(284, 1), // PlanarConfiguration = chunky
                 short_entry(296, 2), // ResolutionUnit = inch
             ];
@@ -699,14 +847,20 @@ impl FormatWriter for TiffWriter {
             // Append next IFD placeholder (4 bytes)
             ifd_bytes.extend_from_slice(&0u32.to_le_bytes());
 
-            ifd_blobs.push(IfdBlob { ifd_bytes, extra_bytes: extra, desc_offset });
+            ifd_blobs.push(IfdBlob {
+                ifd_bytes,
+                extra_bytes: extra,
+                desc_offset,
+                bps_offset: bps_offset_placeholder,
+                xres_offset,
+                yres_offset,
+            });
 
             // Remember what we need to patch later:
             // - BitsPerSample offset (if spp > 1)
             // - XResolution offset
             // - YResolution offset
             // We'll do a second pass once we know the IFD file offsets.
-            let _ = (bps_offset_placeholder, xres_offset, yres_offset);
         }
 
         // Now write IFDs to the file and patch offsets.
@@ -736,33 +890,29 @@ impl FormatWriter for TiffWriter {
                         // BitsPerSample — patch to file offset of BPS array in extra
                         // (only if count > 1)
                         let count = u32::from_le_bytes([
-                            blob.ifd_bytes[off+4], blob.ifd_bytes[off+5],
-                            blob.ifd_bytes[off+6], blob.ifd_bytes[off+7]
+                            blob.ifd_bytes[off + 4],
+                            blob.ifd_bytes[off + 5],
+                            blob.ifd_bytes[off + 6],
+                            blob.ifd_bytes[off + 7],
                         ]);
                         if count > 1 {
-                            // extra starts with BPS array at offset 0
-                            let abs_off = (extra_file_off) as u32;
-                            blob.ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                            let abs_off = (extra_file_off + blob.bps_offset as u64) as u32;
+                            blob.ifd_bytes[off + 8..off + 12]
+                                .copy_from_slice(&abs_off.to_le_bytes());
                         }
                     }
                     282 => {
-                        // XResolution — 8 bytes before YResolution in extra
-                        // Extra layout: [BPS array if spp>1], XRes(8), YRes(8)
-                        // Find where XRes starts in extra:
-                        let bps_extra_bytes = if spp > 1 { spp as u64 * 2 } else { 0 };
-                        let abs_off = (extra_file_off + bps_extra_bytes) as u32;
-                        blob.ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                        let abs_off = (extra_file_off + blob.xres_offset as u64) as u32;
+                        blob.ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     283 => {
-                        // YResolution
-                        let bps_extra_bytes = if spp > 1 { spp as u64 * 2 } else { 0 };
-                        let abs_off = (extra_file_off + bps_extra_bytes + 8) as u32;
-                        blob.ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                        let abs_off = (extra_file_off + blob.yres_offset as u64) as u32;
+                        blob.ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     270 => {
                         // ImageDescription — offset into extra data
                         let abs_off = (extra_file_off + blob.desc_offset as u64) as u32;
-                        blob.ifd_bytes[off+8..off+12].copy_from_slice(&abs_off.to_le_bytes());
+                        blob.ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     // StripOffsets / StripByteCounts are already absolute (set from plane_strips)
                     _ => {}
@@ -779,7 +929,8 @@ impl FormatWriter for TiffWriter {
             blob.ifd_bytes[last..].copy_from_slice(&next_ifd.to_le_bytes());
 
             w.write_all(&blob.ifd_bytes).map_err(BioFormatsError::Io)?;
-            w.write_all(&blob.extra_bytes).map_err(BioFormatsError::Io)?;
+            w.write_all(&blob.extra_bytes)
+                .map_err(BioFormatsError::Io)?;
         }
 
         // Patch header: write first_ifd_file_offset at byte 4
@@ -793,5 +944,7 @@ impl FormatWriter for TiffWriter {
         Ok(())
     }
 
-    fn can_do_stacks(&self) -> bool { true }
+    fn can_do_stacks(&self) -> bool {
+        true
+    }
 }

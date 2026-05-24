@@ -17,7 +17,9 @@ pub struct WholeSlideTiffReader {
 
 impl WholeSlideTiffReader {
     pub fn new() -> Self {
-        WholeSlideTiffReader { inner: crate::tiff::TiffReader::new() }
+        WholeSlideTiffReader {
+            inner: crate::tiff::TiffReader::new(),
+        }
     }
 
     /// Parse Aperio SVS ImageDescription metadata.
@@ -25,12 +27,25 @@ impl WholeSlideTiffReader {
     fn parse_aperio_metadata(&mut self) {
         let desc = {
             let series = self.inner.series_list();
-            if series.is_empty() { return; }
-            series[0].metadata.series_metadata.get("ImageDescription")
-                .and_then(|v| if let MetadataValue::String(s) = v { Some(s.clone()) } else { None })
+            if series.is_empty() {
+                return;
+            }
+            series[0]
+                .metadata
+                .series_metadata
+                .get("ImageDescription")
+                .and_then(|v| {
+                    if let MetadataValue::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
         };
         let Some(desc) = desc else { return };
-        if !desc.starts_with("Aperio") { return; }
+        if !desc.starts_with("Aperio") {
+            return;
+        }
 
         // Parse |key=value pairs
         let mut vendor_meta = std::collections::HashMap::new();
@@ -43,43 +58,60 @@ impl WholeSlideTiffReader {
         }
 
         // Also try to extract microns-per-pixel and magnification as OME-like metadata
-        let mpp = vendor_meta.get("MPP")
-            .and_then(|v| if let MetadataValue::String(s) = v { s.parse::<f64>().ok() } else { None });
-        let mag = vendor_meta.get("AppMag")
-            .and_then(|v| if let MetadataValue::String(s) = v { s.parse::<f64>().ok() } else { None });
+        let mpp = vendor_meta.get("MPP").and_then(|v| {
+            if let MetadataValue::String(s) = v {
+                s.parse::<f64>().ok()
+            } else {
+                None
+            }
+        });
+        let mag = vendor_meta.get("AppMag").and_then(|v| {
+            if let MetadataValue::String(s) = v {
+                s.parse::<f64>().ok()
+            } else {
+                None
+            }
+        });
 
         let series = self.inner.series_list_mut();
         if let Some(s) = series.first_mut() {
             // Store vendor metadata
             for (k, v) in vendor_meta {
-                s.metadata.series_metadata.insert(format!("aperio.{}", k), v);
+                s.metadata
+                    .series_metadata
+                    .insert(format!("aperio.{}", k), v);
             }
             // Store magnification
             if let Some(m) = mag {
-                s.metadata.series_metadata.insert(
-                    "objective.magnification".into(),
-                    MetadataValue::Float(m),
-                );
+                s.metadata
+                    .series_metadata
+                    .insert("objective.magnification".into(), MetadataValue::Float(m));
             }
             if let Some(m) = mpp {
-                s.metadata.series_metadata.insert(
-                    "pixel.size.um".into(),
-                    MetadataValue::Float(m),
-                );
+                s.metadata
+                    .series_metadata
+                    .insert("pixel.size.um".into(), MetadataValue::Float(m));
             }
         }
     }
 }
 
 impl Default for WholeSlideTiffReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for WholeSlideTiffReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str())
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("svs") | Some("bif") | Some("ndpi") | Some("scn") | Some("vsi") | Some("afi"))
+        matches!(
+            ext.as_deref(),
+            Some("svs") | Some("bif") | Some("ndpi") | Some("scn") | Some("vsi") | Some("afi")
+        )
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -92,17 +124,44 @@ impl FormatReader for WholeSlideTiffReader {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<()> { self.inner.close() }
-    fn series_count(&self) -> usize { self.inner.series_count() }
-    fn set_series(&mut self, series: usize) -> Result<()> { self.inner.set_series(series) }
-    fn series(&self) -> usize { self.inner.series() }
-    fn metadata(&self) -> &ImageMetadata { self.inner.metadata() }
-    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> { self.inner.open_bytes(plane_index) }
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+    fn set_series(&mut self, series: usize) -> Result<()> {
+        self.inner.set_series(series)
+    }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(plane_index)
+    }
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         self.inner.open_bytes_region(plane_index, x, y, w, h)
     }
-    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> { self.inner.open_thumb_bytes(plane_index) }
-    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
-    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
-    fn resolution(&self) -> usize { self.inner.resolution() }
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(plane_index)
+    }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
 }

@@ -1,5 +1,5 @@
-use std::io::{Read, Seek, SeekFrom};
 use crate::error::{BioFormatsError, Result};
+use std::io::{Read, Seek, SeekFrom};
 
 /// Read exactly `n` bytes at a given file offset.
 pub fn read_bytes_at<R: Read + Seek>(r: &mut R, offset: u64, n: usize) -> Result<Vec<u8>> {

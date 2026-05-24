@@ -9,7 +9,7 @@
 //! Key chunk names: "ImageAttributesLV!", "ImageMetadataLV!",
 //!                  "ImageDataSeq|0!", "ImageDataSeq|1!", ...
 //!
-//! Compression: uncompressed or zlib. (JPEG2000 requires an external decoder.)
+//! Compression: uncompressed, zlib, or JPEG2000.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -33,34 +33,202 @@ struct Nd2Chunk {
 
 fn scan_chunks(f: &mut BufReader<File>) -> std::io::Result<Vec<Nd2Chunk>> {
     let mut chunks = Vec::new();
+    let file_len = f.get_ref().metadata()?.len();
     f.seek(SeekFrom::Start(0))?;
 
     loop {
+        let chunk_start = f.stream_position()?;
+        if chunk_start + 16 > file_len {
+            break;
+        }
+
         let mut magic = [0u8; 4];
-        if f.read_exact(&mut magic).is_err() { break; }
-        if magic != ND2_MAGIC { break; }
+        if f.read_exact(&mut magic).is_err() {
+            break;
+        }
+        if magic != ND2_MAGIC {
+            f.seek(SeekFrom::Start(chunk_start + 1))?;
+            continue;
+        }
 
         let mut name_len_bytes = [0u8; 4];
         f.read_exact(&mut name_len_bytes)?;
         let name_len = u32::from_le_bytes(name_len_bytes) as usize;
+        if name_len == 0 || name_len > 4096 {
+            f.seek(SeekFrom::Start(chunk_start + 1))?;
+            continue;
+        }
 
         let mut data_len_bytes = [0u8; 8];
         f.read_exact(&mut data_len_bytes)?;
         let data_len = u64::from_le_bytes(data_len_bytes);
+        let data_offset = chunk_start + 16 + name_len as u64;
+        let Some(data_end) = data_offset.checked_add(data_len) else {
+            f.seek(SeekFrom::Start(chunk_start + 1))?;
+            continue;
+        };
+        if data_end > file_len {
+            f.seek(SeekFrom::Start(chunk_start + 1))?;
+            continue;
+        }
 
         let mut name_bytes = vec![0u8; name_len];
         f.read_exact(&mut name_bytes)?;
         let name = String::from_utf8_lossy(&name_bytes)
             .trim_end_matches('\0')
             .to_string();
+        if !name.ends_with('!') {
+            f.seek(SeekFrom::Start(chunk_start + 1))?;
+            continue;
+        }
 
-        let data_offset = f.stream_position()?;
-        chunks.push(Nd2Chunk { name, data_offset, data_length: data_len });
+        chunks.push(Nd2Chunk {
+            name,
+            data_offset,
+            data_length: data_len,
+        });
 
         // Advance past data
-        f.seek(SeekFrom::Start(data_offset + data_len))?;
+        f.seek(SeekFrom::Start(data_end))?;
     }
     Ok(chunks)
+}
+
+fn image_data_index(name: &str) -> Option<usize> {
+    let suffix = name.strip_prefix("ImageDataSeq|")?.trim_end_matches('!');
+    suffix.parse().ok()
+}
+
+fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chunk>>> {
+    const CHUNK_MAP_SIGNATURE: &[u8] = b"ND2 CHUNK MAP SIGNATURE 0000001";
+
+    let file_len = f.get_ref().metadata()?.len();
+    if file_len < 40 {
+        return Ok(None);
+    }
+
+    f.seek(SeekFrom::Start(file_len - 40))?;
+    let mut sig = vec![0u8; CHUNK_MAP_SIGNATURE.len()];
+    f.read_exact(&mut sig)?;
+    if sig != CHUNK_MAP_SIGNATURE {
+        return Ok(None);
+    }
+
+    let mut skip = [0u8; 1];
+    f.read_exact(&mut skip)?;
+    let mut off = [0u8; 8];
+    f.read_exact(&mut off)?;
+    let map_offset = u64::from_le_bytes(off);
+    if map_offset + 16 > file_len {
+        return Ok(None);
+    }
+
+    f.seek(SeekFrom::Start(map_offset))?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)?;
+    if magic != ND2_MAGIC {
+        return Ok(None);
+    }
+
+    let mut name_len_bytes = [0u8; 4];
+    f.read_exact(&mut name_len_bytes)?;
+    let name_len = u32::from_le_bytes(name_len_bytes) as u64;
+    let mut data_len_bytes = [0u8; 8];
+    f.read_exact(&mut data_len_bytes)?;
+    let map_len = u64::from_le_bytes(data_len_bytes);
+    let entries_offset = map_offset + 16 + name_len;
+    let entries_end = entries_offset.checked_add(map_len).unwrap_or(u64::MAX);
+    if entries_offset > file_len || entries_end > file_len {
+        return Ok(None);
+    }
+
+    f.seek(SeekFrom::Start(entries_offset))?;
+    let mut chunks = Vec::new();
+    let mut image_count = 0usize;
+    let mut max_image_index: Option<usize> = None;
+
+    while f.stream_position()? + 1 + 16 <= entries_end {
+        let mut name_bytes = Vec::new();
+        loop {
+            if f.stream_position()? >= entries_end {
+                return Ok(None);
+            }
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b)?;
+            if b[0] == b'!' {
+                break;
+            }
+            name_bytes.push(b[0]);
+        }
+
+        let name = String::from_utf8_lossy(&name_bytes).to_string();
+        if name.as_bytes() == CHUNK_MAP_SIGNATURE {
+            break;
+        }
+        let mut position_bytes = [0u8; 8];
+        let mut length_bytes = [0u8; 8];
+        f.read_exact(&mut position_bytes)?;
+        f.read_exact(&mut length_bytes)?;
+        let position = u64::from_le_bytes(position_bytes);
+        let _length = u64::from_le_bytes(length_bytes);
+        let map_entry_offset = f.stream_position()?;
+
+        if position + 16 > file_len {
+            return Ok(None);
+        }
+
+        f.seek(SeekFrom::Start(position))?;
+        let mut chunk_magic = [0u8; 4];
+        f.read_exact(&mut chunk_magic)?;
+        if chunk_magic != ND2_MAGIC {
+            return Ok(None);
+        }
+        let mut actual_name_len_bytes = [0u8; 4];
+        let mut actual_data_len_bytes = [0u8; 8];
+        f.read_exact(&mut actual_name_len_bytes)?;
+        f.read_exact(&mut actual_data_len_bytes)?;
+        let actual_name_len = u32::from_le_bytes(actual_name_len_bytes) as u64;
+        let actual_data_len = u64::from_le_bytes(actual_data_len_bytes);
+        let data_offset = position + 16 + actual_name_len;
+        if data_offset > file_len || data_offset + actual_data_len > file_len {
+            return Ok(None);
+        }
+        f.seek(SeekFrom::Start(map_entry_offset))?;
+
+        if let Some(index) = image_data_index(&name) {
+            image_count += 1;
+            max_image_index = Some(max_image_index.map_or(index, |m| m.max(index)));
+        }
+        chunks.push(Nd2Chunk {
+            name: format!("{name}!"),
+            data_offset,
+            data_length: actual_data_len,
+        });
+    }
+
+    if let Some(max_index) = max_image_index {
+        if image_count != max_index + 1 {
+            return Ok(None);
+        }
+    }
+
+    for chunk in chunks.iter().filter(|c| c.name.starts_with("ImageDataSeq")) {
+        let block_offset = chunk
+            .data_offset
+            .saturating_sub(16 + chunk.name.len() as u64);
+        if block_offset + 4 > file_len {
+            return Ok(None);
+        }
+        f.seek(SeekFrom::Start(block_offset))?;
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic)?;
+        if magic != ND2_MAGIC {
+            return Ok(None);
+        }
+    }
+
+    chunks.sort_by_key(|c| c.data_offset);
+    Ok(Some(chunks))
 }
 
 fn read_chunk_data(f: &mut BufReader<File>, chunk: &Nd2Chunk) -> std::io::Result<Vec<u8>> {
@@ -75,34 +243,172 @@ fn xml_value(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}", tag);
     let pos = xml.find(&open)?;
     let after_open = &xml[pos..];
-    // Look for > and value until </tag>
     let gt = after_open.find('>')?;
+    let attrs = &after_open[..gt];
+    if let Some(value) = xml_attr(attrs, "value") {
+        return Some(value);
+    }
+
     let content_start = &after_open[gt + 1..];
     let close = format!("</{}>", tag);
     let end = content_start.find(&close)?;
     Some(content_start[..end].trim().to_string())
 }
 
-fn parse_nd2_attributes(xml: &str) -> (u32, u32, u32, u32, u8) {
-    let w = xml_value(xml, "uiWidth")
-        .or_else(|| xml_value(xml, "uiCamPxlCountX"))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0u32);
-    let h = xml_value(xml, "uiHeight")
-        .or_else(|| xml_value(xml, "uiCamPxlCountY"))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0u32);
-    let c = xml_value(xml, "uiComp")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1u32);
-    let bpp = xml_value(xml, "uiBpcSignificant")
+fn xml_attr(tag_text: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{attr}=\"");
+    let pos = tag_text.find(&pattern)?;
+    let value_start = pos + pattern.len();
+    let rest = &tag_text[value_start..];
+    let value_end = rest.find('"')?;
+    Some(rest[..value_end].to_string())
+}
+
+fn nd2_u32_value(xml: &str, tag: &str) -> Option<u32> {
+    let value = xml_value(xml, tag)?.parse::<u32>().ok()?;
+    (value != u32::MAX).then_some(value)
+}
+
+fn nd2_bpp_value(xml: &str) -> Option<u8> {
+    xml_value(xml, "uiBpcInMemory")
         .or_else(|| xml_value(xml, "uiBpc"))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8u8);
-    let z_count = xml_value(xml, "uiZStackHome")
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
+        .or_else(|| xml_value(xml, "uiBpcSignificant"))
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|&b| b > 0)
+}
+
+fn rect_sensor_extent(xml: &str) -> Option<(u32, u32)> {
+    let pos = xml.find("<rectSensorUser")?;
+    let after_open = &xml[pos..];
+    let gt = after_open.find('>')?;
+    let content_start = &after_open[gt + 1..];
+    let end = content_start.find("</rectSensorUser>")?;
+    let rect = &content_start[..end];
+
+    let left = nd2_u32_value(rect, "left")?;
+    let top = nd2_u32_value(rect, "top")?;
+    let right = nd2_u32_value(rect, "right")?;
+    let bottom = nd2_u32_value(rect, "bottom")?;
+
+    if right > left && bottom > top {
+        Some((right - left, bottom - top))
+    } else {
+        None
+    }
+}
+
+fn parse_nd2_attributes(xml: &str) -> (u32, u32, u32, u32, u8) {
+    let (rect_w, rect_h) = rect_sensor_extent(xml).unwrap_or((0, 0));
+    let w = if rect_w > 0 {
+        rect_w
+    } else {
+        nd2_u32_value(xml, "uiWidth")
+            .or_else(|| nd2_u32_value(xml, "uiCamPxlCountX"))
+            .unwrap_or(0)
+    };
+    let h = if rect_h > 0 {
+        rect_h
+    } else {
+        nd2_u32_value(xml, "uiHeight")
+            .or_else(|| nd2_u32_value(xml, "uiCamPxlCountY"))
+            .unwrap_or(0)
+    };
+    let c = nd2_u32_value(xml, "uiComp").unwrap_or(1u32);
+    let bpp = nd2_bpp_value(xml).unwrap_or(8u8);
+    let z_count = nd2_u32_value(xml, "uiZStackHome")
+        .or_else(|| nd2_u32_value(xml, "uiSequenceCount"))
+        .unwrap_or(1u32);
     (w, h, c, z_count.max(1), bpp)
+}
+
+fn looks_like_zlib(data: &[u8]) -> bool {
+    if data.len() < 2 {
+        return false;
+    }
+    let cmf = data[0];
+    let flg = data[1];
+    (cmf & 0x0f) == 8 && u16::from_be_bytes([cmf, flg]) % 31 == 0
+}
+
+fn looks_like_jpeg2000(data: &[u8]) -> bool {
+    data.starts_with(&[0xff, 0x4f, 0xff, 0x51])
+        || data.starts_with(&[0x00, 0x00, 0x00, 0x0c, b'j', b'P', b' ', b' '])
+}
+
+fn require_exact_frame(data: Vec<u8>, expected: usize, kind: &str) -> Result<Vec<u8>> {
+    if data.len() == expected {
+        Ok(data)
+    } else if data.len() > expected {
+        Err(BioFormatsError::Format(format!(
+            "{kind} frame has trailing data ({} > {expected})",
+            data.len()
+        )))
+    } else {
+        Err(BioFormatsError::Format(format!(
+            "{kind} frame too small ({} < {expected})",
+            data.len()
+        )))
+    }
+}
+
+fn decompress_nd2_zlib(data: &[u8], expected: usize) -> Result<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read as _;
+
+    let mut dec = ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).map_err(BioFormatsError::Io)?;
+    require_exact_frame(out, expected, "zlib")
+}
+
+fn decode_nd2_frame_payload(data: &[u8], expected: usize) -> Result<Vec<u8>> {
+    const FRAME_PREFIX_LEN: usize = 8;
+    const NIKON_PAYLOAD_OFFSET: usize = 4096;
+    const MAX_RAW_TRAILER_LEN: usize = 4096;
+
+    if data.len() == expected {
+        return Ok(data.to_vec());
+    }
+
+    if data.len() > expected
+        && expected >= 1024
+        && data.len() - expected <= MAX_RAW_TRAILER_LEN
+        && !looks_like_zlib(data)
+        && !looks_like_jpeg2000(data)
+    {
+        return Ok(data[..expected].to_vec());
+    }
+
+    for prefix_len in [0usize, FRAME_PREFIX_LEN, NIKON_PAYLOAD_OFFSET] {
+        let Some(payload) = data.get(prefix_len..) else {
+            continue;
+        };
+
+        if prefix_len > 0 && payload.len() == expected {
+            return Ok(payload.to_vec());
+        }
+
+        if looks_like_zlib(payload) {
+            return decompress_nd2_zlib(payload, expected);
+        }
+
+        if looks_like_jpeg2000(payload) {
+            let decoded = crate::common::codec::decompress_jpeg2000(payload)?;
+            return require_exact_frame(decoded, expected, "JPEG2000");
+        }
+    }
+
+    if data.len() > expected {
+        Err(BioFormatsError::UnsupportedFormat(format!(
+            "unsupported structured frame encoding ({} bytes for {expected}-byte plane)",
+            data.len()
+        )))
+    } else {
+        Err(BioFormatsError::Format(format!(
+            "frame data too small ({} < {expected})",
+            data.len()
+        )))
+    }
 }
 
 // ---- reader -----------------------------------------------------------------
@@ -117,15 +423,26 @@ pub struct Nd2Reader {
 
 impl Nd2Reader {
     pub fn new() -> Self {
-        Nd2Reader { file: None, path: None, chunks: Vec::new(), meta: None, image_chunks: Vec::new() }
+        Nd2Reader {
+            file: None,
+            path: None,
+            chunks: Vec::new(),
+            meta: None,
+            image_chunks: Vec::new(),
+        }
     }
 }
 
-impl Default for Nd2Reader { fn default() -> Self { Self::new() } }
+impl Default for Nd2Reader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatReader for Nd2Reader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("nd2"))
             .unwrap_or(false)
     }
@@ -138,27 +455,61 @@ impl FormatReader for Nd2Reader {
         let f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut reader = BufReader::new(f);
 
-        let chunks = scan_chunks(&mut reader).map_err(BioFormatsError::Io)?;
+        let chunks = match read_chunk_map(&mut reader).map_err(BioFormatsError::Io)? {
+            Some(chunks) => chunks,
+            None => scan_chunks(&mut reader).map_err(BioFormatsError::Io)?,
+        };
 
-        // Find attributes chunk
-        let attr_chunk = chunks.iter().find(|c| c.name.starts_with("ImageAttributesLV"));
-        let (mut size_x, mut size_y, mut size_c, mut size_z, mut bpp) = (0u32, 0u32, 1u32, 1u32, 8u8);
+        let (mut size_x, mut size_y, mut size_c, mut size_z, mut bpp) =
+            (0u32, 0u32, 1u32, 1u32, 8u8);
 
-        if let Some(ac) = attr_chunk {
+        for ac in chunks
+            .iter()
+            .filter(|c| c.name.starts_with("ImageAttributes"))
+        {
             let data = read_chunk_data(&mut reader, ac).map_err(BioFormatsError::Io)?;
             // Data may be a raw binary struct OR XML wrapped. Try XML first.
-            if let Ok(xml) = std::str::from_utf8(&data) {
-                let (w, h, c, z, b) = parse_nd2_attributes(xml);
-                if w > 0 { size_x = w; }
-                if h > 0 { size_y = h; }
-                if c > 0 { size_c = c; }
-                if z > 0 { size_z = z; }
-                if b > 0 { bpp = b; }
+            let xml = String::from_utf8_lossy(&data);
+            let (w, h, c, z, b) = parse_nd2_attributes(&xml);
+            if w > 0 && h > 0 {
+                size_x = w;
+                size_y = h;
+                if c > 0 {
+                    size_c = c;
+                }
+                if z > 0 {
+                    size_z = z;
+                }
+                if b > 0 {
+                    bpp = b;
+                }
+                break;
+            }
+        }
+
+        for mc in chunks.iter().filter(|c| {
+            c.name.starts_with("ImageMetadata") || c.name.contains("GrabberCameraSettings")
+        }) {
+            let data = read_chunk_data(&mut reader, mc).map_err(BioFormatsError::Io)?;
+            let xml = String::from_utf8_lossy(&data);
+            if let Some((w, h)) = rect_sensor_extent(&xml) {
+                size_x = w;
+                size_y = h;
+                let c = nd2_u32_value(&xml, "uiComp").unwrap_or(0);
+                if c > 0 {
+                    size_c = c;
+                }
+                if let Some(b) = nd2_bpp_value(&xml) {
+                    bpp = b;
+                }
+                break;
             }
         }
 
         // Collect image data chunks (ImageDataSeq|N!)
-        let image_chunks: Vec<usize> = chunks.iter().enumerate()
+        let image_chunks: Vec<usize> = chunks
+            .iter()
+            .enumerate()
             .filter(|(_, c)| c.name.starts_with("ImageDataSeq"))
             .map(|(i, _)| i)
             .collect();
@@ -224,17 +575,30 @@ impl FormatReader for Nd2Reader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.file = None; self.path = None; self.meta = None;
-        self.chunks.clear(); self.image_chunks.clear();
+        self.file = None;
+        self.path = None;
+        self.meta = None;
+        self.chunks.clear();
+        self.image_chunks.clear();
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
@@ -242,7 +606,9 @@ impl FormatReader for Nd2Reader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
-        let chunk_idx = self.image_chunks.get(plane_index as usize)
+        let chunk_idx = self
+            .image_chunks
+            .get(plane_index as usize)
             .copied()
             .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
         let chunk = &self.chunks[chunk_idx];
@@ -250,32 +616,31 @@ impl FormatReader for Nd2Reader {
         let f = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         let data = read_chunk_data(f, chunk).map_err(BioFormatsError::Io)?;
 
-        // ND2 image data chunks may have a small per-frame header (variable).
-        // A safe heuristic: if the data is larger than expected, skip the excess prefix.
         let bps = meta.pixel_type.bytes_per_sample();
         let expected = meta.size_x as usize * meta.size_y as usize * meta.size_c as usize * bps;
 
-        if data.len() >= expected {
-            let offset = data.len() - expected;
-            Ok(data[offset..].to_vec())
-        } else {
-            // Try zlib decompression
-            use flate2::read::ZlibDecoder;
-            use std::io::Read as _;
-            let mut dec = ZlibDecoder::new(data.as_slice());
-            let mut decompressed = Vec::new();
-            if dec.read_to_end(&mut decompressed).is_ok() && decompressed.len() >= expected {
-                let offset = decompressed.len() - expected;
-                Ok(decompressed[offset..].to_vec())
-            } else {
-                Err(BioFormatsError::Format(format!(
-                    "ND2: plane {} data too small ({} < {})", plane_index, data.len(), expected
-                )))
+        decode_nd2_frame_payload(&data, expected).map_err(|e| match e {
+            BioFormatsError::Format(msg) => {
+                BioFormatsError::Format(format!("ND2: plane {plane_index}: {msg}"))
             }
-        }
+            BioFormatsError::UnsupportedFormat(msg) => {
+                BioFormatsError::UnsupportedFormat(format!("ND2: plane {plane_index}: {msg}"))
+            }
+            BioFormatsError::Codec(msg) => {
+                BioFormatsError::Codec(format!("ND2: plane {plane_index}: {msg}"))
+            }
+            other => other,
+        })
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let spp = meta.size_c as usize;

@@ -1,8 +1,9 @@
-use std::path::{Path, PathBuf};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
+use std::path::{Path, PathBuf};
 
 pub struct JpegReader {
     path: Option<PathBuf>,
@@ -12,18 +13,23 @@ pub struct JpegReader {
 
 impl JpegReader {
     pub fn new() -> Self {
-        JpegReader { path: None, meta: None, pixels: None }
+        JpegReader {
+            path: None,
+            meta: None,
+            pixels: None,
+        }
     }
 }
 
 impl Default for JpegReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn load_jpeg(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     use image::GenericImageView;
-    let img = image::open(path)
-        .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+    let img = image::open(path).map_err(|e| BioFormatsError::Format(e.to_string()))?;
     let (w, h) = img.dimensions();
     let rgb = img.to_rgb8();
     let raw = rgb.into_raw();
@@ -49,7 +55,8 @@ fn load_jpeg(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
 
 impl FormatReader for JpegReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
             .unwrap_or(false)
     }
@@ -73,32 +80,42 @@ impl FormatReader for JpegReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        if plane_index != 0 { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         self.pixels.clone().ok_or(BioFormatsError::NotInitialized)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        let row_bytes = meta.size_x as usize * 3;
-        let out_row = w as usize * 3;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            out.extend_from_slice(&src[x as usize * 3..x as usize * 3 + out_row]);
-        }
-        Ok(out)
+        crop_full_plane("JPEG", &full, meta, 3, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -120,15 +137,29 @@ pub struct JpegWriter {
 }
 
 impl JpegWriter {
-    pub fn new() -> Self { JpegWriter { path: None, meta: None, quality: 90 } }
-    pub fn with_quality(mut self, q: u8) -> Self { self.quality = q; self }
+    pub fn new() -> Self {
+        JpegWriter {
+            path: None,
+            meta: None,
+            quality: 90,
+        }
+    }
+    pub fn with_quality(mut self, q: u8) -> Self {
+        self.quality = q;
+        self
+    }
 }
 
-impl Default for JpegWriter { fn default() -> Self { Self::new() } }
+impl Default for JpegWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatWriter for JpegWriter {
     fn is_this_type(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
             .unwrap_or(false)
     }
@@ -136,7 +167,7 @@ impl FormatWriter for JpegWriter {
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
         if meta.pixel_type != PixelType::Uint8 {
             return Err(BioFormatsError::UnsupportedFormat(
-                "JPEG writer only supports Uint8".into()
+                "JPEG writer only supports Uint8".into(),
             ));
         }
         self.meta = Some(meta.clone());
@@ -144,7 +175,9 @@ impl FormatWriter for JpegWriter {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.meta.as_ref().ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
+        self.meta
+            .as_ref()
+            .ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -157,7 +190,9 @@ impl FormatWriter for JpegWriter {
 
     fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
         if plane_index != 0 {
-            return Err(BioFormatsError::Format("JPEG writer supports only one plane".into()));
+            return Err(BioFormatsError::Format(
+                "JPEG writer supports only one plane".into(),
+            ));
         }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
@@ -166,21 +201,28 @@ impl FormatWriter for JpegWriter {
 
         let img: image::DynamicImage = match spp {
             1 => image::GrayImage::from_raw(w, h, data.to_vec())
-                    .map(image::DynamicImage::ImageLuma8)
-                    .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?,
+                .map(image::DynamicImage::ImageLuma8)
+                .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?,
             3 => image::RgbImage::from_raw(w, h, data.to_vec())
-                    .map(image::DynamicImage::ImageRgb8)
-                    .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?,
-            _ => return Err(BioFormatsError::UnsupportedFormat(
-                    format!("JPEG writer: unsupported spp={}", spp))),
+                .map(image::DynamicImage::ImageRgb8)
+                .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?,
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "JPEG writer: unsupported spp={}",
+                    spp
+                )))
+            }
         };
 
         let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
             std::fs::File::create(path).map_err(BioFormatsError::Io)?,
             self.quality,
         );
-        img.write_with_encoder(encoder).map_err(|e| BioFormatsError::Format(e.to_string()))
+        img.write_with_encoder(encoder)
+            .map_err(|e| BioFormatsError::Format(e.to_string()))
     }
 
-    fn can_do_stacks(&self) -> bool { false }
+    fn can_do_stacks(&self) -> bool {
+        false
+    }
 }

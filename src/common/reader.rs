@@ -1,7 +1,7 @@
-use std::path::Path;
-use crate::error::Result;
-use crate::common::metadata::{ImageMetadata, MetadataOptions};
 use super::ome_metadata::OmeMetadata;
+use crate::common::metadata::{ImageMetadata, MetadataOptions};
+use crate::error::Result;
+use std::path::Path;
 
 /// Core trait that every format reader must implement.
 pub trait FormatReader: Send + Sync {
@@ -14,11 +14,24 @@ pub trait FormatReader: Send + Sync {
     fn series(&self) -> usize;
     fn metadata(&self) -> &ImageMetadata;
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>>;
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>>;
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>>;
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>>;
-    fn resolution_count(&self) -> usize { 1 }
-    fn set_resolution(&mut self, _level: usize) -> Result<()> { Ok(()) }
-    fn resolution(&self) -> usize { 0 }
+    fn resolution_count(&self) -> usize {
+        1
+    }
+    fn set_resolution(&mut self, _level: usize) -> Result<()> {
+        Ok(())
+    }
+    fn resolution(&self) -> usize {
+        0
+    }
 
     /// Set metadata parsing options. Must be called before `set_id`.
     /// Default: parse all metadata.

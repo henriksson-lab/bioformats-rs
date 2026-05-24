@@ -1,8 +1,8 @@
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use std::io::Read;
 
-use crate::error::Result;
 use crate::error::BioFormatsError;
+use crate::error::Result;
 
 /// Read a u16 with the given endianness.
 pub fn read_u16<R: Read>(r: &mut R, little_endian: bool) -> Result<u16> {

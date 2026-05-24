@@ -13,9 +13,9 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::tiff::TiffReader;
 use crate::tiff::ifd::IfdValue;
 use crate::tiff::parser::TiffParser;
+use crate::tiff::TiffReader;
 
 // ── Tag IDs ───────────────────────────────────────────────────────────────────
 const CZ_LSM_INFO: u16 = 34412;
@@ -29,7 +29,7 @@ const CZ_LSM_INFO: u16 = 34412;
 //   offset 16: DimensionZ (int32)
 //   offset 20: DimensionChannels (int32)
 //   offset 24: DimensionTime (int32)
-//   offset 28: DataType (int32) → 1=uint8, 2=uint12, 5=uint16
+//   offset 28: DataType (int32) -> 1=uint8, 2=uint12, 5=float32
 //   offset 32: ThumbnailX (int32)
 //   offset 36: ThumbnailY (int32)
 //   offset 40: VoxelSizeX (float64)
@@ -48,36 +48,92 @@ struct LsmInfo {
     voxel_z: f64,
 }
 
+fn checked_plane_count(size_z: u32, size_c: u32, size_t: u32) -> Result<u32> {
+    size_z
+        .checked_mul(size_c)
+        .and_then(|v| v.checked_mul(size_t))
+        .ok_or_else(|| BioFormatsError::Format("LSM: plane count overflow".into()))
+}
+
+fn lsm_uses_packed_channels(
+    dim_z: u32,
+    dim_c: u32,
+    dim_t: u32,
+    tiff_size_c: u32,
+    full_res_ifd_count: u32,
+) -> bool {
+    dim_c > 1
+        && tiff_size_c == dim_c
+        && checked_plane_count(dim_z, 1, dim_t).ok() == Some(full_res_ifd_count)
+}
+
+fn resolve_lsm_plane_index(
+    plane_index: u32,
+    logical_count: u32,
+    physical_count: u32,
+) -> Result<u32> {
+    if plane_index >= logical_count || plane_index >= physical_count {
+        return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+    }
+    Ok(plane_index)
+}
+
 fn read_i32_lsm(buf: &[u8], off: usize, le: bool) -> i32 {
-    let b = [buf[off], buf[off+1], buf[off+2], buf[off+3]];
-    if le { i32::from_le_bytes(b) } else { i32::from_be_bytes(b) }
+    let b = [buf[off], buf[off + 1], buf[off + 2], buf[off + 3]];
+    if le {
+        i32::from_le_bytes(b)
+    } else {
+        i32::from_be_bytes(b)
+    }
 }
 fn read_f64_lsm(buf: &[u8], off: usize, le: bool) -> f64 {
-    let b: [u8; 8] = buf[off..off+8].try_into().unwrap_or([0u8; 8]);
-    if le { f64::from_le_bytes(b) } else { f64::from_be_bytes(b) }
+    let b: [u8; 8] = buf[off..off + 8].try_into().unwrap_or([0u8; 8]);
+    if le {
+        f64::from_le_bytes(b)
+    } else {
+        f64::from_be_bytes(b)
+    }
 }
 
 fn parse_lsm_info(bytes: &[u8], le: bool) -> Option<LsmInfo> {
-    if bytes.len() < 64 { return None; }
+    if bytes.len() < 64 {
+        return None;
+    }
     let magic = read_i32_lsm(bytes, 0, le) as u32;
-    if magic != LSM_MAGIC { return None; }
+    if magic != LSM_MAGIC {
+        return None;
+    }
 
     Some(LsmInfo {
         dim_z: read_i32_lsm(bytes, 16, le).max(1) as u32,
         dim_c: read_i32_lsm(bytes, 20, le).max(1) as u32,
         dim_t: read_i32_lsm(bytes, 24, le).max(1) as u32,
         data_type: read_i32_lsm(bytes, 28, le),
-        voxel_x: if bytes.len() >= 48 { read_f64_lsm(bytes, 40, le) } else { 0.0 },
-        voxel_y: if bytes.len() >= 56 { read_f64_lsm(bytes, 48, le) } else { 0.0 },
-        voxel_z: if bytes.len() >= 64 { read_f64_lsm(bytes, 56, le) } else { 0.0 },
+        voxel_x: if bytes.len() >= 48 {
+            read_f64_lsm(bytes, 40, le)
+        } else {
+            0.0
+        },
+        voxel_y: if bytes.len() >= 56 {
+            read_f64_lsm(bytes, 48, le)
+        } else {
+            0.0
+        },
+        voxel_z: if bytes.len() >= 64 {
+            read_f64_lsm(bytes, 56, le)
+        } else {
+            0.0
+        },
     })
 }
 
 fn lsm_pixel_type(data_type: i32, tiff_bps: u16) -> PixelType {
-    // data_type: 1=uint8, 2=uint12, 5=uint16
+    // data_type follows ZeissLSMReader: 1=uint8, 2=12-bit stored as uint16,
+    // 5=32-bit float.
     match data_type {
         1 => PixelType::Uint8,
-        2 | 5 => PixelType::Uint16,
+        2 => PixelType::Uint16,
+        5 => PixelType::Float32,
         _ => {
             // Fall back to TIFF BPS
             match tiff_bps {
@@ -109,9 +165,8 @@ fn read_lsm_info_from_file(path: &Path) -> Result<(LsmInfo, bool)> {
         }
     };
 
-    let info = parse_lsm_info(&lsm_bytes, le).ok_or_else(|| {
-        BioFormatsError::Format("LSM: failed to parse CZ_LSMInfo block".into())
-    })?;
+    let info = parse_lsm_info(&lsm_bytes, le)
+        .ok_or_else(|| BioFormatsError::Format("LSM: failed to parse CZ_LSMInfo block".into()))?;
     Ok((info, le))
 }
 
@@ -132,15 +187,54 @@ impl LsmReader {
             inner: TiffReader::new(),
         }
     }
+
+    fn collect_full_resolution_ifds(&self, best_series: usize) -> Vec<usize> {
+        let series = self.inner.series_list();
+        let Some(target) = series.get(best_series).map(|s| &s.metadata) else {
+            return Vec::new();
+        };
+
+        series
+            .iter()
+            .filter(|s| {
+                let meta = &s.metadata;
+                meta.size_x == target.size_x
+                    && meta.size_y == target.size_y
+                    && meta.size_c == target.size_c
+                    && meta.bits_per_pixel == target.bits_per_pixel
+                    && meta.pixel_type == target.pixel_type
+                    && meta.is_rgb == target.is_rgb
+                    && meta.is_interleaved == target.is_interleaved
+            })
+            .flat_map(|s| s.ifd_indices.iter().copied())
+            .collect()
+    }
+
+    fn configure_full_resolution_series(&mut self, best_series: usize) -> u32 {
+        let full_res_ifds = self.collect_full_resolution_ifds(best_series);
+        let full_res_ifd_count = full_res_ifds.len() as u32;
+        if !full_res_ifds.is_empty() {
+            if let Some(series) = self.inner.series_list_mut().get_mut(best_series) {
+                series.ifd_indices = full_res_ifds;
+                series.plane_ifd_indices.clear();
+                series.metadata.image_count = full_res_ifd_count;
+                series.metadata.size_z = full_res_ifd_count;
+            }
+        }
+        full_res_ifd_count
+    }
 }
 
 impl Default for LsmReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FormatReader for LsmReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("lsm"))
             .unwrap_or(false)
     }
@@ -173,21 +267,37 @@ impl FormatReader for LsmReader {
             }
         }
         let _ = self.inner.set_series(best_series);
+        let full_res_ifd_count = self.configure_full_resolution_series(best_series);
         let tiff_meta = self.inner.metadata().clone();
 
         // Build corrected metadata using LSM dimensions
         let dim_z = lsm_info.dim_z.max(1);
         let dim_c = lsm_info.dim_c.max(1);
         let dim_t = lsm_info.dim_t.max(1);
-        let image_count = dim_z * dim_c * dim_t;
+        let packed_channels =
+            lsm_uses_packed_channels(dim_z, dim_c, dim_t, tiff_meta.size_c, full_res_ifd_count);
+        let image_count = if packed_channels {
+            checked_plane_count(dim_z, 1, dim_t)?
+        } else {
+            checked_plane_count(dim_z, dim_c, dim_t)?
+        };
 
         let pixel_type = lsm_pixel_type(lsm_info.data_type, tiff_meta.bits_per_pixel as u16);
-        let is_rgb = dim_c == 3;
+        let is_rgb = packed_channels && tiff_meta.is_rgb;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-        meta_map.insert("voxel_size_x_um".into(), MetadataValue::Float(lsm_info.voxel_x * 1e6));
-        meta_map.insert("voxel_size_y_um".into(), MetadataValue::Float(lsm_info.voxel_y * 1e6));
-        meta_map.insert("voxel_size_z_um".into(), MetadataValue::Float(lsm_info.voxel_z * 1e6));
+        meta_map.insert(
+            "voxel_size_x_um".into(),
+            MetadataValue::Float(lsm_info.voxel_x * 1e6),
+        );
+        meta_map.insert(
+            "voxel_size_y_um".into(),
+            MetadataValue::Float(lsm_info.voxel_y * 1e6),
+        );
+        meta_map.insert(
+            "voxel_size_z_um".into(),
+            MetadataValue::Float(lsm_info.voxel_z * 1e6),
+        );
 
         let meta = ImageMetadata {
             size_x: tiff_meta.size_x,
@@ -223,13 +333,21 @@ impl FormatReader for LsmReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -240,24 +358,25 @@ impl FormatReader for LsmReader {
         if plane_index >= count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        // Delegate to inner TIFF reader. In LSM, every pair of IFDs is
-        // (full-res, thumbnail); full-res planes are at even TIFF IFD indices.
-        // The inner reader's current series already selects the correct IFDs,
-        // but plane_index here may be out of range for the inner reader if
-        // the TIFF series has fewer planes than LSM dimensions suggest.
-        // Map plane_index → inner plane index with bounds check.
         let inner_count = self.inner.metadata().image_count;
-        let inner_idx = if inner_count > 0 { plane_index.min(inner_count - 1) } else { 0 };
+        let inner_idx = resolve_lsm_plane_index(plane_index, count, inner_count)?;
         self.inner.open_bytes(inner_idx)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let count = self.meta.as_ref().map(|m| m.image_count).unwrap_or(0);
         if plane_index >= count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let inner_count = self.inner.metadata().image_count;
-        let inner_idx = if inner_count > 0 { plane_index.min(inner_count - 1) } else { 0 };
+        let inner_idx = resolve_lsm_plane_index(plane_index, count, inner_count)?;
         self.inner.open_bytes_region(inner_idx, x, y, w, h)
     }
 
@@ -275,12 +394,51 @@ impl FormatReader for LsmReader {
         let mut ome = OmeMetadata::from_image_metadata(meta);
         let img = &mut ome.images[0];
         let get_f = |k: &str| -> Option<f64> {
-            if let Some(MetadataValue::Float(v)) = meta.series_metadata.get(k) { Some(*v) } else { None }
+            if let Some(MetadataValue::Float(v)) = meta.series_metadata.get(k) {
+                Some(*v)
+            } else {
+                None
+            }
         };
         // Already stored in µm
         img.physical_size_x = get_f("voxel_size_x_um");
         img.physical_size_y = get_f("voxel_size_y_um");
         img.physical_size_z = get_f("voxel_size_z_um");
         Some(ome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lsm_plane_mapping_rejects_logical_planes_without_physical_ifds() {
+        assert_eq!(resolve_lsm_plane_index(0, 3, 2).unwrap(), 0);
+        assert_eq!(resolve_lsm_plane_index(1, 3, 2).unwrap(), 1);
+        assert!(matches!(
+            resolve_lsm_plane_index(2, 3, 2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+    }
+
+    #[test]
+    fn lsm_plane_mapping_rejects_planes_past_logical_count() {
+        assert!(matches!(
+            resolve_lsm_plane_index(2, 2, 4),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+    }
+
+    #[test]
+    fn lsm_channel_split_planes_are_not_treated_as_packed_rgb() {
+        assert!(!lsm_uses_packed_channels(1, 3, 1, 1, 3));
+        assert_eq!(checked_plane_count(1, 3, 1).unwrap(), 3);
+    }
+
+    #[test]
+    fn lsm_packed_channels_use_one_physical_ifd_per_zt_plane() {
+        assert!(lsm_uses_packed_channels(2, 3, 4, 3, 8));
+        assert_eq!(checked_plane_count(2, 1, 4).unwrap(), 8);
     }
 }

@@ -19,12 +19,18 @@ pub struct LimReader {
 
 impl LimReader {
     pub fn new() -> Self {
-        LimReader { path: None, meta: None, data_offset: 0 }
+        LimReader {
+            path: None,
+            meta: None,
+            data_offset: 0,
+        }
     }
 }
 
 impl Default for LimReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn load_lim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
@@ -80,7 +86,8 @@ fn load_lim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
 
 impl FormatReader for LimReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("lim"))
             .unwrap_or(false)
     }
@@ -104,11 +111,19 @@ impl FormatReader for LimReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -124,13 +139,21 @@ impl FormatReader for LimReader {
         let file_offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(file_offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(file_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();
@@ -164,17 +187,29 @@ pub struct TillVisionReader {
 
 impl TillVisionReader {
     pub fn new() -> Self {
-        TillVisionReader { path: None, meta: None }
+        TillVisionReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for TillVisionReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn load_tillvision(path: &Path) -> Result<ImageMetadata> {
     let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-    let mut buf = vec![0u8; 512.min(std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(512))];
+    let mut buf = vec![
+        0u8;
+        512.min(
+            std::fs::metadata(path)
+                .map(|m| m.len() as usize)
+                .unwrap_or(512)
+        )
+    ];
     let n = f.read(&mut buf).map_err(BioFormatsError::Io)?;
     let buf = &buf[..n];
 
@@ -185,10 +220,13 @@ fn load_tillvision(path: &Path) -> Result<ImageMetadata> {
 
     let mut i = 0;
     while i + 4 <= buf.len() && found < 2 {
-        let v = u32::from_le_bytes([buf[i], buf[i+1], buf[i+2], buf[i+3]]);
+        let v = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
         if v >= 16 && v <= 8192 {
-            if found == 0 { width = v; }
-            else { height = v; }
+            if found == 0 {
+                width = v;
+            } else {
+                height = v;
+            }
             found += 1;
             i += 4;
         } else {
@@ -221,7 +259,8 @@ fn load_tillvision(path: &Path) -> Result<ImageMetadata> {
 
 impl FormatReader for TillVisionReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("vws"))
             .unwrap_or(false)
     }
@@ -243,11 +282,19 @@ impl FormatReader for TillVisionReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -255,11 +302,20 @@ impl FormatReader for TillVisionReader {
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index != 0 { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * 2])
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let row_bytes = meta.size_x as usize * 2;

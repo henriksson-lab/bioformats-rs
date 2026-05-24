@@ -84,7 +84,8 @@ impl Memoizer {
                 }
             }
         }
-        let r = found.ok_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string()))?;
+        let r =
+            found.ok_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string()))?;
         drop(reader); // close the initial reader
         let mut memo = Memoizer::new(r);
         memo.set_id(path)?;
@@ -93,7 +94,11 @@ impl Memoizer {
 
     fn cache_path(file_path: &Path) -> PathBuf {
         let mut p = file_path.to_path_buf();
-        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         p.set_file_name(format!(".{}.bfmemo", name));
         p
     }
@@ -101,8 +106,11 @@ impl Memoizer {
     fn file_stamp(path: &Path) -> Option<(u64, u64)> {
         let md = std::fs::metadata(path).ok()?;
         let size = md.len();
-        let mtime = md.modified().ok()?
-            .duration_since(SystemTime::UNIX_EPOCH).ok()?
+        let mtime = md
+            .modified()
+            .ok()?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()?
             .as_secs();
         Some((size, mtime))
     }
@@ -121,8 +129,12 @@ impl Memoizer {
     }
 
     fn save_cache(&self) {
-        let Some(file_path) = &self.file_path else { return };
-        let Some((size, mtime)) = Self::file_stamp(file_path) else { return };
+        let Some(file_path) = &self.file_path else {
+            return;
+        };
+        let Some((size, mtime)) = Self::file_stamp(file_path) else {
+            return;
+        };
         let cache = MemoCache {
             file_size: size,
             mtime_secs: mtime,
@@ -136,8 +148,12 @@ impl Memoizer {
 }
 
 impl FormatReader for Memoizer {
-    fn is_this_type_by_name(&self, path: &Path) -> bool { self.inner.is_this_type_by_name(path) }
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool { self.inner.is_this_type_by_bytes(header) }
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        self.inner.is_this_type_by_name(path)
+    }
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        self.inner.is_this_type_by_bytes(header)
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.file_path = Some(path.to_path_buf());
@@ -175,7 +191,9 @@ impl FormatReader for Memoizer {
         self.inner.close()
     }
 
-    fn series_count(&self) -> usize { self.cached_meta.len() }
+    fn series_count(&self) -> usize {
+        self.cached_meta.len()
+    }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
         if series >= self.cached_meta.len() {
@@ -185,7 +203,9 @@ impl FormatReader for Memoizer {
         self.inner.set_series(series)
     }
 
-    fn series(&self) -> usize { self.current_series }
+    fn series(&self) -> usize {
+        self.current_series
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         &self.cached_meta[self.current_series]
@@ -195,7 +215,14 @@ impl FormatReader for Memoizer {
         self.inner.open_bytes(plane_index)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         self.inner.open_bytes_region(plane_index, x, y, w, h)
     }
 
@@ -203,8 +230,16 @@ impl FormatReader for Memoizer {
         self.inner.open_thumb_bytes(plane_index)
     }
 
-    fn resolution_count(&self) -> usize { self.inner.resolution_count() }
-    fn set_resolution(&mut self, level: usize) -> Result<()> { self.inner.set_resolution(level) }
-    fn resolution(&self) -> usize { self.inner.resolution() }
-    fn ome_metadata(&self) -> Option<OmeMetadata> { self.inner.ome_metadata() }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        self.inner.ome_metadata()
+    }
 }

@@ -2,9 +2,11 @@ use super::error::{BioFormatsError, Result};
 
 /// Decompress LZW-encoded data (TIFF variant — horizontal differencing applied separately).
 pub fn decompress_lzw(data: &[u8]) -> Result<Vec<u8>> {
-    use weezl::{BitOrder, decode::Decoder};
+    use weezl::{decode::Decoder, BitOrder};
     let mut decoder = Decoder::with_tiff_size_switch(BitOrder::Msb, 8);
-    decoder.decode(data).map_err(|e| BioFormatsError::Codec(e.to_string()))
+    decoder
+        .decode(data)
+        .map_err(|e| BioFormatsError::Codec(e.to_string()))
 }
 
 /// Decompress Deflate/Zlib data (TIFF compression 8 = Deflate, 32946 = deflate without header).
@@ -66,7 +68,9 @@ pub fn decompress_packbits(data: &[u8]) -> Result<Vec<u8>> {
 /// Decompress JPEG data (both lossy and lossless/SOF3 variants).
 pub fn decompress_jpeg(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = jpeg_decoder::Decoder::new(data);
-    decoder.decode().map_err(|e| BioFormatsError::Codec(e.to_string()))
+    decoder
+        .decode()
+        .map_err(|e| BioFormatsError::Codec(e.to_string()))
 }
 
 /// Decompress Zstd data.
@@ -89,7 +93,13 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
 
     // Determine bytes per sample from the first component's precision
     let prec = components[0].precision() as usize;
-    let bps = if prec <= 8 { 1 } else if prec <= 16 { 2 } else { 4 };
+    let bps = if prec <= 8 {
+        1
+    } else if prec <= 16 {
+        2
+    } else {
+        4
+    };
 
     let mut out = Vec::with_capacity(width * height * n_components * bps);
     // Interleave components pixel by pixel (RGBRGB...)
@@ -117,9 +127,11 @@ pub fn decompress_jpegxr(data: &[u8]) -> Result<Vec<u8>> {
     let cursor = Cursor::new(data);
     let mut decoder = jpegxr::ImageDecode::with_reader(cursor)
         .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR: {e}")))?;
-    let (width, height) = decoder.get_size()
+    let (width, height) = decoder
+        .get_size()
         .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR size: {e}")))?;
-    let format = decoder.get_pixel_format()
+    let format = decoder
+        .get_pixel_format()
         .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR format: {e}")))?;
 
     // Determine bytes per pixel from the pixel format
@@ -138,7 +150,8 @@ pub fn decompress_jpegxr(data: &[u8]) -> Result<Vec<u8>> {
     let row_bytes = width as usize * bpp;
     let stride = (row_bytes + 3) & !3; // 4-byte aligned
     let mut buf = vec![0u8; stride * height as usize];
-    decoder.copy_all(&mut buf, stride)
+    decoder
+        .copy_all(&mut buf, stride)
         .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR decode: {e}")))?;
 
     // Remove stride padding if needed
@@ -157,33 +170,121 @@ pub fn decompress_jpegxr(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(not(feature = "jpegxr"))]
 pub fn decompress_jpegxr(_data: &[u8]) -> Result<Vec<u8>> {
     Err(BioFormatsError::UnsupportedFormat(
-        "JPEG-XR support requires the 'jpegxr' feature: cargo build --features jpegxr".into()
+        "JPEG-XR support requires the 'jpegxr' feature: cargo build --features jpegxr".into(),
     ))
 }
 
 // ---- CCITT fax compression stubs ----
 
 /// Decompress CCITT Group 3 (T.4) 1-bit fax compression.
-pub fn decompress_ccitt_group3(_data: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>> {
-    Err(BioFormatsError::UnsupportedFormat(
-        "CCITT Group 3 fax decompression not yet implemented".into(),
-    ))
+pub fn decompress_ccitt_group3(_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(format!(
+        "CCITT Group 3 fax decompression not yet implemented for {width}x{height}"
+    )))
 }
 
 /// Decompress CCITT Group 4 (T.6) 1-bit fax compression.
-pub fn decompress_ccitt_group4(_data: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>> {
-    Err(BioFormatsError::UnsupportedFormat(
-        "CCITT Group 4 fax decompression not yet implemented".into(),
-    ))
+pub fn decompress_ccitt_group4(_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(format!(
+        "CCITT Group 4 fax decompression not yet implemented for {width}x{height}"
+    )))
 }
 
 // ---- Video codec stubs ----
 
-/// Microsoft Run-Length Encoding for AVI.
-pub fn decompress_msrle(_data: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>> {
-    Err(BioFormatsError::UnsupportedFormat(
-        "MSRLE video codec not yet implemented".into(),
-    ))
+/// Microsoft RLE8 video codec for indexed 8-bit AVI/BMP frames.
+pub fn decompress_msrle(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let width = width as usize;
+    let height = height as usize;
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::InvalidData(
+            "MSRLE: width and height must be non-zero".into(),
+        ));
+    }
+
+    let mut out = vec![0u8; width * height];
+    let mut x = 0usize;
+    let mut y = height - 1;
+    let mut i = 0usize;
+
+    while i + 1 < data.len() {
+        let count = data[i] as usize;
+        let value = data[i + 1];
+        i += 2;
+
+        if count != 0 {
+            if x + count > width {
+                return Err(BioFormatsError::InvalidData(
+                    "MSRLE: encoded run exceeds row width".into(),
+                ));
+            }
+            let row = y * width;
+            for px in &mut out[row + x..row + x + count] {
+                *px = value;
+            }
+            x += count;
+            continue;
+        }
+
+        match value {
+            0 => {
+                x = 0;
+                if y == 0 {
+                    break;
+                }
+                y -= 1;
+            }
+            1 => break,
+            2 => {
+                if i + 1 >= data.len() {
+                    return Err(BioFormatsError::InvalidData(
+                        "MSRLE: delta command missing offsets".into(),
+                    ));
+                }
+                let dx = data[i] as usize;
+                let dy = data[i + 1] as usize;
+                i += 2;
+                x = x.checked_add(dx).ok_or_else(|| {
+                    BioFormatsError::InvalidData("MSRLE: delta x overflows".into())
+                })?;
+                y = y.checked_sub(dy).ok_or_else(|| {
+                    BioFormatsError::InvalidData("MSRLE: delta y moves before first row".into())
+                })?;
+                if x > width {
+                    return Err(BioFormatsError::InvalidData(
+                        "MSRLE: delta moves past row width".into(),
+                    ));
+                }
+            }
+            n => {
+                let n = n as usize;
+                if i + n > data.len() {
+                    return Err(BioFormatsError::InvalidData(
+                        "MSRLE: absolute run overruns input".into(),
+                    ));
+                }
+                if x + n > width {
+                    return Err(BioFormatsError::InvalidData(
+                        "MSRLE: absolute run exceeds row width".into(),
+                    ));
+                }
+                let row = y * width;
+                out[row + x..row + x + n].copy_from_slice(&data[i..i + n]);
+                x += n;
+                i += n;
+                if n & 1 == 1 {
+                    if i >= data.len() {
+                        return Err(BioFormatsError::InvalidData(
+                            "MSRLE: absolute run missing pad byte".into(),
+                        ));
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Motion JPEG-B codec.
@@ -210,10 +311,10 @@ pub fn decompress_rpza(_data: &[u8], _width: u32, _height: u32) -> Result<Vec<u8
 // ---- Niche codec stubs ----
 
 /// Nikon NEF lossy compression.
-pub fn decompress_nikon(_data: &[u8], _width: u32, _height: u32, _bpp: u32) -> Result<Vec<u8>> {
-    Err(BioFormatsError::UnsupportedFormat(
-        "Nikon NEF codec not yet implemented".into(),
-    ))
+pub fn decompress_nikon(_data: &[u8], width: u32, height: u32, bpp: u32) -> Result<Vec<u8>> {
+    Err(BioFormatsError::UnsupportedFormat(format!(
+        "Nikon NEF codec not yet implemented for {width}x{height} at {bpp} bpp"
+    )))
 }
 
 /// LZO decompression.
@@ -274,5 +375,48 @@ pub fn undo_horizontal_differencing_u16(data: &mut [u16], samples_per_pixel: usi
     }
     for i in samples_per_pixel..data.len() {
         data[i] = data[i].wrapping_add(data[i - samples_per_pixel]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msrle_decodes_encoded_absolute_delta_and_bottom_up_rows() {
+        let data = [
+            3, 7, // bottom row: 7 7 7
+            0, 0, // EOL
+            0, 3, 1, 2, 3, 0, // top row absolute: 1 2 3 plus word pad
+            0, 1, // EOB
+        ];
+
+        let out = decompress_msrle(&data, 3, 2).expect("MSRLE decode");
+
+        assert_eq!(out, vec![1, 2, 3, 7, 7, 7]);
+    }
+
+    #[test]
+    fn msrle_decodes_delta_offsets() {
+        let data = [
+            1, 9, // bottom row x=0
+            0, 2, 1, 1, // move to top row x=2
+            1, 5, // top row x=2
+            0, 1, // EOB
+        ];
+
+        let out = decompress_msrle(&data, 3, 2).expect("MSRLE decode");
+
+        assert_eq!(out, vec![0, 0, 5, 9, 0, 0]);
+    }
+
+    #[test]
+    fn msrle_rejects_overlong_runs() {
+        let err = decompress_msrle(&[4, 1], 3, 1).expect_err("overlong run must fail");
+
+        assert!(matches!(
+            err,
+            BioFormatsError::InvalidData(message) if message.contains("exceeds row width")
+        ));
     }
 }

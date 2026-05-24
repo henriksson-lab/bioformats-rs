@@ -70,7 +70,8 @@ fn read_utf16_string(f: &mut File) -> std::io::Result<String> {
     let byte_count = char_count * 2;
     let mut bytes = vec![0u8; byte_count];
     f.read_exact(&mut bytes)?;
-    let chars: Vec<u16> = bytes.chunks_exact(2)
+    let chars: Vec<u16> = bytes
+        .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     Ok(String::from_utf16_lossy(&chars).to_string())
@@ -82,7 +83,10 @@ fn parse_lif_file(path: &Path) -> Result<(Vec<LifSeries>, Vec<MemBlock>)> {
     // Header
     let magic = read_u8(&mut f).map_err(BioFormatsError::Io)?;
     if magic != LIF_MAGIC {
-        return Err(BioFormatsError::Format(format!("LIF: bad magic byte {}", magic)));
+        return Err(BioFormatsError::Format(format!(
+            "LIF: bad magic byte {}",
+            magic
+        )));
     }
     // Skip 3 bytes
     let mut _skip = [0u8; 3];
@@ -90,7 +94,9 @@ fn parse_lif_file(path: &Path) -> Result<(Vec<LifSeries>, Vec<MemBlock>)> {
 
     let mem_byte = read_u8(&mut f).map_err(BioFormatsError::Io)?;
     if mem_byte != LIF_MEMORY {
-        return Err(BioFormatsError::Format("LIF: missing memory byte in header".into()));
+        return Err(BioFormatsError::Format(
+            "LIF: missing memory byte in header".into(),
+        ));
     }
 
     let xml_str = read_utf16_string(&mut f).map_err(BioFormatsError::Io)?;
@@ -108,13 +114,17 @@ fn parse_lif_file(path: &Path) -> Result<(Vec<LifSeries>, Vec<MemBlock>)> {
         }
         // Skip 4 bytes
         let mut skip = [0u8; 4];
-        if f.read_exact(&mut skip).is_err() { break; }
+        if f.read_exact(&mut skip).is_err() {
+            break;
+        }
 
         let mem = match read_u8(&mut f) {
             Ok(b) => b,
             Err(_) => break,
         };
-        if mem != LIF_MEMORY { break; }
+        if mem != LIF_MEMORY {
+            break;
+        }
 
         // Read length — may be int32 or int64 depending on next byte
         let len_lo = match read_i32_le(&mut f) {
@@ -137,7 +147,9 @@ fn parse_lif_file(path: &Path) -> Result<(Vec<LifSeries>, Vec<MemBlock>)> {
             len_lo | (len_hi << 32)
         } else {
             // We consumed an extra byte; back up by 1 (only works if seekable)
-            if f.seek(SeekFrom::Current(-1)).is_err() { break; }
+            if f.seek(SeekFrom::Current(-1)).is_err() {
+                break;
+            }
             len_lo
         };
 
@@ -153,10 +165,16 @@ fn parse_lif_file(path: &Path) -> Result<(Vec<LifSeries>, Vec<MemBlock>)> {
             Err(_) => break,
         };
 
-        blocks.push(MemBlock { id, file_offset: data_offset, byte_length: block_bytes });
+        blocks.push(MemBlock {
+            id,
+            file_offset: data_offset,
+            byte_length: block_bytes,
+        });
 
         // Skip past image data to next block
-        if f.seek(SeekFrom::Current(block_bytes as i64)).is_err() { break; }
+        if f.seek(SeekFrom::Current(block_bytes as i64)).is_err() {
+            break;
+        }
     }
 
     Ok((series, blocks))
@@ -173,13 +191,15 @@ fn parse_xml_metadata(xml: &str) -> Result<Vec<LifSeries>> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let name = std::str::from_utf8(e.name().as_ref()).unwrap_or("").to_ascii_uppercase();
+                let name = std::str::from_utf8(e.name().as_ref())
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
                 match name.as_str() {
                     "ELEMENT" => {
                         // <Element Name="..."> is a top-level element (series or folder)
-                        let has_name = e.attributes().any(|a| {
-                            a.map(|a| a.key.as_ref() == b"Name").unwrap_or(false)
-                        });
+                        let has_name = e
+                            .attributes()
+                            .any(|a| a.map(|a| a.key.as_ref() == b"Name").unwrap_or(false));
                         if has_name {
                             in_image = true;
                             current = Some(LifSeries::default());
@@ -192,8 +212,18 @@ fn parse_xml_metadata(xml: &str) -> Result<Vec<LifSeries>> {
                             let mut count = 0u32;
                             for attr in e.attributes().flatten() {
                                 match attr.key.as_ref() {
-                                    b"DimID" => dim_id = std::str::from_utf8(&attr.value).unwrap_or("0").parse().unwrap_or(0),
-                                    b"NumberOfElements" => count = std::str::from_utf8(&attr.value).unwrap_or("0").parse().unwrap_or(0),
+                                    b"DimID" => {
+                                        dim_id = std::str::from_utf8(&attr.value)
+                                            .unwrap_or("0")
+                                            .parse()
+                                            .unwrap_or(0)
+                                    }
+                                    b"NumberOfElements" => {
+                                        count = std::str::from_utf8(&attr.value)
+                                            .unwrap_or("0")
+                                            .parse()
+                                            .unwrap_or(0)
+                                    }
                                     _ => {}
                                 }
                             }
@@ -214,12 +244,18 @@ fn parse_xml_metadata(xml: &str) -> Result<Vec<LifSeries>> {
                                 s.size_c += 1;
                                 for attr in e.attributes().flatten() {
                                     if attr.key.as_ref() == b"BytesInc" {
-                                        if let Ok(b) = std::str::from_utf8(&attr.value).unwrap_or("0").parse::<u64>() {
+                                        if let Ok(b) = std::str::from_utf8(&attr.value)
+                                            .unwrap_or("0")
+                                            .parse::<u64>()
+                                        {
                                             s.channel_bytes_list.push(b);
                                         }
                                     }
                                     if attr.key.as_ref() == b"Resolution" {
-                                        if let Ok(bpp) = std::str::from_utf8(&attr.value).unwrap_or("8").parse::<u8>() {
+                                        if let Ok(bpp) = std::str::from_utf8(&attr.value)
+                                            .unwrap_or("8")
+                                            .parse::<u8>()
+                                        {
                                             s.bits_per_pixel = bpp;
                                         }
                                     }
@@ -233,7 +269,8 @@ fn parse_xml_metadata(xml: &str) -> Result<Vec<LifSeries>> {
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == b"MemoryBlockID" {
                                     if let Some(ref mut s) = current {
-                                        s.block_id = String::from_utf8_lossy(&attr.value).into_owned();
+                                        s.block_id =
+                                            String::from_utf8_lossy(&attr.value).into_owned();
                                     }
                                 }
                             }
@@ -243,7 +280,9 @@ fn parse_xml_metadata(xml: &str) -> Result<Vec<LifSeries>> {
                 }
             }
             Ok(Event::End(e)) => {
-                let name = std::str::from_utf8(e.name().as_ref()).unwrap_or("").to_ascii_uppercase();
+                let name = std::str::from_utf8(e.name().as_ref())
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
                 if name == "ELEMENT" {
                     if let Some(s) = current.take() {
                         if s.size_x > 0 && s.size_y > 0 {
@@ -273,19 +312,31 @@ pub struct LifReader {
 
 impl LifReader {
     pub fn new() -> Self {
-        LifReader { path: None, series_list: Vec::new(), blocks: Vec::new(), current_series: 0 }
+        LifReader {
+            path: None,
+            series_list: Vec::new(),
+            blocks: Vec::new(),
+            current_series: 0,
+        }
     }
 
     fn find_block(&self, id: &str) -> Option<&MemBlock> {
-        self.blocks.iter().find(|b| b.id.contains(id) || id.contains(&b.id))
+        self.blocks
+            .iter()
+            .find(|b| b.id.contains(id) || id.contains(&b.id))
     }
 }
 
-impl Default for LifReader { fn default() -> Self { Self::new() } }
+impl Default for LifReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatReader for LifReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("lif"))
             .unwrap_or(false)
     }
@@ -304,26 +355,36 @@ impl FormatReader for LifReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None; self.series_list.clear(); self.blocks.clear();
+        self.path = None;
+        self.series_list.clear();
+        self.blocks.clear();
         Ok(())
     }
 
-    fn series_count(&self) -> usize { self.series_list.len().max(1) }
+    fn series_count(&self) -> usize {
+        self.series_list.len().max(1)
+    }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.series_list.len() { return Err(BioFormatsError::SeriesOutOfRange(s)); }
+        if s >= self.series_list.len() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
         self.current_series = s;
         Ok(())
     }
 
-    fn series(&self) -> usize { self.current_series }
+    fn series(&self) -> usize {
+        self.current_series
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         panic!("LIF metadata is computed on the fly; use open_bytes to access data")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let s = self.series_list.get(self.current_series)
+        let s = self
+            .series_list
+            .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?;
 
         let block = self.find_block(&s.block_id).ok_or_else(|| {
@@ -344,17 +405,30 @@ impl FormatReader for LifReader {
 
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let s = self.series_list.get(self.current_series)
+        let s = self
+            .series_list
+            .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?;
-        let bps = match s.bits_per_pixel { 16 => 2usize, _ => 1 };
+        let bps = match s.bits_per_pixel {
+            16 => 2usize,
+            _ => 1,
+        };
         let spp = s.size_c.max(1) as usize;
         let row_bytes = s.size_x as usize * spp * bps;
         let out_row = w as usize * spp * bps;
@@ -369,7 +443,9 @@ impl FormatReader for LifReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let (sx, sy) = {
-            let s = self.series_list.get(self.current_series)
+            let s = self
+                .series_list
+                .get(self.current_series)
                 .ok_or(BioFormatsError::NotInitialized)?;
             (s.size_x, s.size_y)
         };

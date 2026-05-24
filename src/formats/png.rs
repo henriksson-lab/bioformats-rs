@@ -1,8 +1,10 @@
-use std::path::{Path, PathBuf};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub struct PngReader {
     path: Option<PathBuf>,
@@ -12,18 +14,23 @@ pub struct PngReader {
 
 impl PngReader {
     pub fn new() -> Self {
-        PngReader { path: None, meta: None, pixels: None }
+        PngReader {
+            path: None,
+            meta: None,
+            pixels: None,
+        }
     }
 }
 
 impl Default for PngReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn load_png(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     use image::GenericImageView;
-    let img = image::open(path)
-        .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+    let img = image::open(path).map_err(|e| BioFormatsError::Format(e.to_string()))?;
     let (w, h) = img.dimensions();
 
     let (pixel_type, is_rgb, spp, raw) = match img {
@@ -32,15 +39,27 @@ fn load_png(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         image::DynamicImage::ImageRgb8(buf) => (PixelType::Uint8, true, 3, buf.into_raw()),
         image::DynamicImage::ImageRgba8(buf) => (PixelType::Uint8, true, 4, buf.into_raw()),
         image::DynamicImage::ImageLuma16(buf) => {
-            let raw: Vec<u8> = buf.into_raw().iter().flat_map(|v| v.to_le_bytes()).collect();
+            let raw: Vec<u8> = buf
+                .into_raw()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             (PixelType::Uint16, false, 1, raw)
         }
         image::DynamicImage::ImageRgb16(buf) => {
-            let raw: Vec<u8> = buf.into_raw().iter().flat_map(|v| v.to_le_bytes()).collect();
+            let raw: Vec<u8> = buf
+                .into_raw()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             (PixelType::Uint16, true, 3, raw)
         }
         image::DynamicImage::ImageRgba16(buf) => {
-            let raw: Vec<u8> = buf.into_raw().iter().flat_map(|v| v.to_le_bytes()).collect();
+            let raw: Vec<u8> = buf
+                .into_raw()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             (PixelType::Uint16, true, 4, raw)
         }
         other => {
@@ -70,9 +89,42 @@ fn load_png(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     Ok((meta, raw))
 }
 
+fn contains_apng_animation_control(path: &Path) -> Result<bool> {
+    let bytes = fs::read(path)?;
+    let Some(mut offset) = bytes
+        .strip_prefix(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        .map(|_| 8usize)
+    else {
+        return Ok(false);
+    };
+
+    while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+        let length = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        let chunk_type = &bytes[offset + 4..offset + 8];
+        if chunk_type == b"acTL" {
+            return Ok(true);
+        }
+        if chunk_type == b"IDAT" || chunk_type == b"IEND" {
+            return Ok(false);
+        }
+        offset = offset
+            .checked_add(12)
+            .and_then(|v| v.checked_add(length))
+            .ok_or_else(|| BioFormatsError::InvalidData("PNG chunk offset overflows".into()))?;
+    }
+
+    Ok(false)
+}
+
 impl FormatReader for PngReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("png"))
             .unwrap_or(false)
     }
@@ -82,6 +134,11 @@ impl FormatReader for PngReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        if contains_apng_animation_control(path)? {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "animated PNG is not supported; use a still PNG image".into(),
+            ));
+        }
         let (meta, pixels) = load_png(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
@@ -96,35 +153,42 @@ impl FormatReader for PngReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        if plane_index != 0 { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         self.pixels.clone().ok_or(BioFormatsError::NotInitialized)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        let spp = meta.size_c as usize;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let start = x as usize * spp * bps;
-            out.extend_from_slice(&src[start..start + out_row]);
-        }
-        Ok(out)
+        crop_full_plane("PNG", &full, meta, meta.size_c as usize, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -145,14 +209,24 @@ pub struct PngWriter {
 }
 
 impl PngWriter {
-    pub fn new() -> Self { PngWriter { path: None, meta: None } }
+    pub fn new() -> Self {
+        PngWriter {
+            path: None,
+            meta: None,
+        }
+    }
 }
 
-impl Default for PngWriter { fn default() -> Self { Self::new() } }
+impl Default for PngWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FormatWriter for PngWriter {
     fn is_this_type(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("png"))
             .unwrap_or(false)
     }
@@ -163,7 +237,9 @@ impl FormatWriter for PngWriter {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.meta.as_ref().ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
+        self.meta
+            .as_ref()
+            .ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -176,7 +252,9 @@ impl FormatWriter for PngWriter {
 
     fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
         if plane_index != 0 {
-            return Err(BioFormatsError::Format("PNG writer supports only one plane".into()));
+            return Err(BioFormatsError::Format(
+                "PNG writer supports only one plane".into(),
+            ));
         }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
@@ -185,23 +263,18 @@ impl FormatWriter for PngWriter {
         let spp = meta.size_c as usize;
 
         let img: image::DynamicImage = match (meta.pixel_type, spp) {
-            (PixelType::Uint8, 1) => {
-                image::GrayImage::from_raw(w, h, data.to_vec())
-                    .map(image::DynamicImage::ImageLuma8)
-                    .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?
-            }
-            (PixelType::Uint8, 3) => {
-                image::RgbImage::from_raw(w, h, data.to_vec())
-                    .map(image::DynamicImage::ImageRgb8)
-                    .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?
-            }
-            (PixelType::Uint8, 4) => {
-                image::RgbaImage::from_raw(w, h, data.to_vec())
-                    .map(image::DynamicImage::ImageRgba8)
-                    .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?
-            }
+            (PixelType::Uint8, 1) => image::GrayImage::from_raw(w, h, data.to_vec())
+                .map(image::DynamicImage::ImageLuma8)
+                .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?,
+            (PixelType::Uint8, 3) => image::RgbImage::from_raw(w, h, data.to_vec())
+                .map(image::DynamicImage::ImageRgb8)
+                .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?,
+            (PixelType::Uint8, 4) => image::RgbaImage::from_raw(w, h, data.to_vec())
+                .map(image::DynamicImage::ImageRgba8)
+                .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?,
             (PixelType::Uint16, 1) => {
-                let pixels: Vec<u16> = data.chunks_exact(2)
+                let pixels: Vec<u16> = data
+                    .chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 image::ImageBuffer::<image::Luma<u16>, _>::from_raw(w, h, pixels)
@@ -209,7 +282,8 @@ impl FormatWriter for PngWriter {
                     .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?
             }
             (PixelType::Uint16, 3) => {
-                let pixels: Vec<u16> = data.chunks_exact(2)
+                let pixels: Vec<u16> = data
+                    .chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(w, h, pixels)
@@ -218,13 +292,17 @@ impl FormatWriter for PngWriter {
             }
             _ => {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "PNG writer: unsupported {:?} spp={}", meta.pixel_type, spp
+                    "PNG writer: unsupported {:?} spp={}",
+                    meta.pixel_type, spp
                 )));
             }
         };
 
-        img.save(path).map_err(|e| BioFormatsError::Format(e.to_string()))
+        img.save(path)
+            .map_err(|e| BioFormatsError::Format(e.to_string()))
     }
 
-    fn can_do_stacks(&self) -> bool { false }
+    fn can_do_stacks(&self) -> bool {
+        false
+    }
 }

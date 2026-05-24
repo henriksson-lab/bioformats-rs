@@ -40,14 +40,20 @@ fn default_meta(w: u32, h: u32, pt: PixelType) -> ImageMetadata {
     }
 }
 
-fn open_bytes_impl(path: &Path, offset: u64, meta: &ImageMetadata, plane_index: u32) -> Result<Vec<u8>> {
+fn open_bytes_impl(
+    path: &Path,
+    offset: u64,
+    meta: &ImageMetadata,
+    plane_index: u32,
+) -> Result<Vec<u8>> {
     if plane_index != 0 {
         return Err(BioFormatsError::PlaneOutOfRange(plane_index));
     }
     let bps = meta.pixel_type.bytes_per_sample();
     let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
     let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-    f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+    f.seek(SeekFrom::Start(offset))
+        .map_err(BioFormatsError::Io)?;
     let mut buf = vec![0u8; plane_bytes];
     let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
     Ok(buf)
@@ -75,12 +81,18 @@ pub struct PerkinElmerReader {
 
 impl PerkinElmerReader {
     pub fn new() -> Self {
-        PerkinElmerReader { path: None, rec_path: None, meta: None }
+        PerkinElmerReader {
+            path: None,
+            rec_path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for PerkinElmerReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_pe_cfg(path: &Path) -> Result<(ImageMetadata, PathBuf)> {
@@ -92,11 +104,17 @@ fn parse_pe_cfg(path: &Path) -> Result<(ImageMetadata, PathBuf)> {
     for line in content.lines() {
         let line = line.trim();
         if let Some(v) = kv(line, "Image Width") {
-            if let Ok(n) = v.parse() { width = n; }
+            if let Ok(n) = v.parse() {
+                width = n;
+            }
         } else if let Some(v) = kv(line, "Image Height") {
-            if let Ok(n) = v.parse() { height = n; }
+            if let Ok(n) = v.parse() {
+                height = n;
+            }
         } else if let Some(v) = kv(line, "Bytes Per Pixel") {
-            if let Ok(n) = v.parse() { bytes_per_pixel = n; }
+            if let Ok(n) = v.parse() {
+                bytes_per_pixel = n;
+            }
         }
     }
 
@@ -116,14 +134,19 @@ fn kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 impl FormatReader for PerkinElmerReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         if matches!(ext.as_deref(), Some("cfg")) {
             return path.with_extension("rec").exists();
         }
         false
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let (meta, rec_path) = parse_pe_cfg(path)?;
@@ -134,24 +157,48 @@ impl FormatReader for PerkinElmerReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None; self.rec_path = None; self.meta = None; Ok(())
+        self.path = None;
+        self.rec_path = None;
+        self.meta = None;
+        Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
+    fn series_count(&self) -> usize {
+        1
+    }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
     }
-    fn series(&self) -> usize { 0 }
+    fn series(&self) -> usize {
+        0
+    }
 
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let rec = self.rec_path.as_ref().ok_or(BioFormatsError::NotInitialized)?.clone();
+        let rec = self
+            .rec_path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         open_bytes_impl(&rec, 0, meta, plane_index)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         Ok(region_from_full(&full, meta, x, y, w, h))
@@ -159,8 +206,10 @@ impl FormatReader for PerkinElmerReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256); let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2; let ty = (meta.size_y - th) / 2;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
@@ -177,12 +226,17 @@ pub struct OpenlabRawReader {
 
 impl OpenlabRawReader {
     pub fn new() -> Self {
-        OpenlabRawReader { path: None, meta: None }
+        OpenlabRawReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for OpenlabRawReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_openlab(path: &Path) -> Result<ImageMetadata> {
@@ -207,7 +261,10 @@ fn parse_openlab(path: &Path) -> Result<ImageMetadata> {
 
 impl FormatReader for OpenlabRawReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("raw"))
     }
 
@@ -223,24 +280,47 @@ impl FormatReader for OpenlabRawReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None; self.meta = None; Ok(())
+        self.path = None;
+        self.meta = None;
+        Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
+    fn series_count(&self) -> usize {
+        1
+    }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
     }
-    fn series(&self) -> usize { 0 }
+    fn series(&self) -> usize {
+        0
+    }
 
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?.clone();
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         open_bytes_impl(&path, OPENLAB_HEADER_SIZE, meta, plane_index)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         Ok(region_from_full(&full, meta, x, y, w, h))
@@ -248,8 +328,10 @@ impl FormatReader for OpenlabRawReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256); let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2; let ty = (meta.size_y - th) / 2;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
@@ -263,24 +345,33 @@ pub struct PhotonDynamicsReader {
 
 impl PhotonDynamicsReader {
     pub fn new() -> Self {
-        PhotonDynamicsReader { path: None, meta: None }
+        PhotonDynamicsReader {
+            path: None,
+            meta: None,
+        }
     }
 }
 
 impl Default for PhotonDynamicsReader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_pds(path: &Path) -> Result<ImageMetadata> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
     // Try to read width/height as u32 LE at reasonable offsets
     let width = if data.len() >= 8 {
-        u32::from_le_bytes([data[4], data[5], data[6], data[7]]).max(1).min(65536)
+        u32::from_le_bytes([data[4], data[5], data[6], data[7]])
+            .max(1)
+            .min(65536)
     } else {
         512
     };
     let height = if data.len() >= 12 {
-        u32::from_le_bytes([data[8], data[9], data[10], data[11]]).max(1).min(65536)
+        u32::from_le_bytes([data[8], data[9], data[10], data[11]])
+            .max(1)
+            .min(65536)
     } else {
         512
     };
@@ -296,11 +387,16 @@ fn parse_pds(path: &Path) -> Result<ImageMetadata> {
 
 impl FormatReader for PhotonDynamicsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("pds"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let meta = parse_pds(path)?;
@@ -310,25 +406,46 @@ impl FormatReader for PhotonDynamicsReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None; self.meta = None; Ok(())
+        self.path = None;
+        self.meta = None;
+        Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
+    fn series_count(&self) -> usize {
+        1
+    }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
     }
-    fn series(&self) -> usize { 0 }
+    fn series(&self) -> usize {
+        0
+    }
 
-    fn metadata(&self) -> &ImageMetadata { self.meta.as_ref().expect("set_id not called") }
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index != 0 { return Err(BioFormatsError::PlaneOutOfRange(plane_index)); }
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         let bps = meta.pixel_type.bytes_per_sample();
         Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * bps])
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         Ok(region_from_full(&full, meta, x, y, w, h))
@@ -336,8 +453,10 @@ impl FormatReader for PhotonDynamicsReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256); let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2; let ty = (meta.size_y - th) / 2;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }

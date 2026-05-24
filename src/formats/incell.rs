@@ -52,17 +52,22 @@ fn parse_incell_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         if line.contains("Width=") && line.contains("Height=") {
             // Try to extract Width="N"
             if let Some(w) = extract_attr(line, "Width") {
-                if let Ok(v) = w.parse() { width = v; }
+                if let Ok(v) = w.parse() {
+                    width = v;
+                }
             }
             if let Some(h) = extract_attr(line, "Height") {
-                if let Ok(v) = h.parse() { height = v; }
+                if let Ok(v) = h.parse() {
+                    height = v;
+                }
             }
         }
         // Collect referenced image files
         for attr in &["filename", "URL", "FileName"] {
             if let Some(fname) = extract_attr(line, attr) {
                 let p = dir.join(fname);
-                if p.extension().and_then(|e| e.to_str())
+                if p.extension()
+                    .and_then(|e| e.to_str())
                     .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
                     .unwrap_or(false)
                 {
@@ -164,13 +169,21 @@ impl FormatReader for InCellReader {
         Ok(())
     }
 
-    fn series_count(&self) -> usize { 1 }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+    fn series_count(&self) -> usize {
+        1
     }
 
-    fn series(&self) -> usize { 0 }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -200,7 +213,14 @@ impl FormatReader for InCellReader {
         Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * bps])
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = meta.pixel_type.bytes_per_sample();

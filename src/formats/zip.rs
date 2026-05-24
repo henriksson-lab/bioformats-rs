@@ -1,16 +1,13 @@
 //! ZIP container reader.
 //!
 //! Detects ZIP files by magic bytes PK\x03\x04 and extracts the first
-//! supported image file to a temp directory. If the inner file is a TIFF it
-//! delegates to TiffReader; otherwise it returns a 1×1 uint8 placeholder.
+//! supported TIFF file to a temp directory and delegates to TiffReader.
 
-use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
-use crate::common::pixel_type::PixelType;
+use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
 
 /// Extensions treated as TIFF inside a ZIP.
@@ -19,12 +16,10 @@ fn is_tiff_name(name: &str) -> bool {
     lower.ends_with(".tif") || lower.ends_with(".tiff")
 }
 
-/// Extensions of any supported image file inside a ZIP.
+/// Extensions of image files that are recognized but not decoded by this ZIP reader.
 fn is_image_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".tif")
-        || lower.ends_with(".tiff")
-        || lower.ends_with(".png")
+    lower.ends_with(".png")
         || lower.ends_with(".jpg")
         || lower.ends_with(".jpeg")
         || lower.ends_with(".bmp")
@@ -37,30 +32,6 @@ fn is_image_name(name: &str) -> bool {
         || lower.ends_with(".dm3")
         || lower.ends_with(".dm4")
         || lower.ends_with(".spe")
-}
-
-fn placeholder_meta() -> ImageMetadata {
-    ImageMetadata {
-        size_x: 1,
-        size_y: 1,
-        size_z: 1,
-        size_c: 1,
-        size_t: 1,
-        pixel_type: PixelType::Uint8,
-        bits_per_pixel: 8,
-        image_count: 1,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: true,
-        resolution_count: 1,
-        series_metadata: HashMap::new(),
-        lookup_table: None,
-        modulo_z: None,
-        modulo_c: None,
-        modulo_t: None,
-    }
 }
 
 pub struct ZipReader {
@@ -105,23 +76,34 @@ impl FormatReader for ZipReader {
         let mut archive = zip::ZipArchive::new(file)
             .map_err(|e| BioFormatsError::Format(format!("ZIP open error: {e}")))?;
 
-        // Find the first image entry
+        // Find the first TIFF entry, while remembering if the archive contains
+        // another image type that this wrapper cannot delegate yet.
         let mut found_name: Option<String> = None;
+        let mut found_unsupported_image: Option<String> = None;
         for i in 0..archive.len() {
             if let Ok(entry) = archive.by_index(i) {
                 let name = entry.name().to_string();
-                if !entry.is_dir() && is_image_name(&name) {
+                if entry.is_dir() {
+                    continue;
+                }
+                if is_tiff_name(&name) {
                     found_name = Some(name);
                     break;
+                }
+                if found_unsupported_image.is_none() && is_image_name(&name) {
+                    found_unsupported_image = Some(name);
                 }
             }
         }
 
         let Some(name) = found_name else {
-            // No supported image found — use placeholder
-            self.meta = Some(placeholder_meta());
-            self.is_tiff = false;
-            return Ok(());
+            let message = match found_unsupported_image {
+                Some(name) => format!(
+                    "ZIP image entry '{name}' is not supported by ZipReader; only TIFF entries are currently delegated"
+                ),
+                None => "ZIP archive does not contain a supported TIFF image entry".to_string(),
+            };
+            return Err(BioFormatsError::UnsupportedFormat(message));
         };
 
         // Extract to temp file
@@ -144,15 +126,9 @@ impl FormatReader for ZipReader {
 
         self.extracted_path = Some(temp_path.clone());
 
-        if is_tiff_name(&name) {
-            // Delegate to TiffReader
-            self.inner.set_id(&temp_path)?;
-            self.meta = Some(self.inner.metadata().clone());
-            self.is_tiff = true;
-        } else {
-            self.meta = Some(placeholder_meta());
-            self.is_tiff = false;
-        }
+        self.inner.set_id(&temp_path)?;
+        self.meta = Some(self.inner.metadata().clone());
+        self.is_tiff = true;
 
         Ok(())
     }
@@ -214,7 +190,14 @@ impl FormatReader for ZipReader {
         Ok(vec![0u8])
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         if self.is_tiff {
             return self.inner.open_bytes_region(plane_index, x, y, w, h);
         }
