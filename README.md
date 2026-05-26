@@ -3,7 +3,7 @@
 A pure-Rust reimplementation of [Bio-Formats](https://www.openmicroscopy.org/bio-formats/) 
 — a library for reading (and writing) scientific image formats used in microscopy, medical imaging, and astronomy.
 
-**This package is still under development**
+**This package has limited real data testing, not all features are yet included**
 
 * 2026-05-26: 60-70% there. see list of libraries below. translation of mdbtools underway to support key file formats
 * 2026-05-24: started proper audit; plenty left to do on this crate

@@ -3,3 +3,15 @@ external-fixtures/logs/
 __pycache__/
 *.py[cod]
 *.class
+
+# Build artifacts
+/target/
+/Cargo.lock
+/bench/target/
+/bench/Cargo.lock
+
+# Local reference data / scratch (not part of the published crate)
+/java-bioformats/
+/bioformats_package.jar
+/test/
+/convo.txt
