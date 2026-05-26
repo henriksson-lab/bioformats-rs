@@ -31,6 +31,8 @@ pub struct FileStitcher {
     files: Vec<PathBuf>,
     /// Metadata for the stitched dataset.
     meta: Option<ImageMetadata>,
+    /// Maps stitched plane indices to (file index, local plane index).
+    plane_map: Vec<(usize, u32)>,
     /// The currently-open reader (index into `files`).
     current_reader: Option<(usize, Box<dyn FormatReader>)>,
 }
@@ -52,17 +54,14 @@ impl FileStitcher {
         let mut first = crate::registry::ImageReader::open(&files[0])?;
         let base_meta = first.metadata().clone();
 
-        let plane_count = files.len() as u32 * base_meta.image_count;
-        let meta = ImageMetadata {
-            image_count: plane_count,
-            size_z: base_meta.size_z * files.len() as u32,
-            ..base_meta
-        };
+        let pattern = FilePattern::from_file(&files[0]).ok();
+        let (meta, plane_map) = stitch_layout(&files, &base_meta, pattern.as_ref())?;
         let _ = first.close();
 
         Ok(FileStitcher {
             files,
             meta: Some(meta),
+            plane_map,
             current_reader: None,
         })
     }
@@ -75,18 +74,14 @@ impl FileStitcher {
 
         let mut first = crate::registry::ImageReader::open(&files[0])?;
         let base_meta = first.metadata().clone();
-        let planes_per_file = base_meta.image_count;
-        let plane_count = files.len() as u32 * planes_per_file;
-        let meta = ImageMetadata {
-            image_count: plane_count,
-            size_z: base_meta.size_z * files.len() as u32,
-            ..base_meta
-        };
+        let pattern = FilePattern::from_file(&files[0]).ok();
+        let (meta, plane_map) = stitch_layout(&files, &base_meta, pattern.as_ref())?;
         let _ = first.close();
 
         Ok(FileStitcher {
             files,
             meta: Some(meta),
+            plane_map,
             current_reader: None,
         })
     }
@@ -97,11 +92,10 @@ impl FileStitcher {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        // Each file has the same number of planes
-        let planes_per_file = meta.image_count / self.files.len() as u32;
-        let file_idx = (plane_index / planes_per_file) as usize;
-        let local_plane = plane_index % planes_per_file;
-        Ok((file_idx, local_plane))
+        self.plane_map
+            .get(plane_index as usize)
+            .copied()
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
     /// Ensure the reader for `file_idx` is open.
@@ -148,6 +142,18 @@ fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
 /// Looks for numeric patterns in the filename and finds all matching files.
 /// E.g., `img_001.tif` → looks for `img_000.tif`, `img_001.tif`, `img_002.tif`, ...
 fn discover_sequence(path: &Path) -> Result<Vec<PathBuf>> {
+    if let Ok(pattern) = FilePattern::from_file(path) {
+        let mut files: Vec<PathBuf> = pattern
+            .filenames()
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+        if !files.is_empty() {
+            files.sort();
+            return Ok(files);
+        }
+    }
+
     let parent = path.parent().unwrap_or(Path::new("."));
     let stem = path
         .file_stem()
@@ -216,6 +222,162 @@ fn discover_sequence(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(matches.into_iter().map(|(_, p)| p).collect())
 }
 
+fn stitch_layout(
+    files: &[PathBuf],
+    base_meta: &ImageMetadata,
+    pattern: Option<&FilePattern>,
+) -> Result<(ImageMetadata, Vec<(usize, u32)>)> {
+    let mut meta = base_meta.clone();
+    let file_axes = pattern
+        .and_then(|pattern| infer_file_axes(files, pattern))
+        .unwrap_or_else(|| FileAxisLayout {
+            file_coords: (0..files.len()).map(|i| (i as u32, 0, 0)).collect(),
+            size_z: files.len() as u32,
+            size_c: 1,
+            size_t: 1,
+        });
+
+    meta.size_z = checked_axis_mul(base_meta.size_z, file_axes.size_z, "Z")?;
+    meta.size_c = checked_axis_mul(base_meta.size_c, file_axes.size_c, "C")?;
+    meta.size_t = checked_axis_mul(base_meta.size_t, file_axes.size_t, "T")?;
+    meta.image_count = meta
+        .size_z
+        .checked_mul(meta.size_c)
+        .and_then(|v| v.checked_mul(meta.size_t))
+        .ok_or_else(|| BioFormatsError::Format("Stitched plane count overflow".into()))?;
+
+    let mut plane_map = vec![None; meta.image_count as usize];
+    for (file_idx, &(file_z, file_c, file_t)) in file_axes.file_coords.iter().enumerate() {
+        for local_plane in 0..base_meta.image_count {
+            let (local_z, local_c, local_t) = plane_to_zct(local_plane, base_meta)
+                .ok_or_else(|| BioFormatsError::Format("Invalid base plane index".into()))?;
+            let z = file_z * base_meta.size_z + local_z;
+            let c = file_c * base_meta.size_c + local_c;
+            let t = file_t * base_meta.size_t + local_t;
+            let stitched = zct_to_plane(z, c, t, &meta)
+                .ok_or_else(|| BioFormatsError::Format("Invalid stitched plane index".into()))?;
+            plane_map[stitched as usize] = Some((file_idx, local_plane));
+        }
+    }
+
+    let plane_map = plane_map
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| BioFormatsError::Format("Incomplete stitched plane map".into()))?;
+    Ok((meta, plane_map))
+}
+
+struct FileAxisLayout {
+    file_coords: Vec<(u32, u32, u32)>,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+}
+
+fn infer_file_axes(files: &[PathBuf], pattern: &FilePattern) -> Option<FileAxisLayout> {
+    let guessed = AxisGuesser::guess(pattern);
+    if !guessed
+        .iter()
+        .any(|axis| matches!(axis, AxisType::Z | AxisType::Channel | AxisType::Time))
+    {
+        return None;
+    }
+    if has_duplicate_inferred_axis(&guessed) {
+        return None;
+    }
+
+    let mut file_values = Vec::with_capacity(files.len());
+    for file in files {
+        let name = file.file_name()?.to_str()?;
+        file_values.push(pattern.match_filename(name)?);
+    }
+
+    let axis_len = |axis_type| {
+        guessed
+            .iter()
+            .position(|axis| *axis == axis_type)
+            .map(|idx| pattern.blocks[idx].values.len() as u32)
+            .unwrap_or(1)
+    };
+    let size_z = axis_len(AxisType::Z);
+    let size_c = axis_len(AxisType::Channel);
+    let size_t = axis_len(AxisType::Time);
+
+    let mut file_coords = Vec::with_capacity(files.len());
+    for values in file_values {
+        let mut z = 0;
+        let mut c = 0;
+        let mut t = 0;
+        for (idx, value) in values.iter().enumerate() {
+            let ordinal = pattern.blocks[idx].values.iter().position(|v| v == value)? as u32;
+            match guessed[idx] {
+                AxisType::Z => z = ordinal,
+                AxisType::Channel => c = ordinal,
+                AxisType::Time => t = ordinal,
+                AxisType::Series | AxisType::Unknown => {}
+            }
+        }
+        file_coords.push((z, c, t));
+    }
+
+    Some(FileAxisLayout {
+        file_coords,
+        size_z,
+        size_c,
+        size_t,
+    })
+}
+
+fn has_duplicate_inferred_axis(axes: &[AxisType]) -> bool {
+    [AxisType::Z, AxisType::Channel, AxisType::Time]
+        .iter()
+        .any(|axis| axes.iter().filter(|candidate| *candidate == axis).count() > 1)
+}
+
+fn checked_axis_mul(base: u32, files: u32, axis: &str) -> Result<u32> {
+    base.checked_mul(files)
+        .ok_or_else(|| BioFormatsError::Format(format!("Stitched {axis} size overflow")))
+}
+
+fn plane_to_zct(plane_index: u32, meta: &ImageMetadata) -> Option<(u32, u32, u32)> {
+    for t in 0..meta.size_t {
+        for z in 0..meta.size_z {
+            for c in 0..meta.size_c {
+                if zct_to_plane(z, c, t, meta)? == plane_index {
+                    return Some((z, c, t));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn zct_to_plane(z: u32, c: u32, t: u32, meta: &ImageMetadata) -> Option<u32> {
+    if z >= meta.size_z || c >= meta.size_c || t >= meta.size_t {
+        return None;
+    }
+    Some(match meta.dimension_order {
+        crate::common::metadata::DimensionOrder::XYZCT => {
+            t * meta.size_z * meta.size_c + c * meta.size_z + z
+        }
+        crate::common::metadata::DimensionOrder::XYZTC => {
+            c * meta.size_z * meta.size_t + t * meta.size_z + z
+        }
+        crate::common::metadata::DimensionOrder::XYCZT => {
+            t * meta.size_c * meta.size_z + z * meta.size_c + c
+        }
+        crate::common::metadata::DimensionOrder::XYCTZ => {
+            z * meta.size_c * meta.size_t + t * meta.size_c + c
+        }
+        crate::common::metadata::DimensionOrder::XYTCZ => {
+            z * meta.size_t * meta.size_c + c * meta.size_t + t
+        }
+        crate::common::metadata::DimensionOrder::XYTZC => {
+            c * meta.size_t * meta.size_z + z * meta.size_t + t
+        }
+    })
+}
+
 impl FormatReader for FileStitcher {
     fn is_this_type_by_name(&self, _path: &Path) -> bool {
         false
@@ -235,6 +397,7 @@ impl FormatReader for FileStitcher {
         }
         self.meta = None;
         self.files.clear();
+        self.plane_map.clear();
         Ok(())
     }
 

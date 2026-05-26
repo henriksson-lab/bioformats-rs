@@ -1,17 +1,27 @@
-//! Zeiss XRM X-ray tomography format reader.
+//! Zeiss XRM/TXRM X-ray tomography format reader.
 //!
-//! XRM/TXRM files are OLE2-based (Compound Document) format from Zeiss Xradia.
-//! Extension-only detection for .xrm and .txrm; returns placeholder metadata.
+//! Bio-Formats' Java `ZeissXRMReader` reads these files as CFB/OLE2 compound
+//! documents.  This Rust reader implements the same bounded core path:
+//! dimensions and datatype from `Root Entry/ImageInfo/*`, and uncompressed
+//! plane streams from `Root Entry/ImageData/ImageN`.
 
+use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
+
+const XRM_CFB_MAGIC: &[u8; 8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
+const IMAGE_DATA: &str = "/ImageData/";
 
 pub struct XrmReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    image_paths: Vec<String>,
 }
 
 impl XrmReader {
@@ -19,6 +29,7 @@ impl XrmReader {
         XrmReader {
             path: None,
             meta: None,
+            image_paths: Vec::new(),
         }
     }
 }
@@ -35,22 +46,25 @@ impl FormatReader for XrmReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("xrm") | Some("txrm"))
+        matches!(ext.as_deref(), Some("xrm") | Some("txrm") | Some("txm"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= XRM_CFB_MAGIC.len() && &header[..XRM_CFB_MAGIC.len()] == XRM_CFB_MAGIC
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Zeiss XRM format reading is not yet implemented".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let (meta, image_paths) = parse_xrm(path)?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.image_paths = image_paths;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.image_paths.clear();
         Ok(())
     }
 
@@ -74,28 +88,318 @@ impl FormatReader for XrmReader {
         self.meta.as_ref().expect("set_id not called")
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Zeiss XRM format reading is not yet implemented".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let stream_path = self
+            .image_paths
+            .get(plane_index as usize)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?
+            .clone();
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+
+        let mut comp =
+            cfb::open(&path).map_err(|e| BioFormatsError::Format(format!("XRM CFB open: {e}")))?;
+        let mut stream = comp
+            .open_stream(&stream_path)
+            .map_err(|e| BioFormatsError::Format(format!("XRM stream {stream_path}: {e}")))?;
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).map_err(BioFormatsError::Io)?;
+
+        xrm_flip_rows(&raw, meta)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Zeiss XRM format reading is not yet implemented".to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("XRM", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Zeiss XRM format reading is not yet implemented".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
+    let mut comp =
+        cfb::open(path).map_err(|e| BioFormatsError::Format(format!("XRM CFB open: {e}")))?;
+
+    let mut size_x = None;
+    let mut size_y = None;
+    let mut pixel_type = None;
+    let mut metadata = HashMap::new();
+    let mut image_paths = Vec::new();
+
+    let paths: Vec<String> = comp
+        .walk()
+        .filter(|entry| entry.is_stream())
+        .map(|entry| normalize_cfb_path(&entry.path().to_string_lossy()))
+        .collect();
+
+    for path in paths {
+        if path.starts_with(IMAGE_DATA) {
+            image_paths.push(path);
+        } else if path == "/ImageInfo/ImageWidth" {
+            let v = read_xrm_i32(&mut comp, &path)?;
+            size_x = Some(v);
+            metadata.insert(
+                "Image Details: Image width (pixels)".into(),
+                MetadataValue::Int(v as i64),
+            );
+        } else if path == "/ImageInfo/ImageHeight" {
+            let v = read_xrm_i32(&mut comp, &path)?;
+            size_y = Some(v);
+            metadata.insert(
+                "Image Details: Image height (pixels)".into(),
+                MetadataValue::Int(v as i64),
+            );
+        } else if path == "/ImageInfo/DataType" {
+            let code = read_xrm_i32(&mut comp, &path)?;
+            let (ty, label) = xrm_pixel_type(code)?;
+            pixel_type = Some(ty);
+            metadata.insert(
+                "Image Details: Data type".into(),
+                MetadataValue::String(label.into()),
+            );
+        } else if path == "/ImageInfo/FileType" {
+            if let Ok(value) = read_xrm_string(&mut comp, &path) {
+                metadata.insert(
+                    "Image Details: File type".into(),
+                    MetadataValue::String(value),
+                );
+            }
+        } else if path == "/ImageInfo/PixelSize" {
+            if let Ok(value) = read_xrm_f32(&mut comp, &path) {
+                metadata.insert(
+                    "Image Details: Pixel size (um)".into(),
+                    MetadataValue::Float(value as f64),
+                );
+            }
+        }
+    }
+
+    image_paths.sort_by_key(|p| xrm_image_index(p).unwrap_or(u32::MAX));
+    if image_paths.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Zeiss XRM/TXRM contains no Root Entry/ImageData/ImageN streams".into(),
+        ));
+    }
+
+    let size_x = size_x.ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Zeiss XRM/TXRM missing ImageInfo/ImageWidth".into())
+    })? as u32;
+    let size_y = size_y.ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Zeiss XRM/TXRM missing ImageInfo/ImageHeight".into())
+    })? as u32;
+    let pixel_type = pixel_type.ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Zeiss XRM/TXRM missing ImageInfo/DataType".into())
+    })?;
+    if size_x == 0 || size_y == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Zeiss XRM/TXRM has invalid zero image dimensions".into(),
+        ));
+    }
+
+    let bits = (pixel_type.bytes_per_sample() * 8) as u8;
+    let image_count = image_paths.len() as u32;
+    let meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z: image_count,
+        size_c: 1,
+        size_t: 1,
+        pixel_type,
+        bits_per_pixel: bits,
+        image_count,
+        dimension_order: DimensionOrder::XYZTC,
+        is_rgb: false,
+        is_interleaved: false,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        series_metadata: metadata,
+        lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
+    };
+    Ok((meta, image_paths))
+}
+
+fn normalize_cfb_path(path: &str) -> String {
+    path.replace('\\', "/").replace("/Root Entry", "")
+}
+
+fn read_xrm_stream(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str) -> Result<Vec<u8>> {
+    let mut stream = comp
+        .open_stream(path)
+        .or_else(|_| comp.open_stream(format!("/Root Entry{path}")))
+        .map_err(|e| BioFormatsError::Format(format!("XRM stream {path}: {e}")))?;
+    let mut data = Vec::new();
+    stream.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
+    Ok(data)
+}
+
+fn read_xrm_i32(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str) -> Result<i32> {
+    let data = read_xrm_stream(comp, path)?;
+    let bytes = data
+        .get(..4)
+        .ok_or_else(|| BioFormatsError::Format(format!("XRM stream {path} is shorter than i32")))?;
+    Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_xrm_f32(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str) -> Result<f32> {
+    let data = read_xrm_stream(comp, path)?;
+    let bytes = data
+        .get(..4)
+        .ok_or_else(|| BioFormatsError::Format(format!("XRM stream {path} is shorter than f32")))?;
+    Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_xrm_string(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str) -> Result<String> {
+    let data = read_xrm_stream(comp, path)?;
+    Ok(String::from_utf8_lossy(&data)
+        .trim_matches(char::from(0))
+        .trim()
+        .to_string())
+}
+
+fn xrm_pixel_type(data_type: i32) -> Result<(PixelType, &'static str)> {
+    match data_type {
+        2 => Ok((PixelType::Int8, "byte")),
+        3 => Ok((PixelType::Uint8, "ubyte")),
+        4 => Ok((PixelType::Int16, "short")),
+        5 => Ok((PixelType::Uint16, "ushort")),
+        6 => Ok((PixelType::Int32, "int")),
+        7 => Ok((PixelType::Uint32, "uint")),
+        10 => Ok((PixelType::Float32, "float")),
+        11 => Ok((PixelType::Float64, "double")),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "Zeiss XRM/TXRM unsupported data type: {other}"
+        ))),
+    }
+}
+
+fn xrm_image_index(path: &str) -> Option<u32> {
+    let tail = path.rsplit('/').next()?;
+    let digits = tail.strip_prefix("Image")?;
+    digits.parse().ok()
+}
+
+fn xrm_flip_rows(raw: &[u8], meta: &ImageMetadata) -> Result<Vec<u8>> {
+    let row_len = meta
+        .size_x
+        .checked_mul(meta.pixel_type.bytes_per_sample() as u32)
+        .ok_or_else(|| BioFormatsError::Format("XRM row size overflows".into()))?
+        as usize;
+    let expected = row_len
+        .checked_mul(meta.size_y as usize)
+        .ok_or_else(|| BioFormatsError::Format("XRM plane size overflows".into()))?;
+    if raw.len() < expected {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Zeiss XRM/TXRM plane is shorter than declared: got {}, expected {expected}",
+            raw.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(expected);
+    for row in (0..meta.size_y as usize).rev() {
+        let start = row * row_len;
+        out.extend_from_slice(&raw[start..start + row_len]);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::reader::FormatReader;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_xrm_{nanos}_{name}"))
+    }
+
+    fn write_stream(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str, data: &[u8]) {
+        if let Some(parent) = Path::new(path).parent() {
+            comp.create_storage_all(parent).unwrap();
+        }
+        comp.create_stream(path).unwrap().write_all(data).unwrap();
+    }
+
+    fn write_i32_stream(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str, value: i32) {
+        write_stream(comp, path, &value.to_le_bytes());
+    }
+
+    #[test]
+    fn xrm_reads_cfb_imageinfo_and_flipped_image_planes() {
+        let path = temp_path("synthetic.txrm");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            write_i32_stream(&mut comp, "/ImageInfo/ImageWidth", 3);
+            write_i32_stream(&mut comp, "/ImageInfo/ImageHeight", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/DataType", 3);
+            write_stream(&mut comp, "/ImageInfo/FileType", b"txrm\0");
+            write_stream(&mut comp, "/ImageData/Image2", &[21, 22, 23, 24, 25, 26]);
+            write_stream(&mut comp, "/ImageData/Image1", &[1, 2, 3, 4, 5, 6]);
+        }
+
+        let mut reader = XrmReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 3);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![4, 5, 6, 1, 2, 3]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![24, 25, 26, 21, 22, 23]);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
+            vec![5, 6, 2, 3]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xrm_rejects_missing_required_imageinfo() {
+        let path = temp_path("missing.txm");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            write_i32_stream(&mut comp, "/ImageInfo/ImageWidth", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/DataType", 5);
+            write_stream(&mut comp, "/ImageData/Image1", &[0; 8]);
+        }
+
+        let err = XrmReader::new().set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("ImageHeight")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

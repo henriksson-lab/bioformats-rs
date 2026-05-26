@@ -13,9 +13,6 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
-// Re-import hdf5 for MincReader
-use hdf5;
-
 // ---------------------------------------------------------------------------
 // Macro for extension-only placeholder readers
 // ---------------------------------------------------------------------------
@@ -509,7 +506,7 @@ impl FormatReader for MincReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file = hdf5::File::open(path)
+        let file = hdf5_pure::File::open(path)
             .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5: {e}")))?;
 
         // Look for common MINC dataset paths
@@ -529,7 +526,7 @@ impl FormatReader for MincReader {
             )
         })?;
 
-        let shape = ds.shape();
+        let shape = ds.shape().unwrap_or_default();
         // MINC typically has (z, y, x) or (t, z, y, x) ordering
         let (size_x, size_y, size_z) = match shape.len() {
             1 => (shape[0] as u32, 1u32, 1u32),
@@ -545,7 +542,7 @@ impl FormatReader for MincReader {
 
         // Read pixel data as u16
         let data: Vec<u16> = ds
-            .read_raw()
+            .read_u16()
             .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
         let mut pixels = Vec::with_capacity(data.len() * 2);
         for val in &data {
@@ -1052,13 +1049,17 @@ impl FormatReader for SedatReader {
 // ---------------------------------------------------------------------------
 // 9. SM-Camera
 // ---------------------------------------------------------------------------
-/// SM-Camera reader (`.smc`).
+/// SM-Camera reader.
 ///
-/// SM-Camera is a proprietary format with undocumented binary structure.
+/// Java Bio-Formats identifies this format by a fixed 16-byte magic and stores
+/// one UINT8 plane after a 548-byte header.
 pub struct SmCameraReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
 }
+
+const SMC_MAGIC: [u8; 16] = [0, 0, 0, 0, 2, 0, 0, 5, 0xc9, 0x88, 0, 5, 0xcb, 0x88, 0, 0];
+const SMC_HEADER_SIZE: usize = 548;
 
 impl SmCameraReader {
     pub fn new() -> Self {
@@ -1084,14 +1085,66 @@ impl FormatReader for SmCameraReader {
         matches!(ext.as_deref(), Some("smc"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= SMC_MAGIC.len() && header[..SMC_MAGIC.len()] == SMC_MAGIC
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "SM-Camera format is proprietary with undocumented binary structure".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if !self.is_this_type_by_bytes(&data) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "SM-Camera file is missing the expected SMC magic".to_string(),
+            ));
+        }
+        if data.len() < SMC_HEADER_SIZE {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "SM-Camera header is shorter than {SMC_HEADER_SIZE} bytes"
+            )));
+        }
+
+        let size_y = u16::from_be_bytes([data[524], data[525]]) as u32;
+        let size_x = u16::from_be_bytes([data[532], data[533]]) as u32;
+        if size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "SM-Camera header has invalid image dimensions".to_string(),
+            ));
+        }
+
+        let plane_bytes = (size_x as usize)
+            .checked_mul(size_y as usize)
+            .ok_or_else(|| BioFormatsError::Format("SM-Camera plane size overflows".to_string()))?;
+        let required = SMC_HEADER_SIZE
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("SM-Camera file size overflows".to_string()))?;
+        if data.len() < required {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "SM-Camera payload is shorter than declared {size_x}x{size_y} plane"
+            )));
+        }
+
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: false,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1120,29 +1173,48 @@ impl FormatReader for SmCameraReader {
         self.meta.as_ref().expect("set_id not called")
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "SM-Camera format is proprietary with undocumented binary structure".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let plane_bytes = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .ok_or_else(|| BioFormatsError::Format("SM-Camera plane size overflows".to_string()))?;
+        let end = SMC_HEADER_SIZE
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("SM-Camera plane end overflows".to_string()))?;
+        if data.len() < end {
+            return Err(BioFormatsError::InvalidData(format!(
+                "SM-Camera payload is too short: got {}, expected at least {end}",
+                data.len()
+            )));
+        }
+        Ok(data[SMC_HEADER_SIZE..end].to_vec())
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "SM-Camera format is proprietary with undocumented binary structure".to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("SM-Camera", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "SM-Camera format is proprietary with undocumented binary structure".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 

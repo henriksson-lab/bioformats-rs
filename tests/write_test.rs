@@ -131,6 +131,63 @@ fn pyramid_tiff_reads_reduced_resolution_for_every_plane() {
 }
 
 #[test]
+fn pyramid_tiff_rejects_wrong_subresolution_plane_count() {
+    use bioformats::tiff::PyramidOmeTiffWriter;
+    use bioformats::FormatWriter;
+
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 4;
+    meta.size_y = 4;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_z = 2;
+    meta.size_c = 1;
+    meta.size_t = 1;
+    meta.image_count = 2;
+
+    let path = temp_path("bad_pyramid_plane_count.tif");
+    let mut writer = PyramidOmeTiffWriter::new();
+    writer.set_metadata(&meta).unwrap();
+    writer.set_id(&path).unwrap();
+    writer.save_bytes(0, &[1; 16]).unwrap();
+    writer.save_bytes(1, &[2; 16]).unwrap();
+    writer.add_resolution_level(vec![vec![3; 4]]);
+
+    let err = writer.close().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("resolution level 1 has 1 planes, expected 2"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn pyramid_tiff_rejects_wrong_subresolution_plane_size() {
+    use bioformats::tiff::PyramidOmeTiffWriter;
+    use bioformats::FormatWriter;
+
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 5;
+    meta.size_y = 3;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_c = 1;
+    meta.image_count = 1;
+
+    let path = temp_path("bad_pyramid_plane_size.tif");
+    let mut writer = PyramidOmeTiffWriter::new();
+    writer.set_metadata(&meta).unwrap();
+    writer.set_id(&path).unwrap();
+    writer.save_bytes(0, &[1; 15]).unwrap();
+    writer.add_resolution_level(vec![vec![2; 5]]);
+
+    let err = writer.close().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("resolution level 1 plane 0 has 5 bytes, expected 6 for 3x2"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn tiff_deflate_round_trip() {
     use bioformats::FormatWriter;
     use bioformats::{TiffWriter, WriteCompression};
@@ -191,6 +248,16 @@ fn tiff_writer_rejects_missing_planes_on_close() {
         err.to_string().contains("wrote 1 planes, expected 2"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn tiff_writer_does_not_claim_bigtiff_extension() {
+    use bioformats::{FormatWriter, TiffWriter};
+
+    let writer = TiffWriter::new();
+    assert!(!writer.is_this_type(&temp_path("classic_only.btf")));
+    assert!(writer.is_this_type(&temp_path("classic_ok.tif")));
+    assert!(writer.is_this_type(&temp_path("classic_ok.tiff")));
 }
 
 #[test]

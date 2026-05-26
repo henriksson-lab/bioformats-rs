@@ -45,21 +45,28 @@ impl Default for ImarisReader {
 }
 
 /// Read a string attribute from an HDF5 group (tries VarLenAscii then FixedAscii).
-fn read_str_attr(group: &hdf5::Group, attr: &str) -> Option<String> {
-    let a = group.attr(attr).ok()?;
-    // Try VarLenAscii
-    if let Ok(s) = a.read_scalar::<hdf5::types::VarLenAscii>() {
-        return Some(s.as_str().trim_matches('\0').trim().to_string());
+fn read_str_attr(group: &hdf5_pure::Group<'_>, attr: &str) -> Option<String> {
+    let attrs = group.attrs().ok()?;
+    match attrs.get(attr)? {
+        hdf5_pure::AttrValue::String(s) | hdf5_pure::AttrValue::AsciiString(s) => {
+            Some(s.trim_matches('\0').trim().to_string())
+        }
+        hdf5_pure::AttrValue::StringArray(v)
+        | hdf5_pure::AttrValue::AsciiStringArray(v)
+        | hdf5_pure::AttrValue::VarLenAsciiArray(v) => {
+            v.first().map(|s| s.trim_matches('\0').trim().to_string())
+        }
+        hdf5_pure::AttrValue::I32(v) => Some(v.to_string()),
+        hdf5_pure::AttrValue::I64(v) => Some(v.to_string()),
+        hdf5_pure::AttrValue::U32(v) => Some(v.to_string()),
+        hdf5_pure::AttrValue::U64(v) => Some(v.to_string()),
+        hdf5_pure::AttrValue::F64(v) => Some(v.to_string()),
+        _ => None,
     }
-    // Try FixedAscii<64>
-    if let Ok(s) = a.read_scalar::<hdf5::types::FixedAscii<64>>() {
-        return Some(s.as_str().trim_matches('\0').trim().to_string());
-    }
-    None
 }
 
 fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
-    let file = hdf5::File::open(path)
+    let file = hdf5_pure::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
     // ── Read dimensions from DataSetInfo/Image ──────────────────────────────
@@ -83,7 +90,7 @@ fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
         .group("DataSetInfo")
         .map_err(|e| BioFormatsError::Format(format!("DataSetInfo missing: {e}")))?;
     let mut size_c: u32 = 0;
-    if let Ok(members) = ds_info.member_names() {
+    if let Ok(members) = hdf5_group_members(&ds_info) {
         size_c = members.iter().filter(|n| n.starts_with("Channel ")).count() as u32;
     }
     if size_c == 0 {
@@ -92,7 +99,7 @@ fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
 
     // ── Count timepoints from DataSet/ResolutionLevel 0 ────────────────────
     let size_t: u32 = if let Ok(rl0) = file.group("DataSet/ResolutionLevel 0") {
-        if let Ok(members) = rl0.member_names() {
+        if let Ok(members) = hdf5_group_members(&rl0) {
             let n = members
                 .iter()
                 .filter(|n| n.starts_with("TimePoint "))
@@ -111,7 +118,7 @@ fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
 
     // ── Count resolution levels ─────────────────────────────────────────────
     let n_resolutions: usize = if let Ok(ds_group) = file.group("DataSet") {
-        if let Ok(members) = ds_group.member_names() {
+        if let Ok(members) = hdf5_group_members(&ds_group) {
             let n = members
                 .iter()
                 .filter(|n| n.starts_with("ResolutionLevel "))
@@ -131,7 +138,7 @@ fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
     // ── Determine pixel type from first Data dataset ────────────────────────
     let data_path = "DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Data";
     let (pixel_type, bytes_per_sample) = if let Ok(ds) = file.dataset(data_path) {
-        match ds.dtype().map(|d| d.size()).unwrap_or(1) {
+        match ds.dtype().map(hdf5_dtype_size).unwrap_or(1) {
             1 => (PixelType::Uint8, 1usize),
             2 => (PixelType::Uint16, 2usize),
             4 => (PixelType::Uint32, 4usize),
@@ -179,6 +186,33 @@ fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
     };
 
     Ok((meta, n_resolutions, bytes_per_sample))
+}
+
+fn hdf5_group_members(
+    group: &hdf5_pure::Group<'_>,
+) -> std::result::Result<Vec<String>, hdf5_pure::Error> {
+    let mut members = group.groups()?;
+    members.extend(group.datasets()?);
+    Ok(members)
+}
+
+fn hdf5_dtype_size(dtype: hdf5_pure::DType) -> usize {
+    match dtype {
+        hdf5_pure::DType::F32
+        | hdf5_pure::DType::I32
+        | hdf5_pure::DType::U32
+        | hdf5_pure::DType::Enum(_) => 4,
+        hdf5_pure::DType::F64
+        | hdf5_pure::DType::I64
+        | hdf5_pure::DType::U64
+        | hdf5_pure::DType::ObjectReference => 8,
+        hdf5_pure::DType::I16 | hdf5_pure::DType::U16 => 2,
+        hdf5_pure::DType::I8 | hdf5_pure::DType::U8 => 1,
+        hdf5_pure::DType::Array(base, dims) => {
+            hdf5_dtype_size(*base) * dims.iter().copied().product::<u32>() as usize
+        }
+        _ => 0,
+    }
 }
 
 impl FormatReader for ImarisReader {
@@ -268,8 +302,8 @@ impl FormatReader for ImarisReader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        let file =
-            hdf5::File::open(&path).map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+        let file = hdf5_pure::File::open(&path)
+            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
         let ds = file
             .dataset(&data_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {data_path}: {e}")))?;
@@ -281,22 +315,22 @@ impl FormatReader for ImarisReader {
 
         let raw: Vec<u8> = match self.bytes_per_sample {
             1 => ds
-                .read_raw::<u8>()
+                .read_u8()
                 .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
             2 => {
                 let words: Vec<u16> = ds
-                    .read_raw::<u16>()
+                    .read_u16()
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 words.iter().flat_map(|w| w.to_le_bytes()).collect()
             }
             4 => {
                 let dwords: Vec<u32> = ds
-                    .read_raw::<u32>()
+                    .read_u32()
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
             }
             _ => ds
-                .read_raw::<u8>()
+                .read_u8()
                 .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
         };
 
@@ -305,8 +339,12 @@ impl FormatReader for ImarisReader {
         if offset + plane_bytes <= raw.len() {
             Ok(raw[offset..offset + plane_bytes].to_vec())
         } else {
-            // Return zeros if data is smaller than expected
-            Ok(vec![0u8; plane_bytes])
+            Err(BioFormatsError::UnsupportedFormat(format!(
+                "Imaris dataset {data_path} is shorter than declared plane {plane_index} \
+                 (need {} bytes, have {})",
+                offset + plane_bytes,
+                raw.len()
+            )))
         }
     }
 
@@ -338,9 +376,9 @@ impl FormatReader for ImarisReader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        if let Ok(file) = hdf5::File::open(&path) {
+        if let Ok(file) = hdf5_pure::File::open(&path) {
             if let Ok(ds) = file.dataset("Thumbnail/Data") {
-                if let Ok(data) = ds.read_raw::<u8>() {
+                if let Ok(data) = ds.read_u8() {
                     return Ok(data);
                 }
             }

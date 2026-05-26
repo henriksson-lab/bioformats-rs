@@ -3,14 +3,9 @@
 //! DCIMG is a proprietary Hamamatsu format for sCMOS camera time-lapse data.
 //! The file starts with the 8-byte magic "DCIMG\0\0\0".
 //!
-//! Header layout (all little-endian):
-//!   Offset   0: magic "DCIMG" (5 bytes)
-//!   Offset  16: header_size (u32)
-//!   Offset  20: n_frames (u32)
-//!   Offset  32: width (u32)
-//!   Offset  36: height (u32)
-//!   Offset  40: bit_depth (u32) — typically 16
-//!   Offset  48: bytes_per_row (u32)
+//! The on-disk header is versioned. Version 0x01000000 is parsed from the
+//! offsets used by Bio-Formats' DCIMGReader; older synthetic fixtures are kept
+//! on the previous simplified layout for compatibility.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -26,11 +21,26 @@ fn r_u32_le(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+fn r_u64_le(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+        b[off + 4],
+        b[off + 5],
+        b[off + 6],
+        b[off + 7],
+    ])
+}
+
 pub struct DcimgReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
     bytes_per_row: usize,
+    bytes_per_image: u64,
+    frame_footer_size: u64,
 }
 
 impl DcimgReader {
@@ -40,6 +50,8 @@ impl DcimgReader {
             meta: None,
             data_offset: 0,
             bytes_per_row: 0,
+            bytes_per_image: 0,
+            frame_footer_size: 0,
         }
     }
 }
@@ -64,20 +76,90 @@ impl FormatReader for DcimgReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        let mut hdr = vec![0u8; 64];
-        f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
+        let mut hdr = vec![0u8; 512];
+        let n = f.read(&mut hdr).map_err(BioFormatsError::Io)?;
+        hdr.truncate(n);
+        if hdr.len() < 64 {
+            return Err(BioFormatsError::Format(
+                "DCIMG header is shorter than 64 bytes".into(),
+            ));
+        }
 
-        let header_size = r_u32_le(&hdr, 16) as u64;
-        let n_frames = r_u32_le(&hdr, 20).max(1);
-        let width = r_u32_le(&hdr, 32).max(1);
-        let height = r_u32_le(&hdr, 36).max(1);
-        let bit_depth = r_u32_le(&hdr, 40);
-        let bytes_per_row = r_u32_le(&hdr, 48) as usize;
+        let version = r_u32_le(&hdr, 8);
+        let (
+            header_size,
+            n_frames,
+            width,
+            height,
+            pixel_type_code,
+            bytes_per_row,
+            data_offset,
+            bytes_per_image,
+            frame_footer_size,
+        ) = if version >= 0x0100_0000 {
+            let header_size = r_u32_le(&hdr, 40) as u64;
+            let header_start = header_size as usize;
+            if hdr.len() < header_start + 124 {
+                return Err(BioFormatsError::Format(
+                    "DCIMG version 1 header is truncated".into(),
+                ));
+            }
 
-        let (pixel_type, bpp): (PixelType, u8) = match bit_depth {
-            8 => (PixelType::Uint8, 8),
-            32 => (PixelType::Float32, 32),
-            _ => (PixelType::Uint16, 16), // default: 16-bit
+            let n_frames = r_u32_le(&hdr, header_start + 60).max(1);
+            let pixel_type_code = r_u32_le(&hdr, header_start + 64);
+            let width = r_u32_le(&hdr, header_start + 72).max(1);
+            let height = r_u32_le(&hdr, header_start + 76).max(1);
+            let bytes_per_row = r_u32_le(&hdr, header_start + 80) as usize;
+            let bytes_per_image = r_u32_le(&hdr, header_start + 84) as u64;
+            let data_offset = header_size + r_u64_le(&hdr, header_start + 96);
+            let frame_footer_size = r_u32_le(&hdr, header_start + 120) as u64;
+            (
+                header_size,
+                n_frames,
+                width,
+                height,
+                pixel_type_code,
+                bytes_per_row,
+                data_offset,
+                bytes_per_image,
+                frame_footer_size,
+            )
+        } else {
+            let header_size = r_u32_le(&hdr, 16) as u64;
+            let n_frames = r_u32_le(&hdr, 20).max(1);
+            let width = r_u32_le(&hdr, 32).max(1);
+            let height = r_u32_le(&hdr, 36).max(1);
+            let bit_depth = r_u32_le(&hdr, 40);
+            let bytes_per_row = r_u32_le(&hdr, 48) as usize;
+            (
+                header_size,
+                n_frames,
+                width,
+                height,
+                bit_depth,
+                bytes_per_row,
+                if header_size > 64 { header_size } else { 64 },
+                0,
+                0,
+            )
+        };
+
+        let (pixel_type, bpp): (PixelType, u8) = if version >= 0x0100_0000 {
+            match pixel_type_code {
+                1 => (PixelType::Uint8, 8),
+                2 => (PixelType::Uint16, 16),
+                other => {
+                    return Err(BioFormatsError::Format(format!(
+                        "unsupported DCIMG pixel type {other}"
+                    )));
+                }
+            }
+        } else {
+            match pixel_type_code {
+                8 => (PixelType::Uint8, 8),
+                32 => (PixelType::Float32, 32),
+                _ => (PixelType::Uint16, 16), // default: 16-bit
+            }
         };
 
         let bps = pixel_type.bytes_per_sample();
@@ -92,7 +174,9 @@ impl FormatReader for DcimgReader {
             "format".into(),
             MetadataValue::String("Hamamatsu DCIMG".into()),
         );
-        meta_map.insert("bit_depth".into(), MetadataValue::Int(bit_depth as i64));
+        meta_map.insert("version".into(), MetadataValue::Int(version as i64));
+        meta_map.insert("bit_depth".into(), MetadataValue::Int(bpp as i64));
+        meta_map.insert("header_size".into(), MetadataValue::Int(header_size as i64));
 
         self.meta = Some(ImageMetadata {
             size_x: width,
@@ -115,8 +199,11 @@ impl FormatReader for DcimgReader {
             modulo_c: None,
             modulo_t: None,
         });
-        self.data_offset = if header_size > 64 { header_size } else { 64 };
+
+        self.data_offset = data_offset;
         self.bytes_per_row = bpr;
+        self.bytes_per_image = bytes_per_image;
+        self.frame_footer_size = frame_footer_size;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -155,7 +242,12 @@ impl FormatReader for DcimgReader {
             meta.size_x as usize * bps
         };
         let plane_bytes = row_bytes * meta.size_y as usize;
-        let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
+        let frame_stride = if self.bytes_per_image > 0 {
+            self.bytes_per_image + self.frame_footer_size
+        } else {
+            plane_bytes as u64
+        };
+        let offset = self.data_offset + plane_index as u64 * frame_stride;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(offset))

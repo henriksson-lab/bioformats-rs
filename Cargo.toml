@@ -14,7 +14,7 @@ exclude = ["bench"]
 [dependencies]
 thiserror    = "1"
 log          = "0.4"
-hdf5         = { package = "hdf5-metno", version = "0.12" }
+hdf5-pure    = "0.5"
 zip          = "2"
 flate2       = "1"
 weezl        = "0.1"

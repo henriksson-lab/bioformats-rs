@@ -14,16 +14,55 @@ use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
-/// Parse the SIF text header. Returns (width, height, num_frames, data_offset_bytes).
-fn parse_sif_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
+const MAGIC_STRING: &str = "Andor Technology";
+const FOOTER_SIZE: u64 = 8;
+
+#[derive(Debug, Clone)]
+struct SifHeader {
+    width: u32,
+    height: u32,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    image_count: u32,
+    data_offset: u64,
+}
+
+fn parse_u32_token(token: Option<&&str>, label: &str) -> Result<u32> {
+    token
+        .ok_or_else(|| BioFormatsError::Format(format!("Andor SIF: missing {label}")))?
+        .parse::<u32>()
+        .map_err(|_| BioFormatsError::Format(format!("Andor SIF: invalid {label}")))
+}
+
+fn parse_i64_token(token: Option<&&str>, label: &str) -> Result<i64> {
+    token
+        .ok_or_else(|| BioFormatsError::Format(format!("Andor SIF: missing {label}")))?
+        .parse::<i64>()
+        .map_err(|_| BioFormatsError::Format(format!("Andor SIF: invalid {label}")))
+}
+
+fn checked_footer_offset(path: &Path, width: u32, height: u32, image_count: u32) -> Result<u64> {
+    let file_len = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
+    let pixel_bytes = width as u64 * height as u64 * image_count as u64 * 4;
+    file_len
+        .checked_sub(FOOTER_SIZE)
+        .and_then(|len_without_footer| len_without_footer.checked_sub(pixel_bytes))
+        .ok_or_else(|| {
+            BioFormatsError::Format("Andor SIF: file is shorter than declared pixel payload".into())
+        })
+}
+
+/// Parse the SIF text header using Java Bio-Formats' Pixel number layout when
+/// present, with the legacy "32 " acquisition-line parser retained as fallback.
+fn parse_sif_header(path: &Path) -> Result<SifHeader> {
     let f = File::open(path).map_err(BioFormatsError::Io)?;
     let mut reader = BufReader::new(f);
 
     let mut line = String::new();
 
-    // First line must start with "Andor Technology"
     reader.read_line(&mut line).map_err(BioFormatsError::Io)?;
-    if !line.trim_start().contains("Andor Technology") {
+    if !line.starts_with(MAGIC_STRING) {
         return Err(BioFormatsError::Format("Not an Andor SIF file".into()));
     }
 
@@ -44,6 +83,57 @@ fn parse_sif_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
             break;
         }
         let trimmed = line.trim();
+
+        // Java Bio-Formats SIFReader reads:
+        //   Pixel number <C> <X> <Y> <Z> <T>
+        // and then a six-coordinate line used to compute the stored plane size.
+        if trimmed.starts_with("Pixel number") {
+            let parts: Vec<&str> = trimmed.split_ascii_whitespace().collect();
+            let size_c = parse_u32_token(parts.get(2), "SizeC")?;
+            let declared_x = parse_u32_token(parts.get(3), "SizeX")?;
+            let declared_y = parse_u32_token(parts.get(4), "SizeY")?;
+            let size_z = parse_u32_token(parts.get(5), "SizeZ")?;
+            let size_t = parse_u32_token(parts.get(6), "SizeT")?;
+            let image_count = size_c
+                .checked_mul(size_z)
+                .and_then(|v| v.checked_mul(size_t))
+                .ok_or_else(|| BioFormatsError::Format("Andor SIF: plane count overflow".into()))?;
+
+            line.clear();
+            if reader.read_line(&mut line).map_err(BioFormatsError::Io)? == 0 {
+                return Err(BioFormatsError::Format(
+                    "Andor SIF: missing coordinate line after Pixel number".into(),
+                ));
+            }
+            let coords: Vec<&str> = line.split_ascii_whitespace().collect();
+            let x1 = parse_i64_token(coords.get(1), "x1")?;
+            let y1 = parse_i64_token(coords.get(2), "y1")?;
+            let x2 = parse_i64_token(coords.get(3), "x2")?;
+            let y2 = parse_i64_token(coords.get(4), "y2")?;
+            let x3 = parse_i64_token(coords.get(5), "x3")?;
+            let y3 = parse_i64_token(coords.get(6), "y3")?;
+            let computed_width = (x1 - x2).abs() + x3;
+            let computed_height = (y1 - y2).abs() + y3;
+            let width = u32::try_from(computed_width)
+                .ok()
+                .filter(|&v| v > 0)
+                .unwrap_or(declared_x);
+            let height = u32::try_from(computed_height)
+                .ok()
+                .filter(|&v| v > 0)
+                .unwrap_or(declared_y);
+            let data_offset = checked_footer_offset(path, width, height, image_count)?;
+
+            return Ok(SifHeader {
+                width,
+                height,
+                size_z,
+                size_c,
+                size_t,
+                image_count,
+                data_offset,
+            });
+        }
 
         // Look for "Ydet " (height) and "Xdet " (width) labels from older SIF versions
         if trimmed.starts_with("Ydet ") {
@@ -88,7 +178,15 @@ fn parse_sif_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
             if let Ok(byte_count) = trimmed.parse::<u64>() {
                 if byte_count > 0 && width > 0 && height > 0 {
                     let data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
-                    return Ok((width, height, num_frames, data_offset));
+                    return Ok(SifHeader {
+                        width,
+                        height,
+                        size_z: num_frames.max(1),
+                        size_c: 1,
+                        size_t: 1,
+                        image_count: num_frames.max(1),
+                        data_offset,
+                    });
                 }
             }
         }
@@ -101,7 +199,15 @@ fn parse_sif_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
     }
     // Fallback data offset: end of file? Try 0 with a warning
     let data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
-    Ok((width, height, num_frames.max(1), data_offset))
+    Ok(SifHeader {
+        width,
+        height,
+        size_z: num_frames.max(1),
+        size_c: 1,
+        size_t: 1,
+        image_count: num_frames.max(1),
+        data_offset,
+    })
 }
 
 pub struct AndorSifReader {
@@ -135,28 +241,30 @@ impl FormatReader for AndorSifReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // Check for "Andor Technology" in first 64 bytes
-        let s = std::str::from_utf8(&header[..header.len().min(64)]).unwrap_or("");
-        s.contains("Andor Technology")
+        header.starts_with(MAGIC_STRING.as_bytes())
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (width, height, num_frames, data_offset) = parse_sif_header(path)?;
+        let header = parse_sif_header(path)?;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert("format".into(), MetadataValue::String("Andor SIF".into()));
+        meta_map.insert(
+            "sif.pixel_offset".into(),
+            MetadataValue::Int(header.data_offset as i64),
+        );
 
         // SIF stores float32 pixel data
         self.meta = Some(ImageMetadata {
-            size_x: width,
-            size_y: height,
-            size_z: num_frames,
-            size_c: 1,
-            size_t: 1,
+            size_x: header.width,
+            size_y: header.height,
+            size_z: header.size_z,
+            size_c: header.size_c,
+            size_t: header.size_t,
             pixel_type: PixelType::Float32,
             bits_per_pixel: 32,
-            image_count: num_frames,
-            dimension_order: DimensionOrder::XYZCT,
+            image_count: header.image_count,
+            dimension_order: DimensionOrder::XYCZT,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
@@ -168,7 +276,7 @@ impl FormatReader for AndorSifReader {
             modulo_c: None,
             modulo_t: None,
         });
-        self.data_offset = data_offset;
+        self.data_offset = header.data_offset;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -223,6 +331,13 @@ impl FormatReader for AndorSifReader {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let bps = 4usize;
+        if x.checked_add(w).is_none_or(|end| end > meta.size_x)
+            || y.checked_add(h).is_none_or(|end| end > meta.size_y)
+        {
+            return Err(BioFormatsError::InvalidData(
+                "Andor SIF: requested region is outside the image".into(),
+            ));
+        }
         let row = meta.size_x as usize * bps;
         let out_row = w as usize * bps;
         let mut out = Vec::with_capacity(h as usize * out_row);
@@ -238,5 +353,59 @@ impl FormatReader for AndorSifReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("bioformats_andor_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn java_pixel_number_header_uses_footer_relative_pixel_offset() {
+        let path = tmp("pixel_number.sif");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"Andor Technology Multi-Channel File\n");
+        data.extend_from_slice(b"Some original metadata\n");
+        data.extend_from_slice(b"Pixel number 2 4 9 1 1\n");
+        data.extend_from_slice(b"0 1 1 2 4 1 1\n");
+        data.extend_from_slice(b"padding before pixels ignored by footer math\n");
+
+        let mut plane0 = Vec::new();
+        let mut plane1 = Vec::new();
+        for value in 1u32..=8 {
+            plane0.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        for value in 101u32..=108 {
+            plane1.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        data.extend_from_slice(&plane0);
+        data.extend_from_slice(&plane1);
+        data.extend_from_slice(&[0u8; FOOTER_SIZE as usize]);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = AndorSifReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 4);
+        assert_eq!(meta.size_c, 2);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+        assert_eq!(reader.open_bytes(0).unwrap(), plane0);
+        assert_eq!(reader.open_bytes(1).unwrap(), plane1);
+    }
+
+    #[test]
+    fn sif_detection_matches_java_magic_at_start() {
+        let reader = AndorSifReader::new();
+        assert!(reader.is_this_type_by_bytes(b"Andor Technology"));
+        assert!(!reader.is_this_type_by_bytes(b"prefix Andor Technology"));
     }
 }

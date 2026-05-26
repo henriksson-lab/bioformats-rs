@@ -20,6 +20,32 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("bioformats_new_{}", name))
 }
 
+fn minimal_pcx_bytes(
+    x_min: u16,
+    y_min: u16,
+    x_max: u16,
+    y_max: u16,
+    bytes_per_line: u16,
+) -> Vec<u8> {
+    let mut bytes = vec![0u8; 128];
+    bytes[0] = 0x0A;
+    bytes[1] = 5;
+    bytes[2] = 0;
+    bytes[3] = 8;
+    bytes[4..6].copy_from_slice(&x_min.to_le_bytes());
+    bytes[6..8].copy_from_slice(&y_min.to_le_bytes());
+    bytes[8..10].copy_from_slice(&x_max.to_le_bytes());
+    bytes[10..12].copy_from_slice(&y_max.to_le_bytes());
+    bytes[65] = 1;
+    bytes[66..68].copy_from_slice(&bytes_per_line.to_le_bytes());
+
+    if x_max >= x_min && y_max >= y_min {
+        let height = (y_max - y_min + 1) as usize;
+        bytes.extend(std::iter::repeat(0x2A).take(height * bytes_per_line as usize));
+    }
+    bytes
+}
+
 // ── DICOM round-trip ─────────────────────────────────────────────────────────
 
 #[test]
@@ -69,6 +95,47 @@ fn dicom_round_trip_gray16() {
 // ── AVI round-trip ───────────────────────────────────────────────────────────
 
 #[test]
+fn pcx_reader_rejects_inverted_bounds() {
+    let path = tmp("inverted_bounds.pcx");
+    std::fs::write(&path, minimal_pcx_bytes(2, 0, 1, 1, 2)).unwrap();
+
+    let err = bioformats::formats::pcx::PcxReader::new()
+        .set_id(&path)
+        .expect_err("inverted PCX bounds must be rejected");
+
+    assert!(matches!(
+        err,
+        BioFormatsError::InvalidData(message) if message.contains("inverted image bounds")
+    ));
+}
+
+#[test]
+fn pcx_reader_rejects_bytes_per_line_smaller_than_width() {
+    let path = tmp("short_pcx_row.pcx");
+    std::fs::write(&path, minimal_pcx_bytes(0, 0, 1, 1, 1)).unwrap();
+
+    let err = bioformats::formats::pcx::PcxReader::new()
+        .set_id(&path)
+        .expect_err("short PCX rows must be rejected");
+
+    assert!(matches!(
+        err,
+        BioFormatsError::InvalidData(message) if message.contains("bytes_per_line")
+    ));
+}
+
+#[test]
+fn pcx_reader_rejects_out_of_bounds_region() {
+    let path = tmp("pcx_oob_region.pcx");
+    std::fs::write(&path, minimal_pcx_bytes(0, 0, 1, 1, 2)).unwrap();
+
+    let mut reader = bioformats::formats::pcx::PcxReader::new();
+    reader.set_id(&path).unwrap();
+
+    assert!(reader.open_bytes_region(0, 1, 0, 2, 1).is_err());
+}
+
+#[test]
 fn avi_round_trip_gray8() {
     let mut meta = ImageMetadata::default();
     meta.size_x = 8;
@@ -115,6 +182,52 @@ fn avi_round_trip_rgb24_preserves_rows_and_channels() {
     assert_eq!(reader.metadata().size_y, 2);
     assert_eq!(reader.metadata().size_c, 3);
     assert_eq!(reader.open_bytes(0).expect("AVI open_bytes failed"), data);
+}
+
+#[test]
+fn avi_writer_rejects_zero_dimensions_before_creating_file() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 0;
+    meta.size_y = 8;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+
+    let path = tmp("zero_width.avi");
+    let _ = std::fs::remove_file(&path);
+    let err = ImageWriter::save(&path, &meta, &[Vec::new()])
+        .expect_err("zero-width AVI should be rejected");
+
+    assert!(matches!(
+        err,
+        BioFormatsError::InvalidData(message) if message.contains("non-zero")
+    ));
+    assert!(!path.exists(), "AVI writer must not leave partial output");
+}
+
+#[test]
+fn avi_writer_rejects_unrepresentable_riff_sizes_before_creating_file() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = i32::MAX as u32;
+    meta.size_y = 3;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 0;
+
+    let path = tmp("oversized_riff.avi");
+    let _ = std::fs::remove_file(&path);
+    let mut writer = bioformats::formats::avi::AviWriter::new();
+    writer.set_metadata(&meta).unwrap();
+    writer.set_id(&path).unwrap();
+    let err = writer
+        .close()
+        .expect_err("oversized AVI dimensions should be rejected");
+
+    assert!(matches!(
+        err,
+        BioFormatsError::InvalidData(message) if message.contains("32-bit RIFF size limit")
+    ));
+    assert!(!path.exists(), "AVI writer must not leave partial output");
 }
 
 #[test]
@@ -249,6 +362,34 @@ fn avi_reader_rejects_mjpg_compressed_stream() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn avi_reader_rejects_truncated_uncompressed_frame() {
+    let path = tmp("truncated_frame.avi");
+    let bytes = minimal_avi_bytes(b"DIB ", [0, 0, 0, 0], b"00db", &[77], 0, false);
+    std::fs::write(&path, bytes).unwrap();
+
+    let err = bioformats::formats::avi::AviReader::new()
+        .set_id(&path)
+        .expect_err("truncated uncompressed frame must be rejected");
+
+    assert!(matches!(
+        err,
+        BioFormatsError::InvalidData(message) if message.contains("frame chunk is too short")
+    ));
+}
+
+#[test]
+fn avi_reader_rejects_out_of_bounds_region() {
+    let path = tmp("avi_oob_region.avi");
+    let bytes = minimal_avi_bytes(b"DIB ", [0, 0, 0, 0], b"00db", &[77, 0, 0, 0], 0, false);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = bioformats::formats::avi::AviReader::new();
+    reader.set_id(&path).unwrap();
+
+    assert!(reader.open_bytes_region(0, 1, 0, 1, 1).is_err());
 }
 
 fn minimal_avi_bytes(
@@ -608,6 +749,93 @@ fn file_stitcher_assembles_sequence() {
     assert!(p0.iter().all(|&v| v == 0), "plane 0 should be 0");
     assert!(p1.iter().all(|&v| v == 50), "plane 1 should be 50");
     assert!(p2.iter().all(|&v| v == 100), "plane 2 should be 100");
+}
+
+#[test]
+fn file_stitcher_uses_channel_axis_from_filenames() {
+    use bioformats::FileStitcher;
+
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 4;
+    meta.size_y = 4;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    for c in 0..3u8 {
+        let path = tmp(&format!("axis_c{:03}.tif", c));
+        let data = vec![c * 40; 16];
+        ImageWriter::save(&path, &meta, &[data]).expect("write failed");
+    }
+
+    let mut stitcher = FileStitcher::open(&tmp("axis_c001.tif")).expect("stitch failed");
+    let smeta = stitcher.metadata();
+    assert_eq!((smeta.size_z, smeta.size_c, smeta.size_t), (1, 3, 1));
+    assert_eq!(smeta.image_count, 3);
+
+    for c in 0..3u8 {
+        let plane = stitcher.open_bytes(c as u32).expect("plane");
+        assert!(plane.iter().all(|&v| v == c * 40));
+    }
+}
+
+#[test]
+fn file_stitcher_uses_time_axis_from_filenames() {
+    use bioformats::FileStitcher;
+
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 4;
+    meta.size_y = 4;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    for t in 0..3u8 {
+        let path = tmp(&format!("axis_t{:03}.tif", t));
+        let data = vec![t * 50; 16];
+        ImageWriter::save(&path, &meta, &[data]).expect("write failed");
+    }
+
+    let mut stitcher = FileStitcher::open(&tmp("axis_t001.tif")).expect("stitch failed");
+    let smeta = stitcher.metadata();
+    assert_eq!((smeta.size_z, smeta.size_c, smeta.size_t), (1, 1, 3));
+    assert_eq!(smeta.image_count, 3);
+
+    for t in 0..3u8 {
+        let plane = stitcher.open_bytes(t as u32).expect("plane");
+        assert!(plane.iter().all(|&v| v == t * 50));
+    }
+}
+
+#[test]
+fn file_stitcher_maps_mixed_time_channel_filenames() {
+    use bioformats::FileStitcher;
+
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 4;
+    meta.size_y = 4;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    for t in 0..2u8 {
+        for c in 0..2u8 {
+            let path = tmp(&format!("axis_t{:03}_c{:03}.tif", t, c));
+            let data = vec![10 + t * 20 + c * 5; 16];
+            ImageWriter::save(&path, &meta, &[data]).expect("write failed");
+        }
+    }
+
+    let mut stitcher = FileStitcher::open(&tmp("axis_t001_c000.tif")).expect("stitch failed");
+    let smeta = stitcher.metadata();
+    assert_eq!((smeta.size_z, smeta.size_c, smeta.size_t), (1, 2, 2));
+    assert_eq!(smeta.image_count, 4);
+
+    let expected = [10, 30, 15, 35];
+    for (plane_index, value) in expected.into_iter().enumerate() {
+        let plane = stitcher
+            .open_bytes(plane_index as u32)
+            .expect("stitched plane");
+        assert_eq!(plane[0], value, "plane {plane_index}");
+        assert!(plane.iter().all(|&v| v == value));
+    }
 }
 
 // ── Helper ───────────────────────────────────────────────────────────────────

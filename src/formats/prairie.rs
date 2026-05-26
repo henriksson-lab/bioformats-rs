@@ -102,7 +102,12 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         32 => PixelType::Float32,
         _ => PixelType::Uint16,
     };
-    let image_count = tiff_files.len().max(1) as u32;
+    if tiff_files.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "PrairieView XML does not reference any companion TIFF image files".into(),
+        ));
+    }
+    let image_count = tiff_files.len() as u32;
 
     let meta = ImageMetadata {
         size_x: width,
@@ -191,14 +196,6 @@ impl FormatReader for PrairieReader {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        if self.tiff_files.is_empty() {
-            return Ok(vec![
-                0u8;
-                meta.size_x as usize
-                    * meta.size_y as usize
-                    * meta.pixel_type.bytes_per_sample()
-            ]);
         }
         let tiff_path = self.tiff_files[plane_index as usize % self.tiff_files.len()].clone();
         let mut tiff = crate::tiff::TiffReader::new();
@@ -301,7 +298,12 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         }
     }
 
-    let image_count = tiff_files.len().max(1) as u32;
+    if tiff_files.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Leica TCS XML does not reference any companion TIFF image files".into(),
+        ));
+    }
+    let image_count = tiff_files.len() as u32;
 
     let meta = ImageMetadata {
         size_x: width,
@@ -389,9 +391,6 @@ impl FormatReader for LeicaTcsReader {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        if self.tiff_files.is_empty() {
-            return Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * 2]);
         }
         let tiff_path = self.tiff_files[plane_index as usize % self.tiff_files.len()].clone();
         let mut tiff = crate::tiff::TiffReader::new();

@@ -24,6 +24,9 @@ fn read_i32_le(data: &[u8], off: usize) -> i32 {
 fn read_u32_le(data: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
+fn read_u32_be(data: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+}
 fn read_f32_le(data: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
@@ -32,6 +35,63 @@ fn read_i32_be(data: &[u8], off: usize) -> i32 {
 }
 fn read_f32_be(data: &[u8], off: usize) -> f32 {
     f32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+}
+
+fn plausible_mode(mode: i32) -> bool {
+    matches!(mode, 0 | 1 | 2 | 3 | 4 | 6 | 16)
+}
+
+fn plausible_dimension(value: i32) -> bool {
+    value > 0 && value <= 1_000_000
+}
+
+fn endian_score(buf: &[u8], little_endian: bool) -> i32 {
+    let read_i32 = if little_endian {
+        read_i32_le
+    } else {
+        read_i32_be
+    };
+    let nx = read_i32(buf, 0);
+    let ny = read_i32(buf, 4);
+    let nz = read_i32(buf, 8);
+    let mode = read_i32(buf, 12);
+    let mapc = read_i32(buf, 64);
+    let mapr = read_i32(buf, 68);
+    let maps = read_i32(buf, 72);
+
+    let mut score = 0;
+    if plausible_dimension(nx) {
+        score += 2;
+    }
+    if plausible_dimension(ny) {
+        score += 2;
+    }
+    if plausible_dimension(nz) {
+        score += 2;
+    }
+    if plausible_mode(mode) {
+        score += 3;
+    }
+    if valid_axis_permutation(mapc, mapr, maps) {
+        score += 2;
+    }
+    score
+}
+
+fn detect_little_endian(buf: &[u8]) -> bool {
+    let le_score = endian_score(buf, true);
+    let be_score = endian_score(buf, false);
+    if le_score != be_score {
+        return le_score > be_score;
+    }
+
+    // MRC2014 machine stamp, when present and not contradicted by header
+    // plausibility, uses 0x44 for little-endian and 0x11 for big-endian.
+    match buf[212] {
+        0x11 => false,
+        0x44 => true,
+        _ => true,
+    }
 }
 
 struct MrcHeader {
@@ -65,10 +125,10 @@ fn parse_header(buf: &[u8]) -> Result<MrcHeader> {
         return Err(BioFormatsError::Format("MRC header too short".into()));
     }
 
-    // Endianness: byte 212 — 'D' (0x44) = little-endian, 'A' (0x11=17) = big-endian
-    // Alternatively check the magic stamp at 52-55 (MRC2014: "MAP ")
-    let endian_byte = buf[212];
-    let little_endian = endian_byte != 17; // 'A'=17 means big-endian; anything else = LE
+    // Some legacy MRC/IMOD files either omit the modern machine stamp or carry
+    // a misleading first stamp byte. Prefer the endian interpretation that
+    // yields plausible dimensions, mode, and axis metadata.
+    let little_endian = detect_little_endian(buf);
 
     let (nx, ny, nz, mode) = if little_endian {
         (
@@ -152,7 +212,7 @@ fn parse_header(buf: &[u8]) -> Result<MrcHeader> {
     let imod_stamp = if little_endian {
         read_u32_le(buf, 152)
     } else {
-        buf[152..156].iter().fold(0u32, |a, &b| (a << 8) | b as u32)
+        read_u32_be(buf, 152)
     };
     let imod_flags = if little_endian {
         read_i32_le(buf, 156)
@@ -682,6 +742,50 @@ mod tests {
         path
     }
 
+    fn write_imod_signed_mode0_fixture() -> PathBuf {
+        let path = write_mrc_fixture("imod_signed_mode0", 1, 2, 3, 0, 0.0);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[152..156].copy_from_slice(&IMOD_STAMP.to_le_bytes());
+        bytes[156..160].copy_from_slice(&1i32.to_le_bytes());
+        bytes[HEADER_SIZE as usize..HEADER_SIZE as usize + 4]
+            .copy_from_slice(&[0x80, 0xff, 0x00, 0x7f]);
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn write_old_big_endian_mode0_fixture() -> PathBuf {
+        let path = temp_mrc_path("old_big_endian_mode0");
+        let mut bytes = vec![0u8; HEADER_SIZE as usize];
+        bytes[0..4].copy_from_slice(&2i32.to_be_bytes());
+        bytes[4..8].copy_from_slice(&2i32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&1i32.to_be_bytes());
+        bytes[12..16].copy_from_slice(&0i32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&2i32.to_be_bytes());
+        bytes[32..36].copy_from_slice(&2i32.to_be_bytes());
+        bytes[36..40].copy_from_slice(&1i32.to_be_bytes());
+        bytes[40..44].copy_from_slice(&2.0f32.to_be_bytes());
+        bytes[44..48].copy_from_slice(&2.0f32.to_be_bytes());
+        bytes[48..52].copy_from_slice(&1.0f32.to_be_bytes());
+        bytes[64..68].copy_from_slice(&1i32.to_be_bytes());
+        bytes[68..72].copy_from_slice(&2i32.to_be_bytes());
+        bytes[72..76].copy_from_slice(&3i32.to_be_bytes());
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn write_old_little_endian_mode0_fixture_with_ambiguous_stamp() -> PathBuf {
+        let path = write_mrc_fixture("old_little_endian_ambiguous_stamp", 1, 2, 3, 0, 0.0);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[208..212].copy_from_slice(b"MAP ");
+        bytes[212] = 0x11;
+        bytes[213] = 0;
+        bytes[214] = 0;
+        bytes[215] = 0;
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
     fn read_fixture(path: &Path) -> (Vec<u8>, bool) {
         let mut reader = MrcReader::new();
         reader.set_id(path).unwrap();
@@ -731,5 +835,53 @@ mod tests {
 
         assert!(!flip_y);
         assert_eq!(plane, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn mrc_reader_uses_imod_signed_mode0_pixel_type() {
+        let path = write_imod_signed_mode0_fixture();
+        let mut reader = MrcReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata().clone();
+        let plane = reader.open_bytes(0).unwrap();
+        fs::remove_file(path).ok();
+
+        assert_eq!(meta.pixel_type, PixelType::Int8);
+        assert_eq!(meta.bits_per_pixel, 8);
+        assert_eq!(plane, vec![0x00, 0x7f, 0x80, 0xff]);
+    }
+
+    #[test]
+    fn mrc_reader_detects_legacy_big_endian_without_machine_stamp() {
+        let path = write_old_big_endian_mode0_fixture();
+        let mut reader = MrcReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata().clone();
+        let plane = reader.open_bytes(0).unwrap();
+        fs::remove_file(path).ok();
+
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert!(!meta.is_little_endian);
+        assert_eq!(plane, vec![3, 4, 1, 2]);
+    }
+
+    #[test]
+    fn mrc_reader_prefers_plausible_little_endian_over_ambiguous_stamp() {
+        let path = write_old_little_endian_mode0_fixture_with_ambiguous_stamp();
+        let mut reader = MrcReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata().clone();
+        let plane = reader.open_bytes(0).unwrap();
+        fs::remove_file(path).ok();
+
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert!(meta.is_little_endian);
+        assert_eq!(plane, vec![3, 4, 1, 2]);
     }
 }

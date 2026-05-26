@@ -65,46 +65,60 @@ fn scan_width_height(data: &[u8]) -> (u32, u32) {
     (width, height)
 }
 
-fn parse_visitech(path: &Path) -> Result<ImageMetadata> {
+fn collect_companion_tiffs(path: &Path) -> Vec<PathBuf> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|rd| rd.filter_map(|e| e.ok()))
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn parse_visitech(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
     let data = std::fs::read(path).unwrap_or_default();
     let (width, height) = scan_width_height(&data);
 
-    // Count companion TIFFs in same directory
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let image_count = if let Ok(rd) = std::fs::read_dir(dir) {
-        rd.filter_map(|e| e.ok())
-            .filter(|e| {
-                let name = e.file_name();
-                let s = name.to_string_lossy().to_ascii_lowercase();
-                s.ends_with(".tif") || s.ends_with(".tiff")
-            })
-            .count() as u32
-    } else {
-        1
-    };
-    let image_count = image_count.max(1);
+    let image_files = collect_companion_tiffs(path);
+    if image_files.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Visitech XYS does not have any companion TIFF image files".into(),
+        ));
+    }
+    let image_count = image_files.len() as u32;
 
-    Ok(ImageMetadata {
-        size_x: width,
-        size_y: height,
-        size_z: image_count,
-        size_c: 1,
-        size_t: 1,
-        pixel_type: PixelType::Uint16,
-        bits_per_pixel: 16,
-        image_count,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: true,
-        resolution_count: 1,
-        series_metadata: HashMap::new(),
-        lookup_table: None,
-        modulo_z: None,
-        modulo_c: None,
-        modulo_t: None,
-    })
+    Ok((
+        ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: image_count,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        },
+        image_files,
+    ))
 }
 
 impl FormatReader for VisitechReader {
@@ -121,25 +135,10 @@ impl FormatReader for VisitechReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let meta = parse_visitech(path)?;
+        let (meta, image_files) = parse_visitech(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
-        // Collect companion TIFFs
-        let dir = path.parent().unwrap_or(Path::new("."));
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            let mut files: Vec<PathBuf> = rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
-                        .unwrap_or(false)
-                })
-                .collect();
-            files.sort();
-            self.image_files = files;
-        }
+        self.image_files = image_files;
         Ok(())
     }
 
@@ -175,8 +174,10 @@ impl FormatReader for VisitechReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = meta.pixel_type.bytes_per_sample();
-        Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * bps])
+        let tiff_path = self.image_files[plane_index as usize % self.image_files.len()].clone();
+        let mut tiff = crate::tiff::TiffReader::new();
+        tiff.set_id(&tiff_path)?;
+        tiff.open_bytes(0)
     }
 
     fn open_bytes_region(

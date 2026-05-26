@@ -22,9 +22,10 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue, ModuloAnnotation};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 fn r_i16_le(b: &[u8], off: usize) -> i16 {
     i16::from_le_bytes([b[off], b[off + 1]])
@@ -549,5 +550,579 @@ impl FormatReader for SdtReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LiFlimLayout {
+    compression: String,
+    datatype: String,
+    packing: String,
+    size_x: u32,
+    size_y: u32,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    phases: u32,
+    frequencies: u32,
+    pixel_type: PixelType,
+    bits_per_pixel: u8,
+    uint12_packed: bool,
+}
+
+/// Reader for Lambert Instruments LI-FLIM `.fli` files.
+///
+/// This ports the bounded Java `LiFlimReader` header contract and raw pixel
+/// paths: INI header terminated by `{END}`, version 1.0/2.0 dimensional keys,
+/// gzip flag, and UINT12 packed-pixel expansion.
+pub struct LiFlimReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    data_offset: u64,
+    layout: Option<LiFlimLayout>,
+}
+
+impl LiFlimReader {
+    pub fn new() -> Self {
+        Self {
+            path: None,
+            meta: None,
+            data_offset: 0,
+            layout: None,
+        }
+    }
+}
+
+impl Default for LiFlimReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for LiFlimReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("fli"))
+            .unwrap_or(false)
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.windows(b"{END}".len()).any(|w| w == b"{END}")
+            && std::str::from_utf8(header)
+                .map(|s| s.contains("FLIMIMAGE") || s.contains("pixelFormat"))
+                .unwrap_or(false)
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+        let (header, data_offset) = read_liflim_header(&mut file)?;
+        let ini = parse_liflim_ini(&header);
+        let layout = parse_liflim_layout(&ini)?;
+
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert("format".into(), MetadataValue::String("LI-FLIM".into()));
+        series_metadata.insert(
+            "compression".into(),
+            MetadataValue::String(layout.compression.clone()),
+        );
+        series_metadata.insert(
+            "datatype".into(),
+            MetadataValue::String(layout.datatype.clone()),
+        );
+        series_metadata.insert(
+            "packing".into(),
+            MetadataValue::String(layout.packing.clone()),
+        );
+
+        self.meta = Some(ImageMetadata {
+            size_x: layout.size_x,
+            size_y: layout.size_y,
+            size_z: layout.size_z,
+            size_c: layout.size_c,
+            size_t: layout.size_t,
+            pixel_type: layout.pixel_type,
+            bits_per_pixel: layout.bits_per_pixel,
+            image_count: layout.size_z.saturating_mul(layout.size_t),
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: layout.size_c > 1,
+            is_interleaved: true,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: Some(ModuloAnnotation {
+                parent_dimension: "Z".into(),
+                modulo_type: "frequency".into(),
+                start: 0.0,
+                step: layout.size_z as f64 / layout.frequencies.max(1) as f64,
+                end: layout.size_z.saturating_sub(1) as f64,
+                unit: String::new(),
+                labels: Vec::new(),
+            }),
+            modulo_c: None,
+            modulo_t: Some(ModuloAnnotation {
+                parent_dimension: "T".into(),
+                modulo_type: "phase".into(),
+                start: 0.0,
+                step: layout.size_t as f64 / layout.phases.max(1) as f64,
+                end: layout.size_t.saturating_sub(1) as f64,
+                unit: String::new(),
+                labels: Vec::new(),
+            }),
+        });
+        self.data_offset = data_offset;
+        self.layout = Some(layout);
+        self.path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.data_offset = 0;
+        self.layout = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        1
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self
+            .layout
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+
+        let plane_bytes = liflim_plane_bytes(meta)?;
+        let stored_plane_bytes = if layout.uint12_packed {
+            plane_bytes
+                .checked_mul(3)
+                .and_then(|n| n.checked_div(4))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("LI-FLIM UINT12 plane size overflow".into())
+                })?
+        } else {
+            plane_bytes
+        };
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        let mut payload = Vec::new();
+        File::open(path)
+            .map_err(BioFormatsError::Io)?
+            .read_to_end(&mut payload)
+            .map_err(BioFormatsError::Io)?;
+        let data = payload
+            .get(self.data_offset as usize..)
+            .ok_or_else(|| BioFormatsError::Format("LI-FLIM data offset is beyond EOF".into()))?;
+        let decoded = match layout.compression.as_str() {
+            "0" => data.to_vec(),
+            "1" => {
+                let mut decoder = flate2::read::GzDecoder::new(Cursor::new(data));
+                let mut out = Vec::new();
+                decoder.read_to_end(&mut out).map_err(|e| {
+                    BioFormatsError::Codec(format!("LI-FLIM gzip decode failed: {e}"))
+                })?;
+                out
+            }
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "LI-FLIM unknown compression type: {other}"
+                )));
+            }
+        };
+
+        let offset = (plane_index as usize)
+            .checked_mul(stored_plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("LI-FLIM plane offset overflow".into()))?;
+        let end = offset
+            .checked_add(stored_plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("LI-FLIM plane end overflow".into()))?;
+        let stored = decoded.get(offset..end).ok_or_else(|| {
+            BioFormatsError::InvalidData(format!(
+                "LI-FLIM payload shorter than declared plane {plane_index}"
+            ))
+        })?;
+
+        if layout.uint12_packed {
+            let unpacked = if layout.packing.eq_ignore_ascii_case("msb") {
+                liflim_convert12_to_16_msb(stored)
+            } else {
+                liflim_convert12_to_16_lsb(stored)
+            };
+            if unpacked.len() != plane_bytes {
+                return Err(BioFormatsError::InvalidData(
+                    "LI-FLIM UINT12 payload is not a whole number of packed samples".into(),
+                ));
+            }
+            Ok(unpacked)
+        } else {
+            Ok(stored.to_vec())
+        }
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().unwrap();
+        crop_full_plane("LI-FLIM", &full, meta, meta.size_c as usize, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
+        let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+fn read_liflim_header(file: &mut File) -> Result<(String, u64)> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(BioFormatsError::Io)?;
+    let end = bytes
+        .windows(b"{END}".len())
+        .position(|w| w == b"{END}")
+        .ok_or_else(|| BioFormatsError::Format("LI-FLIM header missing {END}".into()))?;
+    let data_offset = end + b"{END}".len();
+    let header = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    Ok((header, data_offset as u64))
+}
+
+fn parse_liflim_ini(text: &str) -> HashMap<String, HashMap<String, String>> {
+    let mut tables: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut current = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            current = section.trim().to_string();
+            tables.entry(current.clone()).or_default();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        tables
+            .entry(current.clone())
+            .or_default()
+            .insert(key.trim().to_string(), value.trim().to_string());
+    }
+    tables
+}
+
+fn parse_liflim_layout(ini: &HashMap<String, HashMap<String, String>>) -> Result<LiFlimLayout> {
+    let version = liflim_find_key(ini, "version").unwrap_or_else(|| "1.0".into());
+    let (
+        datatype,
+        packing,
+        channels,
+        x_len,
+        y_len,
+        z_len,
+        phases,
+        frequencies,
+        timestamps,
+        compression,
+    ) = if version == "2.0" {
+        let base = ini.get("").ok_or_else(|| {
+            BioFormatsError::Format("LI-FLIM 2.0 header missing default table".into())
+        })?;
+        let datatype = required_liflim_key(base, "pixelFormat")?;
+        (
+            datatype.clone(),
+            liflim_pixel_format_packing(&datatype),
+            "1".into(),
+            required_liflim_key(base, "x")?,
+            required_liflim_key(base, "y")?,
+            required_liflim_key(base, "z")?,
+            "1".into(),
+            "1".into(),
+            required_liflim_key(base, "numberOfFrames")?,
+            "0".into(),
+        )
+    } else {
+        let layout = ini.get("FLIMIMAGE: LAYOUT").ok_or_else(|| {
+            BioFormatsError::Format("LI-FLIM header missing FLIMIMAGE: LAYOUT table".into())
+        })?;
+        let info = ini.get("FLIMIMAGE: INFO").ok_or_else(|| {
+            BioFormatsError::Format("LI-FLIM header missing FLIMIMAGE: INFO table".into())
+        })?;
+        (
+            required_liflim_key(layout, "datatype")?,
+            layout.get("packing").cloned().unwrap_or_default(),
+            required_liflim_key(layout, "channels")?,
+            required_liflim_key(layout, "x")?,
+            required_liflim_key(layout, "y")?,
+            required_liflim_key(layout, "z")?,
+            required_liflim_key(layout, "phases")?,
+            required_liflim_key(layout, "frequencies")?,
+            required_liflim_key(layout, "timestamps")?,
+            info.get("compression")
+                .cloned()
+                .unwrap_or_else(|| "0".into()),
+        )
+    };
+
+    let size_x = parse_liflim_u32("x", &x_len)?;
+    let size_y = parse_liflim_u32("y", &y_len)?;
+    let channels = parse_liflim_u32("channels", &channels)?;
+    let z = parse_liflim_u32("z", &z_len)?;
+    let phases = parse_liflim_u32("phases", &phases)?;
+    let frequencies = parse_liflim_u32("frequencies", &frequencies)?;
+    let timestamps = parse_liflim_u32("timestamps", &timestamps)?;
+    let (pixel_type, bits_per_pixel, uint12_packed) =
+        liflim_pixel_type(&datatype, packing.as_str())?;
+
+    Ok(LiFlimLayout {
+        compression,
+        datatype,
+        packing,
+        size_x,
+        size_y,
+        size_z: z.saturating_mul(frequencies),
+        size_c: channels,
+        size_t: timestamps.saturating_mul(phases),
+        phases,
+        frequencies,
+        pixel_type,
+        bits_per_pixel,
+        uint12_packed,
+    })
+}
+
+fn required_liflim_key(table: &HashMap<String, String>, key: &str) -> Result<String> {
+    table
+        .get(key)
+        .cloned()
+        .ok_or_else(|| BioFormatsError::Format(format!("LI-FLIM header missing {key}")))
+}
+
+fn liflim_find_key(ini: &HashMap<String, HashMap<String, String>>, key: &str) -> Option<String> {
+    ini.values().find_map(|table| table.get(key).cloned())
+}
+
+fn parse_liflim_u32(key: &str, value: &str) -> Result<u32> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| BioFormatsError::Format(format!("LI-FLIM invalid {key}: {value}")))?;
+    if parsed == 0 {
+        Err(BioFormatsError::Format(format!(
+            "LI-FLIM {key} must be non-zero"
+        )))
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn liflim_pixel_format_packing(datatype: &str) -> String {
+    let lower = datatype.to_ascii_lowercase();
+    if lower.contains("msb") {
+        "msb".into()
+    } else if lower.contains("lsb") {
+        "lsb".into()
+    } else {
+        String::new()
+    }
+}
+
+fn liflim_pixel_type(datatype: &str, packing: &str) -> Result<(PixelType, u8, bool)> {
+    let upper = datatype.to_ascii_uppercase();
+    if upper == "UINT8" || liflim_pixel_format_bits(&upper) == Some(8) {
+        Ok((PixelType::Uint8, 8, false))
+    } else if upper == "INT8" {
+        Ok((PixelType::Int8, 8, false))
+    } else if upper == "UINT16" || matches!(liflim_pixel_format_bits(&upper), Some(10 | 14 | 16)) {
+        Ok((PixelType::Uint16, 16, false))
+    } else if upper == "INT16" {
+        Ok((PixelType::Int16, 16, false))
+    } else if upper == "UINT32" {
+        Ok((PixelType::Uint32, 32, false))
+    } else if upper == "INT32" {
+        Ok((PixelType::Int32, 32, false))
+    } else if upper == "REAL32" {
+        Ok((PixelType::Float32, 32, false))
+    } else if upper == "REAL64" {
+        Ok((PixelType::Float64, 64, false))
+    } else if upper == "UINT12" || liflim_pixel_format_bits(&upper) == Some(12) {
+        Ok((PixelType::Uint16, 12, !packing.is_empty()))
+    } else {
+        Err(BioFormatsError::Format(format!(
+            "LI-FLIM unknown data type: {datatype}"
+        )))
+    }
+}
+
+fn liflim_pixel_format_bits(datatype: &str) -> Option<u8> {
+    let digits: String = datatype.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn liflim_plane_bytes(meta: &ImageMetadata) -> Result<usize> {
+    meta.size_x
+        .checked_mul(meta.size_y)
+        .and_then(|n| n.checked_mul(meta.size_c))
+        .and_then(|n| (n as usize).checked_mul(meta.pixel_type.bytes_per_sample()))
+        .ok_or_else(|| BioFormatsError::Format("LI-FLIM plane size overflow".into()))
+}
+
+fn liflim_convert12_to_16_lsb(image: &[u8]) -> Vec<u8> {
+    let mut image16 = vec![0; image.len() * 4 / 3];
+    if image16.len() / 4 != image.len() / 3 {
+        return Vec::new();
+    }
+    for (chunk, out) in image.chunks_exact(3).zip(image16.chunks_exact_mut(4)) {
+        out[0] = chunk[0];
+        out[1] = chunk[1] & 0x0f;
+        out[2] = ((chunk[1] & 0xf0) >> 4) | ((chunk[2] & 0x0f) << 4);
+        out[3] = (chunk[2] & 0xf0) >> 4;
+    }
+    image16
+}
+
+fn liflim_convert12_to_16_msb(image: &[u8]) -> Vec<u8> {
+    let mut image16 = vec![0; image.len() * 4 / 3];
+    if image16.len() / 4 != image.len() / 3 {
+        return Vec::new();
+    }
+    for (chunk, out) in image.chunks_exact(3).zip(image16.chunks_exact_mut(4)) {
+        out[0] = ((chunk[0] & 0x0f) << 4) | ((chunk[1] & 0xf0) >> 4);
+        out[1] = (chunk[0] & 0xf0) >> 4;
+        out[2] = chunk[2];
+        out[3] = chunk[1] & 0x0f;
+    }
+    image16
+}
+
+#[cfg(test)]
+mod liflim_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_liflim_{nanos}_{name}"))
+    }
+
+    fn write_liflim(path: &Path, header: &str, payload: &[u8]) {
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(b"{END}");
+        bytes.extend_from_slice(payload);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn liflim_reads_uncompressed_version1_planes_and_regions() {
+        let path = temp_path("raw.fli");
+        let header = "\
+[FLIMIMAGE: INFO]
+version=1.0
+compression=0
+[FLIMIMAGE: LAYOUT]
+datatype=UINT16
+packing=lsb
+channels=1
+x=3
+y=2
+z=1
+phases=1
+frequencies=1
+timestamps=2
+";
+        let mut payload = Vec::new();
+        for value in 1u16..=12 {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        write_liflim(&path, header, &payload);
+
+        let mut reader = LiFlimReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(
+            (
+                meta.size_x,
+                meta.size_y,
+                meta.size_z,
+                meta.size_c,
+                meta.size_t
+            ),
+            (3, 2, 1, 1, 2)
+        );
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert_eq!(meta.image_count, 2);
+
+        assert_eq!(reader.open_bytes(1).unwrap(), payload[12..24].to_vec());
+        assert_eq!(
+            reader.open_bytes_region(1, 1, 0, 2, 1).unwrap(),
+            vec![8, 0, 9, 0]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn liflim_expands_uint12_lsb_payloads_like_java() {
+        let path = temp_path("uint12.fli");
+        let header = "\
+[FLIMIMAGE: INFO]
+compression=0
+[FLIMIMAGE: LAYOUT]
+datatype=UINT12
+packing=lsb
+channels=1
+x=2
+y=1
+z=1
+phases=1
+frequencies=1
+timestamps=1
+";
+        write_liflim(&path, header, &[0xbc, 0x3a, 0x12]);
+
+        let mut reader = LiFlimReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().bits_per_pixel, 12);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0xbc, 0x0a, 0x23, 0x01]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn liflim_uint12_msb_helper_matches_java_byte_order() {
+        assert_eq!(
+            liflim_convert12_to_16_msb(&[0xab, 0xc1, 0x23]),
+            vec![0xbc, 0x0a, 0x23, 0x01]
+        );
+        assert_eq!(liflim_convert12_to_16_lsb(&[1, 2]), vec![0, 0]);
     }
 }

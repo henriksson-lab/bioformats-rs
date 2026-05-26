@@ -563,19 +563,8 @@ impl FormatReader for QuesantReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        let _ = plane_index;
+        Err(unsupported_raw_spm("Quesant AFM"))
     }
 
     fn open_bytes_region(
@@ -586,12 +575,8 @@ impl FormatReader for QuesantReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let _ = (plane_index, _x, _y, w, h);
+        Err(unsupported_raw_spm("Quesant AFM"))
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -825,22 +810,31 @@ impl FormatReader for JpkReader {
 // Raw binary reader — WaTom SPM
 // ===========================================================================
 
-/// WaTom SPM reader (`.wap`, `.opo`, `.opz`, `.opt`).
+/// WA Technology TOP reader (`.wat`, plus legacy aliases).
 ///
-/// Binary format. Falls back to raw uint16 square heuristic.
+/// Java Bio-Formats uses a 4864-byte little-endian header followed by raw
+/// signed 16-bit pixels.
 pub struct WatopReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
 }
 
 impl WatopReader {
+    const HEADER_SIZE: usize = 4864;
+    const MAGIC: &'static [u8] = b"0TOPSystem W.A.Technology";
+
     pub fn new() -> Self {
         WatopReader {
             path: None,
             meta: None,
-            data_offset: 0,
         }
+    }
+
+    fn read_i32_le(data: &[u8], offset: usize, label: &str) -> Result<i32> {
+        let bytes = data.get(offset..offset + 4).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!("WA Technology TOP header missing {label}"))
+        })?;
+        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
 
@@ -858,23 +852,105 @@ impl FormatReader for WatopReader {
             .map(|e| e.to_ascii_lowercase());
         matches!(
             ext.as_deref(),
-            Some("wap") | Some("opo") | Some("opz") | Some("opt")
+            Some("wat") | Some("wap") | Some("opo") | Some("opz") | Some("opt")
         )
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(Self::MAGIC)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let _ = path;
-        Err(unsupported_raw_spm("WaTop SPM"))
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < Self::HEADER_SIZE {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "WA Technology TOP file is shorter than the 4864-byte header".into(),
+            ));
+        }
+        if !data.starts_with(Self::MAGIC) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "WA Technology TOP file is missing 0TOPSystem W.A.Technology magic".into(),
+            ));
+        }
+
+        let width = Self::read_i32_le(&data, 259, "width")?;
+        let height = Self::read_i32_le(&data, 263, "height")?;
+        if width <= 0 || height <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "WA Technology TOP header contains invalid image dimensions".into(),
+            ));
+        }
+        let width = width as u32;
+        let height = height as u32;
+        let expected = (Self::HEADER_SIZE as u64)
+            .checked_add(width as u64 * height as u64 * 2)
+            .ok_or_else(|| BioFormatsError::Format("WA Technology TOP size overflows".into()))?;
+        let file_len = data.len() as u64;
+        if file_len < expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "WA Technology TOP pixel payload is shorter than declared dimensions {width}x{height}"
+            )));
+        }
+
+        let comment_bytes = data.get(49..82).unwrap_or(&[]);
+        let comment = String::from_utf8_lossy(comment_bytes)
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+        let mut series_metadata = HashMap::new();
+        if !comment.is_empty() {
+            series_metadata.insert(
+                "Comment".to_string(),
+                crate::common::metadata::MetadataValue::String(comment),
+            );
+        }
+        if let Ok(x_size) = Self::read_i32_le(&data, 247, "x size") {
+            series_metadata.insert(
+                "X size (in um)".to_string(),
+                crate::common::metadata::MetadataValue::Float(x_size as f64 / 100.0),
+            );
+        }
+        if let Ok(y_size) = Self::read_i32_le(&data, 251, "y size") {
+            series_metadata.insert(
+                "Y size (in um)".to_string(),
+                crate::common::metadata::MetadataValue::Float(y_size as f64 / 100.0),
+            );
+        }
+        if let Ok(z_size) = Self::read_i32_le(&data, 255, "z size") {
+            series_metadata.insert(
+                "Z size (in um)".to_string(),
+                crate::common::metadata::MetadataValue::Float(z_size as f64 / 100.0),
+            );
+        }
+
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Int16,
+            bits_per_pixel: 16,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.data_offset = 0;
         Ok(())
     }
 
@@ -903,14 +979,13 @@ impl FormatReader for WatopReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(Self::HEADER_SIZE as u64))
             .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        let n_bytes = meta.size_x as usize * meta.size_y as usize * 2;
+        let mut buf = vec![0; n_bytes];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
@@ -922,12 +997,16 @@ impl FormatReader for WatopReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("WA Technology TOP", &full, &meta, 1, _x, _y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -959,21 +1038,41 @@ impl FormatReader for WatopReader {
 // Raw binary reader — VG SAM
 // ===========================================================================
 
-/// VG SAM reader (`.vgsam`).
+/// VG SAM reader (`.dti`, plus legacy `.vgsam` alias).
 ///
-/// Binary format. Falls back to raw uint16 square heuristic.
+/// Java Bio-Formats uses `VGS` magic, big-endian dimensions at offsets
+/// 348/352, bytes-per-pixel at 360, and pixels at offset 368.
 pub struct VgSamReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
 }
 
 impl VgSamReader {
+    const PIXEL_OFFSET: usize = 368;
+    const MAGIC: &'static [u8] = b"VGS";
+
     pub fn new() -> Self {
         VgSamReader {
             path: None,
             meta: None,
-            data_offset: 0,
+        }
+    }
+
+    fn read_i32_be(data: &[u8], offset: usize, label: &str) -> Result<i32> {
+        let bytes = data.get(offset..offset + 4).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!("VG SAM header missing {label}"))
+        })?;
+        Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn pixel_type_from_bpp(bytes_per_pixel: i32) -> Result<(PixelType, u8)> {
+        match bytes_per_pixel {
+            1 => Ok((PixelType::Uint8, 8)),
+            2 => Ok((PixelType::Uint16, 16)),
+            4 => Ok((PixelType::Float32, 32)),
+            _ => Err(BioFormatsError::UnsupportedFormat(format!(
+                "VG SAM unsupported bytes per pixel: {bytes_per_pixel}"
+            ))),
         }
     }
 }
@@ -990,22 +1089,78 @@ impl FormatReader for VgSamReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("vgsam"))
+        matches!(ext.as_deref(), Some("dti") | Some("vgsam"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(Self::MAGIC)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let _ = path;
-        Err(unsupported_raw_spm("VG SAM"))
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < Self::PIXEL_OFFSET {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "VG SAM file is shorter than the 368-byte header".into(),
+            ));
+        }
+        if !data.starts_with(Self::MAGIC) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "VG SAM file is missing VGS magic".into(),
+            ));
+        }
+        let width = Self::read_i32_be(&data, 348, "width")?;
+        let height = Self::read_i32_be(&data, 352, "height")?;
+        let bytes_per_pixel = Self::read_i32_be(&data, 360, "bytes per pixel")?;
+        if width <= 0 || height <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "VG SAM header contains invalid image dimensions".into(),
+            ));
+        }
+        let (pixel_type, bits_per_pixel) = Self::pixel_type_from_bpp(bytes_per_pixel)?;
+        let width = width as u32;
+        let height = height as u32;
+        let expected = (Self::PIXEL_OFFSET as u64)
+            .checked_add(width as u64 * height as u64 * bytes_per_pixel as u64)
+            .ok_or_else(|| BioFormatsError::Format("VG SAM size overflows".into()))?;
+        if (data.len() as u64) < expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "VG SAM pixel payload is shorter than declared dimensions {width}x{height}"
+            )));
+        }
+
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert(
+            "Bytes per pixel".into(),
+            crate::common::metadata::MetadataValue::Int(bytes_per_pixel as i64),
+        );
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type,
+            bits_per_pixel,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: false,
+            resolution_count: 1,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.data_offset = 0;
         Ok(())
     }
 
@@ -1034,14 +1189,16 @@ impl FormatReader for VgSamReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(Self::PIXEL_OFFSET as u64))
             .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        let mut buf =
+            vec![
+                0u8;
+                meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample()
+            ];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
@@ -1053,12 +1210,16 @@ impl FormatReader for VgSamReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("VG SAM", &full, &meta, 1, _x, _y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1090,22 +1251,32 @@ impl FormatReader for VgSamReader {
 // Raw binary reader — UBM Messtechnik
 // ===========================================================================
 
-/// UBM Messtechnik reader (`.ubm`).
+/// UBM reader (`.pr3`, plus legacy `.ubm` alias).
 ///
-/// Binary format. Falls back to raw uint16 square heuristic.
+/// Java Bio-Formats stores dimensions at offsets 44/48 in a 128-byte
+/// little-endian header, followed by uint32 pixels with optional row padding.
 pub struct UbmReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
+    padding_pixels: usize,
 }
 
 impl UbmReader {
+    const HEADER_SIZE: usize = 128;
+
     pub fn new() -> Self {
         UbmReader {
             path: None,
             meta: None,
-            data_offset: 0,
+            padding_pixels: 0,
         }
+    }
+
+    fn read_i32_le(data: &[u8], offset: usize, label: &str) -> Result<i32> {
+        let bytes = data.get(offset..offset + 4).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!("UBM header missing {label}"))
+        })?;
+        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
 
@@ -1121,7 +1292,7 @@ impl FormatReader for UbmReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("ubm"))
+        matches!(ext.as_deref(), Some("pr3") | Some("ubm"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -1129,14 +1300,74 @@ impl FormatReader for UbmReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let _ = path;
-        Err(unsupported_raw_spm("UBM Messtechnik"))
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < Self::HEADER_SIZE {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "UBM file is shorter than the 128-byte header".into(),
+            ));
+        }
+        let width = Self::read_i32_le(&data, 44, "width")?;
+        let height = Self::read_i32_le(&data, 48, "height")?;
+        if width <= 0 || height <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "UBM header contains invalid image dimensions".into(),
+            ));
+        }
+        let width = width as u32;
+        let height = height as u32;
+        let plane_bytes = width as u64 * height as u64 * 4;
+        let min_len = Self::HEADER_SIZE as u64 + plane_bytes;
+        if (data.len() as u64) < min_len {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "UBM pixel payload is shorter than declared dimensions {width}x{height}"
+            )));
+        }
+        let extra = data.len() as u64 - min_len;
+        let row_padding_bytes = extra
+            .checked_div(height as u64)
+            .ok_or_else(|| BioFormatsError::Format("UBM row padding overflows".into()))?;
+        if row_padding_bytes % 4 != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "UBM row padding is not aligned to uint32 pixels".into(),
+            ));
+        }
+        let padding_pixels = (row_padding_bytes / 4) as usize;
+
+        self.path = Some(path.to_path_buf());
+        self.padding_pixels = padding_pixels;
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert(
+            "Padding pixels".to_string(),
+            crate::common::metadata::MetadataValue::Int(padding_pixels as i64),
+        );
+        self.meta = Some(ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint32,
+            bits_per_pixel: 32,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.data_offset = 0;
+        self.padding_pixels = 0;
         Ok(())
     }
 
@@ -1165,15 +1396,7 @@ impl FormatReader for UbmReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        self.open_bytes_region(plane_index, 0, 0, meta.size_x, meta.size_y)
     }
 
     fn open_bytes_region(
@@ -1188,8 +1411,28 @@ impl FormatReader for UbmReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        crate::common::region::validate_region("UBM", meta.size_x, meta.size_y, _x, _y, w, h)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let row_stride = (meta.size_x as usize + self.padding_pixels)
+            .checked_mul(4)
+            .ok_or_else(|| BioFormatsError::Format("UBM row stride overflows".into()))?;
+        let out_row = (w as usize)
+            .checked_mul(4)
+            .ok_or_else(|| BioFormatsError::Format("UBM output row size overflows".into()))?;
+        let mut out = Vec::with_capacity(out_row * h as usize);
+        for row in 0..h as usize {
+            let source_row = _y as usize + row;
+            let offset =
+                Self::HEADER_SIZE as u64 + source_row as u64 * row_stride as u64 + _x as u64 * 4;
+            f.seek(SeekFrom::Start(offset))
+                .map_err(BioFormatsError::Io)?;
+            let start = out.len();
+            out.resize(start + out_row, 0);
+            f.read_exact(&mut out[start..start + out_row])
+                .map_err(BioFormatsError::Io)?;
+        }
+        Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1223,20 +1466,33 @@ impl FormatReader for UbmReader {
 
 /// Seiko SPM reader (`.xqd`, `.xqf`).
 ///
-/// Binary format. Falls back to raw uint16 square heuristic.
+/// Java Bio-Formats stores dimensions at offset 1402 in a 2944-byte
+/// little-endian header, followed by raw uint16 pixels.
 pub struct SeikoReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
 }
 
 impl SeikoReader {
+    const HEADER_SIZE: usize = 2944;
+
     pub fn new() -> Self {
         SeikoReader {
             path: None,
             meta: None,
-            data_offset: 0,
         }
+    }
+
+    fn read_u16_le(data: &[u8], offset: usize, label: &str) -> Result<u16> {
+        let bytes = data.get(offset..offset + 2).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!("Seiko SPM header missing {label}"))
+        })?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
+        let bytes = data.get(offset..offset + 4)?;
+        Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
 
@@ -1260,14 +1516,84 @@ impl FormatReader for SeikoReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let _ = path;
-        Err(unsupported_raw_spm("Seiko SPM"))
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < Self::HEADER_SIZE {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Seiko SPM file is shorter than the 2944-byte header".into(),
+            ));
+        }
+        let width = Self::read_u16_le(&data, 1402, "width")? as u32;
+        let height = Self::read_u16_le(&data, 1404, "height")? as u32;
+        if width == 0 || height == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Seiko SPM header contains invalid image dimensions".into(),
+            ));
+        }
+        let expected = (Self::HEADER_SIZE as u64)
+            .checked_add(width as u64 * height as u64 * 2)
+            .ok_or_else(|| BioFormatsError::Format("Seiko SPM size overflows".into()))?;
+        if (data.len() as u64) < expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Seiko SPM pixel payload is shorter than declared dimensions {width}x{height}"
+            )));
+        }
+
+        let mut series_metadata = HashMap::new();
+        let comment_bytes = &data[40..data.len().min(156)];
+        let nul = comment_bytes
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(comment_bytes.len());
+        let comment = String::from_utf8_lossy(&comment_bytes[..nul])
+            .trim()
+            .to_string();
+        if !comment.is_empty() {
+            series_metadata.insert(
+                "Comment".into(),
+                crate::common::metadata::MetadataValue::String(comment),
+            );
+        }
+        if let Some(x_size) = Self::read_f32_le(&data, 156) {
+            series_metadata.insert(
+                "X size".into(),
+                crate::common::metadata::MetadataValue::Float(x_size as f64),
+            );
+        }
+        if let Some(y_size) = Self::read_f32_le(&data, 164) {
+            series_metadata.insert(
+                "Y size".into(),
+                crate::common::metadata::MetadataValue::Float(y_size as f64),
+            );
+        }
+
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.data_offset = 0;
         Ok(())
     }
 
@@ -1296,14 +1622,12 @@ impl FormatReader for SeikoReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(Self::HEADER_SIZE as u64))
             .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; meta.size_x as usize * meta.size_y as usize * 2];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
@@ -1315,12 +1639,16 @@ impl FormatReader for SeikoReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("Seiko SPM", &full, &meta, 1, _x, _y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

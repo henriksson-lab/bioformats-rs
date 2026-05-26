@@ -5,6 +5,7 @@ A pure-Rust reimplementation of [Bio-Formats](https://www.openmicroscopy.org/bio
 
 **This package is still under development**
 
+* 2026-05-26: some functionality added
 * 2026-05-24: started proper audit; plenty left to do on this crate
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 

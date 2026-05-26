@@ -1,4 +1,4 @@
-//! Camera and RAW format readers — PCO, Bio-Rad GEL, Hamamatsu L2D, and more.
+//! Camera and RAW format readers — PCO, Bio-Rad GEL, Li-Cor L2D, and more.
 //!
 //! Includes three binary readers with partial metadata parsing (PcoRawReader,
 //! BioRadGelReader, L2dReader) and several extension-only placeholder readers.
@@ -410,23 +410,140 @@ impl FormatReader for BioRadGelReader {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Hamamatsu L2D INI-style text metadata
+// 3. Li-Cor L2D companion-file reader
 // ---------------------------------------------------------------------------
-/// Hamamatsu L2D format (`.l2d`).
+/// Li-Cor L2D format (`.l2d`).
 ///
-/// INI-style text file with `ImageWidth=N` and `ImageHeight=N` keys.
-/// Returns uint8 RGB placeholder metadata.
+/// Java Bio-Formats stores L2D pixels in companion TIFF files listed by the
+/// `.l2d` scan manifest and each scan's `.scn` metadata file.
 pub struct L2dReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    current_id: Option<PathBuf>,
+    tiffs: Vec<Vec<PathBuf>>,
+    metadata: Vec<ImageMetadata>,
+    current_series: usize,
+    reader: crate::tiff::TiffReader,
 }
 
 impl L2dReader {
+    const LICOR_MAGIC: &'static str = "LI-COR LI2D";
+
     pub fn new() -> Self {
         L2dReader {
-            path: None,
-            meta: None,
+            current_id: None,
+            tiffs: Vec::new(),
+            metadata: Vec::new(),
+            current_series: 0,
+            reader: crate::tiff::TiffReader::new(),
         }
+    }
+
+    fn parse_key_value_lines(text: &str) -> HashMap<String, String> {
+        text.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let (key, value) = line.split_once('=')?;
+                Some((key.trim().to_string(), value.trim().to_string()))
+            })
+            .collect()
+    }
+
+    fn split_list(value: &str) -> Vec<String> {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn set_l2d_id(&mut self, path: &Path) -> Result<()> {
+        let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+        if !text.contains(Self::LICOR_MAGIC) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Li-Cor L2D file is missing LI-COR LI2D marker".into(),
+            ));
+        }
+
+        let l2d = Self::parse_key_value_lines(&text);
+        let scans = l2d
+            .get("ScanNames")
+            .map(|v| Self::split_list(v))
+            .ok_or_else(|| BioFormatsError::Format("Li-Cor L2D missing ScanNames".into()))?;
+        if scans.is_empty() {
+            return Err(BioFormatsError::Format(
+                "Li-Cor L2D ScanNames list is empty".into(),
+            ));
+        }
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut tiffs = Vec::new();
+        let mut metadata = Vec::new();
+
+        for scan in scans {
+            let scan_dir = parent.join(&scan);
+            if !scan_dir.is_dir() {
+                continue;
+            }
+            let scan_path = scan_dir.join(format!("{scan}.scn"));
+            let scan_text = std::fs::read_to_string(&scan_path).map_err(BioFormatsError::Io)?;
+            let scan_meta = Self::parse_key_value_lines(&scan_text);
+            let image_names = scan_meta
+                .get("ImageNames")
+                .map(|v| Self::split_list(v))
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!("Li-Cor L2D scan {scan} missing ImageNames"))
+                })?;
+            if image_names.is_empty() {
+                return Err(BioFormatsError::Format(format!(
+                    "Li-Cor L2D scan {scan} ImageNames list is empty"
+                )));
+            }
+
+            let scan_tiffs: Vec<PathBuf> = image_names
+                .into_iter()
+                .map(|name| scan_dir.join(name))
+                .collect();
+            for tiff in &scan_tiffs {
+                if !tiff.is_file() {
+                    return Err(BioFormatsError::Format(format!(
+                        "Li-Cor L2D companion TIFF is missing: {}",
+                        tiff.display()
+                    )));
+                }
+            }
+
+            self.reader.set_id(&scan_tiffs[0])?;
+            let first = self.reader.metadata().clone();
+            self.reader.close()?;
+
+            let mut series_meta = first;
+            series_meta.image_count = scan_tiffs.len() as u32;
+            series_meta.size_z = 1;
+            series_meta.size_t = 1;
+            series_meta.size_c = scan_tiffs.len() as u32;
+            series_meta.dimension_order = DimensionOrder::XYCZT;
+            series_meta.series_metadata = scan_meta
+                .into_iter()
+                .map(|(k, v)| (k, crate::common::metadata::MetadataValue::String(v)))
+                .collect();
+            tiffs.push(scan_tiffs);
+            metadata.push(series_meta);
+        }
+
+        if tiffs.is_empty() {
+            return Err(BioFormatsError::Format(
+                "Li-Cor L2D did not reference any existing scan directories".into(),
+            ));
+        }
+
+        self.current_id = Some(path.to_path_buf());
+        self.tiffs = tiffs;
+        self.metadata = metadata;
+        self.current_series = 0;
+        Ok(())
     }
 }
 
@@ -443,96 +560,116 @@ impl FormatReader for L2dReader {
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_ascii_lowercase())
                 .as_deref(),
-            Some("l2d")
+            Some("l2d") | Some("scn")
         )
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        std::str::from_utf8(&header[..header.len().min(512)])
+            .map(|s| s.contains(Self::LICOR_MAGIC))
+            .unwrap_or(false)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-        let mut w: u32 = 512;
-        let mut h: u32 = 512;
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(val) = line.strip_prefix("ImageWidth=") {
-                if let Ok(v) = val.trim().parse::<u32>() {
-                    if v > 0 {
-                        w = v;
-                    }
-                }
-            } else if let Some(val) = line.strip_prefix("ImageHeight=") {
-                if let Ok(v) = val.trim().parse::<u32>() {
-                    if v > 0 {
-                        h = v;
-                    }
-                }
-            }
-        }
-        let _ = (w, h);
-        Err(BioFormatsError::UnsupportedFormat(
-            "Hamamatsu L2D image payload decoding is not implemented".into(),
-        ))
+        let l2d_path = if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("l2d"))
+            .unwrap_or(false)
+        {
+            path.to_path_buf()
+        } else {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Li-Cor L2D grouped reads must be opened from the .l2d manifest".into(),
+            ));
+        };
+        self.set_l2d_id(&l2d_path)
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
+        self.current_id = None;
+        self.tiffs.clear();
+        self.metadata.clear();
+        self.current_series = 0;
+        self.reader.close()?;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.metadata.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if s >= self.metadata.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.metadata
+            .get(self.current_series)
+            .expect("set_id not called")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metadata
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Err(BioFormatsError::UnsupportedFormat(
-            "Hamamatsu L2D image payload decoding is not implemented".into(),
-        ))
+        let tiff = self
+            .tiffs
+            .get(self.current_series)
+            .and_then(|series| series.get(plane_index as usize))
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?
+            .clone();
+        self.reader.set_id(&tiff)?;
+        let bytes = self.reader.open_bytes(0);
+        self.reader.close()?;
+        bytes
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metadata
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let _ = (plane_index, w, h);
-        Err(BioFormatsError::UnsupportedFormat(
-            "Hamamatsu L2D image payload decoding is not implemented".into(),
-        ))
+        let tiff = self
+            .tiffs
+            .get(self.current_series)
+            .and_then(|series| series.get(plane_index as usize))
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?
+            .clone();
+        self.reader.set_id(&tiff)?;
+        let bytes = self.reader.open_bytes_region(0, x, y, w, h);
+        self.reader.close()?;
+        bytes
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metadata
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
@@ -726,4 +863,110 @@ tiff_wrapper! {
     /// Photoshop-annotated TIFF format (`.tif`).
     pub struct PhotoshopTiffReader;
     extensions: ["tif"];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::metadata::MetadataValue;
+    use crate::common::writer::FormatWriter;
+    use crate::tiff::TiffWriter;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bioformats_camera2_{name}_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_u8_tiff(path: &Path, pixels: &[u8], width: u32, height: u32) {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = width;
+        meta.size_y = height;
+        meta.pixel_type = PixelType::Uint8;
+        meta.bits_per_pixel = 8;
+        meta.image_count = 1;
+
+        let mut writer = TiffWriter::new();
+        writer.set_metadata(&meta).unwrap();
+        writer.set_id(path).unwrap();
+        writer.save_bytes(0, pixels).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn write_l2d_dataset(root: &Path) -> PathBuf {
+        let scan_dir = root.join("ScanA");
+        fs::create_dir_all(&scan_dir).unwrap();
+        write_u8_tiff(&scan_dir.join("ch1.tif"), &[1, 2, 3, 4, 5, 6], 3, 2);
+        write_u8_tiff(&scan_dir.join("ch2.tif"), &[7, 8, 9, 10, 11, 12], 3, 2);
+        fs::write(
+            scan_dir.join("ScanA.scn"),
+            "ImageNames=ch1.tif, ch2.tif\nComments=synthetic\nScanChannels=700,800\n",
+        )
+        .unwrap();
+        let l2d = root.join("sample.l2d");
+        fs::write(&l2d, "FileType=LI-COR LI2D\nScanNames=ScanA\n").unwrap();
+        l2d
+    }
+
+    #[test]
+    fn l2d_delegates_planes_to_companion_tiffs() {
+        let root = temp_dir("l2d_planes");
+        let l2d = write_l2d_dataset(&root);
+        let mut reader = L2dReader::new();
+        reader.set_id(&l2d).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!(
+            (meta.size_x, meta.size_y, meta.size_c, meta.image_count),
+            (3, 2, 2, 2)
+        );
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+        match meta.series_metadata.get("Comments") {
+            Some(MetadataValue::String(value)) => assert_eq!(value, "synthetic"),
+            other => panic!("unexpected Comments metadata: {other:?}"),
+        }
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![7, 8, 9, 10, 11, 12]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn l2d_delegates_regions_to_companion_tiffs() {
+        let root = temp_dir("l2d_region");
+        let l2d = write_l2d_dataset(&root);
+        let mut reader = L2dReader::new();
+        reader.set_id(&l2d).unwrap();
+
+        assert_eq!(
+            reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
+            vec![8, 9, 11, 12]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn l2d_rejects_manifest_without_magic() {
+        let root = temp_dir("l2d_magic");
+        let l2d = root.join("bad.l2d");
+        fs::write(&l2d, "ScanNames=ScanA\n").unwrap();
+        let err = L2dReader::new().set_id(&l2d).unwrap_err();
+        assert!(
+            err.to_string().contains("LI-COR LI2D"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

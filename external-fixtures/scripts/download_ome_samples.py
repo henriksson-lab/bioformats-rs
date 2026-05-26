@@ -220,7 +220,7 @@ def root_from_sample_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     marker = "/images/"
     if marker not in parsed.path:
-        return category_root(Path(parsed.path).parts[1])
+        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, "/", "", "", ""))
     prefix, suffix = parsed.path.split(marker, 1)
     category = suffix.split("/", 1)[0]
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, f"{prefix}{marker}{category}/", "", "", ""))

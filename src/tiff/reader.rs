@@ -10,6 +10,7 @@ use crate::common::pixel_type::PixelType;
 
 use super::compression::decompress;
 use super::ifd::{tag, Compression, Ifd, Photometric};
+use super::nikon::NikonCompressionOptions;
 use super::parser::TiffParser;
 
 // Re-export LookupTable from bioformats facade via bioformats_common — but here we define a
@@ -42,6 +43,7 @@ struct IfdInfo {
     image_description: Option<String>,
     ycbcr_subsampling: (u16, u16),
     ycbcr_coefficients: (f32, f32, f32),
+    nikon_compression_options: Option<NikonCompressionOptions>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +243,7 @@ impl TiffReader {
             image_description,
             ycbcr_subsampling,
             ycbcr_coefficients: coefficients,
+            nikon_compression_options: None,
         })
     }
 
@@ -485,6 +488,81 @@ impl TiffReader {
         Ok(())
     }
 
+    fn add_nikon_raw_sub_ifd_series(&mut self) -> Result<()> {
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let little_endian = file.parser.little_endian;
+        let mut assigned_ifds: Vec<usize> = Vec::new();
+        for series in &self.series {
+            assigned_ifds.extend(series.ifd_indices.iter().copied());
+            assigned_ifds.extend(series.plane_ifd_indices.iter().filter_map(|&idx| idx));
+        }
+
+        let mut raw_series = Vec::new();
+        for (ifd_index, ifd) in file.ifds.iter().enumerate() {
+            if assigned_ifds.contains(&ifd_index) || ifd.compression() != Compression::Nikon {
+                continue;
+            }
+            let info = Self::ifd_info(ifd, little_endian)?;
+            raw_series.push(Self::single_ifd_series(ifd_index, &info, little_endian));
+            assigned_ifds.push(ifd_index);
+        }
+
+        self.series.extend(raw_series);
+        Ok(())
+    }
+
+    fn single_ifd_series(ifd_index: usize, info: &IfdInfo, little_endian: bool) -> TiffSeries {
+        let is_rgb = matches!(info.photometric, Photometric::Rgb | Photometric::YCbCr)
+            && info.samples_per_pixel >= 3;
+        let is_indexed = info.photometric == Photometric::Palette;
+        let size_c = if is_rgb || info.photometric == Photometric::Cmyk {
+            info.samples_per_pixel as u32
+        } else {
+            1
+        };
+        let lookup_table =
+            info.color_map
+                .as_ref()
+                .map(|(r, g, b)| crate::common::metadata::LookupTable {
+                    red: r.clone(),
+                    green: g.clone(),
+                    blue: b.clone(),
+                });
+
+        let mut metadata = crate::common::metadata::ImageMetadata {
+            size_x: info.width,
+            size_y: info.height,
+            size_z: 1,
+            size_c,
+            size_t: 1,
+            pixel_type: info.pixel_type,
+            bits_per_pixel: info.bits_per_sample as u8,
+            image_count: 1,
+            dimension_order: crate::common::metadata::DimensionOrder::XYZTC,
+            is_rgb,
+            is_interleaved: info.planar_config == 1,
+            is_indexed,
+            is_little_endian: little_endian,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        };
+        metadata.series_metadata.insert(
+            "NikonRawSubIFD".into(),
+            crate::common::metadata::MetadataValue::Bool(true),
+        );
+
+        TiffSeries {
+            ifd_indices: vec![ifd_index],
+            plane_ifd_indices: Vec::new(),
+            metadata,
+            sub_resolutions: Vec::new(),
+        }
+    }
+
     /// Resolve the IFD index for a given plane, taking current resolution into account.
     fn resolve_ifd_index(&self, plane_index: u32) -> Result<usize> {
         let s = &self.series[self.current_series];
@@ -531,7 +609,14 @@ impl TiffReader {
             .get(ifd_index)
             .ok_or_else(|| BioFormatsError::PlaneOutOfRange(ifd_index as u32))?;
         let little_endian = file.parser.little_endian;
-        let info = Self::ifd_info(ifd, little_endian)?;
+        let mut info = Self::ifd_info(ifd, little_endian)?;
+        if info.compression == Compression::Nikon {
+            info.nikon_compression_options = super::nikon::extract_compression_options(
+                &mut file.parser,
+                &file.ifds,
+                info.bits_per_sample,
+            )?;
+        }
         validate_region(&info, x, y, w, h)?;
 
         if info.is_tiled {
@@ -568,11 +653,12 @@ impl TiffReader {
 
         let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
         let effective_spp = info.samples_per_pixel as u32;
-        let packed_samples = info.bits_per_sample < 8;
+        let packed_row_layout = info.bits_per_sample % 8 != 0;
+        let subbyte_samples = info.bits_per_sample < 8;
         let ycbcr = info.photometric == Photometric::YCbCr;
         let row_bytes = if ycbcr {
             ycbcr_row_bytes(info.width, 1, info.ycbcr_subsampling)
-        } else if packed_samples {
+        } else if packed_row_layout {
             packed_row_bytes(info.width, effective_spp, info.bits_per_sample) as u32
         } else {
             info.width * effective_spp * bytes_per_sample
@@ -618,6 +704,7 @@ impl TiffReader {
                 strip_rows,
                 file.parser.little_endian,
                 info.jpeg_tables.as_deref(),
+                info.nikon_compression_options.as_ref(),
             )?;
             strip_data.truncate(expected);
 
@@ -658,7 +745,7 @@ impl TiffReader {
             return Ok(crop_unpacked_rows(&rgb, info.width, 3, x, w, h));
         }
 
-        if packed_samples {
+        if subbyte_samples {
             let unpacked = unpack_subbyte_samples(
                 &plane_rows,
                 info.width,
@@ -674,6 +761,16 @@ impl TiffReader {
                 file.parser.little_endian,
             );
             return Ok(out);
+        }
+
+        if packed_row_layout {
+            if x != 0 || w != info.width {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Partial-column reads for packed non-byte-aligned TIFF samples are not yet supported"
+                        .into(),
+                ));
+            }
+            return Ok(plane_rows);
         }
 
         apply_photometric(
@@ -751,6 +848,7 @@ impl TiffReader {
                     strip_rows,
                     file.parser.little_endian,
                     info.jpeg_tables.as_deref(),
+                    info.nikon_compression_options.as_ref(),
                 )?;
                 strip_data.truncate(expected);
 
@@ -845,6 +943,7 @@ impl TiffReader {
                     info.tile_height,
                     file.parser.little_endian,
                     info.jpeg_tables.as_deref(),
+                    info.nikon_compression_options.as_ref(),
                 )?;
                 tile_data.resize(tile_data_bytes, 0);
                 apply_photometric(
@@ -934,6 +1033,7 @@ impl TiffReader {
                         info.tile_height,
                         file.parser.little_endian,
                         info.jpeg_tables.as_deref(),
+                        info.nikon_compression_options.as_ref(),
                     )?;
                     tile_data.resize(tile_data_bytes, 0);
                     apply_photometric(
@@ -1817,6 +1917,7 @@ impl crate::common::reader::FormatReader for TiffReader {
         self.current_resolution = 0;
         // Parse SubIFD chains for pyramid support
         self.parse_sub_ifds()?;
+        self.add_nikon_raw_sub_ifd_series()?;
         Ok(())
     }
 
@@ -1909,5 +2010,235 @@ impl crate::common::reader::FormatReader for TiffReader {
         self.ome_xml
             .as_deref()
             .map(crate::common::ome_metadata::OmeMetadata::from_ome_xml)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::reader::FormatReader;
+    use std::fs;
+
+    fn push_u16_le(data: &mut Vec<u8>, value: u16) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32_le(data: &mut Vec<u8>, value: u32) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_ifd_short(data: &mut Vec<u8>, tag: u16, value: u16) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 3);
+        push_u32_le(data, 1);
+        push_u16_le(data, value);
+        push_u16_le(data, 0);
+    }
+
+    fn push_ifd_long(data: &mut Vec<u8>, tag: u16, value: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 4);
+        push_u32_le(data, 1);
+        push_u32_le(data, value);
+    }
+
+    fn push_ifd_undefined(data: &mut Vec<u8>, tag: u16, value: &[u8], offset: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 7);
+        push_u32_le(data, value.len() as u32);
+        push_u32_le(data, offset);
+    }
+
+    fn classic_tiff_with_one_undefined_ifd(tag: u16, value: &[u8]) -> Vec<u8> {
+        let value_offset = 26u32;
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+        push_u16_le(&mut data, 1);
+        push_ifd_undefined(&mut data, tag, value, value_offset);
+        push_u32_le(&mut data, 0);
+        data.extend_from_slice(value);
+        data
+    }
+
+    fn synthetic_nikon_maker_note() -> Vec<u8> {
+        let mut tag_150 = vec![0x46, 0x00];
+        for predictor in [11, 22, 33, 44] {
+            push_u16_le(&mut tag_150, predictor);
+        }
+        push_u16_le(&mut tag_150, 0);
+
+        let nested = classic_tiff_with_one_undefined_ifd(
+            super::super::nikon::MAKER_NOTE_COMPRESSION_TAG,
+            &tag_150,
+        );
+        let mut maker_note = b"Nikon\0\x02\0\0\0".to_vec();
+        maker_note.extend_from_slice(&nested);
+        maker_note
+    }
+
+    fn synthetic_nikon_compressed_tiff() -> Vec<u8> {
+        let maker_note = synthetic_nikon_maker_note();
+        let main_ifd_offset = 8u32;
+        let main_entry_count = 10u16;
+        let main_ifd_bytes = 2 + main_entry_count as u32 * 12 + 4;
+        let exif_ifd_offset = main_ifd_offset + main_ifd_bytes;
+        let exif_ifd_bytes = 2 + 12 + 4;
+        let maker_note_offset = exif_ifd_offset + exif_ifd_bytes;
+        let compressed = [1u8, 2, 3];
+        let strip_offset = maker_note_offset + maker_note.len() as u32;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, main_ifd_offset);
+
+        push_u16_le(&mut data, main_entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, 17);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 23);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 12);
+        push_ifd_short(&mut data, tag::COMPRESSION, 34713);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 1);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, strip_offset);
+        push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 1);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 23);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, compressed.len() as u32);
+        push_ifd_long(
+            &mut data,
+            super::super::nikon::EXIF_IFD_TAG,
+            exif_ifd_offset,
+        );
+        push_u32_le(&mut data, 0);
+
+        push_u16_le(&mut data, 1);
+        push_ifd_undefined(
+            &mut data,
+            super::super::nikon::EXIF_MAKER_NOTE_TAG,
+            &maker_note,
+            maker_note_offset,
+        );
+        push_u32_le(&mut data, 0);
+
+        data.extend_from_slice(&maker_note);
+        data.extend_from_slice(&compressed);
+        data
+    }
+
+    fn synthetic_nikon_compressed_sub_ifd_tiff() -> Vec<u8> {
+        let maker_note = synthetic_nikon_maker_note();
+        let main_ifd_offset = 8u32;
+        let main_entry_count = 11u16;
+        let main_ifd_bytes = 2 + main_entry_count as u32 * 12 + 4;
+        let exif_ifd_offset = main_ifd_offset + main_ifd_bytes;
+        let exif_ifd_bytes = 2 + 12 + 4;
+        let maker_note_offset = exif_ifd_offset + exif_ifd_bytes;
+        let sub_ifd_offset = maker_note_offset + maker_note.len() as u32;
+        let sub_entry_count = 9u16;
+        let sub_ifd_bytes = 2 + sub_entry_count as u32 * 12 + 4;
+        let compressed = [1u8, 2, 3];
+        let compressed_offset = sub_ifd_offset + sub_ifd_bytes;
+        let preview = [9u8, 8, 7, 6];
+        let preview_offset = compressed_offset + compressed.len() as u32;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, main_ifd_offset);
+
+        push_u16_le(&mut data, main_entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, 2);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 2);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, tag::COMPRESSION, 1);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 1);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, preview_offset);
+        push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 1);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 2);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, preview.len() as u32);
+        push_ifd_long(
+            &mut data,
+            super::super::nikon::EXIF_IFD_TAG,
+            exif_ifd_offset,
+        );
+        push_ifd_long(&mut data, tag::SUB_IFD, sub_ifd_offset);
+        push_u32_le(&mut data, 0);
+
+        push_u16_le(&mut data, 1);
+        push_ifd_undefined(
+            &mut data,
+            super::super::nikon::EXIF_MAKER_NOTE_TAG,
+            &maker_note,
+            maker_note_offset,
+        );
+        push_u32_le(&mut data, 0);
+
+        data.extend_from_slice(&maker_note);
+
+        push_u16_le(&mut data, sub_entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, 17);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 23);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 12);
+        push_ifd_short(&mut data, tag::COMPRESSION, 34713);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 1);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, compressed_offset);
+        push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 1);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 23);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, compressed.len() as u32);
+        push_u32_le(&mut data, 0);
+
+        data.extend_from_slice(&compressed);
+        data.extend_from_slice(&preview);
+        data
+    }
+
+    #[test]
+    fn nikon_34713_reader_routes_parsed_maker_note_options_to_decoder() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-nikon-34713-route-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_nikon_compressed_tiff()).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let bytes = reader
+            .open_bytes(0)
+            .expect("Nikon decoder should mirror Bio-Formats EOF bit padding");
+
+        let _ = fs::remove_file(&path);
+
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn nikon_34713_sub_ifd_is_exposed_as_raw_series_before_decoder() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-nikon-34713-sub-ifd-route-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_nikon_compressed_sub_ifd_tiff()).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+
+        let mut raw_series = None;
+        for series in 0..reader.series_count() {
+            reader.set_series(series).unwrap();
+            let meta = reader.metadata();
+            if meta.size_x == 17 && meta.size_y == 23 && meta.bits_per_pixel == 12 {
+                raw_series = Some(series);
+                break;
+            }
+        }
+        let series = raw_series.expect("Nikon compression 34713 SubIFD should be a RAW series");
+        reader.set_series(series).unwrap();
+        let bytes = reader
+            .open_bytes(0)
+            .expect("Nikon decoder should mirror Bio-Formats EOF bit padding");
+
+        let _ = fs::remove_file(&path);
+
+        assert!(!bytes.is_empty());
     }
 }

@@ -18,30 +18,6 @@ use crate::common::region::crop_full_plane;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn placeholder_meta() -> ImageMetadata {
-    ImageMetadata {
-        size_x: 512,
-        size_y: 512,
-        size_z: 1,
-        size_c: 1,
-        size_t: 1,
-        pixel_type: PixelType::Uint8,
-        bits_per_pixel: 8,
-        image_count: 1,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: true,
-        resolution_count: 1,
-        series_metadata: HashMap::new(),
-        lookup_table: None,
-        modulo_z: None,
-        modulo_c: None,
-        modulo_t: None,
-    }
-}
-
 fn placeholder_meta_u16(w: u32, h: u32) -> ImageMetadata {
     ImageMetadata {
         size_x: w,
@@ -304,18 +280,32 @@ impl FormatReader for GelReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let data = std::fs::read(path).map_err(|e| BioFormatsError::Io(e))?;
+        if data.len() < 64 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "GEL header is too short for Molecular Dynamics dimensions".into(),
+            ));
+        }
 
-        let (w, h) = if data.len() >= 14 {
-            let w = u16::from_be_bytes([data[10], data[11]]) as u32;
-            let h = u16::from_be_bytes([data[12], data[13]]) as u32;
-            if w == 0 || w > 32768 || h == 0 || h > 32768 {
-                (512u32, 512u32)
-            } else {
-                (w, h)
-            }
-        } else {
-            (512u32, 512u32)
-        };
+        let w = u16::from_be_bytes([data[10], data[11]]) as u32;
+        let h = u16::from_be_bytes([data[12], data[13]]) as u32;
+        if w == 0 || h == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "GEL header contains zero dimensions".into(),
+            ));
+        }
+        let plane_bytes = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| BioFormatsError::Format("GEL plane size overflows".into()))?;
+        let expected_len = 64usize
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("GEL file size overflows".into()))?;
+        if data.len() < expected_len {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "GEL payload is shorter than declared image: got {} bytes, expected at least {expected_len}",
+                data.len()
+            )));
+        }
 
         self.path = Some(path.to_path_buf());
         self.meta = Some(placeholder_meta_u16(w, h));
@@ -359,23 +349,28 @@ impl FormatReader for GelReader {
         f.seek(SeekFrom::Start(64))
             .map_err(|e| BioFormatsError::Io(e))?;
         let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(|e| BioFormatsError::Io(e))?;
+        f.read_exact(&mut buf).map_err(|e| BioFormatsError::Io(e))?;
         Ok(buf)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(vec![0u8; w as usize * h as usize * 2])
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("GEL", &full, &meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -407,9 +402,132 @@ impl FormatReader for GelReader {
 // 4. Imspector OBF STED microscopy
 // ---------------------------------------------------------------------------
 
-/// Imspector OBF/MSR STED microscopy format (`.obf`, `.msr`).
+const IMSPECTOR_FILE_MAGIC: &[u8; 8] = b"OMAS_BF\n";
+const IMSPECTOR_MAGIC_NUMBER: u16 = 0xffff;
+const IMSPECTOR_MIN_HEADER_LEN: usize = 14;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImspectorHeader {
+    version: i32,
+}
+
+fn parse_imspector_header(bytes: &[u8]) -> Result<ImspectorHeader> {
+    if bytes.len() < IMSPECTOR_MIN_HEADER_LEN {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR header is truncated".to_string(),
+        ));
+    }
+    if &bytes[..IMSPECTOR_FILE_MAGIC.len()] != IMSPECTOR_FILE_MAGIC {
+        return Err(BioFormatsError::Format(
+            "Not an Imspector OBF/MSR file".to_string(),
+        ));
+    }
+    let magic_offset = IMSPECTOR_FILE_MAGIC.len();
+    let magic = u16::from_le_bytes([bytes[magic_offset], bytes[magic_offset + 1]]);
+    if magic != IMSPECTOR_MAGIC_NUMBER {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR header has invalid magic number".to_string(),
+        ));
+    }
+    let version_offset = magic_offset + 2;
+    let version = i32::from_le_bytes([
+        bytes[version_offset],
+        bytes[version_offset + 1],
+        bytes[version_offset + 2],
+        bytes[version_offset + 3],
+    ]);
+    Ok(ImspectorHeader { version })
+}
+
+#[allow(dead_code)]
+fn imspector_pixel_type(type_code: i32) -> Result<PixelType> {
+    match type_code {
+        0x01 => Ok(PixelType::Uint8),
+        0x02 => Ok(PixelType::Int8),
+        0x04 => Ok(PixelType::Uint16),
+        0x08 => Ok(PixelType::Int16),
+        0x10 => Ok(PixelType::Uint32),
+        0x20 => Ok(PixelType::Int32),
+        0x40 => Ok(PixelType::Float32),
+        0x80 => Ok(PixelType::Float64),
+        _ => Err(BioFormatsError::Format(format!(
+            "Unsupported Imspector OBF/MSR data type {type_code}"
+        ))),
+    }
+}
+
+#[allow(dead_code)]
+fn imspector_bits_per_pixel(type_code: i32) -> Result<u8> {
+    Ok(match type_code {
+        0x01 | 0x02 => 8,
+        0x04 | 0x08 => 16,
+        0x10 | 0x20 | 0x40 => 32,
+        0x80 => 64,
+        _ => {
+            return Err(BioFormatsError::Format(format!(
+                "Unsupported Imspector OBF/MSR data type {type_code}"
+            )));
+        }
+    })
+}
+
+#[allow(dead_code)]
+fn imspector_stack_length(length: i64) -> Result<u64> {
+    if length >= 0 {
+        Ok(length as u64)
+    } else {
+        Err(BioFormatsError::Format(
+            "Negative Imspector OBF/MSR stack length on disk".to_string(),
+        ))
+    }
+}
+
+#[allow(dead_code)]
+fn imspector_compression_flag(compression: i32) -> Result<bool> {
+    match compression {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(BioFormatsError::Format(format!(
+            "Unsupported Imspector OBF/MSR compression {compression}"
+        ))),
+    }
+}
+
+fn imspector_read_len_string(bytes: &[u8], offset: &mut usize) -> Result<String> {
+    if bytes.len().saturating_sub(*offset) < 4 {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR length-prefixed string is truncated".to_string(),
+        ));
+    }
+    let len = i32::from_le_bytes([
+        bytes[*offset],
+        bytes[*offset + 1],
+        bytes[*offset + 2],
+        bytes[*offset + 3],
+    ]);
+    *offset += 4;
+    if len <= 0 {
+        return Ok(String::new());
+    }
+    let len = len as usize;
+    if bytes.len().saturating_sub(*offset) < len {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR length-prefixed string overruns input".to_string(),
+        ));
+    }
+    let value = std::str::from_utf8(&bytes[*offset..*offset + len])
+        .map_err(|e| {
+            BioFormatsError::Format(format!("Imspector OBF/MSR string is not UTF-8: {e}"))
+        })?
+        .to_string();
+    *offset += len;
+    Ok(value)
+}
+
+/// Imspector OBF/MSR STED microscopy format stub (`.obf`, `.msr`).
 ///
-/// Magic: first 8 bytes contain "OMAS_BF_".
+/// Header parsing is translated from Bio-Formats' `OBFReader`; stack metadata
+/// and payload decoding are still intentionally rejected until ported.
 pub struct ImspectorReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -440,18 +558,27 @@ impl FormatReader for ImspectorReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        if header.len() >= 8 {
-            &header[..8] == b"OMAS_BF_"
-        } else {
-            false
-        }
+        parse_imspector_header(header).is_ok()
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = Some(path.to_path_buf());
-        // Simple placeholder: 256x256 uint16
-        self.meta = Some(placeholder_meta_u16(256, 256));
-        Ok(())
+        self.path = None;
+        self.meta = None;
+        let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let header = parse_imspector_header(&bytes)?;
+        let mut detail = format!(
+            "Imspector OBF/MSR stack metadata and payload decoding is not implemented (version {})",
+            header.version
+        );
+        if bytes.len() > IMSPECTOR_MIN_HEADER_LEN + 12 {
+            let mut offset = IMSPECTOR_MIN_HEADER_LEN + 8;
+            if let Ok(description) = imspector_read_len_string(&bytes, &mut offset) {
+                if !description.is_empty() {
+                    detail.push_str("; header description parsed");
+                }
+            }
+        }
+        Err(BioFormatsError::UnsupportedFormat(detail))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -481,11 +608,10 @@ impl FormatReader for ImspectorReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * 2])
+        let _ = plane_index;
+        Err(BioFormatsError::UnsupportedFormat(
+            "Imspector OBF/MSR payload decoding is not implemented".to_string(),
+        ))
     }
 
     fn open_bytes_region(
@@ -496,20 +622,17 @@ impl FormatReader for ImspectorReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Ok(vec![0u8; w as usize * h as usize * 2])
+        let _ = (plane_index, w, h);
+        Err(BioFormatsError::UnsupportedFormat(
+            "Imspector OBF/MSR payload decoding is not implemented".to_string(),
+        ))
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        let _ = plane_index;
+        Err(BioFormatsError::UnsupportedFormat(
+            "Imspector OBF/MSR payload decoding is not implemented".to_string(),
+        ))
     }
 
     fn resolution_count(&self) -> usize {
@@ -528,13 +651,133 @@ impl FormatReader for ImspectorReader {
     }
 }
 
+#[cfg(test)]
+mod imspector_tests {
+    use super::{
+        imspector_bits_per_pixel, imspector_compression_flag, imspector_pixel_type,
+        imspector_read_len_string, imspector_stack_length, parse_imspector_header, ImspectorReader,
+        IMSPECTOR_FILE_MAGIC, IMSPECTOR_MAGIC_NUMBER,
+    };
+    use crate::common::error::BioFormatsError;
+    use crate::common::pixel_type::PixelType;
+    use crate::common::reader::FormatReader;
+    use std::path::PathBuf;
+
+    fn imspector_header(version: i32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(IMSPECTOR_FILE_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("bioformats_imspector_{name}"))
+    }
+
+    #[test]
+    fn imspector_header_requires_exact_java_magic_and_magic_number() {
+        let good = imspector_header(6);
+        assert_eq!(parse_imspector_header(&good).unwrap().version, 6);
+
+        let mut wrong_magic = good.clone();
+        wrong_magic[7] = b'_';
+        assert!(matches!(
+            parse_imspector_header(&wrong_magic),
+            Err(BioFormatsError::Format(message)) if message.contains("Not an Imspector")
+        ));
+
+        let mut wrong_number = good;
+        wrong_number[8..10].copy_from_slice(&0x1234u16.to_le_bytes());
+        assert!(matches!(
+            parse_imspector_header(&wrong_number),
+            Err(BioFormatsError::Format(message)) if message.contains("invalid magic number")
+        ));
+    }
+
+    #[test]
+    fn imspector_reader_detects_only_complete_obf_header() {
+        let reader = ImspectorReader::new();
+        assert!(!reader.is_this_type_by_bytes(b"OMAS_BF_not enough"));
+        assert!(reader.is_this_type_by_bytes(&imspector_header(4)));
+    }
+
+    #[test]
+    fn imspector_helpers_match_bioformats_type_contracts() {
+        assert_eq!(imspector_pixel_type(0x01).unwrap(), PixelType::Uint8);
+        assert_eq!(imspector_pixel_type(0x08).unwrap(), PixelType::Int16);
+        assert_eq!(imspector_pixel_type(0x40).unwrap(), PixelType::Float32);
+        assert_eq!(imspector_bits_per_pixel(0x80).unwrap(), 64);
+        assert!(matches!(
+            imspector_pixel_type(0x03),
+            Err(BioFormatsError::Format(message)) if message.contains("Unsupported")
+        ));
+
+        assert_eq!(imspector_stack_length(17).unwrap(), 17);
+        assert!(matches!(
+            imspector_stack_length(-1),
+            Err(BioFormatsError::Format(message)) if message.contains("Negative")
+        ));
+        assert!(!imspector_compression_flag(0).unwrap());
+        assert!(imspector_compression_flag(1).unwrap());
+        assert!(matches!(
+            imspector_compression_flag(2),
+            Err(BioFormatsError::Format(message)) if message.contains("Unsupported")
+        ));
+    }
+
+    #[test]
+    fn imspector_length_prefixed_string_tracks_offset_and_bounds() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        bytes.extend_from_slice(b"hello");
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+
+        let mut offset = 0;
+        assert_eq!(
+            imspector_read_len_string(&bytes, &mut offset).unwrap(),
+            "hello"
+        );
+        assert_eq!(offset, 9);
+        assert_eq!(imspector_read_len_string(&bytes, &mut offset).unwrap(), "");
+        assert_eq!(offset, 13);
+
+        let mut truncated_offset = 0;
+        assert!(matches!(
+            imspector_read_len_string(&[4, 0, 0, 0, b'x'], &mut truncated_offset),
+            Err(BioFormatsError::Format(message)) if message.contains("overruns")
+        ));
+    }
+
+    #[test]
+    fn imspector_set_id_parses_header_then_refuses_unported_stack_decoder() {
+        let path = temp_path("header_only.obf");
+        let mut bytes = imspector_header(7);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&4i32.to_le_bytes());
+        bytes.extend_from_slice(b"desc");
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::UnsupportedFormat(message)
+                if message.contains("version 7")
+                    && message.contains("stack metadata and payload decoding")
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 5. Hamamatsu VMS whole-slide
 // ---------------------------------------------------------------------------
 
-/// Hamamatsu VMS/VMU whole-slide format (`.vms`, `.vmu`).
+/// Hamamatsu VMS/VMU whole-slide format stub (`.vms`, `.vmu`).
 ///
-/// VMS files are text files listing JPEG tile files. Parses ImageWidth/ImageHeight.
+/// Full tile metadata and JPEG payload decoding are not implemented.
 pub struct HamamatsuVmsReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -568,35 +811,12 @@ impl FormatReader for HamamatsuVmsReader {
         false
     }
 
-    fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (mut w, mut h) = (512u32, 512u32);
-        if let Ok(text) = std::fs::read_to_string(path) {
-            for line in text.lines() {
-                if let Some(val) = line.strip_prefix("ImageWidth=") {
-                    if let Ok(n) = val.trim().parse::<u32>() {
-                        if n > 0 {
-                            w = n;
-                        }
-                    }
-                } else if let Some(val) = line.strip_prefix("ImageHeight=") {
-                    if let Ok(n) = val.trim().parse::<u32>() {
-                        if n > 0 {
-                            h = n;
-                        }
-                    }
-                }
-            }
-        }
-        self.path = Some(path.to_path_buf());
-        // RGB uint8 placeholder
-        let mut meta = placeholder_meta();
-        meta.size_x = w;
-        meta.size_y = h;
-        meta.size_c = 3;
-        meta.is_rgb = true;
-        meta.is_interleaved = true;
-        self.meta = Some(meta);
-        Ok(())
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        Err(BioFormatsError::UnsupportedFormat(
+            "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented".to_string(),
+        ))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -626,11 +846,10 @@ impl FormatReader for HamamatsuVmsReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * 3])
+        let _ = plane_index;
+        Err(BioFormatsError::UnsupportedFormat(
+            "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented".to_string(),
+        ))
     }
 
     fn open_bytes_region(
@@ -641,20 +860,17 @@ impl FormatReader for HamamatsuVmsReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Ok(vec![0u8; w as usize * h as usize * 3])
+        let _ = (plane_index, w, h);
+        Err(BioFormatsError::UnsupportedFormat(
+            "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented".to_string(),
+        ))
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        let _ = plane_index;
+        Err(BioFormatsError::UnsupportedFormat(
+            "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented".to_string(),
+        ))
     }
 
     fn resolution_count(&self) -> usize {
@@ -703,20 +919,25 @@ impl Default for CellomicsReader {
     }
 }
 
-fn parse_legacy_cellomics_header(data: &[u8]) -> (u32, u32, u32, PixelType, u8, u64) {
+fn parse_legacy_cellomics_header(data: &[u8]) -> Result<(u32, u32, u32, PixelType, u8, u64)> {
     let w = u16::from_le_bytes([data[4], data[5]]) as u32;
     let h = u16::from_le_bytes([data[6], data[7]]) as u32;
     let bd = u16::from_le_bytes([data[8], data[9]]);
-    let (w, h) = if w == 0 || w > 32768 || h == 0 || h > 32768 {
-        (512, 512)
-    } else {
-        (w, h)
-    };
+    if w == 0 || h == 0 || w > 32768 || h > 32768 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Cellomics legacy header has missing or invalid image dimensions {w}x{h}"
+        )));
+    }
     let (pt, bpp) = match bd {
         8 => (PixelType::Uint8, 8u8),
-        _ => (PixelType::Uint16, 16u8),
+        16 => (PixelType::Uint16, 16u8),
+        _ => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Cellomics legacy bits per pixel {bd} is not supported"
+            )));
+        }
     };
-    (w, h, 1, pt, bpp, 52)
+    Ok((w, h, 1, pt, bpp, 52))
 }
 
 impl FormatReader for CellomicsReader {
@@ -787,13 +1008,32 @@ impl FormatReader for CellomicsReader {
                 }
                 (w, h, image_count, pt, bpp, 52u64)
             } else {
-                parse_legacy_cellomics_header(&data)
+                parse_legacy_cellomics_header(&data)?
             }
         } else if data.len() >= 10 {
-            parse_legacy_cellomics_header(&data)
+            parse_legacy_cellomics_header(&data)?
         } else {
-            (512u32, 512u32, 1u32, PixelType::Uint16, 16u8, 52u64)
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Cellomics header is too short to determine image dimensions".to_string(),
+            ));
         };
+
+        let bytes_per_pixel = (bpp / 8) as u64;
+        let plane_bytes = (w as u64)
+            .checked_mul(h as u64)
+            .and_then(|n| n.checked_mul(bytes_per_pixel))
+            .ok_or_else(|| BioFormatsError::Format("Cellomics plane size overflows".to_string()))?;
+        let expected = pixel_offset
+            .checked_add(plane_bytes.checked_mul(image_count as u64).ok_or_else(|| {
+                BioFormatsError::Format("Cellomics total pixel size overflows".to_string())
+            })?)
+            .ok_or_else(|| BioFormatsError::Format("Cellomics file size overflows".to_string()))?;
+        if (data.len() as u64) < expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Cellomics pixel payload is shorter than declared image: got {} bytes, expected at least {expected}",
+                data.len()
+            )));
+        }
 
         self.path = Some(path.to_path_buf());
         self.pixel_offset = pixel_offset;
@@ -1345,6 +1585,20 @@ impl FormatReader for PovRayReader {
             ));
         }
 
+        let plane_bytes = (size_x as usize)
+            .checked_mul(size_y as usize)
+            .ok_or_else(|| BioFormatsError::Format("DF3 plane byte count overflows".into()))?;
+        let expected_pixels = plane_bytes
+            .checked_mul(size_z as usize)
+            .ok_or_else(|| BioFormatsError::Format("DF3 voxel byte count overflows".into()))?;
+        if data.len() - 6 != expected_pixels {
+            return Err(BioFormatsError::Format(format!(
+                "DF3 pixel payload has {} bytes, expected {}",
+                data.len() - 6,
+                expected_pixels
+            )));
+        }
+
         let pixel_data = data[6..].to_vec();
         let image_count = size_z.max(1);
 
@@ -1412,18 +1666,17 @@ impl FormatReader for PovRayReader {
             .ok_or(BioFormatsError::NotInitialized)?;
         let plane_bytes = meta.size_x as usize * meta.size_y as usize;
         let offset = plane_index as usize * plane_bytes;
-        let end = (offset + plane_bytes).min(pixels.len());
-        if offset >= pixels.len() {
-            return Ok(vec![0u8; plane_bytes]);
-        }
+        let end = offset
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("DF3 plane offset overflows".into()))?;
         Ok(pixels[offset..end].to_vec())
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
@@ -1431,7 +1684,32 @@ impl FormatReader for PovRayReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(vec![0u8; w as usize * h as usize])
+        if x.checked_add(w).is_none_or(|end| end > meta.size_x)
+            || y.checked_add(h).is_none_or(|end| end > meta.size_y)
+        {
+            return Err(BioFormatsError::InvalidData(format!(
+                "DF3 region x={x} y={y} width={w} height={h} exceeds image {}x{}",
+                meta.size_x, meta.size_y
+            )));
+        }
+
+        let pixels = self
+            .pixel_data
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let row_bytes = meta.size_x as usize;
+        let plane_bytes = row_bytes
+            .checked_mul(meta.size_y as usize)
+            .ok_or_else(|| BioFormatsError::Format("DF3 plane byte count overflows".into()))?;
+        let plane_offset = (plane_index as usize)
+            .checked_mul(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("DF3 plane offset overflows".into()))?;
+        let mut out = Vec::with_capacity(w as usize * h as usize);
+        for row in y..y + h {
+            let offset = plane_offset + row as usize * row_bytes + x as usize;
+            out.extend_from_slice(&pixels[offset..offset + w as usize]);
+        }
+        Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

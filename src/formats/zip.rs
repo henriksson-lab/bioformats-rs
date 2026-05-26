@@ -183,11 +183,13 @@ impl FormatReader for ZipReader {
         if self.is_tiff {
             return self.inner.open_bytes(plane_index);
         }
-        // Placeholder: 1 byte
         if plane_index != 0 {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(vec![0u8])
+        Err(BioFormatsError::UnsupportedFormat(
+            "ZIP reader has no decoded image payload; only TIFF entries are currently delegated"
+                .to_string(),
+        ))
     }
 
     fn open_bytes_region(
@@ -201,28 +203,13 @@ impl FormatReader for ZipReader {
         if self.is_tiff {
             return self.inner.open_bytes_region(plane_index, x, y, w, h);
         }
-        let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
+        self.open_bytes(plane_index)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         if self.is_tiff {
             return self.inner.open_thumb_bytes(plane_index);
         }
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        self.open_bytes(plane_index)
     }
 }

@@ -8,7 +8,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -242,26 +242,128 @@ impl Default for UnisokuReader {
     }
 }
 
+fn resolve_unisoku_header_path(path: &Path) -> PathBuf {
+    let is_dat = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("dat"))
+        .unwrap_or(false);
+    if !is_dat {
+        return path.to_path_buf();
+    }
+
+    let upper = path.with_extension("HDR");
+    if upper.exists() {
+        return upper;
+    }
+    let lower = path.with_extension("hdr");
+    if lower.exists() {
+        return lower;
+    }
+    upper
+}
+
+fn resolve_unisoku_dat_path(header: &Path) -> PathBuf {
+    let upper = header.with_extension("DAT");
+    if upper.exists() {
+        return upper;
+    }
+    let lower = header.with_extension("dat");
+    if lower.exists() {
+        return lower;
+    }
+    upper
+}
+
+fn unisoku_pixel_type_from_ascii_data_type(data_type: i32) -> Option<PixelType> {
+    let signed = data_type % 2 == 1;
+    let bytes = data_type / 2;
+    match (bytes, signed) {
+        (1, false) => Some(PixelType::Uint8),
+        (1, true) => Some(PixelType::Int8),
+        (2, false) => Some(PixelType::Uint16),
+        (2, true) => Some(PixelType::Int16),
+        (4, _) => Some(PixelType::Float32),
+        _ => None,
+    }
+}
+
 fn parse_unisoku_hdr(path: &Path) -> Result<(ImageMetadata, PathBuf)> {
-    let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+    let header_path = resolve_unisoku_header_path(path);
+    let content = std::fs::read_to_string(&header_path).map_err(BioFormatsError::Io)?;
 
     let mut width: Option<u32> = None;
     let mut height: Option<u32> = None;
     let mut bits: Option<u32> = None;
+    let mut pixel_type: Option<PixelType> = None;
+    let mut series_metadata = HashMap::new();
 
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(val) = kv_value(line, "XSIZE") {
-            if let Ok(v) = val.parse::<u32>() {
-                width = Some(v);
+    if content.contains(":STM data") {
+        let lines: Vec<&str> = content.split('\r').collect();
+        let mut i = 0usize;
+        while i < lines.len() {
+            let key = lines[i].trim();
+            i += 1;
+            if !key.starts_with(':') {
+                continue;
             }
-        } else if let Some(val) = kv_value(line, "YSIZE") {
-            if let Ok(v) = val.parse::<u32>() {
-                height = Some(v);
+
+            let mut values = Vec::new();
+            while i < lines.len() {
+                let value = lines[i].trim();
+                if value.starts_with(':') {
+                    break;
+                }
+                if !value.is_empty() {
+                    values.push(value);
+                }
+                i += 1;
             }
-        } else if let Some(val) = kv_value(line, "BIT") {
-            if let Ok(v) = val.parse::<u32>() {
-                bits = Some(v);
+
+            let value = values.join(" ");
+            series_metadata.insert(key.to_string(), MetadataValue::String(value.clone()));
+            let tokens: Vec<&str> = value.split_whitespace().collect();
+
+            if key == ":data volume(x*y)" && tokens.len() >= 2 {
+                width = tokens[0].parse::<u32>().ok();
+                height = tokens[1].parse::<u32>().ok();
+            } else if key.starts_with(":ascii flag; data type") {
+                let type_token = tokens
+                    .last()
+                    .ok_or_else(|| {
+                        BioFormatsError::UnsupportedFormat(
+                            "Unisoku header missing ASCII data type".into(),
+                        )
+                    })?
+                    .parse::<i32>()
+                    .map_err(|_| {
+                        BioFormatsError::UnsupportedFormat(
+                            "Unisoku header has invalid ASCII data type".into(),
+                        )
+                    })?;
+                pixel_type = unisoku_pixel_type_from_ascii_data_type(type_token);
+                if pixel_type.is_none() {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Unisoku ASCII data type {type_token} is not implemented"
+                    )));
+                }
+            }
+        }
+    } else {
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(val) = kv_value(line, "XSIZE") {
+                if let Ok(v) = val.parse::<u32>() {
+                    width = Some(v);
+                }
+            } else if let Some(val) = kv_value(line, "YSIZE") {
+                if let Ok(v) = val.parse::<u32>() {
+                    height = Some(v);
+                }
+            } else if let Some(val) = kv_value(line, "BIT") {
+                if let Ok(v) = val.parse::<u32>() {
+                    bits = Some(v);
+                }
             }
         }
     }
@@ -272,18 +374,22 @@ fn parse_unisoku_hdr(path: &Path) -> Result<(ImageMetadata, PathBuf)> {
     let height = height
         .filter(|&v| v > 0)
         .ok_or_else(|| BioFormatsError::UnsupportedFormat("Unisoku header missing YSIZE".into()))?;
-    let bits = bits.ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat("Unisoku header missing BIT depth".into())
-    })?;
-    let pixel_type = if bits <= 16 {
-        PixelType::Int16
-    } else {
-        PixelType::Int32
+    let pixel_type = match pixel_type {
+        Some(pixel_type) => pixel_type,
+        None => {
+            let bits = bits.ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat("Unisoku header missing BIT depth".into())
+            })?;
+            if bits <= 16 {
+                PixelType::Int16
+            } else {
+                PixelType::Int32
+            }
+        }
     };
     let bps = pixel_type.bytes_per_sample();
 
-    // Companion .dat file in same directory
-    let dat_path = path.with_extension("dat");
+    let dat_path = resolve_unisoku_dat_path(&header_path);
     let plane_bytes = (width as u64)
         .checked_mul(height as u64)
         .and_then(|v| v.checked_mul(bps as u64))
@@ -312,7 +418,7 @@ fn parse_unisoku_hdr(path: &Path) -> Result<(ImageMetadata, PathBuf)> {
         is_indexed: false,
         is_little_endian: true,
         resolution_count: 1,
-        series_metadata: HashMap::new(),
+        series_metadata,
         lookup_table: None,
         modulo_z: None,
         modulo_c: None,
@@ -324,23 +430,28 @@ fn parse_unisoku_hdr(path: &Path) -> Result<(ImageMetadata, PathBuf)> {
 
 impl FormatReader for UnisokuReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        // Detect .hdr files when companion .dat exists
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if ext.eq_ignore_ascii_case("hdr") {
-                let dat = path.with_extension("dat");
-                return dat.exists();
-            }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        if ext.eq_ignore_ascii_case("hdr") {
+            return resolve_unisoku_dat_path(path).exists();
+        }
+        if ext.eq_ignore_ascii_case("dat") {
+            return resolve_unisoku_header_path(path).exists();
         }
         false
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header
+            .windows(b":STM data".len())
+            .any(|window| window == b":STM data")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        let header_path = resolve_unisoku_header_path(path);
         let (meta, dat_path) = parse_unisoku_hdr(path)?;
-        self.path = Some(path.to_path_buf());
+        self.path = Some(header_path);
         self.meta = Some(meta);
         self.dat_path = Some(dat_path);
         Ok(())

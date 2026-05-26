@@ -1,10 +1,11 @@
 //! Memoizer — caches parsed reader metadata to disk for fast re-opening.
 //!
 //! Equivalent to Java Bio-Formats' `Memoizer` class. On the first open of a
-//! file, the inner reader parses the file normally and the metadata is
+//! file, the inner reader parses the file normally and core series metadata is
 //! serialized to a `.bfmemo` cache file. On subsequent opens, if the cache is
-//! valid (same file size and mtime), the cached metadata is loaded instead of
-//! re-parsing.
+//! valid (same file size and mtime), that cached core metadata is reused for
+//! [`FormatReader::metadata`]. The wrapped reader is still opened for pixel
+//! access and format-specific metadata such as OME XML.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -29,7 +30,13 @@ struct MemoCache {
     series_metadata: Vec<ImageMetadata>,
 }
 
-/// Reader wrapper that caches parsed metadata to disk.
+/// Reader wrapper that caches core series metadata to disk.
+///
+/// Memoizer does not replace the underlying format reader: `set_id` still
+/// initializes the wrapped reader so pixel reads, thumbnails, resolutions, and
+/// format-specific metadata remain backed by the parsed source file. The cache
+/// currently covers only the per-series [`ImageMetadata`] returned by
+/// [`FormatReader::metadata`].
 ///
 /// # Usage
 /// ```no_run
@@ -62,33 +69,9 @@ impl Memoizer {
 
     /// Convenience: open a file with auto-detection and memoization.
     pub fn open(path: &Path) -> Result<Self> {
-        let reader = crate::registry::ImageReader::open(path)?;
-        // ImageReader doesn't expose its inner reader as Box<dyn FormatReader>.
-        // Instead, use the registry directly to get a boxed reader.
-        // We'll re-open through the memoizer's set_id.
-        let header = crate::common::io::peek_header(path, 512).unwrap_or_default();
-        let all = crate::registry::all_readers_pub();
-        let mut found: Option<Box<dyn FormatReader>> = None;
-        for r in all {
-            if r.is_this_type_by_bytes(&header) {
-                found = Some(r);
-                break;
-            }
-        }
-        if found.is_none() {
-            let all2 = crate::registry::all_readers_pub();
-            for r in all2 {
-                if r.is_this_type_by_name(path) {
-                    found = Some(r);
-                    break;
-                }
-            }
-        }
-        let r =
-            found.ok_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string()))?;
-        drop(reader); // close the initial reader
+        let r = crate::registry::open_reader(path)?;
         let mut memo = Memoizer::new(r);
-        memo.set_id(path)?;
+        memo.initialize_opened_reader(path)?;
         Ok(memo)
     }
 
@@ -144,6 +127,24 @@ impl Memoizer {
         if let Ok(data) = bincode::serialize(&cache) {
             let _ = std::fs::write(Self::cache_path(file_path), data);
         }
+    }
+
+    fn initialize_opened_reader(&mut self, path: &Path) -> Result<()> {
+        self.file_path = Some(path.to_path_buf());
+
+        let sc = self.inner.series_count();
+        self.cached_meta.clear();
+        for s in 0..sc {
+            self.inner.set_series(s)?;
+            self.cached_meta.push(self.inner.metadata().clone());
+        }
+        if sc > 0 {
+            self.inner.set_series(0)?;
+        }
+        self.current_series = 0;
+
+        self.save_cache();
+        Ok(())
     }
 }
 
@@ -241,5 +242,34 @@ impl FormatReader for Memoizer {
     }
     fn ome_metadata(&self) -> Option<OmeMetadata> {
         self.inner.ome_metadata()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Memoizer;
+    use crate::common::reader::FormatReader;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_memoizer_{nanos}_{name}"))
+    }
+
+    #[test]
+    fn open_uses_image_reader_extension_fallback_after_magic_set_id_error() {
+        let path = temp_path("magic_png_but_fake.fake");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nnot enough png data").unwrap();
+
+        let reader = Memoizer::open(&path).expect("fake extension fallback failed");
+
+        assert_eq!(reader.metadata().size_x, 512);
+        assert_eq!(reader.metadata().size_y, 512);
+        let _ = std::fs::remove_file(Memoizer::cache_path(&path));
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -1,18 +1,15 @@
 //! Bruker OPUS FTIR spectroscopy and ISS Vista FLIM format readers.
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
-use crate::common::pixel_type::PixelType;
+use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
 
-fn r_u32_le(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
+const OPUS_UNSUPPORTED: &str =
+    "Bruker OPUS spectral image decoding is not implemented; refusing guessed header metadata";
+const ISS_UNSUPPORTED: &str =
+    "ISS Vista FLIM decoding is not implemented; refusing guessed header metadata";
 
 // ─── Bruker OPUS ──────────────────────────────────────────────────────────────
 //
@@ -24,7 +21,6 @@ fn r_u32_le(b: &[u8], off: usize) -> u32 {
 pub struct BrukerOpusReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
 }
 
 impl BrukerOpusReader {
@@ -32,7 +28,6 @@ impl BrukerOpusReader {
         BrukerOpusReader {
             path: None,
             meta: None,
-            data_offset: 0,
         }
     }
 }
@@ -62,51 +57,11 @@ impl FormatReader for BrukerOpusReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        // Read header block to find spectral image dimensions
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        let mut hdr = vec![0u8; 512.min(f.metadata().map_err(BioFormatsError::Io)?.len() as usize)];
-        f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
-
-        // OPUS block directory: 4-byte entries at offset 12
-        // Each entry: block_type(u32) + offset(u32) + length(u32)
-        // For simplicity: try to extract spatial dimensions from block content
-        // Default to 1×1 single spectrum if no image data found
-        let width = 1u32;
-        let height = 1u32;
-        let n_pts = if hdr.len() >= 8 {
-            r_u32_le(&hdr, 4).max(1)
-        } else {
-            1
-        };
-
-        let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-        meta_map.insert("format".into(), MetadataValue::String("Bruker OPUS".into()));
-        meta_map.insert("spectral_points".into(), MetadataValue::Int(n_pts as i64));
-
-        self.meta = Some(ImageMetadata {
-            size_x: width,
-            size_y: height,
-            size_z: 1,
-            size_c: n_pts,
-            size_t: 1,
-            pixel_type: PixelType::Float32,
-            bits_per_pixel: 32,
-            image_count: n_pts,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: meta_map,
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
-        self.data_offset = 512;
+        self.meta = None;
         self.path = Some(path.to_path_buf());
-        Ok(())
+        Err(BioFormatsError::UnsupportedFormat(
+            OPUS_UNSUPPORTED.to_string(),
+        ))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -136,15 +91,9 @@ impl FormatReader for BrukerOpusReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let plane_bytes = (meta.size_x * meta.size_y) as usize * 4;
-        let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; plane_bytes];
-        let _ = f.read(&mut buf);
-        Ok(buf)
+        Err(BioFormatsError::UnsupportedFormat(
+            OPUS_UNSUPPORTED.to_string(),
+        ))
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
@@ -176,7 +125,6 @@ impl FormatReader for BrukerOpusReader {
 pub struct IssFlimReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
 }
 
 impl IssFlimReader {
@@ -184,7 +132,6 @@ impl IssFlimReader {
         IssFlimReader {
             path: None,
             meta: None,
-            data_offset: 256,
         }
     }
 }
@@ -206,56 +153,11 @@ impl FormatReader for IssFlimReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        let mut hdr = vec![0u8; 256.min(f.metadata().map_err(BioFormatsError::Io)?.len() as usize)];
-        f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
-
-        let width = if hdr.len() > 11 {
-            r_u32_le(&hdr, 8).max(1)
-        } else {
-            256
-        };
-        let height = if hdr.len() > 15 {
-            r_u32_le(&hdr, 12).max(1)
-        } else {
-            256
-        };
-        let n_channels = if hdr.len() > 19 {
-            r_u32_le(&hdr, 16).max(1)
-        } else {
-            1
-        };
-
-        let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-        meta_map.insert(
-            "format".into(),
-            MetadataValue::String("ISS Vista FLIM".into()),
-        );
-
-        self.meta = Some(ImageMetadata {
-            size_x: width,
-            size_y: height,
-            size_z: 1,
-            size_c: n_channels,
-            size_t: 1,
-            pixel_type: PixelType::Float32,
-            bits_per_pixel: 32,
-            image_count: n_channels,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: meta_map,
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
-        self.data_offset = 256;
+        self.meta = None;
         self.path = Some(path.to_path_buf());
-        Ok(())
+        Err(BioFormatsError::UnsupportedFormat(
+            ISS_UNSUPPORTED.to_string(),
+        ))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -285,15 +187,9 @@ impl FormatReader for IssFlimReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let plane_bytes = (meta.size_x * meta.size_y) as usize * 4;
-        let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; plane_bytes];
-        let _ = f.read(&mut buf);
-        Ok(buf)
+        Err(BioFormatsError::UnsupportedFormat(
+            ISS_UNSUPPORTED.to_string(),
+        ))
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {

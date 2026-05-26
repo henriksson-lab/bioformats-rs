@@ -79,7 +79,12 @@ fn parse_incell_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         }
     }
 
-    let image_count = (image_files.len() as u32).max(1);
+    if image_files.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "InCell XML/XDCE does not reference any companion TIFF image files".into(),
+        ));
+    }
+    let image_count = image_files.len() as u32;
 
     let meta = ImageMetadata {
         size_x: width,
@@ -195,22 +200,16 @@ impl FormatReader for InCellReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
-        if let Some(tiff_path) = self.image_files.get(plane_index as usize) {
-            let tiff_path = tiff_path.clone();
-            // Load the TIFF for this plane
-            if self.tiff_loaded {
-                let _ = self.tiff_reader.close();
-            }
-            self.tiff_reader.set_id(&tiff_path)?;
-            self.tiff_loaded = true;
-            self.current_plane = plane_index;
-            return self.tiff_reader.open_bytes(0);
+        let Some(tiff_path) = self.image_files.get(plane_index as usize).cloned() else {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        };
+        if self.tiff_loaded {
+            let _ = self.tiff_reader.close();
         }
-
-        // No companion file — return blank plane
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * bps])
+        self.tiff_reader.set_id(&tiff_path)?;
+        self.tiff_loaded = true;
+        self.current_plane = plane_index;
+        self.tiff_reader.open_bytes(0)
     }
 
     fn open_bytes_region(

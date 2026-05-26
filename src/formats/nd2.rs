@@ -20,6 +20,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 /// ND2 file magic bytes.
 pub const ND2_MAGIC: [u8; 4] = [0xDA, 0xCE, 0xBE, 0x0A];
@@ -27,6 +28,12 @@ pub const ND2_MAGIC: [u8; 4] = [0xDA, 0xCE, 0xBE, 0x0A];
 #[derive(Debug, Clone)]
 struct Nd2Chunk {
     name: String,
+    data_offset: u64,
+    data_length: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OldJp2Plane {
     data_offset: u64,
     data_length: u64,
 }
@@ -264,6 +271,33 @@ fn xml_attr(tag_text: &str, attr: &str) -> Option<String> {
     Some(rest[..value_end].to_string())
 }
 
+fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let open = format!("<{}", tag);
+    let close = format!("</{}>", tag);
+    let mut cursor = 0;
+
+    while let Some(relative_pos) = xml[cursor..].find(&open) {
+        let pos = cursor + relative_pos;
+        let after_open = &xml[pos..];
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
+        let attrs = &after_open[..gt];
+        if let Some(value) = xml_attr(attrs, "value") {
+            values.push(value);
+        } else if !attrs.trim_end().ends_with('/') {
+            let content_start = pos + gt + 1;
+            if let Some(end) = xml[content_start..].find(&close) {
+                values.push(xml[content_start..content_start + end].trim().to_string());
+            }
+        }
+        cursor = pos + gt + 1;
+    }
+
+    values
+}
+
 fn nd2_u32_value(xml: &str, tag: &str) -> Option<u32> {
     let value = xml_value(xml, tag)?.parse::<u32>().ok()?;
     (value != u32::MAX).then_some(value)
@@ -333,6 +367,120 @@ fn looks_like_zlib(data: &[u8]) -> bool {
 fn looks_like_jpeg2000(data: &[u8]) -> bool {
     data.starts_with(&[0xff, 0x4f, 0xff, 0x51])
         || data.starts_with(&[0x00, 0x00, 0x00, 0x0c, b'j', b'P', b' ', b' '])
+}
+
+fn has_old_nd_box_footer(f: &mut BufReader<File>) -> std::io::Result<bool> {
+    const OLD_ND_BOX_MARKER: &[u8] = b"LABORATORY IMAGING ND BOX MAP 00";
+
+    let file_len = f.get_ref().metadata()?.len();
+    let start = file_len.saturating_sub(4096);
+    f.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::with_capacity((file_len - start) as usize);
+    f.read_to_end(&mut tail)?;
+    Ok(tail
+        .windows(OLD_ND_BOX_MARKER.len())
+        .any(|window| window == OLD_ND_BOX_MARKER))
+}
+
+fn read_be_u16(bytes: &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?))
+}
+
+fn read_be_u32(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?))
+}
+
+fn scan_old_jp2_boxes(
+    f: &mut BufReader<File>,
+) -> std::io::Result<(Vec<OldJp2Plane>, u32, u32, u16, u32)> {
+    let file_len = f.get_ref().metadata()?.len();
+    let mut planes = Vec::new();
+    let (mut size_x, mut size_y, mut bands, mut pixel_type_code) = (0u32, 0u32, 1u16, 0u32);
+    let mut pos = 0u64;
+
+    while pos + 8 <= file_len {
+        f.seek(SeekFrom::Start(pos))?;
+        let mut header = [0u8; 8];
+        f.read_exact(&mut header)?;
+        let length = read_be_u32(&header[..4]).unwrap_or(0) as u64;
+        let box_type = &header[4..8];
+        let next_pos = pos.saturating_add(length);
+        if length < 8 || next_pos > file_len {
+            break;
+        }
+
+        if box_type == b"jp2c" {
+            planes.push(OldJp2Plane {
+                data_offset: pos + 8,
+                data_length: length - 8,
+            });
+        } else if box_type == b"jp2h" {
+            let mut sub_pos = pos + 8;
+            while sub_pos + 8 <= next_pos {
+                f.seek(SeekFrom::Start(sub_pos))?;
+                let mut sub_header = [0u8; 8];
+                f.read_exact(&mut sub_header)?;
+                let sub_length = read_be_u32(&sub_header[..4]).unwrap_or(0) as u64;
+                let sub_type = &sub_header[4..8];
+                let sub_next = sub_pos.saturating_add(sub_length);
+                if sub_length < 8 || sub_next > next_pos {
+                    break;
+                }
+                if sub_type == b"ihdr" && sub_length >= 22 {
+                    let mut ihdr = [0u8; 14];
+                    f.read_exact(&mut ihdr)?;
+                    size_y = read_be_u32(&ihdr[0..4]).unwrap_or(0);
+                    size_x = read_be_u32(&ihdr[4..8]).unwrap_or(0);
+                    bands = read_be_u16(&ihdr[8..10]).unwrap_or(1);
+                    pixel_type_code = read_be_u32(&ihdr[10..14]).unwrap_or(0);
+                }
+                sub_pos = sub_next;
+            }
+        }
+
+        pos = next_pos;
+    }
+
+    Ok((planes, size_x, size_y, bands, pixel_type_code))
+}
+
+fn old_nd2_metadata_text(f: &mut BufReader<File>) -> std::io::Result<String> {
+    f.seek(SeekFrom::Start(0))?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)?;
+    Ok(String::from_utf8_lossy(&data).into_owned())
+}
+
+fn old_nd2_metadata_indexes(text: &str) -> Vec<u32> {
+    let mut indexes = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_pos) = text[cursor..].find("<MetadataSeq") {
+        let pos = cursor + relative_pos;
+        let after_open = &text[pos..];
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
+        if let Some(value) = xml_attr(&after_open[..gt], "_SEQUENCE_INDEX") {
+            if let Ok(index) = value.parse::<u32>() {
+                if !indexes.contains(&index) {
+                    indexes.push(index);
+                }
+            }
+        }
+        cursor = pos + gt + 1;
+    }
+    indexes.sort_unstable();
+    indexes
+}
+
+fn old_nd2_component_count(text: &str, jp2_bands: u16) -> u32 {
+    xml_values(text, "uiCompCount")
+        .into_iter()
+        .filter_map(|value| value.parse::<u32>().ok())
+        .filter(|&value| value > 0 && value != u32::MAX)
+        .max()
+        .unwrap_or(jp2_bands as u32)
+        .max(1)
 }
 
 fn require_exact_frame(data: Vec<u8>, expected: usize, kind: &str) -> Result<Vec<u8>> {
@@ -417,8 +565,10 @@ pub struct Nd2Reader {
     file: Option<BufReader<File>>,
     path: Option<PathBuf>,
     chunks: Vec<Nd2Chunk>,
-    meta: Option<ImageMetadata>,
+    meta: Vec<ImageMetadata>,
+    current_series: usize,
     image_chunks: Vec<usize>, // indices into chunks[] for ImageDataSeq chunks
+    old_jp2_planes: Vec<Vec<OldJp2Plane>>,
 }
 
 impl Nd2Reader {
@@ -427,9 +577,130 @@ impl Nd2Reader {
             file: None,
             path: None,
             chunks: Vec::new(),
-            meta: None,
+            meta: Vec::new(),
+            current_series: 0,
             image_chunks: Vec::new(),
+            old_jp2_planes: Vec::new(),
         }
+    }
+
+    fn set_old_jp2_id(&mut self, mut reader: BufReader<File>, path: &Path) -> Result<()> {
+        if !has_old_nd_box_footer(&mut reader).map_err(BioFormatsError::Io)? {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ND2: JP2-backed file is missing old ND box footer".into(),
+            ));
+        }
+
+        let (planes, size_x, size_y, jp2_bands, pixel_type_code) =
+            scan_old_jp2_boxes(&mut reader).map_err(BioFormatsError::Io)?;
+        if planes.is_empty() || size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ND2: old JP2-backed file has no usable JP2 codestreams".into(),
+            ));
+        }
+
+        let metadata_text = old_nd2_metadata_text(&mut reader).map_err(BioFormatsError::Io)?;
+        let metadata_indexes = old_nd2_metadata_indexes(&metadata_text);
+        let size_c = old_nd2_component_count(&metadata_text, jp2_bands);
+        let mut usable_plane_count = planes.len();
+        if size_c > 1 && usable_plane_count % size_c as usize == 1 {
+            usable_plane_count -= 1;
+        }
+        usable_plane_count -= usable_plane_count % size_c as usize;
+        if usable_plane_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ND2: old JP2-backed file has no complete component planes".into(),
+            ));
+        }
+
+        let metadata_count = metadata_indexes.len();
+        let series_count =
+            if metadata_count > 1 && usable_plane_count == metadata_count * size_c as usize {
+                metadata_count
+            } else {
+                1
+            };
+        let size_t = (usable_plane_count / series_count / size_c as usize).max(1) as u32;
+        let image_count = size_t * size_c;
+        let bits_per_pixel = if pixel_type_code == 0x0f07_0100 || pixel_type_code == 0x0f07_0000 {
+            16
+        } else {
+            8
+        };
+        let pixel_type = if bits_per_pixel == 16 {
+            PixelType::Uint16
+        } else {
+            PixelType::Uint8
+        };
+        let dimension_order = if series_count > 1 {
+            DimensionOrder::XYCZT
+        } else {
+            DimensionOrder::XYCTZ
+        };
+
+        let mut plane_series = vec![Vec::with_capacity(image_count as usize); series_count];
+        for t in 0..size_t as usize {
+            for series in 0..series_count {
+                for c in 0..size_c as usize {
+                    let source = (t * series_count + series) * size_c as usize + c;
+                    if source < usable_plane_count {
+                        plane_series[series].push(planes[source].clone());
+                    }
+                }
+            }
+        }
+
+        let mut metas = Vec::with_capacity(series_count);
+        for _ in 0..series_count {
+            let mut series_metadata = HashMap::new();
+            series_metadata.insert("nd2_old_jp2".into(), MetadataValue::Bool(true));
+            series_metadata.insert(
+                "nd2_old_jp2_codestreams".into(),
+                MetadataValue::Int(planes.len() as i64),
+            );
+            series_metadata.insert(
+                "nd2_old_jp2_used_codestreams".into(),
+                MetadataValue::Int(usable_plane_count as i64),
+            );
+            series_metadata.insert(
+                "nd2_metadata_seq_count".into(),
+                MetadataValue::Int(metadata_count as i64),
+            );
+
+            metas.push(ImageMetadata {
+                size_x,
+                size_y,
+                size_z: 1,
+                size_c,
+                size_t,
+                pixel_type,
+                bits_per_pixel,
+                image_count,
+                dimension_order,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: false,
+                resolution_count: 1,
+                series_metadata,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            });
+        }
+
+        self.meta = metas;
+        self.current_series = 0;
+        self.old_jp2_planes = plane_series;
+        self.image_chunks.clear();
+        self.chunks.clear();
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(BioFormatsError::Io)?;
+        self.file = Some(reader);
+        self.path = Some(path.to_path_buf());
+        Ok(())
     }
 }
 
@@ -448,12 +719,21 @@ impl FormatReader for Nd2Reader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(&ND2_MAGIC)
+        header.starts_with(&ND2_MAGIC) || looks_like_jpeg2000(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut reader = BufReader::new(f);
+
+        let mut header = [0u8; 8];
+        let read = reader.read(&mut header).map_err(BioFormatsError::Io)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(BioFormatsError::Io)?;
+        if read >= 8 && looks_like_jpeg2000(&header) {
+            return self.set_old_jp2_id(reader, path);
+        }
 
         let chunks = match read_chunk_map(&mut reader).map_err(BioFormatsError::Io)? {
             Some(chunks) => chunks,
@@ -546,7 +826,7 @@ impl FormatReader for Nd2Reader {
         let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
         series_metadata.insert("nd2_chunks".into(), MetadataValue::Int(chunks.len() as i64));
 
-        self.meta = Some(ImageMetadata {
+        self.meta = vec![ImageMetadata {
             size_x,
             size_y,
             size_z,
@@ -566,7 +846,9 @@ impl FormatReader for Nd2Reader {
             modulo_z: None,
             modulo_c: None,
             modulo_t: None,
-        });
+        }];
+        self.current_series = 0;
+        self.old_jp2_planes.clear();
         self.image_chunks = image_chunks;
         self.chunks = chunks;
         self.file = Some(reader);
@@ -577,33 +859,68 @@ impl FormatReader for Nd2Reader {
     fn close(&mut self) -> Result<()> {
         self.file = None;
         self.path = None;
-        self.meta = None;
+        self.meta.clear();
+        self.current_series = 0;
         self.chunks.clear();
         self.image_chunks.clear();
+        self.old_jp2_planes.clear();
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.meta.len().max(1)
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if s >= self.series_count() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .get(self.current_series)
+            .expect("set_id not called")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .meta
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+
+        if !self.old_jp2_planes.is_empty() {
+            let plane = self
+                .old_jp2_planes
+                .get(self.current_series)
+                .and_then(|planes| planes.get(plane_index as usize))
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+            let f = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+            f.seek(SeekFrom::Start(plane.data_offset))
+                .map_err(BioFormatsError::Io)?;
+            let mut data = vec![0u8; plane.data_length as usize];
+            f.read_exact(&mut data).map_err(BioFormatsError::Io)?;
+            let expected =
+                meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample();
+            let decoded = crate::common::codec::decompress_jpeg2000(&data)?;
+            return require_exact_frame(decoded, expected, "old ND2 JPEG2000").map_err(
+                |e| match e {
+                    BioFormatsError::Format(msg) => {
+                        BioFormatsError::Format(format!("ND2: plane {plane_index}: {msg}"))
+                    }
+                    BioFormatsError::Codec(msg) => {
+                        BioFormatsError::Codec(format!("ND2: plane {plane_index}: {msg}"))
+                    }
+                    other => other,
+                },
+            );
         }
 
         let chunk_idx = self
@@ -642,22 +959,20 @@ impl FormatReader for Nd2Reader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let spp = meta.size_c as usize;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * spp * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.metadata();
+        let spp = if self.old_jp2_planes.is_empty() {
+            meta.size_c as usize
+        } else {
+            1
+        };
+        crop_full_plane("ND2", &full, meta, spp, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .meta
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)

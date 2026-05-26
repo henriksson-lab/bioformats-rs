@@ -1,16 +1,66 @@
-//! Placeholder readers for remaining obscure and proprietary formats.
+//! Readers and explicit unsupported detectors for obscure and proprietary formats.
 //!
-//! All readers are extension-only and return 512×512 uint8 placeholder metadata
-//! with zeroed pixel data. Full decoding is not implemented.
+//! Partial readers decode only simple documented/raw payload cases. Formats
+//! without enough structure to read pixels fail with `UnsupportedFormat` instead
+//! of exposing placeholder metadata or synthetic planes.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+
+fn checked_plane_len(meta: &ImageMetadata) -> Result<usize> {
+    let bytes_per_pixel = (meta.bits_per_pixel as usize)
+        .checked_div(8)
+        .filter(|bps| *bps > 0)
+        .ok_or_else(|| BioFormatsError::Format("invalid bits per pixel".to_string()))?;
+    (meta.size_x as usize)
+        .checked_mul(meta.size_y as usize)
+        .and_then(|px| px.checked_mul(bytes_per_pixel))
+        .ok_or_else(|| BioFormatsError::Format("image plane is too large".to_string()))
+}
+
+fn crop_plane(
+    plane: &[u8],
+    meta: &ImageMetadata,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    if x.checked_add(w).is_none_or(|end| end > meta.size_x)
+        || y.checked_add(h).is_none_or(|end| end > meta.size_y)
+    {
+        return Err(BioFormatsError::Format(
+            "requested region is outside the image bounds".to_string(),
+        ));
+    }
+    let bytes_per_pixel = (meta.bits_per_pixel / 8) as usize;
+    let row_bytes = meta.size_x as usize * bytes_per_pixel;
+    let crop_row_bytes = w as usize * bytes_per_pixel;
+    let x_offset = x as usize * bytes_per_pixel;
+    let mut out = Vec::with_capacity(crop_row_bytes * h as usize);
+    for row in y as usize..(y + h) as usize {
+        let start = row
+            .checked_mul(row_bytes)
+            .and_then(|base| base.checked_add(x_offset))
+            .ok_or_else(|| BioFormatsError::Format("requested region is too large".to_string()))?;
+        let end = start
+            .checked_add(crop_row_bytes)
+            .ok_or_else(|| BioFormatsError::Format("requested region is too large".to_string()))?;
+        if end > plane.len() {
+            return Err(BioFormatsError::Format(
+                "decoded plane is shorter than expected".to_string(),
+            ));
+        }
+        out.extend_from_slice(&plane[start..end]);
+    }
+    Ok(out)
+}
 
 // ---------------------------------------------------------------------------
 // Macro for extension-only placeholder readers
@@ -239,11 +289,18 @@ impl FormatReader for ArfReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let file_len = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
+        if file_len % 2 != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ARF raw uint16 payload has an odd byte length".to_string(),
+            ));
+        }
 
         // Assume raw uint16 data; guess square dimensions
         let n_pixels = file_len / 2;
         if n_pixels == 0 {
-            return Err(BioFormatsError::Format("ARF file is empty".to_string()));
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ARF file is empty".to_string(),
+            ));
         }
         let side = (n_pixels as f64).sqrt() as u32;
         let (w, h) = if side > 0 && (side as u64 * side as u64) == n_pixels {
@@ -309,21 +366,19 @@ impl FormatReader for ArfReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * 2;
+        let n_bytes = checked_plane_len(meta)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
-        let bytes_read = f.read(&mut buf).map_err(BioFormatsError::Io)?;
-        buf.truncate(bytes_read);
-        buf.resize(n_bytes, 0);
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
@@ -331,7 +386,9 @@ impl FormatReader for ArfReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(vec![0u8; w as usize * h as usize * 2])
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -805,7 +862,11 @@ impl FormatReader for PdsReader {
             8 => (PixelType::Uint8, 8u8),
             16 => (PixelType::Uint16, 16u8),
             32 => (PixelType::Uint32, 32u8),
-            _ => (PixelType::Uint8, 8u8),
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "PDS SAMPLE_BITS={sample_bits} is not supported"
+                )));
+            }
         };
 
         // Calculate data offset
@@ -823,6 +884,21 @@ impl FormatReader for PdsReader {
                 0u64
             }
         };
+
+        let bytes_per_pixel = (bpp / 8) as u64;
+        let expected = (line_samples as u64)
+            .checked_mul(lines as u64)
+            .and_then(|px| px.checked_mul(bytes_per_pixel))
+            .ok_or_else(|| BioFormatsError::Format("PDS image plane is too large".to_string()))?;
+        let available = data.len() as u64;
+        if offset
+            .checked_add(expected)
+            .is_none_or(|end| end > available)
+        {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PDS payload is shorter than declared image dimensions".to_string(),
+            ));
+        }
 
         self.data_offset = offset;
         self.path = Some(path.to_path_buf());
@@ -881,22 +957,21 @@ impl FormatReader for PdsReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
+        let n_bytes = checked_plane_len(meta)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(self.data_offset))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
@@ -904,8 +979,9 @@ impl FormatReader for PdsReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -921,21 +997,34 @@ impl FormatReader for PdsReader {
 // ---------------------------------------------------------------------------
 // 8. Hiscan HIS format
 // ---------------------------------------------------------------------------
-/// Hiscan HIS format reader (`.his`).
+/// Hamamatsu HIS format reader (`.his`).
 ///
-/// 100-byte header: bytes 0-1 magic (0x49), bytes 2-3 width (u16 LE),
-/// bytes 4-5 height (u16 LE). Pixel data starts at offset 100 as 16-bit LE.
+/// Translated from Bio-Formats `HISReader`: each series starts with the `IM`
+/// magic, a compact little-endian header, an optional semicolon-delimited
+/// comment block, and then one raw image plane. Packed 12-bit variants are
+/// detected but rejected explicitly; byte-aligned UINT8/UINT16 grayscale and
+/// RGB planes are decoded directly.
 pub struct HisReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    metas: Vec<ImageMetadata>,
+    pixel_offsets: Vec<u64>,
+    current_series: usize,
 }
 
 impl HisReader {
     pub fn new() -> Self {
         HisReader {
             path: None,
-            meta: None,
+            metas: Vec::new(),
+            pixel_offsets: Vec::new(),
+            current_series: 0,
         }
+    }
+
+    fn current_meta(&self) -> Result<&ImageMetadata> {
+        self.metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)
     }
 }
 
@@ -955,99 +1044,231 @@ impl FormatReader for HisReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 2 && header[0] == 0x49
+        header.len() >= 2 && &header[..2] == b"IM"
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        let mut header = [0u8; 100];
-        f.read_exact(&mut header).map_err(BioFormatsError::Io)?;
-        let w = u16::from_le_bytes([header[2], header[3]]) as u32;
-        let h = u16::from_le_bytes([header[4], header[5]]) as u32;
-        let (w, h) = if w == 0 || h == 0 { (512, 512) } else { (w, h) };
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < 16 || &data[..2] != b"IM" {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "HIS header missing IM magic".to_string(),
+            ));
+        }
+
+        let series_count = u16::from_le_bytes([data[14], data[15]]) as usize;
+        if series_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "HIS header declares zero image series".to_string(),
+            ));
+        }
+
+        let mut metas = Vec::with_capacity(series_count);
+        let mut pixel_offsets = Vec::with_capacity(series_count);
+        let mut offset = 0usize;
+        for series in 0..series_count {
+            if offset.checked_add(64).is_none_or(|end| end > data.len()) {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "HIS series {series} header is truncated"
+                )));
+            }
+            if &data[offset..offset + 2] != b"IM" {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "HIS series {series} missing IM magic"
+                )));
+            }
+
+            let comment_bytes = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            let w = u16::from_le_bytes([data[offset + 4], data[offset + 5]]) as u32;
+            let h = u16::from_le_bytes([data[offset + 6], data[offset + 7]]) as u32;
+            let data_type = u16::from_le_bytes([data[offset + 12], data[offset + 13]]);
+            if w == 0 || h == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "HIS header is missing image dimensions".to_string(),
+                ));
+            }
+
+            let (pixel_type, bits_per_pixel, size_c, bytes_per_sample) = match data_type {
+                1 => (PixelType::Uint8, 8u8, 1u32, 1u64),
+                2 => (PixelType::Uint16, 16u8, 1u32, 2u64),
+                6 | 14 => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "HIS packed 12-bit data type {data_type} is not implemented"
+                    )));
+                }
+                11 => (PixelType::Uint8, 8u8, 3u32, 1u64),
+                12 => (PixelType::Uint16, 16u8, 3u32, 2u64),
+                other => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "HIS data type {other} is not supported"
+                    )));
+                }
+            };
+
+            let pixel_offset = offset
+                .checked_add(64)
+                .and_then(|base| base.checked_add(comment_bytes))
+                .ok_or_else(|| BioFormatsError::Format("HIS header is too large".to_string()))?;
+            let plane_bytes = (w as u64)
+                .checked_mul(h as u64)
+                .and_then(|px| px.checked_mul(size_c as u64))
+                .and_then(|samples| samples.checked_mul(bytes_per_sample))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("HIS image plane is too large".to_string())
+                })?;
+            let next_offset = (pixel_offset as u64)
+                .checked_add(plane_bytes)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("HIS image plane is too large".to_string())
+                })?;
+            if next_offset > data.len() as u64 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "HIS payload is shorter than declared image dimensions".to_string(),
+                ));
+            }
+
+            let mut series_metadata = HashMap::new();
+            if comment_bytes > 0 {
+                let comment_end = pixel_offset;
+                let comment_start = comment_end - comment_bytes;
+                let comment = String::from_utf8_lossy(&data[comment_start..comment_end]);
+                for token in comment.split(';') {
+                    if let Some((key, value)) = token.split_once('=') {
+                        series_metadata
+                            .insert(key.to_string(), MetadataValue::String(value.to_string()));
+                    }
+                }
+            }
+
+            metas.push(ImageMetadata {
+                size_x: w,
+                size_y: h,
+                size_z: 1,
+                size_c,
+                size_t: 1,
+                pixel_type,
+                bits_per_pixel,
+                image_count: 1,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb: size_c > 1,
+                is_interleaved: size_c > 1,
+                is_indexed: false,
+                is_little_endian: true,
+                resolution_count: 1,
+                series_metadata,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            });
+            pixel_offsets.push(pixel_offset as u64);
+            offset = next_offset as usize;
+        }
+
         self.path = Some(path.to_path_buf());
-        self.meta = Some(ImageMetadata {
-            size_x: w,
-            size_y: h,
-            size_z: 1,
-            size_c: 1,
-            size_t: 1,
-            pixel_type: PixelType::Uint16,
-            bits_per_pixel: 16,
-            image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: HashMap::new(),
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
+        self.metas = metas;
+        self.pixel_offsets = pixel_offsets;
+        self.current_series = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
+        self.metas.clear();
+        self.pixel_offsets.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.metas.len().max(1)
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if s >= self.metas.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.metas
+            .get(self.current_series)
+            .expect("set_id not called")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self.current_meta()?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * 2;
+        let bytes_per_sample = (meta.bits_per_pixel / 8) as usize;
+        let n_bytes = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(meta.size_c as usize))
+            .and_then(|samples| samples.checked_mul(bytes_per_sample))
+            .ok_or_else(|| BioFormatsError::Format("HIS image plane is too large".to_string()))?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let pixel_offset = *self
+            .pixel_offsets
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(100)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(pixel_offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
-        let bytes_read = f.read(&mut buf).map_err(BioFormatsError::Io)?;
-        buf.truncate(bytes_read.max(n_bytes).min(n_bytes));
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self.current_meta()?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(vec![0u8; w as usize * h as usize * 2])
+        if x.checked_add(w).is_none_or(|end| end > meta.size_x)
+            || y.checked_add(h).is_none_or(|end| end > meta.size_y)
+        {
+            return Err(BioFormatsError::Format(
+                "requested region is outside the image bounds".to_string(),
+            ));
+        }
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        let bytes_per_pixel = (meta.bits_per_pixel as usize / 8) * meta.size_c as usize;
+        let row_bytes = meta.size_x as usize * bytes_per_pixel;
+        let crop_row_bytes = w as usize * bytes_per_pixel;
+        let x_offset = x as usize * bytes_per_pixel;
+        let mut out = Vec::with_capacity(crop_row_bytes * h as usize);
+        for row in y as usize..(y + h) as usize {
+            let start = row
+                .checked_mul(row_bytes)
+                .and_then(|base| base.checked_add(x_offset))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("requested region is too large".to_string())
+                })?;
+            let end = start.checked_add(crop_row_bytes).ok_or_else(|| {
+                BioFormatsError::Format("requested region is too large".to_string())
+            })?;
+            out.extend_from_slice(&plane[start..end]);
+        }
+        Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self.current_meta()?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
@@ -1293,8 +1514,8 @@ impl FormatReader for TextImageReader {
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
@@ -1302,7 +1523,7 @@ impl FormatReader for TextImageReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(vec![0u8; w as usize * h as usize * 4])
+        crop_plane(&self.pixel_data, meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

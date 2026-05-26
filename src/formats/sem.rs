@@ -8,7 +8,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -480,7 +480,235 @@ impl FormatReader for InrReader {
 }
 
 // ===========================================================================
-// Real binary reader 2 — Veeco/Nanoscope AFM
+// Real binary reader 2 — FEI/Philips XL SEM
+// ===========================================================================
+
+const FEI_PHILIPS_MAGIC: &[u8; 2] = b"XL";
+const FEI_INVALID_PIXELS: u32 = 112;
+const FEI_DIMENSION_OFFSET: u64 = 514;
+
+/// FEI/Philips XL `.img` SEM files.
+///
+/// Ported from Bio-Formats `FEIReader`: the header stores the physical scan
+/// parameters at fixed offsets, width/height at offset 514, and pixels as an
+/// 8-bit grayscale plane split into four row passes and two column passes.
+pub struct FeiPhilipsReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    header_size: u64,
+}
+
+impl FeiPhilipsReader {
+    pub fn new() -> Self {
+        FeiPhilipsReader {
+            path: None,
+            meta: None,
+            header_size: 0,
+        }
+    }
+}
+
+impl Default for FeiPhilipsReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn read_le_u16_at(data: &[u8], offset: usize, label: &str) -> Result<u16> {
+    let bytes = data.get(offset..offset + 2).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("FEI/Philips header missing {label}"))
+    })?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_le_f32_at(data: &[u8], offset: usize) -> Option<f32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+impl FormatReader for FeiPhilipsReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("img"))
+            .unwrap_or(false)
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(FEI_PHILIPS_MAGIC)
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if !self.is_this_type_by_bytes(&data) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FEI/Philips IMG header does not start with XL".into(),
+            ));
+        }
+
+        let stored_width = read_le_u16_at(&data, 514, "width")? as u32;
+        let height = read_le_u16_at(&data, 516, "height")? as u32;
+        let header_size = read_le_u16_at(&data, 522, "pixel offset")? as u64;
+        if stored_width <= FEI_INVALID_PIXELS || height == 0 || header_size < FEI_DIMENSION_OFFSET {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FEI/Philips IMG header contains invalid dimensions or pixel offset".into(),
+            ));
+        }
+
+        let width = stored_width - FEI_INVALID_PIXELS;
+        if width % 2 != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FEI/Philips IMG width must be even for interlaced decode".into(),
+            ));
+        }
+
+        let encoded_row_bytes = (width / 2 + FEI_INVALID_PIXELS / 2) as u64 * 2;
+        let encoded_bytes = encoded_row_bytes
+            .checked_mul(height as u64)
+            .ok_or_else(|| BioFormatsError::Format("FEI/Philips payload size overflows".into()))?;
+        let expected = header_size
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| BioFormatsError::Format("FEI/Philips file size overflows".into()))?;
+        if (data.len() as u64) < expected {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FEI/Philips IMG payload is shorter than declared dimensions".into(),
+            ));
+        }
+
+        let mut series_metadata = HashMap::new();
+        if let Some(v) = read_le_f32_at(&data, 44) {
+            series_metadata.insert("Magnification".into(), MetadataValue::Float(v as f64));
+        }
+        if let Some(v) = read_le_f32_at(&data, 48) {
+            series_metadata.insert("kV".into(), MetadataValue::Float((v / 1000.0) as f64));
+        }
+        if let Some(v) = read_le_f32_at(&data, 52) {
+            series_metadata.insert("Working distance".into(), MetadataValue::Float(v as f64));
+        }
+        if let Some(v) = read_le_f32_at(&data, 68) {
+            series_metadata.insert("Spot".into(), MetadataValue::Float(v as f64));
+        }
+
+        self.path = Some(path.to_path_buf());
+        self.header_size = header_size;
+        self.meta = Some(ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.header_size = 0;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        1
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+
+        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.header_size))
+            .map_err(BioFormatsError::Io)?;
+
+        let width = meta.size_x as usize;
+        let height = meta.size_y as usize;
+        let segment_len = width / 2;
+        let invalid_len = (FEI_INVALID_PIXELS / 2) as usize;
+        let mut segment = vec![0u8; segment_len];
+        let mut invalid = vec![0u8; invalid_len];
+        let mut plane = vec![0u8; width * height];
+
+        for row_pass in 0..4 {
+            let mut row = row_pass;
+            while row < height {
+                for col_pass in 0..2 {
+                    f.read_exact(&mut segment).map_err(BioFormatsError::Io)?;
+                    f.read_exact(&mut invalid).map_err(BioFormatsError::Io)?;
+                    let mut col = col_pass;
+                    while col < width {
+                        plane[row * width + col] = segment[col / 2];
+                        col += 2;
+                    }
+                }
+                row += 4;
+            }
+        }
+
+        Ok(plane)
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("FEI/Philips IMG", &full, &meta, 1, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+// ===========================================================================
+// Real binary reader 3 — Veeco/Nanoscope AFM
 // ===========================================================================
 
 /// Veeco/Bruker Nanoscope AFM format (numeric extensions like `.001`, `.afm`).
@@ -813,19 +1041,8 @@ impl FormatReader for JeolReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        let _ = plane_index;
+        Err(unsupported_raw_sem("JEOL SEM"))
     }
 
     fn open_bytes_region(
@@ -836,12 +1053,8 @@ impl FormatReader for JeolReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let _ = (plane_index, _x, _y, w, h);
+        Err(unsupported_raw_sem("JEOL SEM"))
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1369,19 +1582,8 @@ impl FormatReader for ZeissLmsReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        let _ = plane_index;
+        Err(unsupported_raw_sem("Zeiss LMS"))
     }
 
     fn open_bytes_region(
@@ -1392,12 +1594,8 @@ impl FormatReader for ZeissLmsReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        Ok(vec![0u8; w as usize * h as usize * bps])
+        let _ = (plane_index, _x, _y, w, h);
+        Err(unsupported_raw_sem("Zeiss LMS"))
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

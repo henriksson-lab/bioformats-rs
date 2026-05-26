@@ -53,9 +53,13 @@ fn region_crop(full: &[u8], meta: &ImageMetadata, x: u32, y: u32, w: u32, h: u32
     out
 }
 
-fn blank_plane(meta: &ImageMetadata) -> Vec<u8> {
-    let bps = meta.pixel_type.bytes_per_sample();
-    vec![0u8; meta.size_x as usize * meta.size_y as usize * bps]
+fn checked_payload_len(meta: &ImageMetadata) -> Result<u64> {
+    let bps = meta.pixel_type.bytes_per_sample() as u64;
+    (meta.size_x as u64)
+        .checked_mul(meta.size_y as u64)
+        .and_then(|px| px.checked_mul(bps))
+        .and_then(|plane| plane.checked_mul(meta.image_count as u64))
+        .ok_or_else(|| BioFormatsError::Format("declared image payload size overflows".into()))
 }
 
 // ── CellWorxReader ────────────────────────────────────────────────────────────
@@ -149,14 +153,12 @@ impl FormatReader for CellWorxReader {
             path.to_path_buf()
         };
 
-        let meta = if cfg_path.exists() {
-            parse_htd(&cfg_path)?
-        } else {
-            simple_meta(512, 512, 1, PixelType::Uint16)
-        };
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        Ok(())
+        if cfg_path.exists() {
+            let _ = parse_htd(&cfg_path)?;
+        }
+        Err(BioFormatsError::UnsupportedFormat(
+            "CellWorX HTD/PNL companion image decoding is not implemented".to_string(),
+        ))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -183,33 +185,27 @@ impl FormatReader for CellWorxReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
+        if plane_index != 0 {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(blank_plane(meta))
+        Err(BioFormatsError::UnsupportedFormat(
+            "CellWorX HTD/PNL companion image decoding is not implemented".to_string(),
+        ))
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        Ok(region_crop(&full, meta, x, y, w, h))
+        self.open_bytes(plane_index)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        self.open_bytes(plane_index)
     }
 }
 
@@ -255,7 +251,17 @@ fn parse_al3d(path: &Path) -> Result<ImageMetadata> {
         2 => PixelType::Float32,
         _ => PixelType::Uint16,
     };
-    Ok(simple_meta(width, height, depth, pixel_type))
+    let meta = simple_meta(width, height, depth, pixel_type);
+    let required_len = AL3D_DATA_OFFSET
+        .checked_add(checked_payload_len(&meta)?)
+        .ok_or_else(|| BioFormatsError::Format("AL3D file size overflows".into()))?;
+    if (data.len() as u64) < required_len {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "AL3D pixel payload is shorter than declared ({} < {required_len})",
+            data.len()
+        )));
+    }
+    Ok(meta)
 }
 
 impl FormatReader for Al3dReader {
@@ -318,7 +324,7 @@ impl FormatReader for Al3dReader {
         f.seek(SeekFrom::Start(plane_offset))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
@@ -372,7 +378,9 @@ impl Default for FeiSerReader {
 fn parse_ser(path: &Path) -> Result<ImageMetadata> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
     if data.len() < 30 {
-        return Ok(simple_meta(512, 512, 1, PixelType::Uint16));
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER header is too short for safe image decoding".to_string(),
+        ));
     }
     // Bytes 4-5: data type id (LE u16). 1=u8,2=u16,3=u32,4=i8,5=i16,6=i32,7=f32,8=f64
     let dtype = u16::from_le_bytes([data[4], data[5]]);
@@ -412,10 +420,10 @@ impl FormatReader for FeiSerReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let meta = parse_ser(path)?;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        Ok(())
+        let _ = parse_ser(path)?;
+        Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER payload decoding is not implemented".to_string(),
+        ))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -441,33 +449,27 @@ impl FormatReader for FeiSerReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
+        if plane_index != 0 {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(blank_plane(meta))
+        Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER payload decoding is not implemented".to_string(),
+        ))
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        Ok(region_crop(&full, meta, x, y, w, h))
+        self.open_bytes(plane_index)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        self.open_bytes(plane_index)
     }
 }
 
@@ -498,7 +500,9 @@ impl Default for OxfordInstrumentsReader {
 fn parse_oxford(path: &Path) -> Result<ImageMetadata> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
     if data.len() < 12 {
-        return Ok(simple_meta(512, 512, 1, PixelType::Uint16));
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Oxford TOP header is too short for safe image decoding".to_string(),
+        ));
     }
     // Offset 4: width (u16 LE), 6: height (u16 LE), 8: data_type (u16 LE)
     let width = u16::from_le_bytes([data[4], data[5]]) as u32;
@@ -510,9 +514,22 @@ fn parse_oxford(path: &Path) -> Result<ImageMetadata> {
         2 => PixelType::Float32,
         _ => PixelType::Uint16,
     };
-    let width = if width == 0 { 512 } else { width };
-    let height = if height == 0 { 512 } else { height };
-    Ok(simple_meta(width, height, 1, pixel_type))
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Oxford TOP header is missing image dimensions".to_string(),
+        ));
+    }
+    let meta = simple_meta(width, height, 1, pixel_type);
+    let required_len = OXFORD_DATA_OFFSET
+        .checked_add(checked_payload_len(&meta)?)
+        .ok_or_else(|| BioFormatsError::Format("Oxford TOP file size overflows".into()))?;
+    if (data.len() as u64) < required_len {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Oxford TOP pixel payload is shorter than declared ({} < {required_len})",
+            data.len()
+        )));
+    }
+    Ok(meta)
 }
 
 impl FormatReader for OxfordInstrumentsReader {
@@ -574,7 +591,7 @@ impl FormatReader for OxfordInstrumentsReader {
         f.seek(SeekFrom::Start(OXFORD_DATA_OFFSET))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 

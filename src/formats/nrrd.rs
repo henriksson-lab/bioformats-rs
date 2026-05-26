@@ -212,8 +212,101 @@ fn is_time_kind(kind: &str) -> bool {
     kind.to_ascii_lowercase().contains("time")
 }
 
+fn first_token_is_nan(value: &str) -> bool {
+    value
+        .split_ascii_whitespace()
+        .next()
+        .map(|token| token.trim_matches('"').eq_ignore_ascii_case("nan"))
+        .unwrap_or(false)
+}
+
+fn first_label_contains_comma(value: &str) -> bool {
+    let value = value.trim_start();
+    if let Some(rest) = value.strip_prefix('"') {
+        return rest
+            .split('"')
+            .next()
+            .map(|label| label.contains(','))
+            .unwrap_or(false);
+    }
+    value
+        .split_ascii_whitespace()
+        .next()
+        .map(|label| label.contains(','))
+        .unwrap_or(false)
+}
+
+fn has_leading_nonspatial_axis(hdr: &NrrdHeader) -> bool {
+    if hdr.sizes.len() < 3 || hdr.sizes.first().copied().unwrap_or(0) > 16 {
+        return false;
+    }
+
+    if hdr.space_directions.len() + 1 == hdr.sizes.len() {
+        return true;
+    }
+
+    ["axis mins", "axismins", "spacings"].iter().any(|key| {
+        hdr.extra
+            .get(*key)
+            .is_some_and(|value| first_token_is_nan(value))
+    }) || hdr
+        .extra
+        .get("labels")
+        .is_some_and(|value| first_label_contains_comma(value))
+}
+
+fn axis_has_space_direction(hdr: &NrrdHeader, axis: usize, leading_nonspatial: bool) -> bool {
+    let direction_axis = if leading_nonspatial && hdr.space_directions.len() + 1 == hdr.sizes.len()
+    {
+        axis.checked_sub(1)
+    } else {
+        Some(axis)
+    };
+    direction_axis
+        .and_then(|direction_axis| hdr.space_directions.get(direction_axis))
+        .copied()
+        .unwrap_or(false)
+}
+
 fn derive_axes(hdr: &NrrdHeader) -> NrrdAxes {
+    let leading_nonspatial = has_leading_nonspatial_axis(hdr);
+
     if hdr.kinds.is_empty() && hdr.space_directions.is_empty() {
+        if leading_nonspatial {
+            match hdr.sizes.as_slice() {
+                [c, x, y] => {
+                    return NrrdAxes {
+                        size_x: *x,
+                        size_y: *y,
+                        size_z: 1,
+                        size_c: *c,
+                        size_t: 1,
+                        axis_x: Some(1),
+                        axis_y: Some(2),
+                        axis_z: None,
+                        axis_c: Some(0),
+                        axis_t: None,
+                    };
+                }
+                [c, x, y, z, ..] => {
+                    return NrrdAxes {
+                        size_x: *x,
+                        size_y: *y,
+                        size_z: *z,
+                        size_c: *c,
+                        size_t: 1,
+                        axis_x: Some(1),
+                        axis_y: Some(2),
+                        axis_z: Some(3),
+                        axis_c: Some(0),
+                        axis_t: None,
+                    };
+                }
+                _ => {
+                    // Fall through to generic axis derivation below.
+                }
+            };
+        }
         return match hdr.sizes.as_slice() {
             [x] => NrrdAxes {
                 size_x: *x,
@@ -284,7 +377,9 @@ fn derive_axes(hdr: &NrrdHeader) -> NrrdAxes {
 
     for (axis, size) in hdr.sizes.iter().enumerate() {
         let kind = hdr.kinds.get(axis).map(String::as_str).unwrap_or("");
-        if is_channel_kind(kind) {
+        if leading_nonspatial && axis == 0 {
+            axis_c = Some(axis);
+        } else if is_channel_kind(kind) {
             axis_c = Some(axis);
         } else if is_time_kind(kind) {
             axis_t = Some(axis);
@@ -295,7 +390,7 @@ fn derive_axes(hdr: &NrrdHeader) -> NrrdAxes {
             && *size <= 4
         {
             axis_c = Some(axis);
-        } else if hdr.space_directions.get(axis).copied().unwrap_or(false) {
+        } else if axis_has_space_direction(hdr, axis, leading_nonspatial) {
             spatial.push(axis);
         } else if *size > 0 {
             spatial.push(axis);

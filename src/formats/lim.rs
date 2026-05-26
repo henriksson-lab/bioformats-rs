@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
@@ -44,20 +44,39 @@ fn load_lim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     let image_count = u16::from_le_bytes([header[6], header[7]]) as u32;
     let data_offset = u32::from_le_bytes([header[8], header[9], 0, 0]) as u64;
 
-    // Fallback defaults if header values are zero
-    let width = if width == 0 { 512 } else { width };
-    let height = if height == 0 { 512 } else { height };
-    let bits = if bits == 0 { 8 } else { bits };
-    let image_count = image_count.max(1);
-    let data_offset = if data_offset == 0 { 256 } else { data_offset };
+    if width == 0 || height == 0 || image_count == 0 || data_offset == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "LIM header is missing required dimensions or data offset".to_string(),
+        ));
+    }
 
     let pixel_type = match bits {
         8 => PixelType::Uint8,
         16 => PixelType::Uint16,
         32 => PixelType::Float32,
-        _ => PixelType::Uint8,
+        _ => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "LIM bit depth {bits} is not supported"
+            )));
+        }
     };
     let bps = pixel_type.bytes_per_sample();
+    let plane_bytes = width
+        .checked_mul(height)
+        .and_then(|px| px.checked_mul(bps as u32))
+        .ok_or_else(|| BioFormatsError::Format("LIM plane size overflows".to_string()))?
+        as u64;
+    let required_len = data_offset
+        .checked_add(plane_bytes.checked_mul(image_count as u64).ok_or_else(|| {
+            BioFormatsError::Format("LIM pixel payload size overflows".to_string())
+        })?)
+        .ok_or_else(|| BioFormatsError::Format("LIM file size overflows".to_string()))?;
+    let actual_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+    if actual_len < required_len {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "LIM pixel payload is shorter than declared ({actual_len} < {required_len})"
+        )));
+    }
 
     let meta = ImageMetadata {
         size_x: width,
@@ -156,6 +175,7 @@ impl FormatReader for LimReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
+        validate_region(meta, x, y, w, h)?;
         let bps = meta.pixel_type.bytes_per_sample();
         let row_bytes = meta.size_x as usize * bps;
         let out_row = w as usize * bps;
@@ -178,19 +198,46 @@ impl FormatReader for LimReader {
     }
 }
 
+fn validate_region(meta: &ImageMetadata, x: u32, y: u32, w: u32, h: u32) -> Result<()> {
+    let x2 = x
+        .checked_add(w)
+        .ok_or_else(|| BioFormatsError::Format("LIM region width overflows".to_string()))?;
+    let y2 = y
+        .checked_add(h)
+        .ok_or_else(|| BioFormatsError::Format("LIM region height overflows".to_string()))?;
+    if x2 > meta.size_x || y2 > meta.size_y {
+        return Err(BioFormatsError::Format(
+            "LIM region is outside image bounds".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // ── TillVision Reader ─────────────────────────────────────────────────────────
 
 pub struct TillVisionReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    series: Vec<TillVisionSeries>,
+    current_series: usize,
+}
+
+#[derive(Clone)]
+struct TillVisionSeries {
+    pixel_path: PathBuf,
+    meta: ImageMetadata,
 }
 
 impl TillVisionReader {
     pub fn new() -> Self {
         TillVisionReader {
-            path: None,
-            meta: None,
+            series: Vec::new(),
+            current_series: 0,
         }
+    }
+
+    fn unsupported() -> BioFormatsError {
+        BioFormatsError::UnsupportedFormat(
+            "TillVision embedded VWS payload decoding is not implemented".to_string(),
+        )
     }
 }
 
@@ -198,63 +245,6 @@ impl Default for TillVisionReader {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn load_tillvision(path: &Path) -> Result<ImageMetadata> {
-    let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-    let mut buf = vec![
-        0u8;
-        512.min(
-            std::fs::metadata(path)
-                .map(|m| m.len() as usize)
-                .unwrap_or(512)
-        )
-    ];
-    let n = f.read(&mut buf).map_err(BioFormatsError::Io)?;
-    let buf = &buf[..n];
-
-    // Try to find plausible width/height as u32 LE values in range [16, 8192]
-    let mut width = 512u32;
-    let mut height = 512u32;
-    let mut found = 0;
-
-    let mut i = 0;
-    while i + 4 <= buf.len() && found < 2 {
-        let v = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
-        if v >= 16 && v <= 8192 {
-            if found == 0 {
-                width = v;
-            } else {
-                height = v;
-            }
-            found += 1;
-            i += 4;
-        } else {
-            i += 1;
-        }
-    }
-
-    Ok(ImageMetadata {
-        size_x: width,
-        size_y: height,
-        size_z: 1,
-        size_c: 1,
-        size_t: 1,
-        pixel_type: PixelType::Uint16,
-        bits_per_pixel: 16,
-        image_count: 1,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: true,
-        resolution_count: 1,
-        series_metadata: HashMap::new(),
-        lookup_table: None,
-        modulo_z: None,
-        modulo_c: None,
-        modulo_t: None,
-    })
 }
 
 impl FormatReader for TillVisionReader {
@@ -270,42 +260,62 @@ impl FormatReader for TillVisionReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let meta = load_tillvision(path)?;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
+        let series = load_tillvision_series(path)?;
+        if series.is_empty() {
+            return Err(Self::unsupported());
+        }
+        self.series = series;
+        self.current_series = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
+        self.series.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.series.len().max(1)
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if s >= self.series.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        &self
+            .series
+            .get(self.current_series)
+            .expect("set_id not called")
+            .meta
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index != 0 {
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &series.meta;
+        if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(vec![0u8; meta.size_x as usize * meta.size_y as usize * 2])
+
+        let plane_bytes = tillvision_plane_bytes(meta)?;
+        let offset = plane_index as u64 * plane_bytes as u64;
+        let mut f = std::fs::File::open(&series.pixel_path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; plane_bytes];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        Ok(buf)
     }
 
     fn open_bytes_region(
@@ -317,24 +327,178 @@ impl FormatReader for TillVisionReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let row_bytes = meta.size_x as usize * 2;
-        let out_row = w as usize * 2;
+        let meta = self.metadata();
+        validate_region(meta, x, y, w, h)?;
+        let bps = meta.pixel_type.bytes_per_sample() * meta.size_c as usize;
+        let row_bytes = meta.size_x as usize * bps;
+        let out_row = w as usize * bps;
         let mut out = Vec::with_capacity(h as usize * out_row);
         for row in 0..h as usize {
             let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * 2;
+            let s = x as usize * bps;
             out.extend_from_slice(&src[s..s + out_row]);
         }
         Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self.metadata();
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+}
+
+fn load_tillvision_series(path: &Path) -> Result<Vec<TillVisionSeries>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut pixel_files = Vec::new();
+
+    if ext == "pst" && path.is_file() {
+        pixel_files.push(path.to_path_buf());
+    } else if ext == "vws" {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        for entry in std::fs::read_dir(parent).map_err(BioFormatsError::Io)? {
+            let entry = entry.map_err(BioFormatsError::Io)?;
+            let entry_path = entry.path();
+            let entry_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if entry_path.is_file() && entry_name.ends_with(".pst") {
+                pixel_files.push(entry_path);
+            } else if entry_path.is_dir()
+                && entry_name.ends_with(".pst")
+                && (stem.is_empty() || entry_name.starts_with(&stem))
+            {
+                for sub in std::fs::read_dir(&entry_path).map_err(BioFormatsError::Io)? {
+                    let sub = sub.map_err(BioFormatsError::Io)?;
+                    let sub_path = sub.path();
+                    if sub_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("pst"))
+                        .unwrap_or(false)
+                    {
+                        pixel_files.push(sub_path);
+                    }
+                }
+            }
+        }
+    }
+
+    pixel_files.sort();
+    let mut series = Vec::new();
+    for pixel_path in pixel_files {
+        let inf_path = pixel_path.with_extension("inf");
+        let meta = load_tillvision_inf(&inf_path)?;
+        let plane_bytes = tillvision_plane_bytes(&meta)?;
+        let expected = plane_bytes
+            .checked_mul(meta.image_count as usize)
+            .ok_or_else(|| BioFormatsError::Format("TillVision pixel size overflows".into()))?;
+        let actual = std::fs::metadata(&pixel_path)
+            .map_err(BioFormatsError::Io)?
+            .len() as usize;
+        if actual < expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TillVision PST pixel payload is shorter than declared ({actual} < {expected})"
+            )));
+        }
+        series.push(TillVisionSeries { pixel_path, meta });
+    }
+    Ok(series)
+}
+
+fn load_tillvision_inf(path: &Path) -> Result<ImageMetadata> {
+    let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+    let mut values = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('[') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            values.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    let int_value = |key: &str| -> Result<u32> {
+        values
+            .get(&key.to_ascii_lowercase())
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!("TillVision INF missing {key}"))
+            })?
+            .parse::<u32>()
+            .map_err(|_| {
+                BioFormatsError::UnsupportedFormat(format!("TillVision INF invalid {key}"))
+            })
+    };
+
+    let size_x = int_value("Width")?;
+    let size_y = int_value("Height")?;
+    let size_c = int_value("Bands")?.max(1);
+    let size_z = int_value("Slices")?.max(1);
+    let size_t = int_value("Frames")?.max(1);
+    let datatype = int_value("Datatype")?;
+    let pixel_type = tillvision_pixel_type(datatype)?;
+    let image_count = size_z
+        .checked_mul(size_t)
+        .ok_or_else(|| BioFormatsError::Format("TillVision image count overflows".into()))?;
+
+    Ok(ImageMetadata {
+        size_x,
+        size_y,
+        size_z,
+        size_c,
+        size_t,
+        pixel_type,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        image_count,
+        dimension_order: DimensionOrder::XYCZT,
+        is_rgb: false,
+        is_interleaved: true,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        series_metadata: values
+            .into_iter()
+            .map(|(k, v)| (format!("Info {k}"), MetadataValue::String(v)))
+            .collect(),
+        lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
+    })
+}
+
+fn tillvision_pixel_type(datatype: u32) -> Result<PixelType> {
+    let signed = datatype % 2 == 1;
+    let bytes = datatype / 2 + u32::from(signed);
+    match (bytes, signed) {
+        (1, false) => Ok(PixelType::Uint8),
+        (1, true) => Ok(PixelType::Int8),
+        (2, false) => Ok(PixelType::Uint16),
+        (2, true) => Ok(PixelType::Int16),
+        (4, false) => Ok(PixelType::Uint32),
+        (4, true) => Ok(PixelType::Int32),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "TillVision datatype {datatype} is not supported"
+        ))),
+    }
+}
+
+fn tillvision_plane_bytes(meta: &ImageMetadata) -> Result<usize> {
+    meta.size_x
+        .checked_mul(meta.size_y)
+        .and_then(|px| px.checked_mul(meta.size_c))
+        .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample() as u32))
+        .map(|n| n as usize)
+        .ok_or_else(|| BioFormatsError::Format("TillVision plane size overflows".into()))
 }

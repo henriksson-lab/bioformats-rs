@@ -44,7 +44,7 @@ impl Default for CellH5Reader {
 }
 
 /// Walk known CellH5 layout patterns and collect leaf channel dataset paths.
-fn find_image_datasets(file: &hdf5::File) -> Vec<String> {
+fn find_image_datasets(file: &hdf5_pure::File) -> Vec<String> {
     let mut paths = Vec::new();
 
     for root in &["sample", "plate"] {
@@ -52,7 +52,7 @@ fn find_image_datasets(file: &hdf5::File) -> Vec<String> {
             Ok(g) => g,
             Err(_) => continue,
         };
-        let plates = match root_g.member_names() {
+        let plates = match hdf5_group_members(&root_g) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -63,7 +63,7 @@ fn find_image_datasets(file: &hdf5::File) -> Vec<String> {
                     Ok(g) => g,
                     Err(_) => continue,
                 };
-                let wells = match mid_g.member_names() {
+                let wells = match hdf5_group_members(&mid_g) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -73,7 +73,7 @@ fn find_image_datasets(file: &hdf5::File) -> Vec<String> {
                         Ok(g) => g,
                         Err(_) => continue,
                     };
-                    let chs = match ch_g.member_names() {
+                    let chs = match hdf5_group_members(&ch_g) {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
@@ -88,108 +88,65 @@ fn find_image_datasets(file: &hdf5::File) -> Vec<String> {
     paths
 }
 
-fn hdf5_attr_value(attr: &hdf5::Attribute) -> MetadataValue {
-    if let Ok(s) = attr.read_scalar::<hdf5::types::VarLenUnicode>() {
-        return MetadataValue::String(s.as_str().to_string());
-    }
-    if let Ok(s) = attr.read_scalar::<hdf5::types::VarLenAscii>() {
-        return MetadataValue::String(s.as_str().trim_matches('\0').trim().to_string());
-    }
-    if let Ok(s) = attr.read_scalar::<hdf5::types::FixedAscii<64>>() {
-        return MetadataValue::String(s.as_str().trim_matches('\0').trim().to_string());
-    }
-    if let Ok(s) = attr.read_scalar::<hdf5::types::FixedUnicode<64>>() {
-        return MetadataValue::String(s.as_str().trim_matches('\0').trim().to_string());
-    }
-    if let Ok(v) = attr.read_scalar::<i64>() {
-        return MetadataValue::Int(v);
-    }
-    if let Ok(v) = attr.read_scalar::<i32>() {
-        return MetadataValue::Int(v as i64);
-    }
-    if let Ok(v) = attr.read_scalar::<u64>() {
-        return MetadataValue::Int(v.min(i64::MAX as u64) as i64);
-    }
-    if let Ok(v) = attr.read_scalar::<u32>() {
-        return MetadataValue::Int(v as i64);
-    }
-    if let Ok(v) = attr.read_scalar::<f64>() {
-        return MetadataValue::Float(v);
-    }
-    if let Ok(v) = attr.read_scalar::<f32>() {
-        return MetadataValue::Float(v as f64);
-    }
-    if let Ok(v) = attr.read_scalar::<bool>() {
-        return MetadataValue::Bool(v);
-    }
-    if let Ok(bytes) = attr.read_raw::<u8>() {
-        if !bytes.is_empty()
-            && bytes
-                .iter()
-                .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
-        {
-            return MetadataValue::String(
-                String::from_utf8_lossy(&bytes)
-                    .trim_matches('\0')
-                    .trim()
-                    .to_string(),
-            );
+fn hdf5_attr_value(attr: &hdf5_pure::AttrValue) -> MetadataValue {
+    match attr {
+        hdf5_pure::AttrValue::F64(v) => MetadataValue::Float(*v),
+        hdf5_pure::AttrValue::F64Array(v) => MetadataValue::String(format!("{v:?}")),
+        hdf5_pure::AttrValue::I32(v) => MetadataValue::Int(*v as i64),
+        hdf5_pure::AttrValue::I64(v) => MetadataValue::Int(*v),
+        hdf5_pure::AttrValue::I64Array(v) => MetadataValue::String(format!("{v:?}")),
+        hdf5_pure::AttrValue::U32(v) => MetadataValue::Int(*v as i64),
+        hdf5_pure::AttrValue::U64(v) => MetadataValue::Int((*v).min(i64::MAX as u64) as i64),
+        hdf5_pure::AttrValue::String(s) | hdf5_pure::AttrValue::AsciiString(s) => {
+            MetadataValue::String(s.trim_matches('\0').trim().to_string())
         }
-        return MetadataValue::Bytes(bytes);
+        hdf5_pure::AttrValue::StringArray(v)
+        | hdf5_pure::AttrValue::AsciiStringArray(v)
+        | hdf5_pure::AttrValue::VarLenAsciiArray(v) => MetadataValue::String(v.join(",")),
     }
-
-    MetadataValue::String(format!("shape={:?}", attr.shape()))
 }
 
 fn collect_group_attrs(
-    group: &hdf5::Group,
+    group: &hdf5_pure::Group<'_>,
     path: &str,
     meta_map: &mut HashMap<String, MetadataValue>,
 ) {
-    if let Ok(names) = group.attr_names() {
-        for name in names {
-            if let Ok(attr) = group.attr(&name) {
-                meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
-            }
+    if let Ok(attrs) = group.attrs() {
+        for (name, attr) in attrs {
+            meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
         }
     }
 }
 
 fn collect_dataset_metadata(
-    dataset: &hdf5::Dataset,
+    dataset: &hdf5_pure::Dataset<'_>,
     path: &str,
     meta_map: &mut HashMap<String, MetadataValue>,
 ) {
-    let dtype_size = dataset.dtype().map(|d| d.size()).unwrap_or(0);
+    let dtype_size = dataset.dtype().map(hdf5_dtype_size).unwrap_or(0);
+    let shape = dataset.shape().unwrap_or_default();
     meta_map.insert(
         format!("cellh5_dataset:{path}"),
-        MetadataValue::String(format!(
-            "shape={:?}; dtype_size={dtype_size}",
-            dataset.shape()
-        )),
+        MetadataValue::String(format!("shape={:?}; dtype_size={dtype_size}", shape)),
     );
 
-    if let Ok(names) = dataset.attr_names() {
-        for name in names {
-            if let Ok(attr) = dataset.attr(&name) {
-                meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
-            }
+    if let Ok(attrs) = dataset.attrs() {
+        for (name, attr) in attrs {
+            meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
         }
     }
 }
 
-fn collect_file_attrs(file: &hdf5::File, meta_map: &mut HashMap<String, MetadataValue>) {
-    if let Ok(names) = file.attr_names() {
-        for name in names {
-            if let Ok(attr) = file.attr(&name) {
-                meta_map.insert(format!("cellh5_attr:/@{name}"), hdf5_attr_value(&attr));
-            }
+fn collect_file_attrs(file: &hdf5_pure::File, meta_map: &mut HashMap<String, MetadataValue>) {
+    if let Ok(attrs) = file.root().attrs() {
+        for (name, attr) in attrs {
+            meta_map.insert(format!("cellh5_attr:/@{name}"), hdf5_attr_value(&attr));
         }
     }
 }
 
 fn collect_hdf5_metadata(
-    file: &hdf5::File,
+    file: &hdf5_pure::File,
     path: &str,
     meta_map: &mut HashMap<String, MetadataValue>,
     visited: &mut usize,
@@ -205,7 +162,7 @@ fn collect_hdf5_metadata(
     };
     collect_group_attrs(&group, path, meta_map);
 
-    let members = match group.member_names() {
+    let members = match hdf5_group_members(&group) {
         Ok(members) => members,
         Err(_) => return,
     };
@@ -228,7 +185,7 @@ fn collect_hdf5_metadata(
 }
 
 fn parse_cellh5(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
-    let file = hdf5::File::open(path)
+    let file = hdf5_pure::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
     let channel_paths = find_image_datasets(&file);
@@ -249,7 +206,7 @@ fn parse_cellh5(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
         .dataset(&channel_paths[0])
         .map_err(|e| BioFormatsError::Format(format!("dataset {}: {e}", channel_paths[0])))?;
 
-    let shape = ds.shape();
+    let shape = ds.shape().unwrap_or_default();
     let (size_x, size_y, size_z, size_t) = match shape.len() {
         3 => {
             // [n_frames, y, x]
@@ -274,7 +231,7 @@ fn parse_cellh5(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
     };
 
     // Determine pixel type from dataset dtype size
-    let pixel_type = match ds.dtype().map(|d| d.size()).unwrap_or(2) {
+    let pixel_type = match ds.dtype().map(hdf5_dtype_size).unwrap_or(2) {
         1 => PixelType::Uint8,
         4 => PixelType::Uint32,
         _ => PixelType::Uint16,
@@ -311,6 +268,33 @@ fn parse_cellh5(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
     };
 
     Ok((meta, channel_paths))
+}
+
+fn hdf5_group_members(
+    group: &hdf5_pure::Group<'_>,
+) -> std::result::Result<Vec<String>, hdf5_pure::Error> {
+    let mut members = group.groups()?;
+    members.extend(group.datasets()?);
+    Ok(members)
+}
+
+fn hdf5_dtype_size(dtype: hdf5_pure::DType) -> usize {
+    match dtype {
+        hdf5_pure::DType::F32
+        | hdf5_pure::DType::I32
+        | hdf5_pure::DType::U32
+        | hdf5_pure::DType::Enum(_) => 4,
+        hdf5_pure::DType::F64
+        | hdf5_pure::DType::I64
+        | hdf5_pure::DType::U64
+        | hdf5_pure::DType::ObjectReference => 8,
+        hdf5_pure::DType::I16 | hdf5_pure::DType::U16 => 2,
+        hdf5_pure::DType::I8 | hdf5_pure::DType::U8 => 1,
+        hdf5_pure::DType::Array(base, dims) => {
+            hdf5_dtype_size(*base) * dims.iter().copied().product::<u32>() as usize
+        }
+        _ => 0,
+    }
 }
 
 impl FormatReader for CellH5Reader {
@@ -398,30 +382,30 @@ impl FormatReader for CellH5Reader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        let file =
-            hdf5::File::open(&path).map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+        let file = hdf5_pure::File::open(&path)
+            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
         let ds = file
             .dataset(&ds_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
 
         let raw: Vec<u8> = match bytes_per_sample {
             1 => ds
-                .read_raw::<u8>()
+                .read_u8()
                 .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
             2 => {
                 let words: Vec<u16> = ds
-                    .read_raw::<u16>()
+                    .read_u16()
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 words.iter().flat_map(|w| w.to_le_bytes()).collect()
             }
             4 => {
                 let dwords: Vec<u32> = ds
-                    .read_raw::<u32>()
+                    .read_u32()
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
             }
             _ => ds
-                .read_raw::<u8>()
+                .read_u8()
                 .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
         };
 

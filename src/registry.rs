@@ -61,6 +61,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::amira::SpiderReader::new()),
         Box::new(crate::formats::imagic::ImagicReader::new()),
         Box::new(crate::formats::flim::SdtReader::new()),
+        Box::new(crate::formats::flim::LiFlimReader::new()),
         Box::new(crate::formats::clinical::Ecat7Reader::new()),
         Box::new(crate::formats::clinical::FdfReader::new()),
         Box::new(crate::formats::hamamatsu::DcimgReader::new()),
@@ -109,6 +110,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::perkinelmer::PhotonDynamicsReader::new()),
         Box::new(crate::formats::mias::CellWorxReader::new()),
         Box::new(crate::formats::mias::OxfordInstrumentsReader::new()),
+        Box::new(crate::formats::sem::FeiPhilipsReader::new()),
         // FEI SER (magic-byte detected: 0x97 0x01)
         Box::new(crate::formats::mias::FeiSerReader::new()),
         // AVI video (RIFF magic)
@@ -245,39 +247,9 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
 impl ImageReader {
     /// Open the file at `path`, detect its format, parse metadata.
     pub fn open(path: &Path) -> Result<Self> {
-        let header = peek_header(path, 512).unwrap_or_default();
-        let mut best_error = None;
-
-        // 1. Magic bytes
-        for mut r in all_readers() {
-            if r.is_this_type_by_bytes(&header) {
-                match r.set_id(path) {
-                    Ok(()) => return Ok(ImageReader { inner: r }),
-                    Err(err) => remember_set_id_error(&mut best_error, err),
-                }
-            }
-        }
-
-        // 2. Extension fallback
-        let mut replacing_magic_error = best_error.is_some();
-        for mut r in all_readers() {
-            if r.is_this_type_by_name(path) {
-                match r.set_id(path) {
-                    Ok(()) => return Ok(ImageReader { inner: r }),
-                    Err(err) => {
-                        if replacing_magic_error {
-                            best_error = Some(err);
-                            replacing_magic_error = false;
-                        } else {
-                            remember_set_id_error(&mut best_error, err);
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(best_error
-            .unwrap_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string())))
+        Ok(ImageReader {
+            inner: open_reader(path)?,
+        })
     }
 
     /// Return structured OME metadata.
@@ -327,6 +299,123 @@ impl ImageReader {
     }
 }
 
+pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
+    let header = peek_header(path, 512).unwrap_or_default();
+    let mut best_error = None;
+
+    // TIFF-based vendor wrappers often have no magic beyond TIFF itself.
+    // Give non-generic TIFF extensions a chance before the broad TiffReader
+    // byte signature accepts the file.
+    if is_tiff_header(&header) {
+        for mut r in tiff_wrapper_readers_for_extension(path) {
+            match r.set_id(path) {
+                Ok(()) => return Ok(r),
+                Err(err) => remember_set_id_error(&mut best_error, err),
+            }
+        }
+    }
+
+    // 1. Magic bytes
+    for mut r in all_readers() {
+        if r.is_this_type_by_bytes(&header) {
+            match r.set_id(path) {
+                Ok(()) => return Ok(r),
+                Err(err @ BioFormatsError::UnsupportedFormat(_))
+                    if unsupported_magic_error_is_terminal(&err) =>
+                {
+                    return Err(err);
+                }
+                Err(err) => remember_set_id_error(&mut best_error, err),
+            }
+        }
+    }
+
+    // 2. Extension fallback
+    let mut replacing_magic_error = best_error.is_some();
+    for mut r in all_readers() {
+        if r.is_this_type_by_name(path) {
+            match r.set_id(path) {
+                Ok(()) => return Ok(r),
+                Err(err) => {
+                    if replacing_magic_error {
+                        best_error = Some(err);
+                        replacing_magic_error = false;
+                    } else {
+                        remember_set_id_error(&mut best_error, err);
+                    }
+                }
+            }
+        }
+    }
+
+    Err(best_error
+        .unwrap_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string())))
+}
+
+fn is_tiff_header(header: &[u8]) -> bool {
+    header.len() >= 4
+        && (header[0..2] == [0x49, 0x49] || header[0..2] == [0x4D, 0x4D])
+        && (header[2..4] == [42, 0]
+            || header[2..4] == [0, 42]
+            || header[2..4] == [43, 0]
+            || header[2..4] == [0, 43])
+}
+
+fn tiff_wrapper_readers_for_extension(path: &Path) -> Vec<Box<dyn FormatReader>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+
+    match ext.as_deref() {
+        Some("lsm") => vec![boxed_reader(crate::formats::lsm::LsmReader::new())],
+        Some("stk") => vec![boxed_reader(
+            crate::formats::metamorph::MetamorphReader::new(),
+        )],
+        Some("svs") => vec![boxed_reader(
+            crate::formats::svs::WholeSlideTiffReader::new(),
+        )],
+        Some("ndpi") => vec![
+            boxed_reader(crate::formats::tiff_wrappers::NdpiReader::new()),
+            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+        ],
+        Some("scn") => vec![
+            boxed_reader(crate::formats::tiff_wrappers::LeicaScnReader::new()),
+            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+            boxed_reader(crate::formats::flim2::BioRadScnReader::new()),
+        ],
+        Some("bif") => vec![
+            boxed_reader(crate::formats::tiff_wrappers::VentanaReader::new()),
+            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+        ],
+        Some("vsi") => vec![
+            boxed_reader(crate::formats::flim2::CellSensReader::new()),
+            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+        ],
+        Some("afi") => vec![
+            boxed_reader(crate::formats::flim2::AfiFluorescenceReader::new()),
+            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+        ],
+        Some("dng") => vec![boxed_reader(crate::formats::extended::DngReader::new())],
+        Some("qptiff") => vec![boxed_reader(crate::formats::extended::QptiffReader::new())],
+        Some("gel") => vec![boxed_reader(crate::formats::extended::GelReader::new())],
+        Some("flex") => vec![boxed_reader(crate::formats::flex::FlexReader::new())],
+        Some("cr2") | Some("crw") | Some("cr3") => {
+            vec![boxed_reader(crate::formats::camera2::CanonRawReader::new())]
+        }
+        Some("ipw") => vec![boxed_reader(crate::formats::camera2::IpwReader::new())],
+        Some("ims") => vec![boxed_reader(crate::formats::flim2::ImarisTiffReader::new())],
+        Some("xlef") => vec![boxed_reader(crate::formats::flim2::XlefReader::new())],
+        Some("ctf") => vec![boxed_reader(crate::formats::flim2::MicroCtReader::new())],
+        Some("ndpis") => vec![boxed_reader(crate::formats::flim2::NdpisReader::new())],
+        _ => Vec::new(),
+    }
+}
+
+fn boxed_reader<T: FormatReader + 'static>(reader: T) -> Box<dyn FormatReader> {
+    Box::new(reader)
+}
+
 fn remember_set_id_error(best_error: &mut Option<BioFormatsError>, err: BioFormatsError) {
     match best_error {
         None => *best_error = Some(err),
@@ -339,10 +428,21 @@ fn remember_set_id_error(best_error: &mut Option<BioFormatsError>, err: BioForma
     }
 }
 
+fn unsupported_magic_error_is_terminal(err: &BioFormatsError) -> bool {
+    matches!(
+        err,
+        BioFormatsError::UnsupportedFormat(message)
+            if message.contains("not implemented")
+                || message.contains("requires OLE2")
+                || message.contains("requires HDF5")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::ImageReader;
     use crate::common::error::BioFormatsError;
+    use crate::common::metadata::MetadataValue;
     use std::io::Write;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -385,16 +485,27 @@ mod tests {
     }
 
     #[test]
+    fn tiff_wrapper_extension_dispatch_runs_before_generic_tiff_reader() {
+        let path = temp_path("wrapper_metadata.ndpi");
+        write_minimal_ndpi_tiff(&path, 20.0);
+
+        let reader = ImageReader::open(&path).expect("NDPI wrapper dispatch failed");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("ndpi.magnification"),
+            Some(MetadataValue::Float(value)) if (*value - 20.0).abs() < f64::EPSILON
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn registered_unsupported_stubs_do_not_open_with_fake_metadata() {
         for (name, expected) in [
             (
                 "sample.mvd2",
                 "Volocity MVD2 format reading is not yet implemented",
             ),
-            (
-                "sample.cif",
-                "FlowSight CIF format reading is not yet implemented",
-            ),
+            ("sample.cif", "FlowSight CIF is not TIFF-like"),
             ("sample.lof", "Leica LOF is a proprietary binary format"),
             (
                 "sample.oir",
@@ -406,7 +517,11 @@ mod tests {
             ),
             (
                 "sample.xrm",
-                "Zeiss XRM format reading is not yet implemented",
+                "Zeiss XRM/TXRM requires OLE2/Compound Document parsing",
+            ),
+            (
+                "sample.txrm",
+                "Zeiss XRM/TXRM requires OLE2/Compound Document parsing",
             ),
             (
                 "sample.eps",
@@ -415,19 +530,64 @@ mod tests {
             ("sample.b16", "PCO B16 file is too short"),
             ("sample.1sc", "Bio-Rad GEL file is too short"),
             (
+                "sample.obf",
+                "Imspector OBF/MSR stack metadata and payload decoding is not implemented",
+            ),
+            (
+                "sample.msr",
+                "Imspector OBF/MSR stack metadata and payload decoding is not implemented",
+            ),
+            (
+                "sample.vms",
+                "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented",
+            ),
+            (
+                "sample.vmu",
+                "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented",
+            ),
+            (
                 "sample.l2d",
-                "Hamamatsu L2D image payload decoding is not implemented",
+                "Li-Cor L2D file is missing LI-COR LI2D marker",
             ),
             (
                 "sample.ptu",
                 "PicoQuant TCSPC event stream decoding to image planes is not implemented",
             ),
+            (
+                "sample.vws",
+                "TillVision embedded VWS payload decoding is not implemented",
+            ),
+            (
+                "sample.abs",
+                "Bruker OPUS spectral image decoding is not implemented",
+            ),
+            (
+                "sample.0",
+                "Bruker OPUS spectral image decoding is not implemented",
+            ),
+            ("sample.iss", "ISS Vista FLIM decoding is not implemented"),
+            (
+                "sample.gel",
+                "GEL header is too short for Molecular Dynamics dimensions",
+            ),
         ] {
             let path = temp_path(name);
-            std::fs::write(&path, b"not a real image").unwrap();
+            if name == "sample.obf" || name == "sample.msr" {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(b"OMAS_BF\n");
+                bytes.extend_from_slice(&0xffffu16.to_le_bytes());
+                bytes.extend_from_slice(&1i32.to_le_bytes());
+                bytes.extend_from_slice(&0u64.to_le_bytes());
+                bytes.extend_from_slice(&0i32.to_le_bytes());
+                std::fs::write(&path, bytes).unwrap();
+            } else if name == "sample.abs" || name == "sample.0" {
+                std::fs::write(&path, b"\x0a\x01\0\0\x04\0\0\0not a real image").unwrap();
+            } else {
+                std::fs::write(&path, b"not a real image").unwrap();
+            }
 
             let err = match ImageReader::open(&path) {
-                Ok(_) => panic!("placeholder reader opened fake data"),
+                Ok(_) => panic!("{name}: placeholder reader opened fake data"),
                 Err(err) => err,
             };
 
@@ -437,6 +597,44 @@ mod tests {
             );
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn visitech_registry_rejects_xys_without_companion_tiffs() {
+        let dir = temp_path("hcs_no_tiffs_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (name, bytes, expected) in [
+            (
+                "sample.xys",
+                b"Width=2\nHeight=2\n".as_slice(),
+                "Visitech XYS does not have any companion TIFF image files",
+            ),
+            (
+                "sample.xdce",
+                b"<InCell Width=\"2\" Height=\"2\"/>".as_slice(),
+                "no TIFF image files found referenced in index",
+            ),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+
+            let err = match ImageReader::open(&path) {
+                Ok(_) => panic!("{name}: index without companion TIFFs opened fake data"),
+                Err(err) => err,
+            };
+
+            assert!(
+                matches!(
+                    err,
+                    BioFormatsError::UnsupportedFormat(ref message) | BioFormatsError::Format(ref message)
+                        if message.contains(expected)
+                ),
+                "expected rejection message containing {expected:?}, got {err:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -452,8 +650,7 @@ mod tests {
             ),
         ] {
             let path = temp_path(name);
-            let _file = hdf5::File::create(&path).unwrap();
-            drop(_file);
+            hdf5_pure::FileBuilder::new().write(&path).unwrap();
 
             let err = match ImageReader::open(&path) {
                 Ok(_) => panic!("HDF5 placeholder reader opened fake data"),
@@ -466,6 +663,29 @@ mod tests {
             );
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn imspector_magic_rejects_without_fake_metadata() {
+        let path = temp_path("magic_imspector.fake");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"OMAS_BF\n");
+        bytes.extend_from_slice(&0xffffu16.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = match ImageReader::open(&path) {
+            Ok(_) => panic!("Imspector magic placeholder opened fake data"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Imspector OBF/MSR stack metadata and payload decoding is not implemented")),
+            "expected unsupported Imspector message, got {err:?}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -504,5 +724,43 @@ mod tests {
             .unwrap();
         zip.write_all(bytes).unwrap();
         zip.finish().unwrap();
+    }
+
+    fn write_minimal_ndpi_tiff(path: &PathBuf, magnification: f32) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),                          // ImageWidth
+            tiff_entry(257, 4, 1, 1),                          // ImageLength
+            tiff_entry(258, 3, 1, 8),                          // BitsPerSample
+            tiff_entry(259, 3, 1, 1),                          // Compression
+            tiff_entry(262, 3, 1, 1),                          // PhotometricInterpretation
+            tiff_entry(273, 4, 1, 8 + 2 + 11 * 12 + 4),        // StripOffsets
+            tiff_entry(277, 3, 1, 1),                          // SamplesPerPixel
+            tiff_entry(278, 4, 1, 1),                          // RowsPerStrip
+            tiff_entry(279, 4, 1, 1),                          // StripByteCounts
+            tiff_entry(284, 3, 1, 1),                          // PlanarConfiguration
+            tiff_entry(65421, 11, 1, magnification.to_bits()), // NDPI magnification
+        ];
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.push(7);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn tiff_entry(tag: u16, field_type: u16, count: u32, value_or_offset: u32) -> [u8; 12] {
+        let mut entry = [0u8; 12];
+        entry[0..2].copy_from_slice(&tag.to_le_bytes());
+        entry[2..4].copy_from_slice(&field_type.to_le_bytes());
+        entry[4..8].copy_from_slice(&count.to_le_bytes());
+        entry[8..12].copy_from_slice(&value_or_offset.to_le_bytes());
+        entry
     }
 }

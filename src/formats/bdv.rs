@@ -68,7 +68,7 @@ fn xml_count(xml: &str, tag: &str) -> usize {
 }
 
 fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
-    let file = hdf5::File::open(path)
+    let file = hdf5_pure::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
     // ── Try companion XML for authoritative dimensions ───────────────────────
@@ -129,7 +129,7 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
     // ── Fall back to HDF5 introspection if XML didn't provide everything ─────
     if size_t == 0 {
         // Count top-level groups matching t\d{5}
-        if let Ok(root_members) = file.member_names() {
+        if let Ok(root_members) = hdf5_members(&file, "/") {
             size_t = root_members
                 .iter()
                 .filter(|n| {
@@ -145,7 +145,7 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
     if size_c == 0 {
         // Count setup groups under t00000
         if let Ok(t0) = file.group("t00000") {
-            if let Ok(members) = t0.member_names() {
+            if let Ok(members) = hdf5_group_members(&t0) {
                 size_c = members
                     .iter()
                     .filter(|n| {
@@ -164,7 +164,7 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
     if size_x == 0 || size_y == 0 || size_z == 0 {
         // Infer from shape of t00000/s00/0/cells
         if let Ok(ds) = file.dataset("t00000/s00/0/cells") {
-            let shape = ds.shape();
+            let shape = ds.shape().unwrap_or_default();
             if shape.len() == 3 {
                 size_z = shape[0] as u32;
                 size_y = shape[1] as u32;
@@ -184,16 +184,16 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
 
     // ── Count resolution levels from s00/resolutions ────────────────────────
     let n_resolutions: usize = if let Ok(ds) = file.dataset("s00/resolutions") {
-        let shape = ds.shape();
+        let shape = ds.shape().unwrap_or_default();
         if !shape.is_empty() && shape[0] > 0 {
-            shape[0]
+            shape[0] as usize
         } else {
             1
         }
     } else {
         // Fall back: count integer-named children of t00000/s00
         if let Ok(g) = file.group("t00000/s00") {
-            if let Ok(members) = g.member_names() {
+            if let Ok(members) = hdf5_group_members(&g) {
                 let n = members
                     .iter()
                     .filter(|n| n.parse::<usize>().is_ok())
@@ -235,6 +235,25 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
     };
 
     Ok((meta, n_resolutions, size_t, size_c))
+}
+
+fn hdf5_group_members(
+    group: &hdf5_pure::Group<'_>,
+) -> std::result::Result<Vec<String>, hdf5_pure::Error> {
+    let mut members = group.groups()?;
+    members.extend(group.datasets()?);
+    Ok(members)
+}
+
+fn hdf5_members(
+    file: &hdf5_pure::File,
+    path: &str,
+) -> std::result::Result<Vec<String>, hdf5_pure::Error> {
+    if path == "/" {
+        hdf5_group_members(&file.root())
+    } else {
+        hdf5_group_members(&file.group(path)?)
+    }
 }
 
 impl FormatReader for BdvReader {
@@ -326,8 +345,8 @@ impl FormatReader for BdvReader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        let file =
-            hdf5::File::open(&path).map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+        let file = hdf5_pure::File::open(&path)
+            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
         let ds = file
             .dataset(&ds_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
@@ -336,7 +355,7 @@ impl FormatReader for BdvReader {
         let plane_bytes = plane_pixels * 2; // uint16
 
         let words: Vec<u16> = ds
-            .read_raw::<u16>()
+            .read_u16()
             .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
         let raw: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
@@ -344,7 +363,12 @@ impl FormatReader for BdvReader {
         if offset + plane_bytes <= raw.len() {
             Ok(raw[offset..offset + plane_bytes].to_vec())
         } else {
-            Ok(vec![0u8; plane_bytes])
+            Err(BioFormatsError::UnsupportedFormat(format!(
+                "BDV dataset {ds_path} is shorter than declared plane {plane_index} \
+                 (need {} bytes, have {})",
+                offset + plane_bytes,
+                raw.len()
+            )))
         }
     }
 
@@ -363,11 +387,7 @@ impl FormatReader for BdvReader {
         let mut out = Vec::with_capacity(h as usize * out_row);
         for r in 0..h as usize {
             let src_start = (y as usize + r) * row_bytes + x as usize * 2;
-            if src_start + out_row <= full.len() {
-                out.extend_from_slice(&full[src_start..src_start + out_row]);
-            } else {
-                out.extend(std::iter::repeat(0u8).take(out_row));
-            }
+            out.extend_from_slice(&full[src_start..src_start + out_row]);
         }
         Ok(out)
     }

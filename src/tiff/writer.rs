@@ -181,6 +181,51 @@ fn expected_plane_count(meta: &ImageMetadata) -> u32 {
     meta.image_count.max(1)
 }
 
+fn expected_plane_len_for_dims(meta: &ImageMetadata, width: u32, height: u32) -> Result<usize> {
+    let samples_per_pixel = if meta.is_rgb { meta.size_c.max(1) } else { 1 };
+    let bytes_per_sample = meta.pixel_type.bytes_per_sample() as u64;
+    let len = width as u64 * height as u64 * samples_per_pixel as u64 * bytes_per_sample;
+    usize::try_from(len).map_err(|_| {
+        BioFormatsError::Format("TIFF writer: expected plane byte count overflows usize".into())
+    })
+}
+
+fn pyramid_level_dimensions(meta: &ImageMetadata, level_idx: usize) -> Result<(u32, u32)> {
+    let scale = 1u32.checked_shl(level_idx as u32).ok_or_else(|| {
+        BioFormatsError::Format(format!(
+            "Pyramid TIFF writer: resolution level {level_idx} scale overflows"
+        ))
+    })?;
+    Ok((
+        meta.size_x.div_ceil(scale).max(1),
+        meta.size_y.div_ceil(scale).max(1),
+    ))
+}
+
+fn validate_pyramid_levels(meta: &ImageMetadata, levels: &[Vec<Vec<u8>>]) -> Result<()> {
+    let expected_planes = expected_plane_count(meta) as usize;
+    for (level_idx, level) in levels.iter().enumerate() {
+        if level.len() != expected_planes {
+            return Err(BioFormatsError::Format(format!(
+                "Pyramid TIFF writer: resolution level {level_idx} has {} planes, expected {expected_planes}",
+                level.len()
+            )));
+        }
+
+        let (width, height) = pyramid_level_dimensions(meta, level_idx)?;
+        let expected_len = expected_plane_len_for_dims(meta, width, height)?;
+        for (plane_idx, plane) in level.iter().enumerate() {
+            if plane.len() != expected_len {
+                return Err(BioFormatsError::Format(format!(
+                    "Pyramid TIFF writer: resolution level {level_idx} plane {plane_idx} has {} bytes, expected {expected_len} for {width}x{height}",
+                    plane.len()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---- FormatWriter impl -------------------------------------------------------
 
 /// Pyramid OME-TIFF writer — writes a main image plus sub-resolution levels
@@ -246,6 +291,7 @@ impl PyramidOmeTiffWriter {
                 "No resolution levels provided".into(),
             ));
         }
+        validate_pyramid_levels(&meta, &self.levels)?;
 
         let comp_tag = compression_tag(self.compression);
         let spp = if meta.is_rgb { meta.size_c } else { 1 } as u16;
@@ -292,9 +338,7 @@ impl PyramidOmeTiffWriter {
             let mut level_offsets = Vec::new();
             let level_planes = strip_info[level_idx].len();
             // Estimate sub-image dimensions (halved per level)
-            let scale = 1u32 << level_idx;
-            let sub_width = (meta.size_x + scale - 1) / scale;
-            let sub_height = (meta.size_y + scale - 1) / scale;
+            let (sub_width, sub_height) = pyramid_level_dimensions(&meta, level_idx)?;
 
             for plane_idx in 0..level_planes {
                 let (strip_offset, strip_byte_count) = strip_info[level_idx][plane_idx];
@@ -602,10 +646,28 @@ impl FormatWriter for PyramidOmeTiffWriter {
         Ok(())
     }
 
-    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         // Accumulate into level 0
         if self.levels.is_empty() {
             self.levels.push(Vec::new());
+        }
+        let expected_plane = self.levels[0].len() as u32;
+        if plane_index != expected_plane {
+            return Err(BioFormatsError::Format(format!(
+                "Pyramid TIFF writer: planes must be written in order; expected {expected_plane}, got {plane_index}"
+            )));
+        }
+        let expected_count = expected_plane_count(meta);
+        if plane_index >= expected_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let expected_len = expected_plane_len(meta)?;
+        if data.len() != expected_len {
+            return Err(BioFormatsError::Format(format!(
+                "Pyramid TIFF writer: level 0 plane {plane_index} has {} bytes, expected {expected_len}",
+                data.len()
+            )));
         }
         self.levels[0].push(data.to_vec());
         Ok(())
@@ -626,7 +688,7 @@ impl FormatWriter for TiffWriter {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff") | Some("btf"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {

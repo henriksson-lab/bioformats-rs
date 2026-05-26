@@ -17,6 +17,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 fn r_u32_le(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
@@ -75,6 +76,27 @@ fn is_raw_handler(handler: [u8; 4]) -> bool {
         || handler == *b"RGB "
         || handler == *b"RAW "
         || handler == *b"    "
+}
+
+fn avi_frame_layout(width: u32, height: u32, channels: usize) -> Result<(usize, usize, usize)> {
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::InvalidData(
+            "AVI: width and height must be non-zero".into(),
+        ));
+    }
+    let row_bytes = (width as usize).checked_mul(channels).ok_or_else(|| {
+        BioFormatsError::InvalidData("AVI: decoded row byte count overflows".into())
+    })?;
+    let stored_row = row_bytes.checked_add(3).map(|n| n & !3).ok_or_else(|| {
+        BioFormatsError::InvalidData("AVI: padded row byte count overflows".into())
+    })?;
+    let plane_bytes = row_bytes.checked_mul(height as usize).ok_or_else(|| {
+        BioFormatsError::InvalidData("AVI: decoded frame byte count overflows".into())
+    })?;
+    let stored_bytes = stored_row.checked_mul(height as usize).ok_or_else(|| {
+        BioFormatsError::InvalidData("AVI: stored frame byte count overflows".into())
+    })?;
+    Ok((row_bytes, stored_row, plane_bytes.max(stored_bytes)))
 }
 
 #[derive(Default)]
@@ -169,8 +191,8 @@ fn parse_riff_chunks(
 fn parse_avih(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse) {
     if data_end.saturating_sub(payload) >= 40 {
         parsed.total_frames = r_u32_le(buf, payload + 16);
-        parsed.width = r_u32_le(buf, payload + 32).max(1);
-        parsed.height = r_u32_le(buf, payload + 36).max(1);
+        parsed.width = r_u32_le(buf, payload + 32);
+        parsed.height = r_u32_le(buf, payload + 36);
     }
 }
 
@@ -183,8 +205,8 @@ fn parse_strh(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse
 fn parse_strf(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse) {
     if data_end.saturating_sub(payload) >= 20 {
         let dib_height = r_i32_le(buf, payload + 8);
-        parsed.width = r_u32_le(buf, payload + 4).max(1);
-        parsed.height = dib_height.unsigned_abs().max(1);
+        parsed.width = r_u32_le(buf, payload + 4);
+        parsed.height = dib_height.unsigned_abs();
         parsed.top_down = dib_height < 0;
         parsed.bit_count = r_u16_le(buf, payload + 14);
         parsed.compression = fourcc(buf, payload + 16);
@@ -351,8 +373,8 @@ impl FormatReader for AviReader {
             )));
         }
 
-        let width = parsed.width.max(1);
-        let height = parsed.height.max(1);
+        let width = parsed.width;
+        let height = parsed.height;
         let bit_count = parsed.bit_count;
         if !matches!(bit_count, 8 | 24 | 32) {
             return Err(BioFormatsError::UnsupportedFormat(format!(
@@ -385,6 +407,23 @@ impl FormatReader for AviReader {
                 }
             }
         };
+        let (_row_bytes, _stored_row, expected_stored) =
+            avi_frame_layout(width, height, bpp as usize)?;
+        for &(offset, stored_size) in &frame_offsets {
+            if (stored_size as usize) < expected_stored {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "AVI: uncompressed frame chunk is too short: got {stored_size}, expected at least {expected_stored}"
+                )));
+            }
+            let end = offset.checked_add(expected_stored as u64).ok_or_else(|| {
+                BioFormatsError::InvalidData("AVI: frame offset overflows".into())
+            })?;
+            if end > buf.len() as u64 {
+                return Err(BioFormatsError::InvalidData(
+                    "AVI: uncompressed frame chunk extends past end of file".into(),
+                ));
+            }
+        }
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert("format".into(), MetadataValue::String("AVI".into()));
 
@@ -446,16 +485,22 @@ impl FormatReader for AviReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let channels = meta.size_c as usize;
-        let plane_bytes = meta.size_x as usize * meta.size_y as usize * channels;
-        let row_bytes = meta.size_x as usize * channels;
-        let stored_row = (row_bytes + 3) & !3;
-        let expected_stored = stored_row * meta.size_y as usize;
+        let (row_bytes, stored_row, expected_stored) =
+            avi_frame_layout(meta.size_x, meta.size_y, channels)?;
+        let plane_bytes = row_bytes.checked_mul(meta.size_y as usize).ok_or_else(|| {
+            BioFormatsError::InvalidData("AVI: decoded frame byte count overflows".into())
+        })?;
         let (offset, stored_size) = self
             .frame_offsets
             .get(plane_index as usize)
             .copied()
             .unwrap_or((plane_index as u64 * plane_bytes as u64, plane_bytes as u32));
-        let read_size = (stored_size as usize).min(expected_stored.max(plane_bytes));
+        if (stored_size as usize) < expected_stored {
+            return Err(BioFormatsError::InvalidData(format!(
+                "AVI: uncompressed frame chunk is too short: got {stored_size}, expected at least {expected_stored}"
+            )));
+        }
+        let read_size = expected_stored;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(offset))
@@ -472,11 +517,15 @@ impl FormatReader for AviReader {
             };
             let src = src_y * stored_row;
             let dst = y * row_bytes;
-            if src >= buf.len() {
-                continue;
+            let end = src.checked_add(row_bytes).ok_or_else(|| {
+                BioFormatsError::InvalidData("AVI: row byte range overflows".into())
+            })?;
+            if end > buf.len() {
+                return Err(BioFormatsError::InvalidData(
+                    "AVI: uncompressed frame data is truncated".into(),
+                ));
             }
-            let available = row_bytes.min(buf.len() - src);
-            out[dst..dst + available].copy_from_slice(&buf[src..src + available]);
+            out[dst..dst + row_bytes].copy_from_slice(&buf[src..end]);
             if meta.is_rgb && channels >= 3 {
                 for px in out[dst..dst + row_bytes].chunks_mut(channels) {
                     px.swap(0, 2);
@@ -497,14 +546,7 @@ impl FormatReader for AviReader {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         let spp = meta.size_c as usize;
-        let row = meta.size_x as usize * spp;
-        let out_row = w as usize * spp;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * spp..x as usize * spp + out_row]);
-        }
-        Ok(out)
+        crop_full_plane("AVI", &full, meta, spp, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -562,6 +604,76 @@ fn write_u16_le(w: &mut impl Write, v: u16) -> std::io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 
+#[derive(Debug)]
+struct AviWriterLayout {
+    width: u32,
+    height: u32,
+    row_bytes: usize,
+    padded_row: usize,
+    padded_frame: u32,
+    n_frames: u32,
+    strf_size: u32,
+    strl_size: u32,
+    hdrl_size: u32,
+    movi_list_size: u32,
+    riff_size: u32,
+}
+
+fn avi_u32_size(name: &str, value: u64) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        BioFormatsError::InvalidData(format!("AVI: {name} exceeds 32-bit RIFF size limit"))
+    })
+}
+
+fn avi_writer_layout(
+    meta: &ImageMetadata,
+    is_rgb: bool,
+    plane_count: usize,
+) -> Result<AviWriterLayout> {
+    if meta.size_x > i32::MAX as u32 || meta.size_y > i32::MAX as u32 {
+        return Err(BioFormatsError::InvalidData(
+            "AVI: width and height must fit signed 32-bit DIB fields".into(),
+        ));
+    }
+
+    let channels = if is_rgb { 3 } else { 1 };
+    let (row_bytes, padded_row, _) = avi_frame_layout(meta.size_x, meta.size_y, channels)?;
+    let padded_frame = padded_row
+        .checked_mul(meta.size_y as usize)
+        .ok_or_else(|| {
+            BioFormatsError::InvalidData("AVI: stored frame byte count overflows".into())
+        })?;
+    let padded_frame = avi_u32_size("stored frame byte count", padded_frame as u64)?;
+    let n_frames = avi_u32_size("frame count", plane_count as u64)?;
+
+    let strf_size = if is_rgb { 40u32 } else { 40 + 256 * 4 };
+    let strl_size = avi_u32_size("strl LIST size", 4u64 + (8 + 56) + (8 + strf_size as u64))?;
+    let hdrl_size = avi_u32_size("hdrl LIST size", 4u64 + (8 + 56) + (8 + strl_size as u64))?;
+    let movi_data_size = avi_u32_size(
+        "movi data size",
+        n_frames as u64 * (8 + padded_frame as u64),
+    )?;
+    let movi_list_size = avi_u32_size("movi LIST size", 4u64 + movi_data_size as u64)?;
+    let riff_size = avi_u32_size(
+        "RIFF size",
+        4u64 + (8 + hdrl_size as u64) + (8 + movi_list_size as u64),
+    )?;
+
+    Ok(AviWriterLayout {
+        width: meta.size_x,
+        height: meta.size_y,
+        row_bytes,
+        padded_row,
+        padded_frame,
+        n_frames,
+        strf_size,
+        strl_size,
+        hdrl_size,
+        movi_list_size,
+        riff_size,
+    })
+}
+
 impl crate::common::writer::FormatWriter for AviWriter {
     fn is_this_type(&self, path: &Path) -> bool {
         let ext = path
@@ -591,29 +703,25 @@ impl crate::common::writer::FormatWriter for AviWriter {
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
 
-        let width = meta.size_x;
         let height = meta.size_y;
         let is_rgb = meta.is_rgb && meta.size_c >= 3;
         let bpp: u16 = if is_rgb { 24 } else { 8 };
-        let _frame_bytes = width as usize * height as usize * (bpp as usize / 8);
-        let row_bytes = width as usize * (bpp as usize / 8);
-        // AVI rows must be 4-byte aligned
-        let padded_row = (row_bytes + 3) & !3;
-        let padded_frame = padded_row * height as usize;
-        let n_frames = self.planes.len() as u32;
+        let layout = avi_writer_layout(&meta, is_rgb, self.planes.len())?;
+        let row_bytes = layout.row_bytes;
+        let padded_row = layout.padded_row;
+        let padded_frame = layout.padded_frame;
+        let n_frames = layout.n_frames;
         let fps = self.fps;
         let usec_per_frame = if fps > 0 { 1_000_000 / fps } else { 100_000 };
 
         let f = File::create(&path).map_err(BioFormatsError::Io)?;
         let mut w = BufWriter::new(f);
 
-        // Compute sizes
-        let movi_data_size = n_frames * (8 + padded_frame as u32); // chunk header + data per frame
-        let movi_list_size = 4 + movi_data_size; // "movi" + chunks
-        let strf_size: u32 = 40 + if !is_rgb { 256 * 4 } else { 0 }; // BITMAPINFOHEADER + palette
-        let strl_size: u32 = 4 + (8 + 56) + (8 + strf_size); // "strl" + strh + strf
-        let hdrl_size: u32 = 4 + (8 + 56) + (8 + strl_size); // "hdrl" + avih + strl_list
-        let riff_size: u32 = 4 + (8 + hdrl_size) + (8 + movi_list_size);
+        let strf_size = layout.strf_size;
+        let strl_size = layout.strl_size;
+        let hdrl_size = layout.hdrl_size;
+        let movi_list_size = layout.movi_list_size;
+        let riff_size = layout.riff_size;
 
         // RIFF header
         write_fourcc(&mut w, b"RIFF").map_err(BioFormatsError::Io)?;
@@ -635,9 +743,9 @@ impl crate::common::writer::FormatWriter for AviWriter {
         write_u32_le(&mut w, n_frames).map_err(BioFormatsError::Io)?; // dwTotalFrames
         write_u32_le(&mut w, 0).map_err(BioFormatsError::Io)?; // dwInitialFrames
         write_u32_le(&mut w, 1).map_err(BioFormatsError::Io)?; // dwStreams
-        write_u32_le(&mut w, padded_frame as u32).map_err(BioFormatsError::Io)?; // dwSuggestedBufferSize
-        write_u32_le(&mut w, width).map_err(BioFormatsError::Io)?; // dwWidth
-        write_u32_le(&mut w, height).map_err(BioFormatsError::Io)?; // dwHeight
+        write_u32_le(&mut w, padded_frame).map_err(BioFormatsError::Io)?; // dwSuggestedBufferSize
+        write_u32_le(&mut w, layout.width).map_err(BioFormatsError::Io)?; // dwWidth
+        write_u32_le(&mut w, layout.height).map_err(BioFormatsError::Io)?; // dwHeight
         w.write_all(&[0u8; 16]).map_err(BioFormatsError::Io)?; // dwReserved[4]
 
         // LIST strl
@@ -658,7 +766,7 @@ impl crate::common::writer::FormatWriter for AviWriter {
         write_u32_le(&mut w, fps).map_err(BioFormatsError::Io)?; // dwRate
         write_u32_le(&mut w, 0).map_err(BioFormatsError::Io)?; // dwStart
         write_u32_le(&mut w, n_frames).map_err(BioFormatsError::Io)?; // dwLength
-        write_u32_le(&mut w, padded_frame as u32).map_err(BioFormatsError::Io)?; // dwSuggestedBufferSize
+        write_u32_le(&mut w, padded_frame).map_err(BioFormatsError::Io)?; // dwSuggestedBufferSize
         write_u32_le(&mut w, 0).map_err(BioFormatsError::Io)?; // dwQuality
         write_u32_le(&mut w, 0).map_err(BioFormatsError::Io)?; // dwSampleSize
         w.write_all(&[0u8; 8]).map_err(BioFormatsError::Io)?; // rcFrame
@@ -667,12 +775,12 @@ impl crate::common::writer::FormatWriter for AviWriter {
         write_fourcc(&mut w, b"strf").map_err(BioFormatsError::Io)?;
         write_u32_le(&mut w, strf_size).map_err(BioFormatsError::Io)?;
         write_u32_le(&mut w, 40).map_err(BioFormatsError::Io)?; // biSize
-        write_u32_le(&mut w, width).map_err(BioFormatsError::Io)?; // biWidth
-        write_u32_le(&mut w, height).map_err(BioFormatsError::Io)?; // biHeight (positive = bottom-up)
+        write_u32_le(&mut w, layout.width).map_err(BioFormatsError::Io)?; // biWidth
+        write_u32_le(&mut w, layout.height).map_err(BioFormatsError::Io)?; // biHeight (positive = bottom-up)
         write_u16_le(&mut w, 1).map_err(BioFormatsError::Io)?; // biPlanes
         write_u16_le(&mut w, bpp).map_err(BioFormatsError::Io)?; // biBitCount
         write_u32_le(&mut w, 0).map_err(BioFormatsError::Io)?; // biCompression = BI_RGB
-        write_u32_le(&mut w, padded_frame as u32).map_err(BioFormatsError::Io)?; // biSizeImage
+        write_u32_le(&mut w, padded_frame).map_err(BioFormatsError::Io)?; // biSizeImage
         write_u32_le(&mut w, 0).map_err(BioFormatsError::Io)?; // biXPelsPerMeter
         write_u32_le(&mut w, 0).map_err(BioFormatsError::Io)?; // biYPelsPerMeter
         write_u32_le(&mut w, if is_rgb { 0 } else { 256 }).map_err(BioFormatsError::Io)?; // biClrUsed
@@ -695,7 +803,7 @@ impl crate::common::writer::FormatWriter for AviWriter {
 
         for plane in &self.planes {
             write_fourcc(&mut w, b"00db").map_err(BioFormatsError::Io)?; // uncompressed frame
-            write_u32_le(&mut w, padded_frame as u32).map_err(BioFormatsError::Io)?;
+            write_u32_le(&mut w, padded_frame).map_err(BioFormatsError::Io)?;
             // AVI stores rows bottom-up
             for y in (0..height as usize).rev() {
                 let offset = y * row_bytes;
@@ -733,5 +841,53 @@ impl crate::common::writer::FormatWriter for AviWriter {
 
     fn can_do_stacks(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gray_meta(width: u32, height: u32) -> ImageMetadata {
+        ImageMetadata {
+            size_x: width,
+            size_y: height,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            ..ImageMetadata::default()
+        }
+    }
+
+    #[test]
+    fn avi_writer_layout_rejects_dimensions_outside_dib_i32() {
+        let err = avi_writer_layout(&gray_meta(i32::MAX as u32 + 1, 1), false, 1)
+            .expect_err("oversized DIB dimensions must be rejected");
+
+        assert!(matches!(
+            err,
+            BioFormatsError::InvalidData(message) if message.contains("signed 32-bit DIB")
+        ));
+    }
+
+    #[test]
+    fn avi_writer_layout_rejects_frame_larger_than_riff_chunk() {
+        let err = avi_writer_layout(&gray_meta(i32::MAX as u32, 3), false, 1)
+            .expect_err("frame chunk larger than RIFF u32 must be rejected");
+
+        assert!(matches!(
+            err,
+            BioFormatsError::InvalidData(message) if message.contains("stored frame byte count")
+        ));
+    }
+
+    #[test]
+    fn avi_writer_layout_rejects_movi_list_larger_than_riff_chunk() {
+        let err = avi_writer_layout(&gray_meta(1, 1), false, u32::MAX as usize)
+            .expect_err("movi LIST larger than RIFF u32 must be rejected");
+
+        assert!(matches!(
+            err,
+            BioFormatsError::InvalidData(message) if message.contains("movi data size")
+        ));
     }
 }
