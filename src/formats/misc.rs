@@ -463,12 +463,304 @@ impl FormatReader for SlideBookReader {
 }
 
 // ---------------------------------------------------------------------------
-// 5. MINC neuroimaging (HDF5-based)
+// 5. MINC neuroimaging (MINC-2 = HDF5, MINC-1 = NetCDF-3 classic)
 // ---------------------------------------------------------------------------
+
+/// Minimal pure-Rust parser for the NetCDF-3 "classic" file format used by
+/// MINC-1 (`.mnc`) files. The classic format is a self-describing, big-endian
+/// binary container (magic `CDF\x01` / `CDF\x02`) with a fixed header layout
+/// that is simple enough to parse directly, so no NetCDF C library binding is
+/// required. Only the subset needed by `MINCReader` is implemented: named
+/// dimensions, the `image` variable's pixel data, and per-variable attributes
+/// (e.g. `signtype`).
+///
+/// Reference: NetCDF Classic Format Specification
+/// (https://docs.unidata.ucar.edu/netcdf-c/current/file_format_specifications.html)
+/// mirrored by `ucar.nc2` as used in `NetCDFServiceImpl.java`.
+mod netcdf3 {
+    use crate::common::error::{BioFormatsError, Result};
+
+    // NetCDF-3 external data type tags.
+    pub const NC_BYTE: u32 = 1; // 8-bit signed
+    pub const NC_CHAR: u32 = 2; // 8-bit
+    pub const NC_SHORT: u32 = 3; // 16-bit signed
+    pub const NC_INT: u32 = 4; // 32-bit signed
+    pub const NC_FLOAT: u32 = 5; // 32-bit IEEE
+    pub const NC_DOUBLE: u32 = 6; // 64-bit IEEE
+
+    const NC_DIMENSION: u32 = 0x0A;
+    const NC_VARIABLE: u32 = 0x0B;
+    const NC_ATTRIBUTE: u32 = 0x0C;
+
+    #[derive(Debug, Clone)]
+    pub struct Attribute {
+        pub name: String,
+        pub nc_type: u32,
+        /// Raw little-/big-endian payload as stored on disk (big-endian on
+        /// disk); for text attributes this is UTF-8/ASCII bytes.
+        pub raw: Vec<u8>,
+    }
+
+    impl Attribute {
+        /// Render the attribute as Java's `arrayToString` would: text types
+        /// become the string itself; numeric types are space-free joined when
+        /// only the prefix is inspected by callers.
+        pub fn as_string(&self) -> String {
+            match self.nc_type {
+                NC_CHAR | NC_BYTE => {
+                    String::from_utf8_lossy(&self.raw)
+                        .trim_end_matches('\0')
+                        .to_string()
+                }
+                _ => String::new(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Dimension {
+        pub name: String,
+        pub length: u32, // 0 means the (single) record/unlimited dimension
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Variable {
+        pub name: String,
+        pub dim_ids: Vec<usize>,
+        pub attrs: Vec<Attribute>,
+        pub nc_type: u32,
+        pub begin: u64,
+    }
+
+    pub struct NetCdf3 {
+        pub dims: Vec<Dimension>,
+        pub vars: Vec<Variable>,
+        pub num_recs: u32,
+    }
+
+    struct Cursor<'a> {
+        buf: &'a [u8],
+        pos: usize,
+        is_64bit: bool,
+    }
+
+    impl<'a> Cursor<'a> {
+        fn u32(&mut self) -> Result<u32> {
+            if self.pos + 4 > self.buf.len() {
+                return Err(eof());
+            }
+            let v = u32::from_be_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap());
+            self.pos += 4;
+            Ok(v)
+        }
+
+        /// Read an "offset" field (4 bytes in classic, 8 bytes in 64-bit-offset
+        /// format).
+        fn offset(&mut self) -> Result<u64> {
+            if self.is_64bit {
+                if self.pos + 8 > self.buf.len() {
+                    return Err(eof());
+                }
+                let v = u64::from_be_bytes(self.buf[self.pos..self.pos + 8].try_into().unwrap());
+                self.pos += 8;
+                Ok(v)
+            } else {
+                Ok(self.u32()? as u64)
+            }
+        }
+
+        /// NetCDF strings: a 4-byte length followed by that many bytes, padded
+        /// to a 4-byte boundary.
+        fn name(&mut self) -> Result<String> {
+            let n = self.u32()? as usize;
+            let bytes = self.take(n)?;
+            self.align4(n);
+            Ok(String::from_utf8_lossy(bytes).to_string())
+        }
+
+        fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+            if self.pos + n > self.buf.len() {
+                return Err(eof());
+            }
+            let s = &self.buf[self.pos..self.pos + n];
+            self.pos += n;
+            Ok(s)
+        }
+
+        fn align4(&mut self, consumed: usize) {
+            let pad = (4 - (consumed % 4)) % 4;
+            self.pos = (self.pos + pad).min(self.buf.len());
+        }
+    }
+
+    fn eof() -> BioFormatsError {
+        BioFormatsError::InvalidData("NetCDF-3: unexpected end of header".into())
+    }
+
+    pub fn type_size(nc_type: u32) -> usize {
+        match nc_type {
+            NC_BYTE | NC_CHAR => 1,
+            NC_SHORT => 2,
+            NC_INT | NC_FLOAT => 4,
+            NC_DOUBLE => 8,
+            _ => 0,
+        }
+    }
+
+    impl NetCdf3 {
+        /// Parse the header of a NetCDF-3 classic file from an in-memory buffer
+        /// that contains at least the full header (the whole file is fine).
+        pub fn parse_header(buf: &[u8]) -> Result<NetCdf3> {
+            if buf.len() < 4 || &buf[0..3] != b"CDF" {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Not a NetCDF-3 classic file".into(),
+                ));
+            }
+            let version = buf[3];
+            let is_64bit = version == 2;
+            if version != 1 && version != 2 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "NetCDF-3: unsupported classic version {version}"
+                )));
+            }
+            let mut c = Cursor {
+                buf,
+                pos: 4,
+                is_64bit,
+            };
+
+            let num_recs = c.u32()?; // numrecs (STREAMING=0xFFFFFFFF tolerated)
+
+            // -- dim_list --
+            let dims = Self::parse_dim_list(&mut c)?;
+            // -- gatt_list (global attributes; parsed and discarded) --
+            let _gatts = Self::parse_att_list(&mut c)?;
+            // -- var_list --
+            let vars = Self::parse_var_list(&mut c)?;
+
+            Ok(NetCdf3 {
+                dims,
+                vars,
+                num_recs,
+            })
+        }
+
+        fn parse_dim_list(c: &mut Cursor) -> Result<Vec<Dimension>> {
+            let tag = c.u32()?;
+            let count = c.u32()? as usize;
+            if tag == 0 && count == 0 {
+                return Ok(Vec::new()); // ABSENT
+            }
+            if tag != NC_DIMENSION {
+                return Err(BioFormatsError::InvalidData(
+                    "NetCDF-3: expected dimension list tag".into(),
+                ));
+            }
+            let mut dims = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name = c.name()?;
+                let length = c.u32()?;
+                dims.push(Dimension { name, length });
+            }
+            Ok(dims)
+        }
+
+        fn parse_att_list(c: &mut Cursor) -> Result<Vec<Attribute>> {
+            let tag = c.u32()?;
+            let count = c.u32()? as usize;
+            if tag == 0 && count == 0 {
+                return Ok(Vec::new()); // ABSENT
+            }
+            if tag != NC_ATTRIBUTE {
+                return Err(BioFormatsError::InvalidData(
+                    "NetCDF-3: expected attribute list tag".into(),
+                ));
+            }
+            let mut attrs = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name = c.name()?;
+                let nc_type = c.u32()?;
+                let nelems = c.u32()? as usize;
+                let elem_size = type_size(nc_type);
+                let total = nelems * elem_size;
+                let raw = c.take(total)?.to_vec();
+                c.align4(total);
+                attrs.push(Attribute {
+                    name,
+                    nc_type,
+                    raw,
+                });
+            }
+            Ok(attrs)
+        }
+
+        fn parse_var_list(c: &mut Cursor) -> Result<Vec<Variable>> {
+            let tag = c.u32()?;
+            let count = c.u32()? as usize;
+            if tag == 0 && count == 0 {
+                return Ok(Vec::new()); // ABSENT
+            }
+            if tag != NC_VARIABLE {
+                return Err(BioFormatsError::InvalidData(
+                    "NetCDF-3: expected variable list tag".into(),
+                ));
+            }
+            let mut vars = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name = c.name()?;
+                let ndims = c.u32()? as usize;
+                let mut dim_ids = Vec::with_capacity(ndims);
+                for _ in 0..ndims {
+                    dim_ids.push(c.u32()? as usize);
+                }
+                let attrs = Self::parse_att_list(c)?;
+                let nc_type = c.u32()?;
+                let _vsize = c.u32()?; // vsize (recomputed from dims when needed)
+                let begin = c.offset()?;
+                vars.push(Variable {
+                    name,
+                    dim_ids,
+                    attrs,
+                    nc_type,
+                    begin,
+                });
+            }
+            Ok(vars)
+        }
+
+        pub fn dimension(&self, name: &str) -> Option<u32> {
+            self.dims
+                .iter()
+                .find(|d| d.name == name)
+                .map(|d| if d.length == 0 { self.num_recs } else { d.length })
+        }
+
+        pub fn variable(&self, name: &str) -> Option<&Variable> {
+            self.vars.iter().find(|v| v.name == name)
+        }
+
+        /// Total element count of a variable, accounting for the unlimited
+        /// (record) dimension which is stored with length 0 in the header.
+        pub fn var_elem_count(&self, var: &Variable) -> usize {
+            var.dim_ids.iter().fold(1usize, |acc, &id| {
+                let len = self
+                    .dims
+                    .get(id)
+                    .map(|d| if d.length == 0 { self.num_recs } else { d.length })
+                    .unwrap_or(1);
+                acc.saturating_mul(len.max(1) as usize)
+            })
+        }
+    }
+}
+
 /// MINC neuroimaging reader (`.mnc`).
 ///
-/// MINC files are HDF5-based. Attempts to open the file via HDF5 and locate
-/// image data in common MINC dataset paths.
+/// MINC files come in two flavours: MINC-2 is HDF5-based (magic `\x89HDF...`)
+/// and MINC-1 is NetCDF-3 classic (magic `CDF\x01`/`CDF\x02`). Both are handled
+/// here in pure Rust — HDF5 via `hdf5-pure`, NetCDF-3 via the local `netcdf3`
+/// parser — mirroring `MINCReader.initFile`, which uses a generic NetCDF
+/// service that transparently reads either backing format.
 pub struct MincReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -482,6 +774,142 @@ impl MincReader {
             meta: None,
             pixel_data: None,
         }
+    }
+
+    /// Read a classic NetCDF-3 MINC-1 file.
+    ///
+    /// Mirrors the non-MINC2 branch of `MINCReader.initFile`:
+    /// `littleEndian = isMINC2` is `false` here, the `/image` variable supplies
+    /// the pixel data, `signtype` (a variable attribute) selects signed vs
+    /// unsigned, and sizeX/sizeY/sizeZ come from the `xspace`/`yspace`/`zspace`
+    /// dimensions with `time` as the optional T axis. NetCDF stores values in
+    /// big-endian byte order on disk.
+    fn set_id_netcdf3(&mut self, path: &Path) -> Result<()> {
+        use std::io::Read as _;
+        use netcdf3::{NetCdf3, NC_BYTE, NC_CHAR, NC_DOUBLE, NC_FLOAT, NC_INT, NC_SHORT};
+
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .map_err(BioFormatsError::Io)?
+            .read_to_end(&mut bytes)
+            .map_err(BioFormatsError::Io)?;
+
+        let nc = NetCdf3::parse_header(&bytes)?;
+
+        let image = nc.variable("image").ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "MINC/NetCDF: no 'image' variable found".to_string(),
+            )
+        })?;
+
+        // signtype attribute (NC_CHAR): "signed__" / "unsigned" — Java keys off
+        // a "signed" prefix.
+        let signed = image
+            .attrs
+            .iter()
+            .find(|a| a.name == "signtype")
+            .map(|a| a.as_string().starts_with("signed"))
+            .unwrap_or(false);
+
+        // Dimensions. Java reads them by name (xspace/yspace/zspace/time); the
+        // dimension lengths are independent of the variable's axis order.
+        let size_x = nc.dimension("xspace").unwrap_or(1).max(1);
+        let size_y = nc.dimension("yspace").unwrap_or(1).max(1);
+        let size_z = nc.dimension("zspace").unwrap_or(1).max(1);
+        let size_t = nc.dimension("time").unwrap_or(1).max(1);
+
+        // Map the NetCDF element type to our pixel type, applying signtype the
+        // same way Java does (signtype only flips the sign for the integer
+        // types; FLOAT/DOUBLE ignore it).
+        let elem_size = netcdf3::type_size(image.nc_type);
+        let pixel_type = match image.nc_type {
+            NC_BYTE | NC_CHAR => {
+                if signed {
+                    PixelType::Int8
+                } else {
+                    PixelType::Uint8
+                }
+            }
+            NC_SHORT => {
+                if signed {
+                    PixelType::Int16
+                } else {
+                    PixelType::Uint16
+                }
+            }
+            NC_INT => {
+                if signed {
+                    PixelType::Int32
+                } else {
+                    PixelType::Uint32
+                }
+            }
+            NC_FLOAT => PixelType::Float32,
+            NC_DOUBLE => PixelType::Float64,
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "MINC/NetCDF: unsupported image element type {other}"
+                )));
+            }
+        };
+
+        // Slurp the raw pixel bytes for the image variable. The classic format
+        // lays out a non-record variable contiguously starting at `begin`.
+        let elem_count = nc.var_elem_count(image);
+        let total_bytes = elem_count.saturating_mul(elem_size);
+        let start = image.begin as usize;
+        let end = start.saturating_add(total_bytes);
+        if end > bytes.len() {
+            return Err(BioFormatsError::InvalidData(
+                "MINC/NetCDF: 'image' data extends past end of file".to_string(),
+            ));
+        }
+        let raw = &bytes[start..end];
+
+        // Convert big-endian on-disk data to the little-endian byte order our
+        // metadata advertises (Java: littleEndian = isMINC2 = false on disk,
+        // but it materialises bytes in isLittleEndian() order — false here —
+        // so values are emitted big-endian by Java; we normalise to LE and set
+        // is_little_endian accordingly so downstream callers read consistently).
+        let pixels: Vec<u8> = if elem_size <= 1 {
+            raw.to_vec()
+        } else {
+            let mut out = Vec::with_capacity(raw.len());
+            for chunk in raw.chunks_exact(elem_size) {
+                let mut le: Vec<u8> = chunk.to_vec();
+                le.reverse();
+                out.extend_from_slice(&le);
+            }
+            out
+        };
+
+        let bits = (elem_size * 8) as u8;
+        let image_count = size_z * size_t; // size_c == 1
+        self.path = Some(path.to_path_buf());
+        self.pixel_data = Some(pixels);
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c: 1,
+            size_t,
+            pixel_type,
+            bits_per_pixel: bits,
+            image_count,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_indexed: false,
+            is_interleaved: false,
+            // Pixel bytes have been normalised to little-endian above.
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
     }
 }
 
@@ -501,12 +929,29 @@ impl FormatReader for MincReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // HDF5 magic: 0x89 H D F \r \n 0x1a \n
-        header.len() >= 8 && header[..8] == [0x89, 0x48, 0x44, 0x46, 0x0D, 0x0A, 0x1A, 0x0A]
+        // MINC-2 = HDF5 magic: 0x89 H D F \r \n 0x1a \n
+        let is_hdf5 =
+            header.len() >= 8 && header[..8] == [0x89, 0x48, 0x44, 0x46, 0x0D, 0x0A, 0x1A, 0x0A];
+        // MINC-1 = NetCDF-3 classic magic: "CDF" followed by version 1 or 2.
+        let is_netcdf3 =
+            header.len() >= 4 && &header[0..3] == b"CDF" && (header[3] == 1 || header[3] == 2);
+        is_hdf5 || is_netcdf3
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         use hdf5_pure::DType;
+
+        // Dispatch on the file's magic bytes: NetCDF-3 classic (MINC-1) is read
+        // by the local parser; everything else is treated as HDF5 (MINC-2).
+        let mut magic = [0u8; 4];
+        {
+            use std::io::Read as _;
+            let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+            let _ = f.read(&mut magic);
+        }
+        if &magic[0..3] == b"CDF" {
+            return self.set_id_netcdf3(path);
+        }
 
         let file = hdf5_pure::File::open(path)
             .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5: {e}")))?;

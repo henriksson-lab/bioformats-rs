@@ -41,6 +41,269 @@ fn placeholder_meta_u16() -> ImageMetadata {
 }
 
 // ---------------------------------------------------------------------------
+// Shared RAW / Bayer-CFA pixel helpers
+//
+// Faithful Rust port of the pixel path used by the Java RAW-camera readers:
+//   * `loci.common.DataTools.unpackBytes(long, byte[], int, int, boolean)`
+//   * `loci.formats.ImageTools.interpolate(short[], byte[], int[], int, int, boolean)`
+//   * the MSB-first bit reader used by `RandomAccessInputStream.readBits`
+//
+// These are used by `CanonRawReader` (this file) and by the MRW and DNG CFA
+// paths in `extended.rs`, which re-export them via `pub(crate)`.
+// ---------------------------------------------------------------------------
+pub(crate) mod cfa {
+    /// Port of `loci.common.DataTools.unpackBytes`.
+    ///
+    /// Writes the low `nbytes` bytes of `value` into `buf` starting at `ndx`,
+    /// little- or big-endian. Matches the Java implementation byte-for-byte:
+    /// little-endian stores byte `i` as `(value >> (8*i)) & 0xff`; big-endian
+    /// stores byte `i` as `(value >> (8*(nbytes-i-1))) & 0xff`.
+    pub fn unpack_bytes(value: i64, buf: &mut [u8], ndx: usize, nbytes: usize, little: bool) {
+        if little {
+            for i in 0..nbytes {
+                buf[ndx + i] = ((value >> (8 * i)) & 0xff) as u8;
+            }
+        } else {
+            for i in 0..nbytes {
+                buf[ndx + i] = ((value >> (8 * (nbytes - i - 1))) & 0xff) as u8;
+            }
+        }
+    }
+
+    /// MSB-first bit reader matching `RandomAccessInputStream.readBits` /
+    /// `skipBits` used by the Java RAW readers (bits are consumed from the most
+    /// significant bit of each successive byte).
+    pub struct BitReader<'a> {
+        data: &'a [u8],
+        /// Absolute bit position into `data`.
+        bit_pos: usize,
+    }
+
+    impl<'a> BitReader<'a> {
+        pub fn new(data: &'a [u8]) -> Self {
+            BitReader { data, bit_pos: 0 }
+        }
+
+        /// Read `n` bits MSB-first as an unsigned value. Reads past the end of
+        /// the buffer yield zero bits, mirroring Java's behaviour of returning
+        /// -1/EOF bits as 0 once exhausted (callers size buffers to the data).
+        pub fn read_bits(&mut self, n: u32) -> u32 {
+            let mut value: u32 = 0;
+            for _ in 0..n {
+                let byte_index = self.bit_pos >> 3;
+                let bit_index = 7 - (self.bit_pos & 7);
+                let bit = if byte_index < self.data.len() {
+                    (self.data[byte_index] >> bit_index) & 1
+                } else {
+                    0
+                };
+                value = (value << 1) | bit as u32;
+                self.bit_pos += 1;
+            }
+            value
+        }
+
+        /// Skip `n` bits (port of `skipBits`).
+        pub fn skip_bits(&mut self, n: usize) {
+            self.bit_pos += n;
+        }
+    }
+
+    /// Port of `loci.formats.ImageTools.interpolate`.
+    ///
+    /// `s` is a planar short buffer of length `width*height*3` laid out as three
+    /// stacked planes [R | G | B]. `buf` receives interleaved RGB samples
+    /// (R,G,B per pixel, 2 bytes each, in the given byte order). `bayer_pattern`
+    /// is a 4-element color map indexed by `(row%2)*2 + (col%2)` where the value
+    /// names the channel present at that CFA position (0=R, 1=G, 2=B).
+    ///
+    /// This is NOT a fancy demosaic: it is exactly Java's nearest-neighbour
+    /// average per missing component (the same algorithm Java DNG/MRW/Canon use).
+    pub fn interpolate(
+        s: &[i16],
+        buf: &mut [u8],
+        bayer_pattern: &[i32; 4],
+        width: usize,
+        height: usize,
+        little_endian: bool,
+    ) {
+        if width == 1 && height == 1 {
+            for b in buf.iter_mut() {
+                *b = s[0] as u8;
+            }
+            return;
+        }
+
+        let plane = width * height;
+
+        for row in 0..height {
+            for col in 0..width {
+                let even_col = (col % 2) == 0;
+
+                let index = (row % 2) * 2 + (col % 2);
+                let need_green = bayer_pattern[index] != 1;
+                let need_red = bayer_pattern[index] != 0;
+                let need_blue = bayer_pattern[index] != 2;
+
+                // --- Green channel (buf offset +2) ---
+                if need_green {
+                    let mut sum: i32 = 0;
+                    let mut ncomps = 0i32;
+                    if row > 0 {
+                        sum += s[plane + (row - 1) * width + col] as i32;
+                        ncomps += 1;
+                    }
+                    if row < height - 1 {
+                        sum += s[plane + (row + 1) * width + col] as i32;
+                        ncomps += 1;
+                    }
+                    if col > 0 {
+                        sum += s[plane + row * width + col - 1] as i32;
+                        ncomps += 1;
+                    }
+                    if col < width - 1 {
+                        sum += s[plane + row * width + col + 1] as i32;
+                        ncomps += 1;
+                    }
+                    let v = (sum / ncomps) as i16;
+                    unpack_bytes(v as i64, buf, row * width * 6 + col * 6 + 2, 2, little_endian);
+                } else {
+                    unpack_bytes(
+                        s[plane + row * width + col] as i64,
+                        buf,
+                        row * width * 6 + col * 6 + 2,
+                        2,
+                        little_endian,
+                    );
+                }
+
+                // --- Red channel (buf offset +0) ---
+                if need_red {
+                    let mut sum: i32 = 0;
+                    let mut ncomps = 0i32;
+                    if !need_blue {
+                        // four corners
+                        if row > 0 {
+                            if col > 0 {
+                                sum += s[(row - 1) * width + col - 1] as i32;
+                                ncomps += 1;
+                            }
+                            if col < width - 1 {
+                                sum += s[(row - 1) * width + col + 1] as i32;
+                                ncomps += 1;
+                            }
+                        }
+                        if row < height - 1 {
+                            if col > 0 {
+                                sum += s[(row + 1) * width + col - 1] as i32;
+                                ncomps += 1;
+                            }
+                            if col < width - 1 {
+                                sum += s[(row + 1) * width + col + 1] as i32;
+                                ncomps += 1;
+                            }
+                        }
+                    } else if (even_col && bayer_pattern[index + 1] == 0)
+                        || (!even_col && bayer_pattern[index - 1] == 0)
+                    {
+                        // horizontal
+                        if col > 0 {
+                            sum += s[row * width + col - 1] as i32;
+                            ncomps += 1;
+                        }
+                        if col < width - 1 {
+                            sum += s[row * width + col + 1] as i32;
+                            ncomps += 1;
+                        }
+                    } else {
+                        // vertical
+                        if row > 0 {
+                            sum += s[(row - 1) * width + col] as i32;
+                            ncomps += 1;
+                        }
+                        if row < height - 1 {
+                            sum += s[(row + 1) * width + col] as i32;
+                            ncomps += 1;
+                        }
+                    }
+                    let v = (sum / ncomps) as i16;
+                    unpack_bytes(v as i64, buf, row * width * 6 + col * 6, 2, little_endian);
+                } else {
+                    unpack_bytes(
+                        s[row * width + col] as i64,
+                        buf,
+                        row * width * 6 + col * 6,
+                        2,
+                        little_endian,
+                    );
+                }
+
+                // --- Blue channel (buf offset +4) ---
+                if need_blue {
+                    let mut sum: i32 = 0;
+                    let mut ncomps = 0i32;
+                    if !need_red {
+                        // four corners
+                        if row > 0 {
+                            if col > 0 {
+                                sum += s[(2 * height + row - 1) * width + col - 1] as i32;
+                                ncomps += 1;
+                            }
+                            if col < width - 1 {
+                                sum += s[(2 * height + row - 1) * width + col + 1] as i32;
+                                ncomps += 1;
+                            }
+                        }
+                        if row < height - 1 {
+                            if col > 0 {
+                                sum += s[(2 * height + row + 1) * width + col - 1] as i32;
+                                ncomps += 1;
+                            }
+                            if col < width - 1 {
+                                sum += s[(2 * height + row + 1) * width + col + 1] as i32;
+                                ncomps += 1;
+                            }
+                        }
+                    } else if (even_col && bayer_pattern[index + 1] == 2)
+                        || (!even_col && bayer_pattern[index - 1] == 2)
+                    {
+                        // horizontal
+                        if col > 0 {
+                            sum += s[(2 * height + row) * width + col - 1] as i32;
+                            ncomps += 1;
+                        }
+                        if col < width - 1 {
+                            sum += s[(2 * height + row) * width + col + 1] as i32;
+                            ncomps += 1;
+                        }
+                    } else {
+                        // vertical
+                        if row > 0 {
+                            sum += s[(2 * height + row - 1) * width + col] as i32;
+                            ncomps += 1;
+                        }
+                        if row < height - 1 {
+                            sum += s[(2 * height + row + 1) * width + col] as i32;
+                            ncomps += 1;
+                        }
+                    }
+                    let v = (sum / ncomps) as i16;
+                    unpack_bytes(v as i64, buf, row * width * 6 + col * 6 + 4, 2, little_endian);
+                } else {
+                    unpack_bytes(
+                        s[2 * plane + row * width + col] as i64,
+                        buf,
+                        row * width * 6 + col * 6 + 4,
+                        2,
+                        little_endian,
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Macro for TIFF wrapper readers
 // ---------------------------------------------------------------------------
 macro_rules! tiff_wrapper {
@@ -911,7 +1174,7 @@ impl CanonRawReader {
         let h = Self::SIZE_Y;
         let plane = w * h;
         // pix layout: 3 planar channels [R | G | B], each w*h shorts.
-        let mut pix = vec![0u16; plane * 3];
+        let mut pix = vec![0i16; plane * 3];
 
         let mut next_byte = 0usize;
         let mut even = true;
@@ -930,7 +1193,7 @@ impl CanonRawReader {
                     next_byte += 1;
                     ((a & 0xf) << 8) | b
                 };
-                let val = (v & 0xffff) as u16;
+                let val = (v & 0xffff) as u16 as i16;
                 even = !even;
 
                 let map_index = (row % 2) * 2 + (col % 2);
@@ -943,19 +1206,12 @@ impl CanonRawReader {
             }
         }
 
-        // Java: ImageTools.interpolate(pix, plane, COLOR_MAP, ...) then
-        // readPlane delivers interleaved RGB. We emit interleaved RGB
-        // (is_interleaved=true) UINT16 LE: for each pixel R,G,B.
+        // Java: ImageTools.interpolate(pix, plane, COLOR_MAP, ...) fills in the
+        // missing CFA components, then readPlane delivers interleaved RGB.
+        // littleEndian = true (m.littleEndian set in initFile).
+        let color_map = Self::COLOR_MAP.map(|c| c as i32);
         let mut out = vec![0u8; plane * 3 * 2];
-        for p in 0..plane {
-            let r = pix[p];
-            let g = pix[plane + p];
-            let b = pix[2 * plane + p];
-            let base = p * 6;
-            out[base..base + 2].copy_from_slice(&r.to_le_bytes());
-            out[base + 2..base + 4].copy_from_slice(&g.to_le_bytes());
-            out[base + 4..base + 6].copy_from_slice(&b.to_le_bytes());
-        }
+        cfa::interpolate(&pix, &mut out, &color_map, w, h, true);
         Ok(out)
     }
 }
@@ -1723,5 +1979,142 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // CFA / RAW helper tests (cfa::unpack_bytes, cfa::BitReader, cfa::interpolate)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unpack_bytes_little_and_big_endian() {
+        // Port-of-Java check: DataTools.unpackBytes(0x1234, buf, 0, 2, le).
+        let mut le = [0u8; 2];
+        cfa::unpack_bytes(0x1234, &mut le, 0, 2, true);
+        assert_eq!(le, [0x34, 0x12]);
+
+        let mut be = [0u8; 2];
+        cfa::unpack_bytes(0x1234, &mut be, 0, 2, false);
+        assert_eq!(be, [0x12, 0x34]);
+
+        // Offset and a 4-byte write, big-endian.
+        let mut buf = [0u8; 6];
+        cfa::unpack_bytes(0x0A0B0C0D, &mut buf, 2, 4, false);
+        assert_eq!(buf, [0, 0, 0x0A, 0x0B, 0x0C, 0x0D]);
+
+        // Negative short truncated to its low 2 bytes (Java casts to short).
+        let mut neg = [0u8; 2];
+        cfa::unpack_bytes((-1i16) as i64, &mut neg, 0, 2, true);
+        assert_eq!(neg, [0xff, 0xff]);
+    }
+
+    #[test]
+    fn bit_reader_msb_first_and_skip() {
+        // 0b1010_0110, 0b1100_1111
+        let data = [0xA6u8, 0xCF];
+        let mut r = cfa::BitReader::new(&data);
+        assert_eq!(r.read_bits(4), 0b1010);
+        assert_eq!(r.read_bits(4), 0b0110);
+        assert_eq!(r.read_bits(8), 0b1100_1111);
+        // Past end -> zero bits.
+        assert_eq!(r.read_bits(4), 0);
+
+        // 12-bit reads crossing byte boundaries, matching readBits(12).
+        let data = [0xFF, 0xF0, 0x00];
+        let mut r = cfa::BitReader::new(&data);
+        assert_eq!(r.read_bits(12), 0xFFF);
+        assert_eq!(r.read_bits(12), 0x000);
+
+        // skip_bits advances the cursor.
+        let data = [0b1111_0000, 0b1010_1010];
+        let mut r = cfa::BitReader::new(&data);
+        r.skip_bits(4);
+        assert_eq!(r.read_bits(4), 0);
+        assert_eq!(r.read_bits(8), 0b1010_1010);
+    }
+
+    #[test]
+    fn interpolate_single_pixel_special_case() {
+        // width == 1 && height == 1: every output byte = (byte) s[0].
+        let s = [0x42i16, 0, 0];
+        let mut buf = [0u8; 6];
+        cfa::interpolate(&s, &mut buf, &[1, 0, 2, 1], 1, 1, true);
+        assert_eq!(buf, [0x42; 6]);
+    }
+
+    #[test]
+    fn interpolate_fills_missing_components() {
+        // 2x2 image, color map {1,0,2,1} (G R / B G), the Canon/DNG default.
+        // Planar source [R|G|B] of 4 shorts each; only the present channel is
+        // set at each CFA site, exactly as the Java readers populate `pix`.
+        let w = 2usize;
+        let h = 2usize;
+        let plane = w * h;
+        let color_map = [1i32, 0, 2, 1];
+
+        // CFA layout by index (row%2)*2 + (col%2):
+        //   (0,0)->1=G  (0,1)->0=R
+        //   (1,0)->2=B  (1,1)->1=G
+        let mut s = vec![0i16; plane * 3];
+        // Greens at (0,0) and (1,1).
+        s[plane] = 10; // G(0,0): channel 1, row 0, col 0
+        s[plane + 1 * w + 1] = 40; // G(1,1)
+        // Red at (0,1).
+        s[1] = 20; // R(0,1): channel 0, row 0, col 1
+        // Blue at (1,0).
+        s[2 * plane + 1 * w + 0] = 30; // B(1,0)
+
+        let mut buf = vec![0u8; plane * 3 * 2];
+        cfa::interpolate(&s, &mut buf, &color_map, w, h, true);
+
+        // Helper to read an interleaved RGB sample (little-endian u16 -> i16).
+        let px = |buf: &[u8], row: usize, col: usize, c: usize| -> i16 {
+            let base = row * w * 6 + col * 6 + c * 2;
+            i16::from_le_bytes([buf[base], buf[base + 1]])
+        };
+
+        // Present components are passed through unchanged.
+        assert_eq!(px(&buf, 0, 0, 1), 10); // G present at (0,0)
+        assert_eq!(px(&buf, 0, 1, 0), 20); // R present at (0,1)
+        assert_eq!(px(&buf, 1, 0, 2), 30); // B present at (1,0)
+        assert_eq!(px(&buf, 1, 1, 1), 40); // G present at (1,1)
+
+        // Missing green at (0,1): neighbours in green plane are (0,0)=10 and
+        // (1,1)=40 -> (10+40)/2 = 25.
+        assert_eq!(px(&buf, 0, 1, 1), 25);
+        // Missing red at (0,0): index 0, need_red && need_blue so !need_blue is
+        // false. even_col && bayer_pattern[index+1]==0 (pattern[1]==0) -> the
+        // horizontal branch: col==0 so only the right neighbour R(0,1)=20 is
+        // summed (ncomps==1) -> 20.
+        assert_eq!(px(&buf, 0, 0, 0), 20);
+    }
+
+    #[test]
+    fn interpolate_matches_planar_passthrough_when_fully_sampled() {
+        // If every CFA site already carries all three channels (degenerate but
+        // exercises the "else" passthrough branches), interpolate must copy the
+        // present component for each channel verbatim.
+        let w = 2usize;
+        let h = 2usize;
+        let plane = w * h;
+        let color_map = [1i32, 0, 2, 1];
+        let mut s = vec![0i16; plane * 3];
+        for p in 0..plane {
+            s[p] = (p as i16) + 1; // R plane
+            s[plane + p] = (p as i16) + 11; // G plane
+            s[2 * plane + p] = (p as i16) + 21; // B plane
+        }
+        let mut buf = vec![0u8; plane * 3 * 2];
+        cfa::interpolate(&s, &mut buf, &color_map, w, h, true);
+        let px = |buf: &[u8], idx: usize, c: usize| -> i16 {
+            let base = idx * 6 + c * 2;
+            i16::from_le_bytes([buf[base], buf[base + 1]])
+        };
+        for (row, col, idx) in [(0usize, 0usize, 0usize), (0, 1, 1), (1, 0, 2), (1, 1, 3)] {
+            let cfa_index = (row % 2) * 2 + (col % 2);
+            // The channel present at this site is copied straight through.
+            let present = color_map[cfa_index] as usize;
+            let expected_plane_val = s[present * plane + idx];
+            assert_eq!(px(&buf, idx, present), expected_plane_val);
+        }
     }
 }

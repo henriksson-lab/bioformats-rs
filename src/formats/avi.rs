@@ -348,6 +348,7 @@ const AVI_MSRLE: u32 = 1;
 const AVI_MS_VIDEO: u32 = 1296126531; // "MSVC"
 const AVI_JPEG: u32 = 1196444237; // "MJPG"
 const AVI_Y8: u32 = 538982489; // "Y800"
+const AVI_CINEPAK: u32 = 1684633187; // "cvid"
 
 pub struct AviReader {
     path: Option<PathBuf>,
@@ -357,6 +358,8 @@ pub struct AviReader {
     top_down: bool,
     compression: u32,
     bit_count: u16,
+    /// Last decoded Cinepak frame (for inter-coded strips) and its index.
+    last_cinepak: Option<(u32, Vec<u8>)>,
 }
 
 impl AviReader {
@@ -369,6 +372,7 @@ impl AviReader {
             top_down: false,
             compression: 0,
             bit_count: 24,
+            last_cinepak: None,
         }
     }
 }
@@ -401,7 +405,7 @@ impl FormatReader for AviReader {
         // Supported codecs: uncompressed (0), MSRLE, MS_VIDEO, JPEG/MotionJPEG, Y8.
         let supported = matches!(
             compression,
-            0 | AVI_MSRLE | AVI_MS_VIDEO | AVI_JPEG | AVI_Y8
+            0 | AVI_MSRLE | AVI_MS_VIDEO | AVI_JPEG | AVI_Y8 | AVI_CINEPAK
         );
         if !supported {
             return Err(BioFormatsError::UnsupportedFormat(format!(
@@ -448,6 +452,13 @@ impl FormatReader for AviReader {
         let palette = parsed.palette.clone();
         let (size_c, pixel_type, out_is_rgb, is_indexed) = if compression == AVI_JPEG {
             (3u32, PixelType::Uint8, true, false)
+        } else if compression == AVI_CINEPAK {
+            // Cinepak decodes to 8-bit grayscale or 24-bit RGB.
+            if bit_count == 8 {
+                (1u32, PixelType::Uint8, false, false)
+            } else {
+                (3u32, PixelType::Uint8, true, false)
+            }
         } else if compression == AVI_MS_VIDEO && bit_count == 16 {
             // MS Video 1 16-bit RGB555 decodes to interleaved RGB888.
             (3u32, PixelType::Uint8, true, false)
@@ -536,6 +547,7 @@ impl FormatReader for AviReader {
         self.meta = None;
         self.frame_offsets.clear();
         self.top_down = false;
+        self.last_cinepak = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -581,6 +593,20 @@ impl FormatReader for AviReader {
             .map_err(BioFormatsError::Io)?;
 
         // --- compressed codecs ---
+        if compression == AVI_CINEPAK {
+            let mut raw = vec![0u8; stored_size as usize];
+            f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
+            // Inter-coded strips reference the previous decoded frame.
+            let prev = match &self.last_cinepak {
+                Some((idx, plane)) if *idx + 1 == plane_index => plane.clone(),
+                _ => Vec::new(),
+            };
+            let plane =
+                crate::common::codec::decompress_cinepak(&raw, width, height, bit_count as u32, &prev)?;
+            self.last_cinepak = Some((plane_index, plane.clone()));
+            return Ok(plane);
+        }
+
         if compression == AVI_MS_VIDEO {
             let mut raw = vec![0u8; stored_size as usize];
             f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;

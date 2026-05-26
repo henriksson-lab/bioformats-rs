@@ -196,10 +196,351 @@ macro_rules! placeholder_reader {
 // ---------------------------------------------------------------------------
 // 1. Adobe DNG (Digital Negative) RAW
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Adobe DNG (Digital Negative) RAW format — TIFF-based (`.dng`).
-    pub struct DngReader;
-    extensions: ["dng"];
+/// Adobe / Canon DNG (Digital Negative) RAW format — TIFF-based (`.dng`).
+///
+/// Port of the upstream Java `DNGReader` (which extends `BaseTiffReader`).
+///
+/// Two code paths, mirroring Java `openBytes`:
+/// * **Developed / RGB** — non-CFA images are decoded directly by `TiffReader`.
+/// * **Bayer CFA** — when the first IFD has `PhotometricInterpretation`
+///   == `CFA_ARRAY` (32803), the strips hold a single-channel bit-packed Bayer
+///   mosaic. This reader concatenates the strips, unpacks the
+///   `BitsPerSample[0]`-bit samples MSB-first, splits them into a planar
+///   [R|G|B] buffer using the `COLOR_MAP` (320) tag (default `{1,0,2,1}`), and
+///   runs `ImageTools.interpolate` to produce an interleaved RGB UINT16 plane —
+///   exactly as Java does.
+///
+/// White-balance expansion ports `DNGReader.initStandardMetadata` +
+/// `adjustForWhiteBalance`: when the Canon EXIF maker-note
+/// (`WHITE_BALANCE_RGB_COEFFS`, via [`TiffReader::dng_white_balance`]) supplies
+/// per-channel gains, each demosaiced sample is scaled by its channel gain. If
+/// the maker-note is absent, scaling is a no-op (identical to Java's
+/// `whiteBalance == null` case).
+pub struct DngReader {
+    inner: crate::tiff::TiffReader,
+    /// CFA decode state, populated only for Bayer-CFA DNGs.
+    cfa: Option<DngCfa>,
+}
+
+/// State for a Bayer-CFA DNG (raw mosaic that needs demosaicing).
+struct DngCfa {
+    path: PathBuf,
+    meta: ImageMetadata,
+    color_map: [i32; 4],
+    data_size: u32,
+    /// (offset, byte_count) of each strip making up the raw mosaic.
+    strips: Vec<(usize, usize)>,
+    /// Per-channel white-balance RGB gains from the Canon EXIF maker-note
+    /// (`WHITE_BALANCE_RGB_COEFFS`). `None` means white balance is absent and
+    /// `adjust_for_white_balance` is a no-op, matching Java.
+    white_balance: Option<[f64; 3]>,
+    /// Cached demosaiced interleaved RGB plane.
+    full_image: Option<Vec<u8>>,
+}
+
+/// Port of `DNGReader.adjustForWhiteBalance`: scales sample `val` (already
+/// masked to 16 bits) by the channel `index` gain when a 3-entry white-balance
+/// table is present; otherwise returns `val` unchanged. Java casts the product
+/// back to `short`, so we wrap to the low 16 bits identically.
+fn adjust_for_white_balance(val: i16, index: usize, wb: &Option<[f64; 3]>) -> i16 {
+    match wb {
+        Some(w) if index < 3 => ((val as f64 * w[index]) as i64 as u16) as i16,
+        _ => val,
+    }
+}
+
+/// TIFF `PhotometricInterpretation` value for a colour-filter array.
+const PHOTO_CFA_ARRAY: u16 = 32803;
+
+impl DngReader {
+    pub fn new() -> Self {
+        DngReader {
+            inner: crate::tiff::TiffReader::new(),
+            cfa: None,
+        }
+    }
+
+    /// Port of the Bayer-CFA branch of `DNGReader.openBytes`. Concatenates the
+    /// raw bit-packed strips, splits into a planar [R|G|B] short buffer, and
+    /// interpolates into an interleaved RGB UINT16 plane.
+    fn decode_cfa(cfa: &DngCfa) -> Result<Vec<u8>> {
+        use crate::formats::camera2::cfa as cfahelp;
+
+        let file = std::fs::read(&cfa.path).map_err(BioFormatsError::Io)?;
+        let size_x = cfa.meta.size_x as usize;
+        let size_y = cfa.meta.size_y as usize;
+        let little = cfa.meta.is_little_endian;
+
+        // Java concatenates all strips into one buffer then bit-reads it.
+        let mut src: Vec<u8> = Vec::new();
+        for &(off, cnt) in &cfa.strips {
+            if off < file.len() {
+                let end = (off + cnt).min(file.len());
+                src.extend_from_slice(&file[off..end]);
+            }
+        }
+
+        let mut bits = cfahelp::BitReader::new(&src);
+        let mut pix = vec![0i16; size_x * size_y * 3];
+
+        for row in 0..size_y {
+            for col in 0..size_x {
+                let val = (bits.read_bits(cfa.data_size) & 0xffff) as u16 as i16;
+                let map_index = (row % 2) * 2 + (col % 2);
+
+                let red_offset = row * size_x + col;
+                let green_offset = (size_y + row) * size_x + col;
+                let blue_offset = (2 * size_y + row) * size_x + col;
+
+                match cfa.color_map[map_index] {
+                    0 => pix[red_offset] = adjust_for_white_balance(val, 0, &cfa.white_balance),
+                    1 => pix[green_offset] = adjust_for_white_balance(val, 1, &cfa.white_balance),
+                    2 => pix[blue_offset] = adjust_for_white_balance(val, 2, &cfa.white_balance),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut full = vec![0u8; size_x * size_y * 3 * 2];
+        cfahelp::interpolate(&pix, &mut full, &cfa.color_map, size_x, size_y, little);
+        Ok(full)
+    }
+}
+
+#[cfg(test)]
+mod dng_wb_tests {
+    use super::adjust_for_white_balance;
+
+    #[test]
+    fn no_white_balance_is_identity() {
+        // Java: whiteBalance == null -> adjustForWhiteBalance returns val.
+        let wb = None;
+        for v in [0i16, 1, 100, 255, 1000, i16::MAX] {
+            assert_eq!(adjust_for_white_balance(v, 0, &wb), v);
+            assert_eq!(adjust_for_white_balance(v, 1, &wb), v);
+            assert_eq!(adjust_for_white_balance(v, 2, &wb), v);
+        }
+    }
+
+    #[test]
+    fn scales_per_channel_and_truncates_like_java() {
+        // Java: (short)(val * whiteBalance[index]); cast truncates toward zero
+        // and wraps into 16 bits.
+        let wb = Some([2.391381f64, 0.929156, 1.298254]);
+        // 100 * 2.391381 = 239.13 -> 239
+        assert_eq!(adjust_for_white_balance(100, 0, &wb), 239);
+        // 100 * 0.929156 = 92.91 -> 92
+        assert_eq!(adjust_for_white_balance(100, 1, &wb), 92);
+        // 100 * 1.298254 = 129.82 -> 129
+        assert_eq!(adjust_for_white_balance(100, 2, &wb), 129);
+    }
+
+    #[test]
+    fn out_of_range_channel_is_identity() {
+        let wb = Some([2.0f64, 2.0, 2.0]);
+        assert_eq!(adjust_for_white_balance(50, 3, &wb), 50);
+    }
+}
+
+impl Default for DngReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for DngReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("dng"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)?;
+
+        // Inspect the first IFD: a Bayer-CFA DNG has PhotometricInterpretation
+        // == CFA_ARRAY (32803). Anything else is returned via the TIFF reader.
+        if let Some(ifd) = self.inner.ifd(0) {
+            let photo = ifd
+                .get_u16(crate::tiff::ifd::tag::PHOTOMETRIC_INTERPRETATION)
+                .unwrap_or(1);
+            if photo == PHOTO_CFA_ARRAY {
+                let bps = ifd.bits_per_sample();
+                let data_size = *bps.first().unwrap_or(&16) as u32;
+
+                // Java default color map {1,0,2,1}; overridden by COLOR_MAP tag
+                // (320) when all four entries are valid channel indices 0..=2.
+                let mut color_map = [1i32, 0, 2, 1];
+                let ifd_colors = ifd.get_vec_u16(crate::tiff::ifd::tag::COLOR_MAP);
+                if ifd_colors.len() >= 4 {
+                    let valid = ifd_colors[..4].iter().all(|&c| c <= 2);
+                    if valid {
+                        for q in 0..4 {
+                            color_map[q] = ifd_colors[q] as i32;
+                        }
+                    }
+                }
+
+                let size_x = ifd.image_width().unwrap_or(0);
+                let size_y = ifd.image_length().unwrap_or(0);
+
+                // Strip layout: offsets + byte counts (single strip is common).
+                let offsets = ifd.get_vec_u64(crate::tiff::ifd::tag::STRIP_OFFSETS);
+                let counts = ifd.get_vec_u64(crate::tiff::ifd::tag::STRIP_BYTE_COUNTS);
+                let mut strips: Vec<(usize, usize)> = Vec::new();
+                for i in 0..offsets.len() {
+                    let cnt = counts.get(i).copied().unwrap_or(0);
+                    strips.push((offsets[i] as usize, cnt as usize));
+                }
+
+                if size_x == 0 || size_y == 0 || strips.is_empty() {
+                    return Err(BioFormatsError::UnsupportedFormat(
+                        "DNG CFA: missing dimensions or strip layout".into(),
+                    ));
+                }
+
+                // Java: UINT16, RGB, interleaved, sizeC=3, sizeZ=sizeT=1.
+                let base = self.inner.metadata();
+                let meta = ImageMetadata {
+                    size_x,
+                    size_y,
+                    size_z: 1,
+                    size_c: 3,
+                    size_t: 1,
+                    pixel_type: PixelType::Uint16,
+                    bits_per_pixel: 16,
+                    image_count: 1,
+                    dimension_order: DimensionOrder::XYCZT,
+                    is_rgb: true,
+                    is_interleaved: true,
+                    is_indexed: false,
+                    is_little_endian: base.is_little_endian,
+                    resolution_count: 1,
+                    series_metadata: HashMap::new(),
+                    lookup_table: None,
+                    modulo_z: None,
+                    modulo_c: None,
+                    modulo_t: None,
+                };
+
+                // Canon EXIF maker-note white-balance gains (tag 16385 via the
+                // EXIF sub-IFD 34665 -> maker-note IFD). `None` => no-op.
+                let white_balance = self.inner.dng_white_balance();
+
+                self.cfa = Some(DngCfa {
+                    path: path.to_path_buf(),
+                    meta,
+                    color_map,
+                    data_size,
+                    strips,
+                    white_balance,
+                    full_image: None,
+                });
+                return Ok(());
+            }
+        }
+        self.cfa = None;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.cfa = None;
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        if self.cfa.is_some() {
+            1
+        } else {
+            self.inner.series_count()
+        }
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.cfa.is_some() {
+            if s != 0 {
+                Err(BioFormatsError::SeriesOutOfRange(s))
+            } else {
+                Ok(())
+            }
+        } else {
+            self.inner.set_series(s)
+        }
+    }
+
+    fn series(&self) -> usize {
+        if self.cfa.is_some() {
+            0
+        } else {
+            self.inner.series()
+        }
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        if let Some(c) = &self.cfa {
+            &c.meta
+        } else {
+            self.inner.metadata()
+        }
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if let Some(c) = &mut self.cfa {
+            if p != 0 {
+                return Err(BioFormatsError::PlaneOutOfRange(p));
+            }
+            if c.full_image.is_none() {
+                c.full_image = Some(Self::decode_cfa(c)?);
+            }
+            return Ok(c.full_image.clone().unwrap());
+        }
+        self.inner.open_bytes(p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        if self.cfa.is_some() {
+            let full = self.open_bytes(p)?;
+            let meta = self.metadata().clone();
+            return crop_full_plane("DNG", &full, &meta, 3, x, y, w, h);
+        }
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if self.cfa.is_some() {
+            return self.open_bytes(p);
+        }
+        self.inner.open_thumb_bytes(p)
+    }
+
+    fn resolution_count(&self) -> usize {
+        if self.cfa.is_some() {
+            1
+        } else {
+            self.inner.resolution_count()
+        }
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if self.cfa.is_some() {
+            if level != 0 {
+                Err(BioFormatsError::Format(format!(
+                    "resolution {} out of range",
+                    level
+                )))
+            } else {
+                Ok(())
+            }
+        } else {
+            self.inner.set_resolution(level)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,31 +1587,127 @@ impl FormatReader for CellomicsReader {
 ///
 /// The pixel data is a single-channel Bayer mosaic that the Java reader
 /// demosaics (via `ImageTools.interpolate`) into an interleaved RGB UINT16
-/// big-endian plane. The demosaic is a substantial RAW operation and is **not**
-/// reproduced here: this port faithfully parses the header so the format is
-/// recognised and its metadata is correct, but pixel reads return an
-/// UnsupportedFormat error.
+/// big-endian plane. This port reproduces the Java `openBytes` path exactly:
+/// the packed `dataSize`-bit CFA samples are read MSB-first, white-balance
+/// gains are applied, the mosaic is split into a planar [R|G|B] buffer using
+/// the appropriate color map (`COLOR_MAP_1`/`COLOR_MAP_2`), and
+/// `ImageTools.interpolate` fills the missing components into an interleaved
+/// big-endian RGB plane.
 pub struct MrwReader {
     meta: Option<ImageMetadata>,
+    path: Option<PathBuf>,
     sensor_width: u32,
     sensor_height: u32,
     bayer_pattern: u8,
     data_size: u8,
     pixel_offset: u64,
     wbg: [f32; 4],
+    /// Cached demosaiced interleaved RGB plane (Java caches `fullImage`).
+    full_image: Option<Vec<u8>>,
 }
 
 impl MrwReader {
+    /// Bayer color maps from `MRWReader.java`.
+    const COLOR_MAP_1: [i32; 4] = [0, 1, 1, 2];
+    const COLOR_MAP_2: [i32; 4] = [1, 2, 0, 1];
+
     pub fn new() -> Self {
         MrwReader {
             meta: None,
+            path: None,
             sensor_width: 0,
             sensor_height: 0,
             bayer_pattern: 0,
             data_size: 0,
             pixel_offset: 0,
             wbg: [1.0; 4],
+            full_image: None,
         }
+    }
+
+    /// Port of `MRWReader.openBytes` (the full-plane decode). Returns the
+    /// demosaiced interleaved RGB UINT16 big-endian plane.
+    fn decode_full_image(&self) -> Result<Vec<u8>> {
+        use crate::formats::camera2::cfa;
+
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+
+        let size_x = self.meta.as_ref().unwrap().size_x as usize;
+        let size_y = self.meta.as_ref().unwrap().size_y as usize;
+        let sensor_w = self.sensor_width as usize;
+        let data_size = self.data_size as u32;
+
+        let offset = self.pixel_offset as usize;
+        if offset > data.len() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "MRW: pixel offset past end of file".into(),
+            ));
+        }
+        // Java seeks to `offset` then reads a continuous bit stream.
+        let mut bits = cfa::BitReader::new(&data[offset..]);
+
+        // Planar [R|G|B] short buffer.
+        let mut s = vec![0i16; size_x * size_y * 3];
+
+        for row in 0..size_y {
+            let even_row = (row % 2) == 0;
+            for col in 0..size_x {
+                let even_col = (col % 2) == 0;
+                let raw = (bits.read_bits(data_size) & 0xffff) as u16 as i16;
+
+                let red_offset = row * size_x + col;
+                let green_offset = (size_y + row) * size_x + col;
+                let blue_offset = (2 * size_y + row) * size_x + col;
+
+                // Java applies wbg via `(short)(val * wbg[k])` (float -> short).
+                let val: i16;
+                if even_row {
+                    if even_col {
+                        val = (raw as f32 * self.wbg[0]) as i16;
+                        if self.bayer_pattern == 1 {
+                            s[red_offset] = val;
+                        } else {
+                            s[green_offset] = val;
+                        }
+                    } else {
+                        val = (raw as f32 * self.wbg[1]) as i16;
+                        if self.bayer_pattern == 1 {
+                            s[green_offset] = val;
+                        } else {
+                            s[blue_offset] = val;
+                        }
+                    }
+                } else if even_col {
+                    val = (raw as f32 * self.wbg[2]) as i16;
+                    if self.bayer_pattern == 1 {
+                        s[green_offset] = val;
+                    } else {
+                        s[red_offset] = val;
+                    }
+                } else {
+                    val = (raw as f32 * self.wbg[3]) as i16;
+                    if self.bayer_pattern == 1 {
+                        s[blue_offset] = val;
+                    } else {
+                        s[green_offset] = val;
+                    }
+                }
+            }
+            // Java: in.skipBits(dataSize * (sensorWidth - getSizeX())).
+            bits.skip_bits((data_size as usize) * (sensor_w - size_x));
+        }
+
+        let color_map = if self.bayer_pattern == 1 {
+            Self::COLOR_MAP_1
+        } else {
+            Self::COLOR_MAP_2
+        };
+
+        // m.littleEndian = false in initFile.
+        let mut full = vec![0u8; size_x * size_y * 3 * 2];
+        cfa::interpolate(&s, &mut full, &color_map, size_x, size_y, false);
+        Ok(full)
     }
 }
 
@@ -1363,6 +1800,8 @@ impl FormatReader for MrwReader {
         self.data_size = data_size;
         self.pixel_offset = offset;
         self.wbg = wbg;
+        self.path = Some(path.to_path_buf());
+        self.full_image = None;
 
         // Java: RGB UINT16, big-endian, interleaved, dimensionOrder XYCZT,
         // sizeC = 3, sizeZ = sizeT = 1, imageCount = 1, bitsPerPixel = dataSize.
@@ -1391,12 +1830,14 @@ impl FormatReader for MrwReader {
     }
     fn close(&mut self) -> Result<()> {
         self.meta = None;
+        self.path = None;
         self.sensor_width = 0;
         self.sensor_height = 0;
         self.bayer_pattern = 0;
         self.data_size = 0;
         self.pixel_offset = 0;
         self.wbg = [1.0; 4];
+        self.full_image = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -1415,13 +1856,19 @@ impl FormatReader for MrwReader {
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
     }
-    fn open_bytes(&mut self, _p: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "MRW: Bayer CFA demosaicing of raw sensor data is not implemented".into(),
-        ))
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if p != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(p));
+        }
+        if self.full_image.is_none() {
+            self.full_image = Some(self.decode_full_image()?);
+        }
+        Ok(self.full_image.clone().unwrap())
     }
-    fn open_bytes_region(&mut self, p: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
-        self.open_bytes(p)
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let full = self.open_bytes(p)?;
+        let meta = self.metadata().clone();
+        crop_full_plane("MRW", &full, &meta, 3, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.open_bytes(p)
@@ -2694,5 +3141,153 @@ impl FormatReader for BurleighReader {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod mrw_tests {
+    use super::MrwReader;
+    use crate::common::reader::FormatReader;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Build a minimal synthetic MRW file with a PRD + WBG block and a 12-bit
+    /// packed Bayer mosaic of `sensor_w * sensor_h` samples. Layout follows the
+    /// parsing offsets used by `MRWReader.java` / `MrwReader::set_id`.
+    fn build_mrw(
+        sensor_w: u16,
+        sensor_h: u16,
+        size_x: u16,
+        size_y: u16,
+        bayer: u8,
+        samples: &[u16],
+    ) -> Vec<u8> {
+        // PRD block body: 24 bytes minimum.
+        let mut prd = vec![0u8; 24];
+        prd[8..10].copy_from_slice(&sensor_h.to_be_bytes());
+        prd[10..12].copy_from_slice(&sensor_w.to_be_bytes());
+        prd[12..14].copy_from_slice(&size_y.to_be_bytes());
+        prd[14..16].copy_from_slice(&size_x.to_be_bytes());
+        prd[16] = 12; // dataSize
+        prd[23] = bayer; // bayerPattern
+
+        // WBG block body: 4 scale bytes + 4 big-endian shorts. Use scale 0 and
+        // coeff 64 so wbg[i] = 64 / (64 << 0) = 1.0 (identity gain).
+        let mut wbg = vec![0u8; 12];
+        for i in 0..4 {
+            wbg[4 + i * 2..6 + i * 2].copy_from_slice(&64i16.to_be_bytes());
+        }
+
+        // Packed 12-bit samples, MSB-first.
+        let mut packed_bits: Vec<u8> = Vec::new();
+        let mut acc: u32 = 0;
+        let mut nbits = 0u32;
+        for &s in samples {
+            acc = (acc << 12) | (s as u32 & 0xfff);
+            nbits += 12;
+            while nbits >= 8 {
+                nbits -= 8;
+                packed_bits.push(((acc >> nbits) & 0xff) as u8);
+            }
+        }
+        if nbits > 0 {
+            packed_bits.push(((acc << (8 - nbits)) & 0xff) as u8);
+        }
+
+        // Compose blocks. Each block: 4-char name + be32 length + body.
+        let mut blocks: Vec<u8> = Vec::new();
+        let mut push_block = |blocks: &mut Vec<u8>, name: &[u8; 4], body: &[u8]| {
+            blocks.extend_from_slice(name);
+            blocks.extend_from_slice(&(body.len() as i32).to_be_bytes());
+            blocks.extend_from_slice(body);
+        };
+        push_block(&mut blocks, b"0PRD", &prd);
+        push_block(&mut blocks, b"0WBG", &wbg);
+
+        // offset = readInt(@4) + 8 -> points just past the block region (where
+        // pixel data starts). The header before blocks is 8 bytes (magic + int).
+        let offset = 8 + blocks.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\0MRM");
+        out.extend_from_slice(&((offset - 8) as i32).to_be_bytes());
+        out.extend_from_slice(&blocks);
+        out.extend_from_slice(&packed_bits);
+        out
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bioformats_mrw_{name}_{}_{}.mrw",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    #[test]
+    fn mrw_decodes_interleaved_rgb_plane() {
+        // 2x2 image, sensor matches (no row padding). bayer=0 -> COLOR_MAP_2.
+        // Distinct sample values so we can confirm channel placement.
+        let samples = [100u16, 200, 300, 400];
+        let bytes = build_mrw(2, 2, 2, 2, 0, &samples);
+        let path = temp_path("decode");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = MrwReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.size_c), (2, 2, 3));
+        assert!(meta.is_rgb && meta.is_interleaved && !meta.is_little_endian);
+        assert_eq!(meta.bits_per_pixel, 12);
+
+        let plane = reader.open_bytes(0).unwrap();
+        // Interleaved RGB, 2 bytes/sample, big-endian: 2*2 px * 3 * 2 = 24 bytes.
+        assert_eq!(plane.len(), 24);
+
+        // Read pixel (row,col) channel c as a big-endian u16.
+        let px = |buf: &[u8], row: usize, col: usize, c: usize| -> u16 {
+            let base = row * 2 * 6 + col * 6 + c * 2;
+            u16::from_be_bytes([buf[base], buf[base + 1]])
+        };
+
+        // bayer=0 -> COLOR_MAP_2 = {1,2,0,1}. With identity white balance the
+        // present component at each CFA site equals the raw sample:
+        //   (0,0) evenRow/evenCol -> green = 100
+        //   (0,1) evenRow/oddCol  -> blue  = 200
+        //   (1,0) oddRow/evenCol  -> red   = 300
+        //   (1,1) oddRow/oddCol   -> green = 400
+        assert_eq!(px(&plane, 0, 0, 1), 100);
+        assert_eq!(px(&plane, 0, 1, 2), 200);
+        assert_eq!(px(&plane, 1, 0, 0), 300);
+        assert_eq!(px(&plane, 1, 1, 1), 400);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mrw_skips_sensor_row_padding() {
+        // sensor wider than output: 3-wide sensor, 2-wide output. Each row reads
+        // 2 samples then skips dataSize*(3-2)=12 bits. Provide 6 sensor samples
+        // (3 per row, 2 rows); the third sample per row must be ignored.
+        let samples = [11u16, 22, 999, 33, 44, 888];
+        let bytes = build_mrw(3, 2, 2, 2, 0, &samples);
+        let path = temp_path("padding");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = MrwReader::new();
+        reader.set_id(&path).unwrap();
+        let plane = reader.open_bytes(0).unwrap();
+        let px = |buf: &[u8], row: usize, col: usize, c: usize| -> u16 {
+            let base = row * 2 * 6 + col * 6 + c * 2;
+            u16::from_be_bytes([buf[base], buf[base + 1]])
+        };
+        // The padding samples 999/888 must not appear as present components.
+        assert_eq!(px(&plane, 0, 0, 1), 11); // green (0,0)
+        assert_eq!(px(&plane, 0, 1, 2), 22); // blue  (0,1)
+        assert_eq!(px(&plane, 1, 0, 0), 33); // red   (1,0)
+        assert_eq!(px(&plane, 1, 1, 1), 44); // green (1,1)
+        std::fs::remove_file(&path).ok();
     }
 }

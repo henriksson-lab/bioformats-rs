@@ -14,15 +14,28 @@ fn round_trip(path: &Path, meta: &ImageMetadata, plane: Vec<u8>) -> Vec<u8> {
     r.open_bytes(0).expect("open_bytes failed")
 }
 
-fn fixed_offset_rhk_header() -> String {
-    let mut header = String::new();
-    loop {
-        let next = format!("x_size 3\ny_size 2\nheader size {}\n", header.len());
-        if next.len() == header.len() {
-            return next;
-        }
-        header = next;
-    }
+/// Build an RHK SPM text-layout page header (the 512-byte block parsed by
+/// RHKReader.java's non-XPM branch) for a `width`x`height` int16 image.
+///
+/// Mirrors the fixed offsets in RHKReader.initFile: the first short is not
+/// 0xaa, the type/dimension record is a space-separated ASCII string at
+/// offset 32 (fields: imageType dataType lineType sizeX sizeY _ pageType),
+/// the X/Y axis records (whose field [1] is the scale) are at 64/96, and the
+/// description sits at 352. Pixels begin at offset 512 (HEADER_SIZE).
+fn rhk_text_header(width: u32, height: u32, x_scale: &str, y_scale: &str) -> [u8; 512] {
+    let mut hdr = [0u8; 512];
+    // first short stays 0 (!= 0xaa) → text layout.
+    let put = |hdr: &mut [u8; 512], off: usize, s: &str| {
+        let b = s.as_bytes();
+        let n = b.len().min(32);
+        hdr[off..off + n].copy_from_slice(&b[..n]);
+    };
+    // imageType=0 dataType=1(int16) lineType=0 sizeX sizeY _ pageType=0
+    put(&mut hdr, 32, &format!("0 1 0 {width} {height} 0 0"));
+    put(&mut hdr, 64, &format!("x {x_scale}"));
+    put(&mut hdr, 96, &format!("y {y_scale}"));
+    put(&mut hdr, 352, "test description");
+    hdr
 }
 
 fn write_i32_le(buf: &mut [u8], offset: usize, value: i32) {
@@ -1043,23 +1056,44 @@ fn ubm_rejects_short_payloads() {
 
 #[test]
 fn rhk_requires_header_dimensions_and_crops_real_pixels() {
+    // A file shorter than the 512-byte page header must be rejected
+    // (RHKReader.java reads fixed offsets up to 512).
     let missing = tmp("missing_dims.sm3");
-    std::fs::write(&missing, b"header size 0\n\x01\x00\x02\x00").unwrap();
+    std::fs::write(&missing, b"\x00\x00header too short").unwrap();
     let mut reader = bioformats::formats::spm::RhkReader::new();
     let err = reader.set_id(&missing).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("missing image dimensions"))
+        matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("shorter than the 512-byte"))
     );
 
+    // Text-layout 3x2 int16 image, no axis inversion (xScale > 0 → invertX
+    // false; yScale < 0 → invertY false since invertY = yScale > 0). Pixels
+    // start at offset 512: rows (1,2,3) and (4,5,6).
     let path = tmp("rhktest.sm3");
-    let mut data = fixed_offset_rhk_header().into_bytes();
+    let mut data = rhk_text_header(3, 2, "1.0", "-1.0").to_vec();
     data.extend_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
     std::fs::write(&path, data).unwrap();
     let mut reader = bioformats::formats::spm::RhkReader::new();
     reader.set_id(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 3);
+    assert_eq!(reader.metadata().size_y, 2);
     assert_eq!(
         reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
         vec![2, 0, 3, 0, 5, 0, 6, 0]
+    );
+
+    // With invertX (xScale < 0) the stored plane is mirrored horizontally
+    // before cropping: row0 becomes (3,2,1), row1 (6,5,4). Region (1,0,2,2)
+    // then yields cols 1,2 of each mirrored row → (2,1) and (5,4).
+    let path_inv = tmp("rhktest_invx.sm3");
+    let mut data_inv = rhk_text_header(3, 2, "-1.0", "-1.0").to_vec();
+    data_inv.extend_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
+    std::fs::write(&path_inv, data_inv).unwrap();
+    let mut reader = bioformats::formats::spm::RhkReader::new();
+    reader.set_id(&path_inv).unwrap();
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
+        vec![2, 0, 1, 0, 5, 0, 4, 0]
     );
 }
 

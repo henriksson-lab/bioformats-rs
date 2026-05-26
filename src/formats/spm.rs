@@ -270,20 +270,75 @@ fn unsupported_raw_spm(format_name: &str) -> BioFormatsError {
 
 /// RHK Technology SPM reader (`.sm2`, `.sm3`, `.sm4`).
 ///
-/// Attempts to parse a text header looking for dimension info. Falls back
-/// to raw uint16 square heuristic.
+/// Port of Bio-Formats `RHKReader.java`. The file begins with a 512-byte
+/// page header. There are two layouts:
+///
+///   * **XPM** (binary): the first little-endian `short` equals `0xaa`.
+///     Integer fields live at fixed offsets (image/page/data/line type at 40,
+///     `sizeX`/`sizeY` after them, then the pixel offset; float X/Y scales
+///     follow).
+///   * **text**: a space-separated ASCII record at offset 32 carries the same
+///     type codes and dimensions; pixels start at the fixed 512-byte boundary
+///     and the X/Y scales come from two further 32-byte axis records.
+///
+/// `dataType` selects the pixel type (0=float32, 1=int16, 2=int32, 3=uint8).
+/// In the text layout the X/Y scale signs drive `invertX`/`invertY`, which
+/// mirror the stored plane horizontally/vertically when reading pixels.
 pub struct RhkReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
+    pixel_offset: u64,
+    invert_x: bool,
+    invert_y: bool,
 }
 
 impl RhkReader {
+    const HEADER_SIZE: u64 = 512;
+
     pub fn new() -> Self {
         RhkReader {
             path: None,
             meta: None,
-            data_offset: 0,
+            pixel_offset: 0,
+            invert_x: false,
+            invert_y: false,
+        }
+    }
+
+    fn read_i32_le(data: &[u8], offset: usize, label: &str) -> Result<i32> {
+        let bytes = data.get(offset..offset + 4).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!("RHK SPM header missing {label}"))
+        })?;
+        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_f32_le(data: &[u8], offset: usize, label: &str) -> Result<f32> {
+        let bytes = data.get(offset..offset + 4).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!("RHK SPM header missing {label}"))
+        })?;
+        Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// Read a fixed-width ASCII record (Java `readString(len).trim()`).
+    fn read_string(data: &[u8], offset: usize, len: usize) -> String {
+        let end = (offset + len).min(data.len());
+        let slice = data.get(offset..end).unwrap_or(&[]);
+        // Stop at the first NUL like Java's String construction over the bytes,
+        // then trim surrounding whitespace.
+        let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+        String::from_utf8_lossy(&slice[..nul]).trim().to_string()
+    }
+
+    /// Map RHK dataType code → (PixelType, bits-per-pixel).
+    fn pixel_type_from_data_type(data_type: i32) -> Result<(PixelType, u8)> {
+        match data_type {
+            0 => Ok((PixelType::Float32, 32)),
+            1 => Ok((PixelType::Int16, 16)),
+            2 => Ok((PixelType::Int32, 32)),
+            3 => Ok((PixelType::Uint8, 8)),
+            other => Err(BioFormatsError::UnsupportedFormat(format!(
+                "RHK SPM unsupported data type: {other}"
+            ))),
         }
     }
 }
@@ -308,71 +363,129 @@ impl FormatReader for RhkReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file_size = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < Self::HEADER_SIZE as usize {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "RHK SPM file is shorter than the 512-byte page header".into(),
+            ));
+        }
 
-        // Read first 1024 bytes and try to parse as text header
-        let read_len = (file_size as usize).min(1024);
-        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        let mut hdr_buf = vec![0u8; read_len];
-        f.read_exact(&mut hdr_buf).map_err(BioFormatsError::Io)?;
+        // Java: little-endian; xpm = (readShort() == 0xaa).
+        let first_short = i16::from_le_bytes([data[0], data[1]]);
+        let xpm = first_short == 0xaa;
 
-        let text = String::from_utf8_lossy(&hdr_buf);
+        let mut width: u32;
+        let mut height: u32;
+        let pixel_offset: u64;
+        let data_type: i32;
+        let mut invert_x = false;
+        let mut invert_y = false;
+        let x_scale: f64;
+        let y_scale: f64;
 
-        let mut width: u32 = 0;
-        let mut height: u32 = 0;
-        let mut data_off: u64 = 0;
+        if xpm {
+            // seek(40): imageType, pageType, dataType, lineType ints.
+            let _image_type = Self::read_i32_le(&data, 40, "image type")?;
+            let _page_type = Self::read_i32_le(&data, 44, "page type")?;
+            data_type = Self::read_i32_le(&data, 48, "data type")?;
+            let _line_type = Self::read_i32_le(&data, 52, "line type")?;
+            // skipBytes(8) → offset 56..64.
+            width = Self::read_i32_le(&data, 64, "width")? as u32;
+            height = Self::read_i32_le(&data, 68, "height")? as u32;
+            // skipBytes(16) → offset 72..88.
+            pixel_offset = Self::read_i32_le(&data, 88, "pixel offset")? as u32 as u64;
+            // After the int read, the stream is at offset 92; skipBytes(8) → 100.
+            x_scale = Self::read_f32_le(&data, 100, "x scale")? as f64 * 1_000_000.0;
+            y_scale = Self::read_f32_le(&data, 104, "y scale")? as f64 * 1_000_000.0;
+        } else {
+            // seek(32): 32-byte space-separated ASCII type/dimension record.
+            let type_record = Self::read_string(&data, 32, 32);
+            let type_data: Vec<&str> = type_record.split_whitespace().collect();
+            let parse = |idx: usize, label: &str| -> Result<i32> {
+                type_data
+                    .get(idx)
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .ok_or_else(|| {
+                        BioFormatsError::UnsupportedFormat(format!(
+                            "RHK SPM text header missing {label}"
+                        ))
+                    })
+            };
+            let _image_type = parse(0, "image type")?;
+            data_type = parse(1, "data type")?;
+            let _line_type = parse(2, "line type")?;
+            width = parse(3, "width")? as u32;
+            height = parse(4, "height")? as u32;
+            let _page_type = parse(6, "page type")?;
+            pixel_offset = Self::HEADER_SIZE;
 
-        // RHK SM2/SM3 may have text header lines with key=value pairs
-        for line in text.lines() {
-            let line_lower = line.to_ascii_lowercase();
-            if line_lower.contains("x_size")
-                || line_lower.contains("xsize")
-                || line_lower.contains("x size")
-                || line_lower.contains("columns")
-            {
-                if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(w) = val.parse::<u32>() {
-                        width = w;
-                    }
-                }
-            } else if line_lower.contains("y_size")
-                || line_lower.contains("ysize")
-                || line_lower.contains("y size")
-                || line_lower.contains("rows")
-            {
-                if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(h) = val.parse::<u32>() {
-                        height = h;
-                    }
-                }
-            } else if line_lower.contains("data offset") || line_lower.contains("header size") {
-                if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(off) = val.parse::<u64>() {
-                        data_off = off;
-                    }
-                }
-            }
+            // Two further 32-byte axis records (X then Y); field [1] is the scale.
+            let x_axis = Self::read_string(&data, 64, 32);
+            let y_axis = Self::read_string(&data, 96, 32);
+            let x_axis_fields: Vec<&str> = x_axis.split_whitespace().collect();
+            let y_axis_fields: Vec<&str> = y_axis.split_whitespace().collect();
+            let x_raw = x_axis_fields
+                .get(1)
+                .and_then(|v| v.parse::<f64>().ok())
+                .ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat("RHK SPM text header missing X scale".into())
+                })?;
+            let y_raw = y_axis_fields
+                .get(1)
+                .and_then(|v| v.parse::<f64>().ok())
+                .ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat("RHK SPM text header missing Y scale".into())
+                })?;
+            x_scale = x_raw * 1_000_000.0;
+            y_scale = y_raw * 1_000_000.0;
+            invert_x = x_scale < 0.0;
+            invert_y = y_scale > 0.0;
         }
 
         if width == 0 || height == 0 {
             return Err(BioFormatsError::UnsupportedFormat(
-                "RHK SPM header missing image dimensions".into(),
+                "RHK SPM header contains invalid image dimensions".into(),
             ));
         }
-        let expected = data_off
+        let _ = (&mut width, &mut height);
+
+        let (pixel_type, bits_per_pixel) = Self::pixel_type_from_data_type(data_type)?;
+        let bps = pixel_type.bytes_per_sample() as u64;
+        let expected = pixel_offset
             .checked_add(
                 (width as u64)
-                    .saturating_mul(height as u64)
-                    .saturating_mul(2),
+                    .checked_mul(height as u64)
+                    .and_then(|p| p.checked_mul(bps))
+                    .ok_or_else(|| BioFormatsError::Format("RHK SPM plane size overflows".into()))?,
             )
             .ok_or_else(|| BioFormatsError::Format("RHK SPM plane size overflows".into()))?;
-        if expected > file_size {
+        if expected > data.len() as u64 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "RHK SPM pixel payload is shorter than declared dimensions".into(),
             ));
         }
 
-        self.data_offset = data_off;
+        // seek(352): 32-byte description string.
+        let description = Self::read_string(&data, 352, 32);
+        let mut series_metadata = HashMap::new();
+        if !description.is_empty() {
+            series_metadata.insert(
+                "Description".into(),
+                crate::common::metadata::MetadataValue::String(description),
+            );
+        }
+        series_metadata.insert(
+            "X scale (um)".into(),
+            crate::common::metadata::MetadataValue::Float(x_scale),
+        );
+        series_metadata.insert(
+            "Y scale (um)".into(),
+            crate::common::metadata::MetadataValue::Float(y_scale),
+        );
+
+        self.pixel_offset = pixel_offset;
+        self.invert_x = invert_x;
+        self.invert_y = invert_y;
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x: width,
@@ -380,8 +493,8 @@ impl FormatReader for RhkReader {
             size_z: 1,
             size_c: 1,
             size_t: 1,
-            pixel_type: PixelType::Uint16,
-            bits_per_pixel: 16,
+            pixel_type,
+            bits_per_pixel,
             image_count: 1,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -389,7 +502,7 @@ impl FormatReader for RhkReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
-            series_metadata: HashMap::new(),
+            series_metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
@@ -401,7 +514,9 @@ impl FormatReader for RhkReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.data_offset = 0;
+        self.pixel_offset = 0;
+        self.invert_x = false;
+        self.invert_y = false;
         Ok(())
     }
 
@@ -430,22 +545,15 @@ impl FormatReader for RhkReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        let (sx, sy) = (meta.size_x, meta.size_y);
+        self.open_bytes_region(plane_index, 0, 0, sx, sy)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
@@ -457,8 +565,48 @@ impl FormatReader for RhkReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let full = self.open_bytes(plane_index)?;
-        crop_full_plane("RHK SPM", &full, &meta, 1, _x, _y, w, h)
+        let bps = meta.pixel_type.bytes_per_sample();
+        let sx = meta.size_x as usize;
+        let sy = meta.size_y as usize;
+        let n_bytes = sx
+            .checked_mul(sy)
+            .and_then(|p| p.checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::Format("RHK SPM plane size overflows".into()))?;
+
+        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.pixel_offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut plane = vec![0u8; n_bytes];
+        f.read_exact(&mut plane).map_err(BioFormatsError::Io)?;
+
+        // RHKReader.java reads pixels from the mirrored corner and then flips
+        // the returned tile. Mirroring the whole stored plane (per axis) before
+        // cropping at (x,y,w,h) is equivalent and reuses the crop helper.
+        let row_len = sx * bps;
+        if self.invert_y {
+            for row in 0..sy / 2 {
+                let top = row * row_len;
+                let bottom = (sy - row - 1) * row_len;
+                for i in 0..row_len {
+                    plane.swap(top + i, bottom + i);
+                }
+            }
+        }
+        if self.invert_x {
+            for row in 0..sy {
+                let base = row * row_len;
+                for col in 0..sx / 2 {
+                    let left = base + col * bps;
+                    let right = base + (sx - col - 1) * bps;
+                    for i in 0..bps {
+                        plane.swap(left + i, right + i);
+                    }
+                }
+            }
+        }
+
+        crop_full_plane("RHK SPM", &plane, &meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

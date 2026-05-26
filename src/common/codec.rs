@@ -78,6 +78,51 @@ pub fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
     zstd::decode_all(data).map_err(BioFormatsError::Io)
 }
 
+/// Decode an in-memory PNG payload to interleaved raw pixel bytes.
+///
+/// Mirrors the Java cellSens `APNGReader` path used for ETS PNG tiles
+/// (CellSensReader.java:1198-1210). Pixel bytes are returned little-endian and
+/// channel-interleaved (e.g. RGBRGB...), matching what the ETS tile-stitcher
+/// expects. 16-bit channels are emitted as 2 little-endian bytes per sample.
+pub fn decompress_png(data: &[u8]) -> Result<Vec<u8>> {
+    decode_image_memory(data, image::ImageFormat::Png)
+}
+
+/// Decode an in-memory BMP payload to interleaved raw pixel bytes.
+///
+/// Mirrors the Java cellSens `BMPReader` path used for ETS BMP tiles
+/// (CellSensReader.java:1201-1210). See [`decompress_png`] for the output byte
+/// layout.
+pub fn decompress_bmp(data: &[u8]) -> Result<Vec<u8>> {
+    decode_image_memory(data, image::ImageFormat::Bmp)
+}
+
+/// Decode an in-memory image payload of a known format to interleaved raw pixel
+/// bytes (little-endian). Shared backend for [`decompress_png`]/[`decompress_bmp`].
+fn decode_image_memory(data: &[u8], format: image::ImageFormat) -> Result<Vec<u8>> {
+    let img = image::load_from_memory_with_format(data, format)
+        .map_err(|e| BioFormatsError::Codec(e.to_string()))?;
+    Ok(match img {
+        image::DynamicImage::ImageLuma8(b) => b.into_raw(),
+        image::DynamicImage::ImageLumaA8(b) => b.into_raw(),
+        image::DynamicImage::ImageRgb8(b) => b.into_raw(),
+        image::DynamicImage::ImageRgba8(b) => b.into_raw(),
+        image::DynamicImage::ImageLuma16(b) => {
+            b.into_raw().iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        image::DynamicImage::ImageLumaA16(b) => {
+            b.into_raw().iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        image::DynamicImage::ImageRgb16(b) => {
+            b.into_raw().iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        image::DynamicImage::ImageRgba16(b) => {
+            b.into_raw().iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        other => other.to_rgb8().into_raw(),
+    })
+}
+
 /// Decompress JPEG 2000 data (JP2 or J2K codestream).
 pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
     use jpeg2k::Image as J2kImage;
@@ -1741,6 +1786,445 @@ pub fn undo_horizontal_differencing_u16(data: &mut [u16], samples_per_pixel: usi
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Cinepak ("cvid") video codec
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One Cinepak codebook (256 entries). Each entry holds a decoded 4x4 block's
+/// four corner colors as RGB (V4) or the single replicated color (V1).
+#[derive(Clone)]
+struct CinepakCodebook {
+    /// Per-entry RGB for the four sub-quadrants: [tl, tr, bl, br], each [r,g,b].
+    entries: Vec<[[u8; 3]; 4]>,
+}
+
+impl CinepakCodebook {
+    fn new() -> Self {
+        CinepakCodebook {
+            entries: vec![[[0u8; 3]; 4]; 256],
+        }
+    }
+}
+
+#[inline]
+fn cinepak_yuv_to_rgb(y: u8, u: i8, v: i8) -> [u8; 3] {
+    // YUV -> RGB per the FFmpeg/Bio-Formats Cinepak convention.
+    let y = y as i32;
+    let u = u as i32;
+    let v = v as i32;
+    let r = (y + (v * 2)).clamp(0, 255) as u8;
+    let g = (y - (u / 2) - v).clamp(0, 255) as u8;
+    let b = (y + (u * 2)).clamp(0, 255) as u8;
+    [r, g, b]
+}
+
+#[inline]
+fn rd_be_u16(data: &[u8], i: usize) -> Result<u16> {
+    data.get(i..i + 2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        .ok_or_else(|| BioFormatsError::Codec("Cinepak: truncated stream".into()))
+}
+
+/// Decode a codebook chunk. `is_v4` selects 6-byte (luma+chroma) entries; when
+/// `grayscale` only the 4 luma bytes are present (V1 uses 6 or 4 likewise).
+/// `detail` (0x2200/0x2300) chunks update only entries flagged in a bit vector.
+fn cinepak_read_codebook(
+    book: &mut CinepakCodebook,
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    grayscale: bool,
+    detail: bool,
+) -> Result<()> {
+    let entry_size = if grayscale { 4 } else { 6 };
+    let mut index = 0usize;
+    let mut flag = 0u32;
+    let mut flag_bits = 0u32;
+    while index < 256 && pos < end {
+        let update = if detail {
+            if flag_bits == 0 {
+                if pos + 4 > end {
+                    break;
+                }
+                flag = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                pos += 4;
+                flag_bits = 32;
+            }
+            flag_bits -= 1;
+            (flag >> flag_bits) & 1 == 1
+        } else {
+            true
+        };
+
+        if update {
+            if pos + entry_size > end {
+                break;
+            }
+            let y = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
+            let (u, v) = if grayscale {
+                (0i8, 0i8)
+            } else {
+                (data[pos + 4] as i8, data[pos + 5] as i8)
+            };
+            pos += entry_size;
+            book.entries[index] = [
+                cinepak_yuv_to_rgb(y[0], u, v),
+                cinepak_yuv_to_rgb(y[1], u, v),
+                cinepak_yuv_to_rgb(y[2], u, v),
+                cinepak_yuv_to_rgb(y[3], u, v),
+            ];
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+/// Write a single 4x4 macroblock from a V1 codebook entry (one color upscaled
+/// to the four 2x2 quadrants). `mb_x`,`mb_y` are pixel coordinates of the top-
+/// left corner.
+#[allow(clippy::too_many_arguments)]
+fn cinepak_put_v1(
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    mb_x: usize,
+    mb_y: usize,
+    e: &[[u8; 3]; 4],
+) {
+    // V1: each of the four codebook colors fills a 2x2 quadrant.
+    for q in 0..4 {
+        let (qx, qy) = ((q & 1) * 2, (q >> 1) * 2);
+        let rgb = e[q];
+        for dy in 0..2usize {
+            for dx in 0..2usize {
+                cinepak_set_pixel(out, width, height, channels, mb_x + qx + dx, mb_y + qy + dy, rgb);
+            }
+        }
+    }
+}
+
+/// Write a single 4x4 macroblock from a V4 codebook entry (each color maps to
+/// one 2x2 quadrant, no upscaling).
+#[allow(clippy::too_many_arguments)]
+fn cinepak_put_v4(
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    mb_x: usize,
+    mb_y: usize,
+    e0: &[[u8; 3]; 4],
+    e1: &[[u8; 3]; 4],
+    e2: &[[u8; 3]; 4],
+    e3: &[[u8; 3]; 4],
+) {
+    // V4: four codebook entries, one per 2x2 quadrant; within each quadrant the
+    // four corner colors map to the four pixels.
+    let books = [e0, e1, e2, e3];
+    for q in 0..4 {
+        let (qx, qy) = ((q & 1) * 2, (q >> 1) * 2);
+        let e = books[q];
+        cinepak_set_pixel(out, width, height, channels, mb_x + qx, mb_y + qy, e[0]);
+        cinepak_set_pixel(out, width, height, channels, mb_x + qx + 1, mb_y + qy, e[1]);
+        cinepak_set_pixel(out, width, height, channels, mb_x + qx, mb_y + qy + 1, e[2]);
+        cinepak_set_pixel(out, width, height, channels, mb_x + qx + 1, mb_y + qy + 1, e[3]);
+    }
+}
+
+#[inline]
+fn cinepak_set_pixel(
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    x: usize,
+    y: usize,
+    rgb: [u8; 3],
+) {
+    if x >= width || y >= height {
+        return;
+    }
+    let off = (y * width + x) * channels;
+    if channels == 1 {
+        if off < out.len() {
+            out[off] = rgb[0];
+        }
+    } else if off + 2 < out.len() {
+        out[off] = rgb[0];
+        out[off + 1] = rgb[1];
+        out[off + 2] = rgb[2];
+    }
+}
+
+/// Decode a Cinepak ("cvid") compressed frame.
+///
+/// Ported to match the Bio-Formats `CinepakCodec` algorithm (strip / macroblock
+/// structure with V1 and V4 codebooks of 4x4 blocks). `bpp` is the source bits
+/// per pixel (8 -> single-channel grayscale output, otherwise 24-bit RGB).
+/// `prev` is the previously decoded frame (same layout) used for inter-coded
+/// strips; pass an empty slice for keyframes.
+pub fn decompress_cinepak(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    bpp: u32,
+    prev: &[u8],
+) -> Result<Vec<u8>> {
+    let width = width as usize;
+    let height = height as usize;
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::InvalidData(
+            "Cinepak: width and height must be non-zero".into(),
+        ));
+    }
+    let grayscale = bpp == 8;
+    let channels = if grayscale { 1 } else { 3 };
+    let output_len = checked_video_output_len("Cinepak", width, height, channels)?;
+
+    let mut out = vec![0u8; output_len];
+    if prev.len() == output_len {
+        out.copy_from_slice(prev);
+    }
+
+    if data.len() < 10 {
+        return Err(BioFormatsError::Codec("Cinepak: frame header too short".into()));
+    }
+    // Frame header: flags(1), length(3), width(2 BE), height(2 BE), strips(2 BE).
+    let num_strips = rd_be_u16(data, 8)? as usize;
+    let mut pos = 10usize;
+
+    // Per-strip codebooks persist across strips within a frame.
+    let mut v1 = CinepakCodebook::new();
+    let mut v4 = CinepakCodebook::new();
+
+    let mut strip_y0 = 0usize;
+    for _ in 0..num_strips {
+        if pos + 12 > data.len() {
+            break;
+        }
+        let _strip_id = rd_be_u16(data, pos)?;
+        let strip_size = rd_be_u16(data, pos + 2)? as usize;
+        let top = rd_be_u16(data, pos + 4)? as usize;
+        let _left = rd_be_u16(data, pos + 6)? as usize;
+        let bottom = rd_be_u16(data, pos + 8)? as usize;
+        let _right = rd_be_u16(data, pos + 10)? as usize;
+        let strip_data_start = pos + 12;
+        let strip_end = (pos + strip_size).min(data.len()).max(strip_data_start);
+        pos = strip_data_start;
+
+        // Strip vertical bounds: some encoders store absolute, others relative.
+        let strip_top = if bottom > top { top } else { strip_y0 };
+        let strip_bottom = if bottom > top {
+            bottom
+        } else {
+            (strip_y0 + (bottom)).max(strip_y0)
+        };
+        let _ = strip_bottom;
+
+        // Decode the chunks inside this strip.
+        cinepak_decode_strip(
+            &mut out, width, height, channels, prev, grayscale, &mut v1, &mut v4, data, pos,
+            strip_end, strip_top,
+        )?;
+
+        strip_y0 = strip_top
+            + {
+                // advance by the strip height (in macroblocks * 4)
+                let h = bottom.saturating_sub(top);
+                if h > 0 {
+                    h
+                } else {
+                    0
+                }
+            };
+        pos = strip_end;
+    }
+
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cinepak_decode_strip(
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    prev: &[u8],
+    grayscale: bool,
+    v1: &mut CinepakCodebook,
+    v4: &mut CinepakCodebook,
+    data: &[u8],
+    mut pos: usize,
+    strip_end: usize,
+    strip_top: usize,
+) -> Result<()> {
+    let mb_per_row = width.div_ceil(4);
+    while pos + 4 <= strip_end {
+        let chunk_id = rd_be_u16(data, pos)?;
+        let chunk_size = rd_be_u16(data, pos + 2)? as usize;
+        let chunk_data = pos + 4;
+        let chunk_end = (pos + chunk_size).min(strip_end).max(chunk_data);
+        pos = chunk_end;
+
+        match chunk_id {
+            // V4 codebook
+            0x2000 => cinepak_read_codebook(v4, data, chunk_data, chunk_end, grayscale, false)?,
+            0x2200 => cinepak_read_codebook(v4, data, chunk_data, chunk_end, grayscale, true)?,
+            // V1 codebook
+            0x2100 => cinepak_read_codebook(v1, data, chunk_data, chunk_end, grayscale, false)?,
+            0x2300 => cinepak_read_codebook(v1, data, chunk_data, chunk_end, grayscale, true)?,
+            // Intra-coded vectors (0x3000) and inter-coded (0x3100).
+            0x3000 | 0x3100 => {
+                let inter = chunk_id == 0x3100;
+                cinepak_decode_vectors(
+                    out, width, height, channels, prev, v1, v4, data, chunk_data, chunk_end,
+                    strip_top, mb_per_row, inter,
+                )?;
+            }
+            // V1-only vectors (no selector flags).
+            0x3200 => {
+                cinepak_decode_v1_only(
+                    out, width, height, channels, v1, data, chunk_data, chunk_end, strip_top,
+                    mb_per_row,
+                )?;
+            }
+            _ => {
+                // Unknown chunk: skip.
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cinepak_decode_vectors(
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    prev: &[u8],
+    v1: &CinepakCodebook,
+    v4: &CinepakCodebook,
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    strip_top: usize,
+    mb_per_row: usize,
+    inter: bool,
+) -> Result<()> {
+    // Macroblock rows remaining from the strip top to the bottom of the image.
+    let strip_mb_rows = height.saturating_sub(strip_top).div_ceil(4).max(1);
+    let mut mb_index = 0usize;
+    let total_mb = mb_per_row * strip_mb_rows;
+
+    let mut flag = 0u32;
+    let mut flag_bits = 0u32;
+    let mut next_flag = |pos: &mut usize| -> Option<bool> {
+        if flag_bits == 0 {
+            if *pos + 4 > end {
+                return None;
+            }
+            flag = u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            *pos += 4;
+            flag_bits = 32;
+        }
+        flag_bits -= 1;
+        Some((flag >> flag_bits) & 1 == 1)
+    };
+
+    while pos < end && mb_index < total_mb {
+        let mb_x = (mb_index % mb_per_row) * 4;
+        let mb_y = strip_top + (mb_index / mb_per_row) * 4;
+        if mb_y >= height {
+            break;
+        }
+
+        // For inter frames, a top-level flag says whether this MB is coded.
+        let coded = if inter {
+            match next_flag(&mut pos) {
+                Some(b) => b,
+                None => break,
+            }
+        } else {
+            true
+        };
+
+        if !coded {
+            // copy from previous frame (already pre-filled in `out`)
+            let _ = prev;
+            mb_index += 1;
+            continue;
+        }
+
+        // V1 vs V4 selector flag.
+        let is_v4 = match next_flag(&mut pos) {
+            Some(b) => b,
+            None => break,
+        };
+
+        if is_v4 {
+            if pos + 4 > end {
+                break;
+            }
+            let i0 = data[pos] as usize;
+            let i1 = data[pos + 1] as usize;
+            let i2 = data[pos + 2] as usize;
+            let i3 = data[pos + 3] as usize;
+            pos += 4;
+            cinepak_put_v4(
+                out,
+                width,
+                height,
+                channels,
+                mb_x,
+                mb_y,
+                &v4.entries[i0],
+                &v4.entries[i1],
+                &v4.entries[i2],
+                &v4.entries[i3],
+            );
+        } else {
+            if pos >= end {
+                break;
+            }
+            let i = data[pos] as usize;
+            pos += 1;
+            cinepak_put_v1(out, width, height, channels, mb_x, mb_y, &v1.entries[i]);
+        }
+        mb_index += 1;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cinepak_decode_v1_only(
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    v1: &CinepakCodebook,
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    strip_top: usize,
+    mb_per_row: usize,
+) -> Result<()> {
+    let mut mb_index = 0usize;
+    while pos < end {
+        let mb_x = (mb_index % mb_per_row) * 4;
+        let mb_y = strip_top + (mb_index / mb_per_row) * 4;
+        if mb_y >= height {
+            break;
+        }
+        let i = data[pos] as usize;
+        pos += 1;
+        cinepak_put_v1(out, width, height, channels, mb_x, mb_y, &v1.entries[i]);
+        mb_index += 1;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2179,5 +2663,147 @@ mod tests {
                 if message.contains("output byte count overflows")
                     || message.contains("decoded frame is too large")
         ));
+    }
+
+    // ── Cinepak ──────────────────────────────────────────────────────────────
+
+    fn be16(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+
+    /// Build a single-strip Cinepak frame with the given chunk bodies.
+    fn cinepak_frame(width: u16, height: u16, chunks: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut strip_body = Vec::new();
+        for (id, body) in chunks {
+            strip_body.extend_from_slice(&be16(*id));
+            strip_body.extend_from_slice(&be16((body.len() + 4) as u16));
+            strip_body.extend_from_slice(body);
+        }
+        let strip_size = strip_body.len() + 12;
+        let mut frame = Vec::new();
+        frame.push(0x00); // flags (intra)
+        frame.extend_from_slice(&[0, 0, 0]); // length (unused by decoder)
+        frame.extend_from_slice(&be16(width));
+        frame.extend_from_slice(&be16(height));
+        frame.extend_from_slice(&be16(1)); // num strips
+                                           // strip header
+        frame.extend_from_slice(&be16(0x1000)); // intra strip id
+        frame.extend_from_slice(&be16(strip_size as u16));
+        frame.extend_from_slice(&be16(0)); // y0
+        frame.extend_from_slice(&be16(0)); // x0
+        frame.extend_from_slice(&be16(height)); // y1
+        frame.extend_from_slice(&be16(width)); // x1
+        frame.extend_from_slice(&strip_body);
+        frame
+    }
+
+    #[test]
+    fn cinepak_v1_grayscale_block_upscales_quadrants() {
+        // One 4x4 grayscale block from V1 codebook entry 0 (Y = 10,20,30,40).
+        let v1 = vec![10u8, 20, 30, 40]; // grayscale entry (4 bytes)
+        let vectors = vec![0u8]; // one block, index 0
+        let frame = cinepak_frame(4, 4, &[(0x2100, v1), (0x3200, vectors)]);
+
+        let out = decompress_cinepak(&frame, 4, 4, 8, &[]).expect("decode");
+        assert_eq!(out.len(), 16);
+        // Expected: TL quadrant=10, TR=20, BL=30, BR=40, each 2x2.
+        let px = |x: usize, y: usize| out[y * 4 + x];
+        for y in 0..2 {
+            for x in 0..2 {
+                assert_eq!(px(x, y), 10, "TL");
+                assert_eq!(px(x + 2, y), 20, "TR");
+                assert_eq!(px(x, y + 2), 30, "BL");
+                assert_eq!(px(x + 2, y + 2), 40, "BR");
+            }
+        }
+    }
+
+    #[test]
+    fn cinepak_v4_rgb_block_maps_four_codebook_entries() {
+        // V4 codebook entries 0..4, each a flat luma so RGB is grayscale-ish.
+        // entry i: Y all = (i+1)*30, U=V=0 -> R=G=B=(i+1)*30.
+        let mut v4 = Vec::new();
+        for i in 0..4u8 {
+            let y = (i + 1) * 30;
+            v4.extend_from_slice(&[y, y, y, y, 0, 0]); // 6-byte color entry
+        }
+        // intra vectors chunk (0x3000): selector flag word + one MB using V4.
+        // flag word: first bit (MSB) = 1 -> V4 for the single macroblock.
+        let mut vectors = Vec::new();
+        vectors.extend_from_slice(&[0x80, 0x00, 0x00, 0x00]); // 32-bit flags, top bit set
+        vectors.extend_from_slice(&[0, 1, 2, 3]); // four V4 indices
+        let frame = cinepak_frame(4, 4, &[(0x2000, v4), (0x3000, vectors)]);
+
+        let out = decompress_cinepak(&frame, 4, 4, 24, &[]).expect("decode");
+        assert_eq!(out.len(), 4 * 4 * 3);
+        // Quadrant q uses entry q -> color (q+1)*30 across its 2x2 area.
+        let px = |x: usize, y: usize| out[(y * 4 + x) * 3];
+        assert_eq!(px(0, 0), 30); // entry 0 quadrant TL
+        assert_eq!(px(2, 0), 60); // entry 1 quadrant TR
+        assert_eq!(px(0, 2), 90); // entry 2 quadrant BL
+        assert_eq!(px(2, 2), 120); // entry 3 quadrant BR
+    }
+
+    #[test]
+    fn cinepak_rejects_zero_dimensions() {
+        let err = decompress_cinepak(&[0u8; 10], 0, 4, 24, &[])
+            .expect_err("zero width must fail");
+        assert!(matches!(err, BioFormatsError::InvalidData(_)));
+    }
+
+    #[test]
+    fn cinepak_inter_frame_copies_previous_when_uncoded() {
+        // Build a previous frame (solid 50 grayscale 4x4).
+        let prev = vec![50u8; 16];
+        // Inter strip with a 0x3100 chunk whose single MB is flagged uncoded.
+        // flags: top-level coded bit = 0 for the one MB -> copy from prev.
+        let mut vectors = Vec::new();
+        vectors.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // all flags 0
+        let mut frame = cinepak_frame(4, 4, &[(0x3100, vectors)]);
+        // mark the strip as inter-coded (0x1100)
+        frame[10] = 0x11;
+
+        let out = decompress_cinepak(&frame, 4, 4, 8, &prev).expect("decode");
+        assert_eq!(out, prev, "uncoded inter MB should copy previous frame");
+    }
+
+    /// Encode an RGB8 image to the given format in memory.
+    fn encode_rgb(pixels: &[u8], w: u32, h: u32, format: image::ImageFormat) -> Vec<u8> {
+        let img = image::RgbImage::from_raw(w, h, pixels.to_vec()).expect("rgb image");
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, format)
+            .expect("encode");
+        buf.into_inner()
+    }
+
+    #[test]
+    fn png_tile_decodes_to_interleaved_rgb() {
+        // 2x2 RGB image with distinct pixels.
+        let pixels = vec![
+            10, 20, 30, // (0,0)
+            40, 50, 60, // (1,0)
+            70, 80, 90, // (0,1)
+            100, 110, 120, // (1,1)
+        ];
+        let encoded = encode_rgb(&pixels, 2, 2, image::ImageFormat::Png);
+        let out = decompress_png(&encoded).expect("PNG decode");
+        assert_eq!(out, pixels, "PNG tile must decode to interleaved RGB bytes");
+    }
+
+    #[test]
+    fn bmp_tile_decodes_to_interleaved_rgb() {
+        let pixels = vec![
+            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120,
+        ];
+        let encoded = encode_rgb(&pixels, 2, 2, image::ImageFormat::Bmp);
+        let out = decompress_bmp(&encoded).expect("BMP decode");
+        assert_eq!(out, pixels, "BMP tile must decode to interleaved RGB bytes");
+    }
+
+    #[test]
+    fn png_decode_rejects_garbage() {
+        let err = decompress_png(&[0u8; 16]).expect_err("garbage must fail");
+        assert!(matches!(err, BioFormatsError::Codec(_)));
     }
 }

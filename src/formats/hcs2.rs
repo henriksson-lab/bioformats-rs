@@ -166,12 +166,55 @@ tiff_wrapper! {
 // pixel I/O to TiffReader)
 // ===========================================================================
 
-/// Reference to a single image plane: which TIFF file holds it, and which
-/// IFD/sub-image within that file (`file_index`, usually 0).
+/// Placement of one source tile within a reconstructed (stitched/montaged)
+/// plane. The tile is read from `filename` (IFD `file_index`); a sub-rectangle
+/// of the source `(src_x, src_y, src_w, src_h)` is copied into the destination
+/// plane at offset `(dst_x, dst_y)`.
+///
+/// For a plain 1:1 plane there is a single `Tile` with `dst_x = dst_y = 0`,
+/// `src_x = src_y = 0` and `src_w/src_h` set to the source dimensions (or 0,
+/// meaning "use the whole source plane").
+#[derive(Clone)]
+struct Tile {
+    filename: PathBuf,
+    file_index: u32,
+    /// Sub-rectangle within the source TIFF plane. `src_w == 0 || src_h == 0`
+    /// means "use the whole source plane" (the common 1:1 case).
+    src_x: u32,
+    src_y: u32,
+    src_w: u32,
+    src_h: u32,
+    /// Destination offset within the reconstructed plane.
+    dst_x: u32,
+    dst_y: u32,
+}
+
+/// Reference to a single image plane: the set of source tiles that make it up.
+///
+/// Simple readers use exactly one whole-plane tile; CellVoyager (multi-tile
+/// area stitching) and BD Pathway (montage field splitting) use cropped /
+/// offset tiles.
 #[derive(Clone, Default)]
 struct PlaneRef {
-    filename: Option<PathBuf>,
-    file_index: u32,
+    tiles: Vec<Tile>,
+}
+
+impl PlaneRef {
+    /// A 1:1 plane backed by the whole source plane of `filename`.
+    fn whole(filename: PathBuf, file_index: u32) -> Self {
+        PlaneRef {
+            tiles: vec![Tile {
+                filename,
+                file_index,
+                src_x: 0,
+                src_y: 0,
+                src_w: 0,
+                src_h: 0,
+                dst_x: 0,
+                dst_y: 0,
+            }],
+        }
+    }
 }
 
 /// Compute the plane index for (z, c, t) given dimension order and sizes.
@@ -287,32 +330,91 @@ impl HcsAssembly {
             .cloned()
             .unwrap_or_default();
 
-        let Some(file) = plane.filename else {
+        if plane.tiles.is_empty() {
             // Missing plane: return a blank (fill 0) buffer, like Java's Arrays.fill.
             return Ok(vec![0u8; nbytes]);
-        };
-        if !file.exists() {
-            return Ok(vec![0u8; nbytes]);
         }
-        if self.ensure_loaded(&file).is_err() {
-            return Ok(vec![0u8; nbytes]);
-        }
-        // file_index selects the IFD/sub-image within multi-image TIFFs.
-        match self.tiff_reader.open_bytes(plane.file_index) {
-            Ok(buf) => {
-                // Pad/truncate to the expected plane size so callers get a
-                // consistent buffer even when the backing TIFF is smaller.
-                if buf.len() == nbytes {
-                    Ok(buf)
-                } else {
-                    let mut out = vec![0u8; nbytes];
-                    let n = buf.len().min(nbytes);
-                    out[..n].copy_from_slice(&buf[..n]);
-                    Ok(out)
+
+        let bps = meta.pixel_type.bytes_per_sample();
+        let dst_w = meta.size_x as usize;
+        let dst_h = meta.size_y as usize;
+        let dst_row = dst_w * bps;
+
+        // Fast path: a single whole-plane tile placed at the origin (the common
+        // 1:1 case). Read the whole source plane and pad/truncate as before.
+        if plane.tiles.len() == 1 {
+            let t = &plane.tiles[0];
+            if t.dst_x == 0
+                && t.dst_y == 0
+                && t.src_x == 0
+                && t.src_y == 0
+                && t.src_w == 0
+                && t.src_h == 0
+            {
+                if !t.filename.exists() || self.ensure_loaded(&t.filename).is_err() {
+                    return Ok(vec![0u8; nbytes]);
+                }
+                match self.tiff_reader.open_bytes(t.file_index) {
+                    Ok(buf) => {
+                        if buf.len() == nbytes {
+                            return Ok(buf);
+                        }
+                        let mut out = vec![0u8; nbytes];
+                        let n = buf.len().min(nbytes);
+                        out[..n].copy_from_slice(&buf[..n]);
+                        return Ok(out);
+                    }
+                    Err(_) => return Ok(vec![0u8; nbytes]),
                 }
             }
-            Err(_) => Ok(vec![0u8; nbytes]),
         }
+
+        // General path: composite each tile's sub-rectangle into the plane.
+        let mut out = vec![0u8; nbytes];
+        for t in &plane.tiles {
+            if !t.filename.exists() || self.ensure_loaded(&t.filename).is_err() {
+                continue;
+            }
+            // Source region: explicit crop, or the whole source plane.
+            let (sx, sy, sw, sh) = if t.src_w == 0 || t.src_h == 0 {
+                let sm = self.tiff_reader.metadata();
+                (0, 0, sm.size_x, sm.size_y)
+            } else {
+                (t.src_x, t.src_y, t.src_w, t.src_h)
+            };
+            // Clip to the destination plane.
+            let dx = t.dst_x as usize;
+            let dy = t.dst_y as usize;
+            if dx >= dst_w || dy >= dst_h {
+                continue;
+            }
+            let copy_w = (sw as usize).min(dst_w - dx);
+            let copy_h = (sh as usize).min(dst_h - dy);
+            if copy_w == 0 || copy_h == 0 {
+                continue;
+            }
+            let region =
+                match self
+                    .tiff_reader
+                    .open_bytes_region(t.file_index, sx, sy, copy_w as u32, copy_h as u32)
+                {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+            let src_row = copy_w * bps;
+            for row in 0..copy_h {
+                let s = row * src_row;
+                if s + src_row > region.len() {
+                    break;
+                }
+                let d = (dy + row) * dst_row + dx * bps;
+                if d + src_row > out.len() {
+                    break;
+                }
+                out[d..d + src_row].copy_from_slice(&region[s..s + src_row]);
+            }
+        }
+        Ok(out)
     }
 
     fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
@@ -646,11 +748,10 @@ impl_assembled_reader!(
 
 /// Yokogawa CellVoyager HCS reader (`.mes`, `.mlf`, `MeasurementResult.xml`).
 ///
-/// Partial port of the upstream Java `CellVoyagerReader`. Parses
-/// `MeasurementResult.xml` for channel/well/field/timepoint geometry and maps
-/// each plane to its `Image/W#F###T####Z##C#.tif` file. The Java reader also
-/// stitches multiple tiles per field on the fly; that tile-stitch step is not
-/// yet implemented here (see module docs).
+/// Port of the upstream Java `CellVoyagerReader`. Parses
+/// `MeasurementResult.xml` for channel/well/field/timepoint geometry and
+/// stitches each area's `Image/W#F###T####Z##C#.tif` field tiles on the fly,
+/// pasting each tile at its computed pixel offset (see module docs).
 pub struct CellVoyagerReader {
     asm: HcsAssembly,
 }
@@ -1517,9 +1618,9 @@ mod operetta {
             asm_planes.push(
                 sp.iter()
                     .map(|p| match p {
-                        Some(p) => PlaneRef {
-                            filename: p.filename.clone(),
-                            file_index: 0,
+                        Some(p) => match p.filename.clone() {
+                            Some(f) => PlaneRef::whole(f, 0),
+                            None => PlaneRef::default(),
                         },
                         None => PlaneRef::default(),
                     })
@@ -1928,10 +2029,9 @@ mod columbus {
                                         order, size_z, size_c, size_t, z, c, t,
                                     ) as usize;
                                     if idx < n_planes {
-                                        sp[idx] = PlaneRef {
-                                            filename: p.file.clone(),
-                                            file_index: p.file_index,
-                                        };
+                                        if let Some(f) = p.file.clone() {
+                                            sp[idx] = PlaneRef::whole(f, p.file_index);
+                                        }
                                     }
                                 }
                             }
@@ -2270,11 +2370,34 @@ mod scanr {
         let mut next = 0usize;
         let mut last_list_index = 0usize;
 
+        // Sorted well-label keys (row letter, then numeric column), mirroring
+        // the Java `keys` array used to drop empty wells from `well_labels`.
+        let mut keys: Vec<String> = h.well_labels.keys().cloned().collect();
+        keys.sort_by(|s1, s2| {
+            let r1 = s1.chars().next().unwrap_or('\0');
+            let r2 = s2.chars().next().unwrap_or('\0');
+            if r1 != r2 {
+                return r1.cmp(&r2);
+            }
+            let c1: i32 = s1[1..].trim().parse().unwrap_or(0);
+            let c2: i32 = s2[1..].trim().parse().unwrap_or(0);
+            c1.cmp(&c2)
+        });
+
+        // Port of ScanrReader's skip-missing-wells loop. `well_numbers` is the
+        // mutable map series->wellNumber; entries for fully-empty wells are
+        // removed (skipMissingWells defaults to true), and `next` is NOT
+        // advanced past their blank slots so present wells compact forward.
+        let mut realpos_count = 0i32;
         for well in 0..n_wells {
+            let mut missing_well_files = 0i32;
             let well_index = h.well_numbers.get(&well).copied().unwrap_or(well + 1);
             let well_pos = block(well_index, "W");
+            let original_index = next;
+
             for pos in 0..n_pos {
                 let pos_pos = block(pos + 1, "P");
+                let pos_index = next;
                 for z in 0..n_slices {
                     let z_pos = block(z, "Z");
                     for t in 0..n_timepoints {
@@ -2301,10 +2424,57 @@ mod scanr {
                                     break;
                                 }
                             }
+                            // Java: increments missingWellFiles whenever the
+                            // whole well has produced nothing so far.
+                            if next == original_index {
+                                missing_well_files += 1;
+                            }
                         }
                     }
                 }
+                if pos_index != next {
+                    realpos_count += 1;
+                }
             }
+            // Drop empty well label (matches keys[] removal in Java).
+            if next == original_index && (well as usize) < keys.len() {
+                h.well_labels.remove(&keys[well as usize]);
+            }
+            // Fully-empty well: skip it (default), compacting later wells.
+            if next == original_index
+                && missing_well_files == n_slices * n_timepoints * n_channels * n_pos
+            {
+                h.well_numbers.remove(&well);
+            }
+        }
+        let mut n_wells = h.well_numbers.len() as i32;
+
+        // Recompute plate dimensions if labels were dropped (Java block).
+        if !h.well_labels.is_empty() && h.well_labels.len() as i32 != n_wells {
+            let mut urows: Vec<String> = Vec::new();
+            let mut ucols: Vec<String> = Vec::new();
+            for w in h.well_labels.keys() {
+                if !w.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
+                    continue;
+                }
+                let row = w[..1].trim().to_string();
+                let col = w[1..].trim().to_string();
+                if !row.is_empty() && !urows.contains(&row) {
+                    urows.push(row);
+                }
+                if !col.is_empty() && !ucols.contains(&col) {
+                    ucols.push(col);
+                }
+            }
+            n_wells = (urows.len() * ucols.len()) as i32;
+            let (c, r) = adjust_well_dims(n_wells as usize);
+            well_columns = c;
+            well_rows = r;
+        }
+
+        let mut n_pos = n_pos;
+        if realpos_count < n_pos {
+            n_pos = realpos_count;
         }
 
         let mut size_x = 1u32;
@@ -2349,14 +2519,13 @@ mod scanr {
                 "Olympus ScanR",
             ));
             // tiffs layout: index = series * image_count + plane (per Java openBytes).
+            // tiffs is compacted by the skip-missing-wells loop above, so series
+            // indices map only onto wells/positions that actually have data.
             let mut sp = vec![PlaneRef::default(); image_count];
             for plane in 0..image_count {
                 let idx = s * image_count + plane;
                 if let Some(Some(f)) = tiffs.get(idx) {
-                    sp[plane] = PlaneRef {
-                        filename: Some(f.clone()),
-                        file_index: 0,
-                    };
+                    sp[plane] = PlaneRef::whole(f.clone(), 0);
                 }
             }
             asm_planes.push(sp);
@@ -2758,7 +2927,7 @@ mod bd {
         let mut asm_planes: Vec<Vec<PlaneRef>> = Vec::with_capacity(series_count);
 
         for (_label, tiffs) in well_tiffs.iter() {
-            for _field in 0..n_fields {
+            for field in 0..n_fields {
                 series.push(super::make_series_meta(
                     size_x,
                     size_y,
@@ -2771,6 +2940,15 @@ mod bd {
                     order,
                     "BD Pathway",
                 ));
+                // Montaged datasets pack all fields in one TIFF; split them per
+                // the Java openBytes: fieldRow = field/fieldCols,
+                // fieldCol = field%fieldCols, and the sub-region is
+                // (fieldCol*sizeX, fieldRow*sizeY, sizeX, sizeY). Single-field
+                // datasets read the whole plane.
+                let field_row = field / field_cols.max(1);
+                let field_col = field % field_cols.max(1);
+                let off_x = field_col as u32 * size_x;
+                let off_y = field_row as u32 * size_y;
                 // Map each plane to its file via getFilename logic.
                 let mut sp = vec![PlaneRef::default(); image_count];
                 for plane in 0..image_count {
@@ -2778,9 +2956,21 @@ mod bd {
                         order, size_z, size_c, size_t, plane as u32,
                     );
                     if let Some(f) = bd_filename(tiffs, &channel_names, c, z, t, order, size_z, size_t) {
-                        sp[plane] = PlaneRef {
-                            filename: Some(f),
-                            file_index: 0,
+                        sp[plane] = if n_fields == 1 {
+                            PlaneRef::whole(f, 0)
+                        } else {
+                            PlaneRef {
+                                tiles: vec![Tile {
+                                    filename: f,
+                                    file_index: 0,
+                                    src_x: off_x,
+                                    src_y: off_y,
+                                    src_w: size_x,
+                                    src_h: size_y,
+                                    dst_x: 0,
+                                    dst_y: 0,
+                                }],
+                            }
                         };
                     }
                 }
@@ -2846,13 +3036,13 @@ mod bd {
 }
 
 // ===========================================================================
-// CellVoyager parser (MeasurementResult.xml)  -- partial port of CellVoyagerReader
+// CellVoyager parser (MeasurementResult.xml)  -- port of CellVoyagerReader
 //
 // Faithful to the Java geometry parsing (channels/wells/areas/fields/Z/T and
-// per-field pixel offsets), producing one series per well x area. The Java
-// reader stitches all tiles of an area on the fly; here each series plane maps
-// to the area's FIRST field tile only (single-tile areas are exact; multi-tile
-// areas show just the first tile -- see module docs / REPORT).
+// per-field pixel offsets), producing one series per well x area. Each series
+// plane is stitched on the fly from all of the area's field tiles, each placed
+// at its (xpixels, ypixels) offset within the reconstructed area image --
+// mirroring the Java openBytes tile-paste loop.
 // ===========================================================================
 
 mod cellvoyager {
@@ -2862,11 +3052,13 @@ mod cellvoyager {
     struct Field {
         index: i32,
         // Stage position in micrometres; consumed for min/max during area
-        // sizing. Retained for the (deferred) full per-tile stitch.
-        #[allow(dead_code)]
+        // sizing.
         x: f64,
-        #[allow(dead_code)]
         y: f64,
+        // Pixel offset of this tile within the reconstructed area image
+        // (Java FieldInfo.xpixels / ypixels).
+        xpixels: i64,
+        ypixels: i64,
     }
 
     #[derive(Default, Clone)]
@@ -2878,6 +3070,9 @@ mod cellvoyager {
 
     #[derive(Default, Clone)]
     struct Well {
+        /// Well number from XML. Retained for metadata fidelity; the filename
+        /// uses the wells-list position per Java, not this value.
+        #[allow(dead_code)]
         number: i32,
         areas: Vec<Area>,
     }
@@ -3048,11 +3243,15 @@ mod cellvoyager {
             }
         }
 
-        // Build one series per well x area.
+        // Build one series per well x area. Each area plane is stitched from
+        // all of the area's field tiles, placing each tile at its pixel offset
+        // (Java openBytes loops over area.fields and pastes each tile). The
+        // well index used in the filename is the position in the wells list
+        // (wi + 1), matching Java's seriesToWellArea / SINGLE_TIFF_PATH_BUILDER.
         let mut series = Vec::new();
         let mut asm_planes: Vec<Vec<PlaneRef>> = Vec::new();
         for (wi, well) in wells.iter().enumerate() {
-            let well_number = if well.number > 0 { well.number } else { wi as i32 + 1 };
+            let well_index = wi as i32 + 1;
             for area in &well.areas {
                 let size_x = area.width.max(tile_w).max(1) as u32;
                 let size_y = area.height.max(tile_h).max(1) as u32;
@@ -3068,23 +3267,35 @@ mod cellvoyager {
                     order,
                     "CellVoyager",
                 ));
-                let first_field = area.fields.first().map(|f| f.index).unwrap_or(1);
                 let mut sp = vec![PlaneRef::default(); image_count];
                 for plane in 0..image_count {
                     let (z, c, t) = super::get_zct_coords(order, n_z, n_c, n_t, plane as u32);
-                    // SINGLE_TIFF_PATH_BUILDER = "W%dF%03dT%04dZ%02dC%d.tif"
-                    let fname = single_tiff_name(
-                        well_number,
-                        first_field,
-                        t as i32 + 1,
-                        z as i32 + 1,
-                        c as i32 + 1,
-                    );
-                    let p = image_folder.join(&fname);
-                    sp[plane] = PlaneRef {
-                        filename: Some(p),
-                        file_index: 0,
-                    };
+                    let mut tiles: Vec<Tile> = Vec::with_capacity(area.fields.len());
+                    for field in &area.fields {
+                        // SINGLE_TIFF_PATH_BUILDER = "W%dF%03dT%04dZ%02dC%d.tif"
+                        let fname = single_tiff_name(
+                            well_index,
+                            field.index,
+                            t as i32 + 1,
+                            z as i32 + 1,
+                            c as i32 + 1,
+                        );
+                        let p = image_folder.join(&fname);
+                        // Place the whole tile at its pixel offset within the
+                        // reconstructed area image. src_w/src_h = 0 -> the
+                        // compositor reads the full tile plane.
+                        tiles.push(Tile {
+                            filename: p,
+                            file_index: 0,
+                            src_x: 0,
+                            src_y: 0,
+                            src_w: 0,
+                            src_h: 0,
+                            dst_x: field.xpixels.max(0) as u32,
+                            dst_y: field.ypixels.max(0) as u32,
+                        });
+                    }
+                    sp[plane] = PlaneRef { tiles };
                 }
                 asm_planes.push(sp);
             }
@@ -3135,10 +3346,20 @@ mod cellvoyager {
                 let yum = -y;
                 ymin = ymin.min(yum);
                 ymax = ymax.max(yum);
-                fields.push(Field { index: 0, x, y });
+                fields.push(Field {
+                    index: 0,
+                    x,
+                    y,
+                    xpixels: 0,
+                    ypixels: 0,
+                });
             }
         }
         for f in fields.iter_mut() {
+            // Java: xpixels = round((x - xmin)/pixelWidth);
+            //       ypixels = round((-ymin - y)/pixelHeight).
+            f.xpixels = ((f.x - xmin) / pixel_width).round() as i64;
+            f.ypixels = ((-ymin - f.y) / pixel_height).round() as i64;
             f.index = *starting_field_index;
             *starting_field_index += 1;
         }

@@ -148,6 +148,58 @@ impl TiffReader {
         self.ome_xml.as_deref()
     }
 
+    /// Read the Canon DNG white-balance RGB coefficients from the EXIF
+    /// maker-note, returning `Some([r, g, b])` when present.
+    ///
+    /// This is an additive helper for [`crate::formats::extended::DngReader`];
+    /// it does not affect ordinary TIFF parsing. It ports the EXIF/maker-note
+    /// traversal in `DNGReader.initStandardMetadata` (Java ~274-336):
+    ///
+    /// 1. follow the EXIF sub-IFD pointer (tag 34665) on the first main IFD,
+    /// 2. read the `MAKER_NOTE` (tag 37500) bytes from that EXIF IFD,
+    /// 3. apply Canon's offset rewrite — the last 4 bytes give an `offset`; the
+    ///    trailing 8 bytes (a mini-TIFF header) move to position 0 and the body
+    ///    is relocated to `offset` — then parse the resulting buffer as a TIFF,
+    /// 4. read tag 16385 (`WHITE_BALANCE_RGB_COEFFS`) from the maker-note IFD.
+    ///
+    /// As in Java, a present-but-non-rational coefficient entry falls back to
+    /// the hard-coded `{2.391381, 0.929156, 1.298254}` table; a fully absent
+    /// maker-note / EXIF yields `None` (white balance is then a no-op).
+    pub fn dng_white_balance(&mut self) -> Option<[f64; 3]> {
+        const WHITE_BALANCE_RGB_COEFFS: u16 = 16385;
+        const DEFAULT_WB: [f64; 3] = [2.391381, 0.929156, 1.298254];
+
+        let file = self.file.as_mut()?;
+        let little = file.parser.little_endian;
+
+        // EXIF sub-IFD pointer lives on the first main IFD.
+        let exif_offset = file.ifds.first()?.get_u64(super::nikon::EXIF_IFD_TAG)?;
+        if exif_offset == 0 {
+            return None;
+        }
+        let (exif_ifd, _) = file.parser.read_ifd(exif_offset).ok()?;
+
+        // MAKER_NOTE bytes (Canon stores an offset-relative TIFF blob here).
+        let maker = match exif_ifd.get(super::nikon::EXIF_MAKER_NOTE_TAG)? {
+            super::ifd::IfdValue::Byte(b) | super::ifd::IfdValue::Undefined(b) => b.clone(),
+            _ => return None,
+        };
+        let note = parse_canon_maker_note(&maker, little)?;
+
+        let value = note.get(WHITE_BALANCE_RGB_COEFFS)?;
+        if note.is_rational(WHITE_BALANCE_RGB_COEFFS) {
+            let coeffs = value.as_vec_f64();
+            if coeffs.len() >= 3 {
+                return Some([coeffs[0], coeffs[1], coeffs[2]]);
+            }
+            // Java only treats a TiffRational[] as valid white balance; a short
+            // rational array is not expected, so fall through to the default.
+            return Some(DEFAULT_WB);
+        }
+        // Present but non-rational: Java uses the hard-coded default table.
+        Some(DEFAULT_WB)
+    }
+
     /// Extract `IfdInfo` from a raw `Ifd`.
     fn ifd_info(ifd: &Ifd, _little_endian: bool) -> Result<IfdInfo> {
         let width = ifd
@@ -2236,6 +2288,51 @@ fn clamp_u8(value: f32) -> u8 {
     value.round().clamp(0.0, 255.0) as u8
 }
 
+/// Parse a Canon DNG EXIF maker-note blob into a TIFF IFD.
+///
+/// Canon stores the maker-note as a TIFF fragment whose value offsets are
+/// relative to a base recorded in the blob's trailing bytes. Bio-Formats
+/// (`DNGReader.initStandardMetadata`) reconstructs a self-contained buffer:
+/// the last 4 bytes give `offset`; a new buffer of length `len + offset - 8`
+/// is built, the trailing 8 bytes (a mini-TIFF header: byte-order, magic,
+/// first-IFD pointer) are copied to position 0, and the leading `len - 8`
+/// body bytes are copied to position `offset`. The result is then parsed as a
+/// standalone TIFF and its first IFD returned. Returns `None` on any malformed
+/// input (matching Java, which logs and continues).
+fn parse_canon_maker_note(data: &[u8], little_endian: bool) -> Option<Ifd> {
+    if data.len() < 8 {
+        return None;
+    }
+    let n = data.len();
+    let off_bytes = &data[n - 4..n];
+    let offset = if little_endian {
+        u32::from_le_bytes([off_bytes[0], off_bytes[1], off_bytes[2], off_bytes[3]]) as usize
+    } else {
+        u32::from_be_bytes([off_bytes[0], off_bytes[1], off_bytes[2], off_bytes[3]]) as usize
+    };
+
+    // Java: new byte[b.length + offset - 8]. Guard against pathological offsets.
+    let new_len = (n + offset).checked_sub(8)?;
+    if offset < 8 || new_len < n {
+        return None;
+    }
+    let mut buf = vec![0u8; new_len];
+    // Trailing 8 bytes (mini-TIFF header) -> start.
+    buf[0..8].copy_from_slice(&data[n - 8..n]);
+    // Leading body -> position `offset`.
+    if offset + (n - 8) > buf.len() {
+        return None;
+    }
+    buf[offset..offset + (n - 8)].copy_from_slice(&data[0..n - 8]);
+
+    let mut parser = TiffParser::new(std::io::Cursor::new(buf)).ok()?;
+    let _ = little_endian; // header in `buf` dictates endianness, as in Java.
+    parser
+        .read_ifd(parser.first_ifd_offset)
+        .ok()
+        .map(|(ifd, _)| ifd)
+}
+
 // ---- FormatReader impl ----
 
 impl crate::common::reader::FormatReader for TiffReader {
@@ -2631,5 +2728,151 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert!(!bytes.is_empty());
+    }
+
+    fn push_ifd_rational(data: &mut Vec<u8>, tag: u16, count: u32, value_offset: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 5); // RATIONAL
+        push_u32_le(data, count);
+        push_u32_le(data, value_offset);
+    }
+
+    /// Build a Canon-style EXIF maker-note blob carrying a rational
+    /// `WHITE_BALANCE_RGB_COEFFS` (tag 16385) with the given r/g/b values.
+    ///
+    /// We first construct the *reconstructed* self-contained little-endian TIFF
+    /// `buf` exactly as `parse_canon_maker_note` expects (header at offset 0,
+    /// first IFD at offset 8), choosing the Canon relocation `offset == 8`. With
+    /// `offset == 8`, the inverse transform is: blob = buf[8..] ++ buf[0..8],
+    /// and the last 4 bytes of buf[0..8] already encode the IFD offset 8.
+    fn synthetic_canon_maker_note(r: (u32, u32), g: (u32, u32), b: (u32, u32)) -> Vec<u8> {
+        const WB: u16 = 16385;
+        // Reconstructed TIFF buffer `buf`.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        push_u16_le(&mut buf, 42);
+        push_u32_le(&mut buf, 8); // first IFD at offset 8
+        // IFD at offset 8: one entry, rational[3] stored out-of-line.
+        push_u16_le(&mut buf, 1); // entry count
+        // Entry table is 2 + 12 + 4 = 18 bytes -> rational data starts at 8+18=26.
+        let rational_offset = 26u32;
+        push_ifd_rational(&mut buf, WB, 3, rational_offset);
+        push_u32_le(&mut buf, 0); // next IFD
+        // Rational data (3 x (num, den)).
+        for (n, d) in [r, g, b] {
+            push_u32_le(&mut buf, n);
+            push_u32_le(&mut buf, d);
+        }
+
+        // Inverse of Java's relocation with offset == 8: header(8) goes to the
+        // blob tail, body (buf[8..]) goes to the blob head.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&buf[8..]);
+        blob.extend_from_slice(&buf[0..8]);
+        blob
+    }
+
+    #[test]
+    fn parse_canon_maker_note_reads_white_balance_rational() {
+        let blob = synthetic_canon_maker_note((2u32, 1), (3u32, 4), (5u32, 2));
+        let note = parse_canon_maker_note(&blob, true).expect("maker-note should parse");
+        let coeffs = note.get_vec_f64(16385);
+        assert_eq!(coeffs.len(), 3);
+        assert!((coeffs[0] - 2.0).abs() < 1e-9);
+        assert!((coeffs[1] - 0.75).abs() < 1e-9);
+        assert!((coeffs[2] - 2.5).abs() < 1e-9);
+        assert!(note.is_rational(16385));
+    }
+
+    #[test]
+    fn dng_white_balance_extracts_coeffs_from_exif_maker_note() {
+        // Full synthetic DNG: main IFD -> EXIF sub-IFD (34665) -> MAKER_NOTE
+        // (37500) -> Canon white-balance rational.
+        let maker_note = synthetic_canon_maker_note((2u32, 1), (3u32, 4), (5u32, 2));
+
+        let main_ifd_offset = 8u32;
+        // Main IFD carries a valid (tiny) image plus the EXIF pointer so that
+        // set_id succeeds; the white-balance read does not depend on pixels.
+        let main_entry_count = 9u16;
+        let main_ifd_bytes = 2 + main_entry_count as u32 * 12 + 4;
+        let exif_ifd_offset = main_ifd_offset + main_ifd_bytes;
+        let exif_entry_count = 1u16;
+        let exif_ifd_bytes = 2 + exif_entry_count as u32 * 12 + 4;
+        let maker_note_offset = exif_ifd_offset + exif_ifd_bytes;
+        let strip_offset = maker_note_offset + maker_note.len() as u32;
+        let pixels = [0u8, 1, 2, 3]; // 2x2 grayscale UINT8
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, main_ifd_offset);
+
+        // Main IFD: minimal image + EXIF pointer.
+        push_u16_le(&mut data, main_entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, 2);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 2);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, tag::COMPRESSION, 1);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 1);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, strip_offset);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 2);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+        push_ifd_long(&mut data, super::super::nikon::EXIF_IFD_TAG, exif_ifd_offset);
+        push_u32_le(&mut data, 0);
+
+        // EXIF IFD: just the MAKER_NOTE (undefined).
+        push_u16_le(&mut data, exif_entry_count);
+        push_ifd_undefined(
+            &mut data,
+            super::super::nikon::EXIF_MAKER_NOTE_TAG,
+            &maker_note,
+            maker_note_offset,
+        );
+        push_u32_le(&mut data, 0);
+
+        data.extend_from_slice(&maker_note);
+        data.extend_from_slice(&pixels);
+
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-dng-wb-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, &data).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let wb = reader.dng_white_balance();
+        let _ = fs::remove_file(&path);
+
+        let wb = wb.expect("white balance should be present");
+        assert!((wb[0] - 2.0).abs() < 1e-9);
+        assert!((wb[1] - 0.75).abs() < 1e-9);
+        assert!((wb[2] - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dng_white_balance_absent_returns_none() {
+        // A plain TIFF with no EXIF pointer yields no white balance (no-op path).
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+        push_u16_le(&mut data, 4);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, 2);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 2);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 1);
+        push_u32_le(&mut data, 0);
+
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-dng-no-wb-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, &data).unwrap();
+        let mut reader = TiffReader::new();
+        let _ = reader.set_id(&path);
+        let wb = reader.dng_white_balance();
+        let _ = fs::remove_file(&path);
+        assert!(wb.is_none());
     }
 }

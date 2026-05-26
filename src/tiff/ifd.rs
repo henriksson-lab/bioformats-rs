@@ -218,6 +218,30 @@ impl IfdValue {
             _ => None,
         }
     }
+
+    /// Interpret a rational/numeric value as a vector of `f64`.
+    ///
+    /// This mirrors `TiffRational.doubleValue()` in upstream Bio-Formats: each
+    /// `(num, den)` pair becomes `num as f64 / den as f64` (a zero denominator
+    /// yields `0.0`, matching Java's `TiffRational`). Numeric (non-rational)
+    /// types are coerced as a best effort so callers can treat them uniformly.
+    pub fn as_vec_f64(&self) -> Vec<f64> {
+        let ratio = |n: f64, d: f64| if d == 0.0 { 0.0 } else { n / d };
+        match self {
+            IfdValue::Rational(v) => v.iter().map(|&(n, d)| ratio(n as f64, d as f64)).collect(),
+            IfdValue::SRational(v) => v.iter().map(|&(n, d)| ratio(n as f64, d as f64)).collect(),
+            IfdValue::Float(v) => v.iter().map(|&x| x as f64).collect(),
+            IfdValue::Double(v) => v.clone(),
+            IfdValue::Byte(v) => v.iter().map(|&x| x as f64).collect(),
+            IfdValue::SByte(v) => v.iter().map(|&x| x as f64).collect(),
+            IfdValue::Short(v) => v.iter().map(|&x| x as f64).collect(),
+            IfdValue::SShort(v) => v.iter().map(|&x| x as f64).collect(),
+            IfdValue::Long(v) => v.iter().map(|&x| x as f64).collect(),
+            IfdValue::SLong(v) => v.iter().map(|&x| x as f64).collect(),
+            IfdValue::Long8(v) => v.iter().map(|&x| x as f64).collect(),
+            _ => vec![],
+        }
+    }
 }
 
 /// One parsed IFD (Image File Directory).
@@ -257,6 +281,22 @@ impl Ifd {
 
     pub fn get_str(&self, tag: u16) -> Option<&str> {
         self.get(tag)?.as_str()
+    }
+
+    /// Read a tag as a vector of `f64`, interpreting rationals as `num/den`.
+    /// Empty when the tag is absent. See [`IfdValue::as_vec_f64`].
+    pub fn get_vec_f64(&self, tag: u16) -> Vec<f64> {
+        self.get(tag).map(|v| v.as_vec_f64()).unwrap_or_default()
+    }
+
+    /// Whether the value stored for `tag` is a (signed or unsigned) rational.
+    /// Canon DNG distinguishes a present-but-non-rational white-balance entry
+    /// (which triggers the hard-coded fallback table) from a rational one.
+    pub fn is_rational(&self, tag: u16) -> bool {
+        matches!(
+            self.get(tag),
+            Some(IfdValue::Rational(_)) | Some(IfdValue::SRational(_))
+        )
     }
 
     // Convenience accessors for common structural tags

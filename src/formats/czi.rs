@@ -14,7 +14,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue, ModuloAnnotation};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -94,6 +94,10 @@ impl DirEntry {
         self.dims.get(name).map(|&(_, size)| size).unwrap_or(1)
     }
 
+    fn has_dim(&self, name: &str) -> bool {
+        self.dims.contains_key(name)
+    }
+
     /// Stored (physical) size of a dimension, falling back to the logical size.
     fn dim_stored_size(&self, name: &str) -> i32 {
         match self.stored.get(name) {
@@ -127,13 +131,33 @@ struct CziResolution {
     height: u32,
 }
 
-/// One series corresponds to one scene/position (the CZI "S" dimension), as in
-/// ZeissCZIReader where `seriesCount = positions` (mosaics/acquisitions/angles
-/// aside). Each series carries its own pyramid resolution list.
+/// One series corresponds to one combination of the CZI "extra" dimensions that
+/// ZeissCZIReader.assignPlaneIndices folds into the series axis: scene ("S"),
+/// acquisition ("B"), angle ("V") and — unless prestitched — mosaic ("M"). Each
+/// series carries its own pyramid resolution list and per-pixel-type slot.
+///
+/// Port of the per-series core split: `seriesCount = positions * acquisitions *
+/// angles * mosaics` (mosaics only when `maxResolution == 0` and not
+/// prestitched), with an extra factor of `pixelTypes.size()` for the per-pixel-
+/// type core split.
 #[derive(Debug, Clone)]
 struct CziSeries {
-    /// Absolute value of the "S" dimension start that selects this scene.
-    scene: i32,
+    /// Selector for the "S" dimension start, or `None` to match any scene.
+    scene: Option<i32>,
+    /// Selector for the "B" (acquisition) dimension start, or `None` to match any.
+    acquisition: Option<i32>,
+    /// Selector for the "V" (angle) dimension start, or `None` to match any.
+    angle: Option<i32>,
+    /// Selector for the "M" (mosaic) dimension start when mosaics are exposed as
+    /// separate series (not prestitched). `None` => match any / stitch all M.
+    mosaic: Option<i32>,
+    /// Index into the distinct-pixel-type list (per-pixel-type core split).
+    /// When `pixel_types.len() > 1`, this also selects the logical channel offset.
+    pixel_type_index: usize,
+    /// PALM series selector: the stored (X,Y) tile size that identifies which of
+    /// the two PALM planes this series exposes (ZeissCZIReader:1155-1172 splits by
+    /// stored size). `None` for non-PALM series.
+    palm_size: Option<(u32, u32)>,
     resolutions: Vec<CziResolution>,
 }
 
@@ -227,8 +251,46 @@ struct CziParsed {
     t_count: u32,
     pixel_type: PixelType,
     spp: u32,
-    /// One entry per scene/position (the "S" dimension). Always non-empty.
+    /// One entry per series (extra-dimension combination). Always non-empty.
     series: Vec<CziSeries>,
+    /// Distinct CZI pixel-type codes seen across subblocks, in first-seen order.
+    /// `len() > 1` triggers the per-pixel-type core split.
+    pixel_types: Vec<i32>,
+    /// True when mosaic ("M") tiles are stitched into a single image per series.
+    prestitched: bool,
+    /// Modulo annotations (rotations->Z, illuminations->C, phases->T).
+    modulo_z: Option<ModuloAnnotation>,
+    modulo_c: Option<ModuloAnnotation>,
+    modulo_t: Option<ModuloAnnotation>,
+    /// Sub-dimension fold factors used by plane-index/selection math.
+    rotations: i32,
+    illuminations: i32,
+    phases: i32,
+    /// True when "R" acts as the rotation axis (folded into Z) rather than the
+    /// pyramid-resolution selector.
+    rotation_axis: bool,
+    /// True when PALM data was detected and split into two series by stored size.
+    palm: bool,
+}
+
+/// Counts of the CZI "extra" dimensions, computed like
+/// ZeissCZIReader.calculateDimensions.
+#[derive(Default)]
+struct DimCounts {
+    positions: i32,    // S
+    acquisitions: i32, // B
+    angles: i32,       // V
+    mosaics: i32,      // M
+    rotations: i32,    // R -> modulo Z
+    illuminations: i32, // I -> modulo C
+    phases: i32,       // H -> modulo T
+    /// True when "R" is a genuine rotation axis (some R.size > 1), as opposed to
+    /// this crate's pyramid-resolution repurposing of "R".
+    rotation_axis: bool,
+    min_scene: i32,
+    min_acq: i32,
+    min_angle: i32,
+    min_mosaic: i32,
 }
 
 fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
@@ -310,37 +372,63 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
     }
 
     // Compute dimensions from entries.
-    //
-    // ZeissCZIReader.calculateDimensions: the "S" dimension yields the scene
-    // count (`positions = maxS - minS + 1`); each scene becomes a series. The
-    // "R" dimension yields pyramid resolution levels. X/Y extents are tracked
-    // per (scene, R) bucket so every series/resolution gets its own size.
+    let parsed = build_dimensions(meta_xml, entries);
+    Ok(parsed)
+}
+
+/// Port of ZeissCZIReader.calculateDimensions + the prestitching / series-split /
+/// per-pixel-type core split machinery (the part of `initFile` from
+/// calculateDimensions through assignPlaneIndices and the mosaic tile min/max
+/// row-col logic).
+fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> CziParsed {
+    // --- calculateDimensions: per-dimension extents (ZeissCZIReader:1942-2048) ---
     let mut max_z = 0i32;
     let mut max_c = 0i32;
     let mut max_t = 0i32;
-    let mut pixel_type = 0i32;
+    let mut first_pixel_type = 0i32;
 
-    let mut min_scene = i32::MAX;
-    let mut max_scene = i32::MIN;
-    let mut has_scene = false;
-    // (scene, R) -> (width, height)
-    let mut extents: HashMap<(i32, i32), (u32, u32)> = HashMap::new();
+    // Distinct pixel-type codes in first-seen order (ZeissCZIReader:969-977).
+    let mut pixel_types: Vec<i32> = Vec::new();
+
+    let mut c = DimCounts {
+        positions: 1,
+        acquisitions: 1,
+        angles: 1,
+        mosaics: 1,
+        rotations: 1,
+        illuminations: 1,
+        phases: 1,
+        rotation_axis: false,
+        min_scene: 0,
+        min_acq: 0,
+        min_angle: 0,
+        min_mosaic: 0,
+    };
+
+    let (mut min_s, mut max_s) = (i32::MAX, i32::MIN);
+    let (mut min_b, mut max_b) = (i32::MAX, i32::MIN);
+    let (mut min_v, mut max_v) = (i32::MAX, i32::MIN);
+    let (mut min_m, mut max_m) = (i32::MAX, i32::MIN);
+    let (mut min_r, mut max_r) = (i32::MAX, i32::MIN);
+    // Java-style rotation extent (start + size) and the largest R.size seen, used
+    // to distinguish genuine rotation files from the pyramid repurposing of "R".
+    let (mut min_rot, mut max_rot) = (i32::MAX, i32::MIN);
+    let mut max_r_size = 0i32;
+    // Max X tile size observed at each R level, used to tell a downscaled pyramid
+    // (sizes differ across R) from a rotation axis (sizes equal across R).
+    let mut r_level_xsize: HashMap<i32, i32> = HashMap::new();
+    let (mut min_i, mut max_i) = (i32::MAX, i32::MIN);
+    let (mut min_h, mut max_h) = (i32::MAX, i32::MIN);
 
     for e in &entries {
-        pixel_type = e.pixel_type;
-        let scene = e.dim_start("S");
-        if e.dims.contains_key("S") {
-            has_scene = true;
-            min_scene = min_scene.min(scene);
-            max_scene = max_scene.max(scene);
+        if pixel_types.is_empty() {
+            first_pixel_type = e.pixel_type;
         }
-        let x_start = e.dim_start("X").max(0) as u32;
-        let y_start = e.dim_start("Y").max(0) as u32;
-        let x_size = e.dim_size("X").max(0) as u32;
-        let y_size = e.dim_size("Y").max(0) as u32;
-        let extent = extents.entry((scene, e.dim_start("R"))).or_insert((0, 0));
-        extent.0 = extent.0.max(x_start.saturating_add(x_size));
-        extent.1 = extent.1.max(y_start.saturating_add(y_size));
+        if !pixel_types.contains(&e.pixel_type) {
+            pixel_types.push(e.pixel_type);
+        }
+
+        // C/Z/T (logical max, ZeissCZIReader case 'C'/'Z'/'T').
         if let Some(&(start, _)) = e.dims.get("Z") {
             if start > max_z {
                 max_z = start;
@@ -356,42 +444,375 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
                 max_t = start;
             }
         }
+        // Extra/modulo dimensions (ZeissCZIReader case 'S'/'I'/'B'/'M'/'H'/'V').
+        //
+        // The "R" dimension carries two distinct meanings in CZI files:
+        //
+        //   * Upstream ZeissCZIReader treats "R" as the *rotation* axis and folds
+        //     it into Z via a moduloZ annotation (ZeissCZIReader:1997-1999,
+        //     2043-2044, 846-849, 2216-2217). There, `rotations = maxRotation -
+        //     minRotation` with `maxRotation = max(start + size)`. Resolution is
+        //     instead derived from a scale-factor pyramid (ZeissCZIReader:772-784):
+        //     a higher pyramid level stores a *smaller* X/Y tile.
+        //
+        //   * This crate repurposes the "R" *start* as the discrete pyramid
+        //     resolution level (see czi_selects_pyramid_resolution_level), since it
+        //     does not implement the scale-factor pyramid detection.
+        //
+        // Both rotation and the pyramid repurposing typically write R.size == 1 and
+        // vary only the start, so size alone cannot disambiguate. We instead apply
+        // Java's pyramid signal: distinct R levels are a *pyramid* iff their X tile
+        // size differs (downscaling); if every R level shares the same X size, "R"
+        // is a genuine rotation axis (no downsampling) and folds into Z. R.size > 1
+        // is also treated as an explicit rotation signal.
+        if let Some(&(start, size)) = e.dims.get("R") {
+            min_r = min_r.min(start);
+            max_r = max_r.max(start + 1);
+            // Java-style rotation extent: maxRotation = max(start + size).
+            min_rot = min_rot.min(start);
+            max_rot = max_rot.max(start + size);
+            max_r_size = max_r_size.max(size);
+            // Track the X tile size seen at each R level to detect downscaling.
+            let x_size = e.dim_size("X").max(0);
+            let cur = r_level_xsize.entry(start).or_insert(x_size);
+            *cur = (*cur).max(x_size);
+        }
+        if let Some(&(start, _)) = e.dims.get("S") {
+            min_s = min_s.min(start);
+            max_s = max_s.max(start);
+        }
+        if let Some(&(start, size)) = e.dims.get("I") {
+            min_i = min_i.min(start);
+            max_i = max_i.max(start + size);
+        }
+        if let Some(&(start, _)) = e.dims.get("B") {
+            min_b = min_b.min(start);
+            max_b = max_b.max(start);
+        }
+        if let Some(&(start, _)) = e.dims.get("M") {
+            min_m = min_m.min(start);
+            max_m = max_m.max(start);
+        }
+        if let Some(&(start, size)) = e.dims.get("H") {
+            min_h = min_h.min(start);
+            max_h = max_h.max(start + size);
+        }
+        if let Some(&(start, _)) = e.dims.get("V") {
+            min_v = min_v.min(start);
+            max_v = max_v.max(start);
+        }
     }
 
-    // positions = maxS - minS + 1 (BaseZeissReader semantics); with no "S"
-    // dimension a single scene with start 0.
-    let (min_scene, positions) = if has_scene {
-        (min_scene, (max_scene - min_scene + 1).max(1))
+    // ZeissCZIReader:2037-2048. positions = maxS - minS + 1; acquisitions/angles/
+    // mosaics use start+1 (max start + 1); illuminations/phases use
+    // max(start+size) - min(start), i.e. a range count.
+    if max_s != i32::MIN {
+        c.positions = (max_s - min_s + 1).max(1);
+        c.min_scene = min_s;
+    }
+    if max_b != i32::MIN {
+        c.acquisitions = (max_b + 1).max(1);
+        c.min_acq = min_b;
+    }
+    if max_v != i32::MIN {
+        c.angles = (max_v + 1).max(1);
+        c.min_angle = min_v;
+    }
+    if max_m != i32::MIN {
+        c.mosaics = (max_m + 1).max(1);
+        c.min_mosaic = min_m;
+    }
+    // Rotation -> moduloZ (ZeissCZIReader:2043-2044). Treat "R" as a rotation axis
+    // (rather than the crate's pyramid repurposing) when either:
+    //   * some subblock explicitly records R.size > 1, or
+    //   * there are multiple R levels that all share the same X tile size (i.e.
+    //     no downscaling, so they are not a pyramid).
+    // When R levels have differing X sizes, "R" is a downscaled pyramid and stays
+    // the resolution selector.
+    let distinct_r_levels = r_level_xsize.len();
+    let all_r_same_xsize = {
+        let mut sizes = r_level_xsize.values().copied();
+        match sizes.next() {
+            Some(first) => sizes.all(|s| s == first),
+            None => true,
+        }
+    };
+    let rotation_axis =
+        max_r_size > 1 || (distinct_r_levels > 1 && all_r_same_xsize);
+    if rotation_axis && max_rot != i32::MIN && min_rot != i32::MAX {
+        c.rotations = (max_rot - min_rot).max(1);
+        c.rotation_axis = true;
+    }
+    let _ = min_r;
+    if max_i != i32::MIN && min_i != i32::MAX {
+        c.illuminations = (max_i - min_i).max(1);
+    }
+    if max_h != i32::MIN && min_h != i32::MAX {
+        c.phases = (max_h - min_h).max(1);
+    }
+
+    let mut z_count = (max_z + 1) as u32;
+    let mut c_count = (max_c + 1) as u32;
+    let mut t_count = (max_t + 1) as u32;
+
+    let (pt, spp) = czi_pixel_type(first_pixel_type);
+
+    // --- modulo annotations (ZeissCZIReader:832-860) ---
+    // rotations -> modulo Z, illuminations -> modulo C, phases -> modulo T.
+    let mut modulo_z = None;
+    let mut modulo_c = None;
+    let mut modulo_t = None;
+    // Rotation/illumination/phase labels parsed from "...|Rotations|" etc. keys in
+    // the metadata XML (ZeissCZIReader:3733-3741).
+    let rotation_labels = parse_modulo_labels(&meta_xml, "Rotations");
+    let illumination_labels = parse_modulo_labels(&meta_xml, "Illuminations");
+    let phase_labels = parse_modulo_labels(&meta_xml, "Phases");
+    if c.rotations > 1 {
+        // ZeissCZIReader:846-849. step = original sizeZ, end = sizeZ*(rotations-1).
+        // When rotation labels are present, Java collapses end to start
+        // (ZeissCZIReader:1246-1249) since the labels enumerate the axis.
+        let mut end = (z_count as i32 * (c.rotations - 1)) as f64;
+        if !rotation_labels.is_empty() {
+            end = 0.0;
+        }
+        modulo_z = Some(ModuloAnnotation {
+            parent_dimension: "Z".into(),
+            modulo_type: "rotation".into(),
+            start: 0.0,
+            step: z_count as f64,
+            end,
+            unit: String::new(),
+            labels: rotation_labels,
+        });
+        z_count *= c.rotations as u32;
+    }
+    if c.illuminations > 1 {
+        let mut end = (c_count as i32 * (c.illuminations - 1)) as f64;
+        if !illumination_labels.is_empty() {
+            end = 0.0;
+        }
+        modulo_c = Some(ModuloAnnotation {
+            parent_dimension: "C".into(),
+            modulo_type: "illumination".into(),
+            start: 0.0,
+            step: c_count as f64,
+            end,
+            unit: String::new(),
+            labels: illumination_labels,
+        });
+        c_count *= c.illuminations as u32;
+    }
+    if c.phases > 1 {
+        let mut end = (t_count as i32 * (c.phases - 1)) as f64;
+        if !phase_labels.is_empty() {
+            end = 0.0;
+        }
+        modulo_t = Some(ModuloAnnotation {
+            parent_dimension: "T".into(),
+            modulo_type: "phase".into(),
+            start: 0.0,
+            step: t_count as f64,
+            end,
+            unit: String::new(),
+            labels: phase_labels,
+        });
+        t_count *= c.phases as u32;
+    }
+
+    // --- maxResolution / pyramid scale detection ---
+    // The "R" dimension supplies discrete resolution levels in this crate's model,
+    // UNLESS it is acting as a rotation axis (R.size > 1). In the rotation case the
+    // R start indexes rotation (folded into Z), so there is a single resolution.
+    let max_resolution = if !c.rotation_axis && max_r != i32::MIN {
+        (max_r - 1).max(0)
     } else {
-        (0, 1)
+        0
     };
 
-    // Build one CziSeries per scene, each with its sorted resolution list.
-    let mut series: Vec<CziSeries> = Vec::with_capacity(positions as usize);
-    for s in 0..positions {
-        let scene = min_scene + s;
-        let mut resolutions: Vec<CziResolution> = extents
-            .iter()
-            .filter(|((sc, _), _)| *sc == scene)
-            .map(|((_, r), (width, height))| CziResolution {
-                r: *r,
-                width: *width,
-                height: *height,
-            })
-            .collect();
-        resolutions.sort_by_key(|res| res.r);
-        if resolutions.is_empty() {
-            resolutions.push(CziResolution {
-                r: 0,
-                width: 0,
-                height: 0,
-            });
+    // --- seriesCount and prestitching (ZeissCZIReader:864-1003) ---
+    // seriesCount = positions * acquisitions * angles, *= mosaics only when there
+    // is no pyramid (maxResolution == 0); otherwise prestitched = true.
+    let mut prestitched = false;
+    let mosaics_as_series = if max_resolution == 0 {
+        c.mosaics > 1 && c.mosaics_exposed_as_series()
+    } else {
+        prestitched = true;
+        false
+    };
+    if c.mosaics > 1 && !mosaics_as_series {
+        // Mosaic tiles are stitched into a single image per series.
+        prestitched = true;
+    }
+
+    // --- mosaic image-fusion series rebalancing (ZeissCZIReader:941-1003) ---
+    //
+    // Faithful port of Java's plane-count-driven `seriesCount` collapse. When the
+    // calculated plane budget (`imageCount * seriesCount`) exceeds what the file
+    // actually stores (`planes.size() * scanDim`), the mosaics were fused at
+    // acquisition time and Java collapses or re-balances the series count. This
+    // is independent of the scale-factor pyramid model: it depends only on the
+    // integer relationships between imageCount / seriesCount / plane count /
+    // sizeZ / sizeT / positions / mosaics, all of which this crate already has.
+    //
+    // Scope: ported for the non-pyramid case (`max_resolution == 0`). When a
+    // pyramid is present Java's `planes.size()` excludes reduced-resolution
+    // subblocks (which this crate keeps as "R" buckets in `entries`) and `scanDim`
+    // is derived from the size/planeSize ratio (not computed here), so the
+    // precondition cannot be reproduced faithfully; in that case Java already
+    // forces `prestitched = true` and the relevant collapse branches at 999-1003
+    // only fire when `max_resolution == 0` regardless.
+    //
+    // `scanDim` is the line-scan-cytometry stored/plane size ratio
+    // (ZeissCZIReader:804/817). This crate does not detect line-scan cytometry, so
+    // every full-resolution plane has ratio 1, i.e. scanDim == 1.
+    //
+    // `seriesCount` here is the extra-dimension product *before* the per-pixel-
+    // type split (Java applies the per-pixel-type multiplication afterwards at
+    // 979-993). `image_count_full` is Java's `getImageCount()` (sizeZ * logical
+    // sizeC * sizeT) computed before the per-pixel-type sizeC division.
+    let image_count_full = z_count * c_count * t_count;
+    let scan_dim: u32 = 1;
+    // Number of valid full-resolution planes. With no pyramid, every directory
+    // entry is a full-resolution plane (Java's `planes.size()` / `fullResBlockCount`
+    // after removing reduced-resolution subblocks).
+    let plane_count = entries.len() as u32;
+    let mut series_count = (c.positions * c.acquisitions * c.angles).max(1);
+    if max_resolution == 0 {
+        series_count *= c.mosaics.max(1);
+    }
+    // When the collapse fires (952-960) we drop all extra-dimension splitting and
+    // expose a single series matching every subblock. When only positions are
+    // collapsed (947-950 / 999-1003), the surviving series no longer split by S,
+    // so the scene selector must match every position.
+    let mut collapse_all = false;
+    let mut position_collapsed = false;
+    if max_resolution == 0 && plane_count > 0 {
+        let lhs = image_count_full as u64 * series_count as u64;
+        let rhs = plane_count as u64 * scan_dim as u64;
+        if lhs > rhs {
+            let sz = z_count.max(1);
+            if plane_count != image_count_full
+                && plane_count != t_count
+                && (plane_count % (series_count as u32 * sz)) == 0
+            {
+                // ZeissCZIReader:947-950 (guarded by !isGroupFiles(); this crate
+                // never groups files, so the guard is always satisfied).
+                if c.positions > 1
+                    && plane_count
+                        == (image_count_full * series_count as u32) / c.positions as u32
+                {
+                    series_count /= c.positions;
+                    c.positions = 1;
+                    position_collapsed = true;
+                }
+            } else if plane_count == t_count
+                || plane_count == image_count_full
+                || c.positions > 1
+            {
+                // ZeissCZIReader:952-960: image was fully fused; collapse to one
+                // series. (!isGroupFiles() is always true here.)
+                c.positions = 1;
+                c.acquisitions = 1;
+                c.mosaics = 1;
+                c.angles = 1;
+                series_count = 1;
+                collapse_all = true;
+            } else if series_count > c.mosaics && c.mosaics > 1 && prestitched {
+                // ZeissCZIReader:961-964.
+                series_count /= c.mosaics;
+                c.mosaics = 1;
+            }
         }
-        series.push(CziSeries { scene, resolutions });
+    }
+
+    // ZeissCZIReader:999-1003: a prestitched image whose series count equals
+    // mosaics * positions is a big single image expecting (absent) pyramids;
+    // expose one series per position.
+    if prestitched
+        && max_resolution == 0
+        && series_count == (c.mosaics.max(1) * c.positions.max(1))
+        && series_count != c.positions
+    {
+        series_count = c.positions.max(1);
+        c.mosaics = 1;
+    }
+    let _ = series_count;
+
+    // --- per-pixel-type core split (ZeissCZIReader:969-995) ---
+    // Each distinct pixel type yields its own core/series with sizeC divided.
+    let original_c = c_count;
+    let pixel_type_count = pixel_types.len().max(1);
+    if pixel_type_count > 1 {
+        c_count = (original_c / pixel_type_count as u32).max(1);
+    }
+
+    // --- build the extra-dimension series list (assignPlaneIndices) ---
+    // Series = positions * acquisitions * angles * (mosaics if exposed) *
+    // pixel_type_count. Each series selects its subblocks via the extra-dim
+    // selectors; resolutions come from the "R" buckets within that selection.
+    let mosaic_factor = if mosaics_as_series { c.mosaics } else { 1 };
+
+    let mut series: Vec<CziSeries> = Vec::new();
+    for ptype in 0..pixel_type_count {
+        for s_idx in 0..c.positions {
+            for b_idx in 0..c.acquisitions {
+                for v_idx in 0..c.angles {
+                    for m_idx in 0..mosaic_factor {
+                        // When the fusion rebalancing collapsed everything into a
+                        // single series (ZeissCZIReader:952-960), the series must
+                        // match every subblock regardless of S/B/V/M, so leave all
+                        // extra-dimension selectors unset.
+                        let scene = if !collapse_all && !position_collapsed && max_s != i32::MIN {
+                            Some(c.min_scene + s_idx)
+                        } else {
+                            None
+                        };
+                        let acquisition = if !collapse_all && max_b != i32::MIN {
+                            Some(c.min_acq + b_idx)
+                        } else {
+                            None
+                        };
+                        let angle = if !collapse_all && max_v != i32::MIN {
+                            Some(c.min_angle + v_idx)
+                        } else {
+                            None
+                        };
+                        let mosaic = if mosaics_as_series {
+                            Some(c.min_mosaic + m_idx)
+                        } else {
+                            None
+                        };
+                        let resolutions = compute_resolutions(
+                            &entries,
+                            scene,
+                            acquisition,
+                            angle,
+                            mosaic,
+                            prestitched,
+                            c.rotation_axis,
+                        );
+                        series.push(CziSeries {
+                            scene,
+                            acquisition,
+                            angle,
+                            mosaic,
+                            pixel_type_index: ptype,
+                            palm_size: None,
+                            resolutions,
+                        });
+                    }
+                }
+            }
+        }
     }
     if series.is_empty() {
         series.push(CziSeries {
-            scene: 0,
+            scene: None,
+            acquisition: None,
+            angle: None,
+            mosaic: None,
+            pixel_type_index: 0,
+            palm_size: None,
             resolutions: vec![CziResolution {
                 r: 0,
                 width: 0,
@@ -400,19 +821,238 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
         });
     }
 
-    let (pt, s) = czi_pixel_type(pixel_type);
-    let spp = s;
+    // --- PALM detection and per-size series split (ZeissCZIReader:1123-1193) ---
+    // PALM requires <= 2 planes and an image count of <= 2; if the XML marks the
+    // file as PALM, the two planes are split into two series (one channel each)
+    // when they have *different* stored sizes (a same-size pair is reverted to a
+    // single 2-channel series, ZeissCZIReader:1174-1192).
+    let image_count = z_count * c_count * t_count;
+    let mut palm = false;
+    if entries.len() <= 2 && image_count <= 2 && check_palm(&meta_xml) {
+        // Distinct stored-size buckets among the (<= 2) subblocks.
+        let mut sizes: Vec<(u32, u32)> = Vec::new();
+        for e in &entries {
+            let sx = e.dim_stored_size("X").max(0) as u32;
+            let sy = e.dim_stored_size("Y").max(0) as u32;
+            if !sizes.contains(&(sx, sy)) {
+                sizes.push((sx, sy));
+            }
+        }
+        if sizes.len() == 2 {
+            // Genuine PALM: split into two single-channel series, each sized to its
+            // own stored tile (ZeissCZIReader:1150-1173).
+            palm = true;
+            c_count = 1;
+            series.clear();
+            for &(sx, sy) in &sizes {
+                series.push(CziSeries {
+                    scene: None,
+                    acquisition: None,
+                    angle: None,
+                    mosaic: None,
+                    pixel_type_index: 0,
+                    palm_size: Some((sx, sy)),
+                    resolutions: vec![CziResolution {
+                        r: 0,
+                        width: sx,
+                        height: sy,
+                    }],
+                });
+            }
+        }
+        // Same-size pair => not PALM; leave the existing 2-channel series untouched.
+    }
 
-    Ok(CziParsed {
+    CziParsed {
         meta_xml,
         entries,
-        z_count: (max_z + 1) as u32,
-        c_count: (max_c + 1) as u32,
-        t_count: (max_t + 1) as u32,
+        z_count: z_count.max(1),
+        c_count: c_count.max(1),
+        t_count: t_count.max(1),
         pixel_type: pt,
         spp,
         series,
-    })
+        pixel_types: if pixel_types.is_empty() {
+            vec![first_pixel_type]
+        } else {
+            pixel_types
+        },
+        prestitched,
+        modulo_z,
+        modulo_c,
+        modulo_t,
+        rotations: c.rotations,
+        illuminations: c.illuminations,
+        phases: c.phases,
+        rotation_axis: c.rotation_axis,
+        palm,
+    }
+}
+
+/// Port of ZeissCZIReader.checkPALM (ZeissCZIReader:2277-2335): the file is PALM
+/// when the metadata XML carries a `CustomAttributes/LsmTag` whose `Name`
+/// attribute starts with "palm", or an
+/// Experiment/ExperimentBlocks/AcquisitionBlock/MultiTrackSetup/TrackSetup/
+/// PalmSlider element whose text content is "true".
+///
+/// The crate keeps the metadata as a raw XML string (no DOM), so this performs a
+/// string/regex-free scan equivalent to the Java DOM walk.
+fn check_palm(xml: &str) -> bool {
+    if xml.is_empty() {
+        return false;
+    }
+    // LsmTag Name starting with "palm" (case-insensitive). Scan each <LsmTag ...>
+    // opening tag for a Name="..." attribute.
+    let lower = xml.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find("<lsmtag") {
+        let tag_start = search_from + rel;
+        let tag_end = lower[tag_start..]
+            .find('>')
+            .map(|e| tag_start + e)
+            .unwrap_or(lower.len());
+        let tag = &lower[tag_start..tag_end];
+        if let Some(npos) = tag.find("name=") {
+            let rest = &tag[npos + 5..];
+            let trimmed = rest.trim_start_matches(['"', '\'']);
+            if trimmed.starts_with("palm") {
+                return true;
+            }
+        }
+        search_from = tag_end.max(tag_start + 1);
+    }
+
+    // PalmSlider element with text content "true". The PalmSlider tag only appears
+    // under the MultiTrack/TrackSetup path in PALM acquisitions, so a positive
+    // text match is sufficient here.
+    if let Some(pos) = lower.find("<palmslider>") {
+        let value_start = pos + "<palmslider>".len();
+        if let Some(rel_end) = lower[value_start..].find("</palmslider>") {
+            let value = lower[value_start..value_start + rel_end].trim();
+            if value == "true" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parse a space-separated modulo label list from the metadata XML for a key
+/// ending in `|<name>|` (ZeissCZIReader:3733-3741, e.g. "...|Rotations|").
+/// The crate keeps metadata as a raw XML/key-value string, so we scan for the
+/// `<Key>...|Name|</Key><Value>label0 label1 ...</Value>` pairing heuristically.
+fn parse_modulo_labels(xml: &str, name: &str) -> Vec<String> {
+    if xml.is_empty() {
+        return Vec::new();
+    }
+    // Match an element whose tag name ends with the modulo name, e.g.
+    // <Rotations>a b c</Rotations>, which is how CZI metadata stores these axes.
+    let open_needle = format!("<{}>", name);
+    let close_needle = format!("</{}>", name);
+    if let Some(start) = xml.find(&open_needle) {
+        let value_start = start + open_needle.len();
+        if let Some(rel_end) = xml[value_start..].find(&close_needle) {
+            let value = &xml[value_start..value_start + rel_end];
+            let labels: Vec<String> = value
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            if labels.len() > 1 {
+                return labels;
+            }
+        }
+    }
+    Vec::new()
+}
+
+impl DimCounts {
+    /// Whether mosaics should be exposed as separate series rather than stitched.
+    /// Mirrors the assignPlaneIndices guard that only adds 'M' to the extra-dim
+    /// order when `mosaics <= seriesCount && (!prestitched || !autostitching)`.
+    /// This crate always allows autostitching, so mosaics are stitched whenever
+    /// there is more than one tile; they are exposed as series only when there is
+    /// genuinely no overlap to stitch (single mosaic). In practice this means
+    /// mosaics are always prestitched here.
+    fn mosaics_exposed_as_series(&self) -> bool {
+        false
+    }
+}
+
+/// Build the sorted resolution list for one series selection. Each "R" level
+/// becomes a resolution; the X/Y extent is the stitched bounding box of all
+/// subblocks matching the selection at that level (mosaic prestitching).
+fn compute_resolutions(
+    entries: &[DirEntry],
+    scene: Option<i32>,
+    acquisition: Option<i32>,
+    angle: Option<i32>,
+    mosaic: Option<i32>,
+    _prestitched: bool,
+    rotation_axis: bool,
+) -> Vec<CziResolution> {
+    // R-level -> (min_col, min_row, max_x_end, max_y_end)
+    //
+    // The stitched extent is the bounding box of all subblocks in the selection;
+    // this collapses to a single tile's size when there is only one tile, and to
+    // the full mosaic span when there are several (ZeissCZIReader prestitching /
+    // the calculateDimensions(s, true) min/max row-col logic at 1034-1076).
+    let mut buckets: HashMap<i32, (i64, i64, i64, i64)> = HashMap::new();
+    for e in entries {
+        if !entry_in_series(e, scene, acquisition, angle, mosaic) {
+            continue;
+        }
+        // When "R" is a rotation axis, its start indexes rotation (not resolution),
+        // so collapse every subblock into the single resolution bucket (R = 0).
+        let r = if rotation_axis { 0 } else { e.dim_start("R") };
+        let col = e.dim_start("X").max(0) as i64;
+        let row = e.dim_start("Y").max(0) as i64;
+        let x_size = e.dim_size("X").max(0) as i64;
+        let y_size = e.dim_size("Y").max(0) as i64;
+        let entry = buckets
+            .entry(r)
+            .or_insert((i64::MAX, i64::MAX, i64::MIN, i64::MIN));
+        entry.0 = entry.0.min(col);
+        entry.1 = entry.1.min(row);
+        entry.2 = entry.2.max(col + x_size);
+        entry.3 = entry.3.max(row + y_size);
+    }
+
+    let mut resolutions: Vec<CziResolution> = buckets
+        .into_iter()
+        .map(|(r, (min_c, min_r, max_x, max_y))| CziResolution {
+            r,
+            width: (max_x - min_c).max(0) as u32,
+            height: (max_y - min_r).max(0) as u32,
+        })
+        .collect();
+    resolutions.sort_by_key(|res| res.r);
+    if resolutions.is_empty() {
+        resolutions.push(CziResolution {
+            r: 0,
+            width: 0,
+            height: 0,
+        });
+    }
+    resolutions
+}
+
+/// Whether a directory entry belongs to the given series selection.
+fn entry_in_series(
+    e: &DirEntry,
+    scene: Option<i32>,
+    acquisition: Option<i32>,
+    angle: Option<i32>,
+    mosaic: Option<i32>,
+) -> bool {
+    let ok = |sel: Option<i32>, name: &str| -> bool {
+        match sel {
+            // Selector active: entry must match (or lack the dimension entirely,
+            // matching the "single position" fallback in calculateDimensions).
+            Some(v) => !e.has_dim(name) || e.dim_start(name) == v,
+            None => true,
+        }
+    };
+    ok(scene, "S") && ok(acquisition, "B") && ok(angle, "V") && ok(mosaic, "M")
 }
 
 // ---- decompression ---------------------------------------------------------
@@ -641,9 +1281,19 @@ pub struct CziReader {
     entries: Vec<DirEntry>,
     meta_xml: String,
     packed_spp: u32,
-    /// One series per scene (CZI "S" dimension); each has its own resolutions.
-    /// `series[i].scene` is the absolute "S" start that selects scene `i`.
+    /// One series per extra-dimension combination (scene/acquisition/angle/
+    /// mosaic/pixel-type). Each carries its own resolution list and selectors.
     series: Vec<CziSeries>,
+    /// Distinct CZI pixel-type codes (per-pixel-type core split).
+    pixel_types: Vec<i32>,
+    /// Mosaic ("M") tiles are stitched into a single image per series.
+    prestitched: bool,
+    /// Sub-dimension fold factors (rotations->Z, illuminations->C, phases->T).
+    rotations: u32,
+    illuminations: u32,
+    phases: u32,
+    /// True when "R" is the rotation axis folded into Z (vs. pyramid resolution).
+    rotation_axis: bool,
     current_series: usize,
     current_resolution: usize,
 }
@@ -657,6 +1307,12 @@ impl CziReader {
             meta_xml: String::new(),
             packed_spp: 1,
             series: Vec::new(),
+            pixel_types: Vec::new(),
+            prestitched: false,
+            rotations: 1,
+            illuminations: 1,
+            phases: 1,
+            rotation_axis: false,
             current_series: 0,
             current_resolution: 0,
         }
@@ -682,18 +1338,74 @@ impl CziReader {
 
     fn matching_entries(&self, plane_index: u32) -> Option<Vec<DirEntry>> {
         let (z, c, t) = self.plane_zct(plane_index)?;
-        let scene = self.series.get(self.current_series)?.scene;
-        let has_scene = self.series.len() > 1;
+        let series = self.series.get(self.current_series)?;
         let r = self.current_resolutions().get(self.current_resolution)?.r;
+
+        // Invert the modulo folding (ZeissCZIReader:2216-2223). The requested
+        // expanded z/c/t decompose into the per-subblock coordinate plus the
+        // rotation/illumination/phase sub-index. origZ = sizeZ / rotations etc.
+        let meta = self.meta.as_ref()?;
+        let orig_z = (meta.size_z / self.rotations.max(1)).max(1);
+        let orig_c = (meta.size_c / self.illuminations.max(1)).max(1);
+        let orig_t = (meta.size_t / self.phases.max(1)).max(1);
+        let rotation = z / orig_z; // R.start when rotation_axis
+        let z = z % orig_z;
+        let illum = c / orig_c; // I.start
+        let c = c % orig_c;
+        let phase = t / orig_t; // H.start
+        let t = t % orig_t;
+
+        // Per-pixel-type core split: the logical channel of an entry is its "C"
+        // start minus the pixel-type index (ZeissCZIReader:2152), so entries with
+        // the active pixel type carry channels [ptype*sizeC .. ). We select by the
+        // entry's pixel-type rank within the distinct list.
+        let want_pt = self.pixel_types.get(series.pixel_type_index).copied();
+        let multi_pt = self.pixel_types.len() > 1;
+        // Logical-channel offset for the per-pixel-type split (ZeissCZIReader:2152
+        // `c = dimension.start - plane.pixelTypeIndex`): the requested channel `c`
+        // corresponds to entry C-start `c + pixelTypeIndex`.
+        let c_with_offset = c + if multi_pt { series.pixel_type_index as u32 } else { 0 };
+
+        // "R" selects rotation (rotation_axis) or pyramid resolution otherwise.
+        let want_r = if self.rotation_axis {
+            rotation as i32
+        } else {
+            r
+        };
+        let match_r = |e: &DirEntry| -> bool {
+            if !e.has_dim("R") {
+                // Subblocks without an explicit R default to level/rotation 0.
+                want_r == 0
+            } else {
+                e.dim_start("R") == want_r
+            }
+        };
+        // Illumination ("I") and phase ("H") sub-index selectors. Subblocks lacking
+        // the dimension default to sub-index 0.
+        let match_sub = |e: &DirEntry, name: &str, want: u32| -> bool {
+            if !e.has_dim(name) {
+                want == 0
+            } else {
+                e.dim_start(name) as u32 == want
+            }
+        };
+
         let entries: Vec<DirEntry> = self
             .entries
             .iter()
             .filter(|e| {
-                // Match the active scene only when scenes exist; a file with a
-                // single (or absent) "S" dimension exposes every plane.
-                (!has_scene || e.dim_start("S") == scene)
-                    && e.dim_start("R") == r
-                    && e.matches_plane(z, c, t)
+                entry_in_series(e, series.scene, series.acquisition, series.angle, series.mosaic)
+                    && match_r(e)
+                    && (self.illuminations <= 1 || match_sub(e, "I", illum))
+                    && (self.phases <= 1 || match_sub(e, "H", phase))
+                    && e.matches_plane(z, c_with_offset, t)
+                    && (!multi_pt || want_pt == Some(e.pixel_type))
+                    // PALM: a series exposes only the subblock matching its stored
+                    // tile size (ZeissCZIReader:1155-1172).
+                    && series.palm_size.map_or(true, |(sx, sy)| {
+                        e.dim_stored_size("X").max(0) as u32 == sx
+                            && e.dim_stored_size("Y").max(0) as u32 == sy
+                    })
             })
             .cloned()
             .collect();
@@ -753,6 +1465,7 @@ impl CziReader {
         decompress_subblock(&compressed, entry.compression, tile_w, tile_h, max_bytes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble_entry(
         out: &mut [u8],
         out_width: u32,
@@ -760,9 +1473,11 @@ impl CziReader {
         tile: &[u8],
         entry: &DirEntry,
         pixel_bytes: usize,
+        off_x: i32,
+        off_y: i32,
     ) {
-        let tile_x = entry.dim_start("X").max(0) as u32;
-        let tile_y = entry.dim_start("Y").max(0) as u32;
+        let tile_x = (entry.dim_start("X").max(0) - off_x).max(0) as u32;
+        let tile_y = (entry.dim_start("Y").max(0) - off_y).max(0) as u32;
         let tile_w = entry.dim_stored_size("X").max(0) as u32;
         let tile_h = entry.dim_stored_size("Y").max(0) as u32;
         let copy_w = tile_w.min(out_width.saturating_sub(tile_x));
@@ -814,6 +1529,9 @@ impl FormatReader for CziReader {
             "czi_subblocks".into(),
             MetadataValue::Int(parsed.entries.len() as i64),
         );
+        if parsed.palm {
+            series_metadata.insert("czi_palm".into(), MetadataValue::Bool(true));
+        }
 
         let first = parsed.series.first();
         let (init_w, init_h, init_res_count) = first
@@ -837,13 +1555,19 @@ impl FormatReader for CziReader {
             resolution_count: init_res_count as u32,
             series_metadata,
             lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
+            modulo_z: parsed.modulo_z,
+            modulo_c: parsed.modulo_c,
+            modulo_t: parsed.modulo_t,
         });
         self.packed_spp = parsed.spp.max(1);
         self.entries = parsed.entries;
         self.series = parsed.series;
+        self.pixel_types = parsed.pixel_types;
+        self.prestitched = parsed.prestitched;
+        self.rotations = parsed.rotations.max(1) as u32;
+        self.illuminations = parsed.illuminations.max(1) as u32;
+        self.phases = parsed.phases.max(1) as u32;
+        self.rotation_axis = parsed.rotation_axis;
         self.current_series = 0;
         self.current_resolution = 0;
         self.meta_xml = parsed.meta_xml;
@@ -858,6 +1582,12 @@ impl FormatReader for CziReader {
         self.meta_xml.clear();
         self.packed_spp = 1;
         self.series.clear();
+        self.pixel_types.clear();
+        self.prestitched = false;
+        self.rotations = 1;
+        self.illuminations = 1;
+        self.phases = 1;
+        self.rotation_axis = false;
         self.current_series = 0;
         self.current_resolution = 0;
         Ok(())
@@ -900,6 +1630,18 @@ impl FormatReader for CziReader {
         let pixel_bytes = self.packed_spp as usize * bps;
         let mut out = vec![0; expected];
 
+        // Prestitching: normalize tile placement so the minimum tile col/row maps
+        // to the stitched-image origin (ZeissCZIReader.openBytes:435-439). A tile
+        // whose stored size already equals the full image is placed at (0,0).
+        let (min_col, min_row) = if self.prestitched {
+            entries.iter().fold((i32::MAX, i32::MAX), |(mc, mr), e| {
+                (mc.min(e.dim_start("X")), mr.min(e.dim_start("Y")))
+            })
+        } else {
+            (0, 0)
+        };
+        let (min_col, min_row) = (min_col.max(0), min_row.max(0));
+
         for entry in entries {
             let tile_w = entry.dim_stored_size("X").max(0) as usize;
             let tile_h = entry.dim_stored_size("Y").max(0) as usize;
@@ -907,6 +1649,15 @@ impl FormatReader for CziReader {
             let mut tile = Self::read_subblock(path, &entry, pixel_bytes)?;
             tile.truncate(tile_expected);
             tile.resize(tile_expected, 0);
+            // Place the tile at its normalized position. When a tile's stored size
+            // already spans the whole stitched image, it sits at the origin.
+            let full_tile =
+                self.prestitched && tile_w as u32 == meta.size_x && tile_h as u32 == meta.size_y;
+            let (off_x, off_y) = if full_tile {
+                (0, 0)
+            } else {
+                (min_col, min_row)
+            };
             Self::assemble_entry(
                 &mut out,
                 meta.size_x,
@@ -914,6 +1665,8 @@ impl FormatReader for CziReader {
                 &tile,
                 &entry,
                 pixel_bytes,
+                off_x,
+                off_y,
             );
         }
         if meta.is_rgb && self.packed_spp >= 3 {
@@ -1047,6 +1800,30 @@ mod tests {
         entry
     }
 
+    /// Directory entry carrying X/Y tile placement plus one extra dimension
+    /// (e.g. "M" mosaic, "B" acquisition, "V" angle) with the given start.
+    /// Used to exercise mosaic stitching and the extra-dimension series split.
+    fn directory_entry_extra(
+        pixel_type: i32,
+        x_start: i32,
+        y_start: i32,
+        x_size: i32,
+        y_size: i32,
+        extra_dim: &str,
+        extra_start: i32,
+    ) -> Vec<u8> {
+        let mut entry = vec![0; 256];
+        put_i32(&mut entry, 2, pixel_type);
+        put_i32(&mut entry, 18, 0);
+        put_i32(&mut entry, 28, 5);
+        entry[32..52].copy_from_slice(&dimension_entry("X", x_start, x_size));
+        entry[52..72].copy_from_slice(&dimension_entry("Y", y_start, y_size));
+        entry[72..92].copy_from_slice(&dimension_entry("C", 0, 1));
+        entry[92..112].copy_from_slice(&dimension_entry("R", 0, 1));
+        entry[112..132].copy_from_slice(&dimension_entry(extra_dim, extra_start, 1));
+        entry
+    }
+
     /// Directory entry carrying an explicit scene ("S") dimension, used to test
     /// the multi-series scene split (one series per S position).
     fn directory_entry_scene(
@@ -1064,6 +1841,28 @@ mod tests {
         entry[32..52].copy_from_slice(&dimension_entry("X", 0, x_size));
         entry[52..72].copy_from_slice(&dimension_entry("Y", 0, y_size));
         entry[72..92].copy_from_slice(&dimension_entry("C", 0, 1));
+        entry[92..112].copy_from_slice(&dimension_entry("R", 0, 1));
+        entry[112..132].copy_from_slice(&dimension_entry("S", scene, 1));
+        entry
+    }
+
+    /// Directory entry carrying both a scene ("S") and a Z dimension, used to
+    /// exercise the mosaic image-fusion series rebalancing
+    /// (ZeissCZIReader:941-960).
+    fn directory_entry_scene_z(
+        pixel_type: i32,
+        scene: i32,
+        z: i32,
+        x_size: i32,
+        y_size: i32,
+    ) -> Vec<u8> {
+        let mut entry = vec![0; 256];
+        put_i32(&mut entry, 2, pixel_type);
+        put_i32(&mut entry, 18, 0);
+        put_i32(&mut entry, 28, 5);
+        entry[32..52].copy_from_slice(&dimension_entry("X", 0, x_size));
+        entry[52..72].copy_from_slice(&dimension_entry("Y", 0, y_size));
+        entry[72..92].copy_from_slice(&dimension_entry("Z", z, 1));
         entry[92..112].copy_from_slice(&dimension_entry("R", 0, 1));
         entry[112..132].copy_from_slice(&dimension_entry("S", scene, 1));
         entry
@@ -1185,6 +1984,71 @@ mod tests {
             let used_size = (SEG_HEADER + 256 + pixels.len()) as u64;
             data.extend_from_slice(&segment_header("ZISRAWSUBBLOCK", used_size));
             // 256-byte fixed body: 16-byte size header followed by 240 reserved bytes.
+            let mut subblock_body = vec![0; 256];
+            put_u64(&mut subblock_body, 8, pixels.len() as u64);
+            data.extend_from_slice(&subblock_body);
+            data.extend_from_slice(pixels);
+        }
+
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&data).unwrap();
+        path
+    }
+
+    /// Like `write_synthetic_czi_entries` but also writes a metadata (ZISRAWMETADATA)
+    /// segment carrying `xml`, wiring its file-header offset so `set_id` parses it.
+    /// Used to exercise XML-guided behavior (PALM detection, modulo labels).
+    fn write_synthetic_czi_with_xml(
+        name: &str,
+        entries_and_pixels: Vec<(Vec<u8>, Vec<u8>)>,
+        xml: &str,
+    ) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_czi_{name}_{}_{}.czi",
+            std::process::id(),
+            entries_and_pixels.len()
+        ));
+        let file_header_size = SEG_HEADER + 80;
+        let dir_size = SEG_HEADER + 128 + entries_and_pixels.len() * 256;
+        let xml_bytes = xml.as_bytes();
+        // Metadata segment: header + 256-byte body header (xml_size at off 0) + xml.
+        let meta_size = SEG_HEADER + 256 + xml_bytes.len();
+        let dir_pos = file_header_size as u64;
+        let meta_pos = (file_header_size + dir_size) as u64;
+        let mut subblock_pos = (file_header_size + dir_size + meta_size) as u64;
+        let mut entries = Vec::new();
+
+        for (mut entry, pixels) in entries_and_pixels {
+            put_i64(&mut entry, 6, subblock_pos as i64);
+            subblock_pos += (SEG_HEADER + 256 + pixels.len()) as u64;
+            entries.push((entry, pixels));
+        }
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&segment_header("ZISRAWFILE", file_header_size as u64));
+        let mut file_header = vec![0; 80];
+        put_u64(&mut file_header, 36, dir_pos);
+        put_u64(&mut file_header, 44, meta_pos);
+        data.extend_from_slice(&file_header);
+
+        data.extend_from_slice(&segment_header("ZISRAWDIRECTORY", dir_size as u64));
+        let mut dir_header = vec![0; 128];
+        put_i32(&mut dir_header, 0, entries.len() as i32);
+        data.extend_from_slice(&dir_header);
+        for (entry, _) in &entries {
+            data.extend_from_slice(entry);
+        }
+
+        // Metadata segment.
+        data.extend_from_slice(&segment_header("ZISRAWMETADATA", meta_size as u64));
+        let mut meta_body = vec![0; 256];
+        put_i32(&mut meta_body, 0, xml_bytes.len() as i32);
+        data.extend_from_slice(&meta_body);
+        data.extend_from_slice(xml_bytes);
+
+        for (_entry, pixels) in &entries {
+            let used_size = (SEG_HEADER + 256 + pixels.len()) as u64;
+            data.extend_from_slice(&segment_header("ZISRAWSUBBLOCK", used_size));
             let mut subblock_body = vec![0; 256];
             put_u64(&mut subblock_body, 8, pixels.len() as u64);
             data.extend_from_slice(&subblock_body);
@@ -1390,6 +2254,288 @@ mod tests {
         assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
 
         assert!(reader.set_series(2).is_err());
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_prestitches_mosaic_tiles_into_single_series() {
+        // Four mosaic tiles (M=0..3) laid out 2x2 with absolute X/Y placement.
+        // ZeissCZIReader collapses the mosaic ("M") dimension into a single
+        // prestitched image (seriesCount stays 1, dimensions span all tiles).
+        let entries = vec![
+            (directory_entry_extra(0, 0, 0, 2, 1, "M", 0), vec![1, 2]),
+            (directory_entry_extra(0, 2, 0, 2, 1, "M", 1), vec![3, 4]),
+            (directory_entry_extra(0, 0, 1, 2, 1, "M", 2), vec![5, 6]),
+            (directory_entry_extra(0, 2, 1, 2, 1, "M", 3), vec![7, 8]),
+        ];
+        let path = write_synthetic_czi_entries("mosaic_M_prestitch", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        // Mosaics are stitched, not exposed as separate series.
+        assert_eq!(reader.series_count(), 1);
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y), (4, 2));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_prestitches_mosaic_with_nonzero_origin() {
+        // Mosaic tiles whose absolute X/Y origin is not 0: the prestitching
+        // normalization subtracts the minimum tile col/row so the stitched image
+        // starts at (0,0) (ZeissCZIReader.openBytes tile.x -= minTileX).
+        let entries = vec![
+            (directory_entry_extra(0, 10, 20, 2, 1, "M", 0), vec![1, 2]),
+            (directory_entry_extra(0, 12, 20, 2, 1, "M", 1), vec![3, 4]),
+        ];
+        let path = write_synthetic_czi_entries("mosaic_M_origin", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y), (4, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_splits_acquisitions_into_separate_series() {
+        // Two acquisitions (B=0, B=1). ZeissCZIReader.calculateDimensions sets
+        // acquisitions = maxB + 1 and seriesCount = positions * acquisitions *
+        // angles, so each B becomes its own series.
+        let entries = vec![
+            (directory_entry_extra(0, 0, 0, 2, 1, "B", 0), vec![1, 2]),
+            (directory_entry_extra(0, 0, 0, 2, 1, "B", 1), vec![3, 4]),
+        ];
+        let path = write_synthetic_czi_entries("acq_series", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_splits_angles_into_separate_series() {
+        // Two angles (V=0, V=1) -> two series (angles = maxV + 1).
+        let entries = vec![
+            (directory_entry_extra(0, 0, 0, 2, 1, "V", 0), vec![1, 2]),
+            (directory_entry_extra(0, 0, 0, 2, 1, "V", 1), vec![3, 4]),
+        ];
+        let path = write_synthetic_czi_entries("angle_series", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_fuses_mosaic_collapses_series_count() {
+        // Mosaic image-fusion series rebalancing (ZeissCZIReader:941-960).
+        //
+        // Two scenes (S=0, S=1) are declared, each carrying a distinct Z plane, so
+        // the dimension scan yields positions = 2 and sizeZ = 2. The expected plane
+        // budget is imageCount(=sizeZ=2) * seriesCount(=positions=2) = 4, but the
+        // file only stores 2 fused planes. ZeissCZIReader detects this
+        // (imageCount * seriesCount > planes.size() * scanDim, i.e. 4 > 2) and,
+        // because planes.size() == imageCount (2 == 2), collapses everything to a
+        // single series (positions = acquisitions = mosaics = angles = seriesCount
+        // = 1, ZeissCZIReader:952-960). Without this rebalancing the reader would
+        // wrongly expose 2 scene series for a fused acquisition.
+        let entries = vec![
+            (directory_entry_scene_z(0, 0, 0, 2, 1), vec![1, 2]),
+            (directory_entry_scene_z(0, 1, 1, 2, 1), vec![3, 4]),
+        ];
+        let path = write_synthetic_czi_entries("fused_collapse", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        // Series collapsed to one; the single series matches both subblocks.
+        assert_eq!(reader.series_count(), 1);
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y), (2, 1));
+        assert_eq!((meta.size_z, meta.size_c, meta.size_t), (2, 1, 1));
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 4]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Directory entry carrying an explicit Z dimension plus a rotation ("R")
+    /// dimension at the given rotation index. Each subblock is one rotation
+    /// (R.size == 1, distinct starts, equal X size), which the reader detects as a
+    /// rotation axis because the R levels are not downscaled (no pyramid).
+    fn directory_entry_rotation(z: i32, r_start: i32, x_size: i32, y_size: i32) -> Vec<u8> {
+        let mut entry = vec![0; 256];
+        put_i32(&mut entry, 2, 0); // Gray8
+        put_i32(&mut entry, 18, 0);
+        put_i32(&mut entry, 28, 5);
+        entry[32..52].copy_from_slice(&dimension_entry("X", 0, x_size));
+        entry[52..72].copy_from_slice(&dimension_entry("Y", 0, y_size));
+        entry[72..92].copy_from_slice(&dimension_entry("C", 0, 1));
+        entry[92..112].copy_from_slice(&dimension_entry("Z", z, 1));
+        entry[112..132].copy_from_slice(&dimension_entry("R", r_start, 1));
+        entry
+    }
+
+    #[test]
+    fn czi_rotation_folds_into_modulo_z() {
+        // ZeissCZIReader treats the "R" dimension as a rotation axis (size > 1) and
+        // exposes it as a moduloZ annotation, multiplying sizeZ by the rotation
+        // count (ZeissCZIReader:846-849) and folding the plane index via
+        // z = r * (sizeZ / rotations) + z (ZeissCZIReader:2216-2217).
+        //
+        // Two real Z planes (Z=0,1) each acquired at two rotations (R=0,1, size 2):
+        //   expanded Z order is rotation-major:
+        //     z=0 -> rot=0,Z=0 ; z=1 -> rot=0,Z=1 ; z=2 -> rot=1,Z=0 ; z=3 -> rot=1,Z=1
+        let entries = vec![
+            (directory_entry_rotation(0, 0, 2, 1), vec![10, 11]),
+            (directory_entry_rotation(1, 0, 2, 1), vec![12, 13]),
+            (directory_entry_rotation(0, 1, 2, 1), vec![20, 21]),
+            (directory_entry_rotation(1, 1, 2, 1), vec![22, 23]),
+        ];
+        let path = write_synthetic_czi_entries("rotation_modulo_z", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        // rotations = maxRotation - minRotation = (0+2) - 0 = 2; sizeZ = 2 * 2 = 4.
+        assert_eq!(meta.size_z, 4);
+        assert_eq!(meta.image_count, 4);
+        // Rotation is exposed as a single resolution, not a pyramid.
+        assert_eq!(reader.resolution_count(), 1);
+        let mz = meta.modulo_z.as_ref().expect("moduloZ annotation");
+        assert_eq!(mz.parent_dimension, "Z");
+        assert_eq!(mz.modulo_type, "rotation");
+        assert_eq!(mz.step, 2.0); // original sizeZ
+        assert_eq!(mz.end, 2.0); // sizeZ * (rotations - 1)
+
+        // Plane order: XYCZT with z fastest after c. sizeC=1 so plane==z.
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 11]); // rot0 z0
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![12, 13]); // rot0 z1
+        assert_eq!(reader.open_bytes(2).unwrap(), vec![20, 21]); // rot1 z0
+        assert_eq!(reader.open_bytes(3).unwrap(), vec![22, 23]); // rot1 z1
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_r_size_one_stays_pyramid_not_rotation() {
+        // Regression guard: when R.size == 1 (the crate's pyramid repurposing),
+        // distinct R starts must remain resolution levels and NOT be folded into Z.
+        let entries = vec![
+            (
+                directory_entry_dims(0, 0, 0, 0, 0, 4, 2, 0),
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            (directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 1), vec![9, 10]),
+        ];
+        let path = write_synthetic_czi_entries("r_size_one_pyramid", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!(meta.size_z, 1); // not multiplied by rotation
+        assert!(meta.modulo_z.is_none());
+        assert_eq!(reader.resolution_count(), 2); // pyramid preserved
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_check_palm_detects_lsmtag_and_palmslider() {
+        // ZeissCZIReader.checkPALM: LsmTag Name starting with "palm" (case-insens.).
+        assert!(check_palm(
+            r#"<CustomAttributes><LsmTag Name="PALMExperiment">x</LsmTag></CustomAttributes>"#
+        ));
+        // ...or a PalmSlider element whose text content is "true".
+        assert!(check_palm(
+            "<TrackSetup><PalmSlider>true</PalmSlider></TrackSetup>"
+        ));
+        // Negative cases.
+        assert!(!check_palm("<TrackSetup><PalmSlider>false</PalmSlider></TrackSetup>"));
+        assert!(!check_palm(r#"<LsmTag Name="Gain">3</LsmTag>"#));
+        assert!(!check_palm(""));
+    }
+
+    #[test]
+    fn czi_parse_modulo_labels_splits_on_whitespace() {
+        // ZeissCZIReader:3733-3741 splits the "...|Rotations|" value on spaces.
+        let xml = "<Rotations>0 90 180 270</Rotations><Phases>a b</Phases>";
+        assert_eq!(
+            parse_modulo_labels(xml, "Rotations"),
+            vec!["0", "90", "180", "270"]
+        );
+        assert_eq!(parse_modulo_labels(xml, "Phases"), vec!["a", "b"]);
+        // Single (or no) label yields an empty list (no modulo labeling).
+        assert!(parse_modulo_labels("<Rotations>0</Rotations>", "Rotations").is_empty());
+        assert!(parse_modulo_labels("", "Rotations").is_empty());
+    }
+
+    #[test]
+    fn czi_palm_splits_two_planes_by_stored_size() {
+        // ZeissCZIReader PALM heuristic (1123-1193): <= 2 planes, imageCount <= 2,
+        // checkPALM(xml) true, and the two planes have *different* stored sizes ->
+        // split into two single-channel series, each sized to its own tile.
+        let palm_xml = "<TrackSetup><PalmSlider>true</PalmSlider></TrackSetup>";
+        // Both planes at C=0; PALM distinguishes the two series purely by the
+        // stored tile size, not by channel (ZeissCZIReader recomputes planeIndex).
+        let entries = vec![
+            (directory_entry(0, 0, 0, 2, 1), vec![1, 2]),
+            (directory_entry(0, 0, 0, 4, 1), vec![3, 4, 5, 6]),
+        ];
+        let path = write_synthetic_czi_with_xml("palm_split", entries, palm_xml);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        // PALM forces sizeC = 1 and exposes two series (one per distinct size).
+        assert_eq!(reader.series_count(), 2);
+        let meta = reader.metadata();
+        assert_eq!(meta.size_c, 1);
+        assert_eq!((meta.size_x, meta.size_y), (2, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+
+        reader.set_series(1).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y), (4, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4, 5, 6]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_palm_same_size_pair_is_not_palm() {
+        // Same-size pair => not PALM; revert to a single 2-channel series
+        // (ZeissCZIReader:1174-1192).
+        let palm_xml = "<TrackSetup><PalmSlider>true</PalmSlider></TrackSetup>";
+        let entries = vec![
+            (directory_entry(0, 0, 0, 2, 1), vec![1, 2]),
+            (directory_entry(0, 0, 1, 2, 1), vec![3, 4]),
+        ];
+        let path = write_synthetic_czi_with_xml("palm_same_size", entries, palm_xml);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        let meta = reader.metadata();
+        assert_eq!(meta.size_c, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 4]);
 
         fs::remove_file(path).unwrap();
     }

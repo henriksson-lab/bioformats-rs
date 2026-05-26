@@ -37,9 +37,16 @@ struct PFile {
 }
 
 /// A `<Frame>` element: one focal-plane (or time) sample, holding one file per
-/// active channel.
+/// active channel, plus the per-frame stage position (Java `Frame.getPositionX/Y/Z`).
 struct PFrame {
+    /// `index` attribute of the `<Frame>` (Java `Frame.getIndex()`).
+    index: i32,
     files: Vec<PFile>,
+    /// Stage X/Y/Z from `<PVStateValue key="positionCurrent">` SubindexedValues,
+    /// or pre-5.2 `positionCurrent_XAxis` Keys, or `<Frame>` position attrs.
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    pos_z: Option<f64>,
 }
 
 impl PFrame {
@@ -58,24 +65,52 @@ struct Sequence {
     frames: Vec<PFrame>,
 }
 
+impl Sequence {
+    /// Smallest `index` attribute among the frames (Java `Sequence.getIndexMin`).
+    fn index_min(&self) -> i32 {
+        self.frames.iter().map(|f| f.index).min().unwrap_or(0)
+    }
+    /// `indexMax - indexMin + 1` (Java `Sequence.getIndexCount`).
+    fn index_count(&self) -> i32 {
+        match (
+            self.frames.iter().map(|f| f.index).min(),
+            self.frames.iter().map(|f| f.index).max(),
+        ) {
+            (Some(lo), Some(hi)) => hi - lo + 1,
+            _ => self.frames.len() as i32,
+        }
+    }
+    /// Frame whose `index` attribute equals `index` (Java `Sequence.getFrame`).
+    fn frame(&self, index: i32) -> Option<&PFrame> {
+        self.frames.iter().find(|f| f.index == index)
+    }
+}
+
 pub struct PrairieReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    /// Per-series core metadata (one entry per stage position).
+    metas: Vec<ImageMetadata>,
+    series: usize,
     sequences: Vec<Sequence>,
     /// Sorted active channel indices.
     channels: Vec<i32>,
-    /// Whether frames act as time points rather than focal planes.
-    frames_are_time: bool,
+    /// Whether frames act as time points rather than focal planes; one flag per
+    /// series (parallel to `metas`), mirroring Java `framesAreTime[]`.
+    frames_are_time: Vec<bool>,
+    /// Number of stage positions == series count (Java `seriesCount`).
+    size_p: usize,
 }
 
 impl PrairieReader {
     pub fn new() -> Self {
         PrairieReader {
             path: None,
-            meta: None,
+            metas: Vec::new(),
+            series: 0,
             sequences: Vec::new(),
             channels: Vec::new(),
-            frames_are_time: false,
+            frames_are_time: Vec::new(),
+            size_p: 1,
         }
     }
 }
@@ -131,8 +166,21 @@ fn find_prairie_xml(path: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Parse the PrairieView XML into sequences/frames/files plus core metadata.
-fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<Sequence>, Vec<i32>, bool)> {
+/// Result of parsing a PrairieView XML document: one core `ImageMetadata` per
+/// stage position (series), the rasterized sequences, the active channels, the
+/// per-series `framesAreTime` flags, and the (sizeP, sizeT) split.
+struct PrairieParse {
+    metas: Vec<ImageMetadata>,
+    sequences: Vec<Sequence>,
+    channels: Vec<i32>,
+    frames_are_time: Vec<bool>,
+    size_p: usize,
+    size_t: usize,
+}
+
+/// Parse the PrairieView XML into sequences/frames/files plus per-series core
+/// metadata.
+fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
     let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
     let dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
 
@@ -220,6 +268,12 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<Sequence>, Vec<i
     let mut active_channels: BTreeSet<i32> = BTreeSet::new();
     let mut cur_seq: Option<Sequence> = None;
     let mut cur_frame: Option<PFrame> = None;
+    let mut next_frame_index: i32 = 0;
+    // State for parsing a `<PVStateValue key="positionCurrent">` block (5.2+):
+    // which axis the current `<SubindexedValues>`/`<IndexedValue>` belongs to,
+    // and whether we are inside the positionCurrent block at all.
+    let mut in_position_block = false;
+    let mut cur_axis: Option<char> = None;
 
     for raw in content.lines() {
         let line = raw.trim();
@@ -236,9 +290,12 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<Sequence>, Vec<i
             }
             let ty = extract_attr(line, "type").unwrap_or("");
             cur_seq = Some(Sequence {
-                is_time_series: ty.to_ascii_lowercase().contains("tseries"),
+                // Java: isTimeSeries() == ("TSeries Timed Element".equals(type)).
+                is_time_series: ty == "TSeries Timed Element"
+                    || ty.to_ascii_lowercase().contains("tseries"),
                 frames: Vec::new(),
             });
+            next_frame_index = 0;
         }
 
         if line.contains("</Sequence>") {
@@ -265,7 +322,108 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<Sequence>, Vec<i
                     frames: Vec::new(),
                 });
             }
-            cur_frame = Some(PFrame { files: Vec::new() });
+            // `index` attribute, or sequential fallback (Java requires it but we
+            // tolerate its absence in synthetic data).
+            let index = extract_attr(line, "index")
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(next_frame_index);
+            next_frame_index = index + 1;
+            in_position_block = false;
+            cur_axis = None;
+            cur_frame = Some(PFrame {
+                index,
+                files: Vec::new(),
+                // `<Frame>` position attributes act as a fallback for the
+                // SubindexedValues form below.
+                pos_x: extract_attr(line, "positionX").and_then(|v| v.parse().ok()),
+                pos_y: extract_attr(line, "positionY").and_then(|v| v.parse().ok()),
+                pos_z: extract_attr(line, "positionZ").and_then(|v| v.parse().ok()),
+            });
+        }
+
+        // ── Per-frame stage position parsing ───────────────────────────────
+        // Java reads Frame.getPositionX/Y/Z from a `positionCurrent` value
+        // table. We capture it from the line-based XML in three forms.
+        if cur_frame.is_some() {
+            // pre-5.2 single Keys: <Key key="positionCurrent_XAxis" value=".."/>
+            if line.contains("<Key") {
+                if let (Some(key), Some(val)) =
+                    (extract_attr(line, "key"), extract_attr(line, "value"))
+                {
+                    if let Some(rest) = key.strip_prefix("positionCurrent_") {
+                        if let Ok(v) = val.split(',').next().unwrap_or(val).parse::<f64>() {
+                            if let Some(f) = cur_frame.as_mut() {
+                                match rest {
+                                    "XAxis" => f.pos_x = Some(v),
+                                    "YAxis" => f.pos_y = Some(v),
+                                    "ZAxis" => f.pos_z = Some(v),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5.2+ block start/end.
+            if line.contains("key=\"positionCurrent\"") {
+                in_position_block = true;
+                cur_axis = None;
+                // Inline IndexedValue on the same line is handled below.
+            }
+            if line.contains("</PVStateValue>") {
+                in_position_block = false;
+                cur_axis = None;
+            }
+
+            if in_position_block {
+                // Track the axis declared by <SubindexedValues index="XAxis">.
+                if line.contains("<SubindexedValues") {
+                    cur_axis = match extract_attr(line, "index") {
+                        Some("XAxis") => Some('x'),
+                        Some("YAxis") => Some('y'),
+                        Some("ZAxis") => Some('z'),
+                        _ => None,
+                    };
+                }
+                // First <SubindexedValue subindex="0" value=".."> per axis is the
+                // value Java's single-entry ValueTable short-circuit returns.
+                if line.contains("<SubindexedValue ") {
+                    let is_zero = extract_attr(line, "subindex")
+                        .map(|s| s == "0")
+                        .unwrap_or(true);
+                    if is_zero {
+                        if let (Some(axis), Some(val)) =
+                            (cur_axis, extract_attr(line, "value").and_then(|v| v.parse::<f64>().ok()))
+                        {
+                            if let Some(f) = cur_frame.as_mut() {
+                                match axis {
+                                    'x' if f.pos_x.is_none() => f.pos_x = Some(val),
+                                    'y' if f.pos_y.is_none() => f.pos_y = Some(val),
+                                    'z' if f.pos_z.is_none() => f.pos_z = Some(val),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                // 5.2+ <IndexedValue index="XAxis" value=".."/> form.
+                if line.contains("<IndexedValue") {
+                    if let (Some(idx), Some(val)) = (
+                        extract_attr(line, "index"),
+                        extract_attr(line, "value").and_then(|v| v.parse::<f64>().ok()),
+                    ) {
+                        if let Some(f) = cur_frame.as_mut() {
+                            match idx {
+                                "XAxis" => f.pos_x = Some(val),
+                                "YAxis" => f.pos_y = Some(val),
+                                "ZAxis" => f.pos_z = Some(val),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if line.contains("<File") {
@@ -296,7 +454,14 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<Sequence>, Vec<i
                             frames: Vec::new(),
                         });
                     }
-                    cur_frame = Some(PFrame { files: Vec::new() });
+                    cur_frame = Some(PFrame {
+                        index: next_frame_index,
+                        files: Vec::new(),
+                        pos_x: None,
+                        pos_y: None,
+                        pos_z: None,
+                    });
+                    next_frame_index += 1;
                 }
                 if let Some(frame) = cur_frame.as_mut() {
                     frame.files.push(pfile);
@@ -323,24 +488,13 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<Sequence>, Vec<i
     let channels: Vec<i32> = active_channels.into_iter().collect();
     let size_c = channels.len().max(1) as u32;
 
-    // sequenceCount = sizeT * seriesCount; for a single series we treat all
-    // sequences as time points. indexCount = frames in the first sequence.
-    let sequence_count = sequences.len().max(1) as u32;
-    let index_count = sequences
-        .first()
-        .map(|s| s.frames.len())
-        .unwrap_or(0)
-        .max(1) as u32;
-
-    // framesAreTime: single TSeries sequence -> frames are time points.
-    let frames_are_time = sequence_count == 1
-        && sequences.first().map(|s| s.is_time_series).unwrap_or(false);
-
-    let (size_z, size_t) = if frames_are_time {
-        (1u32, index_count)
-    } else {
-        (index_count, sequence_count)
-    };
+    // NB: Both stage positions and time points are rasterized into the list of
+    // Sequences. So sequenceCount = sizeT * seriesCount (Java
+    // populateCoreMetadata). We separate the two by comparing per-frame stage
+    // positions (Java computeSizeT / positionsMatch).
+    let sequence_count = sequences.len().max(1);
+    let size_t = compute_size_t(&sequences, sequence_count);
+    let size_p = sequence_count / size_t.max(1); // seriesCount
 
     // Derive pixel type / dimensions from the first available TIFF.
     let mut pixel_type = match bits {
@@ -384,8 +538,6 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<Sequence>, Vec<i
         bits = 16;
     }
 
-    let image_count = size_z * size_c * size_t;
-
     // Original metadata Java populates in populateOriginalMetadata.
     meta_map.insert(
         "sequenceCount".into(),
@@ -396,29 +548,120 @@ fn parse_prairie_xml(path: &Path) -> Result<(ImageMetadata, Vec<Sequence>, Vec<i
         MetadataValue::Int(size_c as i64),
     );
 
-    let meta = ImageMetadata {
-        size_x: width,
-        size_y: height,
-        size_z,
-        size_c,
-        size_t,
-        pixel_type,
-        bits_per_pixel: bits as u8,
-        image_count,
-        dimension_order: DimensionOrder::XYCZT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian,
-        resolution_count: 1,
-        series_metadata: meta_map,
-        lookup_table: None,
-        modulo_z: None,
-        modulo_c: None,
-        modulo_t: None,
-    };
+    // Build one CoreMetadata (ImageMetadata) per stage position (series).
+    // Rasterization order is sequences[sizeP * t + p]; for series s the first
+    // sequence is sequences[s] (t == 0).
+    let mut metas: Vec<ImageMetadata> = Vec::with_capacity(size_p);
+    let mut frames_are_time: Vec<bool> = Vec::with_capacity(size_p);
+    for s in 0..size_p {
+        // sequences[sizeP * t + s] with t == 0
+        let seq = &sequences[s];
+        let index_count = seq.index_count().max(1) as u32;
+        // framesAreTime: sequence is a TSeries and there is only one time point.
+        let fat = seq.is_time_series && size_t == 1;
+        frames_are_time.push(fat);
 
-    Ok((meta, sequences, channels, frames_are_time))
+        let (size_z, this_size_t) = if fat {
+            (1u32, index_count)
+        } else {
+            (index_count, size_t as u32)
+        };
+        let image_count = size_z * size_c * this_size_t;
+
+        let mut sm = meta_map.clone();
+        sm.insert("cycle".into(), MetadataValue::Int(s as i64));
+        sm.insert("indexCount".into(), MetadataValue::Int(index_count as i64));
+
+        metas.push(ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z,
+            size_c,
+            size_t: this_size_t,
+            pixel_type,
+            bits_per_pixel: bits as u8,
+            image_count,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian,
+            resolution_count: 1,
+            series_metadata: sm,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+    }
+
+    Ok(PrairieParse {
+        metas,
+        sequences,
+        channels,
+        frames_are_time,
+        size_p,
+        size_t,
+    })
+}
+
+/// Whether two optional positions are equal (Java `equal(Length, Length)`):
+/// both null is equal; one null is not equal.
+fn pos_eq(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Scan the parsed sequences to separate time points from stage positions
+/// (Java `computeSizeT`). Returns the number of time points `sizeT`; the number
+/// of stage positions (series) is `sequenceCount / sizeT`.
+fn compute_size_t(sequences: &[Sequence], sequence_count: usize) -> usize {
+    // Guess at different possible "spans" for the rasterization.
+    for size_p in 1..=sequence_count {
+        if sequence_count % size_p != 0 {
+            continue; // not a valid combo
+        }
+        let size_t = sequence_count / size_p;
+        if positions_match(sequences, size_t, size_p) {
+            return size_t;
+        }
+    }
+    1
+}
+
+/// Verify that stage coordinates match for all (P, Z) across time (Java
+/// `positionsMatch`). Rasterization order is XYCZpT, so
+/// `sequence(t, p, sizeP) = sequences[sizeP * t + p]`.
+fn positions_match(sequences: &[Sequence], size_t: usize, size_p: usize) -> bool {
+    for p in 0..size_p {
+        // sequences[sizeP * t + p] with t == 0
+        let initial_sequence = &sequences[p];
+        let index_min = initial_sequence.index_min();
+        let index_count = initial_sequence.index_count();
+        for z in 0..index_count {
+            let index = z + index_min;
+            let Some(initial_frame) = initial_sequence.frame(index) else {
+                break;
+            };
+            let (xi, yi, zi) = (initial_frame.pos_x, initial_frame.pos_y, initial_frame.pos_z);
+            for t in 1..size_t {
+                let seq = &sequences[size_p * t + p];
+                let Some(frame) = seq.frame(index) else {
+                    continue;
+                };
+                if !pos_eq(frame.pos_x, xi)
+                    || !pos_eq(frame.pos_y, yi)
+                    || !pos_eq(frame.pos_z, zi)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Compute (z, c, t) for a plane index under XYCZT order.
@@ -432,18 +675,23 @@ fn zct_xyczt(index: u32, size_z: u32, size_c: u32, _size_t: u32) -> (u32, u32, u
 }
 
 impl PrairieReader {
-    /// Resolve the (file path, page) for a plane index, mirroring Java's
-    /// sequence/frame/channel lookup.
+    /// Resolve the (file path, page) for a plane index in the current series,
+    /// mirroring Java's sequence/frame/channel lookup.
     fn file_for_plane(&self, plane_index: u32) -> Option<(PathBuf, u32)> {
-        let meta = self.meta.as_ref()?;
+        let s = self.series;
+        let meta = self.metas.get(s)?;
         let (z, c, t) = zct_xyczt(plane_index, meta.size_z, meta.size_c, meta.size_t);
+        let frames_are_time = *self.frames_are_time.get(s).unwrap_or(&false);
 
-        // sequence = time point t (or 0 if frames are time points)
-        let seq_idx = if self.frames_are_time { 0 } else { t as usize };
+        // sequence(t, s): actualT = framesAreTime ? 0 : t; index = sizeP*actualT + s.
+        let actual_t = if frames_are_time { 0 } else { t as usize };
+        let seq_idx = self.size_p * actual_t + s;
         let sequence = self.sequences.get(seq_idx)?;
 
-        let frame_idx = if self.frames_are_time { t } else { z } as usize;
-        let frame = sequence.frames.get(frame_idx)?;
+        // frameIndex(seq, z, t, s) = (framesAreTime ? t : z) + indexMin.
+        let frame_attr_index =
+            (if frames_are_time { t } else { z }) as i32 + sequence.index_min();
+        let frame = sequence.frame(frame_attr_index)?;
 
         let channel = *self.channels.get(c as usize).unwrap_or(&1);
         let file = frame.file_for_channel(channel)?;
@@ -483,44 +731,53 @@ impl FormatReader for PrairieReader {
             return Err(BioFormatsError::Format("Not a PrairieView XML file".into()));
         }
 
-        let (meta, sequences, channels, frames_are_time) = parse_prairie_xml(&xml)?;
+        let parsed = parse_prairie_xml(&xml)?;
         self.path = Some(xml);
-        self.meta = Some(meta);
-        self.sequences = sequences;
-        self.channels = channels;
-        self.frames_are_time = frames_are_time;
+        self.metas = parsed.metas;
+        self.series = 0;
+        self.sequences = parsed.sequences;
+        self.channels = parsed.channels;
+        self.frames_are_time = parsed.frames_are_time;
+        self.size_p = parsed.size_p;
+        let _ = parsed.size_t;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
+        self.metas.clear();
+        self.series = 0;
         self.sequences.clear();
         self.channels.clear();
-        self.frames_are_time = false;
+        self.frames_are_time.clear();
+        self.size_p = 1;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.metas.len().max(1)
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if s >= self.metas.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.series = s;
             Ok(())
         }
     }
     fn series(&self) -> usize {
-        0
+        self.series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.metas.get(self.series).expect("set_id not called")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
@@ -545,12 +802,15 @@ impl FormatReader for PrairieReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
+        let meta = self.metas.get(self.series).unwrap();
         crate::formats::lei::crop_region(&full, meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
@@ -860,5 +1120,72 @@ impl FormatReader for LeicaTcsReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod prairie_tests {
+    use super::*;
+
+    /// Build a sequence with a single frame at index 0 carrying the given XYZ
+    /// stage position.
+    fn seq_at(x: f64, y: f64, z: f64) -> Sequence {
+        Sequence {
+            is_time_series: false,
+            frames: vec![PFrame {
+                index: 0,
+                files: Vec::new(),
+                pos_x: Some(x),
+                pos_y: Some(y),
+                pos_z: Some(z),
+            }],
+        }
+    }
+
+    #[test]
+    fn prairie_all_same_position_is_single_series_many_timepoints() {
+        // Three sequences sharing one stage position -> sizeT=3, seriesCount=1
+        // (Java computeSizeT: sizeP=1 matches first).
+        let seqs = vec![
+            seq_at(1.0, 2.0, 3.0),
+            seq_at(1.0, 2.0, 3.0),
+            seq_at(1.0, 2.0, 3.0),
+        ];
+        let size_t = compute_size_t(&seqs, 3);
+        assert_eq!(size_t, 3);
+        assert_eq!(3 / size_t, 1); // seriesCount
+    }
+
+    #[test]
+    fn prairie_distinct_positions_split_into_series() {
+        // Rasterization XYCZpT with sizeP=2, sizeT=2: order is
+        // seq[0]=p0/t0, seq[1]=p1/t0, seq[2]=p0/t1, seq[3]=p1/t1.
+        // Positions must match per p across t: p0 -> A, p1 -> B.
+        let a = (10.0, 20.0, 30.0);
+        let b = (40.0, 50.0, 60.0);
+        let seqs = vec![
+            seq_at(a.0, a.1, a.2), // p0 t0
+            seq_at(b.0, b.1, b.2), // p1 t0
+            seq_at(a.0, a.1, a.2), // p0 t1
+            seq_at(b.0, b.1, b.2), // p1 t1
+        ];
+        // sizeP=1 (sizeT=4) fails because positions differ; sizeP=2 (sizeT=2)
+        // matches.
+        let size_t = compute_size_t(&seqs, 4);
+        assert_eq!(size_t, 2);
+        assert_eq!(4 / size_t, 2); // two stage-position series
+    }
+
+    #[test]
+    fn prairie_positions_match_detects_mismatch() {
+        // With sizeP=2 but a position that changes over time, positionsMatch
+        // must reject the grouping.
+        let seqs = vec![
+            seq_at(1.0, 1.0, 1.0), // p0 t0
+            seq_at(2.0, 2.0, 2.0), // p1 t0
+            seq_at(9.0, 9.0, 9.0), // p0 t1 -- differs from p0 t0
+            seq_at(2.0, 2.0, 2.0), // p1 t1
+        ];
+        assert!(!positions_match(&seqs, 2, 2));
     }
 }

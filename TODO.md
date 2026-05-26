@@ -88,32 +88,46 @@ Second-pass items (the former partials and pre-existing failures), now done:
   when new candidates appear. (Full prior fixture-rejection log is in git history
   of this file.)
 
-### Partial — remaining sub-scope (common case done; tracked in README status table)
-- [ ] **CZI** mosaic (M) / acquisition (B) / angle (V) prestitching into series —
-  only scene (S) → series split is done. `src/formats/czi.rs`.
-- [ ] **Prairie** stage-position → multi-series split (needs per-frame Position
-  parsing). `src/formats/prairie.rs`.
-- [ ] **MetaMorph** multi-STK `.nd` file-group series. `src/formats/metamorph.rs`.
-- [ ] **HCS** ScanR sparse-well compaction; CellVoyager/BD on-the-fly tile
-  stitching. `src/formats/hcs2.rs`.
-- [ ] **cellSens VSI** full `.ets` pyramid assembly + JPEG/J2K tile codecs.
-  `src/formats/flim2.rs`.
-- [ ] **Cellomics** `.mdb` channel/exposure metadata — needs an MS-Access reader.
-- [ ] **MINC-1** (classic NetCDF-3) — needs a NetCDF-classic crate; MINC2/HDF5 done.
-- [ ] **Imaris HDF5** true single-plane hyperslab reads — `hdf5-pure` exposes only
-  whole-dataset reads (currently cached). `src/formats/imaris.rs`.
-- [ ] **RHK SPM** real binary header port (`RHKReader.java`) — `src/formats/spm.rs`
-  still uses a text heuristic.
-- [ ] **NRRD bzip2** — promote the `bzip2` crate (already a transitive dep) to a
-  direct dependency, then decode. `src/formats/nrrd.rs`.
+### Done in the latest parity round (now Complete in the README status table)
+- [x] **Prairie** stage-position → multi-series split. `src/formats/prairie.rs`.
+- [x] **MetaMorph** multi-STK `.nd` file-group series. `src/formats/metamorph.rs`.
+- [x] **HCS ScanR** sparse-well compaction, **CellVoyager** tile stitching,
+  **BD Pathway** montage field split. `src/formats/hcs2.rs`.
+- [x] **RHK SPM** real binary page header (XPM/text) ported. `src/formats/spm.rs`.
+- [x] **MINC-1** classic NetCDF-3 via a pure-Rust parser (MINC2/HDF5 already done).
+  `src/formats/misc.rs`.
+- [x] **AVI Cinepak ("cvid")** decoder implemented + wired in. `src/formats/avi.rs`,
+  `src/common/codec.rs`.
+- [x] **NRRD bzip2** — confirmed MATCHES-JAVA (Java NRRDReader supports only
+  raw/gzip and rejects bzip2); the current rejection is already at parity.
+- [x] **CZI** rotation (R) → moduloZ annotation + PALM plane splitting. Scene/
+  acquisition/angle series, mosaic stitching, per-pixel-type split already done.
+  `src/formats/czi.rs`.
+- [x] **cellSens VSI** PNG/BMP `.ets` tile codecs + VSI tag-tree (exact full-res
+  dims, dimension order, tile-origin crop). `src/formats/flim2.rs`, `src/common/codec.rs`.
+- [x] **Canon RAW / Minolta MRW / DNG (CFA)** Bayer interpolation + sub-byte bit
+  unpacking (faithful port of `ImageTools.interpolate`/`DataTools.unpackBytes`).
+  `src/formats/camera2.rs`, `src/formats/extended.rs`.
+- [x] **CZI** mosaic image-fusion series rebalancing (plane-count-driven
+  seriesCount collapse, ZeissCZIReader:941-1003) — ported additively for the
+  non-pyramid case without touching the R-as-pyramid model. `src/formats/czi.rs`.
+- [x] **cellSens VSI** orphan-ETS file matching + dimension collision-shift
+  heuristics + (most) non-geometry metadata. `src/formats/flim2.rs`.
+- [x] **DNG EXIF white-balance** — added additive EXIF (34665) + Canon maker-note
+  (37500) IFD parsing on `TiffReader` and applied the coefficients.
+  `src/tiff/{reader,ifd}.rs`, `src/formats/extended.rs`.
 
-### Large separate codecs / RAW / no Java reference
-- [ ] **AVI Cinepak ("cvid")** — large standalone codec; not implemented and not
-  claimed (unrecognized FOURCCs return `UnsupportedFormat`). `src/formats/avi.rs`.
+### Remaining — needs a dependency, a fixture, or has no Java reference
+- [ ] **cellSens VSI** prefix-gated value metadata (per-channel wavelengths, Z
+  start/increment, timestamps) — needs recursive tag-name-prefix tracking in the
+  tag-tree walker. `src/formats/flim2.rs`. (Pixels/dimensions are complete.)
+- [ ] **Cellomics** `.mdb` channel/exposure metadata — NEEDS-DEP: a pure-Rust
+  MS-Access reader (none suitable exists). Pixel path is complete.
+- [ ] **Imaris HDF5** true single-plane hyperslab reads — NEEDS-DEP: `hdf5-pure`
+  exposes only whole-dataset reads (currently cached). `src/formats/imaris.rs`.
 - [ ] **DICOM JPEG-lossless (process 14)** — routed through the shared JPEG
   decoder (depends on `jpeg_decoder` SOF3 support); no bundled fixture to confirm.
-- [ ] **Canon RAW / DNG / Minolta MRW** Bayer demosaic — headers parsed; full CFA
-  interpolation is out of scope (Java doesn't do it in the pure path either).
+- [ ] **Modern ND2 ImageDataSeq** — blocked on discovering a public fixture (see above).
 - [ ] **DCIMG / Norpix / SimFCS / BigDataViewer / TopoMetrix** — no Java reference
   to be faithful to; current behavior is best-effort per spec.
 

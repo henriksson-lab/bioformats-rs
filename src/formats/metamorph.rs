@@ -337,6 +337,16 @@ pub struct MetamorphReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     inner: TiffReader,
+    /// `.nd`-driven multi-file series grid: `stks[series][file]` holds the
+    /// resolved STK/TIFF path for each constituent file, mirroring Java
+    /// `MetamorphReader.stks`. `None` when reading a standalone STK.
+    stks: Option<Vec<Vec<Option<PathBuf>>>>,
+    /// Per-series core metadata (parallel to `stks`).
+    metas: Vec<ImageMetadata>,
+    /// Currently selected series.
+    series: usize,
+    /// The companion `.nd` file path, if any (Java `ndFilename`).
+    nd_filename: Option<PathBuf>,
 }
 
 impl MetamorphReader {
@@ -345,7 +355,400 @@ impl MetamorphReader {
             path: None,
             meta: None,
             inner: TiffReader::new(),
+            stks: None,
+            metas: Vec::new(),
+            series: 0,
+            nd_filename: None,
         }
+    }
+}
+
+// ── .nd companion file parsing (multi-STK series) ──────────────────────────────
+
+const NDINFOFILE_VER1: &str = "Version 1.0";
+const NDINFOFILE_VER2: &str = "Version 2.0";
+
+/// Parsed contents of a MetaMorph `.nd` info file, mirroring the key/value
+/// pairs Java's `initFile` extracts.
+#[derive(Default)]
+struct NdInfo {
+    version: String,
+    z_steps: Option<i32>,       // NZSteps
+    n_wavelengths: Option<i32>, // NWavelengths
+    n_time_points: Option<i32>, // NTimePoints
+    do_timelapse: bool,         // DoTimelapse
+    do_z_series: bool,          // DoZSeries (globalDoZ)
+    do_wave: bool,              // DoWave
+    n_stage_positions: i32,     // NStagePositions
+    use_wave_names: bool,       // WaveInFileName
+    wave_names: Vec<String>,    // WaveName<n>
+    wave_do_z: Vec<bool>,       // WaveDoZ<n>
+    bizarre_multichannel: bool, // "Both lasers" / "DUAL" wave name
+}
+
+/// Read a `.nd` file as windows-1252 (each byte maps directly to a char),
+/// matching `DataTools.readFile(.., "windows-1252")`.
+fn read_nd_text(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    Ok(bytes.iter().map(|&b| b as char).collect())
+}
+
+/// Parse the key/value pairs of an `.nd` file. The `.nd` format quotes keys as
+/// `"Key", value`; values may span multiple lines until the next comma.
+fn parse_nd(text: &str) -> NdInfo {
+    let mut info = NdInfo {
+        version: NDINFOFILE_VER1.to_string(),
+        do_z_series: true,
+        use_wave_names: true,
+        ..Default::default()
+    };
+
+    // Java accumulates a multi-line value until the next line containing a comma
+    // (or "EndFile"), then dispatches on the *previous* key.
+    let mut current_value = String::new();
+    let mut key = String::new();
+    let mut global_do_z = true;
+
+    for line in text.split('\n') {
+        let comma = line.find(',').map(|i| i as i64).unwrap_or(-1);
+        if comma <= 0 && !line.contains("EndFile") {
+            current_value.push('\n');
+            current_value.push_str(line);
+            continue;
+        }
+
+        let value = current_value.clone();
+        match key.as_str() {
+            "NDInfoFile" => info.version = value.clone(),
+            "NZSteps" => info.z_steps = value.trim().parse().ok(),
+            "DoTimelapse" => info.do_timelapse = parse_bool(&value),
+            "NWavelengths" => info.n_wavelengths = value.trim().parse().ok(),
+            "NTimePoints" => info.n_time_points = value.trim().parse().ok(),
+            k if k.starts_with("WaveDoZ") => info.wave_do_z.push(parse_bool(&value)),
+            k if k.starts_with("WaveName") => {
+                // Strip the surrounding quotes (value is like `"FITC"`).
+                let trimmed = value.trim();
+                let wave_name = if trimmed.len() >= 2 {
+                    trimmed[1..trimmed.len() - 1].to_string()
+                } else {
+                    trimmed.to_string()
+                };
+                if wave_name == "Both lasers" || wave_name.starts_with("DUAL") {
+                    info.bizarre_multichannel = true;
+                }
+                info.wave_names.push(wave_name);
+            }
+            "NStagePositions" => info.n_stage_positions = value.trim().parse().unwrap_or(0),
+            "WaveInFileName" => info.use_wave_names = parse_bool(&value),
+            "DoZSeries" => {
+                global_do_z = parse_bool(&value);
+                info.do_z_series = global_do_z;
+            }
+            "DoWave" => info.do_wave = parse_bool(&value),
+            _ => {}
+        }
+
+        // The key for the *next* value is between the leading quote and the comma:
+        // Java: key = line.substring(1, comma - 1).trim().
+        if comma >= 1 {
+            let c = comma as usize;
+            key = line
+                .get(1..c.saturating_sub(1))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        } else {
+            key = String::new();
+        }
+        current_value.clear();
+        if comma >= 0 {
+            let c = comma as usize;
+            current_value.push_str(line.get(c + 1..).unwrap_or("").trim());
+        }
+    }
+
+    if !global_do_z {
+        for z in info.wave_do_z.iter_mut() {
+            *z = false;
+        }
+    }
+    info
+}
+
+fn parse_bool(s: &str) -> bool {
+    s.trim().eq_ignore_ascii_case("true")
+}
+
+/// The suffix Java appends to STK names for a given wave/format version.
+fn nd_format_suffix(
+    version: &str,
+    has_z_for_wave: bool,
+    any_z: bool,
+    global_do_z: bool,
+) -> &'static str {
+    if version == NDINFOFILE_VER1 {
+        if (any_z && has_z_for_wave) || global_do_z {
+            ".STK"
+        } else {
+            ".TIF"
+        }
+    } else if version == NDINFOFILE_VER2 {
+        ".TIF"
+    } else {
+        ".STK"
+    }
+}
+
+/// Sanitize a wavelength name for use in a filename (Java translates
+/// `_ / \ ( )` to `-`).
+fn sanitize_wave_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '_' | '/' | '\\' | '(' | ')' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+/// Resolve an STK/TIFF file referenced by the `.nd` grid, trying extension
+/// fallbacks (`.STK` → `.TIF` → `.tif` → `.stk`) like Java `getRealSTKFile`.
+fn resolve_real_stk(dir: &Path, name: &str) -> Option<PathBuf> {
+    let direct = dir.join(name);
+    if direct.exists() {
+        return Some(direct);
+    }
+    let candidates = if name.contains('%') {
+        vec![name.replace('%', "-"), name.to_string()]
+    } else {
+        vec![name.to_string()]
+    };
+    for cand in candidates {
+        let p = dir.join(&cand);
+        if p.exists() {
+            return Some(p);
+        }
+        let stem = match cand.rfind('.') {
+            Some(i) => &cand[..i],
+            None => &cand,
+        };
+        for ext in [".TIF", ".tif", ".stk", ".STK"] {
+            let alt = dir.join(format!("{stem}{ext}"));
+            if alt.exists() {
+                return Some(alt);
+            }
+        }
+    }
+    None
+}
+
+/// Locate a sibling `.nd` file for the given STK path (Java initFile's
+/// canLookForND branch, simplified): match on the shared prefix up to the first
+/// underscore, validating that trailing chars look like `_w`/`_t`/`_s`.
+fn find_nd_file(stk: &Path) -> Option<PathBuf> {
+    let dir = stk.parent()?;
+    let stk_name = stk.file_name()?.to_str()?;
+    let stk_prefix = match stk_name.find('_') {
+        Some(i) => &stk_name[..i + 1],
+        None => stk_name,
+    };
+    let mut best: Option<(usize, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()) {
+        let fname = entry.file_name();
+        let fname = match fname.to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let lower = fname.to_ascii_lowercase();
+        if !(lower.ends_with(".nd") || lower.ends_with(".scan")) {
+            continue;
+        }
+        let prefix = match fname.rfind('.') {
+            Some(i) => &fname[..i],
+            None => &fname,
+        };
+        let prefix = match prefix.find('_') {
+            Some(i) => &prefix[..i + 1],
+            None => prefix,
+        };
+        if stk_name.starts_with(prefix) || prefix == stk_prefix {
+            let mut count = 0;
+            for (a, b) in fname.chars().zip(stk_name.chars()) {
+                if a == b {
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            let extra = stk_name[count.min(stk_name.len())..].to_ascii_lowercase();
+            let extra_bytes = extra.as_bytes();
+            let mut valid = true;
+            for i in 0..extra_bytes.len().saturating_sub(1) {
+                if extra_bytes[i] == b'_' {
+                    let ch = extra_bytes[i + 1];
+                    if ch != b'w' && ch != b't' && ch != b's' {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid && best.as_ref().map(|(c, _)| count > *c).unwrap_or(true) {
+                best = Some((count, entry.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// The `stks[series][file]` grid plus the derived base dimensions.
+struct NdGrid {
+    stks: Vec<Vec<Option<PathBuf>>>,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    bizarre_multichannel: bool,
+}
+
+/// Build the `stks[series][file]` grid from a parsed `.nd` file, porting Java
+/// `initFile`'s series/file enumeration.
+#[allow(clippy::too_many_lines)]
+fn build_nd_grid(nd_path: &Path, info: &NdInfo) -> NdGrid {
+    let dir = nd_path.parent().unwrap_or_else(|| Path::new("."));
+    let prefix = nd_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    let zc = info.z_steps.unwrap_or(1).max(1);
+    let mut cc = info.n_wavelengths.unwrap_or(1);
+    let mut tc = match info.n_time_points {
+        Some(t) => t,
+        None if !info.do_timelapse => 1,
+        None => 1,
+    };
+
+    if cc == 0 {
+        cc = 1;
+    }
+    if cc == 1 && info.bizarre_multichannel {
+        cc = 2;
+    }
+    if tc == 0 {
+        tc = 1;
+    }
+
+    let nstages = info.n_stage_positions;
+    let mut num_files = cc * tc;
+    if nstages > 0 {
+        num_files *= nstages;
+    }
+
+    let stages_count = if nstages == 0 { 1 } else { nstages };
+    let mut series_count = stages_count;
+
+    // Detect channels with differing Z behaviour -> series doubling.
+    let has_z = &info.wave_do_z;
+    let mut different_zs = false;
+    for i in 0..cc as usize {
+        let has_z1 = i < has_z.len() && has_z[i];
+        let has_z2 = i != 0 && (i - 1) < has_z.len() && has_z[i - 1];
+        if i > 0 && has_z1 != has_z2 && info.do_z_series {
+            if !different_zs {
+                series_count *= 2;
+            }
+            different_zs = true;
+        }
+    }
+
+    let mut channels_in_first_series = cc;
+    if different_zs {
+        channels_in_first_series = 0;
+        for i in 0..cc as usize {
+            let z0 = has_z.first().copied().unwrap_or(false);
+            if (!z0 && i == 0) || (z0 && i < has_z.len() && has_z[i]) {
+                channels_in_first_series += 1;
+            }
+        }
+    }
+
+    // Allocate the grid.
+    let series_count = series_count.max(1) as usize;
+    let mut stks: Vec<Vec<Option<PathBuf>>> = vec![Vec::new(); series_count];
+    if series_count == 1 {
+        stks[0] = vec![None; num_files.max(0) as usize];
+    } else if different_zs {
+        for i in 0..stages_count as usize {
+            stks[i * 2] = vec![None; (channels_in_first_series * tc).max(0) as usize];
+            stks[i * 2 + 1] = vec![None; ((cc - channels_in_first_series) * tc).max(0) as usize];
+        }
+    } else {
+        let per = num_files as usize / series_count;
+        for s in stks.iter_mut() {
+            *s = vec![None; per];
+        }
+    }
+
+    let any_z = has_z.iter().any(|&z| z);
+    let global_do_z = info.do_z_series;
+    let mut pt = vec![0usize; series_count];
+
+    for i in 0..tc {
+        for s in 0..stages_count {
+            for j in 0..cc {
+                let valid_z = (j as usize) >= has_z.len() || has_z[j as usize];
+                let mut series_ndx = (s as usize) * (series_count / stages_count.max(1) as usize);
+
+                if (series_count != 1 && (!valid_z || (!has_z.is_empty() && !has_z[0])))
+                    || (nstages == 0 && ((!valid_z && cc > 1) || series_count > 1))
+                {
+                    if any_z
+                        && j > 0
+                        && series_ndx < series_count - 1
+                        && (!valid_z || !has_z.first().copied().unwrap_or(false))
+                    {
+                        series_ndx += 1;
+                    }
+                }
+
+                if series_ndx >= stks.len()
+                    || series_ndx >= pt.len()
+                    || pt[series_ndx] >= stks[series_ndx].len()
+                {
+                    continue;
+                }
+
+                let mut name = prefix.clone();
+                let has_z_for_wave = (j as usize) < has_z.len() && has_z[j as usize];
+                let suffix = nd_format_suffix(&info.version, has_z_for_wave, any_z, global_do_z);
+
+                if (j as usize) < info.wave_names.len() && info.do_wave {
+                    name.push_str(&format!("_w{}", j + 1));
+                    if info.use_wave_names {
+                        name.push_str(&sanitize_wave_name(&info.wave_names[j as usize]));
+                    }
+                }
+                if nstages > 0 {
+                    name.push_str(&format!("_s{}", s + 1));
+                }
+                if tc > 1 || info.do_timelapse {
+                    name.push_str(&format!("_t{}{}", i + 1, suffix));
+                } else {
+                    name.push_str(suffix);
+                }
+
+                stks[series_ndx][pt[series_ndx]] = resolve_real_stk(dir, &name);
+                pt[series_ndx] += 1;
+            }
+        }
+    }
+
+    let size_z = if !has_z.is_empty() && !has_z[0] { 1 } else { zc };
+    NdGrid {
+        stks,
+        size_z: size_z.max(1) as u32,
+        size_c: cc.max(1) as u32,
+        size_t: tc.max(1) as u32,
+        bizarre_multichannel: info.bizarre_multichannel,
     }
 }
 
@@ -400,7 +803,10 @@ impl FormatReader for MetamorphReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("stk"))
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "stk" || e == "nd" || e == "scan"
+            })
             .unwrap_or(false)
     }
 
@@ -410,6 +816,285 @@ impl FormatReader for MetamorphReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        // Determine whether we were given an .nd/.scan companion or an STK.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        let is_nd_entry = matches!(ext.as_deref(), Some("nd") | Some("scan"));
+
+        // Resolve the .nd file and the STK file to initialize the inner reader.
+        let (nd_file, stk_path): (Option<PathBuf>, PathBuf) = if is_nd_entry {
+            // Given an .nd file: find an associated STK in the same directory
+            // (Java: scan the directory for `<prefix>` + `` / `_w` / `_s` / `_t`).
+            let stk = find_first_stk_for_nd(path).ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "MetaMorph: no STK file found alongside {}",
+                    path.display()
+                ))
+            })?;
+            (Some(path.to_path_buf()), stk)
+        } else {
+            // Given an STK: look for a sibling .nd file.
+            (find_nd_file(path), path.to_path_buf())
+        };
+
+        // Build single-STK base metadata from the (first) STK file.
+        let (base_meta, _mm_planes) = self.init_single_stk(&stk_path)?;
+
+        // If a companion .nd describes a multi-file group, assemble the series.
+        if let Some(nd) = nd_file {
+            if let Ok(text) = read_nd_text(&nd) {
+                let info = parse_nd(&text);
+                let grid = build_nd_grid(&nd, &info);
+                if grid.stks.iter().any(|s| s.iter().any(|f| f.is_some())) {
+                    self.build_series_from_grid(nd, base_meta, grid)?;
+                    self.path = Some(stk_path);
+                    return Ok(());
+                }
+            }
+        }
+
+        // Single-file STK path: one series.
+        self.metas = vec![base_meta.clone()];
+        self.series = 0;
+        self.stks = None;
+        self.nd_filename = None;
+        self.meta = Some(base_meta);
+        self.path = Some(stk_path);
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.stks = None;
+        self.metas.clear();
+        self.series = 0;
+        self.nd_filename = None;
+        let _ = self.inner.close();
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        self.metas.len().max(1)
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s >= self.metas.len().max(1) {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
+        self.series = s;
+        if let Some(m) = self.metas.get(s) {
+            self.meta = Some(m.clone());
+        }
+        Ok(())
+    }
+
+    fn series(&self) -> usize {
+        self.series
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.metas
+            .get(self.series)
+            .or(self.meta.as_ref())
+            .expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let count = self
+            .metas
+            .get(self.series)
+            .map(|m| m.image_count)
+            .or_else(|| self.meta.as_ref().map(|m| m.image_count))
+            .unwrap_or(0);
+        if plane_index >= count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        // Multi-file .nd series: read from the constituent STK grid.
+        if let Some(bytes) = self.open_grid_plane(plane_index)? {
+            return Ok(bytes);
+        }
+        let inner_count = self.inner.metadata().image_count;
+        // Planes map 1:1 to the inner TIFF reader when it exposes enough planes
+        // (Java rebuilds one IFD per plane). When the STK stores all planes as
+        // strips in a single IFD, fall back to reading the plane directly from
+        // the concatenated strip data.
+        if plane_index < inner_count {
+            return self.inner.open_bytes(plane_index);
+        }
+        self.read_concatenated_plane(plane_index)
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let count = self
+            .metas
+            .get(self.series)
+            .map(|m| m.image_count)
+            .or_else(|| self.meta.as_ref().map(|m| m.image_count))
+            .unwrap_or(0);
+        if plane_index >= count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        // For .nd series, crop the full grid plane.
+        if self.stks.is_some() {
+            let full = self.open_bytes(plane_index)?;
+            let meta = self.metas.get(self.series).unwrap();
+            let bps = meta.pixel_type.bytes_per_sample();
+            let row = meta.size_x as usize * bps;
+            let out_row = w as usize * bps;
+            let mut out = Vec::with_capacity(h as usize * out_row);
+            for r in 0..h as usize {
+                let src = &full[(y as usize + r) * row..];
+                out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
+            }
+            return Ok(out);
+        }
+        let inner_count = self.inner.metadata().image_count;
+        if plane_index < inner_count {
+            return self.inner.open_bytes_region(plane_index, x, y, w, h);
+        }
+        // Crop from the concatenated-strip plane.
+        let full = self.read_concatenated_plane(plane_index)?;
+        let meta = self.meta.as_ref().unwrap();
+        let bps = meta.pixel_type.bytes_per_sample();
+        let row = meta.size_x as usize * bps;
+        let out_row = w as usize * bps;
+        let mut out = Vec::with_capacity(h as usize * out_row);
+        for r in 0..h as usize {
+            let src = &full[(y as usize + r) * row..];
+            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
+        }
+        Ok(out)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self
+            .metas
+            .get(self.series)
+            .or(self.meta.as_ref())
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
+        let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+/// Find the first STK/TIFF file in the `.nd` file's directory whose name starts
+/// with the `.nd` prefix and continues with `` / `_w` / `_s` / `_t` (Java
+/// initFile's `.nd` entry branch).
+fn find_first_stk_for_nd(nd_path: &Path) -> Option<PathBuf> {
+    let dir = nd_path.parent()?;
+    let stem = nd_path.file_stem().and_then(|s| s.to_str())?;
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = match p.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => return false,
+            };
+            let lower = name.to_ascii_lowercase();
+            if !(lower.ends_with(".stk") || lower.ends_with(".tif") || lower.ends_with(".tiff")) {
+                return false;
+            }
+            if !name.starts_with(stem) {
+                return false;
+            }
+            let rest = &name[stem.len()..];
+            let middle = match rest.rfind('.') {
+                Some(i) => &rest[..i],
+                None => rest,
+            };
+            middle.is_empty()
+                || middle.starts_with("_w")
+                || middle.starts_with("_s")
+                || middle.starts_with("_t")
+        })
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
+}
+
+impl MetamorphReader {
+    /// Build per-series core metadata + the `stks` grid from a parsed `.nd`
+    /// grid, cloning the single-STK base metadata for sizing (Java initFile's
+    /// `newCore` block).
+    fn build_series_from_grid(
+        &mut self,
+        nd: PathBuf,
+        base_meta: ImageMetadata,
+        grid: NdGrid,
+    ) -> Result<()> {
+        // Determine X/Y (and pixel type) from the first valid STK in the grid.
+        let first = grid
+            .stks
+            .iter()
+            .flat_map(|s| s.iter())
+            .flatten()
+            .next()
+            .cloned();
+        let mut probe_meta = base_meta.clone();
+        if let Some(f) = &first {
+            let (m, _) = self.init_single_stk(f)?;
+            probe_meta = m;
+        }
+
+        let mut size_x = probe_meta.size_x;
+        if grid.bizarre_multichannel {
+            size_x /= 2;
+        }
+        let size_z = grid.size_z;
+        let size_c = grid.size_c;
+        let size_t = grid.size_t;
+        let rgb_mult = if probe_meta.is_rgb { 3 } else { 1 };
+        let image_count = size_z * (size_c * rgb_mult) * size_t;
+
+        let series_count = grid.stks.len().max(1);
+        let mut metas: Vec<ImageMetadata> = Vec::with_capacity(series_count);
+        for s in 0..series_count {
+            let mut sm = probe_meta.series_metadata.clone();
+            sm.insert(
+                "format".into(),
+                MetadataValue::String("MetaMorph STK".into()),
+            );
+            sm.insert(
+                "ndFilename".into(),
+                MetadataValue::String(nd.to_string_lossy().into_owned()),
+            );
+            sm.insert("series".into(), MetadataValue::Int(s as i64));
+            metas.push(ImageMetadata {
+                size_x,
+                size_z,
+                size_c: size_c * rgb_mult,
+                size_t,
+                image_count,
+                dimension_order: DimensionOrder::XYZCT,
+                series_metadata: sm,
+                ..probe_meta.clone()
+            });
+        }
+
+        self.stks = Some(grid.stks);
+        self.metas = metas;
+        self.series = 0;
+        self.nd_filename = Some(nd);
+        self.meta = self.metas.first().cloned();
+        Ok(())
+    }
+
+    /// Derive single-STK base metadata (the original single-file path), returning
+    /// it along with the `mmPlanes` count.
+    fn init_single_stk(&mut self, path: &Path) -> Result<(ImageMetadata, u32)> {
         // Try to read plane count from UIC1Tag
         let uic_planes = read_uic_plane_count(path).unwrap_or(None);
 
@@ -528,89 +1213,45 @@ impl FormatReader for MetamorphReader {
             ..tiff_meta
         };
 
-        self.meta = Some(meta);
-        self.path = Some(path.to_path_buf());
-        Ok(())
+        Ok((meta, mm_planes))
     }
 
-    fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        let _ = self.inner.close();
-        Ok(())
-    }
-
-    fn series_count(&self) -> usize {
-        1
-    }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
+    /// Resolve and read a plane from the `.nd` series grid (Java openBytes when
+    /// `stks != null`). Maps the plane index to a constituent STK file and the
+    /// plane within it.
+    fn open_grid_plane(&mut self, plane_index: u32) -> Result<Option<Vec<u8>>> {
+        let stks = match &self.stks {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let series = self.series;
+        let meta = self
+            .metas
+            .get(series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let size_z = meta.size_z.max(1);
+        let row = stks.get(series).ok_or(BioFormatsError::NotInitialized)?;
+        if row.is_empty() {
+            return Ok(None);
+        }
+        // ndx = no / sizeZ; plane within the file = no % sizeZ (Java).
+        let (ndx, plane) = if row.len() == 1 {
+            (0usize, plane_index)
         } else {
-            Ok(())
-        }
-    }
-
-    fn series(&self) -> usize {
-        0
-    }
-
-    fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
-    }
-
-    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let count = self.meta.as_ref().map(|m| m.image_count).unwrap_or(0);
-        if plane_index >= count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let inner_count = self.inner.metadata().image_count;
-        // Planes map 1:1 to the inner TIFF reader when it exposes enough planes
-        // (Java rebuilds one IFD per plane). When the STK stores all planes as
-        // strips in a single IFD, fall back to reading the plane directly from
-        // the concatenated strip data.
-        if plane_index < inner_count {
-            return self.inner.open_bytes(plane_index);
-        }
-        self.read_concatenated_plane(plane_index)
-    }
-
-    fn open_bytes_region(
-        &mut self,
-        plane_index: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-    ) -> Result<Vec<u8>> {
-        let count = self.meta.as_ref().map(|m| m.image_count).unwrap_or(0);
-        if plane_index >= count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let inner_count = self.inner.metadata().image_count;
-        if plane_index < inner_count {
-            return self.inner.open_bytes_region(plane_index, x, y, w, h);
-        }
-        // Crop from the concatenated-strip plane.
-        let full = self.read_concatenated_plane(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
-    }
-
-    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
-        let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+            ((plane_index / size_z) as usize, plane_index % size_z)
+        };
+        let file = match row.get(ndx).and_then(|f| f.clone()) {
+            Some(f) => f,
+            // Missing file: return a blank plane (Java returns the buffer as-is).
+            None => {
+                let bps = meta.pixel_type.bytes_per_sample();
+                return Ok(Some(vec![0u8; meta.size_x as usize * meta.size_y as usize * bps]));
+            }
+        };
+        let mut reader = MetamorphReader::new();
+        reader.set_id(&file)?;
+        let inner = reader.metadata().image_count.max(1);
+        Ok(Some(reader.open_bytes(plane % inner)?))
     }
 }
 
@@ -697,5 +1338,144 @@ mod tests {
         assert_eq!(int_format_max(3, 100), "003");
         assert_eq!(int_format_max(42, 9), "42");
         assert_eq!(int_format_max(7, 10), "07");
+    }
+
+    // ── .nd companion file (multi-STK series) tests ────────────────────────
+
+    #[test]
+    fn metamorph_parse_nd_extracts_dimensions_and_waves() {
+        // Mirrors the .nd key/value grammar Java MetamorphReader.initFile reads
+        // ("Key", value lines, EndFile terminator).
+        let nd = "\"NDInfoFile\", Version 1.0\n\
+                  \"DoTimelapse\", TRUE\n\
+                  \"NTimePoints\", 3\n\
+                  \"DoStage\", TRUE\n\
+                  \"NStagePositions\", 2\n\
+                  \"DoWave\", TRUE\n\
+                  \"NWavelengths\", 2\n\
+                  \"WaveName1\", \"FITC\"\n\
+                  \"WaveName2\", \"DAPI\"\n\
+                  \"WaveInFileName\", TRUE\n\
+                  \"DoZSeries\", FALSE\n\
+                  \"EndFile\",\n";
+        let info = parse_nd(nd);
+        assert_eq!(info.version, "Version 1.0");
+        assert!(info.do_timelapse);
+        assert_eq!(info.n_time_points, Some(3));
+        assert_eq!(info.n_stage_positions, 2);
+        assert!(info.do_wave);
+        assert_eq!(info.n_wavelengths, Some(2));
+        assert_eq!(info.wave_names, vec!["FITC".to_string(), "DAPI".to_string()]);
+        assert!(info.use_wave_names);
+        assert!(!info.do_z_series);
+    }
+
+    #[test]
+    fn metamorph_build_nd_grid_enumerates_per_position_series_filenames() {
+        // 2 stage positions, 2 waves, 3 time points, no Z. Java builds one
+        // series per stage position, each holding sizeC * sizeT files named
+        // `<prefix>_w<wave><name>_s<stage>_t<time>.TIF` (DoZSeries FALSE ->
+        // .TIF for V1.0).
+        let dir = std::env::temp_dir().join(format!(
+            "mm_nd_grid_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = "exp";
+        // Create the expected constituent files so resolve_real_stk finds them.
+        for s in 1..=2 {
+            for t in 1..=3 {
+                for (w, name) in [(1, "FITC"), (2, "DAPI")] {
+                    let fname = format!("{prefix}_w{w}{name}_s{s}_t{t}.TIF");
+                    std::fs::write(dir.join(&fname), b"x").unwrap();
+                }
+            }
+        }
+        let nd_path = dir.join(format!("{prefix}.nd"));
+        std::fs::write(&nd_path, b"placeholder").unwrap();
+
+        let info = NdInfo {
+            version: NDINFOFILE_VER1.to_string(),
+            n_wavelengths: Some(2),
+            n_time_points: Some(3),
+            do_timelapse: true,
+            do_z_series: false,
+            do_wave: true,
+            n_stage_positions: 2,
+            use_wave_names: true,
+            wave_names: vec!["FITC".into(), "DAPI".into()],
+            wave_do_z: vec![],
+            ..Default::default()
+        };
+        let grid = build_nd_grid(&nd_path, &info);
+
+        // One series per stage position.
+        assert_eq!(grid.stks.len(), 2);
+        // sizeC * sizeT = 2 * 3 files per series.
+        assert_eq!(grid.stks[0].len(), 6);
+        assert_eq!(grid.stks[1].len(), 6);
+        // Every referenced file resolved to a real path.
+        for series in &grid.stks {
+            for f in series {
+                assert!(f.is_some(), "expected resolved STK path, got None");
+            }
+        }
+        // The first file of series 0 is the wave-1, stage-1, time-1 file.
+        let first = grid.stks[0][0].as_ref().unwrap();
+        assert_eq!(
+            first.file_name().unwrap().to_str().unwrap(),
+            "exp_w1FITC_s1_t1.TIF"
+        );
+        // Series 1 (stage 2) starts at _s2.
+        let s2first = grid.stks[1][0].as_ref().unwrap();
+        assert!(s2first
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("_s2_t1"));
+        assert_eq!(grid.size_c, 2);
+        assert_eq!(grid.size_t, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metamorph_build_nd_grid_single_position_single_series() {
+        // No stage positions, single wave, single time point -> one series with
+        // one file named `<prefix>.STK` (DoZSeries default true -> .STK).
+        let dir = std::env::temp_dir().join(format!(
+            "mm_nd_single_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("solo.STK"), b"x").unwrap();
+        let nd_path = dir.join("solo.nd");
+        std::fs::write(&nd_path, b"x").unwrap();
+
+        let info = NdInfo {
+            version: NDINFOFILE_VER1.to_string(),
+            n_wavelengths: Some(1),
+            n_time_points: Some(1),
+            do_timelapse: false,
+            do_z_series: true,
+            do_wave: false,
+            n_stage_positions: 0,
+            ..Default::default()
+        };
+        let grid = build_nd_grid(&nd_path, &info);
+        assert_eq!(grid.stks.len(), 1);
+        assert_eq!(grid.stks[0].len(), 1);
+        assert_eq!(
+            grid.stks[0][0].as_ref().unwrap().file_name().unwrap(),
+            "solo.STK"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

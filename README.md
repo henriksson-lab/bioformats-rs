@@ -5,7 +5,7 @@ A pure-Rust reimplementation of [Bio-Formats](https://www.openmicroscopy.org/bio
 
 **This package is still under development**
 
-* 2026-05-26: some functionality added
+* 2026-05-26: halfway there
 * 2026-05-24: started proper audit; plenty left to do on this crate
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
@@ -120,8 +120,8 @@ been tested against real-world files.
 - ⛔ **Stub** — detection only; `set_id` returns `UnsupportedFormat` (the format
   is proprietary/undocumented or needs a decoder/container parser not yet ported).
 
-Roughly **95 complete, 54 partial, 36 stub** out of ~185 registered readers
-(up from 66/83/36 before the parity pass).
+Roughly **107 complete, 43 partial, 36 stub** out of ~185 registered readers
+(up from 66/83/36 at the first audit).
 
 ### Standard image formats
 
@@ -144,6 +144,7 @@ Roughly **95 complete, 54 partial, 36 stub** out of ~185 registered readers
 | ZIP container | `.zip` | ✅ | Delegates primary entry to any auto-detected reader |
 | MNG / APNG | `.mng` `.apng` | 🟡 | First frame only |
 | Text / CSV image | `.txt` `.csv` | 🟡 | Parsed as Float32; no distinct Java counterpart |
+| AVI (video) | `.avi` | ✅ | Uncompressed/16-bit/Y8 + MSRLE, MS Video 1, Cinepak, JPEG/MJPEG |
 | Fake (test format) | `.fake` | ✅ | Synthetic gradient generator |
 
 ### Microscopy acquisition containers
@@ -159,10 +160,10 @@ Roughly **95 complete, 54 partial, 36 stub** out of ~185 registered readers
 | Leica TCS | `.xml` | ✅ | Full C/Z/T from Leica handler |
 | MicroManager | `metadata.txt` `.json` | ✅ | Per-plane file map, multi-position, channel/calibration metadata |
 | Visitech | `.xys` `.html` | ✅ | `.html`/`.xys` parse + multi-position series |
-| Zeiss CZI | `.czi` | 🟡 | Multi-scene series; JPEG-XR needs `jpegxr` feature; no mosaic/angle stitching |
+| Zeiss CZI | `.czi` | ✅ | Scene/acquisition/angle series, mosaic stitching + fusion rebalancing, per-pixel-type split, rotation→moduloZ, PALM split, pyramids; JPEG-XR needs `jpegxr` feature |
 | Nikon ND2 | `.nd2` | 🟡 | Raw/zlib/JPEG2000 frames; modern chunked ImageDataSeq blocked on fixtures |
-| Prairie View | `.xml` `.cfg` `.env` `.tif` | 🟡 | Channels/metadata; stage-position series split remains |
-| MetaMorph STK | `.stk` | 🟡 | Full per-plane UIC metadata; multi-STK `.nd` grouping remains |
+| Prairie View | `.xml` `.cfg` `.env` `.tif` | ✅ | Channels/metadata + stage-position multi-series |
+| MetaMorph STK | `.stk` `.nd` | ✅ | Per-plane UIC metadata + multi-STK `.nd` file-group series |
 | Leica XLEF | `.xlef` | 🟡 | XLEF/XLIF container resolved; LOF-backed references undecoded |
 | Imaris IMS | `.ims` | 🟡 | HDF5; whole-volume read cached (no hyperslab slicing) |
 | Leica LIF | `.lif` | ⛔ | Detection only; container parser not ported |
@@ -176,9 +177,9 @@ Roughly **95 complete, 54 partial, 36 stub** out of ~185 registered readers
 | PerkinElmer UltraVIEW | `.htm` `.tim` `.csv` `.zpo` | ✅ | Full dataset parse, TIFF + numbered raw planes |
 | MIAS (Maia Scientific) | `.tif` | ✅ | Per-well series + tiled-mosaic stitching |
 | Operetta / Columbus / InCell3000 / RCPNL | `.xml` `.rcpnl` `.frm` | ✅ | Index → per-well/field series + plane→file mapping |
+| ScanR / CellVoyager / BD Pathway | `.xml` `.mlf` `.exp` | ✅ | Sparse-well compaction, CellVoyager tile stitching, BD montage field split |
 | Tecan plate ASCII | `.asc` | ✅ | Tab-separated plate → Float32 |
 | Yokogawa CV7000/8000 | `.wpi` `.mlf` `.mrf` | ✅ | `.wpi`/`.mlf`/`.mrf` XML index → well/field series + OME plate |
-| ScanR / CellVoyager / BD Pathway | `.xml` `.mes` `.mlf` `.exp` | 🟡 | Geometry + plane mapping; sparse-well/tile-stitch simplifications |
 | MetaXpress / SimplePCI / MIAS / Trestle / TissueFAXS / Mikroscan / Ionpath MIBI TIFFs | `.tif` | 🟡 | Extension-only TIFF delegate; no format-specific assembly |
 | Cellomics | `.c01` `.dib` | 🟡 | zlib + DIB decoded; `.mdb` metadata needs MS-Access lib |
 | CellWorX | `.htd` `.pnl` | ⛔ | Parses HTD dims but `set_id` unsupported |
@@ -193,7 +194,7 @@ Roughly **95 complete, 54 partial, 36 stub** out of ~185 registered readers
 | Leica SCN | `.scn` | ✅ | XML series split + per-resolution pyramid mapping |
 | Ventana/Roche BIF | `.bif` | ✅ | BIF tile reassembly (overlap-averaged stitching) |
 | Hamamatsu NDPIS | `.ndpis` | ✅ | `.ndpis` multi-file channel index |
-| Olympus cellSens VSI | `.vsi` | 🟡 | `.ets` tile indexing; full pyramid + JPEG/J2K tiles remain |
+| Olympus cellSens VSI | `.vsi` | 🟡 | `.ets` pyramid + RAW/JPEG/J2K/PNG/BMP tiles, tag-tree dims/crop, orphan-ETS matching, dim collision-shift; prefix-gated value metadata (channel/Z/timestamp) remains |
 | OpenSlide (MRXS/VMS/BIF) | `.mrxs` `.vms` `.bif` | 🟡 | Feature-gated; multi-resolution |
 
 ### Vendor microscopy & cameras
@@ -218,7 +219,8 @@ Roughly **95 complete, 54 partial, 36 stub** out of ~185 registered readers
 | Hamamatsu DCIMG | `.dcimg` | 🟡 | v0/v1 + four-corner correction (no Java reference) |
 | Norpix StreamPix | `.seq` | 🟡 | JPEG frames + timestamps (no Java reference) |
 | TillVision | `.vws` | 🟡 | PST+INF sidecar; embedded VWS unsupported |
-| Canon RAW / Photoshop / Minolta MRW / DNG / QPTIFF / NIS TIFF wrappers | `.cr2` `.crw` `.tif` `.mrw` `.dng` `.qptiff` `.nif` | 🟡 | Headers parsed; Bayer RAW demosaic out of scope (as in Java) |
+| Canon RAW / Minolta MRW / DNG (CFA) | `.cr2` `.crw` `.mrw` `.dng` | ✅ | CFA Bayer interpolation + bit unpacking + DNG EXIF/maker-note white-balance |
+| Photoshop / QPTIFF / NIS TIFF wrappers | `.tif` `.qptiff` `.nif` | 🟡 | Plain TIFF delegate; vendor metadata not parsed |
 | Hamamatsu VMS/VMU | `.vms` `.vmu` | ⛔ | JPEG tile decoding not ported |
 
 ### Medical, volumetric & astronomy
@@ -239,7 +241,7 @@ Roughly **95 complete, 54 partial, 36 stub** out of ~185 registered readers
 | Varian FDF | `.fdf` | ✅ | matrix[] dims, XYTZC, bigendian honored |
 | Molecular Dynamics GEL | `.gel` | ✅ | TIFF-based; MD_FILETAG, square-root/linear scaling |
 | Kodak BIP | `.bip` | ✅ | KodakReader parity (GBiH/BSfD markers, float32 BE) |
-| MINC | `.mnc` | 🟡 | MINC2/HDF5 datatype+dims; classic MINC-1 (NetCDF) needs a NetCDF lib |
+| MINC | `.mnc` | ✅ | MINC2/HDF5 + classic MINC-1 (pure-Rust NetCDF-3 parser) |
 | PDS (planetary) | `.pds` | 🟡 | Single-band raw; PE two-file `.hdr`/`.IMG` dialect not split |
 
 ### Electron / scanning-probe / AFM microscopy
@@ -256,7 +258,8 @@ Roughly **95 complete, 54 partial, 36 stub** out of ~185 registered readers
 | Zeiss TIFF SEM | `.tif` | ✅ | TIFF delegate |
 | Hitachi SEM | `.txt` | ✅ | `[SemImageFile]` INI + companion image (HitachiReader parity) |
 | LEO/Zeiss SEM | `.tif` | ✅ | TIFF tag 34118 + AP_/DP_/SV_ metadata |
-| RHK / TopoMetrix SPM | `.sm2` `.tfr` | 🟡 | Heuristic header (RHK port pending; TopoMetrix has no Java ref) |
+| RHK SPM | `.sm2` `.sm3` `.sm4` | ✅ | Real binary page header (XPM/text), scales, invertX/Y |
+| TopoMetrix AFM | `.tfr` `.zfr` | 🟡 | No Java reference; best-effort header parse |
 | IMOD mesh / JEOL / Zeiss LMS / Quesant / PicoQuant / Bruker OPUS / ISS Vista | `.mod` `.dat` `.lms` `.afm` `.ptu` `.abs` `.iss` | ⛔ | Stubs — undocumented or decoder not ported |
 
 ### FLIM / lifetime / flow / HDF5
