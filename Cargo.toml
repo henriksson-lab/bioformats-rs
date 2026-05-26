@@ -13,7 +13,6 @@ include = [
     "/src/**/*.rs",
     "/benches/read_ome_tiff.rs",
     "/README.md",
-    "/FEATURES.md",
     "/LICENSE.txt",
 ]
 

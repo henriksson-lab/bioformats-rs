@@ -1728,6 +1728,21 @@ struct VsiPyramidMeta {
     blue_offset: Option<f64>,
     stack_type: Option<String>,
     acquisition_time: Option<i64>,
+    /// Prefix-gated VALUE metadata (CellSensReader.java:1960-1979).
+    channel_wavelengths: Vec<f64>,
+    z_start: Option<f64>,
+    z_increment: Option<f64>,
+    z_values: Vec<f64>,
+    t_values: Vec<f64>,
+    /// Per-channel names and stack name from TCHAR leaves
+    /// (CellSensReader.java:1769-1778).
+    channel_names: Vec<String>,
+    name: Option<String>,
+    /// EXPOSURE_TIME split by tag prefix (CellSensReader.java:1899-1905).
+    /// `exposure_times` (already present) collects top-level (empty-prefix)
+    /// exposures; the prefixed ones land here.
+    default_exposure_time: Option<i64>,
+    other_exposure_times: Vec<i64>,
 }
 
 const ETS_RAW: i32 = 0;
@@ -2307,6 +2322,28 @@ const VSI_X_BINNING: i32 = 100015;
 const VSI_Y_BINNING: i32 = 100016;
 const VSI_BIT_DEPTH: i32 = 100049;
 const VSI_STACK_TYPE: i32 = 2074;
+// Prefix-gated VALUE metadata and the volume tags that build the tag-name prefix
+// (CellSensReader.java:1899-1979, 2081-2108).
+const VSI_VALUE: i32 = 268435458;
+const VSI_Z_INCREMENT: i32 = 2013;
+const VSI_Z_VALUE: i32 = 2014;
+const VSI_TIME_VALUE: i32 = 2017;
+const VSI_CHANNEL_NAME: i32 = 2419;
+const VSI_STACK_NAME: i32 = 2030;
+const VSI_OPTICAL_PATH: i32 = 2043;
+const VSI_CALIBRATION: i32 = 20051;
+// Volume tags whose getVolumeName(tag) yields the empty (structural) prefix
+// (CellSensReader.java:2083-2094).
+const VSI_COLLECTION_VOLUME: i32 = 2000;
+const VSI_MULTIDIM_IMAGE_VOLUME: i32 = 2001;
+const VSI_DIMENSION_SIZE: i32 = 2003;
+const VSI_IMAGE_COLLECTION_PROPERTIES: i32 = 2004;
+const VSI_MULTIDIM_STACK_PROPERTIES: i32 = 2005;
+const VSI_FRAME_PROPERTIES: i32 = 2006;
+const VSI_DISPLAY_MAPPING_VOLUME: i32 = 2011;
+const VSI_LAYER_INFO_PROPERTIES: i32 = 2012;
+// Volume tag 2417 maps to the "Channel Wavelength " prefix (CellSensReader.java:2097).
+const VSI_CHANNEL_WAVELENGTH_VOLUME: i32 = 2417;
 const VSI_OBJECTIVE_MAG: i32 = 120060;
 const VSI_NUMERICAL_APERTURE: i32 = 120061;
 const VSI_WORKING_DISTANCE: i32 = 120062;
@@ -2383,17 +2420,41 @@ impl<'a> VsiTagParser<'a> {
     /// Walk one tag container starting at byte offset `fp`. Mirrors `readTags`.
     /// Returns the file pointer reached, so a parent NEW_VOLUME_HEADER loop can
     /// advance through successive child containers (CellSensReader.java:1685-1695).
-    fn read_tags(&mut self, fp: i64, populate: bool) -> i64 {
+    fn read_tags(&mut self, fp: i64, populate: bool, tag_prefix: &str) -> i64 {
         if self.depth > 64 {
             return fp;
         }
         self.depth += 1;
-        let end = self.read_tags_inner(fp, populate);
+        let end = self.read_tags_inner(fp, populate, tag_prefix);
         self.depth -= 1;
         end
     }
 
-    fn read_tags_inner(&mut self, container_fp: i64, _populate: bool) -> i64 {
+    /// Map a volume tag to the tag-name prefix it pushes onto descendants.
+    /// Ported from `getVolumeName` (CellSensReader.java:2081-2108).
+    fn volume_name(tag: i32) -> &'static str {
+        match tag {
+            VSI_COLLECTION_VOLUME
+            | VSI_MULTIDIM_IMAGE_VOLUME
+            | VSI_IMAGE_FRAME_VOLUME
+            | VSI_DIMENSION_SIZE
+            | VSI_IMAGE_COLLECTION_PROPERTIES
+            | VSI_MULTIDIM_STACK_PROPERTIES
+            | VSI_FRAME_PROPERTIES
+            | VSI_DIMENSION_DESCRIPTION_VOLUME
+            | VSI_CHANNEL_PROPERTIES
+            | VSI_DISPLAY_MAPPING_VOLUME
+            | VSI_LAYER_INFO_PROPERTIES => "",
+            VSI_OPTICAL_PATH => "Microscope ",
+            VSI_CHANNEL_WAVELENGTH_VOLUME => "Channel Wavelength ",
+            VSI_WORKING_DISTANCE => "Objective Working Distance ",
+            VSI_TIME_VALUE => "Timestamp ",
+            VSI_CALIBRATION => "Calibration Function ",
+            _ => "",
+        }
+    }
+
+    fn read_tags_inner(&mut self, container_fp: i64, _populate: bool, tag_prefix: &str) -> i64 {
         if container_fp + 24 >= self.len() {
             return container_fp;
         }
@@ -2455,11 +2516,13 @@ impl<'a> VsiTagParser<'a> {
                     self.dimension_tag = second_tag;
                     self.in_dimension_properties = true;
                 }
+                // Child prefix is getVolumeName(tag) (CellSensReader.java:1690).
+                let child_prefix = Self::volume_name(tag);
                 let end_pointer = cur + data_size as i64;
                 let mut child = cur;
                 while child < end_pointer && child < self.len() {
                     let start = child;
-                    let end = self.read_tags(child, true);
+                    let end = self.read_tags(child, true, child_prefix);
                     // Mirror Java's start >= end guard (CellSensReader.java:1692).
                     if end <= start {
                         break;
@@ -2474,7 +2537,23 @@ impl<'a> VsiTagParser<'a> {
                 && (real_type == VSI_PROPERTY_SET_VOLUME
                     || real_type == VSI_NEW_MDIM_VOLUME_HEADER)
             {
-                self.read_tags(cur, tag != 2037);
+                // Child prefix: getVolumeName(tag) for NEW_MDIM, else inherit the
+                // current tagPrefix (CellSensReader.java:1704-1720). When the MDIM
+                // volume yields an empty name, the Z_* tags get a literal fallback.
+                let mut child_prefix: String = if real_type == VSI_NEW_MDIM_VOLUME_HEADER {
+                    Self::volume_name(tag).to_string()
+                } else {
+                    tag_prefix.to_string()
+                };
+                if child_prefix.is_empty() && real_type == VSI_NEW_MDIM_VOLUME_HEADER {
+                    match tag {
+                        VSI_Z_START => child_prefix = "Z start position".to_string(),
+                        VSI_Z_INCREMENT => child_prefix = "Z increment".to_string(),
+                        VSI_Z_VALUE => child_prefix = "Z value".to_string(),
+                        _ => {}
+                    }
+                }
+                self.read_tags(cur, tag != 2037, &child_prefix);
             } else {
                 // Leaf field: read the value for the types we care about.
                 let mut value: Option<String> = None;
@@ -2494,7 +2573,7 @@ impl<'a> VsiTagParser<'a> {
                 // Non-geometry acquisition metadata (CellSensReader.java:1881-1979).
                 if self.metadata_index >= 0 {
                     if let Some(v) = &value {
-                        self.capture_metadata(tag, v);
+                        self.capture_metadata(tag, v, tag_prefix);
                     }
                 }
             }
@@ -2555,12 +2634,11 @@ impl<'a> VsiTagParser<'a> {
     /// Capture non-geometry acquisition metadata for the current pyramid.
     /// Mirrors the metadata dispatch in `readTags` (CellSensReader.java:1881-1979).
     ///
-    /// The `tagPrefix`-gated tags (channel wavelength, Z start/increment/value,
-    /// timestamp via the generic VALUE tag, and the EXPOSURE_TIME prefix split)
-    /// are NOT ported: this parser does not reconstruct the recursive tag-name
-    /// prefix Java builds while descending volumes, so those values cannot be
-    /// disambiguated here. EXPOSURE_TIME is captured generically.
-    fn capture_metadata(&mut self, tag: i32, value: &str) {
+    /// `tag_prefix` is the recursive tag-name prefix accumulated while descending
+    /// volumes (CellSensReader.java:getVolumeName/tagPrefix); it gates the
+    /// EXPOSURE_TIME split and the generic VALUE tag (channel wavelengths, Z
+    /// start/increment/value, timestamps, working distance).
+    fn capture_metadata(&mut self, tag: i32, value: &str, tag_prefix: &str) {
         let idx = self.metadata_index as usize;
         if idx >= self.pyramids.len() {
             return;
@@ -2580,9 +2658,40 @@ impl<'a> VsiTagParser<'a> {
                     m.objective_types.push(n);
                 }
             }
+            // EXPOSURE_TIME split by prefix (CellSensReader.java:1899-1905):
+            // empty prefix -> exposureTimes; otherwise defaultExposureTime +
+            // otherExposureTimes.
             VSI_EXPOSURE_TIME => {
                 if let Some(n) = as_i64() {
-                    m.exposure_times.push(n);
+                    if tag_prefix.is_empty() {
+                        m.exposure_times.push(n);
+                    } else {
+                        m.default_exposure_time = Some(n);
+                        m.other_exposure_times.push(n);
+                    }
+                }
+            }
+            // Generic VALUE tag, disambiguated entirely by the tag prefix
+            // (CellSensReader.java:1960-1979).
+            VSI_VALUE => {
+                if tag_prefix == "Channel Wavelength " {
+                    if let Some(x) = as_f64() {
+                        m.channel_wavelengths.push(x);
+                    }
+                } else if tag_prefix.starts_with("Objective Working Distance") {
+                    m.working_distance = as_f64();
+                } else if tag_prefix == "Z start position" {
+                    m.z_start = as_f64();
+                } else if tag_prefix == "Z increment" {
+                    m.z_increment = as_f64();
+                } else if tag_prefix == "Z value" {
+                    if let Some(x) = as_f64() {
+                        m.z_values.push(x);
+                    }
+                } else if tag_prefix == "Timestamp " {
+                    if let Some(x) = as_f64() {
+                        m.t_values.push(x);
+                    }
                 }
             }
             VSI_OBJECTIVE_MAG => m.magnification = as_f64(),
@@ -2640,7 +2749,18 @@ impl<'a> VsiTagParser<'a> {
             VSI_TCHAR | VSI_UNICODE_TCHAR => {
                 let n = data_size.max(0) as usize;
                 let bytes = self.rd(off, n)?;
-                Some(String::from_utf8_lossy(bytes).replace('\0', "").trim().to_string())
+                let s = String::from_utf8_lossy(bytes).replace('\0', "").trim().to_string();
+                // CHANNEL_NAME / STACK_NAME are captured straight from the string
+                // leaf (CellSensReader.java:1769-1778).
+                if self.metadata_index >= 0 {
+                    let m = &mut self.pyramids[self.metadata_index as usize].meta;
+                    if tag == VSI_CHANNEL_NAME {
+                        m.channel_names.push(s.clone());
+                    } else if tag == VSI_STACK_NAME && s != "0" && m.name.is_none() {
+                        m.name = Some(s.clone());
+                    }
+                }
+                Some(s)
             }
             VSI_RGB | VSI_BGR => None,
             // INT array family (256..=277, 8195/8199/8200, 8470). These carry
@@ -2711,7 +2831,8 @@ impl CellSensReader {
             return Vec::new();
         };
         let mut parser = VsiTagParser::new(&bytes);
-        parser.read_tags(8, false);
+        // initFile calls readTags(vsi, false, "") (CellSensReader.java:684-685).
+        parser.read_tags(8, false, "");
         parser.pyramids
     }
 
@@ -3050,7 +3171,72 @@ impl CellSensReader {
                         sm.insert(format!("{p}.{key}"), MetadataValue::Int(x));
                     }
                 }
-                let _ = &m.objective_types;
+
+                // Prefix-gated VALUE metadata and per-channel/list fields
+                // (CellSensReader.java:1769-1778, 1899-1979). Java collects these
+                // into per-pyramid lists; here each list element is emitted under
+                // an indexed key (`{key}.{index}`) to preserve order and arity.
+                let float_lists: [(&str, &Vec<f64>); 3] = [
+                    // tagPrefix "Channel Wavelength " (CellSensReader.java:1961-1962)
+                    ("channel_wavelength", &m.channel_wavelengths),
+                    // tagPrefix "Z value" (CellSensReader.java:1973-1974)
+                    ("z_value", &m.z_values),
+                    // tagPrefix "Timestamp " (CellSensReader.java:1976-1977)
+                    ("timestamp", &m.t_values),
+                ];
+                for (key, list) in float_lists {
+                    for (idx, x) in list.iter().enumerate() {
+                        sm.insert(
+                            format!("{p}.{key}.{idx}"),
+                            MetadataValue::Float(*x),
+                        );
+                    }
+                }
+                // Z start position / Z increment (CellSensReader.java:1967-1972).
+                if let Some(x) = m.z_start {
+                    sm.insert(format!("{p}.z_start"), MetadataValue::Float(x));
+                }
+                if let Some(x) = m.z_increment {
+                    sm.insert(format!("{p}.z_increment"), MetadataValue::Float(x));
+                }
+                // Per-channel names (CellSensReader.java:1769-1773).
+                for (idx, name) in m.channel_names.iter().enumerate() {
+                    if !name.is_empty() {
+                        sm.insert(
+                            format!("{p}.channel_name.{idx}"),
+                            MetadataValue::String(name.clone()),
+                        );
+                    }
+                }
+                // Stack name (CellSensReader.java:1774-1778).
+                if let Some(name) = &m.name {
+                    sm.insert(
+                        format!("{p}.stack_name"),
+                        MetadataValue::String(name.clone()),
+                    );
+                }
+                // EXPOSURE_TIME split by prefix (CellSensReader.java:1899-1905):
+                // empty-prefix exposures already emitted above as `exposure_time`;
+                // the prefixed default + the list of "other" exposures land here.
+                if let Some(x) = m.default_exposure_time {
+                    sm.insert(
+                        format!("{p}.default_exposure_time"),
+                        MetadataValue::Int(x),
+                    );
+                }
+                for (idx, x) in m.other_exposure_times.iter().enumerate() {
+                    sm.insert(
+                        format!("{p}.other_exposure_time.{idx}"),
+                        MetadataValue::Int(*x),
+                    );
+                }
+                // Objective types (CellSensReader.java:1924-1926).
+                for (idx, x) in m.objective_types.iter().enumerate() {
+                    sm.insert(
+                        format!("{p}.objective_type.{idx}"),
+                        MetadataValue::Int(*x),
+                    );
+                }
             }
         }
         self.ets = volumes;
@@ -4287,7 +4473,7 @@ mod tests {
         ];
         let stream = build_vsi_tag_stream(&fields);
         let mut parser = VsiTagParser::new(&stream);
-        parser.read_tags(8, false);
+        parser.read_tags(8, false, "");
 
         assert_eq!(parser.pyramids.len(), 1, "one pyramid expected");
         let p = &parser.pyramids[0];
@@ -4306,7 +4492,7 @@ mod tests {
         }];
         let stream = build_vsi_tag_stream(&fields);
         let mut parser = VsiTagParser::new(&stream);
-        parser.read_tags(8, false);
+        parser.read_tags(8, false, "");
         assert!(parser.expect_ets, "HAS_EXTERNAL_FILE=1 must set expect_ets");
     }
 
@@ -4545,7 +4731,7 @@ mod tests {
         ];
         let stream = build_vsi_tag_stream(&fields);
         let mut parser = VsiTagParser::new(&stream);
-        parser.read_tags(8, false);
+        parser.read_tags(8, false, "");
 
         assert_eq!(parser.pyramids.len(), 1);
         let m = &parser.pyramids[0].meta;
@@ -4554,5 +4740,58 @@ mod tests {
         assert_eq!(m.numerical_aperture, Some(0.95));
         assert_eq!(m.bit_depth, Some(12));
         assert_eq!(m.exposure_times, vec![25000]);
+    }
+
+    /// Prefix-gated VALUE metadata: the same VALUE tag is disambiguated entirely
+    /// by the recursive tag-name prefix accumulated while descending volumes
+    /// (CellSensReader.java:1960-1979). Drives `capture_metadata` directly with
+    /// each prefix the way `getVolumeName` would have set it during the walk.
+    #[test]
+    fn vsi_value_tag_routed_by_prefix() {
+        let mut parser = VsiTagParser::new(&[]);
+        parser.pyramids.push(VsiPyramid::default());
+        parser.metadata_index = 0;
+
+        // tag 2417 volume -> "Channel Wavelength " (CellSensReader.java:2097-2098).
+        parser.capture_metadata(VSI_VALUE, "488", "Channel Wavelength ");
+        parser.capture_metadata(VSI_VALUE, "561", "Channel Wavelength ");
+        // empty-name NEW_MDIM Z volumes fall back to these literal prefixes
+        // (CellSensReader.java:1707-1719, 1967-1974).
+        parser.capture_metadata(VSI_VALUE, "1.5", "Z start position");
+        parser.capture_metadata(VSI_VALUE, "0.25", "Z increment");
+        parser.capture_metadata(VSI_VALUE, "0.0", "Z value");
+        parser.capture_metadata(VSI_VALUE, "0.25", "Z value");
+        // TIME_VALUE volume -> "Timestamp " (CellSensReader.java:2101-2102).
+        parser.capture_metadata(VSI_VALUE, "100.0", "Timestamp ");
+        // WORKING_DISTANCE volume -> "Objective Working Distance "
+        // (CellSensReader.java:2099-2100, 1964-1965).
+        parser.capture_metadata(VSI_VALUE, "0.21", "Objective Working Distance ");
+
+        let m = &parser.pyramids[0].meta;
+        assert_eq!(m.channel_wavelengths, vec![488.0, 561.0]);
+        assert_eq!(m.z_start, Some(1.5));
+        assert_eq!(m.z_increment, Some(0.25));
+        assert_eq!(m.z_values, vec![0.0, 0.25]);
+        assert_eq!(m.t_values, vec![100.0]);
+        assert_eq!(m.working_distance, Some(0.21));
+    }
+
+    /// EXPOSURE_TIME is routed by whether the tag prefix is empty
+    /// (CellSensReader.java:1899-1905): empty -> exposureTimes; non-empty ->
+    /// defaultExposureTime + otherExposureTimes.
+    #[test]
+    fn vsi_exposure_time_split_by_prefix() {
+        let mut parser = VsiTagParser::new(&[]);
+        parser.pyramids.push(VsiPyramid::default());
+        parser.metadata_index = 0;
+
+        parser.capture_metadata(VSI_EXPOSURE_TIME, "1000", "");
+        parser.capture_metadata(VSI_EXPOSURE_TIME, "2000", "Microscope ");
+        parser.capture_metadata(VSI_EXPOSURE_TIME, "3000", "Microscope ");
+
+        let m = &parser.pyramids[0].meta;
+        assert_eq!(m.exposure_times, vec![1000], "empty prefix -> exposureTimes");
+        assert_eq!(m.default_exposure_time, Some(3000), "last prefixed wins");
+        assert_eq!(m.other_exposure_times, vec![2000, 3000]);
     }
 }

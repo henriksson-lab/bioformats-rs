@@ -116,15 +116,22 @@ Second-pass items (the former partials and pre-existing failures), now done:
 - [x] **DNG EXIF white-balance** — added additive EXIF (34665) + Canon maker-note
   (37500) IFD parsing on `TiffReader` and applied the coefficients.
   `src/tiff/{reader,ifd}.rs`, `src/formats/extended.rs`.
+- [x] **cellSens VSI** prefix-gated value metadata (per-channel wavelengths, Z
+  start/increment/value, timestamps, exposure-by-prefix) via recursive tag-name
+  prefix tracking — VSI is now complete. `src/formats/flim2.rs`.
 
-### Remaining — needs a dependency, a fixture, or has no Java reference
-- [ ] **cellSens VSI** prefix-gated value metadata (per-channel wavelengths, Z
-  start/increment, timestamps) — needs recursive tag-name-prefix tracking in the
-  tag-tree walker. `src/formats/flim2.rs`. (Pixels/dimensions are complete.)
-- [ ] **Cellomics** `.mdb` channel/exposure metadata — NEEDS-DEP: a pure-Rust
-  MS-Access reader (none suitable exists). Pixel path is complete.
-- [ ] **Imaris HDF5** true single-plane hyperslab reads — NEEDS-DEP: `hdf5-pure`
-  exposes only whole-dataset reads (currently cached). `src/formats/imaris.rs`.
+### Won't implement (decided) / blocked
+- [ ] **`.mdb` companion metadata** (Cellomics, APL, ZeissLSM) — Bio-Formats reads
+  it via the pure-Java `mdbtools.libmdb`, whose source is NOT in this checkout. A
+  from-scratch pure-Rust Jet/MDB reader was declined (no reference to translate,
+  untestable without a fixture). Pixels decode without it; metadata stays absent,
+  mirroring Java's graceful degradation when MDBService is unavailable.
+- [ ] **Imaris HDF5** true single-plane hyperslab reads — `hdf5-pure` exposes only
+  whole-dataset reads (currently cached, correct but memory-heavy). Needs hyperslab
+  support in `hdf5-pure` or a C-linked HDF5 crate (system dep — against the
+  pure-Rust/container-portability stance). `src/formats/imaris.rs`.
+
+### Blocked on a test fixture / has no Java reference
 - [ ] **DICOM JPEG-lossless (process 14)** — routed through the shared JPEG
   decoder (depends on `jpeg_decoder` SOF3 support); no bundled fixture to confirm.
 - [ ] **Modern ND2 ImageDataSeq** — blocked on discovering a public fixture (see above).

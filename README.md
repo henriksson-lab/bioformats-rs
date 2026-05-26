@@ -5,7 +5,7 @@ A pure-Rust reimplementation of [Bio-Formats](https://www.openmicroscopy.org/bio
 
 **This package is still under development**
 
-* 2026-05-26: halfway there
+* 2026-05-26: 60-70% there. see list of libraries below. translation of mdbtools underway to support key file formats
 * 2026-05-24: started proper audit; plenty left to do on this crate
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
@@ -120,7 +120,7 @@ been tested against real-world files.
 - ⛔ **Stub** — detection only; `set_id` returns `UnsupportedFormat` (the format
   is proprietary/undocumented or needs a decoder/container parser not yet ported).
 
-Roughly **107 complete, 43 partial, 36 stub** out of ~185 registered readers
+Roughly **108 complete, 42 partial, 36 stub** out of ~185 registered readers
 (up from 66/83/36 at the first audit).
 
 ### Standard image formats
@@ -194,7 +194,7 @@ Roughly **107 complete, 43 partial, 36 stub** out of ~185 registered readers
 | Leica SCN | `.scn` | ✅ | XML series split + per-resolution pyramid mapping |
 | Ventana/Roche BIF | `.bif` | ✅ | BIF tile reassembly (overlap-averaged stitching) |
 | Hamamatsu NDPIS | `.ndpis` | ✅ | `.ndpis` multi-file channel index |
-| Olympus cellSens VSI | `.vsi` | 🟡 | `.ets` pyramid + RAW/JPEG/J2K/PNG/BMP tiles, tag-tree dims/crop, orphan-ETS matching, dim collision-shift; prefix-gated value metadata (channel/Z/timestamp) remains |
+| Olympus cellSens VSI | `.vsi` | ✅ | `.ets` pyramid + RAW/JPEG/J2K/PNG/BMP tiles, tag-tree dims/crop, orphan-ETS matching, dim collision-shift, prefix-gated value metadata |
 | OpenSlide (MRXS/VMS/BIF) | `.mrxs` `.vms` `.bif` | 🟡 | Feature-gated; multi-resolution |
 
 ### Vendor microscopy & cameras
