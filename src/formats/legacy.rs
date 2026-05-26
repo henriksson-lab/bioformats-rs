@@ -28,11 +28,15 @@ fn region_crop(full: &[u8], meta: &ImageMetadata, x: u32, y: u32, w: u32, h: u32
 
 // ── KodakBipReader ────────────────────────────────────────────────────────────
 
-const KODAK_BIP_HEADER_SIZE: u64 = 512;
-
+/// Kodak Molecular Imaging `.bip` reader, ported from the Java `KodakReader`.
+///
+/// The format is big-endian with 32-bit float pixels. Dimensions and the pixel
+/// offset are located by scanning for the `GBiH` (dimensions) and `BSfD`
+/// (pixels) tag markers; `DTag` is the file magic.
 pub struct KodakBipReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    pixel_offset: u64,
 }
 
 impl KodakBipReader {
@@ -40,6 +44,7 @@ impl KodakBipReader {
         KodakBipReader {
             path: None,
             meta: None,
+            pixel_offset: 0,
         }
     }
 }
@@ -50,41 +55,81 @@ impl Default for KodakBipReader {
     }
 }
 
-fn parse_kodak_bip(path: &Path) -> Result<ImageMetadata> {
+/// Find the byte offset of `marker` within `data`, starting the search at
+/// `from`. Mirrors the Java `findString` helper (which leaves the pointer at
+/// the start of the marker).
+fn kodak_find(data: &[u8], marker: &[u8], from: usize) -> Option<usize> {
+    if marker.is_empty() || from >= data.len() {
+        return None;
+    }
+    data[from..]
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .map(|p| from + p)
+}
+
+fn parse_kodak_bip(path: &Path) -> Result<(ImageMetadata, u64)> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
 
-    let (width, height) = if data.len() >= 22 {
-        // Offset 16: width (u16 LE), offset 20: height (u16 LE)
-        let w = u16::from_le_bytes([data[16], data[17]]) as u32;
-        let h = u16::from_le_bytes([data[20], data[21]]) as u32;
-        let w = if w == 0 { 512 } else { w };
-        let h = if h == 0 { 512 } else { h };
-        (w, h)
-    } else {
-        (512, 512)
-    };
+    const DIMENSIONS_STRING: &[u8] = b"GBiH";
+    const PIXELS_STRING: &[u8] = b"BSfD";
 
-    Ok(ImageMetadata {
+    // findString(DIMENSIONS_STRING); skipBytes(len + 20); readInt sizeX/sizeY.
+    let dim_pos = kodak_find(&data, DIMENSIONS_STRING, 0).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Kodak .bip: dimensions marker not found".into())
+    })?;
+    let dim_data = dim_pos + DIMENSIONS_STRING.len() + 20;
+    if dim_data + 8 > data.len() {
+        return Err(BioFormatsError::Format(
+            "Kodak .bip: truncated dimensions block".into(),
+        ));
+    }
+    let width = u32::from_be_bytes([
+        data[dim_data],
+        data[dim_data + 1],
+        data[dim_data + 2],
+        data[dim_data + 3],
+    ]);
+    let height = u32::from_be_bytes([
+        data[dim_data + 4],
+        data[dim_data + 5],
+        data[dim_data + 6],
+        data[dim_data + 7],
+    ]);
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::Format(
+            "Kodak .bip: missing image dimensions".into(),
+        ));
+    }
+
+    // findString(PIXELS_STRING); pixelOffset = filePointer + len + 20.
+    let pix_pos = kodak_find(&data, PIXELS_STRING, 0).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Kodak .bip: pixel marker not found".into())
+    })?;
+    let pixel_offset = (pix_pos + PIXELS_STRING.len() + 20) as u64;
+
+    let meta = ImageMetadata {
         size_x: width,
         size_y: height,
         size_z: 1,
         size_c: 1,
         size_t: 1,
-        pixel_type: PixelType::Uint16,
-        bits_per_pixel: 16,
+        pixel_type: PixelType::Float32,
+        bits_per_pixel: 32,
         image_count: 1,
-        dimension_order: DimensionOrder::XYZCT,
+        dimension_order: DimensionOrder::XYCZT,
         is_rgb: false,
         is_interleaved: false,
         is_indexed: false,
-        is_little_endian: true,
+        is_little_endian: false, // Kodak .bip is big-endian
         resolution_count: 1,
         series_metadata: HashMap::new(),
         lookup_table: None,
         modulo_z: None,
         modulo_c: None,
         modulo_t: None,
-    })
+    };
+    Ok((meta, pixel_offset))
 }
 
 impl FormatReader for KodakBipReader {
@@ -96,20 +141,23 @@ impl FormatReader for KodakBipReader {
         matches!(ext.as_deref(), Some("bip"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // MAGIC_STRING "DTag" appears within the file header.
+        header.windows(4).any(|w| w == b"DTag")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let meta = parse_kodak_bip(path)?;
+        let (meta, pixel_offset) = parse_kodak_bip(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
+        self.pixel_offset = pixel_offset;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.pixel_offset = 0;
         Ok(())
     }
 
@@ -146,10 +194,10 @@ impl FormatReader for KodakBipReader {
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(KODAK_BIP_HEADER_SIZE))
+        f.seek(SeekFrom::Start(self.pixel_offset))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
-        let _ = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
@@ -411,6 +459,89 @@ fn new_pict_meta(
     }
 }
 
+/// Decode a QuickTime-compressed (JPEG) PICT payload (opcode 0x0018).
+///
+/// Faithful to the Java `PictReader`: the JPEG data begins two bytes after the
+/// opcode (`jpegOffsets[0] = filePointer + 2`). Additional embedded JPEG
+/// streams (tiles) are located by scanning for SOI (0xFFD8) markers after the
+/// first EOI (0xFFD9). Each stream is concatenated and decoded, then exposed as
+/// interleaved 3-channel RGB (`sizeC = 3`, `rgb = true`, `interleaved = true`).
+fn decode_pict_jpeg(
+    c: &mut PictCursor<'_>,
+    fallback_width: u32,
+    fallback_height: u32,
+    version_one: bool,
+) -> Result<PictDecoded> {
+    let data = c.data;
+    // jpegOffsets[0] = filePointer + 2 (current position is just past opcode).
+    let first = c.position() + 2;
+    if first >= data.len() {
+        return Err(BioFormatsError::Format("PICT: truncated JPEG payload".into()));
+    }
+
+    // Collect the start offsets of each embedded JPEG stream, following the
+    // Java scan: skip 16-bit words until the first EOI (0xFFD9), then for each
+    // subsequent SOI (0xFFD8) record offset (filePointer - 2).
+    let mut offsets = vec![first];
+    let mut pos = first;
+    // advance to first EOI
+    while pos + 1 < data.len() {
+        let v = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        pos += 2;
+        if v == 0xffd9 {
+            break;
+        }
+    }
+    while pos + 1 < data.len() {
+        let v = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        pos += 2;
+        if v == 0xffd8 {
+            offsets.push(pos - 2);
+        }
+    }
+
+    // Concatenate each JPEG stream (from its offset up to the next offset, or
+    // end of file for the last) and decode. For the common single-stream case
+    // this decodes the JPEG from `first` to end of file.
+    let mut combined: Vec<u8> = Vec::new();
+    for (i, &start) in offsets.iter().enumerate() {
+        let end = offsets.get(i + 1).copied().unwrap_or(data.len());
+        if start >= end || end > data.len() {
+            continue;
+        }
+        let decoded = crate::common::codec::decompress_jpeg(&data[start..end])?;
+        combined.extend_from_slice(&decoded);
+    }
+    if combined.is_empty() {
+        return Err(BioFormatsError::Format(
+            "PICT: embedded JPEG produced no pixels".into(),
+        ));
+    }
+
+    // Derive dimensions from the decoded RGB buffer length when possible.
+    let (width, height) = if fallback_width > 0 && fallback_height > 0 {
+        (fallback_width, fallback_height)
+    } else {
+        return Err(BioFormatsError::Format(
+            "PICT: JPEG payload without known dimensions".into(),
+        ));
+    };
+
+    let expected = width as usize * height as usize * 3;
+    if combined.len() < expected {
+        combined.resize(expected, 0);
+    } else if combined.len() > expected {
+        combined.truncate(expected);
+    }
+
+    let mut meta = new_pict_meta(width, height, 3, true, false, None, version_one);
+    meta.is_interleaved = true;
+    Ok(PictDecoded {
+        meta,
+        pixels: combined,
+    })
+}
+
 fn parse_pict(path: &Path) -> Result<PictDecoded> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
     let mut c = PictCursor::new(&data);
@@ -496,9 +627,8 @@ fn parse_pict(path: &Path) -> Result<PictDecoded> {
                 c.skip(len)?;
             }
             PICT_JPEG => {
-                return Err(BioFormatsError::UnsupportedFormat(
-                    "PICT JPEG payloads are not implemented".into(),
-                ));
+                decoded = Some(decode_pict_jpeg(&mut c, width, height, version_one)?);
+                break;
             }
             PICT_TYPE_1 | PICT_TYPE_2 => {
                 let len = c.read_u8()? as usize;
@@ -828,6 +958,19 @@ fn pict_region_crop(full: &[u8], meta: &ImageMetadata, x: u32, y: u32, w: u32, h
                 out[dst..dst + w as usize * bps]
                     .copy_from_slice(&src_plane[src..src + w as usize * bps]);
             }
+        }
+        return out;
+    }
+    if meta.is_rgb && meta.is_interleaved {
+        // Interleaved RGB (e.g. JPEG-in-PICT): samples are packed per pixel.
+        let spp = meta.size_c as usize;
+        let row = meta.size_x as usize * spp * bps;
+        let out_row = w as usize * spp * bps;
+        let mut out = Vec::with_capacity(h as usize * out_row);
+        for r in 0..h as usize {
+            let src = &full[(y as usize + r) * row..];
+            let start = x as usize * spp * bps;
+            out.extend_from_slice(&src[start..start + out_row]);
         }
         return out;
     }

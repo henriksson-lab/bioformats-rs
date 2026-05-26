@@ -1,10 +1,17 @@
-//! Princeton Instruments SPE format reader (SPE 2.x).
+//! Princeton Instruments SPE format reader.
 //!
-//! The SPE 2.x file has a 4100-byte binary header followed by raw pixel data.
-//! Key fields: datatype at offset 108 (i16), xdim at 42 (u16), ydim at 656 (u16),
-//! numframes at 1446 (i32).
+//! The SPE file has a 4100-byte binary header followed by raw pixel data.
+//! Key header fields (offsets from SPEReader.java SpeHeaderEntry, all
+//! little-endian): DATATYPE at 108 (short), WIDTH at 42 (short),
+//! HEIGHT at 656 (short), NUM_FRAMES at 1446 (int), XML_OFFSET at 678 (long),
+//! HEADER_VER at 1992 (int).
 //!
-//! Note: SPE 3.x uses a different XML footer format; this reader supports 2.x.
+//! SPE 3.0 introduced a trailing XML footer at `XML_OFFSET`. Matching the Java
+//! reference (SPEReader.initFile), the pixel dimensions are still taken from the
+//! binary header for both 2.x and 3.x; the v3 XML footer is detected (via
+//! HEADER_VER >= 3 or XML_OFFSET > 0) and exposed in metadata, but Java marks
+//! such files as `metadataComplete = false` rather than parsing the XML, so we
+//! do the same and additionally surface the raw footer XML string.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -27,20 +34,45 @@ fn r_u16_le(b: &[u8], off: usize) -> u16 {
 fn r_i32_le(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
-fn r_f32_le(b: &[u8], off: usize) -> f32 {
-    f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+fn r_i64_le(b: &[u8], off: usize) -> i64 {
+    i64::from_le_bytes([
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+        b[off + 4],
+        b[off + 5],
+        b[off + 6],
+        b[off + 7],
+    ])
 }
 
 /// SPE datatype codes
 fn spe_pixel_type(datatype: i16) -> (PixelType, u8) {
+    // Per SPEReader.java: FLOAT=0, INT32=1, INT16=2, UNINT16=3, UNINT32=4.
     match datatype {
         0 => (PixelType::Float32, 32),
         1 => (PixelType::Int32, 32),
         2 => (PixelType::Int16, 16),
         3 => (PixelType::Uint16, 16),
-        8 => (PixelType::Uint32, 32),
+        4 => (PixelType::Uint32, 32),
         _ => (PixelType::Uint16, 16),
     }
+}
+
+/// Read the SPE 3.0 trailing XML footer starting at `offset` to EOF.
+fn read_xml_footer(f: &mut File, offset: u64) -> Result<String> {
+    let len = f.metadata().map_err(BioFormatsError::Io)?.len();
+    if offset >= len {
+        return Ok(String::new());
+    }
+    f.seek(SeekFrom::Start(offset))
+        .map_err(BioFormatsError::Io)?;
+    let mut buf = Vec::with_capacity((len - offset) as usize);
+    f.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
+    Ok(String::from_utf8_lossy(&buf)
+        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+        .to_string())
 }
 
 pub struct SpeReader {
@@ -81,47 +113,85 @@ impl FormatReader for SpeReader {
         let mut hdr = vec![0u8; HEADER_SIZE as usize];
         f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
 
-        // SPE 2.x layout (all little-endian):
-        //  42: datatype (i16)  — 0=f32, 1=i32, 2=i16, 3=u16, 8=u32
-        //  656: xdim (u16)     — image width
-        //  6: ydim (u16)       — image height (also at 1510 in some versions)
-        //  1446: numframes (i32)
-        //  576: exposure_time (f32)
-        //  Note: in SPE 2.x spec, "YCOM" (height) = offset 6, "XDIM" = offset 656
-        //  and "NUMFRAMES" = offset 1446
-        let datatype = r_i16_le(&hdr, 108); // confirmed SPE2 offset
-        let xdim = r_u16_le(&hdr, 42).max(1) as u32; // confirmed
-        let ydim = r_u16_le(&hdr, 656).max(1) as u32; // confirmed
+        // Offsets from SPEReader.java SpeHeaderEntry (all little-endian):
+        //  DATATYPE   = 108 (short)
+        //  WIDTH      =  42 (short)
+        //  HEIGHT     = 656 (short)
+        //  NUM_FRAMES =1446 (int)
+        //  EXPOSURE   =  10 (int)
+        //  DATE       =  20 (10 bytes, byte string)
+        //  XML_OFFSET = 678 (long)
+        //  HEADER_VER =1992 (int)
+        let datatype = r_i16_le(&hdr, 108);
+        let xdim = r_u16_le(&hdr, 42).max(1) as u32;
+        let ydim = r_u16_le(&hdr, 656).max(1) as u32;
+        // Java: numFrames falls back to getStackSize() when < 1, but the common
+        // path is NUM_FRAMES; keep at least 1 frame.
         let numframes = r_i32_le(&hdr, 1446).max(1) as u32;
-        let exp_time = r_f32_le(&hdr, 10);
+        let exposure = r_i32_le(&hdr, 10);
+        let header_ver = r_i32_le(&hdr, 1992);
+        let xml_offset = r_i64_le(&hdr, 678);
 
-        // Date/comment strings (best-effort)
+        // Date string (best-effort)
         let date = std::str::from_utf8(&hdr[20..30])
             .unwrap_or("")
             .trim_end_matches('\0')
+            .trim()
             .to_string();
 
+        // Java throws "Invalid pixel type" for unknown datatypes (FLOAT=0,
+        // INT32=1, INT16=2, UNINT16=3, UNINT32=4).
+        if !matches!(datatype, 0..=4) {
+            return Err(BioFormatsError::Format(format!(
+                "SPE: invalid pixel type {datatype}"
+            )));
+        }
         let (pixel_type, bpp) = spe_pixel_type(datatype);
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-        meta_map.insert(
-            "exposure_time_s".into(),
-            MetadataValue::Float(exp_time as f64),
-        );
+        if exposure > 0 {
+            meta_map.insert("EXPOSURE".into(), MetadataValue::Int(exposure as i64));
+        }
         if !date.is_empty() {
             meta_map.insert("date".into(), MetadataValue::String(date));
+        }
+        meta_map.insert(
+            "HEADER_VER".into(),
+            MetadataValue::Int(header_ver as i64),
+        );
+
+        // SPE 3.0 XML footer: detected when HEADER_VER >= 3 or XML_OFFSET > 0.
+        // Matching SPEReader.java, the binary-header dimensions are authoritative
+        // and the file is flagged metadata-incomplete; we additionally expose the
+        // raw footer XML text so downstream callers can inspect it.
+        if header_ver >= 3 || xml_offset > 0 {
+            meta_map.insert(
+                "XML_OFFSET".into(),
+                MetadataValue::Int(xml_offset),
+            );
+            meta_map.insert("metadataComplete".into(), MetadataValue::Bool(false));
+            if xml_offset > 0 {
+                if let Ok(xml) = read_xml_footer(&mut f, xml_offset as u64) {
+                    if !xml.is_empty() {
+                        meta_map.insert("XMLFooter".into(), MetadataValue::String(xml));
+                    }
+                }
+            }
+        } else {
+            meta_map.insert("metadataComplete".into(), MetadataValue::Bool(true));
         }
 
         self.meta = Some(ImageMetadata {
             size_x: xdim,
             size_y: ydim,
-            size_z: numframes,
+            // Java: sizeZ=1, sizeC=1, sizeT=numFrames, order "XYZTC".
+            size_z: 1,
             size_c: 1,
-            size_t: 1,
+            size_t: numframes,
             pixel_type,
             bits_per_pixel: bpp,
             image_count: numframes,
-            dimension_order: DimensionOrder::XYZCT,
+            dimension_order: DimensionOrder::XYZTC,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
@@ -205,28 +275,11 @@ impl FormatReader for SpeReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::metadata::MetadataValue;
         use crate::common::ome_metadata::OmeMetadata;
         let meta = self.meta.as_ref()?;
-        let mut ome = OmeMetadata::from_image_metadata(meta);
-        // Populate per-plane exposure time from the single exposure stored in the header
-        if let Some(MetadataValue::Float(exp)) = meta.series_metadata.get("exposure_time_s") {
-            let img = &mut ome.images[0];
-            img.planes = (0..meta.image_count)
-                .map(|i| {
-                    let z = i % meta.size_z;
-                    let c = (i / meta.size_z) % meta.size_c;
-                    let t = i / (meta.size_z * meta.size_c);
-                    crate::common::ome_metadata::OmePlane {
-                        the_z: z,
-                        the_c: c,
-                        the_t: t,
-                        exposure_time: Some(*exp),
-                        ..Default::default()
-                    }
-                })
-                .collect();
-        }
-        Some(ome)
+        // SPEReader.java populates pixels only; exposure time is stored as a
+        // global metadata int (microseconds, per the SPE spec) and is not mapped
+        // to per-plane OME PlaneDeltaT, so we mirror the pixel-only mapping.
+        Some(OmeMetadata::from_image_metadata(meta))
     }
 }

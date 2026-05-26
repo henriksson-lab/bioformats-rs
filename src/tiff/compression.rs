@@ -764,7 +764,16 @@ mod tests {
         )
         .expect("Thunderscan decode failed");
 
-        assert_eq!(out, vec![0x56, 0x68, 0x53]);
+        // ThunderScan (libtiff tif_thunder.c) decode of [0xc5, 0x54, 0x99, 0x03]
+        // for an 8-pixel, 1-row strip, lastpixel resetting to 0 at row start:
+        //   0xc5 -> RAW (code 0xc0): lastpixel = 5                       => [5]
+        //   0x54 -> 2-bit deltas (0x40), shifts 4/2/0, table {0,1,0,-1}:
+        //           +1 -> 6, +1 -> 7, +0 -> 7                            => [5,6,7,7]
+        //   0x99 -> 3-bit deltas (0x80), shifts 3/0, table {0,1,2,3,0,-3,-2,-1}:
+        //           +3 -> 10, +1 -> 11                                   => [5,6,7,7,10,11]
+        //   0x03 -> RUN (0x00) of 3 x lastpixel(11); clamped to width 8  => [...,11,11]
+        // Packed nibbles (high nibble first): 0x56, 0x77, 0xAB, 0xBB.
+        assert_eq!(out, vec![0x56, 0x77, 0xAB, 0xBB]);
     }
 
     #[test]

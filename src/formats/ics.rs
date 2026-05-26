@@ -111,6 +111,28 @@ impl IcsHeader {
     }
 }
 
+/// Port of MetadataTools.makeSaneDimensionOrder: ensure all of X,Y,Z,C,T are
+/// present (appending any missing in canonical order), then map to the enum.
+fn make_sane_dimension_order(order: &str) -> DimensionOrder {
+    let mut s: String = order.to_uppercase();
+    for c in ['X', 'Y', 'Z', 'C', 'T'] {
+        if !s.contains(c) {
+            s.push(c);
+        }
+    }
+    // Drop the leading XY (always present) and inspect the trailing ZCT order.
+    let tail: String = s.chars().filter(|c| matches!(c, 'Z' | 'C' | 'T')).collect();
+    match tail.as_str() {
+        "CTZ" => DimensionOrder::XYCTZ,
+        "CZT" => DimensionOrder::XYCZT,
+        "TCZ" => DimensionOrder::XYTCZ,
+        "TZC" => DimensionOrder::XYTZC,
+        "ZCT" => DimensionOrder::XYZCT,
+        "ZTC" => DimensionOrder::XYZTC,
+        _ => DimensionOrder::XYCZT,
+    }
+}
+
 fn pixel_type_from_ics(significant_bits: u8, format: &str, sign: &str) -> PixelType {
     match (significant_bits, format, sign) {
         (1, _, _) => PixelType::Bit,
@@ -137,39 +159,96 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         ));
     }
 
-    let mut size_x = 1u32;
-    let mut size_y = 1u32;
-    let mut size_z = 1u32;
-    let mut size_c = 1u32;
-    let mut size_t = 1u32;
+    // Port of ICSReader.java core-metadata construction.
+    // sizes default to 0 (matching Java's m.sizeX==0 sentinel used by storedRGB).
+    let mut size_x = 0u32;
+    let mut size_y = 0u32;
+    let mut size_z = 0u32;
+    let mut size_c = 0u32;
+    let mut size_t = 0u32;
+
+    // dimensionOrder begins as "XY" and gains Z/T/C in axis order (first occurrence).
+    let mut dim_order = String::from("XY");
+    let mut bits_per_pixel = 0u32;
+    // storedRGB: channel axis appears before the X axis.
+    let mut stored_rgb = false;
+    let mut is_rgb = false;
 
     for (axis, &sz) in axes.iter().zip(sizes.iter()) {
         match axis.as_str() {
+            "bits" => {
+                bits_per_pixel = sz;
+                while bits_per_pixel % 8 != 0 {
+                    bits_per_pixel += 1;
+                }
+                if bits_per_pixel == 24 || bits_per_pixel == 48 {
+                    bits_per_pixel /= 3;
+                }
+            }
             "x" | "width" => size_x = sz,
             "y" | "height" => size_y = sz,
-            "z" | "depth" => size_z = sz,
-            "c" | "ch" | "channel" | "channels" => size_c = sz,
-            "t" | "time" | "phase" => size_t = sz,
-            "bits" => {} // handled separately
-            _ => {}
+            "z" | "depth" => {
+                size_z = sz;
+                if !dim_order.contains('Z') {
+                    dim_order.push('Z');
+                }
+            }
+            "t" | "time" => {
+                if size_t == 0 {
+                    size_t = sz;
+                } else {
+                    size_t *= sz;
+                }
+                if !dim_order.contains('T') {
+                    dim_order.push('T');
+                }
+            }
+            // Any other axis (c, ch, channel, p, f, ...) is treated as a channel axis.
+            _ => {
+                if size_c == 0 {
+                    size_c = sz;
+                } else {
+                    size_c *= sz;
+                }
+                // storedRGB / rgb depend on whether channel axis preceded X.
+                stored_rgb = size_x == 0;
+                is_rgb = size_x == 0 && size_c <= 4 && size_c > 1;
+                if !dim_order.contains('C') {
+                    dim_order.push('C');
+                }
+            }
         }
     }
 
-    let sig = if hdr.significant_bits == 0 {
-        // Infer from sizes[0] if axis[0] == "bits"
-        if axes.first().map(|a| a == "bits").unwrap_or(false) {
-            sizes[0] as u8
-        } else {
-            8
-        }
-    } else {
+    let dimension_order = make_sane_dimension_order(&dim_order);
+
+    if size_z == 0 {
+        size_z = 1;
+    }
+    if size_c == 0 {
+        size_c = 1;
+    }
+    if size_t == 0 {
+        size_t = 1;
+    }
+
+    // Significant bits: prefer rounded bits-per-pixel from the "bits" axis.
+    let sig = if bits_per_pixel != 0 {
+        bits_per_pixel as u8
+    } else if hdr.significant_bits != 0 {
         hdr.significant_bits
+    } else {
+        8
     };
 
     let pixel_type = pixel_type_from_ics(sig, &hdr.format, &hdr.sign);
 
-    let image_count = size_z * size_t * if size_c == 1 { 1 } else { size_c };
-    let is_rgb = size_c == 3;
+    // imageCount = sizeZ * sizeT, times sizeC only when not RGB.
+    let mut image_count = size_z * size_t;
+    if !is_rgb {
+        image_count *= size_c;
+    }
+    let _ = stored_rgb;
 
     let mut series_metadata: HashMap<String, MetadataValue> = hdr
         .extra
@@ -181,6 +260,19 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         MetadataValue::Float(hdr.version as f64),
     );
 
+    // Endianness (ICSReader.java):
+    //   littleEndian = real ? first==1 : first!=1
+    // i.e. for INTEGER ics, first==1 means BIG-endian.
+    let real = hdr.format == "real";
+    let mut little_endian = true;
+    if let Some(&first) = hdr.byte_order.first() {
+        little_endian = if real { first == 1 } else { first != 1 };
+    }
+    // Sub-32-bit pixels: endianness is unconditionally flipped.
+    if (sig as u32) < 32 {
+        little_endian = !little_endian;
+    }
+
     Ok(ImageMetadata {
         size_x,
         size_y,
@@ -190,11 +282,11 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         pixel_type,
         bits_per_pixel: sig,
         image_count,
-        dimension_order: DimensionOrder::XYZCT,
+        dimension_order,
         is_rgb,
-        is_interleaved: false,
+        is_interleaved: is_rgb,
         is_indexed: false,
-        is_little_endian: hdr.byte_order.first().copied().unwrap_or(1) == 1, // [1,2,...] = LE, [4,3,...] = BE
+        is_little_endian: little_endian,
         resolution_count: 1,
         series_metadata,
         lookup_table: None,

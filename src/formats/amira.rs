@@ -12,9 +12,25 @@ use crate::common::reader::FormatReader;
 
 // ─── Amira Mesh ───────────────────────────────────────────────────────────────
 
-/// Parse Amira Mesh ASCII header.
-/// Returns (nx, ny, nz, pixel_type, data_offset, is_little_endian).
-fn parse_amira_header(path: &Path) -> Result<(u32, u32, u32, PixelType, u64, bool)> {
+/// Parsed Amira Mesh header.
+struct AmiraHeader {
+    nx: u32,
+    ny: u32,
+    nz: u32,
+    pixel_type: PixelType,
+    data_offset: u64,
+    little_endian: bool,
+    /// True when the data stream is stored as ASCII numbers, not raw binary.
+    ascii: bool,
+}
+
+/// Parse the Amira Mesh ASCII header (port of AmiraParameters.java).
+///
+/// Endianness comes from the per-stream encoding token on the first line:
+///   `BINARY`               -> big-endian
+///   `BINARY-LITTLE-ENDIAN` -> little-endian
+///   `ASCII`                -> ASCII-encoded numbers
+fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
     let f = File::open(path).map_err(BioFormatsError::Io)?;
     let mut reader = BufReader::new(f);
 
@@ -22,7 +38,8 @@ fn parse_amira_header(path: &Path) -> Result<(u32, u32, u32, PixelType, u64, boo
     let mut ny = 0u32;
     let mut nz = 0u32;
     let mut pixel_type = PixelType::Uint8;
-    let mut little_endian = true;
+    let mut little_endian = false;
+    let mut ascii = false;
     let mut data_section: u32 = 1; // default @1
 
     let mut line = String::new();
@@ -34,9 +51,18 @@ fn parse_amira_header(path: &Path) -> Result<(u32, u32, u32, PixelType, u64, boo
         }
         let t = line.trim();
 
-        // First line: check magic and endianness
-        if t.starts_with("# AmiraMesh") {
-            little_endian = !t.contains("BIG-ENDIAN");
+        // First line: encoding token determines endianness / ASCII mode.
+        if t.starts_with("# AmiraMesh") || t.starts_with("# Avizo") {
+            let up = t.to_ascii_uppercase();
+            if up.contains("BINARY-LITTLE-ENDIAN") {
+                little_endian = true;
+            } else if up.contains("BINARY") {
+                // Plain BINARY is big-endian.
+                little_endian = false;
+            } else if up.contains("ASCII") {
+                ascii = true;
+                little_endian = true; // immaterial for ASCII
+            }
         }
 
         // "define Lattice NX NY NZ"
@@ -56,14 +82,18 @@ fn parse_amira_header(path: &Path) -> Result<(u32, u32, u32, PixelType, u64, boo
         // Lattice data type: "Lattice { byte Data } @1" etc.
         if t.starts_with("Lattice") && t.contains("Data") {
             let lo = t.to_ascii_lowercase();
-            pixel_type = if lo.contains("float") {
-                PixelType::Float32
-            } else if lo.contains("double") {
+            // Order matters: check "ushort" before "short", "double" before
+            // "float" is fine, and "int" must not match "point"-like tokens.
+            pixel_type = if lo.contains("double") {
                 PixelType::Float64
+            } else if lo.contains("float") {
+                PixelType::Float32
             } else if lo.contains("ushort") || lo.contains("unsigned short") {
                 PixelType::Uint16
             } else if lo.contains("short") {
                 PixelType::Int16
+            } else if lo.contains("int") {
+                PixelType::Int32
             } else {
                 PixelType::Uint8 // "byte"
             };
@@ -78,14 +108,15 @@ fn parse_amira_header(path: &Path) -> Result<(u32, u32, u32, PixelType, u64, boo
         // Find @N marker in body — data starts on the next line
         if t == format!("@{}", data_section) {
             let data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
-            return Ok((
-                nx.max(1),
-                ny.max(1),
-                nz.max(1),
+            return Ok(AmiraHeader {
+                nx: nx.max(1),
+                ny: ny.max(1),
+                nz: nz.max(1),
                 pixel_type,
                 data_offset,
                 little_endian,
-            ));
+                ascii,
+            });
         }
     }
 
@@ -98,6 +129,7 @@ pub struct AmiraReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
+    ascii: bool,
 }
 
 impl AmiraReader {
@@ -106,7 +138,62 @@ impl AmiraReader {
             path: None,
             meta: None,
             data_offset: 0,
+            ascii: false,
         }
+    }
+
+    /// Read one plane's worth of ASCII-encoded numbers and pack into bytes
+    /// according to the pixel type. Numbers are whitespace-separated.
+    fn read_ascii_plane(&self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let pixel_type = meta.pixel_type;
+        let bps = pixel_type.bytes_per_sample();
+        let count = (meta.size_x * meta.size_y) as usize;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        let f = File::open(path).map_err(BioFormatsError::Io)?;
+        let mut reader = BufReader::new(f);
+        reader
+            .seek(SeekFrom::Start(self.data_offset))
+            .map_err(BioFormatsError::Io)?;
+
+        // Read all of the remaining text and tokenize. ASCII Amira streams store
+        // values plane-major; skip the planes before the requested one.
+        let mut text = String::new();
+        reader.read_to_string(&mut text).map_err(BioFormatsError::Io)?;
+        let skip = plane_index as usize * count;
+
+        let mut out = vec![0u8; count * bps];
+        for (i, tok) in text.split_ascii_whitespace().skip(skip).take(count).enumerate() {
+            let dst = &mut out[i * bps..(i + 1) * bps];
+            match pixel_type {
+                PixelType::Float32 => {
+                    let v: f32 = tok.parse().unwrap_or(0.0);
+                    dst.copy_from_slice(&v.to_le_bytes());
+                }
+                PixelType::Float64 => {
+                    let v: f64 = tok.parse().unwrap_or(0.0);
+                    dst.copy_from_slice(&v.to_le_bytes());
+                }
+                PixelType::Int32 => {
+                    let v: i32 = tok.parse().unwrap_or(0);
+                    dst.copy_from_slice(&v.to_le_bytes());
+                }
+                PixelType::Uint16 => {
+                    let v: u16 = tok.parse().unwrap_or(0);
+                    dst.copy_from_slice(&v.to_le_bytes());
+                }
+                PixelType::Int16 => {
+                    let v: i16 = tok.parse().unwrap_or(0);
+                    dst.copy_from_slice(&v.to_le_bytes());
+                }
+                _ => {
+                    let v: i64 = tok.parse().unwrap_or(0);
+                    dst[0] = v as u8;
+                }
+            }
+        }
+        Ok(out)
     }
 }
 impl Default for AmiraReader {
@@ -130,22 +217,24 @@ impl FormatReader for AmiraReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (nx, ny, nz, pixel_type, data_offset, le) = parse_amira_header(path)?;
-        let image_count = nz;
+        let hdr = parse_amira_header(path)?;
+        let image_count = hdr.nz;
+        // ASCII-decoded planes are emitted as little-endian byte buffers.
+        let little_endian = if hdr.ascii { true } else { hdr.little_endian };
         self.meta = Some(ImageMetadata {
-            size_x: nx,
-            size_y: ny,
-            size_z: nz,
+            size_x: hdr.nx,
+            size_y: hdr.ny,
+            size_z: hdr.nz,
             size_c: 1,
             size_t: 1,
-            pixel_type,
-            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            pixel_type: hdr.pixel_type,
+            bits_per_pixel: (hdr.pixel_type.bytes_per_sample() * 8) as u8,
             image_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: le,
+            is_little_endian: little_endian,
             resolution_count: 1,
             series_metadata: HashMap::new(),
             lookup_table: None,
@@ -153,7 +242,8 @@ impl FormatReader for AmiraReader {
             modulo_c: None,
             modulo_t: None,
         });
-        self.data_offset = data_offset;
+        self.data_offset = hdr.data_offset;
+        self.ascii = hdr.ascii;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -184,6 +274,9 @@ impl FormatReader for AmiraReader {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if self.ascii {
+            return self.read_ascii_plane(plane_index);
         }
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;

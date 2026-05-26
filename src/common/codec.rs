@@ -91,7 +91,11 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
     let height = components[0].height() as usize;
     let n_components = components.len();
 
-    // Determine bytes per sample from the first component's precision
+    // Determine bytes per sample from the first component's precision.
+    // jpeg2k component samples are i32; narrow by taking the low `bps` bytes of
+    // the two's-complement representation (preserving sign bits for signed data),
+    // rather than casting i32 -> u16 which would silently drop bits for any
+    // precision > 16 that happened to fall into the 2-byte path.
     let prec = components[0].precision() as usize;
     let bps = if prec <= 8 {
         1
@@ -107,11 +111,9 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
         for x in 0..width {
             for c in 0..n_components {
                 let val = components[c].data()[y * width + x];
-                match bps {
-                    1 => out.push(val as u8),
-                    2 => out.extend_from_slice(&(val as u16).to_le_bytes()),
-                    _ => out.extend_from_slice(&val.to_le_bytes()),
-                }
+                // Take the low `bps` bytes of the little-endian i32 encoding.
+                let bytes = val.to_le_bytes();
+                out.extend_from_slice(&bytes[..bps]);
             }
         }
     }
@@ -457,6 +459,245 @@ pub fn decompress_msrle(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>>
     }
 
     Ok(out)
+}
+
+/// Microsoft Video 1 (MSVC / CRAM) codec.
+///
+/// Ported from the Microsoft Video 1 algorithm described at
+/// <http://wiki.multimedia.cx/index.php?title=Microsoft_Video_1>, which is the
+/// reference the Java `MSVideoCodec` (via `ome.codecs.MSVideoCodec`) follows.
+///
+/// The image is divided into 4x4 blocks scanned bottom-to-top (block rows are
+/// laid out from the bottom of the image upward). Each block is one of:
+/// skip (copy from the previous frame — emitted as 0 here since this stateless
+/// helper has no prior frame), 1-color (solid), 2-color, or 8-color (each 2x2
+/// quadrant has its own 2-color pair).
+///
+/// Two variants share the same control flow:
+/// * 8-bit (`bpp == 1`): each color is a single palette index; output is a
+///   width*height index plane (one byte per pixel).
+/// * 16-bit (`bpp == 2`): each color is an RGB555 value; output is
+///   width*height*3 interleaved RGB bytes.
+pub fn decompress_msvideo(data: &[u8], width: u32, height: u32, bpp: u32) -> Result<Vec<u8>> {
+    let width = width as usize;
+    let height = height as usize;
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::InvalidData(
+            "MSVideo: width and height must be non-zero".into(),
+        ));
+    }
+    let out_channels = match bpp {
+        1 => 1usize,
+        2 => 3usize,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "MSVideo: unsupported bit depth {} (only 8-bit and 16-bit are supported)",
+                other * 8
+            )))
+        }
+    };
+    let sixteen_bit = bpp == 2;
+
+    let output_len = checked_video_output_len("MSVideo", width, height, out_channels)?;
+    let mut out = vec![0u8; output_len];
+
+    // MS Video 1 requires dimensions divisible by 4; round the block grid up so
+    // odd sizes still decode (extra pixels are clipped on write).
+    let blocks_wide = width.div_ceil(4);
+    let blocks_high = height.div_ceil(4);
+    let total_blocks = blocks_wide
+        .checked_mul(blocks_high)
+        .ok_or_else(|| BioFormatsError::InvalidData("MSVideo: block count overflows".into()))?;
+
+    // Writes one color into output pixel (px, py); for 8-bit the color is a
+    // palette index, for 16-bit it is an RGB555 value expanded to RGB888.
+    // Out-of-bounds pixels (odd dimensions) are clipped.
+    let put = |out: &mut [u8], px: usize, py: usize, color: u16| {
+        if px >= width || py >= height {
+            return;
+        }
+        if sixteen_bit {
+            // RGB555: red bits 14-10, green 9-5, blue 4-0 (5 bits each, scaled
+            // to 8 bits). Output order is R, G, B.
+            let r = (((color >> 10) & 0x1f) as u32 * 255 / 31) as u8;
+            let g = (((color >> 5) & 0x1f) as u32 * 255 / 31) as u8;
+            let b = ((color & 0x1f) as u32 * 255 / 31) as u8;
+            let off = (py * width + px) * 3;
+            out[off] = r;
+            out[off + 1] = g;
+            out[off + 2] = b;
+        } else {
+            out[py * width + px] = color as u8;
+        }
+    };
+
+    // Writes a 4x4 block where each of the 16 pixels selects between two colors
+    // according to `flags`. Bit 0 corresponds to the bottom-left pixel; bits run
+    // left-to-right then bottom-to-top:
+    //   bit indices by position:
+    //     12 13 14 15   (top row)
+    //      8  9 10 11
+    //      4  5  6  7
+    //      0  1  2  3   (bottom row)
+    // A set bit selects color_a (`ca`); a clear bit selects color_b (`cb`).
+    let put_2color = |out: &mut [u8], base_x: usize, base_y: usize, flags: u16, ca: u16, cb: u16| {
+        for bit in 0..16usize {
+            let col = bit % 4;
+            let row_from_bottom = bit / 4;
+            let px = base_x + col;
+            // base_y is the top of the block; bit row 0 is the bottom row.
+            let py = base_y + (3 - row_from_bottom);
+            let color = if (flags >> bit) & 1 == 1 { ca } else { cb };
+            put(out, px, py, color);
+        }
+    };
+
+    let mut i = 0usize;
+    let mut block_index = 0usize; // in encoder (bottom-up) order
+
+    while block_index < total_blocks {
+        if i + 2 > data.len() {
+            // Out of data: remaining blocks keep the (zeroed) previous frame.
+            break;
+        }
+        let byte_a = data[i];
+        let byte_b = data[i + 1];
+        let flags = u16::from_le_bytes([byte_a, byte_b]);
+        i += 2;
+
+        // Block position: encoder order lays out block rows bottom-up, so block
+        // row 0 is the bottom-most strip of the image.
+        let block_row_from_bottom = block_index / blocks_wide;
+        let block_col = block_index % blocks_wide;
+        let block_row = blocks_high - 1 - block_row_from_bottom;
+        let base_x = block_col * 4;
+        let base_y = block_row * 4;
+
+        // End-of-stream marker.
+        if byte_a == 0 && byte_b == 0 {
+            break;
+        }
+
+        // Skip run: 0x84 <= byte_b <= 0x87, skipping up to 1023 blocks.
+        if (0x84..=0x87).contains(&byte_b) {
+            let skip = (byte_b as usize - 0x84) * 256 + byte_a as usize;
+            block_index += skip.max(1);
+            continue;
+        }
+
+        if sixteen_bit {
+            if byte_b < 0x80 {
+                // 2-color or 8-color, determined by the MSB of the first color.
+                if i + 2 > data.len() {
+                    return Err(BioFormatsError::InvalidData(
+                        "MSVideo: 16-bit block missing color".into(),
+                    ));
+                }
+                let first = u16::from_le_bytes([data[i], data[i + 1]]);
+                if first & 0x8000 != 0 {
+                    // 8-color block: 4 quadrants, each with its own 2-color pair.
+                    if i + 16 > data.len() {
+                        return Err(BioFormatsError::InvalidData(
+                            "MSVideo: 16-bit 8-color block overruns input".into(),
+                        ));
+                    }
+                    let mut colors = [0u16; 8];
+                    for c in &mut colors {
+                        *c = u16::from_le_bytes([data[i], data[i + 1]]) & 0x7fff;
+                        i += 2;
+                    }
+                    put_8color(&mut out, base_x, base_y, flags, &colors, &put);
+                } else {
+                    // 2-color block.
+                    if i + 4 > data.len() {
+                        return Err(BioFormatsError::InvalidData(
+                            "MSVideo: 16-bit 2-color block overruns input".into(),
+                        ));
+                    }
+                    let ca = u16::from_le_bytes([data[i], data[i + 1]]);
+                    let cb = u16::from_le_bytes([data[i + 2], data[i + 3]]);
+                    i += 4;
+                    put_2color(&mut out, base_x, base_y, flags, ca, cb);
+                }
+            } else {
+                // 1-color (solid) block: byte_a/byte_b form the 16-bit color.
+                let color = flags & 0x7fff;
+                for bit in 0..16usize {
+                    put(&mut out, base_x + bit % 4, base_y + (3 - bit / 4), color);
+                }
+            }
+            block_index += 1;
+            continue;
+        }
+
+        // 8-bit mode.
+        if byte_b < 0x80 {
+            // 2-color block: read color_a, color_b (palette indices).
+            if i + 2 > data.len() {
+                return Err(BioFormatsError::InvalidData(
+                    "MSVideo: 8-bit 2-color block overruns input".into(),
+                ));
+            }
+            let ca = data[i] as u16;
+            let cb = data[i + 1] as u16;
+            i += 2;
+            put_2color(&mut out, base_x, base_y, flags, ca, cb);
+        } else if byte_b >= 0x90 {
+            // 8-color block: 4 quadrants, each with a 2-color pair (8 bytes).
+            if i + 8 > data.len() {
+                return Err(BioFormatsError::InvalidData(
+                    "MSVideo: 8-bit 8-color block overruns input".into(),
+                ));
+            }
+            let mut colors = [0u16; 8];
+            for c in &mut colors {
+                *c = data[i] as u16;
+                i += 1;
+            }
+            put_8color(&mut out, base_x, base_y, flags, &colors, &put);
+        } else {
+            // 1-color (solid) block: byte_a is the palette index for all pixels.
+            let color = byte_a as u16;
+            for bit in 0..16usize {
+                put(&mut out, base_x + bit % 4, base_y + (3 - bit / 4), color);
+            }
+        }
+        block_index += 1;
+    }
+
+    Ok(out)
+}
+
+/// Writes a Microsoft Video 1 8-color 4x4 block: each 2x2 quadrant uses its own
+/// color pair (`colors[2*q]`, `colors[2*q+1]`). `flags` provides the per-pixel
+/// selector bits using the same bottom-up bit layout as 2-color blocks.
+///
+/// Quadrant numbering by position:
+///   quad2 | quad3   (top half)
+///   quad0 | quad1   (bottom half)
+fn put_8color<F: Fn(&mut [u8], usize, usize, u16)>(
+    out: &mut [u8],
+    base_x: usize,
+    base_y: usize,
+    flags: u16,
+    colors: &[u16; 8],
+    put: &F,
+) {
+    for bit in 0..16usize {
+        let col = bit % 4;
+        let row_from_bottom = bit / 4;
+        // Quadrant: bottom-left=0, bottom-right=1, top-left=2, top-right=3.
+        let quad = (if row_from_bottom < 2 { 0 } else { 2 }) + usize::from(col >= 2);
+        let pair = quad * 2;
+        let color = if (flags >> bit) & 1 == 1 {
+            colors[pair + 1]
+        } else {
+            colors[pair]
+        };
+        let px = base_x + col;
+        let py = base_y + (3 - row_from_bottom);
+        put(out, px, py, color);
+    }
 }
 
 /// Motion JPEG-B codec.
@@ -1626,6 +1867,58 @@ mod tests {
         let out = decompress_msrle(&data, 3, 2).expect("MSRLE decode");
 
         assert_eq!(out, vec![0, 0, 5, 9, 0, 0]);
+    }
+
+    #[test]
+    fn msvideo_8bit_decodes_two_color_block() {
+        // Single 4x4 block. flags = 0x000F: bits 0..3 set select color_a, which
+        // in the bottom-up bit layout is the bottom display row.
+        let data = [
+            0x0f, 0x00, // flags (byte_b < 0x80 => 2-color)
+            100, // color_a (selected by set bits)
+            200, // color_b (selected by clear bits)
+        ];
+        let out = decompress_msvideo(&data, 4, 4, 1).expect("MSVideo 8-bit decode");
+        // Rows 0..2 (top three display rows) are color_b; row 3 (bottom) is color_a.
+        let mut expected = vec![200u8; 16];
+        for px in expected.iter_mut().skip(12) {
+            *px = 100;
+        }
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn msvideo_8bit_decodes_solid_block() {
+        // 1-color block: 0x80 <= byte_b < 0x90 and byte_b < 0x90 => solid fill of byte_a.
+        let data = [42u8, 0x80];
+        let out = decompress_msvideo(&data, 4, 4, 1).expect("MSVideo 8-bit solid");
+        assert_eq!(out, vec![42u8; 16]);
+    }
+
+    #[test]
+    fn msvideo_8bit_skip_leaves_previous_frame_zero() {
+        // Skip run covering the whole 4x4 frame (one block). 0x84 <= byte_b <= 0x87.
+        // skip = (0x84 - 0x84) * 256 + 1 = 1 block.
+        let data = [0x01u8, 0x84];
+        let out = decompress_msvideo(&data, 4, 4, 1).expect("MSVideo 8-bit skip");
+        assert_eq!(out, vec![0u8; 16]);
+    }
+
+    #[test]
+    fn msvideo_16bit_decodes_solid_rgb555() {
+        // 1-color 16-bit block: byte_b >= 0x80 (here 0xFF) => solid fill.
+        // color = 0x7FFF & flags. Use pure white: R=G=B=31 => 0x7FFF.
+        let data = [0xff, 0xff];
+        let out = decompress_msvideo(&data, 4, 4, 2).expect("MSVideo 16-bit solid");
+        assert_eq!(out.len(), 16 * 3);
+        // RGB555 0x7FFF expands to (255,255,255).
+        assert!(out.iter().all(|&b| b == 255));
+    }
+
+    #[test]
+    fn msvideo_rejects_unsupported_depth() {
+        let err = decompress_msvideo(&[0, 0], 4, 4, 3).expect_err("unsupported depth must fail");
+        assert!(matches!(err, BioFormatsError::UnsupportedFormat(_)));
     }
 
     #[test]

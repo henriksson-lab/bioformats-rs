@@ -16,18 +16,34 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
 // ── NIfTI datatype codes ─────────────────────────────────────────────────────
-fn nifti_pixel_type(datatype: i16) -> PixelType {
-    match datatype {
-        2 => PixelType::Uint8,
-        4 => PixelType::Int16,
-        8 => PixelType::Int32,
-        16 => PixelType::Float32,
-        64 => PixelType::Float64,
-        256 => PixelType::Int8,
-        512 => PixelType::Uint16,
-        768 => PixelType::Uint32,
-        _ => PixelType::Uint8,
-    }
+//
+// Mirrors NiftiReader.populatePixelType. Datatypes 128 (RGB24) and 2304
+// (RGBA32) are colour types: they set the pixel type to UINT8 and fix the
+// channel count (3 / 4 respectively). The returned `Option<u32>`, when set,
+// overrides sizeC for these colour types.
+//
+// Note: the Java switch has fall-through bugs (missing `break` after cases 128
+// and 2304); this uses the clearly intended mapping
+// (128 → UINT8 RGB sizeC=3, 2304 → UINT8 RGBA sizeC=4).
+fn nifti_pixel_type(datatype: i16) -> Result<(PixelType, Option<u32>)> {
+    Ok(match datatype {
+        1 | 2 => (PixelType::Uint8, None),
+        4 => (PixelType::Int16, None),
+        8 => (PixelType::Int32, None),
+        16 => (PixelType::Float32, None),
+        64 => (PixelType::Float64, None),
+        128 => (PixelType::Uint8, Some(3)),
+        256 => (PixelType::Int8, None),
+        512 => (PixelType::Uint16, None),
+        768 => (PixelType::Uint32, None),
+        2304 => (PixelType::Uint8, Some(4)),
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Unsupported NIfTI data type: {}",
+                other
+            )))
+        }
+    })
 }
 
 // ── Header parsing ────────────────────────────────────────────────────────────
@@ -153,38 +169,44 @@ fn is_nifti_single(magic: &[u8; 4]) -> bool {
     magic == b"n+1\0"
 }
 
-fn build_metadata(hdr: &NiftiHeader) -> ImageMetadata {
-    let ndim = hdr.ndim.max(1) as usize;
+fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
+    // Java reads sizeX=dim[1], sizeY=dim[2], sizeZ=dim[3], sizeT=dim[4] and
+    // then multiplies sizeC by the extra dims dim[5..] when nDimensions > 4.
+    // In this struct hdr.dim[0..6] correspond to NIfTI dim[1..7].
+    let size_x = hdr.dim[0].max(1) as u32;
+    let size_y = hdr.dim[1].max(1) as u32;
+    let mut size_z = hdr.dim[2] as u32;
+    let mut size_t = hdr.dim[3] as u32;
 
-    // dim[1]=x, dim[2]=y, dim[3]=z, dim[4]=t, dim[5]=channels (or 5th dim)
-    let size_x = if ndim >= 1 {
-        hdr.dim[0].max(1) as u32
-    } else {
-        1
-    };
-    let size_y = if ndim >= 2 {
-        hdr.dim[1].max(1) as u32
-    } else {
-        1
-    };
-    let size_z = if ndim >= 3 {
-        hdr.dim[2].max(1) as u32
-    } else {
-        1
-    };
-    let size_t = if ndim >= 4 {
-        hdr.dim[3].max(1) as u32
-    } else {
-        1
-    };
-    let size_c = if ndim >= 5 {
-        hdr.dim[4].max(1) as u32
-    } else {
-        1
-    };
+    // extraDims = dim[5], dim[6], dim[7] → hdr.dim[4], hdr.dim[5], hdr.dim[6].
+    let extra_dims = [hdr.dim[4], hdr.dim[5], hdr.dim[6]];
+    let mut size_c = 1u32;
+    if hdr.ndim > 4 {
+        for d in extra_dims.iter().take(hdr.ndim as usize - 4) {
+            size_c *= (*d).max(1) as u32;
+        }
+    }
 
-    let pixel_type = nifti_pixel_type(hdr.datatype);
+    if size_z == 0 {
+        size_z = 1;
+    }
+    if size_t == 0 {
+        size_t = 1;
+    }
+
+    // Java computes imageCount = sizeZ * sizeT * sizeC BEFORE populatePixelType
+    // overrides sizeC for colour datatypes, so the colour override does not
+    // change imageCount.
     let image_count = size_z * size_t * size_c;
+
+    // Pixel type; colour datatypes (128/2304) also override sizeC.
+    let (pixel_type, color_size_c) = nifti_pixel_type(hdr.datatype)?;
+    if let Some(c) = color_size_c {
+        size_c = c;
+    }
+
+    // Java: rgb = sizeC > 1 && imageCount == sizeZ*sizeT.
+    let is_rgb = size_c > 1 && image_count == size_z * size_t;
 
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
     if !hdr.descrip.is_empty() {
@@ -220,7 +242,7 @@ fn build_metadata(hdr: &NiftiHeader) -> ImageMetadata {
         );
     }
 
-    ImageMetadata {
+    Ok(ImageMetadata {
         size_x,
         size_y,
         size_z,
@@ -229,9 +251,10 @@ fn build_metadata(hdr: &NiftiHeader) -> ImageMetadata {
         pixel_type,
         bits_per_pixel: hdr.bitpix.max(0) as u8,
         image_count,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
+        // Java NiftiReader uses dimensionOrder "XYCZT".
+        dimension_order: DimensionOrder::XYCZT,
+        is_rgb,
+        is_interleaved: is_rgb,
         is_indexed: false,
         is_little_endian: hdr.little_endian,
         resolution_count: 1,
@@ -240,7 +263,7 @@ fn build_metadata(hdr: &NiftiHeader) -> ImageMetadata {
         modulo_z: None,
         modulo_c: None,
         modulo_t: None,
-    }
+    })
 }
 
 // ── Reader ────────────────────────────────────────────────────────────────────
@@ -355,7 +378,7 @@ impl FormatReader for NiftiReader {
         }
 
         let hdr = parse_header(&hdr_bytes)?;
-        let meta = build_metadata(&hdr);
+        let meta = build_metadata(&hdr)?;
 
         // Determine data file and offset
         let (data_path, data_offset) = if is_nifti_single(&hdr.magic) || is_gz {

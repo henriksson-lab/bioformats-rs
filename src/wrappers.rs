@@ -68,10 +68,19 @@ impl ChannelSeparator {
         }
     }
 
+    /// Java ChannelSeparator separates whenever `reader.isRGB() && !reader.isIndexed()`,
+    /// regardless of interleaving. In this metadata model `getRGBChannelCount()`
+    /// equals `size_c` when RGB (effectiveSizeC == 1), so the split factor is
+    /// `size_c`.
+    fn should_split(meta: &ImageMetadata) -> bool {
+        meta.is_rgb && !meta.is_indexed && meta.size_c > 1
+    }
+
     fn rebuild_meta(&mut self) {
         let meta = self.inner.metadata();
-        if meta.is_rgb && meta.is_interleaved && meta.size_c > 1 {
+        if Self::should_split(meta) {
             let mut adjusted = meta.clone();
+            // Java getImageCount() = getRGBChannelCount() * reader.getImageCount().
             adjusted.image_count = meta.image_count * meta.size_c;
             adjusted.is_interleaved = false;
             adjusted.is_rgb = false;
@@ -81,16 +90,51 @@ impl ChannelSeparator {
         }
     }
 
-    /// Extract one channel from interleaved pixel data.
-    fn extract_channel(data: &[u8], channel: usize, n_channels: usize, bps: usize) -> Vec<u8> {
-        let pixel_bytes = n_channels * bps;
-        let n_pixels = data.len() / pixel_bytes;
-        let mut out = Vec::with_capacity(n_pixels * bps);
-        for i in 0..n_pixels {
-            let offset = i * pixel_bytes + channel * bps;
-            out.extend_from_slice(&data[offset..offset + bps]);
+    /// Extract one channel using `ImageTools.splitChannels` semantics, handling
+    /// both interleaved (RGBRGB…) and planar (RRR…GGG…BBB…) source layouts.
+    ///
+    /// `n_channels` is the RGB channel count (split factor), `bps` is bytes per
+    /// sample. For planar data the channel is one contiguous block of length
+    /// `data.len() / n_channels`; for interleaved data the channel's samples are
+    /// strided by `n_channels * bps`.
+    fn extract_channel(
+        data: &[u8],
+        channel: usize,
+        n_channels: usize,
+        bps: usize,
+        interleaved: bool,
+    ) -> Vec<u8> {
+        if n_channels <= 1 {
+            return data.to_vec();
         }
-        out
+        let channel_length = data.len() / n_channels;
+        if !interleaved {
+            // Planar: contiguous block at channel_length * channel.
+            let start = channel_length * channel;
+            let end = (start + channel_length).min(data.len());
+            if start >= data.len() {
+                return vec![0u8; channel_length];
+            }
+            let mut out = data[start..end].to_vec();
+            out.resize(channel_length, 0);
+            out
+        } else {
+            // Interleaved: pick `bps` bytes every `n_channels * bps` bytes.
+            let stride = n_channels * bps;
+            let mut out = Vec::with_capacity(channel_length);
+            let mut i = 0;
+            while i < data.len() {
+                for k in 0..bps {
+                    let src = i + channel * bps + k;
+                    if out.len() < channel_length && src < data.len() {
+                        out.push(data[src]);
+                    }
+                }
+                i += stride;
+            }
+            out.resize(channel_length, 0);
+            out
+        }
     }
 }
 
@@ -134,19 +178,26 @@ impl FormatReader for ChannelSeparator {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let (is_split, nc, bps) = {
+        let (is_split, nc, bps, interleaved) = {
             let meta = self.inner.metadata();
             (
-                meta.is_rgb && meta.is_interleaved && meta.size_c > 1,
+                Self::should_split(meta),
                 meta.size_c,
                 meta.pixel_type.bytes_per_sample(),
+                meta.is_interleaved,
             )
         };
         if is_split {
             let real_plane = plane_index / nc;
             let channel = (plane_index % nc) as usize;
             let data = self.inner.open_bytes(real_plane)?;
-            Ok(Self::extract_channel(&data, channel, nc as usize, bps))
+            Ok(Self::extract_channel(
+                &data,
+                channel,
+                nc as usize,
+                bps,
+                interleaved,
+            ))
         } else {
             self.inner.open_bytes(plane_index)
         }
@@ -160,38 +211,52 @@ impl FormatReader for ChannelSeparator {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let (is_split, nc, bps) = {
+        let (is_split, nc, bps, interleaved) = {
             let meta = self.inner.metadata();
             (
-                meta.is_rgb && meta.is_interleaved && meta.size_c > 1,
+                Self::should_split(meta),
                 meta.size_c,
                 meta.pixel_type.bytes_per_sample(),
+                meta.is_interleaved,
             )
         };
         if is_split {
             let real_plane = plane_index / nc;
             let channel = (plane_index % nc) as usize;
             let data = self.inner.open_bytes_region(real_plane, x, y, w, h)?;
-            Ok(Self::extract_channel(&data, channel, nc as usize, bps))
+            Ok(Self::extract_channel(
+                &data,
+                channel,
+                nc as usize,
+                bps,
+                interleaved,
+            ))
         } else {
             self.inner.open_bytes_region(plane_index, x, y, w, h)
         }
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let (is_split, nc, bps) = {
+        let (is_split, nc, bps, interleaved) = {
             let meta = self.inner.metadata();
             (
-                meta.is_rgb && meta.is_interleaved && meta.size_c > 1,
+                Self::should_split(meta),
                 meta.size_c,
                 meta.pixel_type.bytes_per_sample(),
+                meta.is_interleaved,
             )
         };
         if is_split {
             let real_plane = plane_index / nc;
             let channel = (plane_index % nc) as usize;
             let data = self.inner.open_thumb_bytes(real_plane)?;
-            Ok(Self::extract_channel(&data, channel, nc as usize, bps))
+            Ok(Self::extract_channel(
+                &data,
+                channel,
+                nc as usize,
+                bps,
+                interleaved,
+            ))
         } else {
             self.inner.open_thumb_bytes(plane_index)
         }
@@ -233,9 +298,14 @@ impl ChannelMerger {
         }
     }
 
+    /// Java ChannelMerger.canMerge(): `c > 1 && c <= 4 && !reader.isRGB()`.
+    fn can_merge(meta: &ImageMetadata) -> bool {
+        meta.size_c > 1 && meta.size_c <= 4 && !meta.is_rgb
+    }
+
     fn rebuild_meta(&mut self) -> Result<()> {
         let meta = self.inner.metadata();
-        if !meta.is_rgb && !meta.is_interleaved && meta.size_c > 1 && meta.image_count > 1 {
+        if Self::can_merge(meta) {
             if meta.image_count % meta.size_c != 0 {
                 return Err(BioFormatsError::InvalidData(format!(
                     "cannot merge {} planes into {} channels",
@@ -254,9 +324,11 @@ impl ChannelMerger {
                 )));
             }
             let mut adjusted = meta.clone();
+            // Java: getImageCount() divides by getSizeC() when canMerge().
             adjusted.image_count = meta.image_count / meta.size_c;
+            // Java isRGB() returns true and isInterleaved() returns false when merging.
             adjusted.is_rgb = true;
-            adjusted.is_interleaved = true;
+            adjusted.is_interleaved = false;
             self.adjusted_meta = Some(adjusted);
         } else {
             self.adjusted_meta = None;
@@ -264,19 +336,16 @@ impl ChannelMerger {
         Ok(())
     }
 
-    /// Interleave N channel buffers into one RGBRGB... buffer.
-    fn interleave(channels: &[Vec<u8>], bps: usize) -> Vec<u8> {
-        if channels.is_empty() {
-            return Vec::new();
-        }
-        let nc = channels.len();
-        let n_pixels = channels[0].len() / bps;
-        let mut out = Vec::with_capacity(n_pixels * nc * bps);
-        for i in 0..n_pixels {
-            for ch in channels {
-                let offset = i * bps;
-                out.extend_from_slice(&ch[offset..offset + bps]);
-            }
+    /// Concatenate N channel buffers into one planar/contiguous buffer.
+    ///
+    /// Java ChannelMerger.openBytes copies each channel as a contiguous block:
+    /// `System.arraycopy(b, 0, buf, c * b.length, b.length)`. The result is
+    /// non-interleaved (channel 0 bytes, then channel 1 bytes, ...).
+    fn concatenate(channels: &[Vec<u8>]) -> Vec<u8> {
+        let total: usize = channels.iter().map(|c| c.len()).sum();
+        let mut out = Vec::with_capacity(total);
+        for ch in channels {
+            out.extend_from_slice(ch);
         }
         out
     }
@@ -354,13 +423,9 @@ impl FormatReader for ChannelMerger {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let (is_merge, nc, bps) = {
+        let (is_merge, nc) = {
             let meta = self.inner.metadata();
-            (
-                self.adjusted_meta.is_some(),
-                meta.size_c,
-                meta.pixel_type.bytes_per_sample(),
-            )
+            (self.adjusted_meta.is_some(), meta.size_c)
         };
         if is_merge {
             let mut channels = Vec::with_capacity(nc as usize);
@@ -368,7 +433,7 @@ impl FormatReader for ChannelMerger {
                 let source = self.source_plane_for_channel(plane_index, c)?;
                 channels.push(self.inner.open_bytes(source)?);
             }
-            Ok(Self::interleave(&channels, bps))
+            Ok(Self::concatenate(&channels))
         } else {
             self.inner.open_bytes(plane_index)
         }
@@ -382,13 +447,9 @@ impl FormatReader for ChannelMerger {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let (is_merge, nc, bps) = {
+        let (is_merge, nc) = {
             let meta = self.inner.metadata();
-            (
-                self.adjusted_meta.is_some(),
-                meta.size_c,
-                meta.pixel_type.bytes_per_sample(),
-            )
+            (self.adjusted_meta.is_some(), meta.size_c)
         };
         if is_merge {
             let mut channels = Vec::with_capacity(nc as usize);
@@ -396,20 +457,16 @@ impl FormatReader for ChannelMerger {
                 let source = self.source_plane_for_channel(plane_index, c)?;
                 channels.push(self.inner.open_bytes_region(source, x, y, w, h)?);
             }
-            Ok(Self::interleave(&channels, bps))
+            Ok(Self::concatenate(&channels))
         } else {
             self.inner.open_bytes_region(plane_index, x, y, w, h)
         }
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let (is_merge, nc, bps) = {
+        let (is_merge, nc) = {
             let meta = self.inner.metadata();
-            (
-                self.adjusted_meta.is_some(),
-                meta.size_c,
-                meta.pixel_type.bytes_per_sample(),
-            )
+            (self.adjusted_meta.is_some(), meta.size_c)
         };
         if is_merge {
             let mut channels = Vec::with_capacity(nc as usize);
@@ -417,7 +474,7 @@ impl FormatReader for ChannelMerger {
                 let source = self.source_plane_for_channel(plane_index, c)?;
                 channels.push(self.inner.open_thumb_bytes(source)?);
             }
-            Ok(Self::interleave(&channels, bps))
+            Ok(Self::concatenate(&channels))
         } else {
             self.inner.open_thumb_bytes(plane_index)
         }
@@ -672,26 +729,68 @@ impl MinMaxCalculator {
         &self.channel_stats
     }
 
-    fn update_stats(&mut self, data: &[u8]) {
+    /// Update per-channel min/max statistics for one plane.
+    ///
+    /// Ports `MinMaxCalculator.updateMinMax`. The plane's channel coordinate
+    /// selects which `chanMin/chanMax` slots to update:
+    /// `cBase = getZCTCoords(no)[1] * numRGB`. Each of the `numRGB` samples in
+    /// the plane updates `chanMax[cBase + c]`. `numRGB` is the RGB channel count
+    /// (`size_c` when RGB, else 1); the per-channel stat array therefore has
+    /// `effectiveSizeC * numRGB == size_c` slots. Sample addressing follows Java:
+    /// `idx = bpp * (interleaved ? i*numRGB + c : c*pixels + i)`.
+    fn update_stats(&mut self, plane_index: u32, data: &[u8]) {
         let meta = self.inner.metadata();
-        let nc = meta.size_c as usize;
         let bps = meta.pixel_type.bytes_per_sample();
+        if bps == 0 {
+            return;
+        }
         let pt = meta.pixel_type;
         let little_endian = meta.is_little_endian;
+        // numRGB = getRGBChannelCount(); effectiveSizeC = size_c / numRGB.
+        let num_rgb = if meta.is_rgb {
+            meta.size_c.max(1) as usize
+        } else {
+            1
+        };
+        let total_channels = meta.size_c.max(1) as usize;
         let interleaved = meta.is_interleaved && meta.is_rgb;
 
-        while self.channel_stats.len() < nc {
+        // Determine the plane's C coordinate (Java getZCTCoords(no)[1]).
+        let (sz, sc, st) = (
+            meta.size_z.max(1),
+            // effectiveSizeC: the number of distinct C planes.
+            (total_channels / num_rgb).max(1) as u32,
+            meta.size_t.max(1),
+        );
+        let plane_count = (sz as usize) * (sc as usize) * (st as usize);
+        let c_coord = if (plane_index as usize) < plane_count {
+            let (_z, c, _t) = decompose_plane(plane_index, sz, sc, st, meta.dimension_order);
+            c as usize
+        } else {
+            0
+        };
+        let c_base = c_coord * num_rgb;
+
+        while self.channel_stats.len() < total_channels {
             self.channel_stats.push((f64::INFINITY, f64::NEG_INFINITY));
         }
 
-        if interleaved && bps > 0 {
-            let pixel_bytes = nc * bps;
-            let n_pixels = data.len() / pixel_bytes;
-            for i in 0..n_pixels {
-                for c in 0..nc {
-                    let offset = i * pixel_bytes + c * bps;
-                    let val = read_sample(data, offset, pt, little_endian);
-                    let (ref mut mn, ref mut mx) = self.channel_stats[c];
+        let pixels = data.len() / (bps * num_rgb).max(1);
+        for i in 0..pixels {
+            for c in 0..num_rgb {
+                let sample = if interleaved {
+                    i * num_rgb + c
+                } else {
+                    c * pixels + i
+                };
+                let offset = bps * sample;
+                let val = match read_sample_checked(data, offset, pt, little_endian) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let slot = c_base + c;
+                if slot < self.channel_stats.len() {
+                    let (ref mut mn, ref mut mx) = self.channel_stats[slot];
                     if val < *mn {
                         *mn = val;
                     }
@@ -700,28 +799,20 @@ impl MinMaxCalculator {
                     }
                 }
             }
-        } else if bps > 0 {
-            let n_samples = data.len() / bps;
-            let (ref mut mn, ref mut mx) = self.channel_stats[0];
-            for i in 0..n_samples {
-                let val = read_sample(data, i * bps, pt, little_endian);
-                if val < *mn {
-                    *mn = val;
-                }
-                if val > *mx {
-                    *mx = val;
-                }
-            }
         }
     }
 }
 
-fn read_sample(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -> f64 {
-    match pt {
-        PixelType::Uint8 => data[offset] as f64,
-        PixelType::Int8 => data[offset] as i8 as f64,
+/// Decode one sample at `offset`, returning `None` if the buffer is too short
+/// to hold a full sample of `pt` (rather than panicking on a truncated plane).
+fn read_sample_checked(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -> Option<f64> {
+    let n = pt.bytes_per_sample().max(1);
+    let slice = data.get(offset..offset + n)?;
+    let value = match pt {
+        PixelType::Uint8 => slice[0] as f64,
+        PixelType::Int8 => slice[0] as i8 as f64,
         PixelType::Uint16 => {
-            let bytes = [data[offset], data[offset + 1]];
+            let bytes = [slice[0], slice[1]];
             (if little_endian {
                 u16::from_le_bytes(bytes)
             } else {
@@ -729,7 +820,7 @@ fn read_sample(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -
             }) as f64
         }
         PixelType::Int16 => {
-            let bytes = [data[offset], data[offset + 1]];
+            let bytes = [slice[0], slice[1]];
             (if little_endian {
                 i16::from_le_bytes(bytes)
             } else {
@@ -737,12 +828,7 @@ fn read_sample(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -
             }) as f64
         }
         PixelType::Uint32 => {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
+            let bytes = [slice[0], slice[1], slice[2], slice[3]];
             (if little_endian {
                 u32::from_le_bytes(bytes)
             } else {
@@ -750,12 +836,7 @@ fn read_sample(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -
             }) as f64
         }
         PixelType::Int32 => {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
+            let bytes = [slice[0], slice[1], slice[2], slice[3]];
             (if little_endian {
                 i32::from_le_bytes(bytes)
             } else {
@@ -763,12 +844,7 @@ fn read_sample(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -
             }) as f64
         }
         PixelType::Float32 => {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
+            let bytes = [slice[0], slice[1], slice[2], slice[3]];
             (if little_endian {
                 f32::from_le_bytes(bytes)
             } else {
@@ -777,14 +853,7 @@ fn read_sample(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -
         }
         PixelType::Float64 => {
             let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
+                slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
             ];
             if little_endian {
                 f64::from_le_bytes(bytes)
@@ -793,13 +862,14 @@ fn read_sample(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -
             }
         }
         PixelType::Bit => {
-            if data[offset] != 0 {
+            if slice[0] != 0 {
                 1.0
             } else {
                 0.0
             }
         }
-    }
+    };
+    Some(value)
 }
 
 impl FormatReader for MinMaxCalculator {
@@ -838,7 +908,7 @@ impl FormatReader for MinMaxCalculator {
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let data = self.inner.open_bytes(plane_index)?;
-        self.update_stats(&data);
+        self.update_stats(plane_index, &data);
         Ok(data)
     }
 
@@ -851,7 +921,7 @@ impl FormatReader for MinMaxCalculator {
         h: u32,
     ) -> Result<Vec<u8>> {
         let data = self.inner.open_bytes_region(plane_index, x, y, w, h)?;
-        self.update_stats(&data);
+        self.update_stats(plane_index, &data);
         Ok(data)
     }
 

@@ -120,6 +120,18 @@ impl FormatReader for WholeSlideTiffReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
+        // Aperio SVS stores its pyramid as the main IFD chain (differently
+        // sized IFDs). TiffReader splits these into separate series by default;
+        // regroup them into one multi-resolution series + label/macro series,
+        // mirroring SVSReader.java.
+        let is_svs = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("svs"))
+            .unwrap_or(false);
+        if is_svs {
+            self.inner.regroup_as_svs_pyramid()?;
+        }
         self.parse_aperio_metadata();
         Ok(())
     }

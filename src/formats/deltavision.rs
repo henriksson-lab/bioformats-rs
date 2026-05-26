@@ -51,17 +51,18 @@ fn r_f32(b: &[u8], off: usize, le: bool) -> f32 {
     }
 }
 
-/// Pixel type codes used in .dv files
+/// Pixel type codes used in .dv files (matches Java DeltavisionReader.getPixelType)
 fn dv_pixel_type(mode: i32) -> (PixelType, u8) {
     match mode {
-        0 => (PixelType::Int16, 16),
-        1 => (PixelType::Uint16, 16),
+        0 => (PixelType::Uint8, 8),
+        1 => (PixelType::Int16, 16),
         2 => (PixelType::Float32, 32),
-        3 => (PixelType::Int16, 16),   // complex int16 — report as int16
-        4 => (PixelType::Float32, 32), // complex float32
-        5 => (PixelType::Uint8, 8),
-        6 => (PixelType::Uint8, 8), // RGB, 3 channels
-        _ => (PixelType::Int16, 16),
+        3 => (PixelType::Int16, 16),   // 16 bit complex — report as int16
+        4 => (PixelType::Float32, 32), // 64 bit complex — report as float
+        6 => (PixelType::Uint16, 16),
+        7 => (PixelType::Int32, 32),
+        8 => (PixelType::Float64, 64),
+        _ => (PixelType::Uint8, 8),
     }
 }
 
@@ -648,22 +649,15 @@ impl FormatReader for DeltavisionReader {
         let image_sequence = dv_image_sequence(sequence);
 
         let (pixel_type, bpp) = dv_pixel_type(mode);
-        let is_rgb = mode == 6;
-        let samples_per_pixel = if is_rgb { 3u32 } else { 1u32 };
-        let channels = if is_rgb { 3u32 } else { num_waves };
+        // Java always sets rgb=false, interleaved=false; mode 6 is single-channel UINT16.
+        let is_rgb = false;
+        let samples_per_pixel = 1u32;
+        let channels = num_waves;
 
         let panels = num_panels.max(1);
-        let logical_planes_per_z = if is_rgb {
-            num_times.max(1)
-        } else {
-            channels.max(1) * num_times.max(1)
-        };
+        let logical_planes_per_z = channels.max(1) * num_times.max(1);
         let raw_size_z = (num_z / (logical_planes_per_z * panels).max(1)).max(1);
-        let raw_image_count = if is_rgb {
-            raw_size_z * num_times
-        } else {
-            raw_size_z * channels * num_times
-        };
+        let raw_image_count = raw_size_z * channels * num_times;
 
         let extended_headers = read_extended_headers(
             &mut f,
@@ -692,11 +686,7 @@ impl FormatReader for DeltavisionReader {
             num_times
         };
         let size_z = raw_size_z;
-        let image_count = if is_rgb {
-            size_z * size_t
-        } else {
-            size_z * channels * size_t
-        };
+        let image_count = size_z * channels * size_t;
         let data_offset = HEADER_SIZE as u64 + ext_hdr_size;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
@@ -1208,19 +1198,23 @@ mod tests {
     }
 
     #[test]
-    fn rgb_mode_reports_single_interleaved_plane_with_rgb_samples() {
-        let stored_rgb = [1, 2, 3, 4, 5, 6];
-        let path = write_synthetic_dv("rgb_samples", 2, 1, 1, 6, 1, 0, 1, &[&stored_rgb]);
+    fn mode_6_reports_single_channel_uint16() {
+        // Java getPixelType: mode 6 -> UINT16, rgb=false, interleaved=false, 1 channel.
+        // 2x1 UINT16 plane = 4 bytes; only first 4 bytes of stored data are read.
+        let stored = [1, 2, 3, 4, 5, 6];
+        let path = write_synthetic_dv("mode6_uint16", 2, 1, 1, 6, 1, 0, 1, &[&stored]);
 
         let mut reader = DeltavisionReader::new();
         reader.set_id(&path).unwrap();
         let meta = reader.metadata();
         assert_eq!(meta.size_z, 1);
-        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.size_c, 1);
         assert_eq!(meta.image_count, 1);
-        assert!(meta.is_rgb);
-        assert!(meta.is_interleaved);
-        assert_eq!(reader.open_bytes(0).unwrap(), stored_rgb);
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert!(!meta.is_rgb);
+        assert!(!meta.is_interleaved);
+        // Single row, so no row flipping changes; first 4 bytes of the plane.
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
         assert!(matches!(
             reader.open_bytes(1),
             Err(BioFormatsError::PlaneOutOfRange(1))

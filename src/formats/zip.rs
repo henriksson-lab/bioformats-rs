@@ -1,54 +1,45 @@
 //! ZIP container reader.
 //!
-//! Detects ZIP files by magic bytes PK\x03\x04 and extracts the first
-//! supported TIFF file to a temp directory and delegates to TiffReader.
+//! Detects ZIP files by magic bytes PK\x03\x04. Following the Java `ZipReader`,
+//! this wraps an inner auto-detecting `ImageReader` over the archive entries:
+//! all entries are extracted to a temporary directory, the "primary" entry is
+//! selected (the one whose name starts with the archive's base name, else the
+//! first entry), and the matching format reader is chosen by auto-detection
+//! (not restricted to TIFF).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
-
-/// Extensions treated as TIFF inside a ZIP.
-fn is_tiff_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".tif") || lower.ends_with(".tiff")
-}
-
-/// Extensions of image files that are recognized but not decoded by this ZIP reader.
-fn is_image_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".png")
-        || lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.ends_with(".bmp")
-        || lower.ends_with(".mrc")
-        || lower.ends_with(".fits")
-        || lower.ends_with(".nrrd")
-        || lower.ends_with(".ics")
-        || lower.ends_with(".dcm")
-        || lower.ends_with(".nii")
-        || lower.ends_with(".dm3")
-        || lower.ends_with(".dm4")
-        || lower.ends_with(".spe")
-}
+use crate::registry::ImageReader;
 
 pub struct ZipReader {
-    extracted_path: Option<PathBuf>,
-    inner: crate::tiff::TiffReader,
-    meta: Option<ImageMetadata>,
-    is_tiff: bool,
+    /// Directory holding the extracted entries; removed on close.
+    extracted_dir: Option<PathBuf>,
+    /// All files extracted from the archive (absolute paths), in archive order.
+    extracted_files: Vec<PathBuf>,
+    /// Inner auto-detecting reader operating on the primary entry.
+    inner: Option<ImageReader>,
 }
 
 impl ZipReader {
     pub fn new() -> Self {
         ZipReader {
-            extracted_path: None,
-            inner: crate::tiff::TiffReader::new(),
-            meta: None,
-            is_tiff: false,
+            extracted_dir: None,
+            extracted_files: Vec::new(),
+            inner: None,
         }
+    }
+
+    fn inner(&self) -> Result<&ImageReader> {
+        self.inner.as_ref().ok_or(BioFormatsError::NotInitialized)
+    }
+
+    fn inner_mut(&mut self) -> Result<&mut ImageReader> {
+        self.inner.as_mut().ok_or(BioFormatsError::NotInitialized)
     }
 }
 
@@ -76,120 +67,118 @@ impl FormatReader for ZipReader {
         let mut archive = zip::ZipArchive::new(file)
             .map_err(|e| BioFormatsError::Format(format!("ZIP open error: {e}")))?;
 
-        // Find the first TIFF entry, while remembering if the archive contains
-        // another image type that this wrapper cannot delegate yet.
-        let mut found_name: Option<String> = None;
-        let mut found_unsupported_image: Option<String> = None;
-        for i in 0..archive.len() {
-            if let Ok(entry) = archive.by_index(i) {
-                let name = entry.name().to_string();
-                if entry.is_dir() {
-                    continue;
-                }
-                if is_tiff_name(&name) {
-                    found_name = Some(name);
-                    break;
-                }
-                if found_unsupported_image.is_none() && is_image_name(&name) {
-                    found_unsupported_image = Some(name);
-                }
-            }
-        }
-
-        let Some(name) = found_name else {
-            let message = match found_unsupported_image {
-                Some(name) => format!(
-                    "ZIP image entry '{name}' is not supported by ZipReader; only TIFF entries are currently delegated"
-                ),
-                None => "ZIP archive does not contain a supported TIFF image entry".to_string(),
-            };
-            return Err(BioFormatsError::UnsupportedFormat(message));
-        };
-
-        // Extract to temp file
-        let safe_name = Path::new(&name)
+        // Per the Java ZipReader, the preferred ("primary") entry is the one
+        // whose name begins with the archive's base name (file name minus the
+        // ".zip" suffix); otherwise the first regular entry is used.
+        let inner_base = path
             .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("extracted"))
-            .to_string_lossy()
+            .and_then(|n| n.to_str())
+            .map(|n| n.strip_suffix(".zip").or_else(|| n.strip_suffix(".ZIP")).unwrap_or(n))
+            .unwrap_or("")
             .to_string();
-        let unique = format!("bioformats_zip_{}_{}", std::process::id(), safe_name);
-        let temp_path = std::env::temp_dir().join(unique);
 
-        {
+        // Unique temp directory for this archive.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bioformats_zip_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).map_err(BioFormatsError::Io)?;
+
+        let mut extracted_files: Vec<PathBuf> = Vec::new();
+        let mut first_entry: Option<PathBuf> = None;
+        let mut primary_entry: Option<PathBuf> = None;
+
+        for i in 0..archive.len() {
             let mut entry = archive
-                .by_name(&name)
+                .by_index(i)
                 .map_err(|e| BioFormatsError::Format(format!("ZIP entry error: {e}")))?;
+            if entry.is_dir() {
+                continue;
+            }
+            let name = entry.name().to_string();
+            // Flatten the entry name to a safe leaf file name, but keep enough
+            // of the original to match the primary-entry rule.
+            let leaf = Path::new(&name)
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("entry"))
+                .to_string_lossy()
+                .to_string();
+            let out_path = dir.join(format!("{i}_{leaf}"));
+
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
-            std::fs::write(&temp_path, &buf).map_err(BioFormatsError::Io)?;
+            std::fs::write(&out_path, &buf).map_err(BioFormatsError::Io)?;
+
+            if first_entry.is_none() {
+                first_entry = Some(out_path.clone());
+            }
+            if primary_entry.is_none() && !inner_base.is_empty() && name.starts_with(&inner_base) {
+                primary_entry = Some(out_path.clone());
+            }
+            extracted_files.push(out_path);
         }
 
-        self.extracted_path = Some(temp_path.clone());
+        let primary = primary_entry.or(first_entry).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "Zip file does not contain any valid files".to_string(),
+            )
+        })?;
 
-        self.inner.set_id(&temp_path)?;
-        self.meta = Some(self.inner.metadata().clone());
-        self.is_tiff = true;
+        self.extracted_dir = Some(dir);
+        self.extracted_files = extracted_files;
 
-        Ok(())
+        // Delegate to the auto-detecting ImageReader, which picks the matching
+        // format reader for the primary entry (TIFF, PNG, JPEG, ND2, ...).
+        match ImageReader::open(&primary) {
+            Ok(reader) => {
+                self.inner = Some(reader);
+                Ok(())
+            }
+            Err(e) => {
+                // Clean up extracted files on failure.
+                let _ = self.close();
+                Err(e)
+            }
+        }
     }
 
     fn close(&mut self) -> Result<()> {
-        if self.is_tiff {
-            let _ = self.inner.close();
+        if let Some(inner) = self.inner.as_mut() {
+            let _ = inner.close();
         }
-        if let Some(p) = self.extracted_path.take() {
-            let _ = std::fs::remove_file(p);
+        self.inner = None;
+        for f in self.extracted_files.drain(..) {
+            let _ = std::fs::remove_file(f);
         }
-        self.meta = None;
-        self.is_tiff = false;
+        if let Some(dir) = self.extracted_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        if self.is_tiff {
-            self.inner.series_count()
-        } else {
-            1
-        }
+        self.inner().map(|r| r.series_count()).unwrap_or(1)
     }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
-        if self.is_tiff {
-            self.inner.set_series(series)
-        } else if series != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(series))
-        } else {
-            Ok(())
-        }
+        self.inner_mut()?.set_series(series)
     }
 
     fn series(&self) -> usize {
-        if self.is_tiff {
-            self.inner.series()
-        } else {
-            0
-        }
+        self.inner().map(|r| r.series()).unwrap_or(0)
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        if self.is_tiff {
-            self.inner.metadata()
-        } else {
-            self.meta.as_ref().expect("set_id not called")
-        }
+        self.inner
+            .as_ref()
+            .expect("set_id not called")
+            .metadata()
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        if self.is_tiff {
-            return self.inner.open_bytes(plane_index);
-        }
-        if plane_index != 0 {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Err(BioFormatsError::UnsupportedFormat(
-            "ZIP reader has no decoded image payload; only TIFF entries are currently delegated"
-                .to_string(),
-        ))
+        self.inner_mut()?.open_bytes(plane_index)
     }
 
     fn open_bytes_region(
@@ -200,16 +189,10 @@ impl FormatReader for ZipReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        if self.is_tiff {
-            return self.inner.open_bytes_region(plane_index, x, y, w, h);
-        }
-        self.open_bytes(plane_index)
+        self.inner_mut()?.open_bytes_region(plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        if self.is_tiff {
-            return self.inner.open_thumb_bytes(plane_index);
-        }
-        self.open_bytes(plane_index)
+        self.inner_mut()?.open_thumb_bytes(plane_index)
     }
 }

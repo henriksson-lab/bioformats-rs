@@ -26,6 +26,9 @@ struct SifHeader {
     size_t: u32,
     image_count: u32,
     data_offset: u64,
+    /// Per-plane acquisition timestamps (seconds), one per image, in the order
+    /// read from the header lines preceding the coordinate line (SIFReader.java).
+    timestamps: Vec<f64>,
 }
 
 fn parse_u32_token(token: Option<&&str>, label: &str) -> Result<u32> {
@@ -124,6 +127,13 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
                 .unwrap_or(declared_y);
             let data_offset = checked_footer_offset(path, width, height, image_count)?;
 
+            // SIFReader.java allocates one timestamp per plane. Its index math
+            // (lineNumber - (endLine - imageCount) - 1) only fires for lines
+            // strictly before endLine, but endLine equals the "Pixel number"
+            // line number, so the timestamp branch is never reached and the
+            // array stays all-zero. We replicate that faithfully.
+            let timestamps = vec![0.0f64; image_count as usize];
+
             return Ok(SifHeader {
                 width,
                 height,
@@ -132,6 +142,7 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
                 size_t,
                 image_count,
                 data_offset,
+                timestamps,
             });
         }
 
@@ -178,14 +189,16 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
             if let Ok(byte_count) = trimmed.parse::<u64>() {
                 if byte_count > 0 && width > 0 && height > 0 {
                     let data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
+                    let image_count = num_frames.max(1);
                     return Ok(SifHeader {
                         width,
                         height,
-                        size_z: num_frames.max(1),
+                        size_z: image_count,
                         size_c: 1,
                         size_t: 1,
-                        image_count: num_frames.max(1),
+                        image_count,
                         data_offset,
+                        timestamps: vec![0.0f64; image_count as usize],
                     });
                 }
             }
@@ -199,14 +212,16 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
     }
     // Fallback data offset: end of file? Try 0 with a warning
     let data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
+    let image_count = num_frames.max(1);
     Ok(SifHeader {
         width,
         height,
-        size_z: num_frames.max(1),
+        size_z: image_count,
         size_c: 1,
         size_t: 1,
-        image_count: num_frames.max(1),
+        image_count,
         data_offset,
+        timestamps: vec![0.0f64; image_count as usize],
     })
 }
 
@@ -214,6 +229,7 @@ pub struct AndorSifReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
+    timestamps: Vec<f64>,
 }
 
 impl AndorSifReader {
@@ -222,6 +238,7 @@ impl AndorSifReader {
             path: None,
             meta: None,
             data_offset: 0,
+            timestamps: Vec::new(),
         }
     }
 }
@@ -277,6 +294,7 @@ impl FormatReader for AndorSifReader {
             modulo_t: None,
         });
         self.data_offset = header.data_offset;
+        self.timestamps = header.timestamps;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -353,6 +371,32 @@ impl FormatReader for AndorSifReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{OmeMetadata, OmePlane};
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        // SIFReader.java calls store.setPlaneDeltaT(timestamp[i], 0, i) for each
+        // plane (XYCZT order). Mirror that with the parsed (zero-filled) values.
+        if !self.timestamps.is_empty() {
+            let img = &mut ome.images[0];
+            img.planes = (0..meta.image_count)
+                .map(|i| {
+                    let c = i % meta.size_c;
+                    let z = (i / meta.size_c) % meta.size_z;
+                    let t = i / (meta.size_c * meta.size_z);
+                    OmePlane {
+                        the_z: z,
+                        the_c: c,
+                        the_t: t,
+                        delta_t: self.timestamps.get(i as usize).copied(),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+        }
+        Some(ome)
     }
 }
 

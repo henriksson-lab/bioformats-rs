@@ -71,16 +71,6 @@ fn valid_segment_position(pos: u64, file_len: u64) -> bool {
     pos > 0 && pos.saturating_add(SEG_HEADER as u64) <= file_len
 }
 
-fn choose_segment_position(primary: u64, fallback: u64, file_len: u64) -> u64 {
-    if valid_segment_position(primary, file_len) {
-        primary
-    } else if valid_segment_position(fallback, file_len) {
-        fallback
-    } else {
-        0
-    }
-}
-
 // ---- DirectoryEntry (256 bytes) -------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -90,6 +80,9 @@ struct DirEntry {
     compression: i32,
     // Dimensions from DimensionEntry array
     dims: HashMap<String, (i32, i32)>, // dim_name -> (start, size)
+    // storedSize per dimension (physical/decoded extent of the tile, which may
+    // differ from `size` for downsampled or compressed subblocks).
+    stored: HashMap<String, i32>, // dim_name -> storedSize
 }
 
 impl DirEntry {
@@ -99,6 +92,14 @@ impl DirEntry {
 
     fn dim_size(&self, name: &str) -> i32 {
         self.dims.get(name).map(|&(_, size)| size).unwrap_or(1)
+    }
+
+    /// Stored (physical) size of a dimension, falling back to the logical size.
+    fn dim_stored_size(&self, name: &str) -> i32 {
+        match self.stored.get(name) {
+            Some(&s) if s > 0 => s,
+            _ => self.dim_size(name),
+        }
     }
 
     fn matches_plane(&self, z: u32, c: u32, t: u32) -> bool {
@@ -126,6 +127,16 @@ struct CziResolution {
     height: u32,
 }
 
+/// One series corresponds to one scene/position (the CZI "S" dimension), as in
+/// ZeissCZIReader where `seriesCount = positions` (mosaics/acquisitions/angles
+/// aside). Each series carries its own pyramid resolution list.
+#[derive(Debug, Clone)]
+struct CziSeries {
+    /// Absolute value of the "S" dimension start that selects this scene.
+    scene: i32,
+    resolutions: Vec<CziResolution>,
+}
+
 fn parse_dir_entry(data: &[u8]) -> DirEntry {
     // schema 0-1 (2 bytes)
     let pixel_type = read_i32(data, 2);
@@ -134,12 +145,19 @@ fn parse_dir_entry(data: &[u8]) -> DirEntry {
     let dim_count = read_i32(data, 28) as usize;
 
     let mut dims: HashMap<String, (i32, i32)> = HashMap::new();
+    let mut stored: HashMap<String, i32> = HashMap::new();
     let dim_array_start = 32;
     for i in 0..dim_count {
         let off = dim_array_start + i * 20;
         if off + 20 > data.len() {
             break;
         }
+        // DimensionEntry layout (20 bytes):
+        //   0  dimension (4 chars)
+        //   4  start (int)
+        //   8  size (int)
+        //   12 startCoordinate (float)
+        //   16 storedSize (int)
         let dim_name = std::str::from_utf8(&data[off..off + 4])
             .unwrap_or("")
             .trim_end_matches('\0')
@@ -147,8 +165,10 @@ fn parse_dir_entry(data: &[u8]) -> DirEntry {
             .to_string();
         let start = read_i32(data, off + 4);
         let size = read_i32(data, off + 8);
+        let stored_size = read_i32(data, off + 16);
         if !dim_name.is_empty() {
-            dims.insert(dim_name, (start, size));
+            dims.insert(dim_name.clone(), (start, size));
+            stored.insert(dim_name, stored_size);
         }
     }
 
@@ -157,6 +177,7 @@ fn parse_dir_entry(data: &[u8]) -> DirEntry {
         file_position,
         compression,
         dims,
+        stored,
     }
 }
 
@@ -201,14 +222,13 @@ fn parse_directory_entries(data: &[u8], entry_count: usize) -> Vec<DirEntry> {
 struct CziParsed {
     meta_xml: String,
     entries: Vec<DirEntry>,
-    width: u32,
-    height: u32,
     z_count: u32,
     c_count: u32,
     t_count: u32,
     pixel_type: PixelType,
     spp: u32,
-    resolutions: Vec<CziResolution>,
+    /// One entry per scene/position (the "S" dimension). Always non-empty.
+    series: Vec<CziSeries>,
 }
 
 fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
@@ -225,16 +245,31 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
         ));
     }
 
-    // FileHeader data starts after the 32-byte segment header
+    // FileHeader data starts after the 32-byte segment header.
+    // Layout (matching ZeissCZIReader.FileHeader.fillInData):
+    //   0  majorVersion (int)
+    //   4  minorVersion (int)
+    //   8  reserved1 (int)
+    //   12 reserved2 (int)
+    //   16 primaryFileGUID (long)
+    //   24 fileGUID (long)
+    //   32 filePart (int)
+    //   36 directoryPosition (long)
+    //   44 metadataPosition (long)
     let mut fh = vec![0u8; 80];
     f.read_exact(&mut fh)?;
-    // major = fh[0..4], minor = fh[4..8]
-    let real_dir_position = read_u64(&fh, 52);
-    let real_meta_position = read_u64(&fh, 60);
-    let legacy_dir_position = read_u64(&fh, 36);
-    let legacy_meta_position = read_u64(&fh, 44);
-    let dir_position = choose_segment_position(real_dir_position, legacy_dir_position, file_len);
-    let meta_position = choose_segment_position(real_meta_position, legacy_meta_position, file_len);
+    let dir_position = read_u64(&fh, 36);
+    let meta_position = read_u64(&fh, 44);
+    let dir_position = if valid_segment_position(dir_position, file_len) {
+        dir_position
+    } else {
+        0
+    };
+    let meta_position = if valid_segment_position(meta_position, file_len) {
+        meta_position
+    } else {
+        0
+    };
 
     // --- Read metadata segment ---
     let mut meta_xml = String::new();
@@ -274,20 +309,36 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
         }
     }
 
-    // Compute dimensions from entries
+    // Compute dimensions from entries.
+    //
+    // ZeissCZIReader.calculateDimensions: the "S" dimension yields the scene
+    // count (`positions = maxS - minS + 1`); each scene becomes a series. The
+    // "R" dimension yields pyramid resolution levels. X/Y extents are tracked
+    // per (scene, R) bucket so every series/resolution gets its own size.
     let mut max_z = 0i32;
     let mut max_c = 0i32;
     let mut max_t = 0i32;
     let mut pixel_type = 0i32;
-    let mut resolution_extents: HashMap<i32, (u32, u32)> = HashMap::new();
+
+    let mut min_scene = i32::MAX;
+    let mut max_scene = i32::MIN;
+    let mut has_scene = false;
+    // (scene, R) -> (width, height)
+    let mut extents: HashMap<(i32, i32), (u32, u32)> = HashMap::new();
 
     for e in &entries {
         pixel_type = e.pixel_type;
+        let scene = e.dim_start("S");
+        if e.dims.contains_key("S") {
+            has_scene = true;
+            min_scene = min_scene.min(scene);
+            max_scene = max_scene.max(scene);
+        }
         let x_start = e.dim_start("X").max(0) as u32;
         let y_start = e.dim_start("Y").max(0) as u32;
         let x_size = e.dim_size("X").max(0) as u32;
         let y_size = e.dim_size("Y").max(0) as u32;
-        let extent = resolution_extents.entry(e.dim_start("R")).or_insert((0, 0));
+        let extent = extents.entry((scene, e.dim_start("R"))).or_insert((0, 0));
         extent.0 = extent.0.max(x_start.saturating_add(x_size));
         extent.1 = extent.1.max(y_start.saturating_add(y_size));
         if let Some(&(start, _)) = e.dims.get("Z") {
@@ -307,16 +358,45 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
         }
     }
 
-    let mut resolutions: Vec<CziResolution> = resolution_extents
-        .into_iter()
-        .map(|(r, (width, height))| CziResolution { r, width, height })
-        .collect();
-    resolutions.sort_by_key(|res| res.r);
-    if resolutions.is_empty() {
-        resolutions.push(CziResolution {
-            r: 0,
-            width: 0,
-            height: 0,
+    // positions = maxS - minS + 1 (BaseZeissReader semantics); with no "S"
+    // dimension a single scene with start 0.
+    let (min_scene, positions) = if has_scene {
+        (min_scene, (max_scene - min_scene + 1).max(1))
+    } else {
+        (0, 1)
+    };
+
+    // Build one CziSeries per scene, each with its sorted resolution list.
+    let mut series: Vec<CziSeries> = Vec::with_capacity(positions as usize);
+    for s in 0..positions {
+        let scene = min_scene + s;
+        let mut resolutions: Vec<CziResolution> = extents
+            .iter()
+            .filter(|((sc, _), _)| *sc == scene)
+            .map(|((_, r), (width, height))| CziResolution {
+                r: *r,
+                width: *width,
+                height: *height,
+            })
+            .collect();
+        resolutions.sort_by_key(|res| res.r);
+        if resolutions.is_empty() {
+            resolutions.push(CziResolution {
+                r: 0,
+                width: 0,
+                height: 0,
+            });
+        }
+        series.push(CziSeries { scene, resolutions });
+    }
+    if series.is_empty() {
+        series.push(CziSeries {
+            scene: 0,
+            resolutions: vec![CziResolution {
+                r: 0,
+                width: 0,
+                height: 0,
+            }],
         });
     }
 
@@ -326,20 +406,24 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
     Ok(CziParsed {
         meta_xml,
         entries,
-        width: resolutions[0].width,
-        height: resolutions[0].height,
         z_count: (max_z + 1) as u32,
         c_count: (max_c + 1) as u32,
         t_count: (max_t + 1) as u32,
         pixel_type: pt,
         spp,
-        resolutions,
+        series,
     })
 }
 
 // ---- decompression ---------------------------------------------------------
 
-fn decompress_subblock(data: &[u8], compression: i32) -> Result<Vec<u8>> {
+fn decompress_subblock(
+    data: &[u8],
+    compression: i32,
+    tile_width: usize,
+    tile_height: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
     match compression {
         0 => Ok(data.to_vec()), // Uncompressed
         1 => {
@@ -364,10 +448,102 @@ fn decompress_subblock(data: &[u8], compression: i32) -> Result<Vec<u8>> {
             zstd::decode_all(data).map_err(BioFormatsError::Io)
         }
         6 => decompress_zstd_1(data),
+        104 => {
+            // Camera-specific 12-bit packed pixels, with column reversal.
+            // (matches ZeissCZIReader case 104)
+            let mut decoded = decode_12bit_camera(data, max_bytes)?;
+            reverse_columns_16bit(&mut decoded, tile_width, tile_height);
+            Ok(decoded)
+        }
+        504 => {
+            // Camera-specific 12-bit packed pixels without column reversal.
+            decode_12bit_camera(data, max_bytes)
+        }
         _ => Err(BioFormatsError::UnsupportedFormat(format!(
             "CZI: unknown compression {}",
             compression
         ))),
+    }
+}
+
+/// Decode 12-bit camera-packed pixel data into 16-bit samples.
+///
+/// Port of ZeissCZIReader.decode12BitCamera: unpacks the input into 4-bit
+/// nibbles (3 nibbles per 2 output bytes), performs an in-place nibble reorder,
+/// then reassembles 16-bit values.
+fn decode_12bit_camera(data: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    let mut decoded = vec![0u8; max_bytes];
+
+    let four_bits_len = (max_bytes / 2) * 3;
+    let mut four_bits = vec![0u8; four_bits_len];
+
+    // Read 4-bit groups MSB-first from the packed input.
+    let mut bit_pos = 0usize;
+    for nibble in four_bits.iter_mut() {
+        let byte_index = bit_pos / 8;
+        if byte_index >= data.len() {
+            break;
+        }
+        let in_byte_shift = 4 - (bit_pos % 8);
+        *nibble = ((data[byte_index] >> in_byte_shift) & 0x0f) as u8;
+        bit_pos += 4;
+    }
+
+    // In-place nibble reordering (matches the Java reference loop).
+    if four_bits_len > 1 {
+        for index in 1..four_bits_len - 1 {
+            if (index as isize - 3) % 6 == 0 {
+                let middle = four_bits[index];
+                let last = four_bits[index + 1];
+                let first = four_bits[index - 1];
+                four_bits[index + 1] = middle;
+                four_bits[index] = first;
+                four_bits[index - 1] = last;
+            }
+        }
+    }
+
+    // Reassemble 16-bit values from the nibble stream.
+    let mut current_byte = 0usize;
+    let mut index = 0usize;
+    while index < four_bits_len && current_byte < decoded.len() {
+        if index % 3 == 0 {
+            decoded[current_byte] = four_bits[index];
+            current_byte += 1;
+            index += 1;
+        } else {
+            let hi = four_bits[index];
+            index += 1;
+            let lo = if index < four_bits_len {
+                four_bits[index]
+            } else {
+                0
+            };
+            index += 1;
+            decoded[current_byte] = (hi << 4) | lo;
+            current_byte += 1;
+        }
+    }
+
+    Ok(decoded)
+}
+
+/// Reverse the column order of 16-bit pixels, row by row.
+/// Port of the column-reversal loop in ZeissCZIReader case 104.
+fn reverse_columns_16bit(data: &mut [u8], width: usize, height: usize) {
+    if width == 0 {
+        return;
+    }
+    for row in 0..height {
+        for col in 0..width / 2 {
+            let left = row * width * 2 + col * 2;
+            let right = row * width * 2 + (width - col - 1) * 2;
+            if right + 1 >= data.len() {
+                continue;
+            }
+            data.swap(left, right);
+            data.swap(left + 1, right + 1);
+        }
     }
 }
 
@@ -465,7 +641,10 @@ pub struct CziReader {
     entries: Vec<DirEntry>,
     meta_xml: String,
     packed_spp: u32,
-    resolutions: Vec<CziResolution>,
+    /// One series per scene (CZI "S" dimension); each has its own resolutions.
+    /// `series[i].scene` is the absolute "S" start that selects scene `i`.
+    series: Vec<CziSeries>,
+    current_series: usize,
     current_resolution: usize,
 }
 
@@ -477,7 +656,8 @@ impl CziReader {
             entries: Vec::new(),
             meta_xml: String::new(),
             packed_spp: 1,
-            resolutions: Vec::new(),
+            series: Vec::new(),
+            current_series: 0,
             current_resolution: 0,
         }
     }
@@ -492,36 +672,85 @@ impl CziReader {
         Some((z, c, t))
     }
 
+    /// Resolution list for the active series.
+    fn current_resolutions(&self) -> &[CziResolution] {
+        self.series
+            .get(self.current_series)
+            .map(|s| s.resolutions.as_slice())
+            .unwrap_or(&[])
+    }
+
     fn matching_entries(&self, plane_index: u32) -> Option<Vec<DirEntry>> {
         let (z, c, t) = self.plane_zct(plane_index)?;
-        let r = self.resolutions.get(self.current_resolution)?.r;
+        let scene = self.series.get(self.current_series)?.scene;
+        let has_scene = self.series.len() > 1;
+        let r = self.current_resolutions().get(self.current_resolution)?.r;
         let entries: Vec<DirEntry> = self
             .entries
             .iter()
-            .filter(|e| e.dim_start("R") == r && e.matches_plane(z, c, t))
+            .filter(|e| {
+                // Match the active scene only when scenes exist; a file with a
+                // single (or absent) "S" dimension exposes every plane.
+                (!has_scene || e.dim_start("S") == scene)
+                    && e.dim_start("R") == r
+                    && e.matches_plane(z, c, t)
+            })
             .cloned()
             .collect();
         (!entries.is_empty()).then_some(entries)
     }
 
-    fn read_subblock(path: &Path, entry: &DirEntry) -> Result<Vec<u8>> {
+    /// Apply the active series/resolution's X/Y size to the cached metadata.
+    fn refresh_meta_dimensions(&mut self) {
+        let (width, height, res_count) = {
+            let resolutions = self.current_resolutions();
+            let res_count = resolutions.len().max(1) as u32;
+            let res = resolutions.get(self.current_resolution);
+            (
+                res.map(|r| r.width).unwrap_or(0),
+                res.map(|r| r.height).unwrap_or(0),
+                res_count,
+            )
+        };
+        if let Some(meta) = self.meta.as_mut() {
+            meta.size_x = width;
+            meta.size_y = height;
+            meta.resolution_count = res_count;
+        }
+    }
+
+    fn read_subblock(path: &Path, entry: &DirEntry, pixel_bytes: usize) -> Result<Vec<u8>> {
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(entry.file_position as u64))
             .map_err(BioFormatsError::Io)?;
         let mut seg_hdr = vec![0u8; SEG_HEADER];
         f.read_exact(&mut seg_hdr).map_err(BioFormatsError::Io)?;
 
+        // SubBlock body (matching ZeissCZIReader.SubBlock.fillInData):
+        //   body_start = file_position + HEADER_SIZE
+        //   metadataSize (int), attachmentSize (int), dataSize (long) -> 16 bytes
+        //   DirectoryEntry, then skip so the fixed part of the body is 256 bytes
+        //   total (measured from body_start), then metadata of metadataSize bytes.
+        // Pixel data therefore starts at body_start + 256 + metadataSize.
         let mut sb_hdr = vec![0u8; 16];
         f.read_exact(&mut sb_hdr).map_err(BioFormatsError::Io)?;
         let metadata_size = read_i32(&sb_hdr, 0) as u64;
         let data_size = read_u64(&sb_hdr, 8);
 
-        f.seek(SeekFrom::Current(256 + metadata_size as i64))
+        // We have already consumed the 16-byte size header out of the 256-byte
+        // fixed body, so skip the remaining (256 - 16) bytes plus the metadata.
+        f.seek(SeekFrom::Current((256 - 16) + metadata_size as i64))
             .map_err(BioFormatsError::Io)?;
 
         let mut compressed = vec![0u8; data_size as usize];
         f.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;
-        decompress_subblock(&compressed, entry.compression)
+
+        // For compressed/downsampled tiles Java uses the stored (physical) X/Y
+        // sizes to size the decoded buffer.
+        let tile_w = entry.dim_stored_size("X").max(0) as usize;
+        let tile_h = entry.dim_stored_size("Y").max(0) as usize;
+        let max_bytes = tile_w * tile_h * pixel_bytes;
+        decompress_subblock(&compressed, entry.compression, tile_w, tile_h, max_bytes)
     }
 
     fn assemble_entry(
@@ -534,8 +763,8 @@ impl CziReader {
     ) {
         let tile_x = entry.dim_start("X").max(0) as u32;
         let tile_y = entry.dim_start("Y").max(0) as u32;
-        let tile_w = entry.dim_size("X").max(0) as u32;
-        let tile_h = entry.dim_size("Y").max(0) as u32;
+        let tile_w = entry.dim_stored_size("X").max(0) as u32;
+        let tile_h = entry.dim_stored_size("Y").max(0) as u32;
         let copy_w = tile_w.min(out_width.saturating_sub(tile_x));
         let copy_h = tile_h.min(out_height.saturating_sub(tile_y));
         let src_row_bytes = tile_w as usize * pixel_bytes;
@@ -586,9 +815,14 @@ impl FormatReader for CziReader {
             MetadataValue::Int(parsed.entries.len() as i64),
         );
 
+        let first = parsed.series.first();
+        let (init_w, init_h, init_res_count) = first
+            .and_then(|s| s.resolutions.first().map(|r| (r.width, r.height, s.resolutions.len())))
+            .unwrap_or((0, 0, 1));
+
         self.meta = Some(ImageMetadata {
-            size_x: parsed.width,
-            size_y: parsed.height,
+            size_x: init_w,
+            size_y: init_h,
             size_z: parsed.z_count,
             size_c: parsed.c_count,
             size_t: parsed.t_count,
@@ -600,7 +834,7 @@ impl FormatReader for CziReader {
             is_interleaved: true,
             is_indexed: false,
             is_little_endian: true,
-            resolution_count: parsed.resolutions.len() as u32,
+            resolution_count: init_res_count as u32,
             series_metadata,
             lookup_table: None,
             modulo_z: None,
@@ -609,7 +843,8 @@ impl FormatReader for CziReader {
         });
         self.packed_spp = parsed.spp.max(1);
         self.entries = parsed.entries;
-        self.resolutions = parsed.resolutions;
+        self.series = parsed.series;
+        self.current_series = 0;
         self.current_resolution = 0;
         self.meta_xml = parsed.meta_xml;
         self.path = Some(path.to_path_buf());
@@ -622,23 +857,28 @@ impl FormatReader for CziReader {
         self.entries.clear();
         self.meta_xml.clear();
         self.packed_spp = 1;
-        self.resolutions.clear();
+        self.series.clear();
+        self.current_series = 0;
         self.current_resolution = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.series.len().max(1)
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
+        if s >= self.series_count() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
         }
+        self.current_series = s;
+        // Switching scenes resets the active resolution to full-res (level 0),
+        // matching how setSeries resets the core/resolution index in Java.
+        self.current_resolution = 0;
+        self.refresh_meta_dimensions();
+        Ok(())
     }
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -661,10 +901,10 @@ impl FormatReader for CziReader {
         let mut out = vec![0; expected];
 
         for entry in entries {
-            let tile_w = entry.dim_size("X").max(0) as usize;
-            let tile_h = entry.dim_size("Y").max(0) as usize;
+            let tile_w = entry.dim_stored_size("X").max(0) as usize;
+            let tile_h = entry.dim_stored_size("Y").max(0) as usize;
             let tile_expected = tile_w * tile_h * pixel_bytes;
-            let mut tile = Self::read_subblock(path, &entry)?;
+            let mut tile = Self::read_subblock(path, &entry, pixel_bytes)?;
             tile.truncate(tile_expected);
             tile.resize(tile_expected, 0);
             Self::assemble_entry(
@@ -703,25 +943,20 @@ impl FormatReader for CziReader {
     }
 
     fn resolution_count(&self) -> usize {
-        self.resolutions.len().max(1)
+        self.current_resolutions().len().max(1)
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        let res = self.resolutions.get(level).ok_or_else(|| {
-            BioFormatsError::Format(format!(
+        let count = self.current_resolutions().len();
+        if level >= count {
+            return Err(BioFormatsError::Format(format!(
                 "CZI resolution level {} out of range (max {})",
                 level,
-                self.resolutions.len().saturating_sub(1)
-            ))
-        })?;
-        let (width, height) = (res.width, res.height);
-        self.current_resolution = level;
-        let resolution_count = self.resolution_count() as u32;
-        if let Some(meta) = self.meta.as_mut() {
-            meta.size_x = width;
-            meta.size_y = height;
-            meta.resolution_count = resolution_count;
+                count.saturating_sub(1)
+            )));
         }
+        self.current_resolution = level;
+        self.refresh_meta_dimensions();
         Ok(())
     }
 
@@ -812,6 +1047,28 @@ mod tests {
         entry
     }
 
+    /// Directory entry carrying an explicit scene ("S") dimension, used to test
+    /// the multi-series scene split (one series per S position).
+    fn directory_entry_scene(
+        pixel_type: i32,
+        file_position: i64,
+        scene: i32,
+        x_size: i32,
+        y_size: i32,
+    ) -> Vec<u8> {
+        let mut entry = vec![0; 256];
+        put_i32(&mut entry, 2, pixel_type);
+        put_i64(&mut entry, 6, file_position);
+        put_i32(&mut entry, 18, 0);
+        put_i32(&mut entry, 28, 5);
+        entry[32..52].copy_from_slice(&dimension_entry("X", 0, x_size));
+        entry[52..72].copy_from_slice(&dimension_entry("Y", 0, y_size));
+        entry[72..92].copy_from_slice(&dimension_entry("C", 0, 1));
+        entry[92..112].copy_from_slice(&dimension_entry("R", 0, 1));
+        entry[112..132].copy_from_slice(&dimension_entry("S", scene, 1));
+        entry
+    }
+
     fn directory_entry_zc_dims(
         pixel_type: i32,
         file_position: i64,
@@ -843,7 +1100,9 @@ mod tests {
         let height = 1;
         let file_header_size = SEG_HEADER + 80;
         let dir_size = SEG_HEADER + 128 + planes.len() * 256;
-        let subblock_size = |plane: &Vec<u8>| SEG_HEADER + 16 + 256 + plane.len();
+        // Java-correct subblock layout: the fixed body (from body_start) is 256
+        // bytes total, which includes the 16-byte size header. Pixel data follows.
+        let subblock_size = |plane: &Vec<u8>| SEG_HEADER + 256 + plane.len();
         let dir_pos = file_header_size as u64;
         let mut subblock_pos = (file_header_size + dir_size) as u64;
 
@@ -872,13 +1131,13 @@ mod tests {
             data.extend_from_slice(entry);
         }
 
-        for (entry, plane) in entries.iter().zip(planes) {
-            let used_size = (SEG_HEADER + 16 + 256 + plane.len()) as u64;
+        for (_entry, plane) in entries.iter().zip(planes) {
+            let used_size = (SEG_HEADER + 256 + plane.len()) as u64;
             data.extend_from_slice(&segment_header("ZISRAWSUBBLOCK", used_size));
-            let mut subblock_header = vec![0; 16];
-            put_u64(&mut subblock_header, 8, plane.len() as u64);
-            data.extend_from_slice(&subblock_header);
-            data.extend_from_slice(entry);
+            // 256-byte fixed body: 16-byte size header followed by 240 reserved bytes.
+            let mut subblock_body = vec![0; 256];
+            put_u64(&mut subblock_body, 8, plane.len() as u64);
+            data.extend_from_slice(&subblock_body);
             data.extend_from_slice(plane);
         }
 
@@ -904,7 +1163,7 @@ mod tests {
 
         for (mut entry, pixels) in entries_and_pixels {
             put_i64(&mut entry, 6, subblock_pos as i64);
-            subblock_pos += (SEG_HEADER + 16 + 256 + pixels.len()) as u64;
+            subblock_pos += (SEG_HEADER + 256 + pixels.len()) as u64;
             entries.push((entry, pixels));
         }
 
@@ -922,13 +1181,13 @@ mod tests {
             data.extend_from_slice(entry);
         }
 
-        for (entry, pixels) in &entries {
-            let used_size = (SEG_HEADER + 16 + 256 + pixels.len()) as u64;
+        for (_entry, pixels) in &entries {
+            let used_size = (SEG_HEADER + 256 + pixels.len()) as u64;
             data.extend_from_slice(&segment_header("ZISRAWSUBBLOCK", used_size));
-            let mut subblock_header = vec![0; 16];
-            put_u64(&mut subblock_header, 8, pixels.len() as u64);
-            data.extend_from_slice(&subblock_header);
-            data.extend_from_slice(entry);
+            // 256-byte fixed body: 16-byte size header followed by 240 reserved bytes.
+            let mut subblock_body = vec![0; 256];
+            put_u64(&mut subblock_body, 8, pixels.len() as u64);
+            data.extend_from_slice(&subblock_body);
             data.extend_from_slice(pixels);
         }
 
@@ -1097,6 +1356,40 @@ mod tests {
         assert_eq!((meta.size_x, meta.size_y), (2, 1));
         assert_eq!(reader.resolution(), 1);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 10]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_splits_scenes_into_separate_series() {
+        // Two scenes (S=0, S=1), each a single 2x1 plane. ZeissCZIReader treats
+        // each "S" position as its own series (positions = maxS - minS + 1).
+        let entries = vec![
+            (directory_entry_scene(0, 0, 0, 2, 1), vec![1, 2]),
+            (directory_entry_scene(0, 0, 1, 2, 1), vec![3, 4]),
+        ];
+        let path = write_synthetic_czi_entries("scene_series", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 2);
+
+        // Series 0 -> scene S=0.
+        assert_eq!(reader.series(), 0);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+
+        // Series 1 -> scene S=1.
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.series(), 1);
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y), (2, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4]);
+
+        // Switch back to series 0.
+        reader.set_series(0).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+
+        assert!(reader.set_series(2).is_err());
 
         fs::remove_file(path).unwrap();
     }

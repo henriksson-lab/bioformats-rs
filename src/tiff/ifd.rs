@@ -7,6 +7,7 @@ pub mod tag {
     pub const BITS_PER_SAMPLE: u16 = 258;
     pub const COMPRESSION: u16 = 259;
     pub const PHOTOMETRIC_INTERPRETATION: u16 = 262;
+    pub const FILL_ORDER: u16 = 266;
     pub const IMAGE_DESCRIPTION: u16 = 270;
     pub const STRIP_OFFSETS: u16 = 273;
     pub const SAMPLES_PER_PIXEL: u16 = 277;
@@ -54,6 +55,25 @@ pub enum Compression {
     Unknown(u16),
 }
 
+impl Compression {
+    /// True if Java's `TiffParser` bit-reverses each byte of the compressed
+    /// strip/tile when `FillOrder == 2` for this compression scheme.
+    ///
+    /// Java condition (TiffParser.readTile / getTile):
+    /// `code <= GROUP_4_FAX(4) || code == DEFLATE(8) || code == PROPRIETARY_DEFLATE(32946)`.
+    pub fn reverses_bits_on_fill_order_2(self) -> bool {
+        matches!(
+            self,
+            Compression::None
+                | Compression::Ccitt
+                | Compression::Group3Fax
+                | Compression::Group4Fax
+                | Compression::Deflate
+                | Compression::DeflateOld
+        )
+    }
+}
+
 impl From<u16> for Compression {
     fn from(v: u16) -> Self {
         match v {
@@ -72,7 +92,7 @@ impl From<u16> for Compression {
             33003 => Compression::Jpeg2000, // JPEG2000
             33004 => Compression::Jpeg2000, // JPEG2000 lossy
             33005 => Compression::Jpeg2000, // ALT_JPEG2000
-            33007 => Compression::Jpeg2000, // ALT_JPEG (JPEG2000 variant)
+            33007 => Compression::Jpeg,     // ALT_JPEG: baseline JPEGCodec (Java TiffCompression)
             34712 => Compression::Jpeg2000, // Olympus JPEG2000
             34713 => Compression::Nikon,
             50000 => Compression::Zstd,

@@ -35,52 +35,105 @@ impl Default for AimReader {
     }
 }
 
+/// Read a NUL-terminated string starting at the current file position,
+/// returning the string and the position immediately after the NUL.
+fn read_cstring(f: &mut std::fs::File) -> Result<(String, u64)> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = f.read(&mut byte).map_err(BioFormatsError::Io)?;
+        if n == 0 {
+            break; // EOF before NUL
+        }
+        if byte[0] == 0 {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    let pos = f.stream_position().map_err(BioFormatsError::Io)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), pos))
+}
+
+fn read_i32_le(f: &mut std::fs::File) -> Result<i32> {
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b).map_err(BioFormatsError::Io)?;
+    Ok(i32::from_le_bytes(b))
+}
+
+fn read_i64_le(f: &mut std::fs::File) -> Result<i64> {
+    let mut b = [0u8; 8];
+    f.read_exact(&mut b).map_err(BioFormatsError::Io)?;
+    Ok(i64::from_le_bytes(b))
+}
+
 fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-    let mut header = [0u8; 512];
-    let n = f.read(&mut header).map_err(BioFormatsError::Io)?;
-    let header = &header[..n];
 
-    // Check for ISQ magic
-    let is_isq = header.len() >= 20 && &header[..16] == b"CTDATA-HEADER_V1";
-    let is_aim = !is_isq
-        && ((header.len() >= 4 && &header[..4] == b"!AIM")
-            || path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("aim"))
-                .unwrap_or(false));
+    // Peek the first 16 bytes to determine the format flavour.
+    let mut version = [0u8; 16];
+    let n = f.read(&mut version).map_err(BioFormatsError::Io)?;
+    let version_str = String::from_utf8_lossy(&version[..n]).into_owned();
 
-    let (width, height, depth, data_offset) = if is_isq && header.len() >= 44 {
-        let w = i32::from_le_bytes([header[28], header[29], header[30], header[31]]).max(1) as u32;
-        let h = i32::from_le_bytes([header[32], header[33], header[34], header[35]]).max(1) as u32;
-        let d = i32::from_le_bytes([header[36], header[37], header[38], header[39]]).max(1) as u32;
-        (w, h, d, 512u64)
-    } else if is_aim {
-        // Try to find ISQ-style dimensions in first 512 bytes
-        // Scan for plausible i32 LE values in range [1, 4096]
-        let mut dims = Vec::new();
-        let mut i = 4usize; // skip magic
-        while i + 4 <= header.len() && dims.len() < 3 {
-            let v = i32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]);
-            if v >= 16 && v <= 4096 {
-                dims.push(v as u32);
-                i += 4;
-            } else {
-                i += 1;
-            }
-        }
-        let w = dims.get(0).copied().unwrap_or(256);
-        let h = dims.get(1).copied().unwrap_or(256);
-        let d = dims.get(2).copied().unwrap_or(1);
-        (w, h, d, 512u64)
+    // Scanco ISQ files (a distinct format) carry the CTDATA magic. Keep that
+    // path; everything else is treated as a genuine AIM file.
+    let is_isq = n >= 16 && &version[..16] == b"CTDATA-HEADER_V1";
+
+    if is_isq {
+        // ISQ: 512-byte header, dimensions as i32 LE at offsets 28/32/36.
+        f.seek(SeekFrom::Start(28)).map_err(BioFormatsError::Io)?;
+        let w = read_i32_le(&mut f)?.max(1) as u32;
+        let h = read_i32_le(&mut f)?.max(1) as u32;
+        let d = read_i32_le(&mut f)?.max(1) as u32;
+        let meta = aim_metadata(w, h, d);
+        return Ok((meta, 512));
+    }
+
+    // AIM path (port of AIMReader.java). littleEndian = true.
+    // "AIMDATA_V030..." uses wider (64-bit) dimension fields.
+    let wider_offsets = version_str.starts_with("AIMDATA_V030");
+
+    let (w, h, d) = if wider_offsets {
+        f.seek(SeekFrom::Start(96)).map_err(BioFormatsError::Io)?;
+        let w = read_i64_le(&mut f)? as i32;
+        let h = read_i64_le(&mut f)? as i32;
+        let d = read_i64_le(&mut f)? as i32;
+        f.seek(SeekFrom::Start(280)).map_err(BioFormatsError::Io)?;
+        (w.max(1) as u32, h.max(1) as u32, d.max(1) as u32)
     } else {
-        (256, 256, 1, 512u64)
+        f.seek(SeekFrom::Start(56)).map_err(BioFormatsError::Io)?;
+        let w = read_i32_le(&mut f)?;
+        let h = read_i32_le(&mut f)?;
+        let d = read_i32_le(&mut f)?;
+        f.seek(SeekFrom::Start(160)).map_err(BioFormatsError::Io)?;
+        (w.max(1) as u32, h.max(1) as u32, d.max(1) as u32)
     };
 
-    let image_count = depth.max(1);
+    // A variable-length NUL-terminated processing-log string precedes the
+    // pixel data; the pixel offset is the position just after it.
+    let (processing_log, pixel_offset) = read_cstring(&mut f)?;
 
-    let meta = ImageMetadata {
+    let mut meta = aim_metadata(w, h, d);
+    // Store the processing log lines as global metadata (key  value pairs).
+    for line in processing_log.split('\n') {
+        let line = line.trim();
+        if let Some(split) = line.find("  ") {
+            let key = line[..split].trim();
+            let value = line[split..].trim();
+            if !key.is_empty() {
+                meta.series_metadata.insert(
+                    key.to_string(),
+                    crate::common::metadata::MetadataValue::String(value.to_string()),
+                );
+            }
+        }
+    }
+
+    Ok((meta, pixel_offset))
+}
+
+fn aim_metadata(width: u32, height: u32, depth: u32) -> ImageMetadata {
+    let image_count = depth.max(1);
+    ImageMetadata {
         size_x: width,
         size_y: height,
         size_z: image_count,
@@ -100,9 +153,7 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
         modulo_z: None,
         modulo_c: None,
         modulo_t: None,
-    };
-
-    Ok((meta, data_offset))
+    }
 }
 
 impl FormatReader for AimReader {
@@ -115,8 +166,9 @@ impl FormatReader for AimReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // ISQ magic: "CTDATA-HEADER_V1"
-        header.len() >= 16 && &header[..16] == b"CTDATA-HEADER_V1"
+        // ISQ magic, or AIM "AIMDATA_V030" version marker.
+        (header.len() >= 16 && &header[..16] == b"CTDATA-HEADER_V1")
+            || (header.len() >= 12 && &header[..12] == b"AIMDATA_V030")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {

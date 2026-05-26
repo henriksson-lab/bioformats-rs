@@ -77,8 +77,17 @@ impl CachedReader {
         (self.inner.series(), self.inner.resolution(), plane_index)
     }
 
-    fn evict_if_needed(&mut self) {
-        while self.cache.len() >= self.max_planes && !self.access_order.is_empty() {
+    /// Evict least-recently-used planes until inserting one more key without
+    /// removing it again leaves the cache at no more than `max_planes` entries.
+    ///
+    /// `inserting_new` is true when the key about to be stored is not already
+    /// present (and so will grow the cache by one). When the key already exists
+    /// the insert replaces it in place and must not trigger an eviction.
+    fn evict_if_needed(&mut self, inserting_new: bool) {
+        // Target occupancy after the pending insert must be <= max_planes.
+        // If inserting a new key, leave room for one more entry.
+        let reserve = if inserting_new { 1 } else { 0 };
+        while self.cache.len() + reserve > self.max_planes && !self.access_order.is_empty() {
             let oldest = self.access_order.remove(0);
             self.cache.remove(&oldest);
         }
@@ -88,7 +97,8 @@ impl CachedReader {
         if self.max_planes == 0 {
             return;
         }
-        self.evict_if_needed();
+        let inserting_new = !self.cache.contains_key(&key);
+        self.evict_if_needed(inserting_new);
         // Move to end of access order (most recent)
         self.access_order.retain(|k| k != &key);
         self.access_order.push(key);

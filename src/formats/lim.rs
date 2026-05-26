@@ -33,43 +33,74 @@ impl Default for LimReader {
     }
 }
 
+/// Fixed pixel-data offset used by LIMReader.java.
+const LIM_PIXELS_OFFSET: u64 = 0x94b;
+
 fn load_lim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-    let mut header = [0u8; 32];
+    let mut header = [0u8; 8];
     f.read_exact(&mut header).map_err(BioFormatsError::Io)?;
 
-    let width = u16::from_le_bytes([header[10], header[11]]) as u32;
-    let height = u16::from_le_bytes([header[12], header[13]]) as u32;
-    let bits = u16::from_le_bytes([header[14], header[15]]) as u32;
-    let image_count = u16::from_le_bytes([header[6], header[7]]) as u32;
-    let data_offset = u32::from_le_bytes([header[8], header[9], 0, 0]) as u64;
+    // Header layout (matching LIMReader.initFile, little-endian):
+    //   0  sizeX = readShort() & 0x7fff
+    //   2  sizeY = readShort()
+    //   4  bits  = readShort()
+    //   6  isCompressed = readShort() != 0
+    let size_x = (i16::from_le_bytes([header[0], header[1]]) as i32 & 0x7fff) as u32;
+    let size_y = i16::from_le_bytes([header[2], header[3]]) as i32 as u32;
+    let mut bits = i16::from_le_bytes([header[4], header[5]]) as i32;
+    let is_compressed = i16::from_le_bytes([header[6], header[7]]) != 0;
 
-    if width == 0 || height == 0 || image_count == 0 || data_offset == 0 {
+    if size_x == 0 || size_y == 0 || bits == 0 {
         return Err(BioFormatsError::UnsupportedFormat(
-            "LIM header is missing required dimensions or data offset".to_string(),
+            "LIM header is missing required dimensions".to_string(),
         ));
     }
 
-    let pixel_type = match bits {
-        8 => PixelType::Uint8,
-        16 => PixelType::Uint16,
-        32 => PixelType::Float32,
-        _ => {
+    // Round bits up to the next multiple of 8.
+    while bits % 8 != 0 {
+        bits += 1;
+    }
+
+    // RGB images store 3 channels packed; bits is divided across them.
+    let mut size_c: u32 = 1;
+    if bits % 3 == 0 {
+        size_c = 3;
+        bits /= 3;
+    }
+
+    // FormatTools.pixelTypeFromBytes(bits/8, false, false) -> unsigned integer.
+    let pixel_type = match bits / 8 {
+        1 => PixelType::Uint8,
+        2 => PixelType::Uint16,
+        4 => PixelType::Uint32,
+        other => {
             return Err(BioFormatsError::UnsupportedFormat(format!(
-                "LIM bit depth {bits} is not supported"
+                "LIM byte depth {other} is not supported"
             )));
         }
     };
+
+    // LIMReader.java itself rejects compressed planes with
+    // UnsupportedCompressionException("Compressed LIM files not supported."),
+    // i.e. the Java reference does NOT decompress LIM data. Being faithful to
+    // the reference, we reject compressed files here as well rather than
+    // inventing an undocumented decompression scheme.
+    if is_compressed {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Compressed LIM files not supported.".to_string(),
+        ));
+    }
+
+    let is_rgb = size_c > 1;
     let bps = pixel_type.bytes_per_sample();
-    let plane_bytes = width
-        .checked_mul(height)
-        .and_then(|px| px.checked_mul(bps as u32))
-        .ok_or_else(|| BioFormatsError::Format("LIM plane size overflows".to_string()))?
-        as u64;
-    let required_len = data_offset
-        .checked_add(plane_bytes.checked_mul(image_count as u64).ok_or_else(|| {
-            BioFormatsError::Format("LIM pixel payload size overflows".to_string())
-        })?)
+    let plane_bytes = (size_x as u64)
+        .checked_mul(size_y as u64)
+        .and_then(|px| px.checked_mul(size_c as u64))
+        .and_then(|samples| samples.checked_mul(bps as u64))
+        .ok_or_else(|| BioFormatsError::Format("LIM plane size overflows".to_string()))?;
+    let required_len = LIM_PIXELS_OFFSET
+        .checked_add(plane_bytes)
         .ok_or_else(|| BioFormatsError::Format("LIM file size overflows".to_string()))?;
     let actual_len = f.metadata().map_err(BioFormatsError::Io)?.len();
     if actual_len < required_len {
@@ -79,17 +110,17 @@ fn load_lim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     }
 
     let meta = ImageMetadata {
-        size_x: width,
-        size_y: height,
-        size_z: image_count,
-        size_c: 1,
+        size_x,
+        size_y,
+        size_z: 1,
+        size_c,
         size_t: 1,
         pixel_type,
         bits_per_pixel: (bps * 8) as u8,
-        image_count,
+        image_count: 1,
         dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
+        is_rgb,
+        is_interleaved: true,
         is_indexed: false,
         is_little_endian: true,
         resolution_count: 1,
@@ -100,7 +131,7 @@ fn load_lim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
         modulo_t: None,
     };
 
-    Ok((meta, data_offset))
+    Ok((meta, LIM_PIXELS_OFFSET))
 }
 
 impl FormatReader for LimReader {
@@ -154,14 +185,26 @@ impl FormatReader for LimReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let bps = meta.pixel_type.bytes_per_sample();
-        let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let file_offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
+        let is_rgb = meta.is_rgb;
+        let size_c = meta.size_c as usize;
+        let plane_bytes = meta.size_x as usize * meta.size_y as usize * size_c * bps;
+        // LIM always reads from the fixed PIXELS_OFFSET (single image plane).
+        let file_offset = self.data_offset;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(file_offset))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+
+        // Swap red and blue channels for RGB images (BGR storage), matching
+        // LIMReader.openBytes. The swap is per-channel byte-wise (3 channels).
+        if is_rgb {
+            let i = 0..buf.len() / 3;
+            for px in i {
+                buf.swap(px * 3, px * 3 + 2);
+            }
+        }
         Ok(buf)
     }
 
@@ -176,7 +219,7 @@ impl FormatReader for LimReader {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         validate_region(meta, x, y, w, h)?;
-        let bps = meta.pixel_type.bytes_per_sample();
+        let bps = meta.pixel_type.bytes_per_sample() * meta.size_c as usize;
         let row_bytes = meta.size_x as usize * bps;
         let out_row = w as usize * bps;
         let mut out = Vec::with_capacity(h as usize * out_row);

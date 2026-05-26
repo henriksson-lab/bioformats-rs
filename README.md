@@ -104,6 +104,198 @@ ImageWriter::save(Path::new("output.tif"), &meta, &planes)?;
 | Norpix StreamPix | `.seq` | Video sequence; raw frames |
 | Hamamatsu DCIMG | `.dcimg` | Scientific CMOS camera format |
 
+## Translation status (all readers)
+
+A per-reader audit of the Java→Rust translation (2026-05-26, updated after a
+parity pass). Status reflects how complete the translation is *in theory*
+(faithful to the Java reader for the common cases), not how thoroughly it has
+been tested against real-world files.
+
+- ✅ **Complete** — faithful core read path; metadata + pixels work for the
+  format's common cases with no major known gap vs the Java reader.
+- 🟡 **Partial** — opens and reads the common case, but a specific feature is
+  missing (noted). Often a vendor TIFF wrapper that reads pixels via the TIFF
+  engine but skips format-specific metadata/companion-file assembly, or a format
+  with no Java counterpart to be faithful to.
+- ⛔ **Stub** — detection only; `set_id` returns `UnsupportedFormat` (the format
+  is proprietary/undocumented or needs a decoder/container parser not yet ported).
+
+Roughly **95 complete, 54 partial, 36 stub** out of ~185 registered readers
+(up from 66/83/36 before the parity pass).
+
+### Standard image formats
+
+| Format | Extensions | Status | Notes |
+|--------|-----------|:------:|-------|
+| TIFF / BigTIFF / OME-TIFF | `.tif` `.tiff` `.btf` `.tf8` | ✅ | Strips/tiles, planar, palette, YCbCr, LZW/Deflate/PackBits/JPEG/Zstd/JP2/fax, SubIFD pyramids |
+| PNG | `.png` | ✅ | 8/16-bit gray/RGB(A); animated APNG rejected |
+| JPEG | `.jpg` `.jpeg` | ✅ | Decodes to 8-bit RGB |
+| BMP | `.bmp` | ✅ | RAW, RLE4/8, BITFIELDS, palette |
+| PCX | `.pcx` | ✅ | RLE, planar channels, v5 palette |
+| Imagic-5 | `.hed` `.img` | ✅ | REAL/INTG/PACK types |
+| TGA | `.tga` `.tpic` | ✅ | via `image` crate |
+| GIF | `.gif` | ✅ | All frames read as an image stack |
+| WebP / OpenEXR / HDR / DDS / Farbfeld / PNM | `.webp` `.exr` `.hdr` `.dds` `.ff` `.pnm` `.pgm` `.ppm` `.pbm` `.pfm` | ✅ | via `image` crate |
+| JPEG 2000 / JPX | `.jp2` `.j2k` `.j2c` `.jpc` `.jpx` | ✅ | via `jpeg2k`; single plane |
+| EPS / PostScript | `.eps` `.epsi` `.ps` | ✅ | Inline raster + DOS-EPS TIFF preview (matches Java; no vector interpreter) |
+| Photoshop PSD/PSB | `.psd` `.psb` | ✅ | Composite image (matches Java; no per-layer extraction) |
+| Khoros VIFF | `.xv` `.viff` | ✅ | KhorosReader parity (byte-order, pixel types, LUT) |
+| Apple PICT | `.pict` `.pct` | ✅ | Bitmap/pixmap/packbits + JPEG-in-PICT |
+| ZIP container | `.zip` | ✅ | Delegates primary entry to any auto-detected reader |
+| MNG / APNG | `.mng` `.apng` | 🟡 | First frame only |
+| Text / CSV image | `.txt` `.csv` | 🟡 | Parsed as Float32; no distinct Java counterpart |
+| Fake (test format) | `.fake` | ✅ | Synthetic gradient generator |
+
+### Microscopy acquisition containers
+
+| Format | Extensions | Status | Notes |
+|--------|-----------|:------:|-------|
+| Zeiss ZVI | `.zvi` | ✅ | OLE2/CFB; each mosaic tile a separate series |
+| Zeiss XRM/TXRM | `.xrm` `.txrm` `.txm` | ✅ | CFB X-ray tomography (Java reads uncompressed only too) |
+| OME-XML | `.ome` | ✅ | Inline BinData + external `<TiffData>`/`<UUID>` companion files |
+| Zeiss LSM | `.lsm` | ✅ | TIFF + CZ_LSMInfo |
+| Olympus FV1000 OIF/OIB | `.oif` `.oib` | ✅ | INI + companion TIFF; `.oib` via OLE2/CFB |
+| Leica LEI | `.lei` | ✅ | DIMDESCR dimensions/physical sizes + companion TIFF |
+| Leica TCS | `.xml` | ✅ | Full C/Z/T from Leica handler |
+| MicroManager | `metadata.txt` `.json` | ✅ | Per-plane file map, multi-position, channel/calibration metadata |
+| Visitech | `.xys` `.html` | ✅ | `.html`/`.xys` parse + multi-position series |
+| Zeiss CZI | `.czi` | 🟡 | Multi-scene series; JPEG-XR needs `jpegxr` feature; no mosaic/angle stitching |
+| Nikon ND2 | `.nd2` | 🟡 | Raw/zlib/JPEG2000 frames; modern chunked ImageDataSeq blocked on fixtures |
+| Prairie View | `.xml` `.cfg` `.env` `.tif` | 🟡 | Channels/metadata; stage-position series split remains |
+| MetaMorph STK | `.stk` | 🟡 | Full per-plane UIC metadata; multi-STK `.nd` grouping remains |
+| Leica XLEF | `.xlef` | 🟡 | XLEF/XLIF container resolved; LOF-backed references undecoded |
+| Imaris IMS | `.ims` | 🟡 | HDF5; whole-volume read cached (no hyperslab slicing) |
+| Leica LIF | `.lif` | ⛔ | Detection only; container parser not ported |
+
+### High-content screening (HCS)
+
+| Format | Extensions | Status | Notes |
+|--------|-----------|:------:|-------|
+| PerkinElmer FLEX | `.flex` `.mea` `.res` | ✅ | Factor scaling + well/field grouping + OME plate |
+| InCell (GE) | `.xdce` `.xml` | ✅ | Well/field Z/C/T series + OME plate/well/wellsample |
+| PerkinElmer UltraVIEW | `.htm` `.tim` `.csv` `.zpo` | ✅ | Full dataset parse, TIFF + numbered raw planes |
+| MIAS (Maia Scientific) | `.tif` | ✅ | Per-well series + tiled-mosaic stitching |
+| Operetta / Columbus / InCell3000 / RCPNL | `.xml` `.rcpnl` `.frm` | ✅ | Index → per-well/field series + plane→file mapping |
+| Tecan plate ASCII | `.asc` | ✅ | Tab-separated plate → Float32 |
+| Yokogawa CV7000/8000 | `.wpi` `.mlf` `.mrf` | ✅ | `.wpi`/`.mlf`/`.mrf` XML index → well/field series + OME plate |
+| ScanR / CellVoyager / BD Pathway | `.xml` `.mes` `.mlf` `.exp` | 🟡 | Geometry + plane mapping; sparse-well/tile-stitch simplifications |
+| MetaXpress / SimplePCI / MIAS / Trestle / TissueFAXS / Mikroscan / Ionpath MIBI TIFFs | `.tif` | 🟡 | Extension-only TIFF delegate; no format-specific assembly |
+| Cellomics | `.c01` `.dib` | 🟡 | zlib + DIB decoded; `.mdb` metadata needs MS-Access lib |
+| CellWorX | `.htd` `.pnl` | ⛔ | Parses HTD dims but `set_id` unsupported |
+
+### Whole-slide / pyramidal TIFF
+
+| Format | Extensions | Status | Notes |
+|--------|-----------|:------:|-------|
+| Aperio SVS (+ generic WSI) | `.svs` `.ndpi` `.scn` `.vsi` `.afi` | ✅ | SVS pyramid regroup + Aperio metadata |
+| Hamamatsu NDPI | `.ndpi` | ✅ | TIFF-based; vendor tags |
+| Nikon NIS / FEI / Olympus SIS / Improvision / Zeiss ApoTome / Fluoview / Molecular Devices TIFFs | `.tif` `.tiff` | ✅ | TIFF-based metadata scrape; pixels via TIFF engine |
+| Leica SCN | `.scn` | ✅ | XML series split + per-resolution pyramid mapping |
+| Ventana/Roche BIF | `.bif` | ✅ | BIF tile reassembly (overlap-averaged stitching) |
+| Hamamatsu NDPIS | `.ndpis` | ✅ | `.ndpis` multi-file channel index |
+| Olympus cellSens VSI | `.vsi` | 🟡 | `.ets` tile indexing; full pyramid + JPEG/J2K tiles remain |
+| OpenSlide (MRXS/VMS/BIF) | `.mrxs` `.vms` `.bif` | 🟡 | Feature-gated; multi-resolution |
+
+### Vendor microscopy & cameras
+
+| Format | Extensions | Status | Notes |
+|--------|-----------|:------:|-------|
+| Applied Precision DeltaVision | `.dv` `.r3d` | ✅ | Extended headers, panels, stage positions |
+| Gatan DM3/DM4 | `.dm3` `.dm4` | ✅ | Tag-tree parse, endianness |
+| Bio-Rad PIC | `.pic` | ✅ | AXIS notes, multi-file grouping, RGB swap |
+| IPLab | `.ipl` `.ipm` | ✅ | Header + tag block |
+| Bio-Rad GEL | `.1sc` | ✅ | Chunk-walk, dynamic pixel offset |
+| Li-Cor L2D | `.l2d` `.scn` | ✅ | Manifest + companion TIFF |
+| PCO B16 | `.b16` | ✅ | Raw uint16 |
+| Openlab Raw | `.raw` | ✅ | LBLB header + raw plane |
+| Photon Dynamics | `.hdr` `.img` `.pds` | ✅ | Header + companion IMG |
+| SM-Camera | `.smc` | ✅ | 548-byte header |
+| Andor SIF | `.sif` | ✅ | SIFReader parity (Java has no v3 XML-footer path) |
+| Princeton SPE | `.spe` | ✅ | SPE 2.x + 3.x detection (Java keeps binary dims; matches Java) |
+| Gatan DM2 | `.dm2` | ✅ | GatanDM2Reader parity (header + tag metadata) |
+| Lab Imaging LIM | `.lim` | ✅ | Matches Java (Java also rejects compressed LIM) |
+| Hasselblad Imacon / Image-Pro IPW | `.fff` `.ipw` | ✅ | Imacon XML tag; IPW OLE2 multi-TIFF |
+| Hamamatsu DCIMG | `.dcimg` | 🟡 | v0/v1 + four-corner correction (no Java reference) |
+| Norpix StreamPix | `.seq` | 🟡 | JPEG frames + timestamps (no Java reference) |
+| TillVision | `.vws` | 🟡 | PST+INF sidecar; embedded VWS unsupported |
+| Canon RAW / Photoshop / Minolta MRW / DNG / QPTIFF / NIS TIFF wrappers | `.cr2` `.crw` `.tif` `.mrw` `.dng` `.qptiff` `.nif` | 🟡 | Headers parsed; Bayer RAW demosaic out of scope (as in Java) |
+| Hamamatsu VMS/VMU | `.vms` `.vmu` | ⛔ | JPEG tile decoding not ported |
+
+### Medical, volumetric & astronomy
+
+| Format | Extensions | Status | Notes |
+|--------|-----------|:------:|-------|
+| MRC / CCP4 | `.mrc` `.mrcs` `.ccp4` `.map` `.rec` | ✅ | Endian detect, EMAN2/IMOD fixes, Y-flip |
+| MetaImage (ITK/VTK) | `.mha` `.mhd` | ✅ | Inline/detached, zlib, endian swap |
+| NIfTI-1 / Analyze 7.5 | `.nii` `.nii.gz` `.hdr` `.img` | ✅ | Single/paired/gz, color datatypes |
+| ICS / ICS2 | `.ics` | ✅ | gzip, endianness rules, dim ordering |
+| Siemens Inveon | `.hdr` (+`.img`) | ✅ | All data-type codes + endianness |
+| POV-Ray DF3 | `.pov` `.df3` | ✅ | Raw voxel grid |
+| SBIG astronomy | `.fts` | ✅ | FITS-based |
+| FITS | `.fits` `.fit` `.fts` | ✅ | Primary HDU, big-endian, no BZERO/BSCALE (matches Java) |
+| NRRD | `.nrrd` `.nhdr` | ✅ | raw/gzip/ascii (Java has no bzip2 either) |
+| DICOM | `.dcm` `.dicom` `.dic` | ✅ | RLE/JPEG/JP2 encapsulation + multi-series companions (Deflate matches Java) |
+| ECAT7 PET | `.v` | ✅ | data_type 6 (matches Java, which supports only that) |
+| Varian FDF | `.fdf` | ✅ | matrix[] dims, XYTZC, bigendian honored |
+| Molecular Dynamics GEL | `.gel` | ✅ | TIFF-based; MD_FILETAG, square-root/linear scaling |
+| Kodak BIP | `.bip` | ✅ | KodakReader parity (GBiH/BSfD markers, float32 BE) |
+| MINC | `.mnc` | 🟡 | MINC2/HDF5 datatype+dims; classic MINC-1 (NetCDF) needs a NetCDF lib |
+| PDS (planetary) | `.pds` | 🟡 | Single-band raw; PE two-file `.hdr`/`.IMG` dialect not split |
+
+### Electron / scanning-probe / AFM microscopy
+
+| Format | Extensions | Status | Notes |
+|--------|-----------|:------:|-------|
+| FEI/Philips XL SEM | `.img` | ✅ | Interlaced decode + metadata |
+| INRIMAGE-4 | `.inr` | ✅ | Header + planar read |
+| Veeco/Nanoscope AFM | `.afm` | ✅ | Text header + raw plane |
+| Seiko / UBM / VG SAM / WA-Top SPM | `.xqd` `.pr3` `.dti` `.wat` | ✅ | Faithful binary headers |
+| Unisoku STM/AFM | `.hdr` `.dat` | ✅ | Companion hdr/dat |
+| JPK AFM | `.jpk` | ✅ | TIFF-based two-series |
+| Scanco AIM/ISQ micro-CT | `.aim` `.isq` | ✅ | ISQ + AIM v020/v030 headers |
+| Zeiss TIFF SEM | `.tif` | ✅ | TIFF delegate |
+| Hitachi SEM | `.txt` | ✅ | `[SemImageFile]` INI + companion image (HitachiReader parity) |
+| LEO/Zeiss SEM | `.tif` | ✅ | TIFF tag 34118 + AP_/DP_/SV_ metadata |
+| RHK / TopoMetrix SPM | `.sm2` `.tfr` | 🟡 | Heuristic header (RHK port pending; TopoMetrix has no Java ref) |
+| IMOD mesh / JEOL / Zeiss LMS / Quesant / PicoQuant / Bruker OPUS / ISS Vista | `.mod` `.dat` `.lms` `.afm` `.ptu` `.abs` `.iss` | ⛔ | Stubs — undocumented or decoder not ported |
+
+### FLIM / lifetime / flow / HDF5
+
+| Format | Extensions | Status | Notes |
+|--------|-----------|:------:|-------|
+| Lambert LI-FLIM | `.fli` | ✅ | INI header, gzip, UINT12 packing |
+| Becker & Hickl SDT | `.sdt` `.spc` | ✅ | Multi-block; MCS-TA partial |
+| Amira/Avizo Mesh | `.am` `.amiramesh` | ✅ | Binary + ASCII streams |
+| Spider EM | `.spi` `.xmp` | ✅ | Float32 header + planar |
+| Amnis FlowSight CIF | `.cif` | ✅ | TIFF + greyscale/bitmask codecs |
+| CellH5 | `.ch5` | ✅ | HDF5; multi-position/well series (two-pass structure) |
+| Aperio AFI / Bio-Rad SCN | `.afi` `.scn` | ✅ | AFI channel XML; SCN MIME-multipart parse |
+| Bruker MicroCT / Imaris TIFF / SlideBook TIFF | `.ctf` `.ims` `.tif` | 🟡 | TIFF delegate; some companion metadata skipped |
+| SimFCS | `.b64` `.r64` `.i64` | 🟡 | Fixed 256×256 frames (no Java reference) |
+| BigDataViewer | `.h5` | 🟡 | HDF5; single series (no Java reference) |
+| Lambert ASCII FLIM / Amnis IM3 / iVision / Olympus OIR / SlideBook 7 / Volocity clipping | `.asc` `.im3` `.ipm` `.oir` `.sld` `.acff` | ⛔ | Stubs |
+
+### Not yet implemented (stubs)
+
+Detection works; `set_id` returns a descriptive `UnsupportedFormat`. Mostly
+proprietary/undocumented formats or ones needing an unported container parser or
+codec.
+
+| Format | Extensions | Reason |
+|--------|-----------|--------|
+| QuickTime | `.mov` `.qt` | MOV atom container not parsed |
+| Volocity library / MVD2 / clipping | `.acff` `.mvd2` | OLE2 / Metakit container |
+| SlideBook / SlideBook 7 | `.sld` | Proprietary undocumented |
+| Openlab LIFF | `.liff` | Proprietary undocumented |
+| Sedat / APL / I2I / JDCE / PCI / HRD-GDF / NAF | `.sedat` `.apl` `.i2i` `.jdce` `.pci` `.gdf` `.naf` | Proprietary undocumented |
+| KLB | `.klb` | No pure-Rust KLB decoder |
+| Imspector OBF/MSR | `.obf` `.msr` | Header parses; stack payload not decoded |
+| Leica LOF | `.lof` | Leica LAS proprietary binary |
+| Burleigh | `.img` | `.img` too generic to detect |
+| Woolz | `.wlz` | Graph-based format |
+| File-pattern dataset | `.pattern` | Needs glob/regex multi-file expansion |
+| FEI SER | `.ser` | Header parses; `set_id` unsupported |
+
 ## API overview
 
 ### `ImageReader` — auto-detecting reader
@@ -230,8 +422,8 @@ assert_eq!(plane.len(), meta.size_y as usize * row_bytes);
 
 ## Planned (not yet implemented)
 
-- **ND2**: JPEG2000-compressed frames (requires an external J2K decoder)
-- **CZI**: JPEG-XR compression
+- **ND2**: full coverage of modern chunked `ImageDataSeq` per-plane metadata (raw/zlib/JPEG2000 frames already decode; see status table)
+- **CZI**: JPEG-XR compression is available behind the `jpegxr` feature; multi-scene series are not yet split
 - **Write support** for LIF, ND2, CZI, PNM
 - **OME metadata**: `reader.ome_metadata()` returns baseline OME metadata for all readers and enriches it with structured physical sizes, channel names, and plane positions where supported; richer parsing (instrument, experimenter) is partial
 - **Pyramid writing** for tiled multi-resolution TIFF

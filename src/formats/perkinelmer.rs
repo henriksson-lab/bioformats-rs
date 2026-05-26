@@ -72,19 +72,43 @@ fn region_from_full(full: &[u8], meta: &ImageMetadata, x: u32, y: u32, w: u32, h
 }
 
 // ── PerkinElmerReader ─────────────────────────────────────────────────────────
+//
+// Ported from the upstream Java PerkinElmerReader. A PerkinElmer dataset is a
+// directory containing one `.htm` file, several metadata companions (.tim,
+// .csv, .zpo, .cfg, .ano, .rec) and a set of pixel files which are either
+// TIFFs or raw binaries numbered by extension (.2, .3, .4, …) with a 6-byte
+// header. Wavelengths/Frames/Slices map to C/T/Z.
+
+/// A single pixel file (TIFF or raw numbered binary).
+#[derive(Clone)]
+struct PixelsFile {
+    path: PathBuf,
+    /// Sequence index parsed from a `_NNN` suffix, or -1 when absent.
+    first_index: i32,
+    /// File extension index (the numeric extension for raw, 0 for TIFF).
+    ext_index: i32,
+}
 
 pub struct PerkinElmerReader {
     path: Option<PathBuf>,
-    rec_path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    files: Vec<PixelsFile>,
+    ext_count: usize,
+    is_tiff: bool,
+    tiff_reader: crate::tiff::TiffReader,
+    tiff_loaded: bool,
 }
 
 impl PerkinElmerReader {
     pub fn new() -> Self {
         PerkinElmerReader {
             path: None,
-            rec_path: None,
             meta: None,
+            files: Vec::new(),
+            ext_count: 1,
+            is_tiff: true,
+            tiff_reader: crate::tiff::TiffReader::new(),
+            tiff_loaded: false,
         }
     }
 }
@@ -95,73 +119,329 @@ impl Default for PerkinElmerReader {
     }
 }
 
-fn parse_pe_cfg(path: &Path) -> Result<(ImageMetadata, PathBuf)> {
-    let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-    let mut width = None;
-    let mut height = None;
-    let mut bytes_per_pixel = None;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(v) = kv(line, "Image Width") {
-            if let Ok(n) = v.parse() {
-                width = Some(n);
-            }
-        } else if let Some(v) = kv(line, "Image Height") {
-            if let Ok(n) = v.parse() {
-                height = Some(n);
-            }
-        } else if let Some(v) = kv(line, "Bytes Per Pixel") {
-            if let Ok(n) = v.parse() {
-                bytes_per_pixel = Some(n);
-            }
-        }
-    }
-
-    let width = width.ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat("PerkinElmer CFG missing Image Width".to_string())
-    })?;
-    let height = height.ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat("PerkinElmer CFG missing Image Height".to_string())
-    })?;
-    let bytes_per_pixel = bytes_per_pixel.ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat("PerkinElmer CFG missing Bytes Per Pixel".to_string())
-    })?;
-    if width == 0 || height == 0 {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "PerkinElmer CFG has invalid dimensions {width}x{height}"
-        )));
-    }
-    let pixel_type = match bytes_per_pixel {
-        1 => PixelType::Uint8,
-        2 => PixelType::Uint16,
-        4 => PixelType::Uint32,
-        _ => {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "PerkinElmer CFG Bytes Per Pixel {bytes_per_pixel} is not supported"
-            )));
-        }
-    };
-    let rec_path = path.with_extension("rec");
-    let meta = default_meta(width, height, pixel_type);
-    let required_len = (meta.size_x as u64)
-        .checked_mul(meta.size_y as u64)
-        .and_then(|n| n.checked_mul(meta.pixel_type.bytes_per_sample() as u64))
-        .ok_or_else(|| BioFormatsError::Format("PerkinElmer REC plane size overflows".into()))?;
-    let actual_len = std::fs::metadata(&rec_path)
-        .map_err(BioFormatsError::Io)?
-        .len();
-    if actual_len < required_len {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "PerkinElmer REC payload is shorter than declared image: got {actual_len} bytes, expected at least {required_len}"
-        )));
-    }
-    Ok((meta, rec_path))
+fn has_ext(name: &str, ext: &str) -> bool {
+    name.rsplit('.')
+        .next()
+        .map(|e| e.eq_ignore_ascii_case(ext))
+        .unwrap_or(false)
 }
 
-fn kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let stripped = line.strip_prefix(key)?.trim_start();
-    Some(stripped.strip_prefix('=')?.trim_start())
+fn is_tiff_name(name: &str) -> bool {
+    has_ext(name, "tif") || has_ext(name, "tiff")
+}
+
+/// Result of parsing the metadata companion files.
+#[derive(Default)]
+struct PeMeta {
+    size_x: u32,
+    size_y: u32,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    details: Option<String>,
+    metadata: HashMap<String, MetadataValue>,
+}
+
+fn pe_parse_key_value(m: &mut PeMeta, key: &str, value: &str) {
+    m.metadata
+        .insert(key.to_string(), MetadataValue::String(value.to_string()));
+    match key {
+        "Image Width" => {
+            if let Ok(v) = value.trim().parse() {
+                m.size_x = v;
+            }
+        }
+        "Image Length" => {
+            if let Ok(v) = value.trim().parse() {
+                m.size_y = v;
+            }
+        }
+        "Number of slices" => {
+            if let Ok(v) = value.trim().parse() {
+                m.size_z = v;
+            }
+        }
+        "Experiment details:" => m.details = Some(value.to_string()),
+        _ => {}
+    }
+}
+
+/// Parse a `.tim` file: whitespace-separated tokens mapped to known keys
+/// (mirrors Java parseTimFile).
+fn pe_parse_tim(m: &mut PeMeta, content: &str) {
+    let hash_keys = [
+        "Number of Wavelengths/Timepoints",
+        "Zero 1",
+        "Zero 2",
+        "Number of slices",
+        "Extra int",
+        "Calibration Unit",
+        "Pixel Size Y",
+        "Pixel Size X",
+        "Image Width",
+        "Image Length",
+        "Origin X",
+        "SubfileType X",
+        "Dimension Label X",
+        "Origin Y",
+        "SubfileType Y",
+        "Dimension Label Y",
+        "Origin Z",
+        "SubfileType Z",
+        "Dimension Label Z",
+    ];
+    let mut t_num = 0usize;
+    for token in content.split_whitespace() {
+        if token.trim().is_empty() {
+            continue;
+        }
+        if t_num >= hash_keys.len() {
+            break;
+        }
+        if token == "um" {
+            t_num = 5;
+        }
+        while (t_num == 1 || t_num == 2) && token.trim() != "0" {
+            t_num += 1;
+        }
+        if t_num == 4 && token.parse::<i64>().is_err() {
+            t_num += 1;
+        }
+        if t_num < hash_keys.len() {
+            pe_parse_key_value(m, hash_keys[t_num], token);
+            t_num += 1;
+        }
+    }
+}
+
+/// Parse the `.htm` header, which defines the Experiment details (Wavelengths,
+/// Frames, Slices). Tokens are split on tags/whitespace.
+fn pe_parse_htm(m: &mut PeMeta, content: &str) {
+    // Split on HTML tags and surrounding whitespace, similar to Java's
+    // HTML_REGEX. Tokens containing '<' are blanked.
+    let mut tokens: Vec<String> = Vec::new();
+    for part in content.split(|c| c == '<' || c == '>') {
+        let trimmed = part.trim();
+        tokens.push(trimmed.to_string());
+    }
+    let mut j = 0;
+    while j + 1 < tokens.len() {
+        let key = tokens[j].trim().to_string();
+        let value = tokens[j + 1].trim().to_string();
+        if !key.is_empty() {
+            pe_parse_key_value(m, &key, &value);
+        }
+        j += 2;
+    }
+}
+
+fn parse_pe_dataset(id: &Path) -> Result<(PeMeta, Vec<PixelsFile>, usize, bool)> {
+    // Always initialise from the .htm file; locate it if id is something else.
+    let dir = id.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let mut htm_id = id.to_path_buf();
+    if !id
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("htm") || e.eq_ignore_ascii_case("html"))
+        .unwrap_or(false)
+    {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for ent in entries.flatten() {
+                let name = ent.file_name().to_string_lossy().to_string();
+                if (has_ext(&name, "htm") || has_ext(&name, "html")) && !name.starts_with('.') {
+                    htm_id = dir.join(&name);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Prefix used for matching companion files.
+    let check = htm_id
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    // List + sort directory entries.
+    let mut entries: Vec<String> = std::fs::read_dir(&dir)
+        .map_err(BioFormatsError::Io)?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    entries.sort();
+
+    let mut tim_file: Option<PathBuf> = None;
+    let mut csv_file: Option<PathBuf> = None;
+    let mut zpo_file: Option<PathBuf> = None;
+    let mut htm_file: Option<PathBuf> = None;
+    let mut temp_files: Vec<PixelsFile> = Vec::new();
+    let mut is_tiff = true;
+    let mut prefix: Option<String> = None;
+
+    for name in &entries {
+        let dot = name.rfind('.');
+        let stem = match dot {
+            Some(d) => &name[..d],
+            None => name.as_str(),
+        };
+        let matches = stem.starts_with(&check)
+            || check.starts_with(stem)
+            || prefix.as_deref().map(|p| stem.starts_with(p)).unwrap_or(false);
+        if !matches {
+            continue;
+        }
+        if let Some(d) = dot {
+            prefix = Some(name[..d].to_string());
+        }
+        if tim_file.is_none() && has_ext(name, "tim") {
+            tim_file = Some(dir.join(name));
+        }
+        if csv_file.is_none() && has_ext(name, "csv") {
+            csv_file = Some(dir.join(name));
+        }
+        if zpo_file.is_none() && has_ext(name, "zpo") {
+            zpo_file = Some(dir.join(name));
+        }
+        if htm_file.is_none() && (has_ext(name, "htm") || has_ext(name, "html")) {
+            htm_file = Some(dir.join(name));
+        }
+
+        let dot_pos = match dot {
+            Some(d) => d,
+            None => continue,
+        };
+        let path = dir.join(name);
+        let bytes = name.as_bytes();
+        if is_tiff_name(name) {
+            // _NNN before the extension -> firstIndex; _NNNN_NNN -> extIndex
+            let first_index = if dot_pos >= 4 && bytes[dot_pos - 4] == b'_' {
+                name[dot_pos - 3..dot_pos].parse::<i32>().unwrap_or(-1)
+            } else {
+                -1
+            };
+            let (first_index, ext_index) = if dot_pos >= 9 && bytes[dot_pos - 9] == b'_' {
+                (
+                    first_index,
+                    name[dot_pos - 8..dot_pos - 4].parse::<i32>().unwrap_or(0),
+                )
+            } else {
+                (temp_files.len() as i32, 0)
+            };
+            temp_files.push(PixelsFile {
+                path,
+                first_index,
+                ext_index,
+            });
+        } else {
+            // raw numbered binary: extension is a hex number
+            let ext = if dot_pos + 1 < name.len() {
+                &name[dot_pos + 1..]
+            } else {
+                ""
+            };
+            if let Ok(ext_index) = i32::from_str_radix(ext, 16) {
+                let first_index = if dot_pos >= 4 && bytes[dot_pos - 4] == b'_' {
+                    name[dot_pos - 3..dot_pos].parse::<i32>().unwrap_or(-1)
+                } else {
+                    -1
+                };
+                is_tiff = false;
+                temp_files.push(PixelsFile {
+                    path,
+                    first_index,
+                    ext_index,
+                });
+            }
+        }
+    }
+
+    // Count distinct extension indices.
+    let mut found_exts: Vec<i32> = Vec::new();
+    for f in &temp_files {
+        if !found_exts.contains(&f.ext_index) {
+            found_exts.push(f.ext_index);
+        }
+    }
+    let ext_count = found_exts.len().max(1);
+
+    // Parse metadata.
+    let mut m = PeMeta::default();
+    if let Some(tf) = &tim_file {
+        if let Ok(content) = std::fs::read_to_string(tf) {
+            pe_parse_tim(&mut m, &content);
+        }
+    }
+    let htm = htm_file.clone().unwrap_or(htm_id);
+    if let Ok(content) = std::fs::read_to_string(&htm) {
+        pe_parse_htm(&mut m, &content);
+    } else {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "PerkinElmer: valid .htm header file not found".into(),
+        ));
+    }
+    let _ = (csv_file, zpo_file);
+
+    // Parse experiment details for Wavelengths/Frames/Slices.
+    if let Some(details) = m.details.clone() {
+        let mut n = 0u32;
+        for token in details.split_whitespace() {
+            match token {
+                "Wavelengths" => m.size_c = n,
+                "Frames" => m.size_t = n,
+                "Slices" => m.size_z = n,
+                _ => {}
+            }
+            n = token.parse::<u32>().unwrap_or(0);
+        }
+    }
+
+    if temp_files.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "PerkinElmer: no pixel files found".into(),
+        ));
+    }
+
+    Ok((m, temp_files, ext_count, is_tiff))
+}
+
+impl PerkinElmerReader {
+    /// Locate the PixelsFile for the given plane, mirroring Java lookupFile.
+    fn lookup_file(&self, no: u32) -> Option<&PixelsFile> {
+        let no = no as i32;
+        let mut min_ext = i32::MAX;
+        let mut min_first = i32::MAX;
+        for f in &self.files {
+            if f.ext_index < min_ext {
+                min_ext = f.ext_index;
+            }
+            if f.first_index >= 0 && f.first_index < min_first {
+                min_first = f.first_index;
+            }
+        }
+        let ext_count = self.ext_count as i32;
+        for ext in min_ext..=ext_count + min_ext {
+            for f in &self.files {
+                if f.ext_index == ext {
+                    if f.first_index < 0 {
+                        if no % ext_count == ext - min_ext {
+                            return Some(f);
+                        }
+                    } else if no == (f.first_index - min_first) * ext_count + ext - min_ext {
+                        return Some(f);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn file_index(&self, no: u32) -> u32 {
+        match self.lookup_file(no) {
+            Some(f) if f.first_index >= 0 => 0,
+            _ => no / self.ext_count as u32,
+        }
+    }
 }
 
 impl FormatReader for PerkinElmerReader {
@@ -170,10 +450,22 @@ impl FormatReader for PerkinElmerReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        if matches!(ext.as_deref(), Some("cfg")) {
-            return path.with_extension("rec").exists();
+        match ext.as_deref() {
+            Some("htm") | Some("html") => true,
+            // A companion file is acceptable if a sibling .htm exists.
+            Some("tim") | Some("csv") | Some("zpo") | Some("cfg") | Some("ano") | Some("rec") => {
+                let dir = path.parent().unwrap_or(Path::new("."));
+                std::fs::read_dir(dir)
+                    .map(|entries| {
+                        entries.flatten().any(|e| {
+                            let n = e.file_name().to_string_lossy().to_string();
+                            has_ext(&n, "htm") || has_ext(&n, "html")
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
         }
-        false
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -181,17 +473,103 @@ impl FormatReader for PerkinElmerReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (meta, rec_path) = parse_pe_cfg(path)?;
+        let (m, files, ext_count, is_tiff) = parse_pe_dataset(path)?;
+
+        // Determine pixel type and (for raw files) sizeX/sizeY from the data.
+        let mut size_z = if m.size_z == 0 { 1 } else { m.size_z };
+        let mut size_c = if m.size_c == 0 { 1 } else { m.size_c };
+        let mut size_x = m.size_x.max(1);
+        let mut size_y = m.size_y.max(1);
+        let pixel_type;
+        let mut little_endian = true;
+        let mut is_rgb = false;
+
+        let first_path = files[0].path.clone();
+        if is_tiff {
+            self.tiff_reader.set_id(&first_path)?;
+            let tm = self.tiff_reader.metadata();
+            size_x = tm.size_x;
+            size_y = tm.size_y;
+            pixel_type = tm.pixel_type;
+            little_endian = tm.is_little_endian;
+            is_rgb = tm.is_rgb;
+            let _ = self.tiff_reader.close();
+        } else {
+            let flen = std::fs::metadata(&first_path)
+                .map_err(BioFormatsError::Io)?
+                .len();
+            let area = (size_x as u64 * size_y as u64).max(1);
+            let mut bpp = ((flen.saturating_sub(6)) / area) as u32;
+            if bpp % 3 == 0 && bpp > 0 {
+                bpp /= 3;
+            }
+            pixel_type = match bpp {
+                1 => PixelType::Uint8,
+                2 => PixelType::Uint16,
+                4 => PixelType::Uint32,
+                _ => PixelType::Uint16,
+            };
+        }
+
+        // imageCount: one per pixel file (Java increments per file).
+        let mut image_count = files.len() as u32;
+
+        // sizeT derivation (Java logic).
+        let zc = (size_z * size_c).max(1);
+        let mut size_t = if m.size_t == 0 || image_count % zc == 0 {
+            (image_count / zc).max(1)
+        } else {
+            image_count = (size_z * size_c * m.size_t).min(files.len() as u32);
+            (image_count / zc).max(1)
+        };
+        if size_t == 0 {
+            size_t = 1;
+        }
+        if image_count != size_z * size_c * size_t {
+            image_count = size_z * size_c * size_t;
+        }
+        let _ = (&mut size_z, &mut size_c);
+
+        let meta = ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c,
+            size_t,
+            pixel_type,
+            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            image_count,
+            dimension_order: DimensionOrder::XYCTZ,
+            is_rgb,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: little_endian,
+            resolution_count: 1,
+            series_metadata: m.metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        };
+
         self.path = Some(path.to_path_buf());
-        self.rec_path = Some(rec_path);
         self.meta = Some(meta);
+        self.files = files;
+        self.ext_count = ext_count;
+        self.is_tiff = is_tiff;
+        self.tiff_loaded = false;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.rec_path = None;
         self.meta = None;
+        self.files.clear();
+        self.ext_count = 1;
+        if self.tiff_loaded {
+            let _ = self.tiff_reader.close();
+            self.tiff_loaded = false;
+        }
         Ok(())
     }
 
@@ -215,12 +593,42 @@ impl FormatReader for PerkinElmerReader {
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let rec = self
-            .rec_path
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let bps = meta.pixel_type.bytes_per_sample();
+        let plane_bytes = meta.size_x as usize
+            * meta.size_y as usize
+            * bps
+            * if meta.is_rgb { meta.size_c as usize } else { 1 };
+
+        let file = self
+            .lookup_file(plane_index)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?
             .clone();
-        open_bytes_impl(&rec, 0, meta, plane_index)
+        let index = self.file_index(plane_index);
+
+        if self.is_tiff {
+            if self.tiff_loaded {
+                let _ = self.tiff_reader.close();
+            }
+            self.tiff_reader.set_id(&file.path)?;
+            self.tiff_loaded = true;
+            return self.tiff_reader.open_bytes(index);
+        }
+
+        // raw binary with a 6-byte header per file, planes are concatenated.
+        let mut buf = vec![0u8; plane_bytes];
+        let offset = 6u64 + index as u64 * plane_bytes as u64;
+        let mut f = std::fs::File::open(&file.path).map_err(BioFormatsError::Io)?;
+        let len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if offset < len {
+            f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+            let available = (len - offset).min(plane_bytes as u64) as usize;
+            f.read_exact(&mut buf[..available])
+                .map_err(BioFormatsError::Io)?;
+        }
+        Ok(buf)
     }
 
     fn open_bytes_region(

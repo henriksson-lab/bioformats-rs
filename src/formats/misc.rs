@@ -506,50 +506,136 @@ impl FormatReader for MincReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        use hdf5_pure::DType;
+
         let file = hdf5_pure::File::open(path)
             .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5: {e}")))?;
 
-        // Look for common MINC dataset paths
-        let dataset_paths = ["/minc-2.0/image/0/image", "/minc-2.0/image/image", "/image"];
-
-        let mut found_ds = None;
-        for dp in &dataset_paths {
-            if let Ok(ds) = file.dataset(dp) {
-                found_ds = Some(ds);
-                break;
-            }
-        }
-
-        let ds = found_ds.ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat(
+        // Mirror MINCReader.initFile: only the HDF5-backed MINC-2.0 path is
+        // reachable here (classic-NetCDF MINC-1 is not HDF5 and is rejected by
+        // is_this_type_by_bytes). Java tries "/image" first, then
+        // "/minc-2.0/image/0/image" and sets isMINC2 in the latter case.
+        let minc2_path = "/minc-2.0/image/0/image";
+        let (ds, is_minc2) = if let Ok(ds) = file.dataset("/image") {
+            (ds, false)
+        } else if let Ok(ds) = file.dataset(minc2_path) {
+            (ds, true)
+        } else if let Ok(ds) = file.dataset("/minc-2.0/image/image") {
+            (ds, true)
+        } else {
+            return Err(BioFormatsError::UnsupportedFormat(
                 "MINC/HDF5: could not find image dataset in known paths".to_string(),
-            )
-        })?;
+            ));
+        };
 
         let shape = ds.shape().unwrap_or_default();
-        // MINC typically has (z, y, x) or (t, z, y, x) ordering
-        let (size_x, size_y, size_z) = match shape.len() {
-            1 => (shape[0] as u32, 1u32, 1u32),
-            2 => (shape[1] as u32, shape[0] as u32, 1u32),
-            3 => (shape[2] as u32, shape[1] as u32, shape[0] as u32),
-            n if n >= 4 => (
+        // MINC stores dimensions slowest-to-fastest; the image axes are the
+        // trailing two (..., y, x), Z is the next, and any leading axis is T.
+        // Java reads sizeX/sizeY/sizeZ from the xspace/yspace/zspace dimension
+        // variables, but the dataset shape encodes the same values.
+        let (size_x, size_y, size_z, size_t) = match shape.len() {
+            0 => (1u32, 1u32, 1u32, 1u32),
+            1 => (shape[0] as u32, 1u32, 1u32, 1u32),
+            2 => (shape[1] as u32, shape[0] as u32, 1u32, 1u32),
+            3 => (shape[2] as u32, shape[1] as u32, shape[0] as u32, 1u32),
+            n => (
                 shape[n - 1] as u32,
                 shape[n - 2] as u32,
                 shape[n - 3] as u32,
+                // Collapse all remaining leading axes into T (Java flattens
+                // byte[t][z][...] into a single plane list).
+                shape[..n - 3]
+                    .iter()
+                    .fold(1u64, |a, &d| a.saturating_mul(d.max(1))) as u32,
             ),
-            _ => (1u32, 1u32, 1u32),
         };
 
-        // Read pixel data as u16
-        let data: Vec<u16> = ds
-            .read_u16()
-            .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
-        let mut pixels = Vec::with_capacity(data.len() * 2);
-        for val in &data {
-            pixels.extend_from_slice(&val.to_le_bytes());
-        }
+        // Determine the real datatype. The HDF5 dataset datatype already
+        // reports the storage size and intrinsic signedness; for MINC-2 the
+        // "_Unsigned" attribute can override it (HDF5 commonly stores unsigned
+        // image data as a signed fixed-point type plus _Unsigned="true"),
+        // mirroring the signed/_Unsigned handling in MINCReader.initFile.
+        let dtype = ds
+            .dtype()
+            .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 dtype: {e}")))?;
 
-        let image_count = size_z.max(1);
+        let unsigned_attr: Option<bool> = if is_minc2 {
+            ds.attrs().ok().and_then(|attrs| {
+                attrs.get("_Unsigned").map(|v| {
+                    // Java: signed unless the attribute starts with "true".
+                    format!("{v:?}").to_ascii_lowercase().contains("true")
+                })
+            })
+        } else {
+            None
+        };
+
+        // Read the raw values via the matching typed reader and re-emit them as
+        // little-endian bytes (MINCReader uses isLittleEndian()==isMINC2 for the
+        // byte conversion; we always materialise little-endian and flag the
+        // metadata accordingly).
+        let (pixel_type, bits, pixels): (PixelType, u8, Vec<u8>) = match &dtype {
+            DType::U8 | DType::I8 => {
+                let signed = matches!(dtype, DType::I8) && unsigned_attr != Some(false);
+                let raw = ds
+                    .read_u8()
+                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                let pt = if signed { PixelType::Int8 } else { PixelType::Uint8 };
+                (pt, 8, raw)
+            }
+            DType::U16 | DType::I16 => {
+                let signed = matches!(dtype, DType::I16) && unsigned_attr != Some(false);
+                let raw = ds
+                    .read_i16()
+                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                let mut bytes = Vec::with_capacity(raw.len() * 2);
+                for v in &raw {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let pt = if signed { PixelType::Int16 } else { PixelType::Uint16 };
+                (pt, 16, bytes)
+            }
+            DType::U32 | DType::I32 => {
+                let signed = matches!(dtype, DType::I32) && unsigned_attr != Some(false);
+                let raw = ds
+                    .read_i32()
+                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                let mut bytes = Vec::with_capacity(raw.len() * 4);
+                for v in &raw {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let pt = if signed { PixelType::Int32 } else { PixelType::Uint32 };
+                (pt, 32, bytes)
+            }
+            DType::F32 => {
+                let raw = ds
+                    .read_f32()
+                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                let mut bytes = Vec::with_capacity(raw.len() * 4);
+                for v in &raw {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                (PixelType::Float32, 32, bytes)
+            }
+            DType::F64 => {
+                let raw = ds
+                    .read_f64()
+                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                let mut bytes = Vec::with_capacity(raw.len() * 8);
+                for v in &raw {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                (PixelType::Float64, 64, bytes)
+            }
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "MINC/HDF5: unsupported image datatype {other}"
+                )));
+            }
+        };
+
+        // Java: imageCount = sizeZ * sizeT * sizeC (sizeC == 1).
+        let image_count = size_z.max(1) * size_t.max(1);
         self.path = Some(path.to_path_buf());
         self.pixel_data = Some(pixels);
         self.meta = Some(ImageMetadata {
@@ -557,14 +643,16 @@ impl FormatReader for MincReader {
             size_y,
             size_z,
             size_c: 1,
-            size_t: 1,
-            pixel_type: PixelType::Uint16,
-            bits_per_pixel: 16,
+            size_t,
+            pixel_type,
+            bits_per_pixel: bits,
             image_count,
+            // Java MINCReader: dimensionOrder = "XYZCT".
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
+            // Java sets littleEndian = isMINC2.
             is_little_endian: true,
             resolution_count: 1,
             series_metadata: HashMap::new(),
@@ -612,7 +700,8 @@ impl FormatReader for MincReader {
             .pixel_data
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?;
-        let plane_bytes = meta.size_x as usize * meta.size_y as usize * 2;
+        let bps = meta.pixel_type.bytes_per_sample();
+        let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
         let offset = plane_index as usize * plane_bytes;
         let end = offset + plane_bytes;
         if end > pixels.len() {
@@ -633,11 +722,12 @@ impl FormatReader for MincReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let row_bytes = meta.size_x as usize * 2;
-        let out_row = w as usize * 2;
+        let bps = meta.pixel_type.bytes_per_sample();
+        let row_bytes = meta.size_x as usize * bps;
+        let out_row = w as usize * bps;
         let mut out = Vec::with_capacity(h as usize * out_row);
         for row in 0..h as usize {
-            let start = (y as usize + row) * row_bytes + x as usize * 2;
+            let start = (y as usize + row) * row_bytes + x as usize * bps;
             out.extend_from_slice(&full[start..start + out_row]);
         }
         Ok(out)

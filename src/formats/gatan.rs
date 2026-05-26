@@ -109,7 +109,10 @@ impl DmValue {
 struct DmReader<R: Read + Seek> {
     r: R,
     dm4: bool,
-    le: bool, // data endianness (NOT the file's fixed big-endian structure parts)
+    le: bool, // declared file byte order (m.littleEndian in Java)
+    // Java: when adjust_endianness is true, 4/8-byte structural scalars and the
+    // Dimensions ints are read with the opposite byte order (in.order(!le)).
+    adjust_endianness: bool,
 }
 
 impl<R: Read + Seek> DmReader<R> {
@@ -153,6 +156,16 @@ impl<R: Read + Seek> DmReader<R> {
         Ok(len)
     }
 
+    /// Effective endianness for a 4/8-byte structural scalar value: Java flips
+    /// the byte order (in.order(!le)) when adjust_endianness is set.
+    fn flipped_le(&self) -> bool {
+        if self.adjust_endianness {
+            !self.le
+        } else {
+            self.le
+        }
+    }
+
     // Data values respect the file's declared endianness
     fn read_data_i16(&mut self) -> std::io::Result<i16> {
         let mut b = [0u8; 2];
@@ -163,6 +176,7 @@ impl<R: Read + Seek> DmReader<R> {
             i16::from_be_bytes(b)
         })
     }
+    #[allow(dead_code)]
     fn read_data_i32(&mut self) -> std::io::Result<i32> {
         let mut b = [0u8; 4];
         self.r.read_exact(&mut b)?;
@@ -181,6 +195,7 @@ impl<R: Read + Seek> DmReader<R> {
             u16::from_be_bytes(b)
         })
     }
+    #[allow(dead_code)]
     fn read_data_u32(&mut self) -> std::io::Result<u32> {
         let mut b = [0u8; 4];
         self.r.read_exact(&mut b)?;
@@ -190,6 +205,7 @@ impl<R: Read + Seek> DmReader<R> {
             u32::from_be_bytes(b)
         })
     }
+    #[allow(dead_code)]
     fn read_data_f32(&mut self) -> std::io::Result<f32> {
         let mut b = [0u8; 4];
         self.r.read_exact(&mut b)?;
@@ -199,6 +215,7 @@ impl<R: Read + Seek> DmReader<R> {
             f32::from_be_bytes(b)
         })
     }
+    #[allow(dead_code)]
     fn read_data_f64(&mut self) -> std::io::Result<f64> {
         let mut b = [0u8; 8];
         self.r.read_exact(&mut b)?;
@@ -215,22 +232,66 @@ impl<R: Read + Seek> DmReader<R> {
         Ok(self.read_u8()? as i8)
     }
 
-    /// Read a scalar value given its DM type code.
+    /// Read a scalar value given its DM type code, matching Java readValue().
+    /// 1/2-byte values use the base byte order; 4/8-byte values are read with
+    /// the flipped order when adjust_endianness is set.
     fn read_scalar(&mut self, type_code: u32) -> std::io::Result<DmValue> {
+        let flip = self.flipped_le();
         match type_code {
+            // 2-byte: base order (no flip)
             DM_TYPE_INT16 => Ok(DmValue::Int(self.read_data_i16()? as i64)),
-            DM_TYPE_INT32 => Ok(DmValue::Int(self.read_data_i32()? as i64)),
             DM_TYPE_UINT16 => Ok(DmValue::Uint(self.read_data_u16()? as u64)),
-            DM_TYPE_UINT32 => Ok(DmValue::Uint(self.read_data_u32()? as u64)),
-            DM_TYPE_FLOAT32 => Ok(DmValue::Float(self.read_data_f32()? as f64)),
-            DM_TYPE_FLOAT64 => Ok(DmValue::Float(self.read_data_f64()?)),
+            // 4-byte: flipped order
+            DM_TYPE_INT32 => {
+                let mut b = [0u8; 4];
+                self.r.read_exact(&mut b)?;
+                let v = if flip {
+                    i32::from_le_bytes(b)
+                } else {
+                    i32::from_be_bytes(b)
+                };
+                Ok(DmValue::Int(v as i64))
+            }
+            DM_TYPE_UINT32 => {
+                let mut b = [0u8; 4];
+                self.r.read_exact(&mut b)?;
+                let v = if flip {
+                    u32::from_le_bytes(b)
+                } else {
+                    u32::from_be_bytes(b)
+                };
+                Ok(DmValue::Uint(v as u64))
+            }
+            DM_TYPE_FLOAT32 => {
+                let mut b = [0u8; 4];
+                self.r.read_exact(&mut b)?;
+                let v = if flip {
+                    f32::from_le_bytes(b)
+                } else {
+                    f32::from_be_bytes(b)
+                };
+                Ok(DmValue::Float(v as f64))
+            }
+            // 8-byte: flipped order
+            DM_TYPE_FLOAT64 => {
+                let mut b = [0u8; 8];
+                self.r.read_exact(&mut b)?;
+                let v = if flip {
+                    f64::from_le_bytes(b)
+                } else {
+                    f64::from_be_bytes(b)
+                };
+                Ok(DmValue::Float(v))
+            }
+            // 1-byte: base order (no flip)
             DM_TYPE_INT8 => Ok(DmValue::Int(self.read_data_i8()? as i64)),
             DM_TYPE_UINT8 => Ok(DmValue::Uint(self.read_data_u8()? as u64)),
             DM_TYPE_CHAR => Ok(DmValue::Uint(self.read_data_u8()? as u64)),
+            // 8-byte unknown types: flipped order
             DM_TYPE_INT64 => {
                 let mut b = [0u8; 8];
                 self.r.read_exact(&mut b)?;
-                Ok(DmValue::Int(if self.le {
+                Ok(DmValue::Int(if flip {
                     i64::from_le_bytes(b)
                 } else {
                     i64::from_be_bytes(b)
@@ -239,7 +300,7 @@ impl<R: Read + Seek> DmReader<R> {
             DM_TYPE_UINT64 => {
                 let mut b = [0u8; 8];
                 self.r.read_exact(&mut b)?;
-                Ok(DmValue::Uint(if self.le {
+                Ok(DmValue::Uint(if flip {
                     u64::from_le_bytes(b)
                 } else {
                     u64::from_be_bytes(b)
@@ -395,6 +456,16 @@ impl<R: Read + Seek> DmReader<R> {
             self.skip_dm4_padding()?;
         }
         let n_tags = self.read_be_u32()? as u64;
+
+        // Java: if numTags > in.length() the declared byte order is wrong, so
+        // flip m.littleEndian and disable adjust_endianness.
+        if depth == 0 {
+            let len = self.stream_len()?;
+            if n_tags > len {
+                self.le = !self.le;
+                self.adjust_endianness = false;
+            }
+        }
 
         let mut entries = Vec::new();
         for _ in 0..n_tags {
@@ -558,7 +629,8 @@ impl FormatReader for GatanReader {
         let version = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
         let dm4 = version == 4;
 
-        // Byte order field (big-endian uint32): 0=big-endian, 1=little-endian
+        // Byte order field: Java does `m.littleEndian = in.readInt() != 1`.
+        // So a value of 1 means big-endian; anything else means little-endian.
         let bo_off = if dm4 { 12 } else { 8 };
         let byte_order = u32::from_be_bytes([
             header[bo_off],
@@ -566,9 +638,17 @@ impl FormatReader for GatanReader {
             header[bo_off + 2],
             header[bo_off + 3],
         ]);
-        let le = byte_order == 1;
+        let le = byte_order != 1;
 
-        let mut dm = DmReader { r, dm4, le };
+        // `adjustEndianness` is true unless the tag count looks invalid (see Java
+        // GatanReader.initFile). When set, 4/8-byte structural scalars and the
+        // Dimensions ints are read with the opposite byte order via flip helpers.
+        let mut dm = DmReader {
+            r,
+            dm4,
+            le,
+            adjust_endianness: true,
+        };
 
         // Seek past the file header to the root tag group
         let _root_offset = if dm4 { 24u64 } else { 16u64 }; // version(4) + size(4/8) + byteorder(4)
@@ -611,7 +691,9 @@ impl FormatReader for GatanReader {
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: le,
+            // Java forces m.littleEndian = true before populating pixels
+            // (GatanReader.initFile line 242); pixel data is always little-endian.
+            is_little_endian: true,
             resolution_count: 1,
             series_metadata: meta_map,
             lookup_table: None,
@@ -719,6 +801,332 @@ impl FormatReader for GatanReader {
 
 // ── Gatan DM2 Reader ──────────────────────────────────────────────────────────
 
+/// Magic int at the start of a DM2 file (big-endian): 0x003d0000.
+const DM2_MAGIC_BYTES: i32 = 0x3d_0000;
+/// DM2 pixel data offset (GatanDM2Reader.HEADER_SIZE).
+const DM2_HEADER_SIZE: u64 = 24;
+
+/// Map (bytes-per-pixel, signed) to a PixelType, matching
+/// FormatTools.pixelTypeFromBytes(bpp, signed, /*fp=*/true) for the byte sizes
+/// that occur in DM2 (the fp flag only selects float for 4/8-byte data).
+fn dm2_pixel_type_from_bytes(bpp: i32, signed: bool) -> Result<PixelType> {
+    match (bpp, signed) {
+        (1, false) => Ok(PixelType::Uint8),
+        (1, true) => Ok(PixelType::Int8),
+        (2, false) => Ok(PixelType::Uint16),
+        (2, true) => Ok(PixelType::Int16),
+        // GatanDM2Reader passes fp=true, so 4-byte data is treated as float.
+        (4, _) => Ok(PixelType::Float32),
+        other => Err(BioFormatsError::Format(format!(
+            "DM2: unsupported bytes-per-pixel/signed combination {other:?}"
+        ))),
+    }
+}
+
+/// Cursor over a big-endian byte slice mirroring the subset of
+/// RandomAccessInputStream operations used by GatanDM2Reader.
+struct Be<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Be<'a> {
+    fn new(data: &'a [u8], pos: usize) -> Self {
+        Be { data, pos }
+    }
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+    fn pointer(&self) -> usize {
+        self.pos
+    }
+    fn seek(&mut self, p: usize) {
+        self.pos = p.min(self.data.len());
+    }
+    fn skip(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.data.len());
+    }
+    fn read_u8(&mut self) -> i32 {
+        if self.pos >= self.data.len() {
+            return -1;
+        }
+        let v = self.data[self.pos] as i32;
+        self.pos += 1;
+        v
+    }
+    fn read_short(&mut self) -> i32 {
+        if self.pos + 2 > self.data.len() {
+            self.pos = self.data.len();
+            return 0;
+        }
+        let v = i16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]) as i32;
+        self.pos += 2;
+        v
+    }
+    fn read_int(&mut self) -> i32 {
+        if self.pos + 4 > self.data.len() {
+            self.pos = self.data.len();
+            return 0;
+        }
+        let v = i32::from_be_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
+        self.pos += 4;
+        v
+    }
+    /// Read `len` bytes as an ISO-8859-1 string.
+    fn read_string(&mut self, len: usize) -> String {
+        let end = (self.pos + len).min(self.data.len());
+        let s: String = self.data[self.pos..end].iter().map(|&b| b as char).collect();
+        self.pos = end;
+        s
+    }
+}
+
+/// Port of the GatanDM2Reader.initFile label/value scan plus parseExtraTags.
+/// Collects all label/value pairs into `meta` and returns (name, date, time).
+fn parse_dm2_metadata(
+    bytes: &[u8],
+    start: usize,
+    meta: &mut HashMap<String, MetadataValue>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let mut s = Be::new(bytes, start);
+    let mut date: Option<String> = None;
+    let mut time: Option<String> = None;
+    let mut name: Option<String> = None;
+
+    while s.pointer() < s.len() {
+        let mut strlen = s.read_short();
+        if strlen == 0 || strlen > 255 {
+            s.skip(35);
+            strlen = s.read_short();
+            if strlen < 0 || (strlen as usize) + s.pointer() >= s.len() {
+                let back = s.pointer().saturating_sub(10);
+                s.seek(back);
+                strlen = s.read_short();
+            }
+        }
+        if strlen < 0 || (strlen as usize) + s.pointer() >= s.len() {
+            break;
+        }
+        let mut label = s.read_string(strlen as usize);
+        let mut value = String::new();
+
+        let mut block = s.read_int();
+        if block == 5 {
+            s.skip(33);
+            if s.read_short() == 0 {
+                if s.read_short() == 39 {
+                    s.skip(1);
+                } else {
+                    s.skip(2);
+                }
+            } else {
+                let back = s.pointer().saturating_sub(2);
+                s.seek(back);
+                continue;
+            }
+        } else if block == 0 || (block as i64 > 0xffff && block < 0x0100_0000) {
+            if block != 0 && strlen > 0 {
+                let back = s.pointer().saturating_sub(4);
+                s.seek(back);
+                value.push_str(&label);
+                label = "Description".to_string();
+                meta.insert(label.clone(), MetadataValue::String(value.clone()));
+            } else if block != 0 {
+                s.skip(15);
+            }
+            parse_dm2_extra_tags(&mut s, meta);
+            continue;
+        } else if block >= 0x0100_0000 {
+            s.skip(34);
+            strlen = s.read_short();
+            if strlen < 0 || (strlen as usize) + s.pointer() >= s.len() {
+                break;
+            }
+            label = s.read_string(strlen as usize);
+            block = s.read_int();
+            if block == 5 {
+                s.skip(33);
+                continue;
+            }
+        }
+
+        let len = s.read_int();
+        if len < 0 || (len as usize) + s.pointer() >= s.len() {
+            break;
+        }
+        let type_str = s.read_string(len as usize);
+        let _extra = s.read_int() - 2;
+        let mut count = s.read_int();
+
+        match type_str.as_str() {
+            "TEXT" => {
+                value.push_str(&s.read_string(count.max(0) as usize));
+                if block == 5 {
+                    s.skip(22);
+                    if s.read_int() == 4 {
+                        if s.read_string(4) == "TEXT" {
+                            s.skip(4);
+                            count = s.read_int();
+                            value.push_str(", ");
+                            value.push_str(&s.read_string(count.max(0) as usize));
+                            s.skip(37);
+                        } else {
+                            s.skip(7);
+                        }
+                    } else {
+                        s.skip(11);
+                    }
+                }
+            }
+            "long" => {
+                count /= 8;
+                for i in 0..count {
+                    if s.pointer() + 8 > s.len() {
+                        break;
+                    }
+                    let v = i64::from_be_bytes([
+                        bytes[s.pointer()],
+                        bytes[s.pointer() + 1],
+                        bytes[s.pointer() + 2],
+                        bytes[s.pointer() + 3],
+                        bytes[s.pointer() + 4],
+                        bytes[s.pointer() + 5],
+                        bytes[s.pointer() + 6],
+                        bytes[s.pointer() + 7],
+                    ]);
+                    s.skip(8);
+                    value.push_str(&v.to_string());
+                    if i < count - 1 {
+                        value.push_str(", ");
+                    }
+                }
+                s.skip(4);
+            }
+            "bool" => {
+                for i in 0..count {
+                    let v = s.read_u8() == 1;
+                    value.push_str(&v.to_string());
+                    if i < count - 1 {
+                        value.push_str(", ");
+                    }
+                }
+            }
+            "shor" => {
+                count /= 2;
+                for i in 0..count {
+                    value.push_str(&s.read_short().to_string());
+                    if i < count - 1 {
+                        value.push_str(", ");
+                    }
+                }
+            }
+            "sing" => {
+                count /= 4;
+                for i in 0..count {
+                    if s.pointer() + 4 > s.len() {
+                        break;
+                    }
+                    let v = f32::from_be_bytes([
+                        bytes[s.pointer()],
+                        bytes[s.pointer() + 1],
+                        bytes[s.pointer() + 2],
+                        bytes[s.pointer() + 3],
+                    ]);
+                    s.skip(4);
+                    value.push_str(&v.to_string());
+                    if i < count - 1 {
+                        value.push_str(", ");
+                    }
+                }
+            }
+            _ => {
+                if count < 0 || (count as usize) + s.pointer() > s.len() {
+                    break;
+                }
+                s.skip(count as usize);
+            }
+        }
+
+        s.skip(16);
+        meta.insert(label.clone(), MetadataValue::String(value.clone()));
+
+        match label.as_str() {
+            "Acquisition Date" => {
+                let mut d = value.clone();
+                if let Some(slash) = d.rfind('/') {
+                    let year = &d[slash + 1..];
+                    if year.len() < 2 {
+                        d = format!("{}0{}", &d[..slash + 1], year);
+                    }
+                }
+                date = Some(d);
+            }
+            "Acquisition Time" => time = Some(value.clone()),
+            "Name" => name = Some(value.clone()),
+            _ => {}
+        }
+    }
+
+    (name, date, time)
+}
+
+/// Port of GatanDM2Reader.parseExtraTags (reads to EOF).
+fn parse_dm2_extra_tags(s: &mut Be<'_>, meta: &mut HashMap<String, MetadataValue>) {
+    while s.pointer() < s.len() {
+        let tag = s.read_short();
+        let length = s.read_int();
+        let value = if length == 4 {
+            let p = s.pointer();
+            if p + 4 > s.len() {
+                break;
+            }
+            let v = f32::from_be_bytes([
+                s.data[p],
+                s.data[p + 1],
+                s.data[p + 2],
+                s.data[p + 3],
+            ]);
+            s.skip(4);
+            v.to_string()
+        } else if length == 2 {
+            s.read_short().to_string()
+        } else if length == 1 {
+            s.read_u8().to_string()
+        } else {
+            if length < 0 {
+                break;
+            }
+            let raw = s.read_string(length as usize);
+            match raw.find('\0') {
+                Some(i) => raw[..i].to_string(),
+                None => raw,
+            }
+        };
+        let value = value.trim().to_string();
+
+        let label = match tag {
+            17 => "BlackContrastLimit".to_string(),
+            18 => "WhiteContrastLimit".to_string(),
+            22 => "Scale".to_string(),
+            27 => "MaxPixelValue".to_string(),
+            28 => "MinPixelValue".to_string(),
+            31 => "Physical width".to_string(),
+            32 => "Physical height".to_string(),
+            37 => "Image label".to_string(),
+            38 => "MinimumContrast".to_string(),
+            53 => "Physical size units".to_string(),
+            62 => "Origin".to_string(),
+            other => format!("Tag {:x}", other),
+        };
+        meta.insert(label, MetadataValue::String(value));
+    }
+}
+
 pub struct Dm2Reader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -730,7 +1138,7 @@ impl Dm2Reader {
         Dm2Reader {
             path: None,
             meta: None,
-            data_offset: 32,
+            data_offset: DM2_HEADER_SIZE,
         }
     }
 }
@@ -749,29 +1157,50 @@ impl FormatReader for Dm2Reader {
             .unwrap_or(false)
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        // Extension-only detection for DM2
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // GatanDM2Reader.isThisType: first big-endian int equals DM2_MAGIC_BYTES.
+        header.len() >= 4
+            && i32::from_be_bytes([header[0], header[1], header[2], header[3]]) == DM2_MAGIC_BYTES
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        let mut header = [0u8; 32];
-        f.read_exact(&mut header).map_err(BioFormatsError::Io)?;
+        // Port of GatanDM2Reader.initFile (big-endian, ISO-8859-1 strings).
+        let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if bytes.len() < 24 {
+            return Err(BioFormatsError::Format("DM2 file is too short".into()));
+        }
 
-        let width = i32::from_le_bytes([header[4], header[5], header[6], header[7]]).max(1) as u32;
-        let height =
-            i32::from_le_bytes([header[8], header[9], header[10], header[11]]).max(1) as u32;
-        let dm_data_type = i32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+        let magic = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if magic != DM2_MAGIC_BYTES {
+            return Err(BioFormatsError::Format("Invalid DM2 file".into()));
+        }
 
-        let pixel_type = dm_pixel_type(dm_data_type);
-        let bps = dm_bytes_per_pixel(dm_data_type);
+        // readInt() magic (4) + skipBytes(8) -> offset 12: footerOffset int + 16.
+        // Then sizeX short(16), sizeY short(18), bpp short(20), signed short(22).
+        let width = i16::from_be_bytes([bytes[12], bytes[13]]).max(1) as u32;
+        let height = i16::from_be_bytes([bytes[14], bytes[15]]).max(1) as u32;
+        let bpp = i16::from_be_bytes([bytes[16], bytes[17]]) as i32;
+        let signed = i16::from_be_bytes([bytes[18], bytes[19]]) == 1;
+
+        let pixel_type = dm2_pixel_type_from_bytes(bpp, signed)?;
+        let bps = pixel_type.bytes_per_sample();
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-        meta_map.insert(
-            "dm_data_type".into(),
-            MetadataValue::Int(dm_data_type as i64),
-        );
+
+        // Tag/metadata scan, starting after the pixel plane plus the 35-byte gap
+        // that GatanDM2Reader skips (skipBytes(planeSize + 35)).
+        let plane_size = width as usize * height as usize * bps;
+        let scan_start = DM2_HEADER_SIZE as usize + plane_size + 35;
+        let (name, date, time) = parse_dm2_metadata(&bytes, scan_start, &mut meta_map);
+        if let Some(n) = name {
+            meta_map.insert("Name".into(), MetadataValue::String(n));
+        }
+        if let Some(d) = date {
+            meta_map.insert("Acquisition Date".into(), MetadataValue::String(d));
+        }
+        if let Some(t) = time {
+            meta_map.insert("Acquisition Time".into(), MetadataValue::String(t));
+        }
 
         let meta = ImageMetadata {
             size_x: width,
@@ -786,7 +1215,8 @@ impl FormatReader for Dm2Reader {
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: true,
+            // GatanDM2Reader sets m.littleEndian = false.
+            is_little_endian: false,
             resolution_count: 1,
             series_metadata: meta_map,
             lookup_table: None,
@@ -796,7 +1226,7 @@ impl FormatReader for Dm2Reader {
         };
 
         self.meta = Some(meta);
-        self.data_offset = 32;
+        self.data_offset = DM2_HEADER_SIZE;
         self.path = Some(path.to_path_buf());
         Ok(())
     }

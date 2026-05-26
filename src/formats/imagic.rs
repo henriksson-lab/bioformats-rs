@@ -4,11 +4,11 @@
 //!   .hed — header file (one 1024-byte record per image, each as 256 int32 values)
 //!   .img — pixel data file (images stored sequentially)
 //!
-//! Key header record fields:
-//!   Word 1 (off   0): IMGNUM  (i32) — image serial number
-//!   Word 2 (off   4): NROWS   (i32) — image height
-//!   Word 3 (off   8): NPIXEL  (i32) — total pixels = width × height
-//!   Word 6 (off  20): IFORM   (i32) — pixel format: 0=uint8, 1=int16, 2=float32, 3=complex
+//! Header record layout (matching the upstream Java ImagicReader):
+//!   skip 16, then month/day/year/hour/minute/seconds (6×i32 = 24 bytes), skip 8
+//!   off 48: sizeY (i32)
+//!   off 52: sizeX (i32)
+//!   off 56: 4-char ASCII type string ("REAL"=float32, "INTG"=uint16, "PACK"=uint8)
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -26,13 +26,19 @@ fn r_i32_le(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
-fn imagic_pixel_type(iform: i32) -> (PixelType, u8) {
-    match iform {
-        0 => (PixelType::Uint8, 8),
-        1 => (PixelType::Int16, 16),
-        2 => (PixelType::Float32, 32),
-        3 => (PixelType::Float32, 32), // complex = 2×float32, report as float32 per value
-        _ => (PixelType::Float32, 32), // default to float32
+fn imagic_pixel_type(type_str: &str) -> Result<(PixelType, u8)> {
+    match type_str {
+        "REAL" => Ok((PixelType::Float32, 32)),
+        "INTG" => Ok((PixelType::Uint16, 16)),
+        "PACK" => Ok((PixelType::Uint8, 8)),
+        "COMP" => Err(BioFormatsError::UnsupportedFormat(
+            "Unsupported pixel type 'COMP'".into(),
+        )),
+        "RECO" => Err(BioFormatsError::UnsupportedFormat(
+            "Unsupported pixel type 'RECO'".into(),
+        )),
+        // Default to float32 if the type string is unrecognized.
+        _ => Ok((PixelType::Float32, 32)),
     }
 }
 
@@ -70,14 +76,15 @@ impl FormatReader for ImagicReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // Heuristic: IMGNUM at offset 0 should be 1, NROWS at 4 should be positive
-        if header.len() < 12 {
+        // The IMAGIC header has no fixed magic; upstream relies on the .hed
+        // suffix plus the presence of a matching .img file. As a byte-level
+        // heuristic, validate that the type string at offset 56 is one of the
+        // known IMAGIC pixel format tags.
+        if header.len() < 60 {
             return false;
         }
-        let imgnum = r_i32_le(header, 0);
-        let nrows = r_i32_le(header, 4);
-        let npixel = r_i32_le(header, 8);
-        imgnum == 1 && nrows > 0 && nrows < 65536 && npixel > 0 && npixel % nrows == 0
+        let type_str = std::str::from_utf8(&header[56..60]).unwrap_or("");
+        matches!(type_str, "REAL" | "INTG" | "PACK" | "COMP" | "RECO")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -104,20 +111,24 @@ impl FormatReader for ImagicReader {
         let mut rec = vec![0u8; HDR_RECORD_BYTES];
         f.read_exact(&mut rec).map_err(BioFormatsError::Io)?;
 
-        let nrows = r_i32_le(&rec, 4).max(1) as u32;
-        let npixel = r_i32_le(&rec, 8).max(1) as u32;
-        let iform = r_i32_le(&rec, 20);
-        let ncols = npixel / nrows;
+        // Java layout: skip 16, read 6 ints (date/time, 24 bytes), skip 8,
+        // then sizeY @48, sizeX @52, 4-char type string @56.
+        let size_y = r_i32_le(&rec, 48).max(1) as u32;
+        let size_x = r_i32_le(&rec, 52).max(1) as u32;
+        let type_str = std::str::from_utf8(&rec[56..60])
+            .unwrap_or("")
+            .trim_end_matches(char::from(0))
+            .to_string();
 
-        let (pixel_type, bpp) = imagic_pixel_type(iform);
+        let (pixel_type, bpp) = imagic_pixel_type(&type_str)?;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert("format".into(), MetadataValue::String("IMAGIC-5 EM".into()));
-        meta_map.insert("iform".into(), MetadataValue::Int(iform as i64));
+        meta_map.insert("type".into(), MetadataValue::String(type_str));
 
         self.meta = Some(ImageMetadata {
-            size_x: ncols,
-            size_y: nrows,
+            size_x,
+            size_y,
             size_z: num_images as u32,
             size_c: 1,
             size_t: 1,

@@ -1083,26 +1083,84 @@ impl FormatReader for JeolReader {
 }
 
 // ===========================================================================
-// Real binary reader — Hitachi SEM
+// Hitachi S-4800 SEM — INI text file + companion pixels file
 // ===========================================================================
 
-/// Hitachi SEM reader (`.hiv`).
+/// Hitachi S-4800 SEM reader.
 ///
-/// Attempts to read a 512-byte header for dimensions. Falls back to raw
-/// uint16 square heuristic if header parsing fails.
+/// Ported from `HitachiReader.java`. A Hitachi dataset is a `.txt` INI file
+/// whose `[SemImageFile]` section names the actual pixels file (`ImageName`),
+/// a similarly-named `.tif`, `.bmp`, or `.jpg` placed alongside the `.txt`.
+/// Detection requires the magic string `[SemImageFile]` (the file may be
+/// either ASCII or UTF-16 encoded). The pixels are read by delegating to the
+/// auto-detecting `ImageReader`, exactly as the Java reader delegates to a
+/// helper `ImageReader` with `HitachiReader` removed from the class list.
 pub struct HitachiReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
+    /// Resolved path to the companion pixels file (.tif/.bmp/.jpg).
+    pixels_file: Option<PathBuf>,
+    /// Parsed `[SemImageFile]` key/value pairs.
+    ini: HashMap<String, String>,
 }
 
 impl HitachiReader {
+    const MAGIC: &'static str = "[SemImageFile]";
+
     pub fn new() -> Self {
         HitachiReader {
             path: None,
             meta: None,
-            data_offset: 0,
+            pixels_file: None,
+            ini: HashMap::new(),
         }
+    }
+
+    /// Decode the header text as ASCII, falling back to UTF-16 (matching the
+    /// Java reader's `new String(b, ENCODING)` then `new String(b, "UTF-16")`).
+    fn decode_header(bytes: &[u8]) -> String {
+        let ascii = String::from_utf8_lossy(bytes);
+        if ascii.contains(Self::MAGIC) {
+            return ascii.into_owned();
+        }
+        // UTF-16: try little-endian then big-endian.
+        for be in [false, true] {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| {
+                    if be {
+                        u16::from_be_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_le_bytes([c[0], c[1]])
+                    }
+                })
+                .collect();
+            let s = String::from_utf16_lossy(&units);
+            if s.contains(Self::MAGIC) {
+                return s;
+            }
+        }
+        ascii.into_owned()
+    }
+
+    /// Parse a flat INI: lines `key=value` after the `[SemImageFile]` header.
+    fn parse_ini(text: &str) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        let mut in_section = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                in_section = line.eq_ignore_ascii_case(Self::MAGIC);
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        map
     }
 }
 
@@ -1118,75 +1176,89 @@ impl FormatReader for HitachiReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("hiv"))
+        matches!(ext.as_deref(), Some("txt"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Accept ASCII or UTF-16 occurrences of the magic.
+        Self::decode_header(header).contains(Self::MAGIC)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file_size = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
+        // If handed the companion pixels file, redirect to the sibling .txt
+        // (Java initFile() does the same).
+        let txt_path = if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("txt"))
+            .unwrap_or(false)
+        {
+            path.to_path_buf()
+        } else {
+            path.with_extension("txt")
+        };
 
-        // Try reading a 512-byte header; look for width/height as LE u32 at
-        // conventional offsets. If file is too small, skip header.
-        let mut width: u32 = 0;
-        let mut height: u32 = 0;
-        let mut header_size: u64 = 0;
+        let bytes = std::fs::read(&txt_path).map_err(BioFormatsError::Io)?;
+        let text = Self::decode_header(&bytes);
+        if !text.contains(Self::MAGIC) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Hitachi: missing [SemImageFile] section".into(),
+            ));
+        }
+        let ini = Self::parse_ini(&text);
 
-        if file_size >= 512 {
-            let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-            let mut hdr = [0u8; 512];
-            f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
-            // Try offsets 4 and 8 for width/height (common binary header layout)
-            let w = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-            let h = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
-            if w > 0 && w <= 65536 && h > 0 && h <= 65536 {
-                let expected = 512u64 + (w as u64) * (h as u64) * 2;
-                if expected <= file_size {
-                    width = w;
-                    height = h;
-                    header_size = 512;
+        // Resolve the pixels file: stored ImageName next to the .txt, else
+        // fall back to a same-base .tif/.jpg/.bmp.
+        let parent = txt_path.parent().unwrap_or_else(|| Path::new("."));
+        let mut pixels_file: Option<PathBuf> = None;
+        if let Some(name) = ini.get("ImageName") {
+            let candidate = parent.join(name);
+            if candidate.exists() {
+                pixels_file = Some(candidate);
+            }
+        }
+        if pixels_file.is_none() {
+            for ext in ["tif", "jpg", "bmp"] {
+                let candidate = txt_path.with_extension(ext);
+                if candidate.exists() {
+                    pixels_file = Some(candidate);
+                    break;
                 }
             }
         }
+        let pixels_file = pixels_file.ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("Hitachi: could not find pixels file".into())
+        })?;
 
-        if width == 0 || height == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Hitachi SEM header missing supported dimensions".into(),
-            ));
+        // Delegate to the auto-detecting reader for the companion image.
+        let mut helper = crate::registry::ImageReader::open(&pixels_file)?;
+        let mut meta = helper.metadata().clone();
+        helper.close().ok();
+
+        // Carry the [SemImageFile] metadata into series_metadata.
+        for (k, v) in &ini {
+            meta.series_metadata.insert(
+                k.clone(),
+                crate::common::metadata::MetadataValue::String(v.clone()),
+            );
         }
+        meta.series_metadata.insert(
+            "format".into(),
+            crate::common::metadata::MetadataValue::String("Hitachi".into()),
+        );
 
-        self.data_offset = header_size;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(ImageMetadata {
-            size_x: width,
-            size_y: height,
-            size_z: 1,
-            size_c: 1,
-            size_t: 1,
-            pixel_type: PixelType::Uint16,
-            bits_per_pixel: 16,
-            image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: HashMap::new(),
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
+        self.ini = ini;
+        self.pixels_file = Some(pixels_file);
+        self.path = Some(txt_path);
+        self.meta = Some(meta);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.data_offset = 0;
+        self.pixels_file = None;
+        self.ini.clear();
         Ok(())
     }
 
@@ -1211,48 +1283,43 @@ impl FormatReader for HitachiReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        let pixels = self
+            .pixels_file
+            .clone()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let mut helper = crate::registry::ImageReader::open(&pixels)?;
+        let bytes = helper.open_bytes(plane_index);
+        helper.close().ok();
+        bytes
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self
-            .meta
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?
-            .clone();
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let full = self.open_bytes(plane_index)?;
-        crop_full_plane("Hitachi SEM", &full, &meta, 1, _x, _y, w, h)
+        let pixels = self
+            .pixels_file
+            .clone()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let mut helper = crate::registry::ImageReader::open(&pixels)?;
+        let bytes = helper.open_bytes_region(plane_index, x, y, w, h);
+        helper.close().ok();
+        bytes
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        let pixels = self
+            .pixels_file
+            .clone()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let mut helper = crate::registry::ImageReader::open(&pixels)?;
+        let bytes = helper.open_thumb_bytes(plane_index);
+        helper.close().ok();
+        bytes
     }
 
     fn resolution_count(&self) -> usize {
@@ -1272,26 +1339,28 @@ impl FormatReader for HitachiReader {
 }
 
 // ===========================================================================
-// Real binary reader — Leo/Zeiss SEM
+// LEO / Zeiss EM — TIFF with proprietary LEO tag (34118)
 // ===========================================================================
 
-/// Leo/Zeiss SEM reader (`.sxm`).
+/// LEO EM reader (`.sxm`, `.tif`, `.tiff`).
 ///
-/// SXM files may have a text header (like Nanoscope) followed by raw data.
-/// We parse text header lines for dimension info, falling back to raw uint16
-/// square heuristic.
+/// Ported from `LEOReader.java` (extends `BaseTiffReader`). LEO files are
+/// ordinary TIFFs distinguished by the presence of private tag 34118
+/// (`LEO_TAG`), an ISO-8859-1 text blob of `AP_`/`DP_`/`SV_` key/value lines.
+/// Pixel reading is plain TIFF; this reader delegates pixels to `TiffReader`
+/// and parses the LEO tag for metadata.
 pub struct LeoReader {
-    path: Option<PathBuf>,
+    inner: crate::tiff::TiffReader,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
 }
 
 impl LeoReader {
+    const LEO_TAG: u16 = 34118;
+
     pub fn new() -> Self {
         LeoReader {
-            path: None,
+            inner: crate::tiff::TiffReader::new(),
             meta: None,
-            data_offset: 0,
         }
     }
 }
@@ -1308,138 +1377,81 @@ impl FormatReader for LeoReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("sxm"))
+        matches!(ext.as_deref(), Some("sxm") | Some("tif") | Some("tiff"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // Like Java (suffixSufficient=false), detection requires opening the
+        // TIFF and checking for the LEO tag; header bytes alone are not enough.
         false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file_size = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
+        self.inner.set_id(path)?;
 
-        // Read first 1024 bytes and try to parse as text header
-        let read_len = (file_size as usize).min(1024);
-        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        let mut hdr_buf = vec![0u8; read_len];
-        f.read_exact(&mut hdr_buf).map_err(BioFormatsError::Io)?;
+        // Require the LEO private tag in the first IFD.
+        let first = self
+            .inner
+            .ifd(0)
+            .ok_or_else(|| BioFormatsError::UnsupportedFormat("LEO: no IFD".into()))?;
+        if first.get(Self::LEO_TAG).is_none() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "LEO: TIFF is missing the LEO tag (34118)".into(),
+            ));
+        }
 
-        let text = String::from_utf8_lossy(&hdr_buf);
+        let mut meta = self.inner.metadata().clone();
+        meta.series_metadata
+            .insert("format".into(), MetadataValue::String("LEO".into()));
 
-        let mut width: u32 = 0;
-        let mut height: u32 = 0;
-        let mut data_off: u64 = 0;
-
-        // Look for common SXM header patterns
-        for line in text.lines() {
-            let line_lower = line.to_ascii_lowercase();
-            if line_lower.contains("pixels") && line_lower.contains("x") {
-                // e.g. "512 x 512 pixels"
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                for (i, part) in parts.iter().enumerate() {
-                    if *part == "x" || *part == "X" {
-                        if i > 0 {
-                            if let Ok(w) = parts[i - 1].parse::<u32>() {
-                                width = w;
-                            }
-                        }
-                        if i + 1 < parts.len() {
-                            if let Ok(h) = parts[i + 1].parse::<u32>() {
-                                height = h;
-                            }
-                        }
+        // Parse the LEO tag text: lines of `AP_*`/`DP_*`/`SV_*` keys whose
+        // value lives on the following line (Java initStandardMetadata()).
+        if let Some(tag_text) = first.get_str(Self::LEO_TAG) {
+            let lines: Vec<&str> = tag_text.split('\n').collect();
+            let mut i = 0usize;
+            while i < lines.len() {
+                let t = lines[i].trim();
+                if (t.starts_with("AP_") || t.starts_with("DP_") || t.starts_with("SV_"))
+                    && i + 1 < lines.len()
+                {
+                    let sep = if t == "AP_TIME" || t == "AP_DATE" {
+                        ':'
+                    } else {
+                        '='
+                    };
+                    let val_line = lines[i + 1].trim();
+                    if let Some((k, v)) = val_line.split_once(sep) {
+                        meta.series_metadata.insert(
+                            k.trim().to_string(),
+                            MetadataValue::String(v.trim().to_string()),
+                        );
                     }
-                }
-            } else if line_lower.contains("width") {
-                if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(w) = val.parse::<u32>() {
-                        width = w;
-                    }
-                }
-            } else if line_lower.contains("height") {
-                if let Some(val) = line.split_whitespace().last() {
-                    if let Ok(h) = val.parse::<u32>() {
-                        height = h;
-                    }
-                }
-            } else if line.contains(":SCANIT_END:") || line.contains("\\*File list end") {
-                // End of header marker — data follows
-                // Approximate offset: find it in the raw bytes
-                if let Some(pos) = String::from_utf8_lossy(&hdr_buf).find(line.trim()) {
-                    data_off = (pos + line.trim().len()) as u64;
-                    // Skip trailing newline
-                    if data_off < file_size && hdr_buf.get(data_off as usize) == Some(&b'\n') {
-                        data_off += 1;
-                    }
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
         }
 
-        if width == 0 || height == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Leo/Zeiss SXM header missing image dimensions".into(),
-            ));
-        }
-        let expected = data_off
-            .checked_add(
-                (width as u64)
-                    .saturating_mul(height as u64)
-                    .saturating_mul(2),
-            )
-            .ok_or_else(|| BioFormatsError::Format("Leo/Zeiss SXM plane size overflows".into()))?;
-        if expected > file_size {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Leo/Zeiss SXM pixel payload is shorter than declared dimensions".into(),
-            ));
-        }
-
-        self.data_offset = data_off;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(ImageMetadata {
-            size_x: width,
-            size_y: height,
-            size_z: 1,
-            size_c: 1,
-            size_t: 1,
-            pixel_type: PixelType::Uint16,
-            bits_per_pixel: 16,
-            image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: HashMap::new(),
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
+        self.meta = Some(meta);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
         self.meta = None;
-        self.data_offset = 0;
-        Ok(())
+        self.inner.close()
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.inner.series_count()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        self.inner.set_series(s)
     }
 
     fn series(&self) -> usize {
-        0
+        self.inner.series()
     }
 
     fn metadata(&self) -> &ImageMetadata {
@@ -1447,63 +1459,30 @@ impl FormatReader for LeoReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        self.inner.open_bytes(plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self
-            .meta
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?
-            .clone();
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let full = self.open_bytes(plane_index)?;
-        crop_full_plane("Leo/Zeiss SXM", &full, &meta, 1, _x, _y, w, h)
+        self.inner.open_bytes_region(plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        self.inner.open_thumb_bytes(plane_index)
     }
 
     fn resolution_count(&self) -> usize {
-        1
+        self.inner.resolution_count()
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if level != 0 {
-            Err(BioFormatsError::Format(format!(
-                "resolution {} out of range",
-                level
-            )))
-        } else {
-            Ok(())
-        }
+        self.inner.set_resolution(level)
     }
 }
 

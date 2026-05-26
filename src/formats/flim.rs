@@ -250,11 +250,198 @@ fn read_sdt_setup_block(
     Ok(Some(parse_sdt_setup(&text)))
 }
 
+/// Parsed Becker & Hickl SDT header (a partial port of SDTInfo.java covering
+/// the fields the reader needs: dimensions, channels, time bins, timepoints,
+/// MCS-TA points, count increment, and per-data-block offsets/lengths).
+struct SdtInfo {
+    width: u32,
+    height: u32,
+    time_bins: u32,
+    channels: u32,
+    timepoints: u32,
+    mcsta_points: u32,
+    incr: u16,
+    block_offsets: Vec<u64>,
+    block_lengths: Vec<u64>,
+}
+
+/// Read the SDT header and measurement-descriptor blocks (SDTInfo.java).
+fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
+    // bhfileHeader (little-endian).
+    let mut hdr = [0u8; 42];
+    f.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
+    f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
+
+    let info_offs = r_u32_le(&hdr, 2) as u64;
+    let setup_offs = r_u32_le(&hdr, 8) as u64;
+    let setup_length = r_u16_le(&hdr, 12) as usize;
+    let data_block_offs = r_u32_le(&hdr, 14) as u64;
+    let no_of_data_blocks = r_i16_le(&hdr, 18);
+    let meas_desc_block_offs = r_u32_le(&hdr, 20) as u64;
+    let no_of_meas_desc_blocks = r_i16_le(&hdr, 24);
+    let meas_desc_block_length = r_i16_le(&hdr, 26).max(0) as usize;
+    let reserved1 = r_u32_le(&hdr, 34) as usize;
+    let _ = info_offs;
+
+    let block_count = if no_of_data_blocks == 0x7fff {
+        reserved1
+    } else {
+        no_of_data_blocks.max(0) as usize
+    };
+
+    // Setup text block: parse for X/Y/ADC_RE/SCAN_RX.
+    let (mut width, mut height, mut time_bins, mut channels) =
+        read_sdt_setup_block(f, setup_offs, setup_length, file_len)?.unwrap_or((1, 1, 256, 1));
+
+    let mut timepoints: u32 = 0;
+    let mcsta_points: u32 = 0; // MCS-TA parsing is in the binary setup extension; left 0.
+    let mut incr: u16 = 1;
+
+    // Measurement-descriptor block (MeasureInfo) carries authoritative dims.
+    if no_of_meas_desc_blocks > 0 && meas_desc_block_length >= 211 && meas_desc_block_offs < file_len
+    {
+        f.seek(SeekFrom::Start(meas_desc_block_offs))
+            .map_err(BioFormatsError::Io)?;
+        let mut mb = vec![0u8; 211.min((file_len - meas_desc_block_offs) as usize)];
+        f.read_exact(&mut mb).map_err(BioFormatsError::Io)?;
+        // Field offsets within MeasureInfo (see SDTInfo.java order):
+        //   9 (time) + 11 (date) + 16 (modSerNo) = 36; measMode short at 36.
+        let meas_mode = r_i16_le(&mb, 36);
+        // adcRE short at offset 36+2 + 6*float(4)=24 + short(2)+float(4)
+        //   + float(4)+short(2)+float(4)+float(4)+float(4) ... compute directly:
+        // Build cumulative offset from the documented field sequence:
+        // measMode(2), cfdLL..cfdHF(4 floats=16), synZC(4), synFD(2), synHF(4),
+        // tacR(4), tacG(2), tacOF(4), tacLL(4), tacLH(4), adcRE(2)...
+        let mut off = 36usize;
+        off += 2; // measMode
+        off += 16; // cfdLL,cfdLH,cfdZC,cfdHF
+        off += 4; // synZC
+        off += 2; // synFD
+        off += 4; // synHF
+        off += 4; // tacR
+        off += 2; // tacG
+        off += 4; // tacOF
+        off += 4; // tacLL
+        off += 4; // tacLH
+        let adc_re = r_i16_le(&mb, off);
+        off += 2; // adcRE
+        off += 2; // ealDE
+        off += 2; // ncx
+        off += 2; // ncy
+        off += 2; // page (ushort)
+        off += 4; // colT
+        off += 4; // repT
+        let stopt = r_i16_le(&mb, off);
+        off += 2; // stopt
+        off += 1; // overfl (ubyte)
+        off += 2; // useMotor
+        off += 2; // steps (ushort)
+        off += 4; // offset
+        off += 2; // dither
+        incr = r_u16_le(&mb, off);
+        off += 2; // incr
+        off += 2; // memBank
+        off += 16; // modType
+        off += 4; // synTH
+        off += 2; // deadTimeComp
+        off += 2; // polarityL
+        off += 2; // polarityF
+        off += 2; // polarityP
+        off += 2; // linediv
+        off += 2; // accumulate
+        off += 4; // flbckY
+        off += 4; // flbckX
+        off += 4; // bordU
+        off += 4; // bordL
+        off += 4; // pixTime
+        off += 2; // pixClk
+        off += 2; // trigger
+        let scan_x = r_i32_le(&mb, off);
+        off += 4; // scanX
+        let scan_y = r_i32_le(&mb, off);
+        off += 4; // scanY
+        let scan_rx = r_i32_le(&mb, off);
+        // (remaining MeasureInfo fields are not needed)
+
+        timepoints = stopt.max(0) as u32;
+
+        if scan_x > 0 {
+            width = scan_x as u32;
+        }
+        if scan_y > 0 {
+            height = scan_y as u32;
+        }
+        if adc_re > 0 {
+            time_bins = adc_re as u32;
+        }
+        if scan_rx > 0 {
+            channels = scan_rx as u32;
+        }
+        if meas_mode == 0 || meas_mode == 1 {
+            width = 1;
+            height = 1;
+        }
+        if meas_mode == 13 {
+            channels = no_of_meas_desc_blocks.max(1) as u32;
+        }
+    }
+
+    // Walk the data-block headers to collect offsets and lengths.
+    let mut block_offsets = Vec::new();
+    let mut block_lengths = Vec::new();
+    let mut next = data_block_offs;
+    for _ in 0..block_count {
+        if next == 0 || next + 20 > file_len {
+            break;
+        }
+        f.seek(SeekFrom::Start(next)).map_err(BioFormatsError::Io)?;
+        let mut bh = [0u8; 20];
+        f.read_exact(&mut bh).map_err(BioFormatsError::Io)?;
+        // blockNo(2), dataOffs(4), nextBlockOffs(4), blockType(2),
+        // measDescBlockNo(2), lblockNo(4), blockLength(4)
+        let next_block_offs = r_u32_le(&bh, 6) as u64;
+        let block_length = r_u32_le(&bh, 16) as u64;
+        let block_data_offset = next + 20; // file pointer after header
+        if block_data_offset >= file_len {
+            break;
+        }
+        block_offsets.push(block_data_offset);
+        block_lengths.push(block_length);
+
+        if next_block_offs == 0 || next_block_offs <= next {
+            break;
+        }
+        next = next_block_offs;
+    }
+
+    Ok(SdtInfo {
+        width: width.max(1),
+        height: height.max(1),
+        time_bins: time_bins.max(1),
+        channels: channels.max(1),
+        timepoints,
+        mcsta_points,
+        incr,
+        block_offsets,
+        block_lengths,
+    })
+}
+
+/// One SDT series corresponds to a single Becker & Hickl data block.
+#[derive(Clone)]
+struct SdtSeries {
+    block: SdtBlock,
+    n_time: u32,
+    meta: ImageMetadata,
+}
+
 pub struct SdtReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     n_time: u32,
     blocks: Vec<SdtBlock>,
+    series: Vec<SdtSeries>,
+    current_series: usize,
 }
 
 impl SdtReader {
@@ -264,6 +451,8 @@ impl SdtReader {
             meta: None,
             n_time: 256,
             blocks: Vec::new(),
+            series: Vec::new(),
+            current_series: 0,
         }
     }
 
@@ -369,89 +558,107 @@ impl FormatReader for SdtReader {
             }
 
             self.set_metadata(nx, ny, adc_re, channels, HashMap::new());
-            self.blocks = vec![SdtBlock {
+            let block = SdtBlock {
                 data_offset,
                 next_block_offset: 0,
+            };
+            self.blocks = vec![block.clone()];
+            self.series = vec![SdtSeries {
+                block,
+                n_time: adc_re,
+                meta: self.meta.clone().unwrap(),
             }];
+            self.current_series = 0;
             self.path = Some(path.to_path_buf());
             return Ok(());
         }
 
-        // BH file header layout used by modern Becker & Hickl SDT files:
-        // revision i16, info_offs i32, info_length i16, setup_offs i32,
-        // setup_length u16, data_block_offs i32, no_of_data_blocks i16,
-        // data_block_length i32, meas_desc_block_offs i32, ...
-        let info_offs = r_u32_le(&hdr, 2) as u64;
-        let info_length = r_u16_le(&hdr, 6) as usize;
-        let setup_offs = r_u32_le(&hdr, 8) as u64;
-        let setup_length = r_u16_le(&hdr, 12) as usize;
-        let data_block_offs = r_u32_le(&hdr, 14) as u64;
-        let no_of_data_blocks = r_i16_le(&hdr, 18).max(0) as usize;
-        let reserved1 = r_u32_le(&hdr, 34) as usize;
-        let block_count = if no_of_data_blocks == 0x7fff {
-            reserved1
-        } else {
-            no_of_data_blocks
-        };
-
-        if setup_offs >= file_len || data_block_offs >= file_len {
-            return Err(BioFormatsError::Format(
-                "SDT header contains offsets beyond end of file".into(),
-            ));
-        }
-
-        // Read setup text block
-        let (nx, ny, adc_re, mut channels) =
-            read_sdt_setup_block(&mut f, setup_offs, setup_length, file_len)?
-                .unwrap_or((1, 1, 256, 1));
-
-        let mut blocks = Vec::new();
-        let mut block_header_offset = data_block_offs;
-        for _ in 0..block_count {
-            if block_header_offset == 0 || block_header_offset + 22 > file_len {
-                break;
-            }
-            f.seek(SeekFrom::Start(block_header_offset))
-                .map_err(BioFormatsError::Io)?;
-            let mut block_hdr = [0u8; 22];
-            f.read_exact(&mut block_hdr).map_err(BioFormatsError::Io)?;
-
-            let data_offset = r_u32_le(&block_hdr, 2) as u64;
-            let next_block_offset = r_u32_le(&block_hdr, 6) as u64;
-            if data_offset == 0 || data_offset >= file_len {
-                return Err(BioFormatsError::Format(
-                    "SDT data block offset is invalid".into(),
-                ));
-            }
-            blocks.push(SdtBlock {
-                data_offset,
-                next_block_offset,
-            });
-
-            if next_block_offset == 0 || next_block_offset <= block_header_offset {
-                break;
-            }
-            block_header_offset = next_block_offset;
-        }
-
-        if blocks.is_empty() {
+        // Modern Becker & Hickl SDT: parse the full SDTInfo header.
+        let info = parse_sdt_info(&mut f, file_len)?;
+        if info.block_offsets.is_empty() {
             return Err(BioFormatsError::Format(
                 "SDT file does not contain readable data blocks".into(),
             ));
         }
-        channels = channels.max(blocks.len() as u32);
 
-        let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-        meta_map.insert(
-            "format".into(),
-            MetadataValue::String("Becker & Hickl SDT".into()),
-        );
-        meta_map.insert("time_channels".into(), MetadataValue::Int(adc_re as i64));
-        meta_map.insert("info_offset".into(), MetadataValue::Int(info_offs as i64));
-        meta_map.insert("info_length".into(), MetadataValue::Int(info_length as i64));
+        // Per SDTReader.java: sizeT = timeBins * timepoints, sizeC = channels.
+        let timepoints = info.timepoints.max(1);
+        let size_t = info.time_bins.saturating_mul(timepoints).max(1);
+        let plane_pixels = info.width as u64 * info.height as u64 * 2;
+        let base_image_count = size_t.saturating_mul(info.channels);
 
-        self.set_metadata(nx, ny, adc_re, channels, meta_map);
-        self.blocks = blocks;
+        // Each data block becomes its own series.
+        let mut series = Vec::with_capacity(info.block_offsets.len());
+        for (i, &offset) in info.block_offsets.iter().enumerate() {
+            let block_len = info.block_lengths.get(i).copied().unwrap_or(0);
+
+            let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
+            meta_map.insert(
+                "format".into(),
+                MetadataValue::String("Becker & Hickl SDT".into()),
+            );
+            meta_map.insert(
+                "time_channels".into(),
+                MetadataValue::Int(info.time_bins as i64),
+            );
+            meta_map.insert("channels".into(), MetadataValue::Int(info.channels as i64));
+            meta_map.insert("incr".into(), MetadataValue::Int(info.incr as i64));
+
+            // SDTReader.java: if the block length matches mcstaPoints * planeSize,
+            // sizeT becomes mcstaPoints for that series.
+            let mut series_t = size_t;
+            let mut image_count = base_image_count;
+            let expected = plane_pixels.saturating_mul(base_image_count as u64);
+            if info.mcsta_points > 0 && block_len != expected {
+                if (info.mcsta_points as u64).saturating_mul(plane_pixels) == block_len {
+                    series_t = info.mcsta_points;
+                    image_count = series_t.saturating_mul(info.channels);
+                }
+            }
+
+            let meta = ImageMetadata {
+                size_x: info.width,
+                size_y: info.height,
+                size_z: 1,
+                size_c: info.channels,
+                size_t: series_t,
+                pixel_type: PixelType::Uint16,
+                bits_per_pixel: 16,
+                image_count,
+                dimension_order: DimensionOrder::XYZTC,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: true,
+                resolution_count: 1,
+                series_metadata: meta_map,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            };
+
+            let next_block_offset = info
+                .block_offsets
+                .get(i + 1)
+                .map(|o| o.saturating_sub(20))
+                .unwrap_or(0);
+
+            series.push(SdtSeries {
+                block: SdtBlock {
+                    data_offset: offset,
+                    next_block_offset,
+                },
+                n_time: info.time_bins,
+                meta,
+            });
+        }
+
+        self.blocks = series.iter().map(|s| s.block.clone()).collect();
+        self.n_time = series[0].n_time;
+        self.meta = Some(series[0].meta.clone());
+        self.series = series;
+        self.current_series = 0;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -460,20 +667,26 @@ impl FormatReader for SdtReader {
         self.path = None;
         self.meta = None;
         self.blocks.clear();
+        self.series.clear();
+        self.current_series = 0;
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        self.series.len().max(1)
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
+        if s >= self.series.len().max(1) {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
         }
+        self.current_series = s;
+        if let Some(series) = self.series.get(s) {
+            self.meta = Some(series.meta.clone());
+            self.n_time = series.n_time;
+        }
+        Ok(())
     }
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
         self.meta.as_ref().expect("set_id not called")
@@ -485,13 +698,20 @@ impl FormatReader for SdtReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         // Each plane is one lifetime-bin slice: size_x × size_y × uint16.
-        let plane_bytes = (meta.size_x * meta.size_y) as usize * 2;
-        let time_bin = plane_index % self.n_time;
-        let channel = (plane_index / self.n_time) as usize;
-        let block_index = channel.min(self.blocks.len().saturating_sub(1));
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        let plane_bytes = size_x * size_y * 2;
+        // Within a series (one data block), planes are laid out channel-major:
+        //   no = channel * times + timeBin   (SDTReader.java)
+        let times = self.n_time as usize;
+        let time_bin = plane_index as usize % times;
+        let channel = plane_index as usize / times;
+
         let block = self
-            .blocks
-            .get(block_index)
+            .series
+            .get(self.current_series)
+            .map(|s| s.block.clone())
+            .or_else(|| self.blocks.first().cloned())
             .ok_or_else(|| BioFormatsError::Format("SDT plane has no data block".into()))?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
@@ -503,22 +723,30 @@ impl FormatReader for SdtReader {
         f.seek(SeekFrom::Start(block.data_offset))
             .map_err(BioFormatsError::Io)?;
 
+        // planeSize for one channel = sizeX * sizeY * times * bpp.
+        let channel_plane_size = (size_x * size_y * times * 2) as u64;
+
         if &signature == b"PK" {
+            // For ZIP blocks we cannot random-seek; decode and skip channels by
+            // reading from the start of the decompressed stream.
             read_sdt_zip_plane(
                 &mut f,
-                block,
-                meta.size_x as usize,
-                meta.size_y as usize,
-                self.n_time as usize,
-                time_bin as usize,
+                &block,
+                size_x,
+                size_y,
+                times,
+                time_bin,
             )
         } else {
+            // Skip to the requested channel within the block.
+            f.seek(SeekFrom::Current(channel as i64 * channel_plane_size as i64))
+                .map_err(BioFormatsError::Io)?;
             read_sdt_raw_plane(
                 &mut f,
-                meta.size_x as usize,
-                meta.size_y as usize,
-                self.n_time as usize,
-                time_bin as usize,
+                size_x,
+                size_y,
+                times,
+                time_bin,
                 plane_bytes,
             )
         }

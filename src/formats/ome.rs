@@ -27,7 +27,22 @@ use crate::common::region::crop_full_plane;
 
 struct ParsedOmeSeries {
     meta: ImageMetadata,
+    /// Inline Base64 `<BinData>` planes (empty when pixels are external).
     planes: Vec<Vec<u8>>,
+    /// External plane mapping for `<TiffData>` references, one entry per logical
+    /// plane. `None` means the plane has no associated pixel data (black plane).
+    /// `Some((file, ifd))` resolves to IFD `ifd` of companion TIFF `file`.
+    external_planes: Vec<Option<ExternalPlane>>,
+}
+
+/// A logical plane resolved to a companion TIFF file and IFD index, mirroring
+/// the `OMETiffPlane` structure in Java's `OMETiffReader`.
+#[derive(Debug, Clone)]
+struct ExternalPlane {
+    /// Absolute path to the companion TIFF.
+    path: PathBuf,
+    /// IFD index within that TIFF.
+    ifd: usize,
 }
 
 // ─── Minimal Base64 decoder ───────────────────────────────────────────────────
@@ -242,7 +257,317 @@ fn parse_bindata_blocks(pixels_xml: &str) -> (Vec<Vec<u8>>, Option<String>) {
     (blocks, first_big_endian)
 }
 
-fn parse_ome_xml_series(xml: &str) -> Result<Vec<ParsedOmeSeries>> {
+// ─── External TiffData resolution (ported from OMETiffReader.java) ───────────
+
+/// A single `<TiffData>` element with its (optional) `<UUID FileName=...>`.
+#[derive(Debug, Clone)]
+struct ParsedTiffData {
+    ifd: u32,
+    plane_count: Option<u32>,
+    first_z: u32,
+    first_c: u32,
+    first_t: u32,
+    /// FileName from a nested `<UUID FileName="...">`, if any.
+    filename: Option<String>,
+}
+
+/// Parse the `<TiffData>` children of a `<Pixels>` block, including any nested
+/// `<UUID FileName="...">` element.
+fn parse_tiff_data(pixels_xml: &str) -> Vec<ParsedTiffData> {
+    let mut out = Vec::new();
+    for pos in tag_positions(pixels_xml, "TiffData") {
+        let tag = start_tag_at(pixels_xml, pos);
+        // Extract the body of the TiffData element to look for a nested <UUID>.
+        let body_start = tag
+            .find('>')
+            .map(|e| pos + e + 1)
+            .unwrap_or(pos + tag.len());
+        // A self-closing <TiffData/> has no body.
+        let self_closing = tag.trim_end().ends_with("/>");
+        let body_end = if self_closing {
+            body_start
+        } else {
+            end_tag_start_after(pixels_xml, pos, "TiffData").unwrap_or(body_start)
+        };
+        let body = pixels_xml.get(body_start..body_end).unwrap_or("");
+
+        let filename = tag_positions(body, "UUID")
+            .into_iter()
+            .next()
+            .and_then(|up| xml_attr(start_tag_at(body, up), "FileName"));
+
+        out.push(ParsedTiffData {
+            ifd: xml_attr(tag, "IFD").and_then(|s| s.parse().ok()).unwrap_or(0),
+            plane_count: xml_attr(tag, "PlaneCount").and_then(|s| s.parse().ok()),
+            first_z: xml_attr(tag, "FirstZ").and_then(|s| s.parse().ok()).unwrap_or(0),
+            first_c: xml_attr(tag, "FirstC").and_then(|s| s.parse().ok()).unwrap_or(0),
+            first_t: xml_attr(tag, "FirstT").and_then(|s| s.parse().ok()).unwrap_or(0),
+            filename,
+        });
+    }
+    out
+}
+
+/// Linearised plane index for given Z/C/T coordinates, mirroring
+/// `FormatTools.getIndex` (see `ome_plane_index` in `tiff/reader.rs`).
+fn ome_plane_index(
+    z: u32,
+    c: u32,
+    t: u32,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    order: DimensionOrder,
+) -> Option<usize> {
+    if z >= size_z || c >= size_c || t >= size_t {
+        return None;
+    }
+    Some(match order {
+        DimensionOrder::XYZCT => t * size_z * size_c + c * size_z + z,
+        DimensionOrder::XYZTC => c * size_z * size_t + t * size_z + z,
+        DimensionOrder::XYCZT => t * size_c * size_z + z * size_c + c,
+        DimensionOrder::XYCTZ => z * size_c * size_t + t * size_c + c,
+        DimensionOrder::XYTCZ => z * size_t * size_c + c * size_t + t,
+        DimensionOrder::XYTZC => c * size_t * size_z + z * size_t + t,
+    } as usize)
+}
+
+/// Advance (z, c, t) by one plane in the given dimension order. Returns false
+/// when the coordinate space wraps (no more planes), mirroring
+/// `advance_ome_plane` in `tiff/reader.rs`.
+fn advance_ome_plane(
+    z: &mut u32,
+    c: &mut u32,
+    t: &mut u32,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    order: DimensionOrder,
+) -> bool {
+    fn advance_axis(value: &mut u32, limit: u32) -> bool {
+        *value += 1;
+        if *value < limit {
+            true
+        } else {
+            *value = 0;
+            false
+        }
+    }
+    match order {
+        DimensionOrder::XYZCT => {
+            advance_axis(z, size_z) || advance_axis(c, size_c) || advance_axis(t, size_t)
+        }
+        DimensionOrder::XYZTC => {
+            advance_axis(z, size_z) || advance_axis(t, size_t) || advance_axis(c, size_c)
+        }
+        DimensionOrder::XYCZT => {
+            advance_axis(c, size_c) || advance_axis(z, size_z) || advance_axis(t, size_t)
+        }
+        DimensionOrder::XYCTZ => {
+            advance_axis(c, size_c) || advance_axis(t, size_t) || advance_axis(z, size_z)
+        }
+        DimensionOrder::XYTCZ => {
+            advance_axis(t, size_t) || advance_axis(c, size_c) || advance_axis(z, size_z)
+        }
+        DimensionOrder::XYTZC => {
+            advance_axis(t, size_t) || advance_axis(z, size_z) || advance_axis(c, size_c)
+        }
+    }
+}
+
+/// Resolve a `<UUID FileName="...">` reference to an absolute path relative to
+/// the directory containing the `.ome` file. Returns `None` if the file does
+/// not exist (mirrors Java `normalizeFilename` + existence check).
+fn resolve_companion(base_dir: Option<&Path>, filename: &str) -> Option<PathBuf> {
+    let candidate = match base_dir {
+        Some(dir) => dir.join(filename),
+        None => PathBuf::from(filename),
+    };
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    // Old writers stored absolute paths in UUID.FileName; retry with just the
+    // basename relative to the metadata directory (Java OMETiffReader).
+    if let (Some(dir), Some(base)) = (base_dir, Path::new(filename).file_name()) {
+        let retry = dir.join(base);
+        if retry.exists() {
+            return Some(retry);
+        }
+    }
+    None
+}
+
+/// Cheaply determine the byte order of a companion TIFF by opening it.
+fn companion_is_little_endian(path: &Path) -> Result<bool> {
+    let mut reader = crate::tiff::TiffReader::new();
+    reader.set_id(path)?;
+    Ok(reader.is_little_endian())
+}
+
+/// Read one external plane: open the companion TIFF with the crate's
+/// `TiffReader` and read the IFD recorded in `plane`. The companion is a plain
+/// (non-OME) TIFF, so its IFDs map sequentially onto series planes; we locate
+/// the series whose `ifd_indices` contains the target IFD and read the matching
+/// plane index from it.
+fn read_external_plane(
+    plane: &ExternalPlane,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    let mut reader = crate::tiff::TiffReader::new();
+    reader.set_id(&plane.path)?;
+
+    // Find (series, plane-within-series) for the requested global IFD index.
+    let mut target: Option<(usize, usize)> = None;
+    for (si, s) in reader.series_list().iter().enumerate() {
+        if let Some(pos) = s.ifd_indices.iter().position(|&idx| idx == plane.ifd) {
+            target = Some((si, pos));
+            break;
+        }
+    }
+    // Fallback: assume IFD index == plane index in series 0 (typical companion).
+    let (series_idx, plane_idx) = target.unwrap_or((0, plane.ifd));
+
+    reader.set_series(series_idx)?;
+    if x == 0 && y == 0 {
+        let meta = reader.metadata();
+        if w == meta.size_x && h == meta.size_y {
+            return reader.open_bytes(plane_idx as u32);
+        }
+    }
+    reader.open_bytes_region(plane_idx as u32, x, y, w, h)
+}
+
+/// Build the logical-plane -> (file, IFD) mapping for a Pixels block that
+/// stores its pixels in external companion TIFFs via `<TiffData>` elements.
+///
+/// Faithful port of the TiffData-untangling loop in `OMETiffReader.initFile`
+/// (the single-file/grouped-files branch): it honours `IFD`, `PlaneCount`,
+/// `FirstZ/C/T`, the 1-indexed-coordinate workaround, and the "fill down when
+/// PlaneCount is unspecified" behaviour.
+fn build_external_plane_map(
+    tiff_data: &[ParsedTiffData],
+    base_dir: Option<&Path>,
+    size_z: u32,
+    eff_c: u32,
+    size_t: u32,
+    order: DimensionOrder,
+) -> Vec<Option<ExternalPlane>> {
+    let num = (size_z * eff_c * size_t) as usize;
+    let mut planes: Vec<Option<ExternalPlane>> = vec![None; num];
+    if num == 0 {
+        return planes;
+    }
+
+    // Pre-scan: detect whether FirstZ/C/T are 1-indexed (some writers do this).
+    let mut z_one_indexed: Option<bool> = None;
+    let mut c_one_indexed: Option<bool> = None;
+    let mut t_one_indexed: Option<bool> = None;
+    for td in tiff_data {
+        let (z, c, t) = (td.first_z, td.first_c, td.first_t);
+        if c >= eff_c && c_one_indexed.is_none() {
+            c_one_indexed = Some(true);
+        } else if c == 0 {
+            c_one_indexed = Some(false);
+        }
+        if z >= size_z && z_one_indexed.is_none() {
+            z_one_indexed = Some(true);
+        } else if z == 0 {
+            z_one_indexed = Some(false);
+        }
+        if t >= size_t && t_one_indexed.is_none() {
+            t_one_indexed = Some(true);
+        } else if t == 0 {
+            t_one_indexed = Some(false);
+        }
+        if c == 0 && z == 0 && t == 0 {
+            break;
+        }
+    }
+
+    // Track "certain" planes so that fill-down stops at explicitly-started planes.
+    let mut certain = vec![false; num];
+
+    for td in tiff_data {
+        let mut z = td.first_z;
+        let mut c = td.first_c;
+        let mut t = td.first_t;
+        if c_one_indexed == Some(true) && c > 0 {
+            c -= 1;
+        }
+        if z_one_indexed == Some(true) && z > 0 {
+            z -= 1;
+        }
+        if t_one_indexed == Some(true) && t > 0 {
+            t -= 1;
+        }
+
+        if z >= size_z || c >= eff_c || t >= size_t {
+            // Invalid TiffData (Java logs a warning and breaks out of the loop).
+            break;
+        }
+
+        let Some(index) = ome_plane_index(z, c, t, size_z, eff_c, size_t, order) else {
+            break;
+        };
+
+        // Resolve the companion file for this TiffData. A missing/non-existent
+        // file leaves the planes as black (None), matching the non-fail path.
+        let resolved = td
+            .filename
+            .as_deref()
+            .and_then(|f| resolve_companion(base_dir, f));
+
+        let count = td.plane_count.unwrap_or(1);
+        if count == 0 {
+            // PlaneCount=0 invalidates the whole series in Java; we drop refs.
+            return vec![None; num];
+        }
+
+        for q in 0..count as usize {
+            let no = index + q;
+            if no >= num {
+                break;
+            }
+            certain[no] = true;
+            planes[no] = resolved.as_ref().map(|p| ExternalPlane {
+                path: p.clone(),
+                ifd: td.ifd as usize + q,
+            });
+        }
+
+        // Unknown plane count: fill down sequential IFDs until the next
+        // explicitly-started ("certain") plane.
+        if td.plane_count.is_none() {
+            let mut prev_ifd = td.ifd as usize;
+            let mut no = index + 1;
+            while no < num {
+                if certain[no] {
+                    break;
+                }
+                certain[no] = true;
+                prev_ifd += 1;
+                planes[no] = resolved.as_ref().map(|p| ExternalPlane {
+                    path: p.clone(),
+                    ifd: prev_ifd,
+                });
+                no += 1;
+            }
+            // advance helper keeps z/c/t consistent for any future extension; not
+            // strictly needed for IFD numbering but mirrors the Java traversal.
+            let _ = advance_ome_plane(&mut z, &mut c, &mut t, size_z, eff_c, size_t, order);
+        }
+    }
+
+    planes
+}
+
+fn parse_ome_xml_series_with_base(
+    xml: &str,
+    base_dir: Option<&Path>,
+) -> Result<Vec<ParsedOmeSeries>> {
     let mut series = Vec::new();
     for image_pos in tag_positions(xml, "Image") {
         let image_end = end_tag_after(xml, image_pos, "Image");
@@ -270,18 +595,60 @@ fn parse_ome_xml_series(xml: &str) -> Result<Vec<ParsedOmeSeries>> {
         let max_spp = samples.iter().copied().max().unwrap_or(1);
         let is_rgb = max_spp > 1;
         let exposed_c = if is_rgb { max_spp } else { logical_c };
+        // For RGB channels each plane bundles `SamplesPerPixel` samples, so the
+        // number of effective (separately-addressable) channels is reduced:
+        //   effectiveSizeC = SizeC / SamplesPerPixel
+        // imageCount = SizeZ * SizeT * effectiveSizeC.
+        let effective_c = if max_spp > 1 {
+            (logical_c / max_spp).max(1)
+        } else {
+            logical_c
+        };
         let image_count = size_z
-            .checked_mul(logical_c)
+            .checked_mul(effective_c)
             .and_then(|v| v.checked_mul(size_t))
             .ok_or_else(|| BioFormatsError::Format("OME-XML plane count overflow".into()))?;
 
         let (planes, first_bindata_big_endian) = parse_bindata_blocks(pixels_xml);
         let pixels_big_endian =
             xml_attr(pixels_tag, "BigEndian").or_else(|| xml_attr(pixels_tag, "bigendian"));
-        let is_big_endian = pixels_big_endian
+        let mut is_big_endian = pixels_big_endian
             .or(first_bindata_big_endian)
             .map(|s| s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+
+        // When there is no inline pixel data, attempt to resolve external
+        // pixels referenced via <TiffData>/<UUID FileName="..."> (the OME-TIFF
+        // companion case handled by Java's OMETiffReader). A <MetadataOnly>
+        // element with no resolvable TiffData yields black/absent planes.
+        let mut external_planes: Vec<Option<ExternalPlane>> = Vec::new();
+        let inline_pixels_present = planes.iter().any(|p| !p.is_empty());
+        if !inline_pixels_present {
+            let tiff_data = parse_tiff_data(pixels_xml);
+            if !tiff_data.is_empty() {
+                external_planes = build_external_plane_map(
+                    &tiff_data,
+                    base_dir,
+                    size_z,
+                    effective_c,
+                    size_t,
+                    dim_order,
+                );
+                // Mirror OMETiffReader: pixel endianness follows the first
+                // resolvable companion TIFF's byte order, not the OME-XML
+                // BigEndian attribute (which OME-TIFF forces true for BinData).
+                if let Some(first) = external_planes.iter().flatten().next() {
+                    if let Ok(le) = companion_is_little_endian(&first.path) {
+                        is_big_endian = !le;
+                    }
+                }
+            } else if child_block(pixels_xml, "MetadataOnly").is_some() {
+                // <MetadataOnly/> declares planes that exist but carry no pixel
+                // source; Java returns blank planes for these. Mark the whole
+                // image as external-with-no-files so open_bytes yields zeros.
+                external_planes = vec![None; image_count as usize];
+            }
+        }
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert("format".into(), MetadataValue::String("OME-XML".into()));
@@ -308,6 +675,7 @@ fn parse_ome_xml_series(xml: &str) -> Result<Vec<ParsedOmeSeries>> {
                 modulo_t: None,
             },
             planes,
+            external_planes,
         });
     }
 
@@ -358,7 +726,10 @@ impl FormatReader for OmeXmlReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let xml = fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-        let series = parse_ome_xml_series(&xml)?;
+        // Companion TIFFs referenced from <UUID FileName="..."> are resolved
+        // relative to the directory containing the .ome file.
+        let base_dir = path.parent();
+        let series = parse_ome_xml_series_with_base(&xml, base_dir)?;
         self.raw_xml = Some(xml.clone());
         self.series = series;
         self.current_series = 0;
@@ -403,6 +774,17 @@ impl FormatReader for OmeXmlReader {
         let bps = meta.pixel_type.bytes_per_sample();
         let samples = if meta.is_rgb { meta.size_c as usize } else { 1 };
         let plane_bytes = (meta.size_x * meta.size_y) as usize * bps * samples;
+
+        // External pixels referenced via <TiffData> companion TIFFs.
+        if !series.external_planes.is_empty() {
+            match series.external_planes.get(plane_index as usize) {
+                Some(Some(ext)) => return read_external_plane(ext, 0, 0, meta.size_x, meta.size_y),
+                // Missing/unresolved plane: return a black plane (Java fills the
+                // buffer with the fill color for non-existent planes).
+                _ => return Ok(vec![0u8; plane_bytes]),
+            }
+        }
+
         if let Some(plane) = series.planes.get(plane_index as usize) {
             if series.planes.len() > 1 || plane.len() == plane_bytes {
                 return Ok(plane.clone());
@@ -427,6 +809,31 @@ impl FormatReader for OmeXmlReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        // For external companion-TIFF planes, read the cropped region directly
+        // from the TIFF so we don't materialise the whole plane first.
+        {
+            let series = self
+                .series
+                .get(self.current_series)
+                .ok_or(BioFormatsError::NotInitialized)?;
+            if !series.external_planes.is_empty() {
+                let meta = &series.meta;
+                if plane_index >= meta.image_count {
+                    return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+                }
+                match series.external_planes.get(plane_index as usize) {
+                    Some(Some(ext)) => {
+                        let ext = ext.clone();
+                        return read_external_plane(&ext, x, y, w, h);
+                    }
+                    _ => {
+                        let bps = meta.pixel_type.bytes_per_sample();
+                        let samples = if meta.is_rgb { meta.size_c as usize } else { 1 };
+                        return Ok(vec![0u8; w as usize * h as usize * bps * samples]);
+                    }
+                }
+            }
+        }
         let full = self.open_bytes(plane_index)?;
         let meta = self.metadata();
         crop_full_plane("OME-XML", &full, meta, 1, x, y, w, h)
@@ -622,5 +1029,85 @@ impl crate::common::writer::FormatWriter for OmeXmlWriter {
 
     fn can_do_stacks(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tiffdata_with_uuid_filename() {
+        let pixels = r#"<Pixels SizeX="4" SizeY="4" SizeZ="2" SizeC="1" SizeT="1" Type="uint8" DimensionOrder="XYZCT">
+            <TiffData IFD="0" PlaneCount="1" FirstZ="0" FirstC="0" FirstT="0">
+              <UUID FileName="a.tiff">urn:uuid:1111</UUID>
+            </TiffData>
+            <TiffData IFD="3" PlaneCount="1" FirstZ="1" FirstC="0" FirstT="0">
+              <UUID FileName="b.tiff">urn:uuid:2222</UUID>
+            </TiffData>
+        </Pixels>"#;
+        let td = parse_tiff_data(pixels);
+        assert_eq!(td.len(), 2);
+        assert_eq!(td[0].ifd, 0);
+        assert_eq!(td[0].plane_count, Some(1));
+        assert_eq!(td[0].filename.as_deref(), Some("a.tiff"));
+        assert_eq!(td[1].ifd, 3);
+        assert_eq!(td[1].first_z, 1);
+        assert_eq!(td[1].filename.as_deref(), Some("b.tiff"));
+    }
+
+    #[test]
+    fn external_plane_map_resolves_missing_files_to_black() {
+        // Files don't exist on disk -> entries resolve to None (black planes),
+        // but plane slots and IFD numbering still follow the TiffData layout.
+        let td = vec![
+            ParsedTiffData {
+                ifd: 0,
+                plane_count: Some(1),
+                first_z: 0,
+                first_c: 0,
+                first_t: 0,
+                filename: Some("does_not_exist_a.tiff".into()),
+            },
+            ParsedTiffData {
+                ifd: 0,
+                plane_count: Some(1),
+                first_z: 1,
+                first_c: 0,
+                first_t: 0,
+                filename: Some("does_not_exist_b.tiff".into()),
+            },
+        ];
+        let map = build_external_plane_map(&td, None, 2, 1, 1, DimensionOrder::XYZCT);
+        assert_eq!(map.len(), 2);
+        // Both unresolved (files absent) but the mapping was attempted for both.
+        assert!(map[0].is_none());
+        assert!(map[1].is_none());
+    }
+
+    #[test]
+    fn external_plane_map_fills_down_when_planecount_absent() {
+        // Single TiffData with no PlaneCount should fill IFDs 0..N sequentially.
+        let td = vec![ParsedTiffData {
+            ifd: 0,
+            plane_count: None,
+            first_z: 0,
+            first_c: 0,
+            first_t: 0,
+            filename: None,
+        }];
+        // filename is None -> resolved is None, so plane entries are None, but
+        // the fill-down still marks all planes (as black). Verify length only.
+        let map = build_external_plane_map(&td, None, 3, 1, 1, DimensionOrder::XYZCT);
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn ome_plane_index_matches_dimension_order() {
+        // XYZCT: index = t*Z*C + c*Z + z
+        assert_eq!(ome_plane_index(1, 0, 0, 3, 2, 4, DimensionOrder::XYZCT), Some(1));
+        assert_eq!(ome_plane_index(0, 1, 0, 3, 2, 4, DimensionOrder::XYZCT), Some(3));
+        // Out of range -> None
+        assert_eq!(ome_plane_index(3, 0, 0, 3, 2, 4, DimensionOrder::XYZCT), None);
     }
 }

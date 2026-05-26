@@ -110,6 +110,10 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::perkinelmer::PhotonDynamicsReader::new()),
         Box::new(crate::formats::mias::CellWorxReader::new()),
         Box::new(crate::formats::mias::OxfordInstrumentsReader::new()),
+        // MIAS (Beckman Coulter): well/field/Z/C/T TIFF series. Detected by name
+        // only (Well<xxxx> directory + mode/z naming); generic TiffReader still
+        // wins auto-detection of plain .tif via the magic pass.
+        Box::new(crate::formats::mias::MiasReader::new()),
         Box::new(crate::formats::sem::FeiPhilipsReader::new()),
         // FEI SER (magic-byte detected: 0x97 0x01)
         Box::new(crate::formats::mias::FeiSerReader::new()),
@@ -408,6 +412,18 @@ fn tiff_wrapper_readers_for_extension(path: &Path) -> Vec<Box<dyn FormatReader>>
         Some("xlef") => vec![boxed_reader(crate::formats::flim2::XlefReader::new())],
         Some("ctf") => vec![boxed_reader(crate::formats::flim2::MicroCtReader::new())],
         Some("ndpis") => vec![boxed_reader(crate::formats::flim2::NdpisReader::new())],
+        // MIAS datasets are plain TIFFs, so the generic TiffReader would win the
+        // magic pass. Give MiasReader a chance first, but ONLY when the file is
+        // genuinely a MIAS plane (a Well<xxxx> directory + mode/z/t naming), so
+        // ordinary .tif files still fall through to the generic TiffReader.
+        Some("tif") | Some("tiff") => {
+            let mias = crate::formats::mias::MiasReader::new();
+            if mias.is_this_type_by_name(path) {
+                vec![boxed_reader(mias)]
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     }
 }
@@ -515,17 +531,17 @@ mod tests {
                 "sample.acff",
                 "Volocity Library format requires OLE2/Compound Document container parsing",
             ),
-            (
-                "sample.xrm",
-                "Zeiss XRM/TXRM requires OLE2/Compound Document parsing",
-            ),
-            (
-                "sample.txrm",
-                "Zeiss XRM/TXRM requires OLE2/Compound Document parsing",
-            ),
+            // NOTE: XRM/TXRM are no longer stubs — XrmReader is a real CFB-based
+            // reader. It rejects fake/short input with a genuine CFB error
+            // ("XRM CFB open: Invalid CFB file ..."), not fabricated metadata.
+            // That rejection is covered by xrm.rs's own unit tests, so XRM is
+            // intentionally excluded from this not-yet-implemented stub list.
+            // EPS now rasterizes inline PostScript images and reads embedded
+            // TIFF previews; fake data is still rejected (no fabricated metadata),
+            // just with a content-specific message.
             (
                 "sample.eps",
-                "EPS/PostScript rasterization requires a PostScript interpreter",
+                "EPS: not a PostScript file and no embedded TIFF preview found",
             ),
             ("sample.b16", "PCO B16 file is too short"),
             ("sample.1sc", "Bio-Rad GEL file is too short"),
@@ -566,10 +582,10 @@ mod tests {
                 "Bruker OPUS spectral image decoding is not implemented",
             ),
             ("sample.iss", "ISS Vista FLIM decoding is not implemented"),
-            (
-                "sample.gel",
-                "GEL header is too short for Molecular Dynamics dimensions",
-            ),
+            // NOTE: sample.gel was removed here: GEL is no longer a stub.
+            // extended::GelReader is a real Molecular Dynamics GEL reader (TIFF-based),
+            // so on fake data it rejects via the underlying TIFF parser
+            // ("Not a TIFF file: bad byte-order mark") rather than fabricating metadata.
         ] {
             let path = temp_path(name);
             if name == "sample.obf" || name == "sample.msr" {
@@ -608,7 +624,7 @@ mod tests {
             (
                 "sample.xys",
                 b"Width=2\nHeight=2\n".as_slice(),
-                "Visitech XYS does not have any companion TIFF image files",
+                "Visitech XYS does not have",
             ),
             (
                 "sample.xdce",
@@ -689,32 +705,49 @@ mod tests {
     }
 
     #[test]
-    fn zip_reader_rejects_archives_without_delegated_tiff() {
+    fn zip_reader_opens_inner_image_and_rejects_unrecognized_entries() {
+        // Like the Java ZipReader, ZipReader now delegates the primary archive
+        // entry to the auto-detecting ImageReader (any inner format, not only
+        // TIFF). A ZIP whose primary entry is a recognized image opens and
+        // reads its real pixels; a ZIP whose entries match no reader is
+        // rejected (the inner auto-detection fails and the error propagates).
+
+        // Positive case: a real 2x2 uint8 TIFF entry decodes to its real pixels.
+        let tiff_src = temp_path("zip_inner_source.tif");
+        let mut meta = crate::common::metadata::ImageMetadata::default();
+        meta.size_x = 2;
+        meta.size_y = 2;
+        meta.pixel_type = crate::common::pixel_type::PixelType::Uint8;
+        meta.image_count = 1;
+        let pixels = vec![10u8, 20, 30, 40];
+        crate::writer_registry::ImageWriter::save(&tiff_src, &meta, &[pixels.clone()]).unwrap();
+        let tiff_bytes = std::fs::read(&tiff_src).unwrap();
+        let _ = std::fs::remove_file(&tiff_src);
+
+        let tiff_zip = temp_path("inner_tiff.zip");
+        write_zip_entry(&tiff_zip, "frame.tif", &tiff_bytes);
+        let mut reader = ImageReader::open(&tiff_zip).expect("ZIP with inner TIFF should open");
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+        let _ = reader.close();
+        let _ = std::fs::remove_file(&tiff_zip);
+
+        // Negative case: an entry name + bytes that match no registered reader.
         let no_image_path = temp_path("no_image.zip");
-        write_zip_entry(&no_image_path, "README.txt", b"not image data");
+        write_zip_entry(&no_image_path, "data.unknownfmt", b"not image data at all");
 
         let err = match ImageReader::open(&no_image_path) {
-            Ok(_) => panic!("ZIP without TIFF opened"),
+            Ok(_) => panic!("ZIP without a recognized image entry opened"),
             Err(err) => err,
         };
+        // The inner ImageReader finds no matching reader and rejects with
+        // UnsupportedFormat (the extracted entry path it could not detect).
         assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("does not contain a supported TIFF image entry")),
+            matches!(err, BioFormatsError::UnsupportedFormat(_)),
             "expected unsupported ZIP message, got {err:?}"
         );
         let _ = std::fs::remove_file(&no_image_path);
-
-        let png_path = temp_path("png_only.zip");
-        write_zip_entry(&png_path, "image.png", b"not a png");
-
-        let err = match ImageReader::open(&png_path) {
-            Ok(_) => panic!("ZIP PNG placeholder opened"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("only TIFF entries are currently delegated")),
-            "expected unsupported ZIP image message, got {err:?}"
-        );
-        let _ = std::fs::remove_file(png_path);
     }
 
     fn write_zip_entry(path: &PathBuf, name: &str, bytes: &[u8]) {

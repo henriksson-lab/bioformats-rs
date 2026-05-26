@@ -115,10 +115,33 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     let depth = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
     let color_mode = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
 
-    // Skip Color Mode Data section
+    // Color Mode Data section. For palette images (mode 2) this holds a
+    // 768-byte (3 x 256) RGB lookup table, stored plane-by-plane.
     let cm_len = read_u32_be(&mut r).map_err(BioFormatsError::Io)? as u64;
-    r.seek(SeekFrom::Current(cm_len as i64))
-        .map_err(BioFormatsError::Io)?;
+    let mut lookup_table = None;
+    if cm_len != 0 {
+        if color_mode == 2 && cm_len >= 768 {
+            let mut lut = [0u8; 768];
+            r.read_exact(&mut lut).map_err(BioFormatsError::Io)?;
+            let mut red = vec![0u16; 256];
+            let mut green = vec![0u16; 256];
+            let mut blue = vec![0u16; 256];
+            for i in 0..256 {
+                red[i] = lut[i] as u16;
+                green[i] = lut[256 + i] as u16;
+                blue[i] = lut[512 + i] as u16;
+            }
+            lookup_table = Some(crate::common::metadata::LookupTable { red, green, blue });
+            // Seek past any remaining color-mode data.
+            if cm_len > 768 {
+                r.seek(SeekFrom::Current((cm_len - 768) as i64))
+                    .map_err(BioFormatsError::Io)?;
+            }
+        } else {
+            r.seek(SeekFrom::Current(cm_len as i64))
+                .map_err(BioFormatsError::Io)?;
+        }
+    }
 
     // Skip Image Resources section
     let ir_len = read_u32_be(&mut r).map_err(BioFormatsError::Io)? as u64;
@@ -183,25 +206,38 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         raw
     };
 
-    // Convert from planar to interleaved
-    let is_rgb = color_mode == 3;
-    let output_channels = if is_rgb { 3usize } else { channels as usize };
-    let pixels = if is_rgb && channels >= 3 {
+    // Color-mode semantics per the Java PSDReader:
+    //   RGB(3) / CMYK(4) -> rgb = true
+    //   palette(2)       -> indexed
+    // sizeC keeps the full channel count (RGB+alpha=4, CMYK=4, Lab=3, ...).
+    let is_rgb = color_mode == 3 || color_mode == 4;
+    let is_indexed = color_mode == 2 && lookup_table.is_some();
+    let output_channels = channels as usize;
+
+    // Convert from planar to interleaved, preserving every channel so that
+    // alpha (RGBA), CMYK, and Lab data are not dropped.
+    let pixels = if output_channels > 1 {
         let mut interleaved =
-            Vec::with_capacity(width as usize * height as usize * 3 * bytes_per_sample);
+            Vec::with_capacity(width as usize * height as usize * output_channels * bytes_per_sample);
         for i in 0..(width as usize * height as usize) {
-            for c in 0..3usize {
+            for c in 0..output_channels {
                 let src_off = c * plane_bytes + i * bytes_per_sample;
-                interleaved.extend_from_slice(&pixel_data[src_off..src_off + bytes_per_sample]);
+                if src_off + bytes_per_sample <= pixel_data.len() {
+                    interleaved.extend_from_slice(&pixel_data[src_off..src_off + bytes_per_sample]);
+                } else {
+                    interleaved.extend(std::iter::repeat(0u8).take(bytes_per_sample));
+                }
             }
         }
         interleaved
     } else {
-        // Grayscale or other: return first channel
-        pixel_data[..plane_bytes].to_vec()
+        pixel_data[..plane_bytes.min(pixel_data.len())].to_vec()
     };
 
     let pixel_type = pixel_type_from_depth(depth);
+
+    // Java: imageCount = sizeC / (isRGB ? 3 : 1).
+    let image_count = (output_channels as u32 / if is_rgb { 3 } else { 1 }).max(1);
 
     let meta = ImageMetadata {
         size_x: width,
@@ -211,15 +247,15 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         size_t: 1,
         pixel_type,
         bits_per_pixel: depth as u8,
-        image_count: 1,
+        image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,
-        is_interleaved: is_rgb,
-        is_indexed: false,
+        is_interleaved: output_channels > 1,
+        is_indexed,
         is_little_endian: false, // PSD is big-endian
         resolution_count: 1,
         series_metadata: HashMap::new(),
-        lookup_table: None,
+        lookup_table,
         modulo_z: None,
         modulo_c: None,
         modulo_t: None,

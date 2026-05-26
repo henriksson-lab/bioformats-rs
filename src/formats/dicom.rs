@@ -5,9 +5,11 @@
 //! - Implicit VR Little Endian (legacy)
 //! - Unencapsulated (raw) pixel data
 //! - JPEG 2000 encapsulated pixel data
+//! - JPEG baseline / lossless encapsulated pixel data (via the shared JPEG
+//!   decoder)
+//! - RLE (run-length encoding, PS3.5 Annex G) encapsulated pixel data
 //!
-//! Does NOT support most compressed transfer syntaxes (JPEG baseline/lossless,
-//! RLE, etc.).
+//! Does NOT support Deflated Explicit VR Little Endian transfer syntax.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -73,6 +75,10 @@ struct DicomAttrs {
     little_endian: bool,
     explicit_vr: bool,
     encapsulated: bool,
+    /// Window Width (0028,1051); -1 when absent/empty (DicomReader.maxPixelRange).
+    max_pixel_range: i32,
+    /// Window Center (0028,1050); -1 when absent/empty (DicomReader.centerPixelValue).
+    center_pixel_value: i32,
     extra: HashMap<String, String>,
 }
 
@@ -209,6 +215,8 @@ fn dicom_tag_info(group: u16, element: u16) -> Option<(&'static str, &'static st
         (0x0028, 0x0101) => ("BitsStored", "US"),
         (0x0028, 0x0102) => ("HighBit", "US"),
         (0x0028, 0x0103) => ("PixelRepresentation", "US"),
+        (0x0028, 0x1050) => ("WindowCenter", "DS"),
+        (0x0028, 0x1051) => ("WindowWidth", "DS"),
         (0x0028, 0x1101) => ("RedPaletteColorLookupTableDescriptor", "US"),
         (0x0028, 0x1102) => ("GreenPaletteColorLookupTableDescriptor", "US"),
         (0x0028, 0x1103) => ("BluePaletteColorLookupTableDescriptor", "US"),
@@ -566,6 +574,11 @@ fn parse_encapsulated_pixel_data(
 
 fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
     let f = File::open(path).map_err(BioFormatsError::Io)?;
+    // File length is used to bound element-value allocations: a corrupt or
+    // malicious `length` field must never trigger a multi-GB allocation. The
+    // Java reader streams/skips through the file, so an element value can never
+    // exceed the bytes physically present.
+    let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
     let mut r = BufReader::new(f);
 
     let mut attrs = DicomAttrs {
@@ -614,6 +627,14 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
             read_u16_le(&mut r).map_err(BioFormatsError::Io)? as u64
         };
 
+        // Guard against an implausible length (corrupt header): the value
+        // cannot extend past the end of the file.
+        let cur = r.stream_position().map_err(BioFormatsError::Io)?;
+        if length > file_len.saturating_sub(cur) {
+            return Err(BioFormatsError::InvalidData(
+                "DICOM meta element length exceeds file size".into(),
+            ));
+        }
         let mut value = vec![0u8; length as usize];
         r.read_exact(&mut value).map_err(BioFormatsError::Io)?;
 
@@ -718,6 +739,14 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
 
         // Read value bytes for other elements
         let value_start = r.stream_position().map_err(BioFormatsError::Io)?;
+        // Guard against an implausible length (corrupt element): the value
+        // cannot extend past the end of the file. This prevents a huge
+        // `vec![0u8; length]` allocation on malformed input.
+        if length > file_len.saturating_sub(value_start) {
+            return Err(BioFormatsError::InvalidData(
+                "DICOM element length exceeds file size".into(),
+            ));
+        }
         let mut value = vec![0u8; length as usize];
         r.read_exact(&mut value).map_err(BioFormatsError::Io)?;
         store_dicom_metadata(&mut attrs, &vr, group, element, &value);
@@ -750,6 +779,26 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
             (0x0028, 0x0100) => attrs.bits_allocated = read_u16(&value),
             (0x0028, 0x0101) => attrs.bits_stored = read_u16(&value),
             (0x0028, 0x0103) => attrs.pixel_representation = read_u16(&value),
+            (0x0028, 0x1050) => {
+                // Window Center (DS). DicomReader.centerPixelValue: -1 when empty.
+                let s = ascii_trim(&value);
+                let first = s.split('\\').next().unwrap_or("").trim();
+                attrs.center_pixel_value = if first.is_empty() {
+                    -1
+                } else {
+                    first.parse::<f64>().map(|f| f as i32).unwrap_or(-1)
+                };
+            }
+            (0x0028, 0x1051) => {
+                // Window Width (DS). DicomReader.maxPixelRange: -1 when empty.
+                let s = ascii_trim(&value);
+                let first = s.split('\\').next().unwrap_or("").trim();
+                attrs.max_pixel_range = if first.is_empty() {
+                    -1
+                } else {
+                    first.parse::<f64>().map(|f| f as i32).unwrap_or(-1)
+                };
+            }
             (0x0028, 0x1101) => {
                 palette_descriptors[0] = parse_lut_descriptor(&value, attrs.little_endian)
             }
@@ -802,6 +851,238 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
     };
 
     Ok(attrs)
+}
+
+// ── Multi-series companion-file grouping (DicomReader.makeFileList / ──────────
+//    scanDirectory / addFileToList) ────────────────────────────────────────────
+//
+// The Java DicomReader, when file grouping is enabled (the default), scans the
+// directory of the selected file and groups together every DICOM file that
+// belongs to the same study/series. Each resulting group is exposed as a
+// separate series. Files are grouped by Series Number (0020,0011); a candidate
+// is admitted to the group only when it shares the original file's
+// Acquisition Date (0008,0022), its Series Number matches, the leading
+// components of the SOP Instance UID (0008,0018) match (all but the trailing
+// two), the specimen matches, and the Acquisition Time (0008,0032) is within
+// 150 s. Files whose pixel dimensions differ from the original land in a
+// separate (incremented) series, mirroring Java's resolution split.
+
+/// Grouping key extracted from a parsed DICOM file, mirroring the fields read
+/// by `DicomReader.addFileToList`.
+#[derive(Clone, Default)]
+struct DicomGroupKey {
+    date: Option<String>,
+    time: Option<String>,
+    instance: Option<i64>,
+    series: i32,
+    instance_uid: Option<String>,
+    rows: u16,
+    columns: u16,
+}
+
+fn first_value(s: &str) -> String {
+    s.split('\\').next().unwrap_or("").trim().to_string()
+}
+
+fn group_key_from_attrs(a: &DicomAttrs) -> DicomGroupKey {
+    let get = |tag: &str| a.extra.get(tag).map(|v| first_value(v));
+    let date = get("AcquisitionDate").filter(|s| !s.is_empty());
+    let time = get("AcquisitionTime").filter(|s| !s.is_empty());
+    let instance = get("InstanceNumber")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|f| f as i64);
+    let series = get("SeriesNumber")
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|f| f as i32)
+        .unwrap_or(0);
+    let instance_uid = get("SOPInstanceUID").filter(|s| !s.is_empty());
+    DicomGroupKey {
+        date,
+        time,
+        instance,
+        series,
+        instance_uid,
+        rows: a.rows,
+        columns: a.columns,
+    }
+}
+
+/// Convert a DICOM TM value (HHMMSS.FFFFFF, optionally with ':' separators or a
+/// +/- timezone) to microseconds. Mirrors DicomReader.getTimestampMicroseconds.
+fn timestamp_microseconds(v: Option<&str>) -> i128 {
+    let Some(v) = v else { return 0 };
+    let mut v = v.trim().replace(':', "");
+    if let Some(p) = v.find('+') {
+        v.truncate(p);
+    }
+    if let Some(p) = v.find('-') {
+        v.truncate(p);
+    }
+    if v.is_empty() {
+        return 0;
+    }
+    let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let hours = digits.get(0..2).and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+    let mut total = hours * 60 * 60;
+    if let Some(m) = digits.get(2..4).and_then(|s| s.parse::<i128>().ok()) {
+        total += m * 60;
+    }
+    if let Some(s) = digits.get(4..6).and_then(|s| s.parse::<i128>().ok()) {
+        total += s;
+    }
+    total *= 1_000_000;
+    if let Some(dot) = v.find('.') {
+        if let Ok(frac) = v[dot + 1..].parse::<i128>() {
+            total += frac;
+        }
+    }
+    total
+}
+
+/// UID prefix match: all but the trailing two dot-separated components must be
+/// equal (DicomReader.addFileToList).
+fn instance_uid_prefix_matches(original: &Option<String>, candidate: &Option<String>) -> bool {
+    match (original, candidate) {
+        (Some(o), Some(c)) => {
+            let ou: Vec<&str> = o.split('.').collect();
+            let cu: Vec<&str> = c.split('.').collect();
+            let count = ou.len().min(cu.len()).saturating_sub(2);
+            (0..count).all(|i| ou[i] == cu[i])
+        }
+        (None, None) => true,
+        // Exactly one UID present → not a match.
+        _ => false,
+    }
+}
+
+/// Decide whether `candidate` belongs in the same dataset as `original`, and if
+/// so which series index it lands in. Returns `None` when the file should not be
+/// grouped. Mirrors the admission test in DicomReader.addFileToList.
+fn grouped_series(original: &DicomGroupKey, candidate: &DicomGroupKey) -> Option<i32> {
+    // Must have date/time/instance, same series number, and matching UID prefix.
+    if candidate.date.is_none() || candidate.time.is_none() || candidate.instance.is_none() {
+        return None;
+    }
+    if candidate.series != original.series {
+        return None;
+    }
+    if !instance_uid_prefix_matches(&original.instance_uid, &candidate.instance_uid) {
+        return None;
+    }
+
+    let mut file_series = candidate.series;
+    // Differing dimensions → separate (resolution) series.
+    if candidate.columns != original.columns || candidate.rows != original.rows {
+        file_series += 1;
+    }
+
+    let stamp = timestamp_microseconds(candidate.time.as_deref());
+    let timestamp = timestamp_microseconds(original.time.as_deref());
+    let time_difference = (stamp - timestamp).abs();
+
+    if candidate.date == original.date && time_difference < 150_000_000 {
+        Some(file_series)
+    } else {
+        None
+    }
+}
+
+/// Scan the directory of `path` and build the series→files grouping, following
+/// DicomReader.makeFileList. The selected file always anchors its own series
+/// (keyed by its Series Number). Returns a map series-number → ordered file
+/// list, where each file is placed at its (InstanceNumber - 1) position.
+fn build_dicom_file_list(
+    path: &Path,
+    original: &DicomGroupKey,
+) -> std::collections::BTreeMap<i32, Vec<PathBuf>> {
+    use std::collections::BTreeMap;
+
+    let mut file_list: BTreeMap<i32, Vec<Option<PathBuf>>> = BTreeMap::new();
+
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    // Seed the original file at its instance position within its own series.
+    let instance_number = original.instance.unwrap_or(1).max(1) - 1;
+    let series_files = file_list.entry(original.series).or_default();
+    if instance_number == 0 {
+        series_files.push(Some(abs.clone()));
+    } else {
+        while (instance_number as usize) > series_files.len() {
+            series_files.push(None);
+        }
+        series_files.push(Some(abs.clone()));
+    }
+
+    if let Some(dir) = path.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut files: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file())
+                .collect();
+            files.sort();
+
+            let reader = DicomReader::new();
+            for file in files {
+                let file_abs =
+                    std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                if file_abs == abs {
+                    continue;
+                }
+                // Must look like DICOM.
+                let header = match read_dicom_probe_header(&file) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                if !reader.is_this_type_by_bytes(&header) {
+                    continue;
+                }
+                let attrs = match parse_dicom(&file) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                let candidate = group_key_from_attrs(&attrs);
+                let Some(series) = grouped_series(original, &candidate) else {
+                    continue;
+                };
+
+                let position = (candidate.instance.unwrap_or(1).max(1) - 1).max(0) as usize;
+                let bucket = file_list.entry(series).or_default();
+                if position < bucket.len() {
+                    let mut pos = position;
+                    while pos < bucket.len() && bucket[pos].is_some() {
+                        pos += 1;
+                    }
+                    if pos < bucket.len() {
+                        bucket[pos] = Some(file_abs.clone());
+                    } else if !bucket.iter().any(|f| f.as_deref() == Some(file_abs.as_path())) {
+                        bucket.push(Some(file_abs.clone()));
+                    }
+                } else if !bucket.iter().any(|f| f.as_deref() == Some(file_abs.as_path())) {
+                    while position > bucket.len() {
+                        bucket.push(None);
+                    }
+                    bucket.push(Some(file_abs.clone()));
+                }
+            }
+        }
+    }
+
+    // Drop the null placeholders (DicomReader.makeFileList removes them).
+    file_list
+        .into_iter()
+        .map(|(series, files)| (series, files.into_iter().flatten().collect::<Vec<_>>()))
+        .filter(|(_, files)| !files.is_empty())
+        .collect()
+}
+
+/// Read the first 132 bytes of a candidate file for the DICM magic probe.
+fn read_dicom_probe_header(path: &Path) -> Option<Vec<u8>> {
+    let mut f = File::open(path).ok()?;
+    let mut buf = vec![0u8; 132];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    Some(buf)
 }
 
 fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
@@ -1067,31 +1348,54 @@ fn normalize_native_pixels(
     }
 }
 
-fn invert_monochrome1(buf: &mut [u8], meta: &ImageMetadata) {
-    let max_value = match meta.bits_per_pixel {
-        0 => return,
-        1..=7 => (1u32 << meta.bits_per_pixel) - 1,
-        8 => u8::MAX as u32,
-        9..=15 => (1u32 << meta.bits_per_pixel) - 1,
-        16 => u16::MAX as u32,
-        _ => return,
-    };
+/// Maximum sample value for a pixel type, matching FormatTools.defaultMinMax()[1].
+fn default_max_value(meta: &ImageMetadata) -> i64 {
+    match meta.pixel_type {
+        PixelType::Int8 => i8::MAX as i64,
+        PixelType::Uint8 | PixelType::Bit => u8::MAX as i64,
+        PixelType::Int16 => i16::MAX as i64,
+        PixelType::Uint16 => u16::MAX as i64,
+        PixelType::Int32 => i32::MAX as i64,
+        PixelType::Uint32 => u32::MAX as i64,
+        // Floating types: Bio-Formats uses the corresponding int range.
+        PixelType::Float32 => i32::MAX as i64,
+        PixelType::Float64 => i64::MAX,
+    }
+}
 
+/// Invert MONOCHROME1 pixels (white→0 stored, so subtract from the observed/
+/// windowed maximum), following DicomReader.openBytes.
+fn invert_monochrome1(
+    buf: &mut [u8],
+    meta: &ImageMetadata,
+    max_pixel_range: i32,
+    center_pixel_value: i32,
+) {
     match meta.pixel_type.bytes_per_sample() {
         1 => {
-            let max = max_value as u8;
+            // Java: buf[i] = (byte) (255 - buf[i]).
             for b in buf {
-                *b = max.saturating_sub(*b);
+                *b = 255u8.wrapping_sub(*b);
             }
         }
         2 => {
+            // Java:
+            //   maxPixelValue = maxPixelRange + (centerPixelValue / 2);
+            //   if (maxPixelRange == -1 || centerPixelValue < (maxPixelRange/2))
+            //     maxPixelValue = defaultMinMax(pixelType)[1];
+            let mut max_pixel_value =
+                max_pixel_range as i64 + (center_pixel_value as i64) / 2;
+            if max_pixel_range == -1 || (center_pixel_value as i64) < (max_pixel_range as i64) / 2
+            {
+                max_pixel_value = default_max_value(meta);
+            }
             for px in buf.chunks_exact_mut(2) {
                 let value = if meta.is_little_endian {
-                    u16::from_le_bytes([px[0], px[1]])
+                    u16::from_le_bytes([px[0], px[1]]) as i64
                 } else {
-                    u16::from_be_bytes([px[0], px[1]])
+                    u16::from_be_bytes([px[0], px[1]]) as i64
                 };
-                let inverted = (max_value as u16).saturating_sub(value);
+                let inverted = (max_pixel_value - value) as u16;
                 let bytes = if meta.is_little_endian {
                     inverted.to_le_bytes()
                 } else {
@@ -1121,11 +1425,144 @@ fn planar_to_interleaved(buf: &[u8], meta: &ImageMetadata) -> Vec<u8> {
     out
 }
 
-fn is_jpeg2000_transfer_syntax(uid: &str) -> bool {
-    matches!(
-        uid.trim_end_matches('\0').trim(),
-        "1.2.840.10008.1.2.4.90" | "1.2.840.10008.1.2.4.91"
-    )
+/// Transfer-syntax classification mirroring DicomReader.java:
+///   isJP2K   = uid.startsWith("1.2.840.10008.1.2.4.9")
+///   isJPEG   = !isJP2K && uid.startsWith("1.2.840.10008.1.2.4")
+///   isRLE    = uid.startsWith("1.2.840.10008.1.2.5")
+///   isDeflate= uid.startsWith("1.2.8.10008.1.2.1.99")
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EncapsulatedSyntax {
+    Jpeg2000,
+    Jpeg,
+    Rle,
+    Deflate,
+    Unknown,
+}
+
+fn classify_transfer_syntax(uid: &str) -> EncapsulatedSyntax {
+    let uid = uid.trim_end_matches('\0').trim();
+    if uid.starts_with("1.2.840.10008.1.2.4.9") {
+        EncapsulatedSyntax::Jpeg2000
+    } else if uid.starts_with("1.2.840.10008.1.2.4") {
+        EncapsulatedSyntax::Jpeg
+    } else if uid.starts_with("1.2.840.10008.1.2.5") {
+        EncapsulatedSyntax::Rle
+    } else if uid.starts_with("1.2.8.10008.1.2.1.99") {
+        EncapsulatedSyntax::Deflate
+    } else {
+        EncapsulatedSyntax::Unknown
+    }
+}
+
+/// Decodes DICOM RLE (PS3.5 Annex G) into a native interleaved pixel buffer.
+///
+/// Mirrors `DicomReader.readTile` for the RLE branch. The fragment begins with a
+/// 64-byte header of 16 little-endian uint32s: `[0]` = segment count, `[1..]` =
+/// byte offsets (from the fragment start) of each segment. Each segment is
+/// PackBits-encoded. Segments are ordered by sample, then by byte plane from
+/// most-significant to least-significant. We decode each segment, then
+/// reassemble samples in little-endian order (matching Java's
+/// `byteIndex = bpp - j - 1` for little-endian output) and interleave channels
+/// (RGBRGB...) to match the layout the native pixel pipeline expects.
+fn decode_dicom_rle(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    ec: usize,
+    bpp: usize,
+) -> Result<Vec<u8>> {
+    if data.len() < 64 {
+        return Err(BioFormatsError::Format(
+            "DICOM RLE: fragment shorter than 64-byte header".into(),
+        ));
+    }
+    let plane = width
+        .checked_mul(height)
+        .ok_or_else(|| BioFormatsError::Format("DICOM RLE: dimensions overflow".into()))?;
+
+    let num_segments = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if num_segments == 0 || num_segments > 15 {
+        return Err(BioFormatsError::Format(format!(
+            "DICOM RLE: invalid segment count {num_segments}"
+        )));
+    }
+
+    // Read segment offsets and derive per-segment lengths.
+    let mut offsets = Vec::with_capacity(num_segments + 1);
+    for s in 0..num_segments {
+        let o = 4 + s * 4;
+        let off = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize;
+        offsets.push(off);
+    }
+    offsets.push(data.len());
+
+    // Decode each segment via PackBits.
+    let mut segments: Vec<Vec<u8>> = Vec::with_capacity(num_segments);
+    for s in 0..num_segments {
+        let start = offsets[s];
+        let end = offsets[s + 1].max(start).min(data.len());
+        if start > data.len() {
+            return Err(BioFormatsError::Format(
+                "DICOM RLE: segment offset past end of fragment".into(),
+            ));
+        }
+        let mut seg = crate::common::codec::decompress_packbits(&data[start..end])?;
+        // Each segment should yield exactly `plane` bytes; pad/truncate to be safe.
+        seg.resize(plane, 0);
+        segments.push(seg);
+    }
+
+    // Reassemble into interleaved native output. For sample (channel) c and
+    // byte index j of a pixel, the source segment is c*bpp + (bpp-1-j) so that
+    // the most-significant byte plane (segment 0 of the sample) lands in the
+    // high byte (little-endian native output: low byte first).
+    let mut out = vec![0u8; plane * ec * bpp];
+    for c in 0..ec {
+        for j in 0..bpp {
+            // Most-significant plane first in segment order.
+            let seg_index = c * bpp + (bpp - 1 - j);
+            if seg_index >= segments.len() {
+                continue;
+            }
+            let seg = &segments[seg_index];
+            for p in 0..plane {
+                out[(p * ec + c) * bpp + j] = seg[p];
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Normalises an encapsulated JPEG fragment into a self-contained JPEG stream,
+/// mirroring the marker fix-ups in `DicomReader.readTile`:
+///   * if byte 2 is not 0xFF, insert a 0xFF there (some encoders drop it);
+///   * locate the last EOI (0xFF 0xD9) marker; if absent, append one; if it
+///     appears before the end of the buffer, truncate just after it.
+fn trim_dicom_jpeg(mut b: Vec<u8>) -> Vec<u8> {
+    if b.len() < 8 {
+        return b;
+    }
+    if b[2] != 0xff {
+        let mut tmp = Vec::with_capacity(b.len() + 1);
+        tmp.push(b[0]);
+        tmp.push(b[1]);
+        tmp.push(0xff);
+        tmp.extend_from_slice(&b[2..]);
+        b = tmp;
+    }
+
+    // Find the last 0xFF 0xD9 (EOI) marker.
+    let mut pt: isize = b.len() as isize - 2;
+    while pt >= 0 && !(b[pt as usize] == 0xff && b[pt as usize + 1] == 0xd9) {
+        pt -= 1;
+    }
+    if pt < 0 {
+        b.push(0xff);
+        b.push(0xd9);
+    } else if (pt as usize) < b.len() - 2 {
+        b.truncate(pt as usize + 2);
+    }
+    b
 }
 
 fn expected_output_bytes(meta: &ImageMetadata) -> Result<usize> {
@@ -1153,7 +1590,14 @@ pub struct DicomReader {
     bits_allocated: u16,
     bits_stored: u16,
     pixel_representation: u16,
+    max_pixel_range: i32,
+    center_pixel_value: i32,
     palette: PaletteLut,
+    /// Per-series ordered file lists, in series order. When grouping finds only
+    /// the selected file (or grouping is disabled) this holds a single entry.
+    series_files: Vec<Vec<PathBuf>>,
+    /// Currently selected series index into `series_files`.
+    current_series: usize,
 }
 
 impl DicomReader {
@@ -1173,8 +1617,129 @@ impl DicomReader {
             bits_allocated: 8,
             bits_stored: 8,
             pixel_representation: 0,
+            max_pixel_range: 0,
+            center_pixel_value: 0,
             palette: PaletteLut::default(),
+            series_files: Vec::new(),
+            current_series: 0,
         }
+    }
+}
+
+impl DicomReader {
+    /// Load the representative (first) file of `series_index` and populate the
+    /// per-series reader state. Mirrors how Java re-derives core metadata per
+    /// series from `fileList.get(keys[i]).get(0)`.
+    fn load_series(&mut self, series_index: usize) -> Result<()> {
+        let files = self
+            .series_files
+            .get(series_index)
+            .ok_or(BioFormatsError::SeriesOutOfRange(series_index))?;
+        let rep = files
+            .first()
+            .ok_or(BioFormatsError::SeriesOutOfRange(series_index))?
+            .clone();
+
+        let attrs = parse_dicom(&rep)?;
+        let mut meta = build_metadata(&attrs)?;
+
+        if !attrs.encapsulated {
+            validate_pixel_data_length(
+                &meta,
+                attrs.pixel_data_length,
+                attrs.samples_per_pixel,
+                attrs.bits_allocated,
+            )?;
+        }
+
+        // When a series spans multiple files, each file contributes its planes
+        // along Z (DicomReader multiplies sizeZ by the file count).
+        let file_count = files.len() as u32;
+        if file_count > 1 {
+            meta.size_z = meta.size_z.saturating_mul(file_count).max(1);
+            meta.image_count = meta.image_count.saturating_mul(file_count).max(1);
+        }
+
+        self.meta = Some(meta);
+        self.pixel_data_offset = attrs.pixel_data_offset;
+        self.pixel_data_length = attrs.pixel_data_length;
+        self.encapsulated_frames = attrs.encapsulated_frames;
+        self.is_little_endian = attrs.little_endian;
+        self.encapsulated = attrs.encapsulated;
+        self.transfer_syntax = attrs.transfer_syntax;
+        self.photometric_interpretation = attrs.photometric_interpretation;
+        self.planar_configuration = attrs.planar_configuration;
+        self.source_samples_per_pixel = attrs.samples_per_pixel;
+        self.bits_allocated = attrs.bits_allocated;
+        self.bits_stored = attrs.bits_stored;
+        self.pixel_representation = attrs.pixel_representation;
+        self.max_pixel_range = attrs.max_pixel_range;
+        self.center_pixel_value = attrs.center_pixel_value;
+        self.palette = attrs.palette;
+        self.path = Some(rep);
+        self.current_series = series_index;
+        Ok(())
+    }
+
+    /// Read a single plane from an arbitrary companion file in the current
+    /// series. Builds a throwaway single-file reader for `file` (so the full
+    /// native/encapsulated pixel pipeline is reused unchanged) and reads the
+    /// local plane index within it.
+    fn open_plane_from_file(&self, file: &Path, local_plane: u32) -> Result<Vec<u8>> {
+        let attrs = parse_dicom(file)?;
+        let meta = build_metadata(&attrs)?;
+        if !attrs.encapsulated {
+            validate_pixel_data_length(
+                &meta,
+                attrs.pixel_data_length,
+                attrs.samples_per_pixel,
+                attrs.bits_allocated,
+            )?;
+        }
+        let mut sub = DicomReader::new();
+        sub.meta = Some(meta);
+        sub.pixel_data_offset = attrs.pixel_data_offset;
+        sub.pixel_data_length = attrs.pixel_data_length;
+        sub.encapsulated_frames = attrs.encapsulated_frames;
+        sub.is_little_endian = attrs.little_endian;
+        sub.encapsulated = attrs.encapsulated;
+        sub.transfer_syntax = attrs.transfer_syntax;
+        sub.photometric_interpretation = attrs.photometric_interpretation;
+        sub.planar_configuration = attrs.planar_configuration;
+        sub.source_samples_per_pixel = attrs.samples_per_pixel;
+        sub.bits_allocated = attrs.bits_allocated;
+        sub.bits_stored = attrs.bits_stored;
+        sub.pixel_representation = attrs.pixel_representation;
+        sub.max_pixel_range = attrs.max_pixel_range;
+        sub.center_pixel_value = attrs.center_pixel_value;
+        sub.palette = attrs.palette;
+        sub.path = Some(file.to_path_buf());
+        sub.series_files = vec![vec![file.to_path_buf()]];
+        sub.current_series = 0;
+        sub.open_bytes(local_plane)
+    }
+
+    /// Map a plane index within the current series to the file holding it and
+    /// the plane index within that file. For multi-file series each file
+    /// contributes `planes_per_file` consecutive planes along Z.
+    fn locate_plane(&self, plane_index: u32) -> Result<(PathBuf, u32)> {
+        let files = self
+            .series_files
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if files.len() <= 1 {
+            let path = files
+                .first()
+                .or(self.path.as_ref())
+                .cloned()
+                .ok_or(BioFormatsError::NotInitialized)?;
+            return Ok((path, plane_index));
+        }
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let planes_per_file = (meta.image_count / files.len() as u32).max(1);
+        let file_idx = (plane_index / planes_per_file).min(files.len() as u32 - 1) as usize;
+        let local = plane_index % planes_per_file;
+        Ok((files[file_idx].clone(), local))
     }
 }
 
@@ -1198,54 +1763,67 @@ impl FormatReader for DicomReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        // Parse the selected file first to derive its grouping key.
         let attrs = parse_dicom(path)?;
-        let meta = build_metadata(&attrs)?;
-        if !attrs.encapsulated {
-            validate_pixel_data_length(
-                &meta,
-                attrs.pixel_data_length,
-                attrs.samples_per_pixel,
-                attrs.bits_allocated,
-            )?;
+        let key = group_key_from_attrs(&attrs);
+
+        // Scan the directory and group companion files into series (DicomReader
+        // makeFileList / scanDirectory). When grouping yields nothing extra we
+        // fall back to a single series containing just the selected file.
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let file_list = build_dicom_file_list(path, &key);
+
+        let mut series_files: Vec<Vec<PathBuf>> = file_list.into_values().collect();
+        if series_files.is_empty() {
+            series_files = vec![vec![abs.clone()]];
         }
-        self.meta = Some(meta);
-        self.pixel_data_offset = attrs.pixel_data_offset;
-        self.pixel_data_length = attrs.pixel_data_length;
-        self.encapsulated_frames = attrs.encapsulated_frames;
-        self.is_little_endian = attrs.little_endian;
-        self.encapsulated = attrs.encapsulated;
-        self.transfer_syntax = attrs.transfer_syntax;
-        self.photometric_interpretation = attrs.photometric_interpretation;
-        self.planar_configuration = attrs.planar_configuration;
-        self.source_samples_per_pixel = attrs.samples_per_pixel;
-        self.bits_allocated = attrs.bits_allocated;
-        self.bits_stored = attrs.bits_stored;
-        self.pixel_representation = attrs.pixel_representation;
-        self.palette = attrs.palette;
-        self.path = Some(path.to_path_buf());
+
+        // Select the series that contains the originally requested file so that
+        // `series()` reflects it after set_id (Java keeps series 0 selected but
+        // the requested file is always present in the list).
+        let selected = series_files
+            .iter()
+            .position(|files| files.iter().any(|f| f == &abs))
+            .unwrap_or(0);
+
+        self.series_files = series_files;
+        self.load_series(selected)?;
+        // Match Java: series 0 is selected after initialisation.
+        self.set_series(0)?;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.series_files.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.series_files.len().max(1)
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
+        if s >= self.series_files.len().max(1) {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
         }
+        if self.series_files.is_empty() {
+            // Single-file fallback (no grouping performed).
+            if s != 0 {
+                return Err(BioFormatsError::SeriesOutOfRange(s));
+            }
+            return Ok(());
+        }
+        if s != self.current_series {
+            self.load_series(s)?;
+        }
+        Ok(())
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
@@ -1253,14 +1831,35 @@ impl FormatReader for DicomReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        {
+            let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            if plane_index >= meta.image_count {
+                return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            }
+        }
+
+        // For a series spanning several files, route the plane to the file that
+        // holds it and read it with that file's own pixel layout. The
+        // representative file's state already covers a single-file series.
+        let multi_file = self
+            .series_files
+            .get(self.current_series)
+            .map(|f| f.len() > 1)
+            .unwrap_or(false);
+        if multi_file {
+            let (file, local_plane) = self.locate_plane(plane_index)?;
+            return self.open_plane_from_file(&file, local_plane);
+        }
+
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
         if self.encapsulated {
-            if !is_jpeg2000_transfer_syntax(&self.transfer_syntax) {
+            let syntax = classify_transfer_syntax(&self.transfer_syntax);
+            if matches!(
+                syntax,
+                EncapsulatedSyntax::Deflate | EncapsulatedSyntax::Unknown
+            ) {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "DICOM: encapsulated transfer syntax {} is not supported",
                     self.transfer_syntax
@@ -1287,15 +1886,68 @@ impl FormatReader for DicomReader {
                 f.read_exact(&mut encoded[start..])
                     .map_err(BioFormatsError::Io)?;
             }
-            let decoded = crate::common::codec::decompress_jpeg2000(&encoded)?;
             let expected = expected_output_bytes(meta)?;
-            if decoded.len() != expected {
-                return Err(BioFormatsError::Codec(format!(
-                    "DICOM JPEG 2000 decoded {} bytes, expected {expected}",
-                    decoded.len()
-                )));
+
+            match syntax {
+                EncapsulatedSyntax::Jpeg2000 => {
+                    let decoded = crate::common::codec::decompress_jpeg2000(&encoded)?;
+                    if decoded.len() != expected {
+                        return Err(BioFormatsError::Codec(format!(
+                            "DICOM JPEG 2000 decoded {} bytes, expected {expected}",
+                            decoded.len()
+                        )));
+                    }
+                    return Ok(decoded);
+                }
+                EncapsulatedSyntax::Jpeg => {
+                    // Trim the fragment to a clean JPEG stream (Java readTile):
+                    // ensure an 0xFF prefix before SOI and a trailing EOI marker.
+                    let trimmed = trim_dicom_jpeg(encoded);
+                    // Both baseline (process 1) and lossless (process 14) JPEG
+                    // are handled by the shared JPEG decoder, which supports the
+                    // lossless SOF3 path.
+                    let decoded = crate::common::codec::decompress_jpeg(&trimmed)?;
+                    if decoded.len() != expected {
+                        return Err(BioFormatsError::Codec(format!(
+                            "DICOM JPEG decoded {} bytes, expected {expected}",
+                            decoded.len()
+                        )));
+                    }
+                    return Ok(decoded);
+                }
+                EncapsulatedSyntax::Rle => {
+                    let ec = self.source_samples_per_pixel.max(1) as usize;
+                    let bpp = (self.bits_allocated.max(8) as usize).div_ceil(8);
+                    let native = decode_dicom_rle(
+                        &encoded,
+                        meta.size_x as usize,
+                        meta.size_y as usize,
+                        ec,
+                        bpp,
+                    )?;
+                    // RLE output is already interleaved (planar config 0);
+                    // run it through the native normalisation pipeline.
+                    let mut buf = normalize_native_pixels(
+                        &native,
+                        meta,
+                        self.source_samples_per_pixel,
+                        self.bits_allocated,
+                        self.bits_stored,
+                        self.pixel_representation,
+                        &self.palette,
+                    );
+                    if self.photometric_interpretation.trim() == "MONOCHROME1" {
+                        invert_monochrome1(
+                            &mut buf,
+                            meta,
+                            self.max_pixel_range,
+                            self.center_pixel_value,
+                        );
+                    }
+                    return Ok(buf);
+                }
+                EncapsulatedSyntax::Deflate | EncapsulatedSyntax::Unknown => unreachable!(),
             }
-            return Ok(decoded);
         }
 
         let source_plane_bytes =
@@ -1321,7 +1973,12 @@ impl FormatReader for DicomReader {
             buf = planar_to_interleaved(&buf, meta);
         }
         if self.photometric_interpretation.trim() == "MONOCHROME1" {
-            invert_monochrome1(&mut buf, meta);
+            invert_monochrome1(
+                &mut buf,
+                meta,
+                self.max_pixel_range,
+                self.center_pixel_value,
+            );
         }
 
         Ok(buf)
@@ -1602,5 +2259,104 @@ impl crate::common::writer::FormatWriter for DicomWriter {
 
     fn can_do_stacks(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rle_header(offsets: &[u32]) -> Vec<u8> {
+        // 64-byte RLE header: segment count + 15 offsets, all little-endian u32.
+        let mut h = vec![0u8; 64];
+        h[0..4].copy_from_slice(&(offsets.len() as u32).to_le_bytes());
+        for (i, &off) in offsets.iter().enumerate() {
+            let o = 4 + i * 4;
+            h[o..o + 4].copy_from_slice(&off.to_le_bytes());
+        }
+        h
+    }
+
+    #[test]
+    fn dicom_rle_decodes_single_segment_8bit() {
+        // 2x2 grayscale, one PackBits segment with literal run [10,20,30,40].
+        let mut data = rle_header(&[64]);
+        data.extend_from_slice(&[3, 10, 20, 30, 40]); // PackBits: literal of 4 bytes
+        let out = decode_dicom_rle(&data, 2, 2, 1, 1).expect("RLE decode");
+        assert_eq!(out, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn dicom_rle_decodes_16bit_two_segments() {
+        // 1x2 (2 pixels) 16-bit, two segments: MSB plane then LSB plane.
+        // Pixel values: 0x0102, 0x0304 (little-endian native output).
+        let seg_start_0 = 64u32;
+        // MSB segment: literal [0x01, 0x03]
+        let msb = [1u8, 0x01, 0x03];
+        let seg_start_1 = seg_start_0 + msb.len() as u32;
+        // LSB segment: literal [0x02, 0x04]
+        let lsb = [1u8, 0x02, 0x04];
+        let mut data = rle_header(&[seg_start_0, seg_start_1]);
+        data.extend_from_slice(&msb);
+        data.extend_from_slice(&lsb);
+        let out = decode_dicom_rle(&data, 1, 2, 1, 2).expect("RLE 16-bit decode");
+        // Little-endian native: low byte first, then high byte.
+        assert_eq!(out, vec![0x02, 0x01, 0x04, 0x03]);
+    }
+
+    #[test]
+    fn dicom_rle_decodes_rgb_three_segments() {
+        // 1x1 RGB 8-bit: 3 segments (R, G, B), interleaved on output.
+        let s0 = 64u32;
+        let r = [0u8, 255]; // PackBits literal of 1 byte: 255
+        let s1 = s0 + r.len() as u32;
+        let g = [0u8, 128];
+        let s2 = s1 + g.len() as u32;
+        let b = [0u8, 64];
+        let mut data = rle_header(&[s0, s1, s2]);
+        data.extend_from_slice(&r);
+        data.extend_from_slice(&g);
+        data.extend_from_slice(&b);
+        let out = decode_dicom_rle(&data, 1, 1, 3, 1).expect("RLE RGB decode");
+        assert_eq!(out, vec![255, 128, 64]);
+    }
+
+    #[test]
+    fn dicom_jpeg_trim_appends_eoi() {
+        // No EOI marker present; one should be appended. Needs 0xFF at index 2.
+        let input = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x00, 0x00];
+        let out = trim_dicom_jpeg(input);
+        assert_eq!(&out[out.len() - 2..], &[0xff, 0xd9]);
+    }
+
+    #[test]
+    fn dicom_jpeg_trim_truncates_after_eoi() {
+        let input = vec![0xff, 0xd8, 0xff, 0xd9, 0x11, 0x22, 0x33, 0x44];
+        let out = trim_dicom_jpeg(input);
+        assert_eq!(out, vec![0xff, 0xd8, 0xff, 0xd9]);
+    }
+
+    #[test]
+    fn classify_transfer_syntax_matches_java() {
+        assert_eq!(
+            classify_transfer_syntax("1.2.840.10008.1.2.4.90"),
+            EncapsulatedSyntax::Jpeg2000
+        );
+        assert_eq!(
+            classify_transfer_syntax("1.2.840.10008.1.2.4.50"),
+            EncapsulatedSyntax::Jpeg
+        );
+        assert_eq!(
+            classify_transfer_syntax("1.2.840.10008.1.2.4.70"),
+            EncapsulatedSyntax::Jpeg
+        );
+        assert_eq!(
+            classify_transfer_syntax("1.2.840.10008.1.2.5"),
+            EncapsulatedSyntax::Rle
+        );
+        assert_eq!(
+            classify_transfer_syntax("1.2.840.10008.1.2.1"),
+            EncapsulatedSyntax::Unknown
+        );
     }
 }

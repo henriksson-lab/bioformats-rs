@@ -30,6 +30,7 @@ struct IfdInfo {
     photometric: Photometric,
     planar_config: u16,
     predictor: u16,
+    fill_order: u16,
     is_tiled: bool,
     tile_width: u32,
     tile_height: u32,
@@ -118,6 +119,25 @@ impl TiffReader {
         &mut self.series
     }
 
+    /// Replace the entire series list (used by vendor wrappers such as SVS that
+    /// need to regroup the IFD chain into resolution levels of a single series).
+    /// Resets the current series/resolution to 0.
+    pub fn replace_series(&mut self, series: Vec<TiffSeries>) {
+        self.series = series;
+        self.current_series = 0;
+        self.current_resolution = 0;
+    }
+
+    /// Number of parsed IFDs in the open file.
+    pub fn ifd_count(&self) -> usize {
+        self.file.as_ref().map(|f| f.ifds.len()).unwrap_or(0)
+    }
+
+    /// Whether the file was parsed as little-endian.
+    pub fn is_little_endian(&self) -> bool {
+        self.file.as_ref().map(|f| f.parser.little_endian).unwrap_or(true)
+    }
+
     /// Access a raw IFD by index (for extracting vendor-specific tags).
     pub fn ifd(&self, index: usize) -> Option<&Ifd> {
         self.file.as_ref().and_then(|f| f.ifds.get(index))
@@ -148,6 +168,9 @@ impl TiffReader {
         let compression = ifd.compression();
         let planar_config = ifd.planar_configuration();
         let predictor = ifd.predictor();
+        // FillOrder (tag 266); default 1 (MSB-to-LSB). 2 means bits within each
+        // byte are stored LSB-to-MSB and must be reversed before decompression.
+        let fill_order = ifd.get_u16(tag::FILL_ORDER).unwrap_or(1);
 
         let is_tiled = ifd.is_tiled();
 
@@ -230,6 +253,7 @@ impl TiffReader {
             photometric,
             planar_config,
             predictor,
+            fill_order,
             is_tiled,
             tile_width,
             tile_height,
@@ -511,6 +535,142 @@ impl TiffReader {
         Ok(())
     }
 
+    /// Re-group the main IFD chain into Aperio SVS series, mirroring
+    /// `SVSReader.java`. The largest IFDs become the resolution levels of a
+    /// single pyramid series; label/macro images become trailing extra series.
+    ///
+    /// Classification follows SVSReader: an IFD with no ImageDescription comment
+    /// is assigned to label, then macro. An IFD whose comment contains "label"
+    /// or "macro" is tagged accordingly. Otherwise, if NewSubfileType != 0 and
+    /// neither label nor macro has been found yet, it is treated as label/macro.
+    /// Resolution levels with a pixel type differing from the full-resolution
+    /// image are dropped (as in SVSReader).
+    pub fn regroup_as_svs_pyramid(&mut self) -> Result<()> {
+        let little_endian = self.is_little_endian();
+
+        // Collect the main IFD chain in order. Each pre-existing series maps to
+        // one top-level IFD (SVS stores its pyramid as the main IFD chain).
+        let main_ifds: Vec<usize> = self
+            .series
+            .iter()
+            .filter_map(|s| s.ifd_indices.first().copied())
+            .collect();
+        if main_ifds.len() <= 1 {
+            return Ok(());
+        }
+
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        let mut label_index: Option<usize> = None;
+        let mut macro_index: Option<usize> = None;
+
+        for (i, &ifd_idx) in main_ifds.iter().enumerate() {
+            let ifd = &file.ifds[ifd_idx];
+            let comment = ifd.get_str(tag::IMAGE_DESCRIPTION);
+            let subfile_type = ifd.get_u32(tag::NEW_SUBFILE_TYPE).unwrap_or(0);
+
+            match comment {
+                None => {
+                    if label_index.is_none() {
+                        label_index = Some(i);
+                    } else if macro_index.is_none() {
+                        macro_index = Some(i);
+                    }
+                    continue;
+                }
+                Some(comment) => {
+                    let mut found_label = false;
+                    let mut found_macro = false;
+                    // Java only checks tokens without '=' for label/macro names.
+                    for line in comment.split('\n') {
+                        for tok in line.split('|') {
+                            if tok.contains('=') {
+                                continue;
+                            }
+                            let t = tok.to_ascii_lowercase();
+                            if t.contains("label") {
+                                label_index = Some(i);
+                                found_label = true;
+                            } else if t.contains("macro") {
+                                macro_index = Some(i);
+                                found_macro = true;
+                            }
+                        }
+                    }
+                    if !found_label && !found_macro && subfile_type != 0 {
+                        if label_index.is_none() {
+                            label_index = Some(i);
+                        } else if macro_index.is_none() {
+                            macro_index = Some(i);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolution images are the main IFDs that are NOT label/macro, in order.
+        let extra: Vec<usize> = [label_index, macro_index].into_iter().flatten().collect();
+        let resolution_positions: Vec<usize> = (0..main_ifds.len())
+            .filter(|i| !extra.contains(i))
+            .collect();
+        if resolution_positions.is_empty() {
+            return Ok(());
+        }
+
+        // Full-resolution IFD = first resolution image.
+        let full_ifd_idx = main_ifds[resolution_positions[0]];
+        let full_info = Self::ifd_info(&file.ifds[full_ifd_idx], little_endian)?;
+
+        // Drop pyramid levels whose pixel type differs from the full resolution.
+        let mut kept_levels: Vec<usize> = Vec::new();
+        for &pos in &resolution_positions {
+            let ifd_idx = main_ifds[pos];
+            let info = Self::ifd_info(&file.ifds[ifd_idx], little_endian)?;
+            if ifd_idx == full_ifd_idx || info.pixel_type == full_info.pixel_type {
+                kept_levels.push(ifd_idx);
+            }
+        }
+        if kept_levels.is_empty() {
+            return Ok(());
+        }
+
+        // Build the single pyramid series: level 0 is the main resolution,
+        // remaining levels are sub-resolutions.
+        let mut pyramid = Self::single_ifd_series(kept_levels[0], &full_info, little_endian);
+        let sub_resolutions: Vec<Vec<usize>> =
+            kept_levels[1..].iter().map(|&idx| vec![idx]).collect();
+        pyramid.metadata.resolution_count = 1 + sub_resolutions.len() as u32;
+        pyramid.sub_resolutions = sub_resolutions;
+        if let Some(desc) = file.ifds[kept_levels[0]].get_str(tag::IMAGE_DESCRIPTION) {
+            pyramid.metadata.series_metadata.insert(
+                "ImageDescription".into(),
+                crate::common::metadata::MetadataValue::String(desc.to_string()),
+            );
+        }
+
+        let mut new_series = vec![pyramid];
+
+        // Append label/macro as standalone series, label first then macro.
+        for &pos in &extra {
+            let ifd_idx = main_ifds[pos];
+            let info = Self::ifd_info(&file.ifds[ifd_idx], little_endian)?;
+            let mut s = Self::single_ifd_series(ifd_idx, &info, little_endian);
+            let name = if Some(pos) == label_index {
+                "label"
+            } else {
+                "macro"
+            };
+            s.metadata.series_metadata.insert(
+                "svs.image_type".into(),
+                crate::common::metadata::MetadataValue::String(name.to_string()),
+            );
+            new_series.push(s);
+        }
+
+        self.replace_series(new_series);
+        Ok(())
+    }
+
     fn single_ifd_series(ifd_index: usize, info: &IfdInfo, little_endian: bool) -> TiffSeries {
         let is_rgb = matches!(info.photometric, Photometric::Rgb | Photometric::YCbCr)
             && info.samples_per_pixel >= 3;
@@ -636,11 +796,6 @@ impl TiffReader {
         _plane_byte_len: usize,
     ) -> Result<Vec<u8>> {
         if info.planar_config == 2 && info.samples_per_pixel > 1 {
-            if info.bits_per_sample < 8 {
-                return Err(BioFormatsError::UnsupportedFormat(
-                    "Packed planar TIFF samples are not yet supported".into(),
-                ));
-            }
             return self.read_planar_stripped_plane(info, x, y, w, h);
         }
 
@@ -672,6 +827,12 @@ impl TiffReader {
 
         // We assemble the full plane row-by-row, then crop to [x, y, w, h].
         let mut plane_rows: Vec<u8> = Vec::with_capacity((h * row_bytes) as usize);
+        // For subsampled YCbCr, RGB is accumulated per-plane (R then G then B) as
+        // strips are decoded, so partial-row reads (a strip overlapping only part of
+        // the requested y range) work like Java's per-block unpacking.
+        let mut ycbcr_r: Vec<u8> = Vec::new();
+        let mut ycbcr_g: Vec<u8> = Vec::new();
+        let mut ycbcr_b: Vec<u8> = Vec::new();
 
         for strip_idx in 0..info.strip_offsets.len() {
             let strip_start_row = strip_idx as u32 * rows_per_strip;
@@ -685,7 +846,8 @@ impl TiffReader {
             let offset = info.strip_offsets[strip_idx];
             let byte_count = info.strip_byte_counts[strip_idx] as usize;
 
-            let compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+            let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+            apply_fill_order(&mut compressed, info.fill_order, info.compression);
             let strip_rows = strip_end_row - strip_start_row;
             let expected = if ycbcr {
                 ycbcr_strip_bytes(info.width, strip_rows, info.ycbcr_subsampling)
@@ -713,13 +875,25 @@ impl TiffReader {
             let row_end = (y + h - strip_start_row).min(strip_rows) as usize;
 
             if ycbcr {
-                if row_start == 0 && row_end as u32 == strip_rows {
-                    plane_rows.extend_from_slice(&strip_data);
-                    continue;
-                }
-                return Err(BioFormatsError::UnsupportedFormat(
-                    "Partial-row reads for subsampled TIFF YCbCr are not yet supported".into(),
-                ));
+                // Decode this strip's subsampled YCbCr to planar RGB covering the
+                // strip's full height, then keep only the requested rows. This
+                // supports partial-row reads of strips spanning subsampling blocks.
+                let rgb = decode_ycbcr_chunky(
+                    &strip_data,
+                    info.width,
+                    strip_rows,
+                    info.ycbcr_subsampling,
+                    info.ycbcr_coefficients,
+                )?;
+                let plane_len = (info.width * strip_rows) as usize;
+                let row_w = info.width as usize;
+                let r_plane = &rgb[0..plane_len];
+                let g_plane = &rgb[plane_len..2 * plane_len];
+                let b_plane = &rgb[2 * plane_len..3 * plane_len];
+                ycbcr_r.extend_from_slice(&r_plane[row_start * row_w..row_end * row_w]);
+                ycbcr_g.extend_from_slice(&g_plane[row_start * row_w..row_end * row_w]);
+                ycbcr_b.extend_from_slice(&b_plane[row_start * row_w..row_end * row_w]);
+                continue;
             }
 
             for row in row_start..row_end {
@@ -732,17 +906,23 @@ impl TiffReader {
         }
 
         if ycbcr {
-            let rgb = decode_ycbcr_chunky(
-                &plane_rows,
-                info.width,
-                h,
-                info.ycbcr_subsampling,
-                info.ycbcr_coefficients,
-            )?;
             if x == 0 && w == info.width {
-                return Ok(rgb);
+                let mut out =
+                    Vec::with_capacity(ycbcr_r.len() + ycbcr_g.len() + ycbcr_b.len());
+                out.extend_from_slice(&ycbcr_r);
+                out.extend_from_slice(&ycbcr_g);
+                out.extend_from_slice(&ycbcr_b);
+                return Ok(out);
             }
-            return Ok(crop_unpacked_rows(&rgb, info.width, 3, x, w, h));
+            // Crop each plane (single sample per pixel) and emit planar R, G, B.
+            let r = crop_unpacked_rows(&ycbcr_r, info.width, 1, x, w, h);
+            let g = crop_unpacked_rows(&ycbcr_g, info.width, 1, x, w, h);
+            let b = crop_unpacked_rows(&ycbcr_b, info.width, 1, x, w, h);
+            let mut out = Vec::with_capacity(r.len() + g.len() + b.len());
+            out.extend_from_slice(&r);
+            out.extend_from_slice(&g);
+            out.extend_from_slice(&b);
+            return Ok(out);
         }
 
         if subbyte_samples {
@@ -764,13 +944,27 @@ impl TiffReader {
         }
 
         if packed_row_layout {
-            if x != 0 || w != info.width {
-                return Err(BioFormatsError::UnsupportedFormat(
-                    "Partial-column reads for packed non-byte-aligned TIFF samples are not yet supported"
-                        .into(),
-                ));
-            }
-            return Ok(plane_rows);
+            // bits_per_sample is >= 8 but not a multiple of 8 (e.g. 12-bit). Java's
+            // TiffParser.unpackBytes reads each sample MSB-first via readBits and
+            // writes it as bytes_per_sample little/big-endian bytes, with per-row
+            // skipBits padding. Unpack to byte-aligned samples so we can crop columns.
+            let unpacked = unpack_packed_samples(
+                &plane_rows,
+                info.width,
+                h,
+                effective_spp,
+                info.bits_per_sample,
+                file.parser.little_endian,
+            );
+            let mut out =
+                crop_unpacked_rows(&unpacked, info.width, effective_spp * bytes_per_sample, x, w, h);
+            apply_photometric(
+                &mut out,
+                info.photometric,
+                info.bits_per_sample,
+                file.parser.little_endian,
+            );
+            return Ok(out);
         }
 
         apply_photometric(
@@ -806,7 +1000,15 @@ impl TiffReader {
     ) -> Result<Vec<u8>> {
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
-        let channel_row_bytes = info.width * bytes_per_sample;
+        let subbyte = info.bits_per_sample < 8;
+        // For sub-byte planar samples, each channel's row is stored as packed bits
+        // (one sample per pixel) padded to a byte boundary, matching Java's per-row
+        // skipBits handling in TiffParser.unpackBytes.
+        let channel_row_bytes = if subbyte {
+            packed_row_bytes(info.width, 1, info.bits_per_sample) as u32
+        } else {
+            info.width * bytes_per_sample
+        };
         let rows_per_strip = if info.rows_per_strip == 0 || info.rows_per_strip >= info.height {
             info.height
         } else {
@@ -834,7 +1036,8 @@ impl TiffReader {
                 }
                 let offset = info.strip_offsets[strip_idx];
                 let byte_count = info.strip_byte_counts[strip_idx] as usize;
-                let compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+                let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+                apply_fill_order(&mut compressed, info.fill_order, info.compression);
                 let strip_rows = strip_end_row - strip_start_row;
                 let expected = (strip_rows * channel_row_bytes) as usize;
                 let mut strip_data = decompress(
@@ -861,6 +1064,23 @@ impl TiffReader {
                         channel_rows.extend_from_slice(&strip_data[rs..re]);
                     }
                 }
+            }
+
+            if subbyte {
+                // Unpack the packed bits of this channel into one byte per sample,
+                // then apply photometric inversion and crop, matching Java's
+                // per-sample unpacking in TiffParser.unpackBytes.
+                let mut unpacked =
+                    unpack_subbyte_samples(&channel_rows, info.width, h, 1, info.bits_per_sample);
+                apply_photometric(
+                    &mut unpacked,
+                    info.photometric,
+                    info.bits_per_sample,
+                    file.parser.little_endian,
+                );
+                let cropped = crop_unpacked_rows(&unpacked, info.width, 1, x, w, h);
+                out.extend_from_slice(&cropped);
+                continue;
             }
 
             apply_photometric(
@@ -894,18 +1114,16 @@ impl TiffReader {
         _plane_byte_len: usize,
     ) -> Result<Vec<u8>> {
         if info.planar_config == 2 && info.samples_per_pixel > 1 {
-            if info.bits_per_sample < 8 {
-                return Err(BioFormatsError::UnsupportedFormat(
-                    "Packed planar TIFF samples are not yet supported".into(),
-                ));
-            }
             return self.read_planar_tiled_plane(info, x, y, w, h);
         }
 
         if info.photometric == Photometric::YCbCr {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Tiled TIFF YCbCr is not yet supported".into(),
-            ));
+            if is_unsupported_ycbcr(info) {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Only 8-bit chunky non-JPEG TIFF YCbCr is supported".into(),
+                ));
+            }
+            return self.read_tiled_ycbcr_plane(info, x, y, w, h);
         }
 
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
@@ -931,7 +1149,8 @@ impl TiffReader {
                 }
                 let offset = info.tile_offsets[tile_idx];
                 let byte_count = info.tile_byte_counts[tile_idx] as usize;
-                let compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+                let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+                apply_fill_order(&mut compressed, info.fill_order, info.compression);
                 let mut tile_data = decompress(
                     &compressed,
                     info.compression,
@@ -983,6 +1202,103 @@ impl TiffReader {
         Ok(out)
     }
 
+    /// Read a tiled, subsampled YCbCr plane (chunky, 8-bit, non-JPEG), decoding
+    /// each tile to planar RGB and assembling planar R, G, B output. Mirrors the
+    /// YCbCr handling in Java's TiffParser.getTile + unpackBytes.
+    fn read_tiled_ycbcr_plane(
+        &mut self,
+        info: &IfdInfo,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+        let tiles_across = (info.width + info.tile_width - 1) / info.tile_width;
+        // Each YCbCr tile stores subsampled blocks: (subX*subY) luma + 2 chroma.
+        let tile_data_bytes =
+            ycbcr_strip_bytes(info.tile_width, info.tile_height, info.ycbcr_subsampling);
+
+        let tx_start = x / info.tile_width;
+        let tx_end = (x + w + info.tile_width - 1) / info.tile_width;
+        let ty_start = y / info.tile_height;
+        let ty_end = (y + h + info.tile_height - 1) / info.tile_height;
+
+        // Planar RGB output for the requested region.
+        let plane_size = (w * h) as usize;
+        let mut r_out = vec![0u8; plane_size];
+        let mut g_out = vec![0u8; plane_size];
+        let mut b_out = vec![0u8; plane_size];
+
+        for ty in ty_start..ty_end {
+            for tx in tx_start..tx_end {
+                let tile_idx = (ty * tiles_across + tx) as usize;
+                if tile_idx >= info.tile_offsets.len() || tile_idx >= info.tile_byte_counts.len() {
+                    continue;
+                }
+                let offset = info.tile_offsets[tile_idx];
+                let byte_count = info.tile_byte_counts[tile_idx] as usize;
+                let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+                apply_fill_order(&mut compressed, info.fill_order, info.compression);
+                let mut tile_data = decompress(
+                    &compressed,
+                    info.compression,
+                    tile_data_bytes,
+                    info.predictor,
+                    info.samples_per_pixel,
+                    info.bits_per_sample,
+                    info.tile_width,
+                    info.tile_height,
+                    file.parser.little_endian,
+                    info.jpeg_tables.as_deref(),
+                    info.nikon_compression_options.as_ref(),
+                )?;
+                tile_data.resize(tile_data_bytes, 0);
+
+                // Decode the tile's YCbCr blocks to planar RGB at tile resolution.
+                let rgb = decode_ycbcr_chunky(
+                    &tile_data,
+                    info.tile_width,
+                    info.tile_height,
+                    info.ycbcr_subsampling,
+                    info.ycbcr_coefficients,
+                )?;
+                let tile_plane = (info.tile_width * info.tile_height) as usize;
+                let r_plane = &rgb[0..tile_plane];
+                let g_plane = &rgb[tile_plane..2 * tile_plane];
+                let b_plane = &rgb[2 * tile_plane..3 * tile_plane];
+
+                let tile_x0 = tx * info.tile_width;
+                let tile_y0 = ty * info.tile_height;
+                let src_x = x.saturating_sub(tile_x0) as usize;
+                let src_y = y.saturating_sub(tile_y0) as usize;
+                let dst_x = tile_x0.saturating_sub(x) as usize;
+                let dst_y = tile_y0.saturating_sub(y) as usize;
+                let copy_w = ((info.tile_width - src_x as u32).min(w - dst_x as u32)) as usize;
+                let copy_h = ((info.tile_height - src_y as u32).min(h - dst_y as u32)) as usize;
+                let tw = info.tile_width as usize;
+                let ow = w as usize;
+
+                for row in 0..copy_h {
+                    let src_off = (src_y + row) * tw + src_x;
+                    let dst_off = (dst_y + row) * ow + dst_x;
+                    r_out[dst_off..dst_off + copy_w]
+                        .copy_from_slice(&r_plane[src_off..src_off + copy_w]);
+                    g_out[dst_off..dst_off + copy_w]
+                        .copy_from_slice(&g_plane[src_off..src_off + copy_w]);
+                    b_out[dst_off..dst_off + copy_w]
+                        .copy_from_slice(&b_plane[src_off..src_off + copy_w]);
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(plane_size * 3);
+        out.extend_from_slice(&r_out);
+        out.extend_from_slice(&g_out);
+        out.extend_from_slice(&b_out);
+        Ok(out)
+    }
+
     fn read_planar_tiled_plane(
         &mut self,
         info: &IfdInfo,
@@ -993,8 +1309,15 @@ impl TiffReader {
     ) -> Result<Vec<u8>> {
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
+        let subbyte = info.bits_per_sample < 8;
+        // For sub-byte planar samples, each tile stores packed bits (one sample per
+        // pixel) with byte-aligned rows; we unpack to one byte per sample below.
+        let tile_data_bytes = if subbyte {
+            packed_row_bytes(info.tile_width, 1, info.bits_per_sample) * info.tile_height as usize
+        } else {
+            (info.tile_width * bytes_per_sample) as usize * info.tile_height as usize
+        };
         let tile_row_bytes = (info.tile_width * bytes_per_sample) as usize;
-        let tile_data_bytes = tile_row_bytes * info.tile_height as usize;
         let tiles_across = (info.width + info.tile_width - 1) / info.tile_width;
         let tiles_down = (info.height + info.tile_height - 1) / info.tile_height;
         let tiles_per_channel = (tiles_across * tiles_down) as usize;
@@ -1021,7 +1344,8 @@ impl TiffReader {
                     }
                     let offset = info.tile_offsets[tile_idx];
                     let byte_count = info.tile_byte_counts[tile_idx] as usize;
-                    let compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+                    let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+                    apply_fill_order(&mut compressed, info.fill_order, info.compression);
                     let mut tile_data = decompress(
                         &compressed,
                         info.compression,
@@ -1036,6 +1360,16 @@ impl TiffReader {
                         info.nikon_compression_options.as_ref(),
                     )?;
                     tile_data.resize(tile_data_bytes, 0);
+                    if subbyte {
+                        // Unpack the packed bits of this tile to one byte per sample.
+                        tile_data = unpack_subbyte_samples(
+                            &tile_data,
+                            info.tile_width,
+                            info.tile_height,
+                            1,
+                            info.bits_per_sample,
+                        );
+                    }
                     apply_photometric(
                         &mut tile_data,
                         info.photometric,
@@ -1228,6 +1562,17 @@ fn validate_tiff_storage(
 
 fn div_ceil_u32(value: u32, divisor: u32) -> u32 {
     value / divisor + u32::from(value % divisor != 0)
+}
+
+/// Reverse the bit order within each byte if `FillOrder == 2` for a compression
+/// scheme that Java's `TiffParser` bit-reverses (CCITT/fax and Deflate streams).
+/// Mirrors `tile[i] = (byte) (Integer.reverse(tile[i]) >> 24)`.
+fn apply_fill_order(data: &mut [u8], fill_order: u16, compression: Compression) {
+    if fill_order == 2 && compression.reverses_bits_on_fill_order_2() {
+        for b in data.iter_mut() {
+            *b = b.reverse_bits();
+        }
+    }
 }
 
 fn parse_ome_tiff_images(xml: &str) -> Vec<OmeTiffImage> {
@@ -1684,6 +2029,52 @@ fn unpack_subbyte_samples(
             let byte = row_data.get(bit / 8).copied().unwrap_or(0);
             let shift = 8 - bits_per_sample as usize - (bit % 8);
             out.push((byte >> shift) & mask);
+        }
+    }
+
+    out
+}
+
+/// Unpack packed samples whose bit depth is not a multiple of 8 (e.g. 12-bit),
+/// reading MSB-first within each byte-aligned row, and emitting each sample as
+/// `ceil(bits_per_sample/8)` little/big-endian bytes. Mirrors the `noDiv8` path
+/// of Java's TiffParser.unpackBytes, including the per-row skipBits padding (rows
+/// are byte-aligned because each row occupies `packed_row_bytes` bytes).
+fn unpack_packed_samples(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    samples_per_pixel: u32,
+    bits_per_sample: u16,
+    little_endian: bool,
+) -> Vec<u8> {
+    let row_samples = width as usize * samples_per_pixel as usize;
+    let row_bytes = packed_row_bytes(width, samples_per_pixel, bits_per_sample);
+    let bytes_per_sample = ((bits_per_sample as usize) + 7) / 8;
+    let bps = bits_per_sample as usize;
+    let mut out = vec![0u8; row_samples * bytes_per_sample * height as usize];
+
+    for row in 0..height as usize {
+        let row_start = row * row_bytes;
+        let row_data = data.get(row_start..row_start + row_bytes).unwrap_or(&[]);
+        for sample in 0..row_samples {
+            let mut value: u64 = 0;
+            let bit_base = sample * bps;
+            for k in 0..bps {
+                let bit = bit_base + k;
+                let byte = row_data.get(bit / 8).copied().unwrap_or(0);
+                let bit_val = (byte >> (7 - (bit % 8))) & 1;
+                value = (value << 1) | bit_val as u64;
+            }
+            let out_base = (row * row_samples + sample) * bytes_per_sample;
+            for b in 0..bytes_per_sample {
+                let shift = if little_endian {
+                    8 * b
+                } else {
+                    8 * (bytes_per_sample - 1 - b)
+                };
+                out[out_base + b] = ((value >> shift) & 0xff) as u8;
+            }
         }
     }
 

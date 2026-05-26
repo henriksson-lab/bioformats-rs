@@ -3,7 +3,8 @@
 //!
 //! All share the same generic implementation; the only difference is the extension/magic check.
 //!
-//! Animated formats are not flattened: animated GIFs are rejected explicitly.
+//! Animated GIFs are read as an image stack (one plane per frame), matching the
+//! Java `GIFReader`; animated PNG (APNG) is still rejected.
 //! Indexed/paletted inputs that the `image` crate can decode, including GIF and TGA,
 //! are expanded to concrete samples and reported as non-indexed RGB/RGBA data.
 
@@ -24,41 +25,11 @@ use crate::common::writer::FormatWriter;
 #[derive(Clone, Copy)]
 enum RasterBehavior {
     Still,
-    Gif,
-}
-
-fn reject_animated_gif(path: &Path) -> Result<()> {
-    use image::AnimationDecoder;
-
-    let file = File::open(path)?;
-    let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(file))
-        .map_err(|e| BioFormatsError::Format(e.to_string()))?;
-    let mut frames = decoder.into_frames();
-
-    let _first = frames
-        .next()
-        .transpose()
-        .map_err(|e| BioFormatsError::Format(e.to_string()))?
-        .ok_or_else(|| BioFormatsError::InvalidData("GIF contains no frames".into()))?;
-
-    if frames
-        .next()
-        .transpose()
-        .map_err(|e| BioFormatsError::Format(e.to_string()))?
-        .is_some()
-    {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "animated GIF is not supported by the generic raster reader".into(),
-        ));
-    }
-
-    Ok(())
 }
 
 fn load_image(path: &Path, behavior: RasterBehavior) -> Result<(ImageMetadata, Vec<u8>)> {
     match behavior {
         RasterBehavior::Still => {}
-        RasterBehavior::Gif => reject_animated_gif(path)?,
     }
 
     let img = image::open(path).map_err(|e| BioFormatsError::Format(e.to_string()))?;
@@ -220,11 +191,150 @@ impl FormatReader for GenericReader {
 // ---- public constructors for each format ------------------------------------
 
 pub fn gif_reader() -> impl FormatReader {
-    GenericReader::new(
-        &["gif"],
-        |h| h.starts_with(b"GIF87a") || h.starts_with(b"GIF89a"),
-        RasterBehavior::Gif,
-    )
+    GifReader::new()
+}
+
+/// Multi-frame GIF reader.
+///
+/// Faithful to the Java `GIFReader`, which reads every frame of an (animated)
+/// GIF as a separate plane, producing an image stack (`sizeT = imageCount`).
+/// The `image` crate's `GifDecoder` composites each frame (applying disposal
+/// and transparency, as the Java reader does), so frames are exposed as
+/// interleaved 8-bit RGBA planes rather than indexed data.
+pub struct GifReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    frames: Vec<Vec<u8>>,
+}
+
+impl GifReader {
+    pub fn new() -> Self {
+        GifReader {
+            path: None,
+            meta: None,
+            frames: Vec::new(),
+        }
+    }
+}
+
+impl Default for GifReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn load_gif_frames(path: &Path) -> Result<(ImageMetadata, Vec<Vec<u8>>)> {
+    use image::AnimationDecoder;
+
+    let file = File::open(path)?;
+    let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(file))
+        .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+
+    for frame in decoder.into_frames() {
+        let frame = frame.map_err(|e| BioFormatsError::Format(e.to_string()))?;
+        let buffer = frame.into_buffer(); // RgbaImage, fully composited
+        if width == 0 {
+            width = buffer.width();
+            height = buffer.height();
+        }
+        frames.push(buffer.into_raw());
+    }
+
+    if frames.is_empty() {
+        return Err(BioFormatsError::InvalidData("GIF contains no frames".into()));
+    }
+
+    let image_count = frames.len() as u32;
+    let meta = ImageMetadata {
+        size_x: width,
+        size_y: height,
+        size_z: 1,
+        size_c: 4,
+        size_t: image_count,
+        pixel_type: PixelType::Uint8,
+        bits_per_pixel: 8,
+        image_count,
+        // Java GIFReader uses XYCTZ (frames vary over T).
+        dimension_order: DimensionOrder::XYCTZ,
+        is_rgb: true,
+        is_interleaved: true,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        ..Default::default()
+    };
+    Ok((meta, frames))
+}
+
+impl FormatReader for GifReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gif"))
+            .unwrap_or(false)
+    }
+
+    fn is_this_type_by_bytes(&self, h: &[u8]) -> bool {
+        h.starts_with(b"GIF87a") || h.starts_with(b"GIF89a")
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let (meta, frames) = load_gif_frames(path)?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.frames = frames;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.frames.clear();
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        1
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta.as_ref().expect("set_id not called")
+    }
+
+    fn open_bytes(&mut self, idx: u32) -> Result<Vec<u8>> {
+        let frame = self
+            .frames
+            .get(idx as usize)
+            .ok_or(BioFormatsError::PlaneOutOfRange(idx))?;
+        Ok(frame.clone())
+    }
+
+    fn open_bytes_region(&mut self, idx: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let full = self.open_bytes(idx)?;
+        let meta = self.meta.as_ref().unwrap();
+        crop_full_plane("gif", &full, meta, meta.size_c as usize, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, idx: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
+        let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
+        self.open_bytes_region(idx, tx, ty, tw, th)
+    }
 }
 
 pub fn tga_reader() -> impl FormatReader {

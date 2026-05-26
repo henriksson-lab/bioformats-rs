@@ -759,15 +759,39 @@ placeholder_reader_u16_small! {
 // ---------------------------------------------------------------------------
 /// NDPI Set format reader (`.ndpis`).
 ///
-/// Delegates to `TiffReader` since NDPI files reference TIFF data.
+/// Ported from the Java `NDPISReader`. The `.ndpis` file is a small text index
+/// listing one `.ndpi` file per channel:
+///
+/// ```text
+/// NoImages=2
+/// Image0=slide_ch0.ndpi
+/// Image1=slide_ch1.ndpi
+/// ```
+///
+/// Each `.ndpi` is a single-channel Hamamatsu TIFF. The pyramid resolutions are
+/// merged so that `sizeC` equals the number of channel files; per-channel planes
+/// are read from the matching delegate. Non-pyramid extra images (macro/label)
+/// come from the first file only.
 pub struct NdpisReader {
-    inner: crate::tiff::TiffReader,
+    /// One TiffReader delegate per channel `.ndpi` file.
+    readers: Vec<crate::tiff::TiffReader>,
+    ndpi_files: Vec<PathBuf>,
+    /// Per-channel resolved channel name (from NDPI tag 65434), if present.
+    channel_names: Vec<Option<String>>,
+    metas: Vec<ImageMetadata>,
+    current_series: usize,
 }
+
+const NDPI_TAG_CHANNEL: u16 = 65434;
 
 impl NdpisReader {
     pub fn new() -> Self {
         NdpisReader {
-            inner: crate::tiff::TiffReader::new(),
+            readers: Vec::new(),
+            ndpi_files: Vec::new(),
+            channel_names: Vec::new(),
+            metas: Vec::new(),
+            current_series: 0,
         }
     }
 }
@@ -790,37 +814,136 @@ impl FormatReader for NdpisReader {
         false
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path)
+        let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+        let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+
+        // Parse the index: NoImages=N and ImageK=relative_path lines.
+        let mut files: Vec<PathBuf> = Vec::new();
+        for line in text.split(['\r', '\n']) {
+            let line = line.trim();
+            let Some(eq) = line.find('=') else { continue };
+            let key = line[..eq].trim();
+            let value = line[eq + 1..].trim();
+            if key == "NoImages" {
+                let count = value.parse().unwrap_or(0);
+                files = vec![PathBuf::new(); count];
+            } else if let Some(idx) = key.strip_prefix("Image") {
+                if let Ok(index) = idx.parse::<usize>() {
+                    if index >= files.len() {
+                        files.resize(index + 1, PathBuf::new());
+                    }
+                    files[index] = parent.join(value);
+                }
+            }
+        }
+        files.retain(|p| !p.as_os_str().is_empty());
+        if files.is_empty() {
+            return Err(BioFormatsError::Format(
+                "NDPIS index references no .ndpi files".into(),
+            ));
+        }
+
+        // Open each channel file as a TIFF delegate.
+        let mut readers = Vec::with_capacity(files.len());
+        let mut channel_names = Vec::with_capacity(files.len());
+        for file in &files {
+            let mut r = crate::tiff::TiffReader::new();
+            r.set_id(file)?;
+            // Channel name from NDPI tag 65434 on the first IFD.
+            let name = r.ifd(0).and_then(|ifd| ifd.get_str(NDPI_TAG_CHANNEL).map(str::to_owned));
+            channel_names.push(name);
+            readers.push(r);
+        }
+
+        // Build merged metadata from the first reader's series, setting sizeC to
+        // the number of channel files and recomputing the plane count.
+        let base = &readers[0];
+        let mut metas: Vec<ImageMetadata> = Vec::new();
+        for s in 0..base.series_count() {
+            // We can't call set_series on an immutable borrow; collect by index.
+            let m = base.series_list()[s].metadata.clone();
+            metas.push(m);
+        }
+        let nchannels = files.len() as u32;
+        // The pyramid resolutions are series whose dimensions shrink; the macro/
+        // label images are extra. Following the Java reader, only the pyramid
+        // resolutions get sizeC adjusted. We treat all base series as channel
+        // stacks (sizeC == channel count) which matches single-resolution NDPI.
+        for m in &mut metas {
+            m.size_c = nchannels;
+            m.is_rgb = false;
+            m.image_count = m.size_c * m.size_z.max(1) * m.size_t.max(1);
+        }
+
+        self.readers = readers;
+        self.ndpi_files = files;
+        self.channel_names = channel_names;
+        self.metas = metas;
+        self.current_series = 0;
+        Ok(())
     }
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        for r in &mut self.readers {
+            let _ = r.close();
+        }
+        self.readers.clear();
+        self.ndpi_files.clear();
+        self.channel_names.clear();
+        self.metas.clear();
+        self.current_series = 0;
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.metas.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        if s >= self.metas.len() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
+        self.current_series = s;
+        for r in &mut self.readers {
+            let _ = r.set_series(s);
+        }
+        Ok(())
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        &self.metas[self.current_series]
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        // plane index p maps to a channel; each channel comes from one file.
+        let nchannels = self.readers.len() as u32;
+        let channel = (p % nchannels.max(1)) as usize;
+        let inner_plane = p / nchannels.max(1);
+        self.readers[channel].set_series(self.current_series)?;
+        self.readers[channel].open_bytes(inner_plane)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let nchannels = self.readers.len() as u32;
+        let channel = (p % nchannels.max(1)) as usize;
+        let inner_plane = p / nchannels.max(1);
+        self.readers[channel].set_series(self.current_series)?;
+        self.readers[channel].open_bytes_region(inner_plane, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+        let nchannels = self.readers.len() as u32;
+        let channel = (p % nchannels.max(1)) as usize;
+        self.readers[channel].set_series(self.current_series)?;
+        self.readers[channel].open_thumb_bytes(0)
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        self.readers
+            .first()
+            .map(|r| r.resolution_count())
+            .unwrap_or(1)
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        for r in &mut self.readers {
+            r.set_resolution(level)?;
+        }
+        Ok(())
     }
 }
 
@@ -927,16 +1050,53 @@ impl FormatReader for IvisionReader {
 // ---------------------------------------------------------------------------
 /// Aperio AFI fluorescence format reader (`.afi`).
 ///
-/// AFI files use TIFF data; delegates to `TiffReader`.
+/// Ported from the Java `AFIReader`. The `.afi` file is simple XML listing one
+/// `.svs` file per channel:
+///
+/// ```xml
+/// <ImageList>
+///   <Image><Path>slide_DAPI.svs</Path></Image>
+///   <Image><Path>slide_FITC.svs</Path></Image>
+/// </ImageList>
+/// ```
+///
+/// Each `.svs` corresponds to a single channel. Channel names are derived from
+/// the filename substring between `_` and `.` (matching Java). The channels are
+/// assembled into a single multi-channel series (the trailing label/macro
+/// resolutions are taken from the first file).
 pub struct AfiFluorescenceReader {
-    inner: crate::tiff::TiffReader,
+    readers: Vec<crate::formats::svs::WholeSlideTiffReader>,
+    channel_names: Vec<Option<String>>,
+    metas: Vec<ImageMetadata>,
+    current_series: usize,
 }
 
 impl AfiFluorescenceReader {
     pub fn new() -> Self {
         AfiFluorescenceReader {
-            inner: crate::tiff::TiffReader::new(),
+            readers: Vec::new(),
+            channel_names: Vec::new(),
+            metas: Vec::new(),
+            current_series: 0,
         }
+    }
+
+    /// Extract `<Path>...</Path>` entries from the AFI XML.
+    fn parse_paths(xml: &str) -> Vec<String> {
+        let mut paths = Vec::new();
+        let mut rest = xml;
+        while let Some(start) = rest.find("<Path") {
+            let after = &rest[start..];
+            let Some(gt) = after.find('>') else { break };
+            let body = &after[gt + 1..];
+            let Some(end) = body.find('<') else { break };
+            let value = body[..end].trim();
+            if !value.is_empty() {
+                paths.push(value.to_string());
+            }
+            rest = &body[end..];
+        }
+        paths
     }
 }
 
@@ -958,37 +1118,134 @@ impl FormatReader for AfiFluorescenceReader {
         false
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path)
+        let xml = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+        let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let rel_paths = Self::parse_paths(&xml);
+        if rel_paths.is_empty() {
+            return Err(BioFormatsError::Format(
+                "AFI file lists no <Path> channel images".into(),
+            ));
+        }
+
+        let mut readers = Vec::with_capacity(rel_paths.len());
+        let mut channel_names = Vec::with_capacity(rel_paths.len());
+        for rel in &rel_paths {
+            // Channel name = substring between '_' and '.' of the file name.
+            let name = {
+                let underscore = rel.find('_');
+                let dot = rel.find('.');
+                match (underscore, dot) {
+                    (Some(u), Some(d)) if d > u => Some(rel[u + 1..d].to_string()),
+                    _ => None,
+                }
+            };
+            channel_names.push(name);
+
+            let full = parent.join(rel);
+            let mut r = crate::formats::svs::WholeSlideTiffReader::new();
+            r.set_id(&full)?;
+            readers.push(r);
+        }
+
+        // Build metadata: clone the first reader's per-series metadata and set
+        // sizeC to the number of channels for the non-extra (pyramid) series.
+        let mut metas: Vec<ImageMetadata> = Vec::new();
+        for s in 0..readers[0].series_count() {
+            readers[0].set_series(s)?;
+            metas.push(readers[0].metadata().clone());
+        }
+        readers[0].set_series(0)?;
+
+        let nchannels = readers.len() as u32;
+        // EXTRA_IMAGES = 2 (label + macro) are single-channel; the rest are
+        // the multi-channel pyramid resolutions.
+        let total = metas.len();
+        let extra = 2usize.min(total);
+        for (i, m) in metas.iter_mut().enumerate() {
+            if i + extra < total {
+                m.size_c = nchannels;
+                m.is_rgb = false;
+                m.image_count = m.size_c * m.size_z.max(1) * m.size_t.max(1);
+            }
+        }
+
+        self.readers = readers;
+        self.channel_names = channel_names;
+        self.metas = metas;
+        self.current_series = 0;
+        Ok(())
     }
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        for r in &mut self.readers {
+            let _ = r.close();
+        }
+        self.readers.clear();
+        self.channel_names.clear();
+        self.metas.clear();
+        self.current_series = 0;
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.metas.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        if s >= self.metas.len() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
+        self.current_series = s;
+        for r in &mut self.readers {
+            let _ = r.set_series(s);
+        }
+        Ok(())
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        &self.metas[self.current_series]
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        let m = &self.metas[self.current_series];
+        let extra = 2usize.min(self.metas.len());
+        // Extra (label/macro) series: read straight from the first file.
+        if self.current_series + extra >= self.metas.len() {
+            self.readers[0].set_series(self.current_series)?;
+            return self.readers[0].open_bytes(p);
+        }
+        let nchannels = self.readers.len() as u32;
+        let channel = (p % nchannels.max(1)) as usize;
+        let inner_plane = p / nchannels.max(1);
+        let _ = m;
+        self.readers[channel].set_series(self.current_series)?;
+        self.readers[channel].open_bytes(inner_plane)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let extra = 2usize.min(self.metas.len());
+        if self.current_series + extra >= self.metas.len() {
+            self.readers[0].set_series(self.current_series)?;
+            return self.readers[0].open_bytes_region(p, x, y, w, h);
+        }
+        let nchannels = self.readers.len() as u32;
+        let channel = (p % nchannels.max(1)) as usize;
+        let inner_plane = p / nchannels.max(1);
+        self.readers[channel].set_series(self.current_series)?;
+        self.readers[channel].open_bytes_region(inner_plane, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+        self.readers[0].set_series(self.current_series)?;
+        self.readers[0].open_thumb_bytes(p)
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        self.readers
+            .first()
+            .map(|r| r.resolution_count())
+            .unwrap_or(1)
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        for r in &mut self.readers {
+            r.set_resolution(level)?;
+        }
+        Ok(())
     }
 }
 
@@ -997,7 +1254,16 @@ impl FormatReader for AfiFluorescenceReader {
 // ---------------------------------------------------------------------------
 /// Imaris TIFF format reader (`.ims`).
 ///
-/// Imaris TIFF files are valid TIFFs; delegates to `TiffReader`.
+/// Ported from the Java `ImarisTiffReader`. Bitplane Imaris 3 TIFFs store a
+/// thumbnail in the first IFD and one IFD per channel; each IFD holds a stack
+/// of tiled Z planes. The first IFD's ImageDescription carries an INI-style
+/// comment with `Description`, `Name` (channel names), `LSMEmissionWavelength`,
+/// `LSMExcitationWavelength`, and `RecordingDate`.
+///
+/// We port the comment parsing and dimension assignment (`sizeC` = number of
+/// IFDs). The per-IFD strip→Z-plane reshape that the Java reader performs is
+/// not yet replicated; pixel reads are delegated to `TiffReader` as-is, so
+/// per-channel planes are exposed at IFD granularity.
 pub struct ImarisTiffReader {
     inner: crate::tiff::TiffReader,
 }
@@ -1006,6 +1272,87 @@ impl ImarisTiffReader {
     pub fn new() -> Self {
         ImarisTiffReader {
             inner: crate::tiff::TiffReader::new(),
+        }
+    }
+
+    fn enrich_metadata(&mut self) {
+        use crate::common::metadata::MetadataValue;
+        let comment = self
+            .inner
+            .ifd(0)
+            .and_then(|ifd| ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION).map(str::to_owned));
+        let Some(comment) = comment else { return };
+        if !comment.starts_with('[') {
+            return;
+        }
+
+        let mut description: Option<String> = None;
+        let mut creation_date: Option<String> = None;
+        let mut channel_names: Vec<String> = Vec::new();
+        let mut em_wave: Vec<f64> = Vec::new();
+        let mut ex_wave: Vec<f64> = Vec::new();
+
+        for line in comment.split('\n') {
+            let Some(eq) = line.find('=') else { continue };
+            let key = line[..eq].trim();
+            let value = line[eq + 1..].trim();
+            match key {
+                "Description" => description = Some(value.to_string()),
+                "LSMEmissionWavelength" if value != "0" => {
+                    if let Ok(v) = value.parse::<f64>() {
+                        em_wave.push(v);
+                    }
+                }
+                "LSMExcitationWavelength" if value != "0" => {
+                    if let Ok(v) = value.parse::<f64>() {
+                        ex_wave.push(v);
+                    }
+                }
+                "Name" => channel_names.push(value.to_string()),
+                "RecordingDate" => {
+                    let v = value.replace(' ', "T");
+                    let trimmed = v.split('.').next().unwrap_or(&v).to_string();
+                    creation_date = Some(trimmed);
+                }
+                _ => {}
+            }
+        }
+
+        let ifd_count = self.inner.ifd_count() as u32;
+        if let Some(s) = self.inner.series_list_mut().first_mut() {
+            // sizeC equals the number of IFDs (channels), per Java.
+            if ifd_count > 0 {
+                s.metadata.size_c = ifd_count;
+                s.metadata.is_rgb = false;
+            }
+            if let Some(d) = description {
+                s.metadata
+                    .series_metadata
+                    .insert("imaris.description".into(), MetadataValue::String(d));
+            }
+            if let Some(cd) = creation_date {
+                s.metadata
+                    .series_metadata
+                    .insert("imaris.recording_date".into(), MetadataValue::String(cd));
+            }
+            for (i, name) in channel_names.iter().enumerate() {
+                s.metadata.series_metadata.insert(
+                    format!("imaris.channel.{}.name", i),
+                    MetadataValue::String(name.clone()),
+                );
+            }
+            for (i, em) in em_wave.iter().enumerate() {
+                s.metadata.series_metadata.insert(
+                    format!("imaris.channel.{}.emission", i),
+                    MetadataValue::Float(*em),
+                );
+            }
+            for (i, ex) in ex_wave.iter().enumerate() {
+                s.metadata.series_metadata.insert(
+                    format!("imaris.channel.{}.excitation", i),
+                    MetadataValue::Float(*ex),
+                );
+            }
         }
     }
 }
@@ -1028,7 +1375,9 @@ impl FormatReader for ImarisTiffReader {
         false
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path)
+        self.inner.set_id(path)?;
+        self.enrich_metadata();
+        Ok(())
     }
     fn close(&mut self) -> Result<()> {
         self.inner.close()
@@ -1235,17 +1584,230 @@ impl FormatReader for OirReader {
 // ---------------------------------------------------------------------------
 /// Olympus cellSens VSI format reader (`.vsi`).
 ///
-/// VSI files are TIFF-based with ETS companion files. Delegates to TiffReader
-/// for the base TIFF structure.
+/// Ported (partially) from the Java `CellSensReader`. The base `.vsi` is a
+/// TIFF-like container (parsed by the inner `TiffReader`). High-resolution
+/// pyramid pixels live in companion `.ets` files inside `_<name>_/<stack>/`
+/// subdirectories. This reader ports the ETS tile-index parsing: it locates the
+/// `frame_*.ets` files and reads each ETS `SIS`/`ETS` binary header to recover
+/// the tile geometry (tileX/tileY), channel count, compression type, pixel
+/// type, and the per-chunk tile-coordinate → file-offset map.
+///
+/// Pixel assembly for the ETS pyramid is only attempted for uncompressed
+/// (`RAW`) tiles whose tile coordinate has no extra (C/Z/T/resolution)
+/// dimensions, because the per-dimension ordering is stored in the VSI's
+/// proprietary tag tree (a non-OLE2 binary structure not yet parsed here).
+/// JPEG / JPEG-2000 / JPEG-lossless tiles require codecs not wired in. These
+/// limitations are recorded in series metadata under `cellsens.*`. Tag 700-style
+/// metadata and label/overview images continue to be served by the inner TIFF.
 pub struct CellSensReader {
     inner: crate::tiff::TiffReader,
+    ets: Vec<EtsVolume>,
 }
+
+/// Parsed header + tile index for one `.ets` file.
+#[derive(Debug, Clone, Default)]
+struct EtsVolume {
+    path: PathBuf,
+    n_dimensions: u32,
+    size_c: u32,
+    compression: i32,
+    tile_x: u32,
+    tile_y: u32,
+    pixel_type_code: i32,
+    /// (coordinate vector, file offset, byte count) for each used chunk.
+    tiles: Vec<(Vec<i32>, u64, u32)>,
+}
+
+const ETS_RAW: i32 = 0;
 
 impl CellSensReader {
     pub fn new() -> Self {
         CellSensReader {
             inner: crate::tiff::TiffReader::new(),
+            ets: Vec::new(),
         }
+    }
+
+    /// Locate `frame_*.ets` files in the `_<name>_/<stack>/` pixel directories
+    /// next to the `.vsi`. Mirrors the directory walk in `initFile`.
+    fn find_ets_files(vsi_path: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Some(dir) = vsi_path.parent() else { return out };
+        let stem = vsi_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let pixels_dir = dir.join(format!("_{}_", stem));
+        let Ok(stacks) = std::fs::read_dir(&pixels_dir) else { return out };
+        let mut stack_dirs: Vec<PathBuf> = stacks
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        stack_dirs.sort();
+        for stack in stack_dirs {
+            if let Ok(files) = std::fs::read_dir(&stack) {
+                let mut paths: Vec<PathBuf> = files.filter_map(|e| e.ok().map(|e| e.path())).collect();
+                paths.sort();
+                for p in paths {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                    if name.starts_with("frame_") && name.to_ascii_lowercase().ends_with(".ets") {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Parse one ETS file's volume header and tile index. Mirrors `parseETSFile`.
+    /// ETS is always little-endian.
+    fn parse_ets(path: &Path) -> Result<EtsVolume> {
+        let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let rd = |off: usize, n: usize| -> Option<&[u8]> { bytes.get(off..off + n) };
+        let u32_at = |off: usize| -> u32 {
+            rd(off, 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .unwrap_or(0)
+        };
+        let i32_at = |off: usize| -> i32 { u32_at(off) as i32 };
+        let u64_at = |off: usize| -> u64 {
+            rd(off, 8)
+                .map(|b| {
+                    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                })
+                .unwrap_or(0)
+        };
+
+        // Volume header (offset 0): "SIS" magic, then ints/longs.
+        let magic = String::from_utf8_lossy(rd(0, 4).unwrap_or(&[])).trim().to_string();
+        if magic != "SIS" {
+            return Err(BioFormatsError::Format(format!(
+                "ETS file {:?}: unexpected magic {:?}",
+                path, magic
+            )));
+        }
+        // headerSize(4) version(8) nDimensions(12) addHeaderOffset(16, long)
+        // addHeaderSize(24) reserved(28) usedChunkOffset(32, long) nUsedChunks(40)
+        let n_dimensions = u32_at(12);
+        let additional_header_offset = u64_at(16) as usize;
+        let used_chunk_offset = u64_at(32) as usize;
+        let n_used_chunks = u32_at(40) as usize;
+
+        // Additional header (additionalHeaderOffset): "ETS" magic.
+        let more_magic = String::from_utf8_lossy(rd(additional_header_offset, 4).unwrap_or(&[]))
+            .trim()
+            .to_string();
+        if more_magic != "ETS" {
+            return Err(BioFormatsError::Format(format!(
+                "ETS file {:?}: unexpected secondary magic {:?}",
+                path, more_magic
+            )));
+        }
+        // skip 4 (extra version), then pixelType(int), sizeC(int), colorspace(int),
+        // compression(int), quality(int), tileX(int), tileY(int), tileZ(int)
+        let base = additional_header_offset + 8;
+        let pixel_type_code = i32_at(base);
+        let size_c = u32_at(base + 4);
+        let compression = i32_at(base + 12);
+        let tile_x = u32_at(base + 20);
+        let tile_y = u32_at(base + 24);
+
+        // Used-chunk table at usedChunkOffset. Each entry:
+        //   skip 4; nDimensions * int coordinate; long offset; int nBytes; skip 4.
+        let mut tiles = Vec::with_capacity(n_used_chunks);
+        let mut off = used_chunk_offset;
+        for _ in 0..n_used_chunks {
+            off += 4;
+            let mut coord = Vec::with_capacity(n_dimensions as usize);
+            for _ in 0..n_dimensions {
+                coord.push(i32_at(off));
+                off += 4;
+            }
+            let tile_offset = u64_at(off);
+            off += 8;
+            let n_bytes = u32_at(off);
+            off += 4;
+            off += 4; // reserved
+            tiles.push((coord, tile_offset, n_bytes));
+        }
+
+        Ok(EtsVolume {
+            path: path.to_path_buf(),
+            n_dimensions,
+            size_c,
+            compression,
+            tile_x,
+            tile_y,
+            pixel_type_code,
+            tiles,
+        })
+    }
+
+    /// Read one RAW tile by its (col,row[,...]) coordinate from an ETS volume.
+    #[allow(dead_code)]
+    fn read_raw_tile(vol: &EtsVolume, col: i32, row: i32) -> Result<Vec<u8>> {
+        if vol.compression != ETS_RAW {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "cellSens ETS tile uses compression code {} (only RAW is decodable here)",
+                vol.compression
+            )));
+        }
+        let tile = vol
+            .tiles
+            .iter()
+            .find(|(c, _, _)| c.first() == Some(&col) && c.get(1) == Some(&row));
+        let Some((_, offset, n_bytes)) = tile else {
+            return Err(BioFormatsError::PlaneOutOfRange(0));
+        };
+        let mut reader = BufReader::new(File::open(&vol.path).map_err(BioFormatsError::Io)?);
+        read_bytes_at(&mut reader, *offset, *n_bytes as usize)
+    }
+
+    fn enrich_metadata(&mut self, vsi_path: &Path) {
+        use crate::common::metadata::MetadataValue;
+        let ets_files = Self::find_ets_files(vsi_path);
+        let mut volumes = Vec::new();
+        for f in &ets_files {
+            match Self::parse_ets(f) {
+                Ok(v) => volumes.push(v),
+                Err(_) => {}
+            }
+        }
+        if volumes.is_empty() {
+            return;
+        }
+        // Record ETS summary in the first series' metadata.
+        if let Some(s) = self.inner.series_list_mut().first_mut() {
+            s.metadata.series_metadata.insert(
+                "cellsens.ets_file_count".into(),
+                MetadataValue::Int(volumes.len() as i64),
+            );
+            for (i, v) in volumes.iter().enumerate() {
+                let p = format!("cellsens.ets.{}", i);
+                s.metadata.series_metadata.insert(
+                    format!("{p}.tile_size"),
+                    MetadataValue::String(format!("{}x{}", v.tile_x, v.tile_y)),
+                );
+                s.metadata.series_metadata.insert(
+                    format!("{p}.size_c"),
+                    MetadataValue::Int(v.size_c as i64),
+                );
+                s.metadata.series_metadata.insert(
+                    format!("{p}.compression"),
+                    MetadataValue::Int(v.compression as i64),
+                );
+                s.metadata.series_metadata.insert(
+                    format!("{p}.tile_count"),
+                    MetadataValue::Int(v.tiles.len() as i64),
+                );
+                s.metadata.series_metadata.insert(
+                    format!("{p}.dimensions"),
+                    MetadataValue::Int(v.n_dimensions as i64),
+                );
+                let _ = v.pixel_type_code;
+            }
+        }
+        self.ets = volumes;
     }
 }
 
@@ -1274,10 +1836,13 @@ impl FormatReader for CellSensReader {
                 "Olympus cellSens VSI: could not parse as TIFF (may require ETS companion files)"
                     .to_string(),
             )
-        })
+        })?;
+        self.enrich_metadata(path);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        self.ets.clear();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -1480,15 +2045,25 @@ impl FormatReader for MicroCtReader {
 // ---------------------------------------------------------------------------
 /// Bio-Rad SCN confocal format reader (`.scn`).
 ///
-/// Bio-Rad SCN confocal files are TIFF-based; delegates to `TiffReader`.
+/// Ported from the Java `BioRadSCNReader`. These `.scn` files are NOT TIFF;
+/// they are a MIME-multipart container (magic "Generated by Image Lab"). The
+/// reader walks `Content-Type`/`Content-Length`/boundary headers: an
+/// `application/octet-stream` part holds the raw little/big-endian pixel data,
+/// and `text/xml` parts describe the image (`<size_pix width=.. height=..>`,
+/// `<scanner max_value=..>` → pixel type, `<size_mm>`, `<endian>`,
+/// `<channel_count>`, gain/exposure/serial/binning/imager).
 pub struct BioRadScnReader {
-    inner: crate::tiff::TiffReader,
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    pixels_offset: u64,
 }
 
 impl BioRadScnReader {
     pub fn new() -> Self {
         BioRadScnReader {
-            inner: crate::tiff::TiffReader::new(),
+            path: None,
+            meta: None,
+            pixels_offset: 0,
         }
     }
 }
@@ -1507,41 +2082,362 @@ impl FormatReader for BioRadScnReader {
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("scn"))
     }
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Magic string "Generated by Image Lab" within the first 64 bytes.
+        let n = header.len().min(64);
+        let prefix = String::from_utf8_lossy(&header[..n]);
+        prefix.contains("Generated by Image Lab")
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path)
+        use crate::common::metadata::MetadataValue;
+        let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let text = String::from_utf8_lossy(&bytes);
+        if !text.contains("Generated by Image Lab") {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Bio-Rad SCN: missing 'Generated by Image Lab' magic".into(),
+            ));
+        }
+
+        // Walk the MIME-multipart structure to find the pixel block offset and
+        // collect text/xml blocks. We track byte offsets so the octet-stream
+        // body offset matches the on-disk pixel position.
+        let mut pixels_offset = 0u64;
+        let mut current_type = String::new();
+        let mut current_boundary = String::new();
+        let mut current_length = 0usize;
+        let mut xml_blocks: Vec<String> = Vec::new();
+
+        // Iterate over physical lines, tracking byte position.
+        let mut pos = 0usize; // byte offset of start of current line
+        let line_iter = bytes.split(|&b| b == b'\n');
+        for raw_line in line_iter {
+            // The byte offset just after this line's terminating '\n'.
+            let line_len_with_nl = raw_line.len() + 1;
+            let line = String::from_utf8_lossy(raw_line);
+            let line = line.trim_end_matches('\r').trim();
+
+            if line.starts_with("Content-Type") {
+                current_type = line[line.find(' ').map(|i| i + 1).unwrap_or(line.len())..]
+                    .to_string();
+                if let Some(b) = current_type.find("boundary") {
+                    // boundary=<value> ; value ends at trailing quote/semicolon
+                    let after = &current_type[b + "boundary".len()..];
+                    let after = after.trim_start_matches(['=', '"', ' ']);
+                    let end = after.find(['"', ';']).unwrap_or(after.len());
+                    current_boundary = after[..end].to_string();
+                }
+                if let Some(sc) = current_type.find(';') {
+                    current_type = current_type[..sc].to_string();
+                }
+                current_type = current_type.trim().to_string();
+            } else if !current_boundary.is_empty() && line == format!("--{}", current_boundary) {
+                current_length = 0;
+            } else if line.starts_with("Content-Length") {
+                current_length = line[line.find(' ').map(|i| i + 1).unwrap_or(line.len())..]
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+            } else if line.is_empty() {
+                // A blank line ends the headers of a part; its body follows.
+                let body_offset = (pos + line_len_with_nl) as u64;
+                if current_type == "application/octet-stream" {
+                    pixels_offset = body_offset;
+                } else if current_type == "text/xml" {
+                    let start = body_offset as usize;
+                    let end = (start + current_length).min(bytes.len());
+                    if start <= end {
+                        xml_blocks
+                            .push(String::from_utf8_lossy(&bytes[start..end]).into_owned());
+                    }
+                }
+            }
+            pos += line_len_with_nl;
+        }
+
+        // Parse the XML metadata blocks via the lightweight tag scanner.
+        let mut meta = ImageMetadata {
+            size_z: 1,
+            size_t: 1,
+            size_c: 1,
+            image_count: 1,
+            is_little_endian: true,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
+            ..ImageMetadata::default()
+        };
+        let mut size_mm_x: Option<f64> = None;
+        let mut size_mm_y: Option<f64> = None;
+
+        for block in &xml_blocks {
+            for tag in scn_scan_tags(block) {
+                match tag.0.as_str() {
+                    "size_pix" => {
+                        if let Some(w) = tag.1.get("width").and_then(|s| s.parse().ok()) {
+                            meta.size_x = w;
+                        }
+                        if let Some(h) = tag.1.get("height").and_then(|s| s.parse().ok()) {
+                            meta.size_y = h;
+                        }
+                    }
+                    "scanner" => {
+                        if let Some(mv) = tag.1.get("max_value").and_then(|s| s.parse::<u64>().ok())
+                        {
+                            if mv <= 256 {
+                                meta.pixel_type = PixelType::Uint8;
+                                meta.bits_per_pixel = 8;
+                            } else if mv <= 65535 {
+                                meta.pixel_type = PixelType::Uint16;
+                                meta.bits_per_pixel = 16;
+                            }
+                        }
+                    }
+                    "size_mm" => {
+                        if let Some(w) = tag.1.get("width").and_then(|s| s.parse().ok()) {
+                            size_mm_x = Some(w);
+                        }
+                        if let Some(h) = tag.1.get("height").and_then(|s| s.parse().ok()) {
+                            size_mm_y = Some(h);
+                        }
+                    }
+                    "serial_number" => {
+                        if let Some(v) = tag.1.get("value") {
+                            meta.series_metadata.insert(
+                                "biorad.serial_number".into(),
+                                MetadataValue::String(v.clone()),
+                            );
+                        }
+                    }
+                    "binning" => {
+                        if let Some(v) = tag.1.get("value") {
+                            meta.series_metadata
+                                .insert("biorad.binning".into(), MetadataValue::String(v.clone()));
+                        }
+                    }
+                    "image_date" => {
+                        if let Some(v) = tag.1.get("value") {
+                            meta.series_metadata.insert(
+                                "biorad.acquisition_date".into(),
+                                MetadataValue::String(v.clone()),
+                            );
+                        }
+                    }
+                    "imager" => {
+                        if let Some(v) = tag.1.get("value") {
+                            meta.series_metadata
+                                .insert("biorad.model".into(), MetadataValue::String(v.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Element-text values: endian, channel_count, gain, exposure, name.
+            if let Some(v) = scn_element_text(block, "endian") {
+                meta.is_little_endian = v == "little";
+            }
+            if let Some(v) = scn_element_text(block, "channel_count").and_then(|s| s.parse().ok()) {
+                meta.size_c = v;
+            }
+            if let Some(v) = scn_element_text(block, "application_gain") {
+                if let Ok(g) = v.parse::<f64>() {
+                    meta.series_metadata
+                        .insert("biorad.gain".into(), MetadataValue::Float(g));
+                }
+            }
+            if let Some(v) = scn_element_text(block, "exposure_time") {
+                if let Ok(e) = v.parse::<f64>() {
+                    meta.series_metadata
+                        .insert("biorad.exposure_time".into(), MetadataValue::Float(e));
+                }
+            }
+            if let Some(v) = scn_element_text(block, "name") {
+                meta.series_metadata
+                    .insert("biorad.image_name".into(), MetadataValue::String(v));
+            }
+        }
+
+        // Physical pixel size (mm -> um per pixel).
+        if let (Some(w), true) = (size_mm_x, meta.size_x > 0) {
+            meta.series_metadata.insert(
+                "biorad.physical_size_x".into(),
+                MetadataValue::Float(w / meta.size_x as f64 * 1000.0),
+            );
+        }
+        if let (Some(h), true) = (size_mm_y, meta.size_y > 0) {
+            meta.series_metadata.insert(
+                "biorad.physical_size_y".into(),
+                MetadataValue::Float(h / meta.size_y as f64 * 1000.0),
+            );
+        }
+
+        meta.image_count = meta.size_z.max(1) * meta.size_t.max(1);
+        self.pixels_offset = pixels_offset;
+        self.meta = Some(meta);
+        self.path = Some(path.to_path_buf());
+        Ok(())
     }
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        self.path = None;
+        self.meta = None;
+        self.pixels_offset = 0;
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        1
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.meta.as_ref().expect("set_id not called")
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if p >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(p));
+        }
+        let bpp = (meta.bits_per_pixel as usize + 7) / 8;
+        let plane = meta.size_x as usize * meta.size_y as usize * bpp;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut reader = BufReader::new(File::open(path).map_err(BioFormatsError::Io)?);
+        read_bytes_at(&mut reader, self.pixels_offset + (p as u64 * plane as u64), plane)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?.clone();
+        let bpp = (meta.bits_per_pixel as usize + 7) / 8;
+        let full = self.open_bytes(p)?;
+        let full_w = meta.size_x as usize;
+        let out_row = w as usize * bpp;
+        let mut out = Vec::with_capacity(out_row * h as usize);
+        for row in 0..h as usize {
+            let src_row = (y as usize + row) * full_w * bpp;
+            let start = src_row + x as usize * bpp;
+            let end = start + out_row;
+            if end <= full.len() {
+                out.extend_from_slice(&full[start..end]);
+            } else {
+                out.resize(out.len() + out_row, 0);
+            }
+        }
+        Ok(out)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+        self.open_bytes(p)
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        1
     }
-    fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+    fn set_resolution(&mut self, _level: usize) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Scan an XML fragment into `(tag_name, attributes)` pairs for each start tag.
+/// Minimal parser sufficient for the attribute-only Bio-Rad SCN elements.
+fn scn_scan_tags(xml: &str) -> Vec<(String, std::collections::HashMap<String, String>)> {
+    let bytes = xml.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if matches!(bytes.get(i + 1), Some(b'/') | Some(b'?') | Some(b'!')) {
+            if let Some(end) = xml[i..].find('>') {
+                i += end + 1;
+            } else {
+                break;
+            }
+            continue;
+        }
+        let mut j = i + 1;
+        let mut quote = 0u8;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if quote != 0 {
+                if c == quote {
+                    quote = 0;
+                }
+            } else if c == b'"' || c == b'\'' {
+                quote = c;
+            } else if c == b'>' {
+                break;
+            }
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let inner = xml[i + 1..j].trim_end().trim_end_matches('/');
+        let name_end = inner
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(inner.len());
+        let name = inner[..name_end].to_string();
+        let mut attrs = std::collections::HashMap::new();
+        let mut a = &inner[name_end..];
+        loop {
+            let a_trim = a.trim_start();
+            if a_trim.is_empty() {
+                break;
+            }
+            let Some(eq) = a_trim.find('=') else { break };
+            let key = a_trim[..eq].trim().to_string();
+            let rest = a_trim[eq + 1..].trim_start();
+            let rb = rest.as_bytes();
+            if rb.is_empty() {
+                break;
+            }
+            if rb[0] == b'"' || rb[0] == b'\'' {
+                let q = rb[0];
+                if let Some(close) = rest[1..].find(q as char) {
+                    let val = rest[1..1 + close].to_string();
+                    if !key.is_empty() {
+                        attrs.insert(key, val);
+                    }
+                    a = &rest[1 + close + 1..];
+                } else {
+                    break;
+                }
+            } else {
+                let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                if !key.is_empty() {
+                    attrs.insert(key, rest[..end].to_string());
+                }
+                a = &rest[end..];
+            }
+        }
+        out.push((name, attrs));
+        i = j + 1;
+    }
+    out
+}
+
+/// Return the text content of the first `<tag>...</tag>` element (no nested
+/// elements). Helper for the Bio-Rad SCN XML blocks.
+fn scn_element_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}", tag);
+    let start = xml.find(&open)?;
+    let after = &xml[start..];
+    let gt = after.find('>')?;
+    // Self-closing element has no text.
+    if after.as_bytes().get(gt.wrapping_sub(1)) == Some(&b'/') {
+        return None;
+    }
+    let body = &after[gt + 1..];
+    let end = body.find('<')?;
+    let text = body[..end].trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
     }
 }
 
@@ -1550,15 +2446,77 @@ impl FormatReader for BioRadScnReader {
 // ---------------------------------------------------------------------------
 /// 3i SlideBook TIFF export format reader (`.tif`).
 ///
-/// SlideBook TIFF exports are valid TIFFs; delegates to `TiffReader`.
+/// Ported from the Java `SlidebookTiffReader`. SlideBook TIFFs carry private
+/// tags in the first IFD: 65000/65001/65002 (X/Y/Z stage position), 65004
+/// (channel name), 65005 (objective magnification), 65007 (physical pixel
+/// size). The magic check is `Software == "SlideBook"` plus presence of one of
+/// these tags.
+///
+/// We port the single-file tag enrichment. The Java reader's multi-file
+/// grouping by timestamp (each matching `.tif` is a separate channel) is not
+/// replicated here; a single `.tif` is exposed via the inner `TiffReader`.
 pub struct SlidebookTiffReader {
     inner: crate::tiff::TiffReader,
 }
+
+const SLIDEBOOK_X_POS_TAG: u16 = 65000;
+const SLIDEBOOK_Y_POS_TAG: u16 = 65001;
+const SLIDEBOOK_Z_POS_TAG: u16 = 65002;
+const SLIDEBOOK_CHANNEL_TAG: u16 = 65004;
+const SLIDEBOOK_MAGNIFICATION_TAG: u16 = 65005;
+const SLIDEBOOK_PHYSICAL_SIZE_TAG: u16 = 65007;
 
 impl SlidebookTiffReader {
     pub fn new() -> Self {
         SlidebookTiffReader {
             inner: crate::tiff::TiffReader::new(),
+        }
+    }
+
+    fn enrich_metadata(&mut self) {
+        use crate::common::metadata::MetadataValue;
+        let mut vendor: Vec<(String, MetadataValue)> = Vec::new();
+        let mut channel_name: Option<String> = None;
+        if let Some(ifd) = self.inner.ifd(0) {
+            if let Some(name) = ifd.get_str(SLIDEBOOK_CHANNEL_TAG) {
+                // Java strips a "prefix:" and a ";suffix".
+                let mut n = name;
+                if let Some(p) = n.find(':') {
+                    n = &n[p + 1..];
+                }
+                if let Some(p) = n.find(';') {
+                    n = &n[..p];
+                }
+                channel_name = Some(n.trim().to_string());
+            }
+            if let Some(p) = ifd.get_str(SLIDEBOOK_PHYSICAL_SIZE_TAG).and_then(|s| s.trim().parse::<f64>().ok()) {
+                if p > 0.0 {
+                    vendor.push(("slidebook.physical_size_x".into(), MetadataValue::Float(p)));
+                    vendor.push(("slidebook.physical_size_y".into(), MetadataValue::Float(p)));
+                }
+            }
+            if let Some(mag) = ifd.get_str(SLIDEBOOK_MAGNIFICATION_TAG).and_then(|s| s.trim().parse::<f64>().ok()) {
+                vendor.push(("slidebook.magnification".into(), MetadataValue::Float(mag)));
+            }
+            for (tag, key) in [
+                (SLIDEBOOK_X_POS_TAG, "slidebook.position_x"),
+                (SLIDEBOOK_Y_POS_TAG, "slidebook.position_y"),
+                (SLIDEBOOK_Z_POS_TAG, "slidebook.position_z"),
+            ] {
+                if let Some(v) = ifd.get_str(tag).and_then(|s| s.trim().parse::<f64>().ok()) {
+                    vendor.push((key.into(), MetadataValue::Float(v)));
+                }
+            }
+        }
+        if let Some(s) = self.inner.series_list_mut().first_mut() {
+            if let Some(cn) = channel_name {
+                s.metadata
+                    .series_metadata
+                    .insert("slidebook.channel.0.name".into(), MetadataValue::String(cn));
+            }
+            for (k, v) in vendor {
+                s.metadata.series_metadata.insert(k, v);
+            }
         }
     }
 }
@@ -1581,7 +2539,9 @@ impl FormatReader for SlidebookTiffReader {
         false
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path)
+        self.inner.set_id(path)?;
+        self.enrich_metadata();
+        Ok(())
     }
     fn close(&mut self) -> Result<()> {
         self.inner.close()

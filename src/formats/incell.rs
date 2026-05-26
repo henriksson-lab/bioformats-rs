@@ -1,34 +1,81 @@
-//! InCell GE Healthcare HCS reader.
+//! InCell GE Healthcare HCS reader (.xdce / .xml).
 //!
-//! Detects .xdce files or .xml files that contain "<InCell" in the first 512 bytes.
-//! Parses the XML for image dimensions and companion TIFF paths.
+//! Ported from the upstream Java InCellReader. The .xdce XML describes a plate
+//! of wells, each with one or more fields, and per-plane Z/C/T structure plus
+//! companion TIFF (or .im) pixel files. Each well/field combination becomes a
+//! separate series.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use quick_xml::events::Event;
+use quick_xml::Reader as XmlReader;
+
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::ome_metadata::{
+    create_lsid, OmeChannel, OmeImage, OmeInstrument, OmeMetadata, OmeObjective, OmePlate, OmeWell,
+    OmeWellSample,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
+/// A single image plane referenced by the .xdce metadata.
+#[derive(Clone, Default)]
+struct ImagePlane {
+    filename: Option<PathBuf>,
+    is_tiff: bool,
+}
+
 pub struct InCellReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    image_files: Vec<PathBuf>,
-    current_plane: u32,
+    // One ImageMetadata per series (well/field combination).
+    series: Vec<ImageMetadata>,
+    current_series: usize,
+    // imageFiles[series][plane_index] -> ImagePlane.  Indexed in XYZCT order:
+    // plane_index = z + c*sizeZ + t*sizeZ*sizeC.
+    image_files: Vec<Vec<ImagePlane>>,
+    // Number of fields per well (used to map series -> well/field).
+    field_count: usize,
+    // List of (row,col) wells that actually appear in the plate map, in order.
+    plate_wells: Vec<(usize, usize)>,
     tiff_reader: crate::tiff::TiffReader,
     tiff_loaded: bool,
+    // Captured HCS/OME metadata (built into OmeMetadata on demand).
+    hcs: HcsMeta,
+}
+
+/// Subset of parsed metadata retained for the OME metadata store.
+#[derive(Default, Clone)]
+struct HcsMeta {
+    well_rows: usize,
+    well_cols: usize,
+    plate_name: String,
+    row_name: String,
+    col_name: String,
+    channel_names: Vec<String>,
+    em_waves: Vec<f64>,
+    ex_waves: Vec<f64>,
+    nominal_magnification: Option<f64>,
+    lens_na: Option<f64>,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    pos_x: HashMap<usize, f64>,
+    pos_y: HashMap<usize, f64>,
 }
 
 impl InCellReader {
     pub fn new() -> Self {
         InCellReader {
             path: None,
-            meta: None,
+            series: Vec::new(),
+            current_series: 0,
             image_files: Vec::new(),
-            current_plane: 0,
+            field_count: 1,
+            plate_wells: Vec::new(),
             tiff_reader: crate::tiff::TiffReader::new(),
             tiff_loaded: false,
+            hcs: HcsMeta::default(),
         }
     }
 }
@@ -39,95 +86,494 @@ impl Default for InCellReader {
     }
 }
 
-fn parse_incell_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
+#[derive(Default)]
+struct InCellMeta {
+    well_rows: usize,
+    well_cols: usize,
+    field_count: usize,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    image_width: u32,
+    image_height: u32,
+    do_z: bool,
+    do_t: bool,
+    // plateMap[row][col] = a well exists here
+    plate_map: Vec<Vec<bool>>,
+    // imageFiles[well][field][t][index]
+    image_files: Vec<Vec<Vec<Vec<Option<ImagePlane>>>>>,
+    total_images: usize,
+
+    // Metadata-store fields (mirrors the Java InCellHandler).
+    row_name: String,
+    col_name: String,
+    plate_name: String,
+    channel_names: Vec<String>,
+    em_waves: Vec<f64>,
+    ex_waves: Vec<f64>,
+    nominal_magnification: Option<f64>,
+    lens_na: Option<f64>,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    // posX/posY keyed by field index (offset_point), in reference-frame units.
+    pos_x: HashMap<usize, f64>,
+    pos_y: HashMap<usize, f64>,
+}
+
+fn attr_val(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+    for a in e.attributes().flatten() {
+        if a.key.as_ref() == name.as_bytes() {
+            return Some(String::from_utf8_lossy(&a.value).to_string());
+        }
+    }
+    None
+}
+
+fn attr_int(e: &quick_xml::events::BytesStart, name: &str) -> Option<i64> {
+    attr_val(e, name).and_then(|s| s.trim().parse::<i64>().ok())
+}
+
+fn attr_f64(e: &quick_xml::events::BytesStart, name: &str) -> Option<f64> {
+    attr_val(e, name).and_then(|s| s.trim().parse::<f64>().ok())
+}
+
+/// Parse the .xdce / .xml metadata into a usable structure (mirrors Java
+/// MinimalInCellHandler).
+fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
     let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
-    let mut width = 512u32;
-    let mut height = 512u32;
-    let mut image_files: Vec<PathBuf> = Vec::new();
+    let mut m = InCellMeta {
+        do_z: true,
+        do_t: true,
+        row_name: "A".to_string(),
+        col_name: "1".to_string(),
+        ..Default::default()
+    };
+    // Plate name = the input file name without directory or extension.
+    m.plate_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    // offset_point index counter (when no explicit index is given).
+    let mut offset_point_counter: usize = 0;
 
-    // Simple text scanning for Width/Height attributes
-    for line in content.lines() {
-        if line.contains("Width=") && line.contains("Height=") {
-            // Try to extract Width="N"
-            if let Some(w) = extract_attr(line, "Width") {
-                if let Ok(v) = w.parse() {
-                    width = v;
+    // Current parse state.
+    let mut current_image_file: Option<PathBuf> = None;
+    let mut well_row: usize = 0;
+    let mut well_col: usize = 0;
+    let mut channels_per_timepoint: Vec<u32> = Vec::new();
+    let mut n_channels: u32 = 0;
+    let mut allocated = false;
+
+    let mut reader = XmlReader::from_str(&content);
+    reader.config_mut().trim_text(false);
+
+    loop {
+        let ev = reader
+            .read_event()
+            .map_err(|e| BioFormatsError::Format(format!("InCell XML parse error: {e}")))?;
+        match ev {
+            Event::Eof => break,
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let qname = e.name();
+                let qname = qname.as_ref();
+                match qname {
+                    b"Plate" => {
+                        m.well_rows = attr_int(e, "rows").unwrap_or(0) as usize;
+                        m.well_cols = attr_int(e, "columns").unwrap_or(0) as usize;
+                        m.plate_map = vec![vec![false; m.well_cols]; m.well_rows];
+                    }
+                    b"Images" => {
+                        // imagesNumber - not strictly needed for assembly
+                    }
+                    b"Image" => {
+                        m.total_images += 1;
+                        if let Some(file) = attr_val(e, "filename") {
+                            current_image_file = Some(dir.join(file));
+                        }
+                    }
+                    b"Identifier" => {
+                        let field = attr_int(e, "field_index").unwrap_or(0) as usize;
+                        let z = attr_int(e, "z_index").unwrap_or(0) as u32;
+                        let c = attr_int(e, "wave_index").unwrap_or(0) as u32;
+                        let t = attr_int(e, "time_index").unwrap_or(0) as usize;
+
+                        // channels per timepoint is read by Java but the plane
+                        // index (with t=0) reduces to z + c*sizeZ regardless.
+                        let _channels = channels_per_timepoint
+                            .get(t)
+                            .copied()
+                            .unwrap_or(m.size_c.max(1));
+                        let size_z = m.size_z.max(1);
+                        // FormatTools.getIndex("XYZCT", ...) with z, c, t=0 => z + c*sizeZ
+                        let index = (z + c * size_z) as usize;
+
+                        let filename = current_image_file.clone();
+                        let exists = filename.as_ref().map(|p| p.exists()).unwrap_or(false);
+                        let is_tiff = filename
+                            .as_ref()
+                            .and_then(|p| p.extension())
+                            .and_then(|e| e.to_str())
+                            .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+                            .unwrap_or(false);
+                        let plane = ImagePlane {
+                            filename: if exists { filename } else { None },
+                            is_tiff,
+                        };
+
+                        if !allocated {
+                            allocate_image_files(&mut m, &channels_per_timepoint);
+                            allocated = true;
+                        }
+                        let well = well_row * m.well_cols + well_col;
+                        if let Some(w) = m.image_files.get_mut(well) {
+                            if let Some(f) = w.get_mut(field) {
+                                if let Some(tp) = f.get_mut(t) {
+                                    if let Some(slot) = tp.get_mut(index) {
+                                        *slot = Some(plane);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    b"offset_point" => {
+                        // MinimalInCellHandler counts fields; InCellHandler also
+                        // records per-field stage positions. We do both here.
+                        m.field_count += 1;
+                        let x = attr_f64(e, "x");
+                        let y = attr_f64(e, "y");
+                        let index = attr_int(e, "index").map(|v| v as usize).unwrap_or_else(|| {
+                            let i = offset_point_counter;
+                            offset_point_counter += 1;
+                            i
+                        });
+                        if let Some(x) = x {
+                            m.pos_x.insert(index, x);
+                        }
+                        if let Some(y) = y {
+                            // negate Y to flip center-origin -> top-left origin
+                            m.pos_y.insert(index, -y);
+                        }
+                    }
+                    b"TimePoint" => {
+                        if m.do_t {
+                            m.size_t += 1;
+                        }
+                    }
+                    b"Wavelength" => {
+                        let fusion = attr_val(e, "fusion_wave").unwrap_or_default();
+                        if fusion == "false" {
+                            m.size_c += 1;
+                        }
+                        if let Some(mode) = attr_val(e, "imaging_mode") {
+                            let is_3d = mode == "3-D";
+                            if m.size_c == 1 || !m.do_z {
+                                m.do_z = is_3d;
+                            }
+                        }
+                    }
+                    b"AcqWave" => {
+                        n_channels += 1;
+                    }
+                    b"ZDimensionParameters" => {
+                        if let Some(nz) = attr_int(e, "number_of_slices") {
+                            if m.do_z {
+                                m.size_z = nz as u32;
+                            } else {
+                                m.size_z = 1;
+                            }
+                        } else {
+                            m.size_z = 1;
+                        }
+                    }
+                    b"Row" => {
+                        well_row = (attr_int(e, "number").unwrap_or(1) - 1).max(0) as usize;
+                    }
+                    b"Column" => {
+                        well_col = (attr_int(e, "number").unwrap_or(1) - 1).max(0) as usize;
+                        if well_row < m.plate_map.len() && well_col < m.well_cols {
+                            m.plate_map[well_row][well_col] = true;
+                        }
+                    }
+                    b"Size" => {
+                        m.image_width = attr_int(e, "width").unwrap_or(0) as u32;
+                        m.image_height = attr_int(e, "height").unwrap_or(0) as u32;
+                    }
+                    b"NamingRows" => {
+                        if let Some(begin) = attr_val(e, "begin") {
+                            m.row_name = begin;
+                        }
+                    }
+                    b"NamingColumns" => {
+                        if let Some(begin) = attr_val(e, "begin") {
+                            m.col_name = begin;
+                        }
+                    }
+                    b"ObjectiveCalibration" => {
+                        m.nominal_magnification = attr_f64(e, "magnification");
+                        m.lens_na = attr_f64(e, "numerical_aperture");
+                        m.physical_size_x = attr_f64(e, "pixel_width");
+                        m.physical_size_y = attr_f64(e, "pixel_height");
+                    }
+                    b"ExcitationFilter" => {
+                        if let Some(w) = attr_f64(e, "wavelength") {
+                            m.ex_waves.push(w);
+                        }
+                    }
+                    b"EmissionFilter" => {
+                        if let Some(w) = attr_f64(e, "wavelength") {
+                            m.em_waves.push(w);
+                        }
+                        if let Some(name) = attr_val(e, "name") {
+                            m.channel_names.push(name);
+                        }
+                    }
+                    b"TimeSchedule" => {
+                        m.do_t = attr_val(e, "enabled")
+                            .map(|v| v == "true")
+                            .unwrap_or(true);
+                    }
+                    _ => {}
                 }
             }
-            if let Some(h) = extract_attr(line, "Height") {
-                if let Ok(v) = h.parse() {
-                    height = v;
+            Event::End(ref e) => {
+                let qname = e.name();
+                match qname.as_ref() {
+                    b"PlateMap" => {
+                        // End of the plate map: allocate the imageFiles array now,
+                        // mirroring Java MinimalInCellHandler.endElement.
+                        if m.size_t == 0 {
+                            m.size_t = 1;
+                        }
+                        if channels_per_timepoint.is_empty() {
+                            channels_per_timepoint.push(m.size_c.max(1));
+                        }
+                        allocate_image_files(&mut m, &channels_per_timepoint);
+                        allocated = true;
+                    }
+                    b"TimePoint" => {
+                        if m.do_t {
+                            channels_per_timepoint.push(n_channels);
+                            n_channels = 0;
+                        }
+                    }
+                    b"Times" => {
+                        if channels_per_timepoint.is_empty() {
+                            channels_per_timepoint.push(m.size_c.max(1));
+                        }
+                        for c in channels_per_timepoint.iter_mut() {
+                            if *c == 0 {
+                                *c = m.size_c.max(1);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if m.size_z == 0 {
+        m.size_z = 1;
+    }
+    if m.size_c == 0 {
+        m.size_c = 1;
+    }
+    if m.size_t == 0 {
+        m.size_t = 1;
+    }
+    if m.field_count == 0 {
+        m.field_count = 1;
+    }
+
+    Ok(m)
+}
+
+/// Allocate the imageFiles[well][field][t][channels*z] structure.
+fn allocate_image_files(m: &mut InCellMeta, channels_per_timepoint: &[u32]) {
+    let wells = (m.well_rows * m.well_cols).max(1);
+    let fields = m.field_count.max(1);
+    let size_t = m.size_t.max(1) as usize;
+    let size_z = m.size_z.max(1);
+    m.image_files = (0..wells)
+        .map(|_| {
+            (0..fields)
+                .map(|_| {
+                    (0..size_t)
+                        .map(|t| {
+                            let channels = channels_per_timepoint
+                                .get(t)
+                                .copied()
+                                .unwrap_or(m.size_c.max(1));
+                            vec![None; (channels * size_z) as usize]
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+}
+
+impl InCellReader {
+    /// Build the series list and a flat per-series plane lookup from parsed metadata.
+    fn build(&mut self, m: InCellMeta) -> Result<()> {
+        let size_z = m.size_z.max(1);
+        let size_c = m.size_c.max(1);
+        let size_t = m.size_t.max(1);
+
+        // Determine the ordered list of populated wells (matches getWellFromSeries).
+        let mut plate_wells: Vec<(usize, usize)> = Vec::new();
+        for row in 0..m.well_rows {
+            for col in 0..m.well_cols {
+                if m.plate_map.get(row).and_then(|r| r.get(col)).copied().unwrap_or(false) {
+                    plate_wells.push((row, col));
                 }
             }
         }
-        // Collect referenced image files
-        for attr in &["filename", "URL", "FileName"] {
-            if let Some(fname) = extract_attr(line, attr) {
-                let p = dir.join(fname);
-                if p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
-                    .unwrap_or(false)
-                {
-                    if !image_files.contains(&p) {
-                        image_files.push(p);
+        if plate_wells.is_empty() {
+            // No plate map: assume a single well at (0,0).
+            plate_wells.push((0, 0));
+        }
+        let field_count = m.field_count.max(1);
+        let series_count = plate_wells.len() * field_count;
+
+        // Determine pixel parameters from the first available TIFF plane.
+        let mut size_x = m.image_width.max(1);
+        let mut size_y = m.image_height.max(1);
+        let mut pixel_type = PixelType::Uint16;
+        let mut bits = 16u8;
+        let mut little_endian = true;
+        let mut is_tiff_first = false;
+
+        'find: for well in &m.image_files {
+            for field in well {
+                for tp in field {
+                    for plane in tp {
+                        if let Some(p) = plane {
+                            if let Some(fname) = &p.filename {
+                                if p.is_tiff {
+                                    let mut tr = crate::tiff::TiffReader::new();
+                                    if tr.set_id(fname).is_ok() {
+                                        let tm = tr.metadata();
+                                        size_x = tm.size_x;
+                                        size_y = tm.size_y;
+                                        pixel_type = tm.pixel_type;
+                                        bits = tm.bits_per_pixel;
+                                        little_endian = tm.is_little_endian;
+                                        is_tiff_first = true;
+                                        let _ = tr.close();
+                                        break 'find;
+                                    }
+                                    let _ = tr.close();
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+        let _ = is_tiff_first;
+
+        // Build per-series metadata and the flat plane lookup.
+        let mut series = Vec::with_capacity(series_count);
+        let mut image_files = Vec::with_capacity(series_count);
+        for s in 0..series_count {
+            let (well_idx, field) = series_to_well_field(s, &plate_wells, field_count, m.well_cols);
+
+            let mut meta_map = HashMap::new();
+            meta_map.insert(
+                "format".to_string(),
+                crate::common::metadata::MetadataValue::String("InCell".into()),
+            );
+            let meta = ImageMetadata {
+                size_x,
+                size_y,
+                size_z,
+                size_c,
+                size_t,
+                pixel_type,
+                bits_per_pixel: bits,
+                image_count: size_z * size_c * size_t,
+                dimension_order: DimensionOrder::XYZCT,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: little_endian,
+                resolution_count: 1,
+                series_metadata: meta_map,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            };
+            series.push(meta);
+
+            // Flatten imageFiles[well][field][t][z+c*sizeZ] into XYZCT plane order.
+            let mut planes = vec![ImagePlane::default(); (size_z * size_c * size_t) as usize];
+            if let Some(well) = m.image_files.get(well_idx) {
+                if let Some(field_planes) = well.get(field) {
+                    for t in 0..size_t {
+                        let tp = field_planes.get(t as usize);
+                        for c in 0..size_c {
+                            for z in 0..size_z {
+                                let src_index = (z + c * size_z) as usize;
+                                let dst = (z + c * size_z + t * size_z * size_c) as usize;
+                                if let Some(Some(p)) =
+                                    tp.and_then(|tp| tp.get(src_index)).map(|p| p.as_ref())
+                                {
+                                    planes[dst] = p.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            image_files.push(planes);
+        }
+
+        self.hcs = HcsMeta {
+            well_rows: m.well_rows,
+            well_cols: m.well_cols,
+            plate_name: m.plate_name.clone(),
+            row_name: m.row_name.clone(),
+            col_name: m.col_name.clone(),
+            channel_names: m.channel_names.clone(),
+            em_waves: m.em_waves.clone(),
+            ex_waves: m.ex_waves.clone(),
+            nominal_magnification: m.nominal_magnification,
+            lens_na: m.lens_na,
+            physical_size_x: m.physical_size_x,
+            physical_size_y: m.physical_size_y,
+            pos_x: m.pos_x.clone(),
+            pos_y: m.pos_y.clone(),
+        };
+
+        self.series = series;
+        self.image_files = image_files;
+        self.field_count = field_count;
+        self.plate_wells = plate_wells;
+        Ok(())
     }
-
-    if image_files.is_empty() {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "InCell XML/XDCE does not reference any companion TIFF image files".into(),
-        ));
-    }
-    let image_count = image_files.len() as u32;
-
-    let meta = ImageMetadata {
-        size_x: width,
-        size_y: height,
-        size_z: 1,
-        size_c: 1,
-        size_t: image_count,
-        pixel_type: PixelType::Uint16,
-        bits_per_pixel: 16,
-        image_count,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: true,
-        resolution_count: 1,
-        series_metadata: HashMap::new(),
-        lookup_table: None,
-        modulo_z: None,
-        modulo_c: None,
-        modulo_t: None,
-    };
-
-    Ok((meta, image_files))
 }
 
-fn extract_attr<'a>(line: &'a str, attr: &str) -> Option<&'a str> {
-    // Match attr="value" or attr='value'
-    let search = format!("{}=\"", attr);
-    if let Some(start) = line.find(&search) {
-        let rest = &line[start + search.len()..];
-        if let Some(end) = rest.find('"') {
-            return Some(&rest[..end]);
-        }
-    }
-    let search2 = format!("{}='", attr);
-    if let Some(start) = line.find(&search2) {
-        let rest = &line[start + search2.len()..];
-        if let Some(end) = rest.find('\'') {
-            return Some(&rest[..end]);
-        }
-    }
-    None
+/// Map a flat series index to (well array index, field), matching Java
+/// getWellFromSeries / getFieldFromSeries for the uniform case.
+fn series_to_well_field(
+    series: usize,
+    plate_wells: &[(usize, usize)],
+    field_count: usize,
+    well_cols: usize,
+) -> (usize, usize) {
+    let well_ordinal = series / field_count;
+    let field = series % field_count;
+    let (row, col) = plate_wells
+        .get(well_ordinal)
+        .copied()
+        .unwrap_or((0, 0));
+    (row * well_cols.max(1) + col, field)
 }
 
 impl FormatReader for InCellReader {
@@ -139,7 +585,6 @@ impl FormatReader for InCellReader {
         if matches!(ext.as_deref(), Some("xdce")) {
             return true;
         }
-        // For .xml, check content
         if matches!(ext.as_deref(), Some("xml")) {
             if let Ok(data) = std::fs::read(path) {
                 let snippet = std::str::from_utf8(&data[..data.len().min(512)]).unwrap_or("");
@@ -155,18 +600,30 @@ impl FormatReader for InCellReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (meta, image_files) = parse_incell_xml(path)?;
+        let m = parse_incell_xml(path)?;
+        if m.total_images == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "InCell XML/XDCE does not reference any companion TIFF image files".into(),
+            ));
+        }
+        self.build(m)?;
+        if self.series.is_empty() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "InCell XML/XDCE produced no series".into(),
+            ));
+        }
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.image_files = image_files;
+        self.current_series = 0;
         self.tiff_loaded = false;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
+        self.series.clear();
         self.image_files.clear();
+        self.current_series = 0;
+        self.hcs = HcsMeta::default();
         if self.tiff_loaded {
             let _ = self.tiff_reader.close();
             self.tiff_loaded = false;
@@ -175,41 +632,72 @@ impl FormatReader for InCellReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.series.len().max(1)
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if s >= self.series_count() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.series
+            .get(self.current_series)
+            .expect("set_id not called")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
+        let plane_bytes =
+            meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample();
 
-        let Some(tiff_path) = self.image_files.get(plane_index as usize).cloned() else {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        let plane = self
+            .image_files
+            .get(self.current_series)
+            .and_then(|p| p.get(plane_index as usize))
+            .cloned()
+            .unwrap_or_default();
+
+        let Some(tiff_path) = plane.filename else {
+            // Missing plane: return zero-filled (Java returns the unmodified buffer).
+            return Ok(vec![0u8; plane_bytes]);
         };
-        if self.tiff_loaded {
-            let _ = self.tiff_reader.close();
+
+        if plane.is_tiff {
+            if self.tiff_loaded {
+                let _ = self.tiff_reader.close();
+            }
+            self.tiff_reader.set_id(&tiff_path)?;
+            self.tiff_loaded = true;
+            return self.tiff_reader.open_bytes(0);
         }
-        self.tiff_reader.set_id(&tiff_path)?;
-        self.tiff_loaded = true;
-        self.current_plane = plane_index;
-        self.tiff_reader.open_bytes(0)
+
+        // .im files: pixel data after a 128-byte header.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&tiff_path).map_err(BioFormatsError::Io)?;
+        let len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        let mut buf = vec![0u8; plane_bytes];
+        if len > plane_bytes as u64 {
+            f.seek(SeekFrom::Start(128)).map_err(BioFormatsError::Io)?;
+            let available = (len - 128).min(plane_bytes as u64) as usize;
+            f.read_exact(&mut buf[..available])
+                .map_err(BioFormatsError::Io)?;
+        }
+        Ok(buf)
     }
 
     fn open_bytes_region(
@@ -221,7 +709,7 @@ impl FormatReader for InCellReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
+        let meta = self.series.get(self.current_series).unwrap();
         let bps = meta.pixel_type.bytes_per_sample();
         let row = meta.size_x as usize * bps;
         let out_row = w as usize * bps;
@@ -234,11 +722,154 @@ impl FormatReader for InCellReader {
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    /// Build the OME HCS metadata: one Plate with Wells/WellSamples mapping each
+    /// series (well/field combination) to an Image, plus per-image channel and
+    /// physical-size metadata. Mirrors `InCellReader.populateMetadataStore`.
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        if self.series.is_empty() {
+            return None;
+        }
+        let h = &self.hcs;
+        let series_count = self.series.len();
+        let field_count = self.field_count.max(1);
+        let well_cols = h.well_cols.max(1);
+
+        // A single instrument with one objective is shared by all images when
+        // the objective calibration was present (mirrors Java InCellReader).
+        let has_objective = h.nominal_magnification.is_some() || h.lens_na.is_some();
+        let instruments = if has_objective {
+            vec![OmeInstrument {
+                id: Some(create_lsid("Instrument", &[0])),
+                objectives: vec![OmeObjective {
+                    id: Some(create_lsid("Objective", &[0, 0])),
+                    nominal_magnification: h.nominal_magnification,
+                    lens_na: h.lens_na,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }]
+        } else {
+            Vec::new()
+        };
+
+        // Per-series OmeImage (name, physical size, channels).
+        let mut images: Vec<OmeImage> = Vec::with_capacity(series_count);
+        let size_c = self.series.first().map(|m| m.size_c).unwrap_or(1) as usize;
+        for s in 0..series_count {
+            let well_ordinal = s / field_count;
+            let field = s % field_count;
+            let (well_row, well_col) = h_well_coords(self, well_ordinal);
+
+            // Well label, mirroring the Java row/column naming logic.
+            let row_label = format_well_label(&h.row_name, well_row);
+            let col_label = format_well_label(&h.col_name, well_col);
+            let name = format!("Well {}-{}, Field #{}", row_label, col_label, field + 1);
+
+            let mut channels = Vec::with_capacity(size_c);
+            for q in 0..size_c {
+                channels.push(OmeChannel {
+                    name: h.channel_names.get(q).cloned(),
+                    samples_per_pixel: 1,
+                    color: None,
+                    emission_wavelength: h.em_waves.get(q).copied(),
+                    excitation_wavelength: h.ex_waves.get(q).copied(),
+                });
+            }
+
+            images.push(OmeImage {
+                name: Some(name),
+                physical_size_x: h.physical_size_x.filter(|&v| v > 0.0),
+                physical_size_y: h.physical_size_y.filter(|&v| v > 0.0),
+                channels,
+                instrument_ref: if has_objective { Some(0) } else { None },
+                objective_ref: if has_objective { Some(0) } else { None },
+                ..Default::default()
+            });
+        }
+
+        // Build the Plate -> Wells -> WellSamples structure.
+        // Wells are indexed by their ordinal in plate_wells (the populated wells).
+        let mut wells: Vec<OmeWell> = Vec::with_capacity(self.plate_wells.len());
+        for (well_ordinal, &(well_row, well_col)) in self.plate_wells.iter().enumerate() {
+            let mut well_samples = Vec::with_capacity(field_count);
+            for field in 0..field_count {
+                let series = well_ordinal * field_count + field;
+                if series >= series_count {
+                    continue;
+                }
+                well_samples.push(OmeWellSample {
+                    id: Some(create_lsid("WellSample", &[0, well_ordinal, field])),
+                    index: series as u32,
+                    image_ref: Some(series),
+                    position_x: h.pos_x.get(&field).copied(),
+                    position_y: h.pos_y.get(&field).copied(),
+                });
+            }
+            wells.push(OmeWell {
+                id: Some(create_lsid("Well", &[0, well_ordinal])),
+                row: well_row as u32,
+                column: well_col as u32,
+                well_samples,
+            });
+        }
+        let _ = well_cols;
+
+        let plate = OmePlate {
+            id: Some(create_lsid("Plate", &[0])),
+            name: if h.plate_name.is_empty() {
+                None
+            } else {
+                Some(h.plate_name.clone())
+            },
+            rows: h.well_rows as u32,
+            columns: h.well_cols as u32,
+            wells,
+        };
+
+        Some(OmeMetadata {
+            images,
+            instruments,
+            plates: vec![plate],
+            ..Default::default()
+        })
+    }
+}
+
+/// Coordinates of the n-th populated well (matches `plate_wells` ordering).
+fn h_well_coords(reader: &InCellReader, well_ordinal: usize) -> (usize, usize) {
+    reader
+        .plate_wells
+        .get(well_ordinal)
+        .copied()
+        .unwrap_or((0, 0))
+}
+
+/// Format a well row/column label from a naming string such as "A" or "1",
+/// offset by `index`. Mirrors the Java InCellReader naming logic: the last
+/// character is treated as the base; if it is a digit, add `index`
+/// numerically, otherwise advance the character.
+fn format_well_label(naming: &str, index: usize) -> String {
+    if naming.is_empty() {
+        return (index + 1).to_string();
+    }
+    let last = naming.chars().last().unwrap();
+    let prefix: String = naming.chars().take(naming.chars().count() - 1).collect();
+    if last.is_ascii_digit() {
+        let base = last.to_digit(10).unwrap() as usize;
+        format!("{}{}", prefix, index + base)
+    } else {
+        let ch = (last as u8).wrapping_add(index as u8) as char;
+        format!("{}{}", prefix, ch)
     }
 }

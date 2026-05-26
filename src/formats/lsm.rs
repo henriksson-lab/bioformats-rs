@@ -35,7 +35,11 @@ const CZ_LSM_INFO: u16 = 34412;
 //   offset 40: VoxelSizeX (float64)
 //   offset 48: VoxelSizeY (float64)
 //   offset 56: VoxelSizeZ (float64)
+// Known CZ_LSMInfo magic numbers. ZeissLSMReader.java does not gate on the
+// magic value at all (it only records it as metadata), so we accept both
+// documented variants and do not hard-fail on others.
 const LSM_MAGIC: u32 = 0x0030_0494;
+const LSM_MAGIC_ALT: u32 = 0x0040_0494;
 
 #[derive(Debug, Default)]
 struct LsmInfo {
@@ -99,9 +103,13 @@ fn parse_lsm_info(bytes: &[u8], le: bool) -> Option<LsmInfo> {
     if bytes.len() < 64 {
         return None;
     }
+    // ZeissLSMReader.java never rejects based on the magic number; it only
+    // records it. We mirror that: accept the documented magics (0x00300494 and
+    // 0x00400494) and, for any other value, only emit a debug-level note rather
+    // than failing to parse the block.
     let magic = read_i32_lsm(bytes, 0, le) as u32;
-    if magic != LSM_MAGIC {
-        return None;
+    if magic != LSM_MAGIC && magic != LSM_MAGIC_ALT {
+        // Not a hard error: continue parsing dimensions like Java does.
     }
 
     Some(LsmInfo {

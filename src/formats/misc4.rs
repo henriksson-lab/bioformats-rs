@@ -249,15 +249,17 @@ impl FormatReader for AplReader {
 // ---------------------------------------------------------------------------
 // 2. ARF format — raw uint16 heuristic
 // ---------------------------------------------------------------------------
-/// ARF binary format reader (`.arf`).
+/// Axon Raw Format (ARF) reader (`.arf`).
 ///
-/// Attempts to read the file as raw uint16 data. Guesses square dimensions
-/// from the file size. If the file size does not correspond to a valid image,
-/// returns an error.
+/// Reads the real file header per the upstream Java ARFReader:
+/// 2 endianness bytes, "AR" signature, then version/width/height/bitsPerPixel
+/// as unsigned shorts. Pixel data begins at `PIXELS_OFFSET` (524).
 pub struct ArfReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
 }
+
+const ARF_PIXELS_OFFSET: u64 = 524;
 
 impl ArfReader {
     pub fn new() -> Self {
@@ -283,48 +285,92 @@ impl FormatReader for ArfReader {
         matches!(ext.as_deref(), Some("arf"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // 2 endianness bytes followed by the "AR" signature.
+        if header.len() < 4 {
+            return false;
+        }
+        let valid_endian = (header[0] == 1 && header[1] == 0)
+            || (header[0] == 0 && header[1] == 1);
+        valid_endian && &header[2..4] == b"AR"
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file_len = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
-        if file_len % 2 != 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "ARF raw uint16 payload has an odd byte length".to_string(),
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let mut hdr = [0u8; 12];
+        f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
+
+        // Determine endianness from the first two bytes.
+        let little = if hdr[0] == 1 && hdr[1] == 0 {
+            true
+        } else if hdr[0] == 0 && hdr[1] == 1 {
+            false
+        } else {
+            return Err(BioFormatsError::InvalidData(
+                "ARF: undefined endianness".to_string(),
+            ));
+        };
+
+        if &hdr[2..4] != b"AR" {
+            return Err(BioFormatsError::InvalidData(
+                "ARF: missing 'AR' signature".to_string(),
             ));
         }
 
-        // Assume raw uint16 data; guess square dimensions
-        let n_pixels = file_len / 2;
-        if n_pixels == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "ARF file is empty".to_string(),
-            ));
-        }
-        let side = (n_pixels as f64).sqrt() as u32;
-        let (w, h) = if side > 0 && (side as u64 * side as u64) == n_pixels {
-            (side, side)
+        let read_u16 = |b: &[u8]| -> u32 {
+            if little {
+                u16::from_le_bytes([b[0], b[1]]) as u32
+            } else {
+                u16::from_be_bytes([b[0], b[1]]) as u32
+            }
+        };
+
+        let version = read_u16(&hdr[4..6]);
+        let width = read_u16(&hdr[6..8]);
+        let height = read_u16(&hdr[8..10]);
+        let bits_per_pixel = read_u16(&hdr[10..12]);
+
+        // For version 2, the image count follows; otherwise a single image.
+        let num_images = if version == 2 {
+            let mut nb = [0u8; 2];
+            f.read_exact(&mut nb).map_err(BioFormatsError::Io)?;
+            read_u16(&nb).max(1)
         } else {
-            // Non-square: treat as single row
-            (n_pixels as u32, 1u32)
+            1
+        };
+
+        // pixelTypeFromBytes(bpp, false, false): unsigned integer of bpp bytes.
+        let mut bpp = bits_per_pixel / 8;
+        if bits_per_pixel % 8 != 0 {
+            bpp += 1;
+        }
+        let pixel_type = match bpp {
+            1 => PixelType::Uint8,
+            2 => PixelType::Uint16,
+            4 => PixelType::Uint32,
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "ARF: unsupported bits per pixel {}",
+                    bits_per_pixel
+                )))
+            }
         };
 
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
-            size_x: w,
-            size_y: h,
+            size_x: width,
+            size_y: height,
             size_z: 1,
             size_c: 1,
-            size_t: 1,
-            pixel_type: PixelType::Uint16,
-            bits_per_pixel: 16,
-            image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
+            size_t: num_images,
+            pixel_type,
+            bits_per_pixel: bits_per_pixel as u8,
+            image_count: num_images,
+            dimension_order: DimensionOrder::XYCZT,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: true,
+            is_little_endian: little,
             resolution_count: 1,
             series_metadata: HashMap::new(),
             lookup_table: None,
@@ -369,6 +415,10 @@ impl FormatReader for ArfReader {
         let n_bytes = checked_plane_len(meta)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(
+            ARF_PIXELS_OFFSET + plane_index as u64 * n_bytes as u64,
+        ))
+        .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)

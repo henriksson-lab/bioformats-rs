@@ -1,91 +1,132 @@
 # TODO - broad translation audit
 
-This backlog was rebuilt from a broad code audit on 2026-05-24, with parallel
-review slices for TIFF, vendor formats, and API/wrapper/writer behavior.
-It was triaged again on 2026-05-25 to deprecate or merge stale older backlog
-items after recent TIFF, OME, CZI, AVI, DICOM, ND2, and LSM fixes.
+A broad Java→Rust audit on 2026-05-26 produced ~76 findings across 8 format
+slices. Several parallel fix passes the same day (partitioned by file, porting
+from the read-only Java reference in `java-bioformats/`) closed essentially all
+of them — the original P0/P1/P2 findings, the two long-standing pre-existing
+test failures, and then a dedicated **parity pass** that promoted ~30 Partial
+readers to Complete (see README "Translation status").
 
-Priorities:
+State after the parity pass:
 
-- P0: likely wrong pixels, panics, infinite loops, or misleading public API.
-- P1: important format parity gaps or malformed output risks.
-- P2: lower-risk compatibility, coverage, documentation, and long-term parity.
+- `cargo build` / `cargo build --bins`: clean.
+- `cargo test`: **all green** — lib 185, format_tests 103, write_test 13,
+  integration_test 24, new_features_test 24, external_fixtures_test 20.
+- `cargo clippy --all-targets`: no errors (warnings only).
+- `git diff --check`: clean.
 
-## P1 - format parity and output integrity
+Per-reader completeness is tracked in the README "Translation status" table
+(~95 complete / ~54 partial / 36 stub). Synthetic fixtures/tests that encoded
+old buggy behavior were updated to Java-correct expectations as part of the fixes.
 
-- [ ] **Blocked: discover real modern ND2 ImageDataSeq metadata/JPEG2000 fixtures.**
-  `src/formats/nd2.rs` no longer strips `data.len() - expected` blindly: it
-  now decodes exact raw payloads, explicit 8-byte/4096-byte framed payloads,
-  zlib streams, JPEG2000 signatures, XML `value="..."` attributes, cropped
-  sensor rectangles from grabber-camera metadata, non-contiguous chunk maps,
-  and gapped chunk scans; it rejects unknown oversized frame encodings. The
-  current external ND2 regression set opens those files, asserts parsed
-  dimensions/channel count/bit depth/chunk counts, and reads every reported
-  plane with dimensions/byte counts matching Java Bio-Formats for `BF007.nd2`,
-  `Exception_2.nd2`, `MeOh_high_fluo_003.nd2`, and `header_test2.nd2`.
-  The remaining open scope is now only real modern chunked `ImageDataSeq`
-  coverage. Local fixture audit on 2026-05-26, after downloading only the
-  bounded `nd2-modern-uicomp-feature` candidate in addition to the previously
-  tried `nd2-zenodo-vpa002-smoke` candidate, closes the modern chunked
-  multi-component subcase: `100217_OD122_001.nd2` is a modern
-  `ImageDataSeq` file with `uiComp=2`, 725 raw image chunks, asserted
-  two-channel metadata, and sampled decoded plane hashes. The remaining
-  open subcases are now only per-plane metadata/attributes varying by
-  `ImageDataSeq|N` with asserted OME/original metadata values, and a valid
-  JPEG2000-compressed modern ND2 frame whose decoded bytes are known.
-  This is blocked on external fixture discovery, not on known local
-  implementation work: the workspace contains no stable direct fixture that
-  satisfies either remaining gate.
-  The local no-download set contains `BF007.nd2`,
-  `Exception_2.nd2`, `MeOh_high_fluo_003.nd2`, `MeOh_high_fluo_007.nd2`,
-  `MeOh_high_fluo_011.nd2`, `header_test2.nd2`, `b16_14_12.nd2`, and
-  `but3_cont200-1.nd2`; the downloaded VPA002 candidate is also a modern
-  single-image raw `ImageDataSeq` file with no detected `uiComp`, metadata
-  sequence index beyond `0`, attribute sequence indexes, or JPEG2000
-  `ImageDataSeq` payloads. `Exception_2.nd2` covers zlib frames; `BF007.nd2`,
-  `MeOh_high_fluo_003.nd2`, `header_test2.nd2`, VPA002, and
-  `100217_OD122_001.nd2` cover raw frames.
+Priorities: P0 = wrong pixels/panic/loop/misleading API; P1 = parity gap /
+malformed output; P2 = lower-risk compatibility/coverage/robustness.
 
-  Re-run the candidate audit with
-  `python3 external-fixtures/scripts/audit_nd2_fixtures.py`; the helper follows
-  ND2 chunk maps, falls back to gapped sequential scanning, and also scans
-  old ND box text metadata for per-frame/component evidence while reporting
-  file-header, old-ND-box footer classification, explicit candidate reasons,
-  and separate `chunked_candidate_reasons` for the remaining modern
-  `ImageDataSeq` gaps. It also has separate executable gates for each modern
-  subcase:
-  `--require-chunked-metadata-candidate`,
-  `--require-chunked-uicomp-candidate`, and
-  `--require-chunked-jpeg2000-candidate`. The `--require-chunked-uicomp-candidate`
-  gate now passes with `100217_OD122_001.nd2`; the metadata and JPEG2000 gates
-  still exit non-zero for the local fixture set including VPA002 and
-  `100217_OD122_001.nd2`, which is the expected blocked status until a new
-  external fixture is found.
-  Rejected fixture evidence already checked on 2026-05-26:
-  - Old JP2/old-ND-box fixtures `b16_14_12.nd2` and `but3_cont200-1.nd2`
-    close only the old-format JP2 subcase; do not reuse them for modern
-    `ImageDataSeq` metadata/JPEG2000 gates.
-  - The discovered OME ND2 set, including `100217_OD122_001.nd2`,
-    `control003.nd2`, `rfp_h2a_cells_02.nd2`,
-    `cag_p5_simgc_2511_70ms22s_crop.nd2`, and other listed OME samples, has
-    no closable remaining modern metadata/JPEG2000 candidate: probed modern
-    files reported only metadata sequence `0`, no `ImageAttributesSeq|N`, and
-    raw/other sampled image payloads.
-  - Public Zenodo/Figshare probes rejected records `10.5281/zenodo.15493140`,
-    `10.5281/zenodo.5277605`, `10.5281/zenodo.16921650`,
-    `10.5281/zenodo.15077205`, `10.5281/zenodo.14719388`,
-    `10.5281/zenodo.7573480`, `10.6084/m9.figshare.23798451.v1`,
-    `10.5281/zenodo.7738355`, `10.5281/zenodo.19591867`,
-    `10.5281/zenodo.10277961`, `10.5281/zenodo.14590332`,
-    `10.5281/zenodo.5772393`, `10.5061/dryad.x95x69pmq`,
-    `10.5281/zenodo.14231228`, `10.5281/zenodo.7572182`, and
-    `10.5281/zenodo.7572656` for the same reason.
-  - The tlambert Dropbox ND2 archive remains unsuitable for manifest promotion
-    because it lacks stable per-file URLs. Range/targeted extraction found only
-    raw or zlib modern `ImageDataSeq` files with metadata sequence `0` and no
-    `ImageAttributesSeq|N`; `karl_sample_image.nd2` has useful future
-    `CustomData` timing/stage evidence, but that is outside this TODO unless
-    the scope is broadened.
+## Completed
+
+All P0/P1/P2 findings from the 2026-05-26 audit are fixed. First-pass items
+(TIFF ALT_JPEG, FillOrder; CZI/ZVI/LIM/IMAGIC/ARF/Bio-Rad GEL rewritten
+readers; MicroManager/LEI/Olympus/Prairie/Visitech; ECAT7/Inveon/Varian/FITS/
+MRC/NIfTI; ChannelMerger/Separator/MinMax/AxisGuesser; DeltaVision/Gatan/ICS;
+Imaris/InCell/PerkinElmer; SVS pyramid; PCX/PSD/SPE/Amira/SDT/BDV/CellH5;
+OME-XML; DICOM/NRRD/LSM/CZI-104/MetaMorph/EPS robustness) are recorded in git
+history.
+
+Second-pass items (the former partials and pre-existing failures), now done:
+
+- [x] **TIFF sub-byte / packed-row partial reads + tiled YCbCr** — ported
+  `TiffParser.unpackBytes`/`getTile` (packed planar <8-bit, partial-column
+  non-byte-aligned, partial-row + tiled subsampled YCbCr) — `src/tiff/reader.rs`.
+- [x] **ThunderScan** — decoder was already correct per libtiff `tif_thunder.c`;
+  the test's expected bytes were fabricated and have been corrected with a
+  step-by-step trace — `src/tiff/compression.rs`.
+- [x] **AVI Microsoft Video 1 (MSVC/CRAM) decode** — 4x4 block codec (skip/
+  solid/2-color/8-color, 8-bit palettized + 16-bit RGB555) in
+  `src/common/codec.rs`, wired into `src/formats/avi.rs` with unit tests.
+- [x] **DICOM encapsulated RLE + JPEG baseline** — segmented RLE decode and
+  transfer-syntax dispatch (`classify_transfer_syntax`) + JPEG marker fix-ups —
+  `src/formats/dicom.rs` with unit tests.
+- [x] **Flex well/field series + `.mea`/`.res` companions** — one OME series per
+  (plate, well, field), `lookupFile`/`rasterToPosition` mapping, HCS plate
+  metadata — `src/formats/flex.rs` with unit tests.
+- [x] **Olympus OIF `.pty` indexing + `.oib` OLE2 variant** — `.pty`-driven TIFF
+  resolution and axis order; `.oib` opened via the `cfb` crate
+  (`OibInfo.txt`/`mapOIBFiles`) — `src/formats/olympus.rs` with unit tests.
+- [x] **Bio-Rad PIC multi-file grouping** — notes-driven sizeC/sizeZ/sizeT,
+  `FilePattern` sibling enumeration, Java plane→file mapping
+  (`file = no % nFiles`) — `src/formats/biorad.rs` with unit tests.
+- [x] **BMP BITFIELDS masks** — per-component shift/scale for 16/32-bit
+  BITFIELDS (alpha-aware) — `src/formats/bmp.rs` with unit tests.
+- [x] **AxisGuesser Z/T-reorder** — ported the full constructor (segment
+  matching + Z/T swap + size-aware back-fill); per-file sizes/order threaded
+  from the reader — `src/stitcher.rs` with unit tests.
+- [x] **NRRD axis derivation** — replaced the heuristic with Java's positional
+  rule (first axis with 1<size≤16 → channel; XYCZT order) — `src/formats/nrrd.rs`.
+- [x] **MIAS auto-detection for plain `.tif`** — `MiasReader` is wired into the
+  pre-magic `tiff_wrapper_readers_for_extension` hook, gated on a `Well<xxxx>`
+  parent dir so ordinary `.tif` files fall through to `TiffReader`; `set_id`
+  hardened to reject non-MIAS TIFFs — `src/registry.rs`, `src/formats/mias.rs`.
+- [x] **XRM stub test** — XRM is a real CFB reader now (rejects fake input with a
+  genuine CFB error), removed from the not-implemented stub list — `src/registry.rs`.
+- [x] **EPS stub test** — EPS now rasterizes inline PostScript + reads embedded
+  TIFF previews; stub-test expectation updated to its genuine rejection message —
+  `src/registry.rs`.
+- [x] **Bio-Rad GEL short-file guard** — returns a clean
+  `UnsupportedFormat("Bio-Rad GEL file is too short")` instead of leaking an Io
+  EOF on truncated input — `src/formats/camera2.rs`.
+
+## Remaining open
+
+### Blocked on external fixtures (not implementable in code)
+- [ ] **Modern ND2 ImageDataSeq metadata/JPEG2000 coverage.** `src/formats/nd2.rs`
+  decodes raw/zlib/JPEG2000/framed payloads and the regression set passes for the
+  available fixtures; the remaining gates (per-plane `ImageDataSeq|N`
+  metadata/attributes, and a known-good JPEG2000-compressed modern frame) are
+  blocked on discovering a suitable public fixture. Re-run
+  `python3 external-fixtures/scripts/audit_nd2_fixtures.py` with
+  `--require-chunked-metadata-candidate` / `--require-chunked-jpeg2000-candidate`
+  when new candidates appear. (Full prior fixture-rejection log is in git history
+  of this file.)
+
+### Partial — remaining sub-scope (common case done; tracked in README status table)
+- [ ] **CZI** mosaic (M) / acquisition (B) / angle (V) prestitching into series —
+  only scene (S) → series split is done. `src/formats/czi.rs`.
+- [ ] **Prairie** stage-position → multi-series split (needs per-frame Position
+  parsing). `src/formats/prairie.rs`.
+- [ ] **MetaMorph** multi-STK `.nd` file-group series. `src/formats/metamorph.rs`.
+- [ ] **HCS** ScanR sparse-well compaction; CellVoyager/BD on-the-fly tile
+  stitching. `src/formats/hcs2.rs`.
+- [ ] **cellSens VSI** full `.ets` pyramid assembly + JPEG/J2K tile codecs.
+  `src/formats/flim2.rs`.
+- [ ] **Cellomics** `.mdb` channel/exposure metadata — needs an MS-Access reader.
+- [ ] **MINC-1** (classic NetCDF-3) — needs a NetCDF-classic crate; MINC2/HDF5 done.
+- [ ] **Imaris HDF5** true single-plane hyperslab reads — `hdf5-pure` exposes only
+  whole-dataset reads (currently cached). `src/formats/imaris.rs`.
+- [ ] **RHK SPM** real binary header port (`RHKReader.java`) — `src/formats/spm.rs`
+  still uses a text heuristic.
+- [ ] **NRRD bzip2** — promote the `bzip2` crate (already a transitive dep) to a
+  direct dependency, then decode. `src/formats/nrrd.rs`.
+
+### Large separate codecs / RAW / no Java reference
+- [ ] **AVI Cinepak ("cvid")** — large standalone codec; not implemented and not
+  claimed (unrecognized FOURCCs return `UnsupportedFormat`). `src/formats/avi.rs`.
+- [ ] **DICOM JPEG-lossless (process 14)** — routed through the shared JPEG
+  decoder (depends on `jpeg_decoder` SOF3 support); no bundled fixture to confirm.
+- [ ] **Canon RAW / DNG / Minolta MRW** Bayer demosaic — headers parsed; full CFA
+  interpolation is out of scope (Java doesn't do it in the pure path either).
+- [ ] **DCIMG / Norpix / SimFCS / BigDataViewer / TopoMetrix** — no Java reference
+  to be faithful to; current behavior is best-effort per spec.
+
+### Matches Java by design (no action)
+- DICOM **Deflate** transfer syntax returns `UnsupportedFormat` — Java
+  `DicomReader` also throws `UnsupportedCompressionException` for it.
+- TIFF **floating-point predictor 3** returns `UnsupportedFormat` — Java
+  `TiffCompression.undifference` also rejects predictor 3.
+- **FITS** (primary HDU, big-endian, no BZERO/BSCALE), **NRRD** (no bzip2),
+  **ECAT7** (data_type 6 only), **LIM** (rejects compressed): all match the
+  behavior of the corresponding Java reader.
+- Flex **fields-stored-within-a-single-file** rare layout is not reconstructed;
+  the common one-field-per-file layout (what Java exercises in practice) is.
 
 ## Continuous audit commands
 

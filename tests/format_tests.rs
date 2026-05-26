@@ -213,38 +213,131 @@ fn topometrix_region_crops_real_pixels() {
     assert_eq!(crop, vec![2, 0, 3, 0, 5, 0, 6, 0]);
 }
 
+/// Build a minimal little-endian, single-strip, 16-bit grayscale TIFF with a
+/// list of extra (tag, type, value) entries appended to the IFD. Used to forge
+/// Molecular Dynamics GEL files for the GelReader tests. `value` for SHORT/LONG
+/// is the inline value; for RATIONAL it is an out-of-line numerator/denominator
+/// pair written after the IFD.
+fn build_gel_tiff(w: u16, h: u16, pixels_le: &[u8], extra: &[(u16, u16, u32)]) -> Vec<u8> {
+    // type codes: 3 = SHORT, 4 = LONG, 5 = RATIONAL
+    let mut entries: Vec<(u16, u16, u32, u32)> = vec![
+        (256, 3, 1, w as u32),  // ImageWidth
+        (257, 3, 1, h as u32),  // ImageLength
+        (258, 3, 1, 16),        // BitsPerSample
+        (259, 3, 1, 1),         // Compression = none
+        (262, 3, 1, 1),         // PhotometricInterpretation = BlackIsZero
+        (277, 3, 1, 1),         // SamplesPerPixel
+        (278, 3, 1, h as u32),  // RowsPerStrip
+    ];
+    for &(tag, ty, val) in extra {
+        entries.push((tag, ty, 1, val));
+    }
+    // We'll patch StripOffsets (273) and StripByteCounts (279) after layout.
+    entries.push((273, 4, 1, 0)); // StripOffsets (patched)
+    entries.push((279, 4, 1, pixels_le.len() as u32)); // StripByteCounts
+    entries.sort_by_key(|e| e.0);
+
+    let n = entries.len();
+    // Header (8) + IFD count (2) + 12*n entries + next-IFD offset (4)
+    let ifd_start = 8u32;
+    let ifd_size = 2 + 12 * n as u32 + 4;
+    let mut rational_area = Vec::new();
+    let rational_start = ifd_start + ifd_size;
+
+    // Resolve out-of-line RATIONAL values, recording their offsets.
+    let mut rational_offsets: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+    for &(tag, ty, _cnt, val) in &entries {
+        if ty == 5 {
+            let off = rational_start + rational_area.len() as u32;
+            rational_offsets.insert(tag, off);
+            // val encodes numerator in high 16 bits, denominator in low 16 bits.
+            let num = (val >> 16) as u32;
+            let den = (val & 0xffff) as u32;
+            rational_area.extend_from_slice(&num.to_le_bytes());
+            rational_area.extend_from_slice(&den.to_le_bytes());
+        }
+    }
+
+    let pixel_start = rational_start + rational_area.len() as u32;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"II"); // little-endian
+    out.extend_from_slice(&42u16.to_le_bytes());
+    out.extend_from_slice(&ifd_start.to_le_bytes());
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    for &(tag, ty, cnt, val) in &entries {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&ty.to_le_bytes());
+        out.extend_from_slice(&cnt.to_le_bytes());
+        let field_val = match tag {
+            273 => pixel_start,
+            _ if ty == 5 => *rational_offsets.get(&tag).unwrap(),
+            _ => val,
+        };
+        out.extend_from_slice(&field_val.to_le_bytes());
+    }
+    out.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+    out.extend_from_slice(&rational_area);
+    out.extend_from_slice(pixels_le);
+    out
+}
+
 #[test]
-fn gel_requires_complete_payload_and_crops_real_pixels() {
-    let short = tmp("short_payload.gel");
-    let mut data = vec![0u8; 64];
-    data[10..12].copy_from_slice(&2u16.to_be_bytes());
-    data[12..14].copy_from_slice(&2u16.to_be_bytes());
-    data.extend_from_slice(&[0, 1, 0, 2]);
-    std::fs::write(&short, data).unwrap();
-
-    let mut reader = bioformats::formats::extended::GelReader::new();
-    let err = reader.set_id(&short).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("shorter than declared")),
-        "{err:?}"
-    );
-    let _ = std::fs::remove_file(&short);
-
-    let path = tmp("real_payload.gel");
-    let mut data = vec![0u8; 64];
-    data[10..12].copy_from_slice(&2u16.to_be_bytes());
-    data[12..14].copy_from_slice(&2u16.to_be_bytes());
-    data.extend_from_slice(&[0, 1, 0, 2, 0, 3, 0, 4]);
-    std::fs::write(&path, data).unwrap();
+fn gel_linear_reads_tiff_pixels() {
+    // A GEL is a TIFF carrying the MD_FILETAG (33445). With LINEAR format (128),
+    // pixels pass through as the underlying 16-bit TIFF samples.
+    let pixels: Vec<u8> = vec![0, 1, 0, 2, 0, 3, 0, 4];
+    let tiff = build_gel_tiff(2, 2, &pixels, &[(33445, 3, 128)]);
+    let path = tmp("gel_linear.gel");
+    std::fs::write(&path, &tiff).unwrap();
 
     let mut reader = bioformats::formats::extended::GelReader::new();
     reader.set_id(&path).unwrap();
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1, 0, 2, 0, 3, 0, 4]);
-    assert_eq!(
-        reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
-        vec![0, 2, 0, 4]
+    let meta = reader.metadata();
+    assert_eq!((meta.size_x, meta.size_y), (2, 2));
+    assert_eq!(meta.pixel_type, PixelType::Uint16);
+    assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+    let _ = std::fs::remove_file(&path);
+
+    // A plain TIFF without MD_FILETAG must be rejected by GelReader.
+    let plain = build_gel_tiff(2, 2, &pixels, &[]);
+    let path2 = tmp("gel_plain.gel");
+    std::fs::write(&path2, &plain).unwrap();
+    let mut reader2 = bioformats::formats::extended::GelReader::new();
+    let err = reader2.set_id(&path2).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref m) if m.contains("MD_FILETAG")),
+        "{err:?}"
     );
-    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(&path2);
+}
+
+#[test]
+fn gel_square_root_squares_and_scales_to_float() {
+    // SQUARE_ROOT format (2): each unsigned-short sample is squared and
+    // multiplied by the MD_SCALE_PIXEL (33446) rational, output as 32-bit float.
+    // Use a scale of 2/1 and samples [1, 2, 3, 4].
+    let pixels: Vec<u8> = vec![1, 0, 2, 0, 3, 0, 4, 0]; // 1,2,3,4 LE u16
+    let tiff = build_gel_tiff(
+        2,
+        2,
+        &pixels,
+        &[(33445, 3, 2), (33446, 5, (2u32 << 16) | 1u32)],
+    );
+    let path = tmp("gel_sqrt.gel");
+    std::fs::write(&path, &tiff).unwrap();
+
+    let mut reader = bioformats::formats::extended::GelReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.metadata().pixel_type, PixelType::Float32);
+    let bytes = reader.open_bytes(0).unwrap();
+    let floats: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    // value*value*scale: 1*1*2=2, 4*2=8, 9*2=18, 16*2=32
+    assert_eq!(floats, vec![2.0, 8.0, 18.0, 32.0]);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -308,9 +401,14 @@ fn photon_dynamics_pds_is_explicit_unsupported() {
     let _ = std::fs::remove_file(path);
 }
 
+// NB: The upstream Java CellomicsReader reads `.c01` files as zlib-compressed
+// (skip the 4-byte magic, then inflate) and `.dib` files as uncompressed. These
+// synthetic tests therefore use the `.dib` (uncompressed) layout so the same
+// DIB header/cropping path is exercised without needing a zlib encoder in the
+// test crate. (CellomicsReader::set_id, src/formats/extended.rs.)
 #[test]
 fn cellomics_rejects_fake_dimensions_and_truncated_payloads() {
-    let missing = tmp("missing_dims.c01");
+    let missing = tmp("missing_dims.dib");
     std::fs::write(&missing, [0u8; 10]).unwrap();
     let mut reader = bioformats::formats::extended::CellomicsReader::new();
     let err = reader.set_id(&missing).unwrap_err();
@@ -320,7 +418,7 @@ fn cellomics_rejects_fake_dimensions_and_truncated_payloads() {
     );
     let _ = std::fs::remove_file(&missing);
 
-    let short = tmp("short_payload.c01");
+    let short = tmp("short_payload.dib");
     let mut data = vec![0u8; 52];
     data[4..6].copy_from_slice(&2u16.to_le_bytes());
     data[6..8].copy_from_slice(&2u16.to_le_bytes());
@@ -338,7 +436,7 @@ fn cellomics_rejects_fake_dimensions_and_truncated_payloads() {
 
 #[test]
 fn cellomics_legacy_payload_crops_real_pixels() {
-    let path = tmp("real_payload.c01");
+    let path = tmp("real_payload.dib");
     let mut data = vec![0u8; 52];
     data[4..6].copy_from_slice(&3u16.to_le_bytes());
     data[6..8].copy_from_slice(&2u16.to_le_bytes());
@@ -358,19 +456,33 @@ fn cellomics_legacy_payload_crops_real_pixels() {
 
 #[test]
 fn perkinelmer_and_openlab_reject_short_payloads_instead_of_padding() {
+    // PerkinElmer .htm layout: an .htm header plus a numbered/TIFF pixel file
+    // whose stem matches the header stem. Here the TIFF pixel file is truncated
+    // so its declared dimensions require more bytes than the file actually
+    // contains; the reader must reject it rather than zero-pad.
     let dir = isolated_tmp_dir("perkin_short_payload");
-    let cfg = dir.join("scan.cfg");
-    let rec = dir.join("scan.rec");
-    std::fs::write(
-        &cfg,
-        b"Image Width = 2\nImage Height = 2\nBytes Per Pixel = 2\n",
-    )
-    .unwrap();
-    std::fs::write(&rec, [1, 0, 2, 0]).unwrap();
+    let htm = dir.join("scan.htm");
+    let tif = dir.join("scan.tif");
+    std::fs::write(&htm, b"<html><body></body></html>").unwrap();
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 3;
+    meta.size_y = 2;
+    meta.size_z = 1;
+    meta.size_c = 1;
+    meta.size_t = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+    meta.is_little_endian = true;
+    meta.resolution_count = 1;
+    ImageWriter::save(&tif, &meta, &[vec![1u8, 2, 3, 4, 5, 6]]).unwrap();
+    // Truncate the pixel file so it no longer covers the declared image.
+    let full = std::fs::read(&tif).unwrap();
+    std::fs::write(&tif, &full[..full.len() - 3]).unwrap();
     let mut pe = bioformats::formats::perkinelmer::PerkinElmerReader::new();
-    let err = pe.set_id(&cfg).unwrap_err();
+    let err = pe.set_id(&htm).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("REC payload is shorter")),
+        matches!(err, BioFormatsError::Format(ref message) if message.contains("exceeds file length")),
         "{err:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -394,17 +506,30 @@ fn perkinelmer_and_openlab_reject_short_payloads_instead_of_padding() {
 
 #[test]
 fn perkinelmer_and_openlab_crop_real_pixels() {
+    // PerkinElmer .htm layout: an .htm header plus a matching single-plane TIFF
+    // pixel file holding a 3x2 8-bit ramp. Cropping returns real pixels.
     let dir = isolated_tmp_dir("perkin_real_payload");
-    let cfg = dir.join("scan.cfg");
-    let rec = dir.join("scan.rec");
-    std::fs::write(
-        &cfg,
-        b"Image Width = 3\nImage Height = 2\nBytes Per Pixel = 1\n",
-    )
-    .unwrap();
-    std::fs::write(&rec, [1, 2, 3, 4, 5, 6]).unwrap();
+    let htm = dir.join("scan.htm");
+    let tif = dir.join("scan.tif");
+    std::fs::write(&htm, b"<html><body></body></html>").unwrap();
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 3;
+    meta.size_y = 2;
+    meta.size_z = 1;
+    meta.size_c = 1;
+    meta.size_t = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+    meta.is_little_endian = true;
+    meta.resolution_count = 1;
+    ImageWriter::save(&tif, &meta, &[vec![1u8, 2, 3, 4, 5, 6]]).unwrap();
     let mut pe = bioformats::formats::perkinelmer::PerkinElmerReader::new();
-    pe.set_id(&cfg).unwrap();
+    pe.set_id(&htm).unwrap();
+    let m = pe.metadata();
+    assert_eq!((m.size_x, m.size_y, m.image_count), (3, 2, 1));
+    assert_eq!(m.pixel_type, PixelType::Uint8);
+    assert_eq!(pe.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
     assert_eq!(
         pe.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
         vec![2, 3, 5, 6]
@@ -491,13 +616,15 @@ fn lim_requires_declared_header_and_crops_real_pixels() {
     );
     let _ = std::fs::remove_file(&missing);
 
+    // Java-correct LIM header layout (LIMReader.java):
+    //   sizeX @0, sizeY @2, bits @4, isCompressed @6; pixels at PIXELS_OFFSET=0x94b.
     let path = tmp("real_payload.lim");
-    let mut data = vec![0u8; 32];
-    data[6..8].copy_from_slice(&1u16.to_le_bytes());
-    data[8..10].copy_from_slice(&32u16.to_le_bytes());
-    data[10..12].copy_from_slice(&3u16.to_le_bytes());
-    data[12..14].copy_from_slice(&2u16.to_le_bytes());
-    data[14..16].copy_from_slice(&8u16.to_le_bytes());
+    let pixels_offset = 0x94b;
+    let mut data = vec![0u8; pixels_offset];
+    data[0..2].copy_from_slice(&3u16.to_le_bytes()); // sizeX
+    data[2..4].copy_from_slice(&2u16.to_le_bytes()); // sizeY
+    data[4..6].copy_from_slice(&8u16.to_le_bytes()); // bits
+    data[6..8].copy_from_slice(&0u16.to_le_bytes()); // isCompressed
     data.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
     std::fs::write(&path, data).unwrap();
 
@@ -606,11 +733,49 @@ fn mias_placeholder_readers_reject_or_require_real_payloads() {
 }
 
 #[test]
-fn zip_without_delegated_tiff_has_no_placeholder_pixels() {
-    let mut reader = bioformats::formats::zip::ZipReader::new();
-    let err = reader.open_bytes(0).unwrap_err();
+fn zip_delegates_inner_image_and_has_no_placeholder_pixels() {
+    use std::io::Write;
+    fn write_zip_entry(path: &Path, name: &str, bytes: &[u8]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    // Matching the Java ZipReader, ZipReader delegates the primary archive entry
+    // to the auto-detecting ImageReader (any inner format). A ZIP wrapping a real
+    // TIFF reads that TIFF's real pixels (no fabricated placeholder data).
+    let dir = isolated_tmp_dir("zip_inner_image");
+    let tiff_src = dir.join("source.tif");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 2;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+    let pixels = vec![11u8, 22, 33, 44];
+    ImageWriter::save(&tiff_src, &meta, &[pixels.clone()]).unwrap();
+    let tiff_bytes = std::fs::read(&tiff_src).unwrap();
+
+    let zip_path = dir.join("inner.zip");
+    write_zip_entry(&zip_path, "frame.tif", &tiff_bytes);
+
+    let mut reader = ImageReader::open(&zip_path).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+
+    // A ZIP whose entry matches no registered reader is rejected outright,
+    // never producing placeholder pixels.
+    let bad_zip = dir.join("bad.zip");
+    write_zip_entry(&bad_zip, "data.unknownfmt", b"not image data at all");
+    let err = match ImageReader::open(&bad_zip) {
+        Ok(_) => panic!("ZIP with no recognized image entry should be rejected"),
+        Err(err) => err,
+    };
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("only TIFF entries")),
+        matches!(err, BioFormatsError::UnsupportedFormat(_)),
         "{err:?}"
     );
 }
@@ -1080,8 +1245,17 @@ fn opus_iss_registry_paths_reject_guessed_headers() {
 
 #[test]
 fn misc4_raw_payload_readers_crop_real_pixels() {
+    // A valid Axon Raw Format (ARF) file per the Java ARFReader: 2 endianness
+    // bytes, "AR" signature, then version/width/height/bitsPerPixel as unsigned
+    // shorts; raw pixel data begins at PIXELS_OFFSET (524).
     let arf_path = tmp("crop.arf");
-    let mut arf_data = Vec::new();
+    let mut arf_data = vec![1u8, 0]; // little-endian
+    arf_data.extend_from_slice(b"AR");
+    arf_data.extend_from_slice(&1u16.to_le_bytes()); // version
+    arf_data.extend_from_slice(&3u16.to_le_bytes()); // width
+    arf_data.extend_from_slice(&3u16.to_le_bytes()); // height
+    arf_data.extend_from_slice(&16u16.to_le_bytes()); // bits per pixel
+    arf_data.resize(524, 0); // pad to PIXELS_OFFSET
     for value in 1u16..=9 {
         arf_data.extend_from_slice(&value.to_le_bytes());
     }
@@ -1174,12 +1348,16 @@ fn hamamatsu_his_reads_java_style_multiseries_and_rgb_regions() {
 
 #[test]
 fn misc4_raw_payload_readers_reject_truncated_or_fake_dimensions() {
+    // A file with valid endianness bytes but a missing "AR" signature must be
+    // rejected (per the Java ARFReader header validation).
     let arf_path = tmp("odd.arf");
-    std::fs::write(&arf_path, [1, 2, 3]).unwrap();
+    let mut bad = vec![1u8, 0, b'X', b'Y'];
+    bad.resize(12, 0);
+    std::fs::write(&arf_path, bad).unwrap();
     let mut arf = bioformats::formats::misc4::ArfReader::new();
     let err = arf.set_id(&arf_path).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("odd byte length")),
+        matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("AR")),
         "{err:?}"
     );
 
@@ -1250,17 +1428,38 @@ fn povray_df3_regions_crop_real_voxel_data() {
 
 #[test]
 fn hitachi_region_crops_real_pixels_from_declared_header() {
-    let path = tmp("hitachi.hiv");
-    let mut data = vec![0u8; 512];
-    data[4..8].copy_from_slice(&3u32.to_le_bytes());
-    data[8..12].copy_from_slice(&2u32.to_le_bytes());
-    data.extend_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
-    std::fs::write(&path, data).unwrap();
+    // HitachiReader.java reads a `.txt` INI whose `[SemImageFile]` table carries
+    // an `ImageName=` pointing at a companion pixels file; pixel access is fully
+    // delegated to a helper ImageReader on that companion image (openBytes and
+    // the x/y/w/h crop). Build a real INI + a small TIFF companion (3x2 uint8)
+    // and verify a cropped region returns the companion's real pixels.
+    let dir = isolated_tmp_dir("hitachi_sem");
+    let txt = dir.join("scan.txt");
+    let companion = dir.join("scan.tif");
 
-    let mut reader = ImageReader::open(&path).unwrap();
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 3;
+    meta.size_y = 2;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+    let pixels: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
+    ImageWriter::save(&companion, &meta, &[pixels]).unwrap();
+
+    // The `[SemImageFile]` magic and `ImageName` key match HitachiReader.java.
+    let ini = format!(
+        "[SemImageFile]\r\nImageName={}\r\nPixelSize=1.0\r\nDataSize=3x2\r\n",
+        companion.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::write(&txt, ini).unwrap();
+
+    let mut reader = ImageReader::open(&txt).unwrap();
+    assert_eq!(reader.metadata().size_x, 3);
+    assert_eq!(reader.metadata().size_y, 2);
+    // Crop the right-most 2 columns, both rows: companion row-major pixels are
+    // [1,2,3 / 4,5,6], so columns 1..3 -> [2,3,5,6].
     assert_eq!(
         reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
-        vec![2, 0, 3, 0, 5, 0, 6, 0]
+        vec![2, 3, 5, 6]
     );
 }
 
@@ -1428,7 +1627,9 @@ fn fits_multi_plane() {
 }
 
 #[test]
-fn fits_applies_bzero_unsigned_16_scaling() {
+fn fits_returns_raw_int16_big_endian_without_bzero_scaling() {
+    // Java FitsReader keeps littleEndian=false and returns raw samples; it does
+    // not apply BZERO/BSCALE. BITPIX 16 maps to signed INT16.
     let path = tmp("bzero_u16.fits");
     let raw: Vec<u8> = [-32768i16, -1, 0, 32767]
         .into_iter()
@@ -1446,24 +1647,21 @@ fn fits_applies_bzero_unsigned_16_scaling() {
                 fits_header_record("BZERO", Some("             32768.0")),
                 fits_header_record("BSCALE", Some("                 1.0")),
             ],
-            raw,
+            raw.clone(),
         )],
     );
 
     let mut r = ImageReader::open(&path).unwrap();
-    assert_eq!(r.metadata().pixel_type, PixelType::Uint16);
-    assert!(r.metadata().is_little_endian);
-    let values: Vec<u16> = r
-        .open_bytes(0)
-        .unwrap()
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
-    assert_eq!(values, vec![0, 32767, 32768, 65535]);
+    assert_eq!(r.metadata().pixel_type, PixelType::Int16);
+    assert!(!r.metadata().is_little_endian);
+    // Raw, unscaled, big-endian bytes exactly as stored.
+    assert_eq!(r.open_bytes(0).unwrap(), raw);
 }
 
 #[test]
-fn fits_applies_nontrivial_bscale_as_float32() {
+fn fits_ignores_bscale_and_returns_raw_int16() {
+    // BSCALE/BZERO are ignored by Java FitsReader; the type stays INT16 (not
+    // promoted to float) and the bytes are returned unscaled, big-endian.
     let path = tmp("bscale_float.fits");
     let raw: Vec<u8> = [-2i16, 0, 4]
         .into_iter()
@@ -1481,23 +1679,21 @@ fn fits_applies_nontrivial_bscale_as_float32() {
                 fits_header_record("BZERO", Some("                10.0")),
                 fits_header_record("BSCALE", Some("                 0.5")),
             ],
-            raw,
+            raw.clone(),
         )],
     );
 
     let mut r = ImageReader::open(&path).unwrap();
-    assert_eq!(r.metadata().pixel_type, PixelType::Float32);
-    let values: Vec<f32> = r
-        .open_bytes(0)
-        .unwrap()
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
-    assert_eq!(values, vec![9.0, 10.0, 12.0]);
+    assert_eq!(r.metadata().pixel_type, PixelType::Int16);
+    assert!(!r.metadata().is_little_endian);
+    assert_eq!(r.open_bytes(0).unwrap(), raw);
 }
 
 #[test]
-fn fits_reads_first_image_extension_when_primary_is_empty() {
+fn fits_reads_only_primary_hdu_ignoring_image_extensions() {
+    // Java FitsReader reads only the primary HDU. An empty primary (NAXIS 0)
+    // followed by an IMAGE extension yields no readable image, so opening fails
+    // rather than silently reading the extension's pixels.
     let path = tmp("image_extension.fits");
     write_fits(
         &path,
@@ -1525,10 +1721,7 @@ fn fits_reads_first_image_extension_when_primary_is_empty() {
         ],
     );
 
-    let mut r = ImageReader::open(&path).unwrap();
-    assert_eq!(r.metadata().size_x, 2);
-    assert_eq!(r.metadata().size_y, 2);
-    assert_eq!(r.open_bytes(0).unwrap(), vec![5, 6, 7, 8]);
+    assert!(ImageReader::open(&path).is_err());
 }
 
 // ---- NRRD ------------------------------------------------------------------
@@ -1669,7 +1862,11 @@ data file: {}
 }
 
 #[test]
-fn nrrd_time_kind_expands_image_count() {
+fn nrrd_leading_channel_then_xyz_axes() {
+    // Java NRRDReader (initFile, lines ~308-328) assigns axes positionally and
+    // ignores `kinds`. For `sizes: 2 1 2 3` with dimension >= 3: axis 0 has size
+    // 2 (1 < 2 <= 16) so it becomes sizeC; the remaining axes fill X, Y, Z. T
+    // stays 1, so imageCount = sizeZ * sizeT = 3. Data is interleaved C-first.
     let path = tmp("time_kind.nrrd");
     let data: Vec<u8> = (0..12).collect();
     let mut bytes = b"NRRD0004
@@ -1685,12 +1882,14 @@ encoding: raw
     std::fs::write(&path, bytes).unwrap();
 
     let mut reader = ImageReader::open(&path).unwrap();
-    assert_eq!(reader.metadata().size_x, 2);
-    assert_eq!(reader.metadata().size_y, 1);
-    assert_eq!(reader.metadata().size_z, 2);
-    assert_eq!(reader.metadata().size_t, 3);
-    assert_eq!(reader.metadata().image_count, 6);
-    assert_eq!(reader.open_bytes(4).unwrap(), vec![8, 9]);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.metadata().size_x, 1);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().size_z, 3);
+    assert_eq!(reader.metadata().size_t, 1);
+    assert_eq!(reader.metadata().image_count, 3);
+    // Plane size = X*Y*C = 1*2*2 = 4 bytes; z=0 is the first 4 interleaved samples.
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1, 2, 3]);
 }
 
 #[test]
@@ -1704,7 +1903,7 @@ fn nrrd_detached_list_reads_one_file_per_plane() {
         "NRRD0004
 type: uint8
 dimension: 3
-sizes: 2 1 2
+sizes: 1 2 2
 kinds: domain domain domain
 encoding: raw
 data file: LIST
@@ -1724,7 +1923,10 @@ data file: LIST
 }
 
 #[test]
-fn nrrd_detached_data_honors_line_and_byte_skip() {
+fn nrrd_detached_data_honors_byte_skip_as_absolute_offset() {
+    // Java NRRDReader treats `byte skip` as an absolute file offset
+    // (offset = parseLong(v); safeSkip(fis, offset)) and has no `line skip`
+    // handling for detached raw data. The pixels \x05\x06 begin at byte 20.
     let path = tmp("skip.nhdr");
     let raw = tmp("skip.raw");
     std::fs::write(&raw, b"skip this\nand this\nX\x05\x06").unwrap();
@@ -1736,8 +1938,7 @@ sizes: 2 1
 kinds: domain domain
 encoding: raw
 data file: {}
-line skip: 2
-byte skip: 1
+byte skip: 20
 
 ",
         raw.file_name().unwrap().to_string_lossy()
@@ -2172,22 +2373,34 @@ fn cellh5_preserves_hdf5_attributes_and_dataset_metadata() {
         "experiment_name",
         hdf5_pure::AttrValue::String("synthetic assay".to_string()),
     );
+    // CellH5Reader.java#parseStructure() walks the canonical experiment layout
+    //   /sample/0/plate/{plate}/experiment/{well}/position/{site}/image/channel
+    // (CellH5Constants: PREFIX_PATH "/sample/0/", PLATE "plate/", WELL
+    // "/experiment/", SITE "/position/", IMAGE_PATH "image/channel/"). The
+    // `image/channel` dataset is itself the 5D [channel, time, zslice, y, x]
+    // image stack. Here c=1,t=2,z=1,y=2,x=3, keeping x=3, y=2, t=2.
     let mut sample = file.create_group("sample");
-    let mut plate = sample.create_group("0");
-    let mut position = plate.create_group("position");
-    let mut well = position.create_group("A01");
-    let mut image = well.create_group("image");
-    let mut channel = image.create_group("channel");
-    channel
-        .create_dataset("0")
+    let mut zero = sample.create_group("0");
+    let mut plate = zero.create_group("plate");
+    let mut plate0 = plate.create_group("Plate0");
+    let mut experiment = plate0.create_group("experiment");
+    let mut well = experiment.create_group("A01");
+    let mut positions = well.create_group("position");
+    let mut site = positions.create_group("1");
+    let mut image = site.create_group("image");
+    image
+        .create_dataset("channel")
         .with_u16_data(&[1u16, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
-        .with_shape(&[2, 2, 3])
+        .with_shape(&[1, 2, 1, 2, 3])
         .set_attr("wavelength_nm", hdf5_pure::AttrValue::U32(488));
-    image.add_group(channel.finish());
-    well.add_group(image.finish());
-    position.add_group(well.finish());
-    plate.add_group(position.finish());
-    sample.add_group(plate.finish());
+    site.add_group(image.finish());
+    positions.add_group(site.finish());
+    well.add_group(positions.finish());
+    experiment.add_group(well.finish());
+    plate0.add_group(experiment.finish());
+    plate.add_group(plate0.finish());
+    zero.add_group(plate.finish());
+    sample.add_group(zero.finish());
     file.add_group(sample.finish());
     file.write(&path).unwrap();
 
@@ -2206,14 +2419,15 @@ fn cellh5_preserves_hdf5_attributes_and_dataset_metadata() {
         "{:?}",
         metadata.get("cellh5_attr:/@experiment_name")
     );
+    let ds_path = "/sample/0/plate/Plate0/experiment/A01/position/1/image/channel";
     assert!(matches!(
-        metadata.get("cellh5_attr:/sample/0/position/A01/image/channel/0@wavelength_nm"),
+        metadata.get(&format!("cellh5_attr:{ds_path}@wavelength_nm")),
         Some(MetadataValue::Int(488))
     ));
     assert!(matches!(
-        metadata.get("cellh5_dataset:/sample/0/position/A01/image/channel/0"),
+        metadata.get(&format!("cellh5_dataset:{ds_path}")),
         Some(MetadataValue::String(value))
-            if value == "shape=[2, 2, 3]; dtype_size=2"
+            if value == "shape=[1, 2, 1, 2, 3]; dtype_size=2"
     ));
 }
 
@@ -2705,18 +2919,50 @@ fn zvi_preserves_tag_stream_ids_names_and_values() {
     let mut comp = cfb::create(&path).unwrap();
     comp.create_storage_all("/Image/Item(1)/Tags").unwrap();
     {
-        let mut stream = comp.create_stream("/Image/CONTENTS").unwrap();
-        stream.write_all(&1u32.to_le_bytes()).unwrap();
-        stream.write_all(&1u32.to_le_bytes()).unwrap();
-        stream.write_all(&1u32.to_le_bytes()).unwrap();
-    }
-    {
+        // Java-correct ZVI item ("/Image/Item(N)/CONTENTS") layout. The reader
+        // derives all image dimensions and the pixel-data offset from this
+        // stream (see ZeissZVIReader.fillMetadataPass1). Streams of <=1024 bytes
+        // are skipped, so the stream must exceed that.
+        let mut item: Vec<u8> = Vec::new();
+        // 11 leading VT_EMPTY tags (type 0, 2 bytes each).
+        item.extend_from_slice(&[0u8; 22]);
+        // skipBytes(2)
+        item.extend_from_slice(&[0u8; 2]);
+        // len = readInt() - 20. We pad the skip(len-8) region to push the
+        // stream past 1024 bytes. Choose len_raw so that skip(len-8) = 1100.
+        let pad: i32 = 1100;
+        let len_raw: i32 = pad + 28; // skip = (len_raw - 20) - 8 = len_raw - 28
+        item.extend_from_slice(&len_raw.to_le_bytes());
+        // skipBytes(8)
+        item.extend_from_slice(&[0u8; 8]);
+        // zidx, cidx, tidx, skip(4), tileIndex
+        item.extend_from_slice(&0i32.to_le_bytes()); // zidx
+        item.extend_from_slice(&0i32.to_le_bytes()); // cidx
+        item.extend_from_slice(&0i32.to_le_bytes()); // tidx
+        item.extend_from_slice(&[0u8; 4]); // skip
+        item.extend_from_slice(&0i32.to_le_bytes()); // tileIndex
+        // skipBytes(len - 8) == pad
+        item.extend_from_slice(&vec![0u8; pad as usize]);
+        // 5 more VT_EMPTY tags.
+        item.extend_from_slice(&[0u8; 10]);
+        // skipBytes(4)
+        item.extend_from_slice(&[0u8; 4]);
+        // sizeX, sizeY
+        item.extend_from_slice(&1i32.to_le_bytes()); // sizeX
+        item.extend_from_slice(&1i32.to_le_bytes()); // sizeY
+        // skipBytes(4)
+        item.extend_from_slice(&[0u8; 4]);
+        // bpp (1 => UINT8, grayscale)
+        item.extend_from_slice(&1i32.to_le_bytes());
+        // skipBytes(4); skipBytes(4)
+        item.extend_from_slice(&[0u8; 8]);
+        // valid (use 2 so the data is treated as uncompressed)
+        item.extend_from_slice(&2i32.to_le_bytes());
+        // check / first pixel bytes: pixel data offset = filePointer - 4, i.e.
+        // it points at this 4-byte region. First pixel value is 77.
+        item.extend_from_slice(&[77u8, 0, 0, 0]);
         let mut stream = comp.create_stream("/Image/Item(1)/CONTENTS").unwrap();
-        stream.write_all(&0u32.to_le_bytes()).unwrap();
-        stream.write_all(&0u32.to_le_bytes()).unwrap();
-        stream.write_all(&0u32.to_le_bytes()).unwrap();
-        stream.write_all(&0u32.to_le_bytes()).unwrap();
-        stream.write_all(&[77]).unwrap();
+        stream.write_all(&item).unwrap();
     }
     {
         let mut tags = Vec::new();
@@ -2825,17 +3071,30 @@ fn gif_palette_is_expanded_to_samples() {
 }
 
 #[test]
-fn animated_gif_is_rejected_instead_of_flattened() {
+fn animated_gif_reads_all_frames_as_image_stack() {
+    // The Java GIFReader reads every frame of an animated GIF as a separate
+    // plane (sizeT == imageCount), rather than rejecting or flattening it.
+    // The synthetic GIF has two 1x1 frames (red then green).
     let path = tmp("animated.gif");
     write_animated_gif(&path);
 
-    let err = match ImageReader::open(&path) {
-        Ok(_) => panic!("animated GIF should be rejected"),
-        Err(err) => err,
-    };
-    assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("animated GIF"))
-    );
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 1);
+    assert_eq!(meta.size_y, 1);
+    // Two frames -> two planes.
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(reader.series_count(), 1);
+
+    let size_c = reader.metadata().size_c as usize;
+    // Both frames decode to real (composited RGBA) pixels.
+    let frame0 = reader.open_bytes(0).unwrap();
+    let frame1 = reader.open_bytes(1).unwrap();
+    assert_eq!(frame0.len(), size_c);
+    assert_eq!(frame1.len(), size_c);
+    // First frame is red, second is green (RGBA, opaque).
+    assert_eq!(&frame0[..4], &[255, 0, 0, 255]);
+    assert_eq!(&frame1[..4], &[0, 255, 0, 255]);
 }
 
 #[test]

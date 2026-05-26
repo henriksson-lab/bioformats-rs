@@ -96,6 +96,10 @@ fn dicom_round_trip_gray16() {
 
 #[test]
 fn pcx_reader_rejects_inverted_bounds() {
+    // The Java PCXReader computes sizeX = xMax - xMin with no explicit inverted
+    // bounds check (PCXReader.java:168-169). With xMin > xMax the derived width
+    // collapses to a non-positive value; our reader rejects this as an invalid
+    // dimension rather than computing a negative size.
     let path = tmp("inverted_bounds.pcx");
     std::fs::write(&path, minimal_pcx_bytes(2, 0, 1, 1, 2)).unwrap();
 
@@ -105,23 +109,25 @@ fn pcx_reader_rejects_inverted_bounds() {
 
     assert!(matches!(
         err,
-        BioFormatsError::InvalidData(message) if message.contains("inverted image bounds")
+        BioFormatsError::InvalidData(message)
+            if message.contains("invalid dimensions")
     ));
 }
 
 #[test]
-fn pcx_reader_rejects_bytes_per_line_smaller_than_width() {
+fn pcx_reader_accepts_bytes_per_line_equal_to_width() {
+    // Java's PCXReader does not reject bytesPerLine relative to width; it simply
+    // reads bytesPerLine * sizeY * nColorPlanes bytes of RLE data
+    // (PCXReader.java:105, 174). A 1x1 single-plane image with bytesPerLine=1 is
+    // therefore valid and must read successfully.
     let path = tmp("short_pcx_row.pcx");
     std::fs::write(&path, minimal_pcx_bytes(0, 0, 1, 1, 1)).unwrap();
 
-    let err = bioformats::formats::pcx::PcxReader::new()
-        .set_id(&path)
-        .expect_err("short PCX rows must be rejected");
-
-    assert!(matches!(
-        err,
-        BioFormatsError::InvalidData(message) if message.contains("bytes_per_line")
-    ));
+    let mut reader = bioformats::formats::pcx::PcxReader::new();
+    reader.set_id(&path).expect("1x1 PCX must read");
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 1);
+    assert_eq!(meta.size_y, 1);
 }
 
 #[test]
@@ -344,24 +350,25 @@ fn avi_reader_uses_idx1_for_movi_after_large_header() {
 }
 
 #[test]
-fn avi_reader_rejects_mjpg_compressed_stream() {
+fn avi_reader_accepts_mjpg_compressed_stream_metadata() {
+    // The upstream Java AVIReader supports Motion-JPEG (MJPG) via the JPEG
+    // codec (AVIReader.java:438). The stream is therefore accepted and reported
+    // as 3-channel RGB; decoding invalid JPEG payload bytes fails only at
+    // open_bytes time.
     let path = tmp("compressed_mjpg.avi");
     let bytes = minimal_avi_bytes(b"MJPG", *b"MJPG", b"00dc", &[1, 2, 3, 4], 0, false);
     std::fs::write(&path, bytes).unwrap();
 
-    let err = bioformats::formats::avi::AviReader::new()
+    let mut reader = bioformats::formats::avi::AviReader::new();
+    reader
         .set_id(&path)
-        .expect_err("MJPG AVI should be rejected");
-    match err {
-        BioFormatsError::UnsupportedFormat(msg) => {
-            assert!(msg.contains("MJPG"), "unexpected error message: {msg}");
-            assert!(
-                msg.contains("uncompressed BI_RGB/DIB"),
-                "unexpected error message: {msg}"
-            );
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
+        .expect("MJPG AVI metadata should be accepted");
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 3);
+    assert!(meta.is_rgb);
+
+    // The 4 garbage bytes are not a valid JPEG stream, so decoding fails.
+    assert!(reader.open_bytes(0).is_err());
 }
 
 #[test]

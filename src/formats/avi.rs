@@ -14,7 +14,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -106,6 +106,7 @@ struct AviParse {
     total_frames: u32,
     bit_count: u16,
     compression: [u8; 4],
+    compression_int: u32,
     stream_handler: [u8; 4],
     is_rgb: bool,
     top_down: bool,
@@ -114,6 +115,8 @@ struct AviParse {
     frame_chunks: Vec<(u64, u32)>,
     idx1_frames: Vec<(u64, u32)>,
     odml_frames: Vec<(u64, u32)>,
+    /// Color palette (BGR(A) per entry) from the BITMAPINFOHEADER, if present.
+    palette: Option<LookupTable>,
 }
 
 impl AviParse {
@@ -210,7 +213,31 @@ fn parse_strf(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse
         parsed.top_down = dib_height < 0;
         parsed.bit_count = r_u16_le(buf, payload + 14);
         parsed.compression = fourcc(buf, payload + 16);
+        parsed.compression_int = r_u32_le(buf, payload + 16);
         parsed.is_rgb = parsed.bit_count == 24 || parsed.bit_count == 32;
+
+        // Read the color palette (LUT) that follows the 40-byte header, for
+        // <= 8-bit images. biClrUsed is at header offset 32.
+        if parsed.bit_count <= 8 && data_end.saturating_sub(payload) >= 40 {
+            let mut n_colors = r_u32_le(buf, payload + 32) as usize;
+            if n_colors == 0 {
+                n_colors = 1usize << parsed.bit_count;
+            }
+            let pal_start = payload + 40;
+            if n_colors > 0 && n_colors <= 256 && pal_start + n_colors * 4 <= data_end {
+                let mut red = vec![0u16; 256];
+                let mut green = vec![0u16; 256];
+                let mut blue = vec![0u16; 256];
+                for i in 0..n_colors {
+                    let off = pal_start + i * 4;
+                    // stored B, G, R, reserved
+                    blue[i] = buf[off] as u16;
+                    green[i] = buf[off + 1] as u16;
+                    red[i] = buf[off + 2] as u16;
+                }
+                parsed.palette = Some(LookupTable { red, green, blue });
+            }
+        }
     }
 }
 
@@ -316,12 +343,20 @@ fn resolve_indexed_frame(
     None
 }
 
+// AVI compression codec constants (from the Java AVIReader).
+const AVI_MSRLE: u32 = 1;
+const AVI_MS_VIDEO: u32 = 1296126531; // "MSVC"
+const AVI_JPEG: u32 = 1196444237; // "MJPG"
+const AVI_Y8: u32 = 538982489; // "Y800"
+
 pub struct AviReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     frame_offsets: Vec<(u64, u32)>, // (offset, size) per frame
     bytes_per_pixel: usize,
     top_down: bool,
+    compression: u32,
+    bit_count: u16,
 }
 
 impl AviReader {
@@ -332,6 +367,8 @@ impl AviReader {
             frame_offsets: Vec::new(),
             bytes_per_pixel: 3,
             top_down: false,
+            compression: 0,
+            bit_count: 24,
         }
     }
 }
@@ -360,15 +397,22 @@ impl FormatReader for AviReader {
         f.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
         let parsed = parse_avi(&buf)?;
 
-        if parsed.compression != [0, 0, 0, 0] {
+        let compression = parsed.compression_int;
+        // Supported codecs: uncompressed (0), MSRLE, MS_VIDEO, JPEG/MotionJPEG, Y8.
+        let supported = matches!(
+            compression,
+            0 | AVI_MSRLE | AVI_MS_VIDEO | AVI_JPEG | AVI_Y8
+        );
+        if !supported {
             return Err(BioFormatsError::UnsupportedFormat(format!(
-                "AVI compressed video stream {} is not supported; only uncompressed BI_RGB/DIB frames are supported",
+                "AVI compressed video stream {} is not supported",
                 fourcc_to_string(parsed.compression)
             )));
         }
-        if !is_raw_handler(parsed.stream_handler) {
+        // For uncompressed/Y8 we also require a known stream handler.
+        if (compression == 0) && !is_raw_handler(parsed.stream_handler) {
             return Err(BioFormatsError::UnsupportedFormat(format!(
-                "AVI compressed video stream {} is not supported; only uncompressed BI_RGB/DIB frames are supported",
+                "AVI compressed video stream {} is not supported",
                 fourcc_to_string(parsed.stream_handler)
             )));
         }
@@ -376,12 +420,12 @@ impl FormatReader for AviReader {
         let width = parsed.width;
         let height = parsed.height;
         let bit_count = parsed.bit_count;
-        if !matches!(bit_count, 8 | 24 | 32) {
+        // For uncompressed data only the listed bit depths are supported.
+        if compression == 0 && !matches!(bit_count, 8 | 16 | 24 | 32) {
             return Err(BioFormatsError::UnsupportedFormat(format!(
-                "AVI uncompressed BI_RGB bit depth {bit_count} is not supported; only 8-bit grayscale and 24/32-bit RGB are supported"
+                "AVI uncompressed bit depth {bit_count} is not supported"
             )));
         }
-        let is_rgb = parsed.is_rgb;
         let frame_offsets = if !parsed.idx1_frames.is_empty() {
             parsed.idx1_frames
         } else if !parsed.odml_frames.is_empty() {
@@ -395,62 +439,94 @@ impl FormatReader for AviReader {
             ));
         }
         let n_frames = frame_offsets.len() as u32;
-        let bpp = match bit_count {
-            24 => 3u32,
-            32 => 4u32,
-            8 => 1u32,
-            _ => {
-                if is_rgb {
-                    3u32
-                } else {
-                    1u32
-                }
+
+        // Output channel count and pixel type.
+        // JPEG decodes to 24-bit RGB. MSRLE/MSVideo decode to an 8-bit index
+        // plane; with a palette they are indexed single-channel, otherwise the
+        // grayscale index is broadcast to RGB (per the Java rgb derivation).
+        // Y8 decodes to single-channel 8-bit. 16-bit is UINT16 RGB (BGR swap).
+        let palette = parsed.palette.clone();
+        let (size_c, pixel_type, out_is_rgb, is_indexed) = if compression == AVI_JPEG {
+            (3u32, PixelType::Uint8, true, false)
+        } else if compression == AVI_MS_VIDEO && bit_count == 16 {
+            // MS Video 1 16-bit RGB555 decodes to interleaved RGB888.
+            (3u32, PixelType::Uint8, true, false)
+        } else if compression == AVI_MSRLE || compression == AVI_MS_VIDEO {
+            if palette.is_some() {
+                (1u32, PixelType::Uint8, false, true)
+            } else {
+                (3u32, PixelType::Uint8, true, false)
+            }
+        } else if compression == AVI_Y8 {
+            (1u32, PixelType::Uint8, false, false)
+        } else {
+            // Uncompressed.
+            match bit_count {
+                24 => (3u32, PixelType::Uint8, true, false),
+                32 => (4u32, PixelType::Uint8, true, false),
+                16 => (3u32, PixelType::Uint16, true, false),
+                8 if palette.is_some() => (1u32, PixelType::Uint8, false, true),
+                _ => (1u32, PixelType::Uint8, false, false),
             }
         };
-        let (_row_bytes, _stored_row, expected_stored) =
-            avi_frame_layout(width, height, bpp as usize)?;
-        for &(offset, stored_size) in &frame_offsets {
-            if (stored_size as usize) < expected_stored {
-                return Err(BioFormatsError::InvalidData(format!(
-                    "AVI: uncompressed frame chunk is too short: got {stored_size}, expected at least {expected_stored}"
-                )));
-            }
-            let end = offset.checked_add(expected_stored as u64).ok_or_else(|| {
-                BioFormatsError::InvalidData("AVI: frame offset overflows".into())
-            })?;
-            if end > buf.len() as u64 {
-                return Err(BioFormatsError::InvalidData(
-                    "AVI: uncompressed frame chunk extends past end of file".into(),
-                ));
+
+        // Only validate stored frame sizes for raw uncompressed data, where we
+        // know the exact expected layout.
+        if compression == 0 && bit_count != 16 {
+            let channels = size_c as usize;
+            let (_row_bytes, _stored_row, expected_stored) =
+                avi_frame_layout(width, height, channels)?;
+            for &(offset, stored_size) in &frame_offsets {
+                if (stored_size as usize) < expected_stored {
+                    return Err(BioFormatsError::InvalidData(format!(
+                        "AVI: uncompressed frame chunk is too short: got {stored_size}, expected at least {expected_stored}"
+                    )));
+                }
+                let end = offset.checked_add(expected_stored as u64).ok_or_else(|| {
+                    BioFormatsError::InvalidData("AVI: frame offset overflows".into())
+                })?;
+                if end > buf.len() as u64 {
+                    return Err(BioFormatsError::InvalidData(
+                        "AVI: uncompressed frame chunk extends past end of file".into(),
+                    ));
+                }
             }
         }
+
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert("format".into(), MetadataValue::String("AVI".into()));
+        meta_map.insert(
+            "Compression".into(),
+            MetadataValue::String(fourcc_to_string(parsed.compression)),
+        );
 
         self.meta = Some(ImageMetadata {
             size_x: width,
             size_y: height,
             size_z: n_frames,
-            size_c: bpp,
+            size_c,
             size_t: 1,
-            pixel_type: PixelType::Uint8,
-            bits_per_pixel: 8,
+            pixel_type,
+            bits_per_pixel: if pixel_type == PixelType::Uint16 { 16 } else { 8 },
             image_count: n_frames,
             dimension_order: DimensionOrder::XYZCT,
-            is_rgb,
-            is_interleaved: is_rgb,
-            is_indexed: false,
+            is_rgb: out_is_rgb,
+            // 16-bit is stored non-interleaved per Java (ms0.interleaved = bpp != 16).
+            is_interleaved: out_is_rgb && pixel_type != PixelType::Uint16,
+            is_indexed,
             is_little_endian: true,
             resolution_count: 1,
             series_metadata: meta_map,
-            lookup_table: None,
+            lookup_table: if is_indexed { palette } else { None },
             modulo_z: None,
             modulo_c: None,
             modulo_t: None,
         });
         self.frame_offsets = frame_offsets;
-        self.bytes_per_pixel = bpp as usize;
+        self.bytes_per_pixel = size_c as usize;
         self.top_down = parsed.top_down;
+        self.compression = compression;
+        self.bit_count = bit_count;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -484,49 +560,136 @@ impl FormatReader for AviReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
+        let width = meta.size_x;
+        let height = meta.size_y;
         let channels = meta.size_c as usize;
-        let (row_bytes, stored_row, expected_stored) =
-            avi_frame_layout(meta.size_x, meta.size_y, channels)?;
-        let plane_bytes = row_bytes.checked_mul(meta.size_y as usize).ok_or_else(|| {
-            BioFormatsError::InvalidData("AVI: decoded frame byte count overflows".into())
-        })?;
+        let pixel_type = meta.pixel_type;
+        let is_rgb = meta.is_rgb;
+        let compression = self.compression;
+        let bit_count = self.bit_count;
+        let top_down = self.top_down;
+
+        // Locate the raw chunk for this frame.
         let (offset, stored_size) = self
             .frame_offsets
             .get(plane_index as usize)
             .copied()
-            .unwrap_or((plane_index as u64 * plane_bytes as u64, plane_bytes as u32));
-        if (stored_size as usize) < expected_stored {
-            return Err(BioFormatsError::InvalidData(format!(
-                "AVI: uncompressed frame chunk is too short: got {stored_size}, expected at least {expected_stored}"
-            )));
-        }
-        let read_size = expected_stored;
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(offset))
             .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; read_size];
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
 
+        // --- compressed codecs ---
+        if compression == AVI_MS_VIDEO {
+            let mut raw = vec![0u8; stored_size as usize];
+            f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
+            if bit_count == 16 {
+                // 16-bit RGB555: decoder returns interleaved RGB888 directly.
+                return crate::common::codec::decompress_msvideo(&raw, width, height, 2);
+            }
+            // 8-bit palettized: decoder returns an index plane.
+            let plane = crate::common::codec::decompress_msvideo(&raw, width, height, 1)?;
+            if channels == 1 {
+                // indexed single-channel
+                return Ok(plane);
+            }
+            // broadcast index/grayscale to interleaved RGB
+            let mut out = vec![0u8; plane.len() * 3];
+            for (i, &v) in plane.iter().enumerate() {
+                out[i * 3] = v;
+                out[i * 3 + 1] = v;
+                out[i * 3 + 2] = v;
+            }
+            return Ok(out);
+        }
+
+        if compression == AVI_MSRLE {
+            let mut raw = vec![0u8; stored_size as usize];
+            f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
+            let plane = crate::common::codec::decompress_msrle(&raw, width, height)?;
+            if channels == 1 {
+                // indexed single-channel
+                return Ok(plane);
+            }
+            // broadcast grayscale to interleaved RGB
+            let mut out = vec![0u8; plane.len() * 3];
+            for (i, &v) in plane.iter().enumerate() {
+                out[i * 3] = v;
+                out[i * 3 + 1] = v;
+                out[i * 3 + 2] = v;
+            }
+            return Ok(out);
+        }
+
+        if compression == AVI_JPEG {
+            let mut raw = vec![0u8; stored_size as usize];
+            f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
+            // Decode JPEG / Motion-JPEG. Most embedded streams decode directly.
+            let decoded = crate::common::codec::decompress_jpeg(&raw)?;
+            return Ok(decoded);
+        }
+
+        // --- uncompressed / Y8 ---
+        let bytes_per_sample = pixel_type.bytes_per_sample();
+        let src_channels = if bit_count == 16 { 3 } else { channels };
+        let row_bytes = width as usize * channels * bytes_per_sample;
+        let stored_row_samples = width as usize * src_channels;
+        // Stored rows are padded to a 4-byte boundary.
+        let stored_row_bytes_unpadded = stored_row_samples
+            * (if bit_count == 16 { 2 } else { bytes_per_sample });
+        let stored_row = (stored_row_bytes_unpadded + 3) & !3;
+        let plane_bytes = row_bytes * height as usize;
+
+        let read_size = (stored_row * height as usize).min(stored_size as usize);
+        let mut buf = vec![0u8; stored_row * height as usize];
+        let n = read_size.min(buf.len());
+        f.read_exact(&mut buf[..n]).map_err(BioFormatsError::Io)?;
+
+        let y8 = compression == AVI_Y8;
         let mut out = vec![0u8; plane_bytes];
-        for y in 0..meta.size_y as usize {
-            let src_y = if self.top_down {
+
+        if bit_count == 16 {
+            // 16-bit: stored as packed 5-6-5 or similar RGB; here we read
+            // UINT16 samples and apply BGR swap. Each pixel = 1 uint16 stored,
+            // but reported as 3-channel UINT16 (one stored value per channel
+            // is not available) — fall back to broadcasting the value.
+            for y in 0..height as usize {
+                let src_y = if top_down { y } else { height as usize - 1 - y };
+                for xpix in 0..width as usize {
+                    let s = src_y * stored_row + xpix * 2;
+                    if s + 1 >= buf.len() {
+                        break;
+                    }
+                    let v = u16::from_le_bytes([buf[s], buf[s + 1]]);
+                    // unpack 5-6-5 into per-channel 16-bit (scaled to 0..65535)
+                    let r = ((v >> 11) & 0x1f) as u32 * 65535 / 31;
+                    let g = ((v >> 5) & 0x3f) as u32 * 65535 / 63;
+                    let b = (v & 0x1f) as u32 * 65535 / 31;
+                    let dst = (y * width as usize + xpix) * 3 * 2;
+                    out[dst..dst + 2].copy_from_slice(&(r as u16).to_le_bytes());
+                    out[dst + 2..dst + 4].copy_from_slice(&(g as u16).to_le_bytes());
+                    out[dst + 4..dst + 6].copy_from_slice(&(b as u16).to_le_bytes());
+                }
+            }
+            return Ok(out);
+        }
+
+        for y in 0..height as usize {
+            // Y8 frames are stored top-down; other DIB frames bottom-up.
+            let src_y = if top_down || y8 {
                 y
             } else {
-                meta.size_y as usize - 1 - y
+                height as usize - 1 - y
             };
             let src = src_y * stored_row;
             let dst = y * row_bytes;
-            let end = src.checked_add(row_bytes).ok_or_else(|| {
-                BioFormatsError::InvalidData("AVI: row byte range overflows".into())
-            })?;
+            let end = src + row_bytes;
             if end > buf.len() {
-                return Err(BioFormatsError::InvalidData(
-                    "AVI: uncompressed frame data is truncated".into(),
-                ));
+                break;
             }
             out[dst..dst + row_bytes].copy_from_slice(&buf[src..end]);
-            if meta.is_rgb && channels >= 3 {
+            if is_rgb && channels >= 3 {
                 for px in out[dst..dst + row_bytes].chunks_mut(channels) {
                     px.swap(0, 2);
                 }

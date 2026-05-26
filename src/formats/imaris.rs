@@ -19,21 +19,35 @@ use crate::common::reader::FormatReader;
 
 pub struct ImarisReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    n_resolutions: usize,
+    // One ImageMetadata per resolution level. Index 0 is full-resolution.
+    resolutions: Vec<ImageMetadata>,
     current_resolution: usize,
     // pixel type for raw reads
     bytes_per_sample: usize,
+    // Cache of the most recently decoded [z, y, x] volume so that sequential
+    // plane reads within the same dataset do not re-decode the whole volume.
+    // Keyed by (resolution, t, c). Mirrors the per-Z-block buffer cache in
+    // ImarisHDFReader.java (the underlying hdf5-pure 0.5 reader has no
+    // hyperslab API, so we cache the whole-channel volume instead of a slab).
+    cache: Option<VolumeCache>,
+}
+
+/// Cached decoded volume for one (resolution, timepoint, channel) dataset.
+struct VolumeCache {
+    res: usize,
+    t: usize,
+    c: usize,
+    raw: Vec<u8>,
 }
 
 impl ImarisReader {
     pub fn new() -> Self {
         ImarisReader {
             path: None,
-            meta: None,
-            n_resolutions: 1,
+            resolutions: Vec::new(),
             current_resolution: 0,
             bytes_per_sample: 1,
+            cache: None,
         }
     }
 }
@@ -65,7 +79,7 @@ fn read_str_attr(group: &hdf5_pure::Group<'_>, attr: &str) -> Option<String> {
     }
 }
 
-fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
+fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
     let file = hdf5_pure::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
@@ -162,8 +176,13 @@ fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
         }
     }
 
-    let image_count = size_z * size_c * size_t;
-    let meta = ImageMetadata {
+    // ── Build per-resolution-level metadata ─────────────────────────────────
+    // Java reads ImageSizeX/Y/Z attributes from the group
+    // DataSet/ResolutionLevel_N/TimePoint_0/Channel_0 for each sub-resolution
+    // (level 0 uses the DataSetInfo/Image dimensions). sizeC and sizeT are
+    // shared across all levels.
+    let image_count0 = size_z * size_c * size_t;
+    let base_meta = ImageMetadata {
         size_x,
         size_y,
         size_z,
@@ -171,7 +190,7 @@ fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
         size_t,
         pixel_type,
         bits_per_pixel: (bytes_per_sample * 8) as u8,
-        image_count,
+        image_count: image_count0,
         dimension_order: DimensionOrder::XYZCT,
         is_rgb: false,
         is_interleaved: false,
@@ -185,7 +204,33 @@ fn parse_ims(path: &Path) -> Result<(ImageMetadata, usize, usize)> {
         modulo_t: None,
     };
 
-    Ok((meta, n_resolutions, bytes_per_sample))
+    let mut resolutions = Vec::with_capacity(n_resolutions);
+    resolutions.push(base_meta.clone());
+    for level in 1..n_resolutions {
+        let group_path = format!("DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0");
+        let mut lvl = base_meta.clone();
+        if let Ok(g) = file.group(&group_path) {
+            if let Some(v) = read_int_attr(&g, "ImageSizeX") {
+                lvl.size_x = v;
+            }
+            if let Some(v) = read_int_attr(&g, "ImageSizeY") {
+                lvl.size_y = v;
+            }
+            if let Some(v) = read_int_attr(&g, "ImageSizeZ") {
+                lvl.size_z = v;
+            }
+        }
+        lvl.image_count = lvl.size_z * lvl.size_c * lvl.size_t;
+        lvl.resolution_count = n_resolutions as u32;
+        resolutions.push(lvl);
+    }
+
+    Ok((resolutions, bytes_per_sample))
+}
+
+/// Read an integer attribute (string- or numeric-encoded) from an HDF5 group.
+fn read_int_attr(group: &hdf5_pure::Group<'_>, attr: &str) -> Option<u32> {
+    read_str_attr(group, attr).and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 fn hdf5_group_members(
@@ -230,10 +275,9 @@ impl FormatReader for ImarisReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (meta, n_resolutions, bps) = parse_ims(path)?;
-        self.meta = Some(meta);
+        let (resolutions, bps) = parse_ims(path)?;
+        self.resolutions = resolutions;
         self.path = Some(path.to_path_buf());
-        self.n_resolutions = n_resolutions;
         self.current_resolution = 0;
         self.bytes_per_sample = bps;
         Ok(())
@@ -241,9 +285,9 @@ impl FormatReader for ImarisReader {
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.n_resolutions = 1;
+        self.resolutions.clear();
         self.current_resolution = 0;
+        self.cache = None;
         Ok(())
     }
 
@@ -264,15 +308,18 @@ impl FormatReader for ImarisReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.resolutions
+            .get(self.current_resolution)
+            .or_else(|| self.resolutions.first())
+            .expect("set_id not called")
     }
 
     fn resolution_count(&self) -> usize {
-        self.n_resolutions
+        self.resolutions.len().max(1)
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if level >= self.n_resolutions {
+        if level >= self.resolutions.len() {
             return Err(BioFormatsError::Format(format!(
                 "resolution {level} out of range"
             )));
@@ -282,66 +329,80 @@ impl FormatReader for ImarisReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let res = self.current_resolution;
+        let meta = self
+            .resolutions
+            .get(res)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
-        // Decode plane_index → (z, c, t) for XYZCT order
+        // Decode plane_index → (z, c, t) for XYZCT order using this level's dims
         let sz = meta.size_z as usize;
         let sc = meta.size_c as usize;
         let z = (plane_index as usize) % sz;
         let c = (plane_index as usize / sz) % sc;
         let t = (plane_index as usize) / (sz * sc);
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        let bps = self.bytes_per_sample;
+        let plane_bytes = size_x * size_y * bps;
 
-        let res = self.current_resolution;
-        let data_path = format!("DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data");
-
-        let path = self
-            .path
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?
-            .clone();
-        let file = hdf5_pure::File::open(&path)
-            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
-        let ds = file
-            .dataset(&data_path)
-            .map_err(|e| BioFormatsError::Format(format!("dataset {data_path}: {e}")))?;
-
-        // Read full volume as raw bytes then extract the z-plane
-        let plane_pixels = meta.size_x as usize * meta.size_y as usize;
-        let plane_bytes = plane_pixels * self.bytes_per_sample;
-        let _sz_usize = sz;
-
-        let raw: Vec<u8> = match self.bytes_per_sample {
-            1 => ds
-                .read_u8()
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
-            2 => {
-                let words: Vec<u16> = ds
-                    .read_u16()
-                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-                words.iter().flat_map(|w| w.to_le_bytes()).collect()
-            }
-            4 => {
-                let dwords: Vec<u32> = ds
-                    .read_u32()
-                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-                dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
-            }
-            _ => ds
-                .read_u8()
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
+        // Reuse the cached volume if it is for the same (resolution, t, c).
+        let need_load = match &self.cache {
+            Some(cache) => cache.res != res || cache.t != t || cache.c != c,
+            None => true,
         };
+        if need_load {
+            let data_path =
+                format!("DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data");
+            let path = self
+                .path
+                .as_ref()
+                .ok_or(BioFormatsError::NotInitialized)?
+                .clone();
+            let file = hdf5_pure::File::open(&path)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+            let ds = file
+                .dataset(&data_path)
+                .map_err(|e| BioFormatsError::Format(format!("dataset {data_path}: {e}")))?;
 
+            // hdf5-pure 0.5 has no hyperslab API, so read the whole [z,y,x]
+            // channel volume once and cache it; subsequent z-planes are served
+            // from the cache without re-decoding.
+            let raw: Vec<u8> = match bps {
+                1 => ds
+                    .read_u8()
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
+                2 => {
+                    let words: Vec<u16> = ds
+                        .read_u16()
+                        .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+                }
+                4 => {
+                    let dwords: Vec<u32> = ds
+                        .read_u32()
+                        .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                    dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
+                }
+                _ => ds
+                    .read_u8()
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
+            };
+            self.cache = Some(VolumeCache { res, t, c, raw });
+        }
+
+        let raw = &self.cache.as_ref().unwrap().raw;
         // raw is stored [z, y, x]; extract plane z
         let offset = z * plane_bytes;
         if offset + plane_bytes <= raw.len() {
             Ok(raw[offset..offset + plane_bytes].to_vec())
         } else {
             Err(BioFormatsError::UnsupportedFormat(format!(
-                "Imaris dataset {data_path} is shorter than declared plane {plane_index} \
-                 (need {} bytes, have {})",
+                "Imaris ResolutionLevel {res}/TimePoint {t}/Channel {c} is shorter than \
+                 declared plane {plane_index} (need {} bytes, have {})",
                 offset + plane_bytes,
                 raw.len()
             )))
@@ -357,7 +418,10 @@ impl FormatReader for ImarisReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
+        let meta = self
+            .resolutions
+            .get(self.current_resolution)
+            .unwrap();
         let bps = self.bytes_per_sample;
         let row_bytes = meta.size_x as usize * bps;
         let out_row = w as usize * bps;
@@ -384,7 +448,10 @@ impl FormatReader for ImarisReader {
             }
         }
         // Fall back to center crop of plane 0
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .resolutions
+            .get(self.current_resolution)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;

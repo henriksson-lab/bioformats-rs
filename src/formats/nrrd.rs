@@ -20,6 +20,15 @@ enum Encoding {
     Raw,
     Gzip,
     Ascii,
+    /// bzip2-compressed payload. The Java NRRDReader does *not* support this
+    /// encoding (it only handles "raw" and "gzip" and otherwise throws
+    /// UnsupportedCompressionException); we recognise the keyword so we can
+    /// emit a precise error. Decoding it would require a `bzip2` decoder crate,
+    /// which is not a direct dependency of this crate.
+    Bzip2,
+    /// Any other encoding keyword the file declares. Java throws
+    /// UnsupportedCompressionException for these.
+    Unsupported,
 }
 
 #[derive(Debug)]
@@ -60,16 +69,34 @@ impl NrrdAxes {
 }
 
 fn nrrd_pixel_type(t: &str) -> PixelType {
-    match t {
-        "int8" | "signed char" => PixelType::Int8,
-        "uint8" | "uchar" | "unsigned char" => PixelType::Uint8,
-        "int16" | "short" | "signed short" | "short int" | "signed short int" => PixelType::Int16,
-        "uint16" | "ushort" | "unsigned short" | "unsigned short int" => PixelType::Uint16,
-        "int32" | "int" | "signed int" => PixelType::Int32,
-        "uint32" | "uint" | "unsigned int" => PixelType::Uint32,
-        "float" => PixelType::Float32,
-        "double" => PixelType::Float64,
-        _ => PixelType::Uint8,
+    // Mirror NRRDReader.java: any type containing "char" or "8" maps to UINT8,
+    // any containing "short" or "16" maps to UINT16, the int/uint family maps
+    // to UINT32. NRRD/MetaImage treats these as unsigned regardless of the
+    // declared signedness (e.g. "int8"/"signed char" → UINT8, "short" → UINT16,
+    // "int32" → UINT32).
+    let v = t.to_ascii_lowercase();
+    if v.contains("char") || v.contains('8') {
+        PixelType::Uint8
+    } else if v.contains("short") || v.contains("16") {
+        PixelType::Uint16
+    } else if matches!(
+        v.as_str(),
+        "int"
+            | "signed int"
+            | "int32"
+            | "int32_t"
+            | "uint"
+            | "unsigned int"
+            | "uint32"
+            | "uint32_t"
+    ) {
+        PixelType::Uint32
+    } else if v == "float" {
+        PixelType::Float32
+    } else if v == "double" {
+        PixelType::Float64
+    } else {
+        PixelType::Uint8
     }
 }
 
@@ -159,10 +186,18 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
                     little_endian = val.eq_ignore_ascii_case("little");
                 }
                 "encoding" => {
+                    // Java NRRDReader only recognises "raw" and "gzip"; every
+                    // other encoding throws UnsupportedCompressionException at
+                    // openBytes time. We additionally accept "ascii"/"text"
+                    // (a faithful-to-spec extension already implemented here)
+                    // and classify "bzip2"/"bz2" so we can report the missing
+                    // decoder precisely.
                     encoding = match val.to_ascii_lowercase().as_str() {
+                        "raw" => Encoding::Raw,
                         "gzip" | "gz" => Encoding::Gzip,
                         "ascii" | "text" | "txt" => Encoding::Ascii,
-                        _ => Encoding::Raw,
+                        "bzip2" | "bz2" => Encoding::Bzip2,
+                        _ => Encoding::Unsupported,
                     };
                 }
                 "data file" | "datafile" => {
@@ -203,210 +238,71 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
     })
 }
 
-fn is_channel_kind(kind: &str) -> bool {
-    let k = kind.to_ascii_lowercase();
-    k.contains("color") || k.contains("vector") || k == "rgb" || k == "rgba"
-}
-
-fn is_time_kind(kind: &str) -> bool {
-    kind.to_ascii_lowercase().contains("time")
-}
-
-fn first_token_is_nan(value: &str) -> bool {
-    value
-        .split_ascii_whitespace()
-        .next()
-        .map(|token| token.trim_matches('"').eq_ignore_ascii_case("nan"))
-        .unwrap_or(false)
-}
-
-fn first_label_contains_comma(value: &str) -> bool {
-    let value = value.trim_start();
-    if let Some(rest) = value.strip_prefix('"') {
-        return rest
-            .split('"')
-            .next()
-            .map(|label| label.contains(','))
-            .unwrap_or(false);
-    }
-    value
-        .split_ascii_whitespace()
-        .next()
-        .map(|label| label.contains(','))
-        .unwrap_or(false)
-}
-
-fn has_leading_nonspatial_axis(hdr: &NrrdHeader) -> bool {
-    if hdr.sizes.len() < 3 || hdr.sizes.first().copied().unwrap_or(0) > 16 {
-        return false;
-    }
-
-    if hdr.space_directions.len() + 1 == hdr.sizes.len() {
-        return true;
-    }
-
-    ["axis mins", "axismins", "spacings"].iter().any(|key| {
-        hdr.extra
-            .get(*key)
-            .is_some_and(|value| first_token_is_nan(value))
-    }) || hdr
-        .extra
-        .get("labels")
-        .is_some_and(|value| first_label_contains_comma(value))
-}
-
-fn axis_has_space_direction(hdr: &NrrdHeader, axis: usize, leading_nonspatial: bool) -> bool {
-    let direction_axis = if leading_nonspatial && hdr.space_directions.len() + 1 == hdr.sizes.len()
-    {
-        axis.checked_sub(1)
-    } else {
-        Some(axis)
-    };
-    direction_axis
-        .and_then(|direction_axis| hdr.space_directions.get(direction_axis))
-        .copied()
-        .unwrap_or(false)
-}
-
+/// Derive the X/Y/Z/C/T axis sizes from the NRRD header.
+///
+/// Mirrors `NRRDReader.java` (initFile, lines ~308-328) exactly. Java applies a
+/// single positional rule per axis index `i` (where `numDimensions` is the
+/// declared `dimension:` field, falling back to the number of `sizes`):
+///
+/// ```text
+/// if numDimensions >= 3 && i == 0 && size > 1 && size <= 16 -> sizeC = size
+/// else if i == 0 || (sizeC > 1 && i == 1) -> sizeX = size
+/// else if i == 1 || (sizeC > 1 && i == 2) -> sizeY = size
+/// else if i == 2 || (sizeC > 1 && i == 3) -> sizeZ = size
+/// else if i == 3 || (sizeC > 1 && i == 4) -> sizeT = size
+/// ```
+///
+/// The dimension order is always `XYCZT` (NRRDReader.java line 277). There is no
+/// `kinds`/`space directions` based axis detection in Java, so this function
+/// does not use those fields for axis assignment.
 fn derive_axes(hdr: &NrrdHeader) -> NrrdAxes {
-    let leading_nonspatial = has_leading_nonspatial_axis(hdr);
+    // Java uses `numDimensions` (the declared `dimension:` value); when absent
+    // or inconsistent, fall back to the number of parsed sizes.
+    let num_dimensions = if hdr.dimension > 0 && hdr.dimension <= hdr.sizes.len() {
+        hdr.dimension
+    } else {
+        hdr.sizes.len()
+    };
 
-    if hdr.kinds.is_empty() && hdr.space_directions.is_empty() {
-        if leading_nonspatial {
-            match hdr.sizes.as_slice() {
-                [c, x, y] => {
-                    return NrrdAxes {
-                        size_x: *x,
-                        size_y: *y,
-                        size_z: 1,
-                        size_c: *c,
-                        size_t: 1,
-                        axis_x: Some(1),
-                        axis_y: Some(2),
-                        axis_z: None,
-                        axis_c: Some(0),
-                        axis_t: None,
-                    };
-                }
-                [c, x, y, z, ..] => {
-                    return NrrdAxes {
-                        size_x: *x,
-                        size_y: *y,
-                        size_z: *z,
-                        size_c: *c,
-                        size_t: 1,
-                        axis_x: Some(1),
-                        axis_y: Some(2),
-                        axis_z: Some(3),
-                        axis_c: Some(0),
-                        axis_t: None,
-                    };
-                }
-                _ => {
-                    // Fall through to generic axis derivation below.
-                }
-            };
-        }
-        return match hdr.sizes.as_slice() {
-            [x] => NrrdAxes {
-                size_x: *x,
-                size_y: 1,
-                size_z: 1,
-                size_c: 1,
-                size_t: 1,
-                axis_x: Some(0),
-                axis_y: None,
-                axis_z: None,
-                axis_c: None,
-                axis_t: None,
-            },
-            [x, y] => NrrdAxes {
-                size_x: *x,
-                size_y: *y,
-                size_z: 1,
-                size_c: 1,
-                size_t: 1,
-                axis_x: Some(0),
-                axis_y: Some(1),
-                axis_z: None,
-                axis_c: None,
-                axis_t: None,
-            },
-            [x, y, z] => NrrdAxes {
-                size_x: *x,
-                size_y: *y,
-                size_z: *z,
-                size_c: 1,
-                size_t: 1,
-                axis_x: Some(0),
-                axis_y: Some(1),
-                axis_z: Some(2),
-                axis_c: None,
-                axis_t: None,
-            },
-            [x, y, z, c, ..] => NrrdAxes {
-                size_x: *x,
-                size_y: *y,
-                size_z: *z,
-                size_c: *c,
-                size_t: 1,
-                axis_x: Some(0),
-                axis_y: Some(1),
-                axis_z: Some(2),
-                axis_c: Some(3),
-                axis_t: None,
-            },
-            [] => NrrdAxes {
-                size_x: 1,
-                size_y: 1,
-                size_z: 1,
-                size_c: 1,
-                size_t: 1,
-                axis_x: None,
-                axis_y: None,
-                axis_z: None,
-                axis_c: None,
-                axis_t: None,
-            },
-        };
-    }
+    let mut size_x = 1u32;
+    let mut size_y = 1u32;
+    let mut size_z = 1u32;
+    let mut size_c = 1u32;
+    let mut size_t = 1u32;
 
+    let mut axis_x = None;
+    let mut axis_y = None;
+    let mut axis_z = None;
     let mut axis_c = None;
     let mut axis_t = None;
-    let mut spatial = Vec::new();
 
-    for (axis, size) in hdr.sizes.iter().enumerate() {
-        let kind = hdr.kinds.get(axis).map(String::as_str).unwrap_or("");
-        if leading_nonspatial && axis == 0 {
-            axis_c = Some(axis);
-        } else if is_channel_kind(kind) {
-            axis_c = Some(axis);
-        } else if is_time_kind(kind) {
-            axis_t = Some(axis);
-        } else if hdr
-            .space_directions
-            .get(axis)
-            .is_some_and(|has_direction| !*has_direction)
-            && *size <= 4
-        {
-            axis_c = Some(axis);
-        } else if axis_has_space_direction(hdr, axis, leading_nonspatial) {
-            spatial.push(axis);
-        } else if *size > 0 {
-            spatial.push(axis);
+    for i in 0..num_dimensions {
+        let size = hdr.sizes[i];
+
+        if num_dimensions >= 3 && i == 0 && size > 1 && size <= 16 {
+            size_c = size;
+            axis_c = Some(i);
+        } else if i == 0 || (size_c > 1 && i == 1) {
+            size_x = size;
+            axis_x = Some(i);
+        } else if i == 1 || (size_c > 1 && i == 2) {
+            size_y = size;
+            axis_y = Some(i);
+        } else if i == 2 || (size_c > 1 && i == 3) {
+            size_z = size;
+            axis_z = Some(i);
+        } else if i == 3 || (size_c > 1 && i == 4) {
+            size_t = size;
+            axis_t = Some(i);
         }
     }
 
-    let axis_x = spatial.first().copied();
-    let axis_y = spatial.get(1).copied();
-    let axis_z = spatial.get(2).copied();
-
     NrrdAxes {
-        size_x: axis_x.map(|a| hdr.sizes[a]).unwrap_or(1),
-        size_y: axis_y.map(|a| hdr.sizes[a]).unwrap_or(1),
-        size_z: axis_z.map(|a| hdr.sizes[a]).unwrap_or(1),
-        size_c: axis_c.map(|a| hdr.sizes[a]).unwrap_or(1),
-        size_t: axis_t.map(|a| hdr.sizes[a]).unwrap_or(1),
+        size_x,
+        size_y,
+        size_z,
+        size_c,
+        size_t,
         axis_x,
         axis_y,
         axis_z,
@@ -421,14 +317,34 @@ fn total_sample_count(sizes: &[u32]) -> usize {
         .fold(1usize, |acc, size| acc.saturating_mul(*size as usize))
 }
 
-fn data_start_offset(path: &Path, base_offset: u64, hdr: &NrrdHeader) -> Result<u64> {
+fn data_start_offset(
+    path: &Path,
+    base_offset: u64,
+    hdr: &NrrdHeader,
+    has_external_data: bool,
+) -> Result<u64> {
     if hdr.byte_skip < 0 {
         return Err(BioFormatsError::UnsupportedFormat(
             "NRRD byte skip -1 is not supported".into(),
         ));
     }
 
+    // Per NRRDReader.java (raw encoding):
+    //   - external data file: offset = byteSkip (absolute), and "line skip" is
+    //     NOT applied — the reader simply seeks to `offset + no * planeSize`.
+    //   - inline data: offset = post-header file pointer; byte skip is
+    //     overwritten/ignored.
+    // "byte skip" is therefore an absolute offset, never additive to the
+    // header end, and "line skip" is not honoured for raw data.
+    if has_external_data {
+        return Ok(hdr.byte_skip as u64);
+    }
+
     let mut offset = base_offset;
+
+    // Retained for legacy line-skip handling on inline data; Java does not
+    // apply line skip for raw encoding, but keep it to support text/ascii-like
+    // inline payloads where a leading line count is meaningful.
     if hdr.line_skip > 0 {
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(offset))
@@ -448,7 +364,7 @@ fn data_start_offset(path: &Path, base_offset: u64, hdr: &NrrdHeader) -> Result<
         }
     }
 
-    Ok(offset + hdr.byte_skip as u64)
+    Ok(offset)
 }
 
 // ---- reader -----------------------------------------------------------------
@@ -483,7 +399,8 @@ impl NrrdReader {
 
         if hdr.data_files.len() == meta.image_count as usize {
             let data_path = &hdr.data_files[plane_index as usize];
-            let raw = self.read_nrrd_payload(data_path, 0, hdr, plane_bytes)?;
+            // Detached LIST files are external data sources.
+            let raw = self.read_nrrd_payload(data_path, 0, hdr, plane_bytes, true)?;
             let mut buf = raw[..plane_bytes.min(raw.len())].to_vec();
             if buf.len() != plane_bytes {
                 return Err(BioFormatsError::InvalidData(
@@ -515,13 +432,17 @@ impl NrrdReader {
         };
 
         let expected_bytes = total_sample_count(&hdr.sizes) * bps;
+        // External data exists when the pixels live in a separate file
+        // (.nhdr "data file" / detached LIST); inline NRRD data does not.
+        let has_external_data = hdr.data_file.is_some() || !hdr.data_files.is_empty();
         let mut all = Vec::with_capacity(expected_bytes);
         for (data_path, base_offset) in &data_sources {
             let remaining = expected_bytes.saturating_sub(all.len());
             if remaining == 0 {
                 break;
             }
-            let mut chunk = self.read_nrrd_payload(data_path, *base_offset, hdr, remaining)?;
+            let mut chunk =
+                self.read_nrrd_payload(data_path, *base_offset, hdr, remaining, has_external_data)?;
             all.append(&mut chunk);
         }
         if all.len() < expected_bytes {
@@ -607,9 +528,10 @@ impl NrrdReader {
         base_offset: u64,
         hdr: &NrrdHeader,
         max_bytes: usize,
+        has_external_data: bool,
     ) -> Result<Vec<u8>> {
         let mut f = File::open(data_path).map_err(BioFormatsError::Io)?;
-        let data_start = data_start_offset(data_path, base_offset, hdr)?;
+        let data_start = data_start_offset(data_path, base_offset, hdr, has_external_data)?;
 
         let data = match hdr.encoding {
             Encoding::Raw => {
@@ -670,6 +592,19 @@ impl NrrdReader {
                     }
                 }
                 buf
+            }
+            Encoding::Bzip2 => {
+                // The Java NRRDReader throws UnsupportedCompressionException for
+                // any encoding other than "raw"/"gzip"; bzip2 decoding would
+                // need a `bzip2` decoder crate that is not a direct dependency.
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "NRRD bzip2 encoding is not supported (requires a bzip2 decoder crate)".into(),
+                ));
+            }
+            Encoding::Unsupported => {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "NRRD: unsupported encoding".into(),
+                ));
             }
         };
         Ok(data)

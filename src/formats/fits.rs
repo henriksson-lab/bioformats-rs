@@ -32,18 +32,6 @@ fn parse_int_value(s: &str) -> Option<i64> {
     s.trim_matches('\'').trim().parse().ok()
 }
 
-fn parse_float_value(s: &str) -> Option<f64> {
-    let s = s
-        .split('/')
-        .next()
-        .unwrap_or(s)
-        .trim()
-        .trim_matches('\'')
-        .trim()
-        .replace('D', "E");
-    s.parse().ok()
-}
-
 fn pixel_type_from_bitpix(bitpix: i64) -> PixelType {
     match bitpix {
         8 => PixelType::Uint8,
@@ -57,127 +45,17 @@ fn pixel_type_from_bitpix(bitpix: i64) -> PixelType {
     }
 }
 
-fn scaled_pixel_type(bitpix: i64, bzero: f64, bscale: f64) -> PixelType {
-    if (bscale - 1.0).abs() < f64::EPSILON && bzero.abs() < f64::EPSILON {
-        return pixel_type_from_bitpix(bitpix);
-    }
-
-    if bitpix == 16 && (bscale - 1.0).abs() < f64::EPSILON && (bzero - 32768.0).abs() < f64::EPSILON
-    {
-        PixelType::Uint16
-    } else {
-        PixelType::Float32
-    }
-}
-
 #[derive(Debug)]
 struct FitsHdu {
     bitpix: i64,
     dims: Vec<u32>,
-    bzero: f64,
-    bscale: f64,
-    xtension: Option<String>,
     data_offset: u64,
     series_metadata: HashMap<String, MetadataValue>,
-}
-
-fn hdu_data_len(bitpix: i64, dims: &[u32]) -> u64 {
-    if dims.is_empty() {
-        return 0;
-    }
-    let bytes_per_sample = (bitpix.unsigned_abs() / 8).max(1);
-    dims.iter()
-        .fold(bytes_per_sample, |acc, &dim| acc.saturating_mul(dim as u64))
-}
-
-fn padded_len(len: u64) -> u64 {
-    let block = BLOCK as u64;
-    ((len + block - 1) / block) * block
-}
-
-fn raw_sample_as_f64(bytes: &[u8], bitpix: i64) -> f64 {
-    match bitpix {
-        8 => bytes[0] as f64,
-        16 => i16::from_be_bytes([bytes[0], bytes[1]]) as f64,
-        32 => i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64,
-        64 => i64::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]) as f64,
-        -32 => f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64,
-        -64 => f64::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]),
-        _ => 0.0,
-    }
-}
-
-fn convert_fits_endian(buf: &[u8], bitpix: i64, pixel_type: PixelType) -> Vec<u8> {
-    match bitpix {
-        8 => buf.to_vec(),
-        16 | -16 => buf
-            .chunks_exact(2)
-            .flat_map(|chunk| [chunk[1], chunk[0]])
-            .collect(),
-        32 | -32 => buf
-            .chunks_exact(4)
-            .flat_map(|chunk| [chunk[3], chunk[2], chunk[1], chunk[0]])
-            .collect(),
-        64 if pixel_type == PixelType::Float64 => buf
-            .chunks_exact(8)
-            .flat_map(|chunk| raw_sample_as_f64(chunk, bitpix).to_le_bytes().into_iter())
-            .collect(),
-        64 | -64 => buf
-            .chunks_exact(8)
-            .flat_map(|chunk| {
-                [
-                    chunk[7], chunk[6], chunk[5], chunk[4], chunk[3], chunk[2], chunk[1], chunk[0],
-                ]
-            })
-            .collect(),
-        _ => buf.to_vec(),
-    }
-}
-
-fn apply_fits_scaling(
-    buf: &[u8],
-    bitpix: i64,
-    pixel_type: PixelType,
-    bzero: f64,
-    bscale: f64,
-) -> Vec<u8> {
-    let raw_bps = (bitpix.unsigned_abs() as usize / 8).max(1);
-    match pixel_type {
-        PixelType::Uint16 => buf
-            .chunks_exact(raw_bps)
-            .flat_map(|chunk| {
-                let value = raw_sample_as_f64(chunk, bitpix) * bscale + bzero;
-                (value.round().clamp(0.0, u16::MAX as f64) as u16).to_le_bytes()
-            })
-            .collect(),
-        PixelType::Float32 => buf
-            .chunks_exact(raw_bps)
-            .flat_map(|chunk| {
-                let value = (raw_sample_as_f64(chunk, bitpix) * bscale + bzero) as f32;
-                value.to_le_bytes()
-            })
-            .collect(),
-        PixelType::Float64 => buf
-            .chunks_exact(raw_bps)
-            .flat_map(|chunk| {
-                let value = raw_sample_as_f64(chunk, bitpix) * bscale + bzero;
-                value.to_le_bytes()
-            })
-            .collect(),
-        _ => convert_fits_endian(buf, bitpix, pixel_type),
-    }
 }
 
 fn read_hdu(f: &mut File) -> Result<Option<FitsHdu>> {
     let mut bitpix: i64 = 8;
     let mut dims: Vec<u32> = Vec::new();
-    let mut bzero = 0.0;
-    let mut bscale = 1.0;
-    let mut xtension = None;
     let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
     let mut found_end = false;
     let mut block = vec![0u8; BLOCK];
@@ -225,19 +103,15 @@ fn read_hdu(f: &mut File) -> Result<Option<FitsHdu>> {
                         }
                     }
                 }
-                "BZERO" => {
-                    if let Some(v) = val.and_then(parse_float_value) {
-                        bzero = v;
-                    }
-                }
-                "BSCALE" => {
-                    if let Some(v) = val.and_then(parse_float_value) {
-                        bscale = v;
+                "BZERO" | "BSCALE" => {
+                    // Recorded as metadata only; Java does not rescale samples.
+                    if let Some(v) = val {
+                        series_metadata
+                            .insert(key.to_string(), MetadataValue::String(v.to_string()));
                     }
                 }
                 "XTENSION" => {
                     if let Some(v) = val {
-                        xtension = Some(v.to_string());
                         series_metadata
                             .insert(key.to_string(), MetadataValue::String(v.to_string()));
                     }
@@ -260,9 +134,6 @@ fn read_hdu(f: &mut File) -> Result<Option<FitsHdu>> {
     Ok(Some(FitsHdu {
         bitpix,
         dims,
-        bzero,
-        bscale,
-        xtension,
         data_offset,
         series_metadata,
     }))
@@ -281,7 +152,9 @@ fn bitpix_from_pixel_type(pt: PixelType) -> i64 {
 }
 
 fn fits_series_from_hdu(hdu: FitsHdu) -> FitsSeries {
-    let pixel_type = scaled_pixel_type(hdu.bitpix, hdu.bzero, hdu.bscale);
+    // Java FitsReader keeps the raw on-disk pixel type (no BZERO/BSCALE
+    // rescaling) and treats the data as big-endian.
+    let pixel_type = pixel_type_from_bitpix(hdu.bitpix);
     let (size_x, size_y, size_z) = match hdu.dims.as_slice() {
         [x] => (*x, 1, 1),
         [x, y] => (*x, *y, 1),
@@ -299,11 +172,11 @@ fn fits_series_from_hdu(hdu: FitsHdu) -> FitsSeries {
             pixel_type,
             bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
             image_count: size_z,
-            dimension_order: DimensionOrder::XYZTC,
+            dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: true,
+            is_little_endian: false, // FITS is big-endian per spec
             resolution_count: 1,
             series_metadata: hdu.series_metadata,
             lookup_table: None,
@@ -313,8 +186,6 @@ fn fits_series_from_hdu(hdu: FitsHdu) -> FitsSeries {
         },
         data_offset: hdu.data_offset,
         raw_bitpix: hdu.bitpix,
-        bzero: hdu.bzero,
-        bscale: hdu.bscale,
     }
 }
 
@@ -331,8 +202,6 @@ struct FitsSeries {
     metadata: ImageMetadata,
     data_offset: u64,
     raw_bitpix: i64,
-    bzero: f64,
-    bscale: f64,
 }
 
 impl FitsReader {
@@ -367,18 +236,15 @@ impl FormatReader for FitsReader {
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut series = Vec::new();
 
-        while let Some(hdu) = read_hdu(&mut f)? {
-            let data_len = hdu_data_len(hdu.bitpix, &hdu.dims);
-            let is_image_hdu = hdu
-                .xtension
-                .as_deref()
-                .map(|xtension| xtension.contains("IMAGE"))
-                .unwrap_or(true);
-            if !hdu.dims.is_empty() && is_image_hdu {
-                series.push(fits_series_from_hdu(hdu));
+        // Java FitsReader reads only the primary HDU (the standard header that
+        // populates the image dimensions). Image extensions are ignored.
+        if let Some(hdu) = read_hdu(&mut f)? {
+            if hdu.dims.is_empty() {
+                return Err(BioFormatsError::Format(
+                    "FITS primary HDU contains no image".into(),
+                ));
             }
-            f.seek(SeekFrom::Current(padded_len(data_len) as i64))
-                .map_err(BioFormatsError::Io)?;
+            series.push(fits_series_from_hdu(hdu));
         }
 
         if series.is_empty() {
@@ -437,20 +303,9 @@ impl FormatReader for FitsReader {
         let mut buf = vec![0u8; raw_plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
 
-        if (series.bscale - 1.0).abs() < f64::EPSILON && series.bzero.abs() < f64::EPSILON {
-            return Ok(convert_fits_endian(
-                &buf,
-                series.raw_bitpix,
-                meta.pixel_type,
-            ));
-        }
-        Ok(apply_fits_scaling(
-            &buf,
-            series.raw_bitpix,
-            meta.pixel_type,
-            series.bzero,
-            series.bscale,
-        ))
+        // Java FitsReader returns the raw big-endian samples unchanged: no
+        // BZERO/BSCALE rescaling and no byte-swap.
+        Ok(buf)
     }
 
     fn open_bytes_region(
@@ -641,14 +496,6 @@ mod tests {
         padded_block(bytes)
     }
 
-    fn empty_primary_hdu() -> Vec<u8> {
-        header(vec![
-            fits_record("SIMPLE", "                   T"),
-            fits_record("BITPIX", "                   8"),
-            fits_record("NAXIS", "                   0"),
-        ])
-    }
-
     fn image_extension_hdu(
         bitpix: i64,
         dims: &[u32],
@@ -678,46 +525,45 @@ mod tests {
     #[test]
     fn fits_image_extensions_are_exposed_as_series() {
         let path = temp_fits_path("extension_series");
-        let mut bytes = empty_primary_hdu();
-        bytes.extend_from_slice(&image_extension_hdu(8, &[2, 2], &[], &[1, 2, 3, 4]));
-        bytes.extend_from_slice(&image_extension_hdu(
-            16,
-            &[2, 1, 2],
-            &[
-                ("BZERO", "             32768.0"),
-                ("BSCALE", "                 1.0"),
-            ],
-            &[
-                0x80, 0x00, 0xff, 0xff, // plane 0: -32768, -1
-                0x00, 0x00, 0x7f, 0xff, // plane 1: 0, 32767
-            ],
-        ));
+        // Java FitsReader reads ONLY the primary HDU. A 16-bit, big-endian,
+        // 2-plane primary image must be exposed as a single series whose raw
+        // big-endian bytes are returned unmodified (no BZERO/BSCALE rescale,
+        // no byte-swap).
+        let mut bytes = header(vec![
+            fits_record("SIMPLE", "                   T"),
+            fits_record("BITPIX", "                  16"),
+            fits_record("NAXIS", "                   3"),
+            fits_record("NAXIS1", "                   2"),
+            fits_record("NAXIS2", "                   1"),
+            fits_record("NAXIS3", "                   2"),
+            fits_record("BZERO", "             32768.0"),
+            fits_record("BSCALE", "                 1.0"),
+        ]);
+        bytes.extend_from_slice(&padded_block(vec![
+            0x80, 0x00, 0xff, 0xff, // plane 0: big-endian -32768, -1
+            0x00, 0x00, 0x7f, 0xff, // plane 1: big-endian 0, 32767
+        ]));
         std::fs::write(&path, bytes).expect("write synthetic FITS");
 
         let mut reader = FitsReader::new();
         reader.set_id(&path).expect("open FITS");
-        assert_eq!(reader.series_count(), 2);
-        assert_eq!(reader.metadata().size_x, 2);
-        assert_eq!(reader.metadata().size_y, 2);
-        assert_eq!(reader.metadata().image_count, 1);
-        assert_eq!(
-            reader.open_bytes(0).expect("series 0 plane"),
-            vec![1, 2, 3, 4]
-        );
-
-        reader.set_series(1).expect("select extension series");
+        // Only the primary HDU is exposed.
+        assert_eq!(reader.series_count(), 1);
         assert_eq!(reader.metadata().size_x, 2);
         assert_eq!(reader.metadata().size_y, 1);
         assert_eq!(reader.metadata().size_z, 2);
         assert_eq!(reader.metadata().image_count, 2);
-        assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+        // BITPIX 16 → signed Int16, big-endian, raw.
+        assert_eq!(reader.metadata().pixel_type, PixelType::Int16);
+        assert!(!reader.metadata().is_little_endian);
+        // Raw big-endian bytes are returned unchanged.
         assert_eq!(
-            reader.open_bytes(0).expect("series 1 plane 0"),
-            vec![0, 0, 255, 127]
+            reader.open_bytes(0).expect("plane 0"),
+            vec![0x80, 0x00, 0xff, 0xff]
         );
         assert_eq!(
-            reader.open_bytes(1).expect("series 1 plane 1"),
-            vec![0, 128, 255, 255]
+            reader.open_bytes(1).expect("plane 1"),
+            vec![0x00, 0x00, 0x7f, 0xff]
         );
         assert!(matches!(
             reader.open_bytes(2),
@@ -728,8 +574,9 @@ mod tests {
     }
 
     #[test]
-    fn fits_primary_image_and_extension_are_both_series() {
-        let path = temp_fits_path("primary_and_extension");
+    fn fits_only_primary_hdu_is_read() {
+        // Java reads only the primary HDU; any image extension is ignored.
+        let path = temp_fits_path("primary_only");
         let mut bytes = header(vec![
             fits_record("SIMPLE", "                   T"),
             fits_record("BITPIX", "                   8"),
@@ -743,10 +590,9 @@ mod tests {
 
         let mut reader = FitsReader::new();
         reader.set_id(&path).expect("open FITS");
-        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.series_count(), 1);
         assert_eq!(reader.open_bytes(0).expect("primary plane"), vec![9, 10]);
-        reader.set_series(1).expect("select extension");
-        assert_eq!(reader.open_bytes(0).expect("extension plane"), vec![42]);
+        assert!(reader.set_series(1).is_err());
 
         let _ = std::fs::remove_file(path);
     }

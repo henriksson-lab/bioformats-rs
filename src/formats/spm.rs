@@ -605,13 +605,14 @@ impl FormatReader for QuesantReader {
 }
 
 // ===========================================================================
-// ZIP+TIFF reader — JPK Instruments AFM
+// TIFF reader — JPK Instruments AFM
 // ===========================================================================
 
 /// JPK Instruments AFM reader (`.jpk`).
 ///
-/// JPK files are ZIP archives containing TIFF images. Opens the ZIP, finds
-/// the first TIFF, extracts it to a temp file, and delegates to TiffReader.
+/// Port of JPKReader.java: a `.jpk` file IS a TIFF (JPKReader extends
+/// BaseTiffReader). Exposes two series: series 0 = IFD 0 (a single-plane
+/// thumbnail), series 1 = IFDs 1..n grouped as a T-stack.
 pub struct JpkReader {
     extracted_path: Option<PathBuf>,
     inner: crate::tiff::TiffReader,
@@ -650,51 +651,74 @@ impl FormatReader for JpkReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| BioFormatsError::Format(format!("JPK ZIP open error: {e}")))?;
+        // A .jpk file is itself a TIFF; parse it directly.
+        self.inner.set_id(path)?;
 
-        // Find the first TIFF entry
-        let mut found_name: Option<String> = None;
-        for i in 0..archive.len() {
-            if let Ok(entry) = archive.by_index(i) {
-                let name = entry.name().to_string();
-                if !entry.is_dir() {
-                    let lower = name.to_ascii_lowercase();
-                    if lower.ends_with(".tif") || lower.ends_with(".tiff") {
-                        found_name = Some(name);
-                        break;
-                    }
+        let ifd_count = self.inner.ifd_count();
+        if ifd_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "JPK: TIFF contains no IFDs".to_string(),
+            ));
+        }
+
+        // Build a per-IFD metadata lookup from the default series grouping so we
+        // can reconstruct accurate dimensions/pixel-type for the JPK layout.
+        // We clone existing TiffSeries values (the type is not re-exported) and
+        // mutate their public fields rather than constructing literals.
+        let default_series = self.inner.series_list();
+        let mut meta_for_ifd: Vec<Option<ImageMetadata>> = vec![None; ifd_count];
+        for series in default_series {
+            for &idx in &series.ifd_indices {
+                if idx < ifd_count {
+                    meta_for_ifd[idx] = Some(series.metadata.clone());
                 }
             }
         }
-
-        let Some(name) = found_name else {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "JPK ZIP archive does not contain a TIFF image entry".to_string(),
-            ));
+        // A template TiffSeries to clone (carries the unexported type).
+        let template = default_series[0].clone();
+        let ifd_meta = |idx: usize| -> ImageMetadata {
+            meta_for_ifd
+                .get(idx)
+                .and_then(|m| m.clone())
+                .unwrap_or_else(|| template.metadata.clone())
         };
 
-        // Extract to temp file
-        let safe_name = std::path::Path::new(&name)
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("extracted.tif"))
-            .to_string_lossy()
-            .to_string();
-        let unique = format!("bioformats_jpk_{}_{}", std::process::id(), safe_name);
-        let temp_path = std::env::temp_dir().join(unique);
+        let mut new_series = Vec::new();
 
+        // Series 0: IFD 0 only, a single-plane thumbnail.
         {
-            let mut entry = archive
-                .by_name(&name)
-                .map_err(|e| BioFormatsError::Format(format!("JPK ZIP entry error: {e}")))?;
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
-            std::fs::write(&temp_path, &buf).map_err(BioFormatsError::Io)?;
+            let mut s = template.clone();
+            let mut m = ifd_meta(0);
+            m.size_z = 1;
+            m.size_t = 1;
+            m.image_count = 1;
+            m.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+            s.ifd_indices = vec![0];
+            s.plane_ifd_indices = Vec::new();
+            s.sub_resolutions = Vec::new();
+            s.metadata = m;
+            new_series.push(s);
         }
 
-        self.extracted_path = Some(temp_path.clone());
-        self.inner.set_id(&temp_path)?;
+        // Series 1 (only if there is more than one IFD): IFDs 1..n as a T-stack.
+        if ifd_count > 1 {
+            let t = (ifd_count - 1) as u32;
+            let mut s = template.clone();
+            let mut m = ifd_meta(1);
+            m.size_z = 1;
+            m.size_t = t;
+            m.size_c = if m.is_rgb { m.size_c } else { 1 };
+            m.image_count = t;
+            m.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+            s.ifd_indices = (1..ifd_count).collect();
+            s.plane_ifd_indices = Vec::new();
+            s.sub_resolutions = Vec::new();
+            s.metadata = m;
+            new_series.push(s);
+        }
+
+        self.inner.replace_series(new_series);
+        self.inner.set_series(0)?;
         self.meta = Some(self.inner.metadata().clone());
         self.is_tiff = true;
 

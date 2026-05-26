@@ -229,7 +229,7 @@ fn stitch_layout(
 ) -> Result<(ImageMetadata, Vec<(usize, u32)>)> {
     let mut meta = base_meta.clone();
     let file_axes = pattern
-        .and_then(|pattern| infer_file_axes(files, pattern))
+        .and_then(|pattern| infer_file_axes(files, pattern, base_meta))
         .unwrap_or_else(|| FileAxisLayout {
             file_coords: (0..files.len()).map(|i| (i as u32, 0, 0)).collect(),
             size_z: files.len() as u32,
@@ -274,8 +274,24 @@ struct FileAxisLayout {
     size_t: u32,
 }
 
-fn infer_file_axes(files: &[PathBuf], pattern: &FilePattern) -> Option<FileAxisLayout> {
-    let guessed = AxisGuesser::guess(pattern);
+fn infer_file_axes(
+    files: &[PathBuf],
+    pattern: &FilePattern,
+    base_meta: &ImageMetadata,
+) -> Option<FileAxisLayout> {
+    // Feed the reader's per-file dimension order and Z/T/C sizes into the
+    // guesser so Java's step 2 (Z/T swap) and step 3 (size-aware back-fill)
+    // apply. The single-file dimension order is uncertain for a stitched
+    // dataset, so pass `is_certain = false`.
+    let guess = AxisGuesser::guess_with_dims(
+        pattern,
+        dimension_order_str(base_meta.dimension_order),
+        base_meta.size_z,
+        base_meta.size_t,
+        base_meta.size_c,
+        false,
+    );
+    let guessed = guess.axis_types;
     if !guessed
         .iter()
         .any(|axis| matches!(axis, AxisType::Z | AxisType::Channel | AxisType::Time))
@@ -326,6 +342,20 @@ fn infer_file_axes(files: &[PathBuf], pattern: &FilePattern) -> Option<FileAxisL
         size_c,
         size_t,
     })
+}
+
+/// Map a [`DimensionOrder`] to its 5-character string form (e.g. "XYZCT"),
+/// matching the `dimOrder` strings used by Java's AxisGuesser.
+fn dimension_order_str(order: crate::common::metadata::DimensionOrder) -> &'static str {
+    use crate::common::metadata::DimensionOrder::*;
+    match order {
+        XYCTZ => "XYCTZ",
+        XYCZT => "XYCZT",
+        XYTCZ => "XYTCZ",
+        XYTZC => "XYTZC",
+        XYZCT => "XYZCT",
+        XYZTC => "XYZTC",
+    }
 }
 
 fn has_duplicate_inferred_axis(axes: &[AxisType]) -> bool {
@@ -667,59 +697,257 @@ pub enum AxisType {
     Unknown,
 }
 
+/// Result of running the axis guesser: the axis type for each pattern block,
+/// plus the (possibly Z/T-swapped) adjusted within-file dimension order.
+///
+/// Mirrors the relevant outputs of Java `AxisGuesser` (`getAxisTypes`,
+/// `getAdjustedOrder`, `isCertain`).
+#[derive(Debug, Clone)]
+pub struct AxisGuess {
+    /// Guessed axis type per pattern block.
+    pub axis_types: Vec<AxisType>,
+    /// Adjusted within-file dimension order (as a 5-char string like "XYZCT").
+    pub adjusted_order: String,
+    /// Whether the guess is confident.
+    pub certain: bool,
+}
+
 /// Heuristic axis guesser — infers which dimension each numeric block in a
 /// filename pattern represents.
 ///
 /// Equivalent to Java Bio-Formats' `AxisGuesser`.
 pub struct AxisGuesser;
 
+// Known prefix sets, matched exactly against the trailing alphabetic segment of
+// a block's preceding text. Mirrors AxisGuesser.{Z,T,C,S}_PREFIXES in Java.
+const Z_PREFIXES: &[&str] = &["fp", "sec", "z", "zs", "focal", "focalplane"];
+const T_PREFIXES: &[&str] = &["t", "tl", "tp", "time"];
+const C_PREFIXES: &[&str] = &["c", "ch", "w", "wavelength"];
+const S_PREFIXES: &[&str] = &["s", "series", "sp"];
+
 impl AxisGuesser {
-    /// Guess axis types for each block in a FilePattern.
+    /// Guess axis types for each block in a FilePattern, without per-file
+    /// dimension sizes.
+    ///
+    /// This is the convenience entry point: it assumes each within-file
+    /// dimension has size 1 (so every axis is "free" for back-filling) and an
+    /// uncertain dimension order. Under those assumptions Java's step 2 (Z/T
+    /// swap) never fires (it requires `sizeZ > 1` or `sizeT > 1`), so this is
+    /// equivalent to running the full guesser with `sizeZ = sizeT = sizeC = 1`.
+    /// Returns just the axis types; callers needing the adjusted order should
+    /// use [`AxisGuesser::guess_with_dims`].
     pub fn guess(pattern: &FilePattern) -> Vec<AxisType> {
-        pattern
+        Self::guess_with_dims(pattern, "XYZCT", 1, 1, 1, false).axis_types
+    }
+
+    /// Full port of Java `AxisGuesser`'s constructor (steps 1–3), using the
+    /// per-file dimension order and Z/T/C sizes from the reader.
+    ///
+    /// - Step 1: assign each block from its known prefix (Z/T/C/S prefix sets).
+    /// - Step 2 (`AxisGuesser.java` lines ~242-257): if the order is uncertain
+    ///   and exactly one of Z/T was found as a prefix while that dimension has
+    ///   size > 1 within each file (and the other has size 1), swap Z and T in
+    ///   the adjusted order and swap the working `sizeZ`/`sizeT`.
+    /// - Step 3 (lines ~259-293): back-fill remaining UNKNOWN blocks into the
+    ///   first free Z/T/C dimension (free = not found AND size == 1), otherwise
+    ///   onto the last axis of the (adjusted) order.
+    ///
+    /// `dim_order` is a string such as "XYZCT"; only the relative positions of
+    /// 'Z', 'T' and 'C' (and the final axis) are used.
+    pub fn guess_with_dims(
+        pattern: &FilePattern,
+        dim_order: &str,
+        size_z: u32,
+        size_t: u32,
+        size_c: u32,
+        is_certain: bool,
+    ) -> AxisGuess {
+        let mut axis_types: Vec<AxisType> = pattern
             .blocks
             .iter()
             .map(|block| Self::guess_from_separator(&block.separator))
-            .collect()
+            .collect();
+
+        let found_z = axis_types.iter().any(|a| *a == AxisType::Z);
+        let found_t = axis_types.iter().any(|a| *a == AxisType::Time);
+        let found_c = axis_types.iter().any(|a| *a == AxisType::Channel);
+
+        // -- 2) check for special cases where dimension order should be swapped --
+        let mut new_order: Vec<char> = dim_order.chars().collect();
+        let mut size_z = size_z;
+        let mut size_t = size_t;
+        if !is_certain
+            && ((found_z && !found_t && size_z > 1 && size_t == 1)
+                || (found_t && !found_z && size_t > 1 && size_z == 1))
+        {
+            // swap Z and T dimensions in the adjusted order
+            if let (Some(index_z), Some(index_t)) = (
+                new_order.iter().position(|&c| c == 'Z'),
+                new_order.iter().position(|&c| c == 'T'),
+            ) {
+                new_order[index_z] = 'T';
+                new_order[index_t] = 'Z';
+            }
+            std::mem::swap(&mut size_z, &mut size_t);
+        }
+
+        // -- 3) fill in remaining axis types --
+        let mut can_be_z = !found_z && size_z == 1;
+        let mut can_be_t = !found_t && size_t == 1;
+        let mut can_be_c = !found_c && size_c == 1;
+        let mut certain = is_certain;
+
+        let last_axis = new_order.last().copied().unwrap_or('T');
+
+        for axis in axis_types.iter_mut() {
+            if *axis != AxisType::Unknown {
+                continue;
+            }
+            certain = false;
+            if can_be_z {
+                *axis = AxisType::Z;
+                can_be_z = false;
+            } else if can_be_t {
+                *axis = AxisType::Time;
+                can_be_t = false;
+            } else if can_be_c {
+                *axis = AxisType::Channel;
+                can_be_c = false;
+            } else {
+                *axis = match last_axis {
+                    'C' => AxisType::Channel,
+                    'Z' => AxisType::Z,
+                    _ => AxisType::Time,
+                };
+            }
+        }
+
+        AxisGuess {
+            axis_types,
+            adjusted_order: new_order.into_iter().collect(),
+            certain,
+        }
     }
 
-    /// Infer axis type from the text preceding a numeric block.
+    /// Infer axis type from the text preceding a numeric block, matching the
+    /// trailing alphanumeric segment against the exact Java prefix sets.
     fn guess_from_separator(sep: &str) -> AxisType {
-        let lower = sep.to_ascii_lowercase();
-        // Check for common axis indicators
-        if lower.contains('z')
-            || lower.contains("slice")
-            || lower.contains("depth")
-            || lower.contains("sec")
-            || lower.contains("plane")
-        {
+        let p = Self::trailing_segment(sep);
+        if Z_PREFIXES.contains(&p.as_str()) {
             return AxisType::Z;
         }
-        if lower.contains('c') && !lower.contains("tc")
-            || lower.contains("ch")
-            || lower.contains("channel")
-            || lower.contains("wave")
-            || lower.contains("lambda")
-        {
-            return AxisType::Channel;
-        }
-        if lower.contains('t')
-            || lower.contains("time")
-            || lower.contains("frame")
-            || lower.contains("tp")
-            || lower.contains("point")
-        {
+        if T_PREFIXES.contains(&p.as_str()) {
             return AxisType::Time;
         }
-        if lower.contains('s')
-            || lower.contains("series")
-            || lower.contains("pos")
-            || lower.contains("stage")
-            || lower.contains("well")
-            || lower.contains("field")
-        {
+        if C_PREFIXES.contains(&p.as_str()) {
+            return AxisType::Channel;
+        }
+        if S_PREFIXES.contains(&p.as_str()) {
             return AxisType::Series;
         }
         AxisType::Unknown
+    }
+
+    /// Extract the "useful prefix segment": lowercase the text, strip trailing
+    /// digits and divider characters (space, '-', '_', '.'), then take the run
+    /// of trailing ASCII letters. Mirrors AxisGuesser's char-array walk.
+    fn trailing_segment(sep: &str) -> String {
+        let ch: Vec<char> = sep.to_ascii_lowercase().chars().collect();
+        if ch.is_empty() {
+            return String::new();
+        }
+        let mut l: isize = ch.len() as isize - 1;
+        while l >= 0 {
+            let c = ch[l as usize];
+            if c.is_ascii_digit() || c == ' ' || c == '-' || c == '_' || c == '.' {
+                l -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut f: isize = l;
+        while f >= 0 && ch[f as usize].is_ascii_lowercase() {
+            f -= 1;
+        }
+        if l < 0 || f + 1 > l {
+            return String::new();
+        }
+        ch[(f + 1) as usize..=(l as usize)].iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a FilePattern with one block per `(separator, value_count)` pair,
+    /// bypassing directory scanning.
+    fn pattern(blocks: &[(&str, usize)]) -> FilePattern {
+        FilePattern {
+            dir: PathBuf::from("."),
+            prefix: String::new(),
+            suffix: ".tif".into(),
+            blocks: blocks
+                .iter()
+                .map(|(sep, n)| FilePatternBlock {
+                    separator: (*sep).into(),
+                    width: 3,
+                    min: 0,
+                    max: (*n as u64).saturating_sub(1),
+                    values: (0..*n as u64).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn zt_swap_when_only_z_found_and_size_z_gt_one() {
+        // Java AxisGuesser step 2: pattern "z<*>_<*>" with sizes {Z,T,C}=2,1,1
+        // and uncertain order => Z/T are swapped in the adjusted order, and the
+        // unknown second block becomes C (since after the swap canBeT is gone,
+        // sizeT becomes 2 so the only free dimension is C).
+        let fp = pattern(&[("z", 2), ("_", 2)]);
+        let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 2, 1, 1, false);
+        // newOrder has Z and T swapped: XYZCT -> XYTCT? No: only the Z and T
+        // chars swap positions, giving "XYTCZ".
+        assert_eq!(guess.adjusted_order, "XYTCZ");
+        // First block was matched as Z by prefix.
+        assert_eq!(guess.axis_types[0], AxisType::Z);
+        // After the swap, working sizeZ=1 (was T) so canBeZ is false (foundZ),
+        // canBeT is false (working sizeT=2), canBeC true -> second block = C.
+        assert_eq!(guess.axis_types[1], AxisType::Channel);
+        assert!(!guess.certain);
+    }
+
+    #[test]
+    fn no_swap_when_order_certain() {
+        let fp = pattern(&[("z", 2), ("_", 2)]);
+        let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 2, 1, 1, true);
+        assert_eq!(guess.adjusted_order, "XYZCT");
+        assert_eq!(guess.axis_types[0], AxisType::Z);
+        // Order certain so step 2 skipped; sizeZ=2 (foundZ), sizeT=1 so the
+        // unknown block back-fills to T.
+        assert_eq!(guess.axis_types[1], AxisType::Time);
+    }
+
+    #[test]
+    fn no_swap_when_both_sizes_one() {
+        // With all sizes 1 (the convenience `guess` case) step 2 never fires.
+        let fp = pattern(&[("t", 2), ("_", 2)]);
+        let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 1, 1, 1, false);
+        assert_eq!(guess.adjusted_order, "XYZCT");
+        assert_eq!(guess.axis_types[0], AxisType::Time);
+        // foundT, sizeZ==1 -> unknown block back-fills to Z first.
+        assert_eq!(guess.axis_types[1], AxisType::Z);
+    }
+
+    #[test]
+    fn unknown_blocks_backfill_then_last_axis() {
+        // Three unknown blocks, all sizes 1: back-fill Z, T, C in order.
+        let fp = pattern(&[("a", 2), ("b", 2), ("d", 2)]);
+        let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 1, 1, 1, false);
+        assert_eq!(guess.axis_types[0], AxisType::Z);
+        assert_eq!(guess.axis_types[1], AxisType::Time);
+        assert_eq!(guess.axis_types[2], AxisType::Channel);
     }
 }

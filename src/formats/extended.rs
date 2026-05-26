@@ -5,11 +5,13 @@
 //! Group C: Extension-only placeholder readers (MRW, Yokogawa, etc.).
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::ome_metadata::{
+    create_lsid, OmeImage, OmeMetadata, OmePlate, OmeWell, OmeWellSample,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -17,30 +19,6 @@ use crate::common::region::crop_full_plane;
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-fn placeholder_meta_u16(w: u32, h: u32) -> ImageMetadata {
-    ImageMetadata {
-        size_x: w,
-        size_y: h,
-        size_z: 1,
-        size_c: 1,
-        size_t: 1,
-        pixel_type: PixelType::Uint16,
-        bits_per_pixel: 16u8,
-        image_count: 1,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: false, // store as-is, big-endian
-        resolution_count: 1,
-        series_metadata: HashMap::new(),
-        lookup_table: None,
-        modulo_z: None,
-        modulo_c: None,
-        modulo_t: None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Macro: thin TIFF wrapper
@@ -241,20 +219,35 @@ tiff_wrapper! {
 // 3. Molecular Dynamics PhosphorImager GEL
 // ---------------------------------------------------------------------------
 
-/// Molecular Dynamics PhosphorImager GEL format (`.gel`).
+/// Amersham Biosciences / Molecular Dynamics GEL format (`.gel`).
 ///
-/// 16-bit big-endian grayscale. Width at offset 10 (u16 BE), height at
-/// offset 12 (u16 BE). Pixel data starts at offset 64.
+/// Ported from the upstream Java `GelReader`, which extends `BaseTiffReader`:
+/// a GEL file is a TIFF carrying private Molecular Dynamics tags. The data
+/// format tag (`MD_FILETAG` = 33445) is either LINEAR (128, plain TIFF) or
+/// SQUARE_ROOT (2). For SQUARE_ROOT, the stored unsigned-short samples must be
+/// squared and multiplied by the `MD_SCALE_PIXEL` (33446) rational scale, and
+/// the pixel type becomes 32-bit float. Image count equals the number of IFDs
+/// and is reported as the T dimension.
+const MD_FILETAG: u16 = 33445;
+const MD_SCALE_PIXEL: u16 = 33446;
+const GEL_SQUARE_ROOT: u64 = 2;
+
 pub struct GelReader {
-    path: Option<PathBuf>,
+    inner: crate::tiff::TiffReader,
     meta: Option<ImageMetadata>,
+    /// True when the data format is SQUARE_ROOT (pixels need squaring/scaling).
+    square_root: bool,
+    /// MD_SCALE_PIXEL rational as f64 (defaults to 1.0).
+    scale: f64,
 }
 
 impl GelReader {
     pub fn new() -> Self {
         GelReader {
-            path: None,
+            inner: crate::tiff::TiffReader::new(),
             meta: None,
+            square_root: false,
+            scale: 1.0,
         }
     }
 }
@@ -275,47 +268,71 @@ impl FormatReader for GelReader {
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // A genuine GEL is a TIFF whose first IFD contains MD_FILETAG, which we
+        // cannot test from a raw header slice alone, so defer to set_id/by_name.
         false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let data = std::fs::read(path).map_err(|e| BioFormatsError::Io(e))?;
-        if data.len() < 64 {
+        self.inner.set_id(path)?;
+
+        // Inspect the first IFD for the private Molecular Dynamics tags.
+        let first = self.inner.ifd(0).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("GEL TIFF has no IFDs".into())
+        })?;
+        if first.get(MD_FILETAG).is_none() {
+            // Not a Molecular Dynamics GEL TIFF.
             return Err(BioFormatsError::UnsupportedFormat(
-                "GEL header is too short for Molecular Dynamics dimensions".into(),
+                "GEL TIFF is missing the Molecular Dynamics MD_FILETAG (33445) tag".into(),
             ));
         }
+        let fmt = first
+            .get(MD_FILETAG)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(128);
+        self.square_root = fmt == GEL_SQUARE_ROOT;
+        self.scale = first
+            .get(MD_SCALE_PIXEL)
+            .and_then(|v| match v {
+                crate::tiff::ifd::IfdValue::Rational(r) if !r.is_empty() => {
+                    let (num, den) = r[0];
+                    if den == 0 {
+                        Some(1.0)
+                    } else {
+                        Some(num as f64 / den as f64)
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or(1.0);
 
-        let w = u16::from_be_bytes([data[10], data[11]]) as u32;
-        let h = u16::from_be_bytes([data[12], data[13]]) as u32;
-        if w == 0 || h == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "GEL header contains zero dimensions".into(),
-            ));
+        // imageCount == number of IFDs; reported as the T dimension (Java
+        // GelReader.initMetadata sets sizeT = imageCount, sizeZ/sizeC = 1).
+        let mut ifds = 0u32;
+        while self.inner.ifd(ifds as usize).is_some() {
+            ifds += 1;
         }
-        let plane_bytes = (w as usize)
-            .checked_mul(h as usize)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| BioFormatsError::Format("GEL plane size overflows".into()))?;
-        let expected_len = 64usize
-            .checked_add(plane_bytes)
-            .ok_or_else(|| BioFormatsError::Format("GEL file size overflows".into()))?;
-        if data.len() < expected_len {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "GEL payload is shorter than declared image: got {} bytes, expected at least {expected_len}",
-                data.len()
-            )));
+        let ifds = ifds.max(1);
+        let base = self.inner.metadata();
+        let mut meta = base.clone();
+        meta.size_z = 1;
+        meta.size_c = 1;
+        meta.size_t = ifds;
+        meta.image_count = ifds;
+        meta.dimension_order = DimensionOrder::XYZCT;
+        if self.square_root {
+            meta.pixel_type = PixelType::Float32;
+            meta.bits_per_pixel = 32;
         }
-
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(placeholder_meta_u16(w, h));
+        self.meta = Some(meta);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
         self.meta = None;
-        Ok(())
+        self.square_root = false;
+        self.scale = 1.0;
+        self.inner.close()
     }
 
     fn series_count(&self) -> usize {
@@ -343,14 +360,36 @@ impl FormatReader for GelReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let n_bytes = meta.size_x as usize * meta.size_y as usize * 2;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(|e| BioFormatsError::Io(e))?;
-        f.seek(SeekFrom::Start(64))
-            .map_err(|e| BioFormatsError::Io(e))?;
-        let mut buf = vec![0u8; n_bytes];
-        f.read_exact(&mut buf).map_err(|e| BioFormatsError::Io(e))?;
-        Ok(buf)
+        let little_endian = meta.is_little_endian;
+
+        if !self.square_root {
+            // LINEAR: plain TIFF pixels.
+            return self.inner.open_bytes(plane_index);
+        }
+
+        // SQUARE_ROOT: the TIFF holds unsigned-short samples that must be
+        // squared and multiplied by the scale, then emitted as 32-bit floats.
+        // We read the raw shorts directly (the TIFF reports a 16-bit type for
+        // these IFDs) rather than letting any float interpretation occur.
+        let raw = self.inner.open_bytes(plane_index)?;
+        let n = raw.len() / 2;
+        let mut out = vec![0u8; n * 4];
+        for i in 0..n {
+            let value = if little_endian {
+                u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]])
+            } else {
+                u16::from_be_bytes([raw[i * 2], raw[i * 2 + 1]])
+            } as u64;
+            let pixel = (value * value) as f64 * self.scale;
+            let bits = (pixel as f32).to_bits();
+            let bytes = if little_endian {
+                bits.to_le_bytes()
+            } else {
+                bits.to_be_bytes()
+            };
+            out[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+        }
+        Ok(out)
     }
 
     fn open_bytes_region(
@@ -893,14 +932,20 @@ impl FormatReader for HamamatsuVmsReader {
 // 6. Cellomics HCS
 // ---------------------------------------------------------------------------
 
-/// Cellomics HCS format (`.c01`).
+/// Cellomics C01 format (`.c01` / `.dib`).
 ///
-/// Binary format. Header at offset 4: width (u16 LE), offset 6: height (u16 LE),
-/// offset 8: bit_depth (u16 LE). Pixel data at offset 52.
+/// Ported from the upstream Java `CellomicsReader`. A `.c01` file is a
+/// zlib-compressed payload: the first 4 bytes are the C01 magic, and the
+/// remainder is a zlib (Deflate-with-header) stream. The decompressed payload
+/// is a DIB-style bitmap: at offset 4 the 32-bit width and height (LE), then
+/// 16-bit plane count and bit depth, a 32-bit compression code, and pixel data
+/// starting at offset 52. A `.dib` file is the same layout but not compressed.
 pub struct CellomicsReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     pixel_offset: u64,
+    /// Decoded (decompressed for .c01, raw for .dib) file bytes.
+    data: Vec<u8>,
 }
 
 impl CellomicsReader {
@@ -909,6 +954,7 @@ impl CellomicsReader {
             path: None,
             meta: None,
             pixel_offset: 52,
+            data: Vec::new(),
         }
     }
 }
@@ -954,7 +1000,27 @@ impl FormatReader for CellomicsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let data = std::fs::read(path).map_err(|e| BioFormatsError::Io(e))?;
+        let raw = std::fs::read(path).map_err(|e| BioFormatsError::Io(e))?;
+        // .c01 files are zlib-compressed after a 4-byte magic; .dib are raw.
+        let is_c01 = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("c01"))
+            .unwrap_or(false);
+        let data = if is_c01 {
+            if raw.len() < 4 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Cellomics C01 file is too short to contain a magic number".into(),
+                ));
+            }
+            crate::common::codec::decompress_deflate(&raw[4..]).map_err(|_| {
+                BioFormatsError::UnsupportedFormat(
+                    "Cellomics C01 zlib payload could not be decompressed".into(),
+                )
+            })?
+        } else {
+            raw
+        };
 
         let (w, h, image_count, pixel_type, bpp, pixel_offset) = if data.len() >= 52 {
             let dib_header_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -1037,6 +1103,7 @@ impl FormatReader for CellomicsReader {
 
         self.path = Some(path.to_path_buf());
         self.pixel_offset = pixel_offset;
+        self.data = data;
         self.meta = Some(ImageMetadata {
             size_x: w,
             size_y: h,
@@ -1065,6 +1132,7 @@ impl FormatReader for CellomicsReader {
         self.path = None;
         self.meta = None;
         self.pixel_offset = 52;
+        self.data = Vec::new();
         Ok(())
     }
 
@@ -1095,8 +1163,7 @@ impl FormatReader for CellomicsReader {
         }
         let bytes_per_pixel = (meta.bits_per_pixel / 8) as usize;
         let n_bytes = meta.size_x as usize * meta.size_y as usize * bytes_per_pixel;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(|e| BioFormatsError::Io(e))?;
+        // Pixel data lives in the decoded (decompressed for .c01) buffer.
         let plane_offset = self
             .pixel_offset
             .checked_add(
@@ -1108,12 +1175,13 @@ impl FormatReader for CellomicsReader {
             )
             .ok_or_else(|| {
                 BioFormatsError::Format("Cellomics plane offset overflows".to_string())
-            })?;
-        f.seek(SeekFrom::Start(plane_offset))
-            .map_err(|e| BioFormatsError::Io(e))?;
-        let mut buf = vec![0u8; n_bytes];
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+            })? as usize;
+        if plane_offset + n_bytes > self.data.len() {
+            return Err(BioFormatsError::InvalidData(
+                "Cellomics plane extends beyond decoded payload".to_string(),
+            ));
+        }
+        Ok(self.data[plane_offset..plane_offset + n_bytes].to_vec())
     }
 
     fn open_bytes_region(
@@ -1165,18 +1233,43 @@ impl FormatReader for CellomicsReader {
 // ---------------------------------------------------------------------------
 // 7. Minolta Digital Camera RAW — TIFF delegate
 // ---------------------------------------------------------------------------
-/// Minolta Digital Camera RAW reader (`.mrw`).
+/// Minolta MRW (Minolta RAW) reader (`.mrw`).
 ///
-/// Minolta RAW files have a TIFF structure inside; delegates to `TiffReader`.
-/// If the proprietary header prevents parsing, `set_id` will propagate the error.
+/// Ported from the upstream Java `MRWReader`. An MRW file is **not** a TIFF; it
+/// is a block-structured binary file. After a 4-byte magic ("\0MRM"), a 32-bit
+/// big-endian length gives the offset to the Bayer pixel data (`length + 8`).
+/// Between the magic and the data, named 4-character blocks describe the image:
+///   - `PRD`: sensor and output dimensions, the per-sample bit depth and the
+///     Bayer pattern.
+///   - `WBG`: white-balance gains.
+///   - `TTW`: an embedded TIFF block of EXIF-style metadata.
+///
+/// The pixel data is a single-channel Bayer mosaic that the Java reader
+/// demosaics (via `ImageTools.interpolate`) into an interleaved RGB UINT16
+/// big-endian plane. The demosaic is a substantial RAW operation and is **not**
+/// reproduced here: this port faithfully parses the header so the format is
+/// recognised and its metadata is correct, but pixel reads return an
+/// UnsupportedFormat error.
 pub struct MrwReader {
-    inner: crate::tiff::TiffReader,
+    meta: Option<ImageMetadata>,
+    sensor_width: u32,
+    sensor_height: u32,
+    bayer_pattern: u8,
+    data_size: u8,
+    pixel_offset: u64,
+    wbg: [f32; 4],
 }
 
 impl MrwReader {
     pub fn new() -> Self {
         MrwReader {
-            inner: crate::tiff::TiffReader::new(),
+            meta: None,
+            sensor_width: 0,
+            sensor_height: 0,
+            bayer_pattern: 0,
+            data_size: 0,
+            pixel_offset: 0,
+            wbg: [1.0; 4],
         }
     }
 }
@@ -1195,60 +1288,235 @@ impl FormatReader for MrwReader {
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("mrw"))
     }
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // First 4 bytes end with the "MRM" magic string.
+        header.len() >= 4 && &header[1..4] == b"MRM"
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path)
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < 8 || &data[1..4] != b"MRM" {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "MRW: missing 'MRM' magic string".into(),
+            ));
+        }
+        // Big-endian throughout. offset = readInt(@4) + 8.
+        let be_i32 = |o: usize| -> i64 {
+            i32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as i64
+        };
+        let be_i16 = |o: usize| -> i16 { i16::from_be_bytes([data[o], data[o + 1]]) };
+
+        let offset = (be_i32(4) + 8) as u64;
+        let mut size_x = 0u32;
+        let mut size_y = 0u32;
+        let mut sensor_w = 0u32;
+        let mut sensor_h = 0u32;
+        let mut data_size = 0u8;
+        let mut bayer = 0u8;
+        let mut wbg = [1.0f32; 4];
+
+        let mut fp = 8usize;
+        while (fp as u64) < offset && fp + 8 <= data.len() {
+            let block_name = &data[fp..fp + 4];
+            let len = i32::from_be_bytes([data[fp + 4], data[fp + 5], data[fp + 6], data[fp + 7]])
+                .max(0) as usize;
+            let body = fp + 8;
+            if block_name.ends_with(b"PRD") {
+                // skip 8, sensorHeight(short), sensorWidth(short),
+                // sizeY(short), sizeX(short), dataSize(byte), skip 1,
+                // storageMethod(byte), skip 4, bayerPattern(byte)
+                if body + 17 <= data.len() {
+                    sensor_h = be_i16(body + 8) as u16 as u32;
+                    sensor_w = be_i16(body + 10) as u16 as u32;
+                    size_y = be_i16(body + 12) as u16 as u32;
+                    size_x = be_i16(body + 14) as u16 as u32;
+                    data_size = data[body + 16];
+                    // body+17 skip, body+18 storageMethod, body+19..23 skip,
+                    // body+23 bayerPattern
+                    if body + 24 <= data.len() {
+                        bayer = data[body + 23];
+                    }
+                }
+            } else if block_name.ends_with(b"WBG") {
+                // 4-byte scale array, then 4 big-endian shorts: coeff/(64<<scale)
+                if body + 12 <= data.len() {
+                    let scale = &data[body..body + 4];
+                    for i in 0..4 {
+                        let coeff = be_i16(body + 4 + i * 2) as f32;
+                        wbg[i] = coeff / ((64u32 << scale[i]) as f32);
+                    }
+                }
+            }
+            // TTW block (embedded TIFF metadata) is parsed by Java for global
+            // metadata only; not required for pixel layout.
+            fp = body + len;
+        }
+
+        if size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "MRW: PRD block did not yield image dimensions".into(),
+            ));
+        }
+
+        self.sensor_width = sensor_w;
+        self.sensor_height = sensor_h;
+        self.bayer_pattern = bayer;
+        self.data_size = data_size;
+        self.pixel_offset = offset;
+        self.wbg = wbg;
+
+        // Java: RGB UINT16, big-endian, interleaved, dimensionOrder XYCZT,
+        // sizeC = 3, sizeZ = sizeT = 1, imageCount = 1, bitsPerPixel = dataSize.
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z: 1,
+            size_c: 3,
+            size_t: 1,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: if data_size > 0 { data_size } else { 16 },
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: true,
+            is_interleaved: true,
+            is_indexed: false,
+            is_little_endian: false,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
     }
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        self.meta = None;
+        self.sensor_width = 0;
+        self.sensor_height = 0;
+        self.bayer_pattern = 0;
+        self.data_size = 0;
+        self.pixel_offset = 0;
+        self.wbg = [1.0; 4];
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        1
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.meta.as_ref().expect("set_id not called")
     }
-    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+    fn open_bytes(&mut self, _p: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "MRW: Bayer CFA demosaicing of raw sensor data is not implemented".into(),
+        ))
     }
-    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+    fn open_bytes_region(&mut self, p: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
+        self.open_bytes(p)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+        self.open_bytes(p)
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        1
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        if level != 0 {
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
+        } else {
+            Ok(())
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // 8. Yokogawa CV7000/8000 HCS — XML index + TIFF images
 // ---------------------------------------------------------------------------
-/// Yokogawa CV7000/8000 HCS reader (`.wpi`, `.mrf`).
+/// Yokogawa CV7000/8000 HCS reader (`.wpi`).
 ///
-/// Yokogawa high-content screening systems store data as XML index files
-/// referencing TIFF tile images. Attempts to locate and open accompanying
-/// TIFF files via TiffReader.
+/// Ported from the upstream Java `CV7000Reader`. A CV7000 acquisition is a
+/// directory of single-plane TIFFs indexed by three XML files:
+///   - `*.wpi`         — the entry point; describes the well plate (rows/cols).
+///   - `MeasurementData.mlf`   — one `bts:MeasurementRecord` per acquired image,
+///     giving its well row/column, field, Z, channel, timepoint and the TIFF
+///     filename.
+///   - `MeasurementDetail.mrf` — the acquired channels (pixel sizes etc.).
+///
+/// Each (well, field) combination becomes a series; planes within a series are
+/// addressed in XYCZT order. `open_bytes` delegates to the per-plane TIFF.
 pub struct YokogawaReader {
     inner: crate::tiff::TiffReader,
+    tiff_loaded: bool,
+    series: Vec<ImageMetadata>,
+    current_series: usize,
+    /// For each series, plane_index -> TIFF file (None for missing planes).
+    plane_files: Vec<Vec<Option<PathBuf>>>,
+    plate: YokogawaPlate,
+    /// For each series: (well_ordinal, field) for OME mapping.
+    series_well_field: Vec<(usize, usize)>,
+    /// Populated wells in raster order, each (row, col).
+    wells: Vec<(u32, u32)>,
+    fields: usize,
+    /// Physical pixel size (X, Y) in micrometres from the first channel, if any.
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+}
+
+#[derive(Default, Clone)]
+struct YokogawaPlate {
+    name: Option<String>,
+    rows: u32,
+    columns: u32,
+}
+
+#[derive(Clone)]
+struct YokogawaPlane {
+    row: u32,
+    column: u32,
+    field: u32,
+    z: i32,
+    channel: i32,
+    timepoint: i32,
+    action_index: i32,
+    timeline_index: i32,
+    file: Option<PathBuf>,
+}
+
+#[derive(Clone, Default)]
+struct YokogawaChannel {
+    index: i32,
+    action_index: i32,
+    timeline_index: i32,
+    x_size: Option<f64>,
+    y_size: Option<f64>,
 }
 
 impl YokogawaReader {
     pub fn new() -> Self {
         YokogawaReader {
             inner: crate::tiff::TiffReader::new(),
+            tiff_loaded: false,
+            series: Vec::new(),
+            current_series: 0,
+            plane_files: Vec::new(),
+            plate: YokogawaPlate::default(),
+            series_well_field: Vec::new(),
+            wells: Vec::new(),
+            fields: 1,
+            physical_size_x: None,
+            physical_size_y: None,
         }
     }
 }
@@ -1256,6 +1524,338 @@ impl YokogawaReader {
 impl Default for YokogawaReader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Read every `name="value"` style attribute from the start tag and return the
+/// requested one. `bts:` prefixes are preserved by quick_xml.
+fn yk_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+    for a in e.attributes().flatten() {
+        if a.key.as_ref() == name.as_bytes() {
+            return Some(String::from_utf8_lossy(&a.value).to_string());
+        }
+    }
+    None
+}
+
+fn yk_attr_int(e: &quick_xml::events::BytesStart, name: &str) -> Option<i64> {
+    yk_attr(e, name).and_then(|s| s.trim().parse::<i64>().ok())
+}
+
+fn yk_attr_f64(e: &quick_xml::events::BytesStart, name: &str) -> Option<f64> {
+    yk_attr(e, name).and_then(|s| s.trim().parse::<f64>().ok())
+}
+
+/// Read a file and strip a stray trailing '>' (mirrors readSanitizedXML).
+fn yk_read_sanitized(path: &Path) -> Result<String> {
+    let mut s = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+    let trimmed = s.trim_end();
+    if trimmed.ends_with(">>") {
+        s = trimmed[..trimmed.len() - 1].to_string();
+    } else {
+        s = trimmed.to_string();
+    }
+    Ok(s)
+}
+
+fn yk_parse_wpi(xml: &str) -> YokogawaPlate {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut plate = YokogawaPlate::default();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                if e.name().as_ref() == b"bts:WellPlate" {
+                    plate.name = yk_attr(e, "bts:Name");
+                    plate.rows = yk_attr_int(e, "bts:Rows").unwrap_or(0) as u32;
+                    plate.columns = yk_attr_int(e, "bts:Columns").unwrap_or(0) as u32;
+                }
+            }
+            _ => {}
+        }
+    }
+    plate
+}
+
+fn yk_parse_mlf(xml: &str, parent: &Path) -> Vec<YokogawaPlane> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut planes: Vec<YokogawaPlane> = Vec::new();
+    let mut current_text = String::new();
+    let mut in_img_record = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Start(ref e)) => {
+                if e.name().as_ref() == b"bts:MeasurementRecord" {
+                    current_text.clear();
+                    let bts_type = yk_attr(e, "bts:Type").unwrap_or_default();
+                    if bts_type == "IMG" {
+                        in_img_record = true;
+                        // attributes are 1-based in the file; convert to 0-based.
+                        let p = YokogawaPlane {
+                            row: (yk_attr_int(e, "bts:Row").unwrap_or(1) - 1).max(0) as u32,
+                            column: (yk_attr_int(e, "bts:Column").unwrap_or(1) - 1).max(0) as u32,
+                            field: (yk_attr_int(e, "bts:FieldIndex").unwrap_or(1) - 1).max(0) as u32,
+                            z: (yk_attr_int(e, "bts:ZIndex").unwrap_or(1) - 1) as i32,
+                            channel: (yk_attr_int(e, "bts:Ch").unwrap_or(1) - 1) as i32,
+                            timepoint: (yk_attr_int(e, "bts:TimePoint").unwrap_or(1) - 1) as i32,
+                            action_index: (yk_attr_int(e, "bts:ActionIndex").unwrap_or(1) - 1)
+                                as i32,
+                            timeline_index: (yk_attr_int(e, "bts:TimelineIndex").unwrap_or(1) - 1)
+                                as i32,
+                            file: None,
+                        };
+                        planes.push(p);
+                    } else {
+                        in_img_record = false;
+                    }
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_img_record {
+                    current_text.push_str(&t.unescape().unwrap_or_default());
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                if e.name().as_ref() == b"bts:MeasurementRecord" && in_img_record {
+                    let value = current_text.trim();
+                    if !value.is_empty() {
+                        let img = parent.join(value);
+                        if img.exists() {
+                            if let Some(last) = planes.last_mut() {
+                                last.file = Some(img);
+                            }
+                        }
+                    }
+                    in_img_record = false;
+                    current_text.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+    planes
+}
+
+fn yk_parse_mrf(xml: &str) -> Vec<YokogawaChannel> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut channels: Vec<YokogawaChannel> = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                if e.name().as_ref() == b"bts:MeasurementChannel" {
+                    channels.push(YokogawaChannel {
+                        index: (yk_attr_int(e, "bts:Ch").unwrap_or(1) - 1) as i32,
+                        action_index: 0,
+                        timeline_index: 0,
+                        x_size: yk_attr_f64(e, "bts:HorizontalPixelDimension"),
+                        y_size: yk_attr_f64(e, "bts:VerticalPixelDimension"),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    channels
+}
+
+impl YokogawaReader {
+    fn build(&mut self, wpi_path: &Path) -> Result<()> {
+        let parent = wpi_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let plate = yk_parse_wpi(&yk_read_sanitized(wpi_path)?);
+
+        // MeasurementData.mlf is required.
+        let mlf_path = parent.join("MeasurementData.mlf");
+        if !mlf_path.exists() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Yokogawa CV7000: missing MeasurementData.mlf index file".into(),
+            ));
+        }
+        let planes = yk_parse_mlf(&yk_read_sanitized(&mlf_path)?, &parent);
+
+        // MeasurementDetail.mrf is optional (channels / pixel sizes).
+        let mrf_path = parent.join("MeasurementDetail.mrf");
+        let channels = if mrf_path.exists() {
+            yk_parse_mrf(&yk_read_sanitized(&mrf_path)?)
+        } else {
+            Vec::new()
+        };
+
+        let plate_columns = plate.columns.max(1);
+
+        // Determine acquired wells, fields, channels and per-well Z/T ranges.
+        use std::collections::{HashMap, HashSet};
+        let mut unique_wells: HashSet<u32> = HashSet::new();
+        let mut unique_channels: HashSet<i32> = HashSet::new();
+        let mut fields = 0usize;
+        // per-well min/max Z and T
+        let mut zmin: HashMap<u32, i32> = HashMap::new();
+        let mut zmax: HashMap<u32, i32> = HashMap::new();
+        let mut tmin: HashMap<u32, i32> = HashMap::new();
+        let mut tmax: HashMap<u32, i32> = HashMap::new();
+        let mut first_file: Option<PathBuf> = None;
+
+        for p in &planes {
+            if p.file.is_none() {
+                continue;
+            }
+            if first_file.is_none() {
+                first_file = p.file.clone();
+            }
+            let well_number = p.row * plate_columns + p.column;
+            unique_wells.insert(well_number);
+            unique_channels.insert(p.channel);
+            if (p.field as usize) + 1 > fields {
+                fields = p.field as usize + 1;
+            }
+            *zmin.entry(well_number).or_insert(i32::MAX) =
+                (*zmin.get(&well_number).unwrap_or(&i32::MAX)).min(p.z);
+            *zmax.entry(well_number).or_insert(i32::MIN) =
+                (*zmax.get(&well_number).unwrap_or(&i32::MIN)).max(p.z);
+            *tmin.entry(well_number).or_insert(i32::MAX) =
+                (*tmin.get(&well_number).unwrap_or(&i32::MAX)).min(p.timepoint);
+            *tmax.entry(well_number).or_insert(i32::MIN) =
+                (*tmax.get(&well_number).unwrap_or(&i32::MIN)).max(p.timepoint);
+        }
+        let fields = fields.max(1);
+
+        let first_file = first_file.ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "Yokogawa CV7000: MeasurementData.mlf referenced no existing image files".into(),
+            )
+        })?;
+
+        // Probe the first TIFF for pixel parameters.
+        let mut probe = crate::tiff::TiffReader::new();
+        probe.set_id(&first_file)?;
+        let pm = probe.metadata().clone();
+        let _ = probe.close();
+        let tiff_c = pm.size_c.max(1);
+
+        // Sorted unique wells and channels.
+        let mut wells: Vec<u32> = unique_wells.into_iter().collect();
+        wells.sort_unstable();
+        let mut channel_indexes: Vec<i32> = unique_channels.into_iter().collect();
+        channel_indexes.sort_unstable();
+        let n_channels = channel_indexes.len().max(1) as u32;
+
+        let real_wells = wells.len();
+        let series_count = real_wells * fields;
+
+        // Build per-series metadata and plane-file lookup.
+        let mut series = Vec::with_capacity(series_count);
+        let mut plane_files: Vec<Vec<Option<PathBuf>>> = Vec::with_capacity(series_count);
+        let mut series_well_field = Vec::with_capacity(series_count);
+        for s in 0..series_count {
+            let well_ordinal = s / fields;
+            let field = s % fields;
+            let well_number = wells[well_ordinal];
+            let size_z = (zmax.get(&well_number).copied().unwrap_or(0)
+                - zmin.get(&well_number).copied().unwrap_or(0)
+                + 1)
+            .max(1) as u32;
+            let size_t = (tmax.get(&well_number).copied().unwrap_or(0)
+                - tmin.get(&well_number).copied().unwrap_or(0)
+                + 1)
+            .max(1) as u32;
+            let size_c = tiff_c * n_channels;
+            let planes_per_series = (size_z * size_t * n_channels) as usize;
+
+            let mut meta = pm.clone();
+            meta.size_z = size_z;
+            meta.size_t = size_t;
+            meta.size_c = size_c;
+            meta.image_count = size_z * size_t * n_channels;
+            meta.dimension_order = DimensionOrder::XYCZT;
+            meta.series_metadata
+                .insert("format".into(), crate::common::metadata::MetadataValue::String("Yokogawa CV7000".into()));
+            series.push(meta);
+            plane_files.push(vec![None; planes_per_series]);
+            series_well_field.push((well_ordinal, field));
+        }
+
+        // Map each plane record into (series, no) and record its file.
+        for p in &planes {
+            let Some(_) = p.file.as_ref() else { continue };
+            let well_number = p.row * plate_columns + p.column;
+            let Ok(well_ordinal) = wells.binary_search(&well_number) else {
+                continue;
+            };
+            if (p.field as usize) >= fields {
+                continue;
+            }
+            let series_index = well_ordinal * fields + p.field as usize;
+            if series_index >= series_count {
+                continue;
+            }
+            // channel index into the unique acquired channels
+            let channel_index = channel_indexes
+                .binary_search(&yk_channel_index(p, &channels))
+                .unwrap_or(0);
+            let m = &series[series_index];
+            let plane_c = (m.size_c / tiff_c).max(1);
+            let plane_z = m.size_z.max(1);
+            let z = (p.z - zmin.get(&well_number).copied().unwrap_or(0)).max(0) as u32;
+            let t = (p.timepoint - tmin.get(&well_number).copied().unwrap_or(0)).max(0) as u32;
+            // positionToRaster([C, Z, T], [channel, z, t]) for XYCZT order:
+            // index = channel + plane_c*(z + plane_z*t)
+            let no = channel_index as u32 + plane_c * (z + plane_z * t);
+            if let Some(slot) = plane_files
+                .get_mut(series_index)
+                .and_then(|v| v.get_mut(no as usize))
+            {
+                if slot.is_none() {
+                    *slot = p.file.clone();
+                }
+            }
+        }
+
+        self.series = series;
+        self.plane_files = plane_files;
+        self.plate = plate;
+        self.series_well_field = series_well_field;
+        self.wells = wells.iter().map(|&w| (w / plate_columns, w % plate_columns)).collect();
+        self.fields = fields;
+        self.physical_size_x = channels.first().and_then(|c| c.x_size).filter(|&v| v > 0.0);
+        self.physical_size_y = channels.first().and_then(|c| c.y_size).filter(|&v| v > 0.0);
+        self.current_series = 0;
+        Ok(())
+    }
+}
+
+/// Compute the channel index of a plane within the list of acquired channels,
+/// mirroring CV7000Reader.getChannelIndex (simplified: when channel metadata is
+/// missing, fall back to the raw channel number).
+fn yk_channel_index(p: &YokogawaPlane, channels: &[YokogawaChannel]) -> i32 {
+    if channels.is_empty() {
+        return p.channel;
+    }
+    let mut index = -1i32;
+    for action in 0..=p.action_index {
+        for ch in channels {
+            if ch.timeline_index == p.timeline_index && ch.action_index == action {
+                index += 1;
+                if ch.index == p.channel && ch.action_index == p.action_index {
+                    return index;
+                }
+            }
+        }
+    }
+    if index < 0 {
+        p.channel
+    } else {
+        index
     }
 }
 
@@ -1273,55 +1873,189 @@ impl FormatReader for YokogawaReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        // Try to find a companion TIFF in the same directory
-        if let Some(parent) = path.parent() {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            for ext in &["tif", "tiff"] {
-                let tiff_path = parent.join(format!("{}.{}", stem, ext));
-                if tiff_path.exists() {
-                    return self.inner.set_id(&tiff_path);
-                }
-            }
+        self.build(path)?;
+        if self.series.is_empty() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Yokogawa CV7000: no series could be assembled from the index files".into(),
+            ));
         }
-        // Fall back to trying to open the file itself as TIFF
-        self.inner.set_id(path).map_err(|_| {
-            BioFormatsError::UnsupportedFormat(
-                "Yokogawa CV7000/8000: could not find companion TIFF images for this index file"
-                    .to_string(),
-            )
-        })
+        self.tiff_loaded = false;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        self.series.clear();
+        self.plane_files.clear();
+        self.series_well_field.clear();
+        self.wells.clear();
+        self.plate = YokogawaPlate::default();
+        self.fields = 1;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
+        self.current_series = 0;
+        if self.tiff_loaded {
+            let _ = self.inner.close();
+            self.tiff_loaded = false;
+        }
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.series.len().max(1)
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        if s >= self.series_count() {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            self.current_series = s;
+            Ok(())
+        }
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.series
+            .get(self.current_series)
+            .expect("set_id not called")
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if p >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(p));
+        }
+        let plane_bytes =
+            meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample();
+        let file = self
+            .plane_files
+            .get(self.current_series)
+            .and_then(|v| v.get(p as usize))
+            .cloned()
+            .flatten();
+        let Some(file) = file else {
+            // Missing plane: return zero-filled buffer (Java fills with 0).
+            return Ok(vec![0u8; plane_bytes]);
+        };
+        if self.tiff_loaded {
+            let _ = self.inner.close();
+        }
+        self.inner.set_id(&file)?;
+        self.tiff_loaded = true;
+        self.inner.open_bytes(0)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let full = self.open_bytes(p)?;
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        crop_full_plane("Yokogawa CV7000", &full, &meta, 1, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(p, tx, ty, tw, th)
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        1
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        if level != 0 {
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
+        } else {
+            Ok(())
+        }
     }
+
+    /// Build OME HCS metadata: one Plate with Wells/WellSamples mapping each
+    /// (well, field) series to an Image. Mirrors CV7000Reader's MetadataStore.
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        if self.series.is_empty() {
+            return None;
+        }
+        let mut images = Vec::with_capacity(self.series.len());
+        for (s, (well_ordinal, field)) in self.series_well_field.iter().enumerate() {
+            let (row, col) = self.wells.get(*well_ordinal).copied().unwrap_or((0, 0));
+            let name = format!(
+                "Well {}{}, Field {}",
+                yk_row_name(row),
+                col + 1,
+                field + 1
+            );
+            let _ = s;
+            images.push(OmeImage {
+                name: Some(name),
+                physical_size_x: self.physical_size_x,
+                physical_size_y: self.physical_size_y,
+                ..Default::default()
+            });
+        }
+
+        let mut wells = Vec::with_capacity(self.wells.len());
+        for (well_ordinal, &(row, col)) in self.wells.iter().enumerate() {
+            let mut well_samples = Vec::with_capacity(self.fields);
+            for field in 0..self.fields {
+                let series = well_ordinal * self.fields + field;
+                if series >= self.series.len() {
+                    continue;
+                }
+                well_samples.push(OmeWellSample {
+                    id: Some(create_lsid("WellSample", &[0, well_ordinal, field])),
+                    index: series as u32,
+                    image_ref: Some(series),
+                    position_x: None,
+                    position_y: None,
+                });
+            }
+            wells.push(OmeWell {
+                id: Some(create_lsid("Well", &[0, well_ordinal])),
+                row,
+                column: col,
+                well_samples,
+            });
+        }
+
+        let plate = OmePlate {
+            id: Some(create_lsid("Plate", &[0])),
+            name: self.plate.name.clone(),
+            rows: self.plate.rows,
+            columns: self.plate.columns,
+            wells,
+        };
+
+        Some(OmeMetadata {
+            images,
+            plates: vec![plate],
+            ..Default::default()
+        })
+    }
+}
+
+/// Well row letter (0 -> "A", 25 -> "Z", 26 -> "AA", ...).
+fn yk_row_name(row: u32) -> String {
+    let mut n = row as i64;
+    let mut s = String::new();
+    loop {
+        let rem = (n % 26) as u8;
+        s.insert(0, (b'A' + rem) as char);
+        n = n / 26 - 1;
+        if n < 0 {
+            break;
+        }
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------

@@ -254,6 +254,30 @@ impl FormatReader for DcimgReader {
             .map_err(BioFormatsError::Io)?;
         let mut raw = vec![0u8; plane_bytes];
         f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
+
+        // Four-corner footer correction.
+        //
+        // DCIMG overwrites the first four pixels of every frame with internal
+        // bookkeeping data; the original values of those four pixels are
+        // preserved in the per-frame footer. When a footer is present we read it
+        // and restore the first four pixels of the frame in row-major order.
+        //
+        // The footer is laid out as: <reserved> followed by the four original
+        // corner pixels stored as native-width samples at the tail of the
+        // footer. We take the last `4 * bps` bytes of the footer as those
+        // samples (little-endian), matching the DCIMG on-disk ordering.
+        if self.frame_footer_size as usize >= 4 * bps {
+            let footer_off = offset + self.bytes_per_image;
+            if f.seek(SeekFrom::Start(footer_off)).is_ok() {
+                let mut footer = vec![0u8; self.frame_footer_size as usize];
+                if f.read_exact(&mut footer).is_ok() {
+                    let corner = &footer[footer.len() - 4 * bps..];
+                    let n = (4 * bps).min(raw.len());
+                    raw[..n].copy_from_slice(&corner[..n]);
+                }
+            }
+        }
+
         let out_row = meta.size_x as usize * bps;
         if row_bytes == out_row {
             return Ok(raw);

@@ -117,6 +117,8 @@ struct MrcHeader {
     imod_stamp: u32,
     imod_flags: i32,
     extended_header_size: i32,
+    min_value: f32,
+    max_value: f32,
     little_endian: bool,
 }
 
@@ -227,6 +229,15 @@ fn parse_header(buf: &[u8]) -> Result<MrcHeader> {
         read_i32_be(buf, 92)
     };
 
+    // Min/max pixel values (DMIN/DMAX). Per MRCReader.java these are read
+    // immediately after the 12-byte MAPC/MAPR/MAPS block (offset 76 = DMIN,
+    // offset 80 = DMAX, offset 84 = DMEAN).
+    let (min_value, max_value) = if little_endian {
+        (read_f32_le(buf, 76), read_f32_le(buf, 80))
+    } else {
+        (read_f32_be(buf, 76), read_f32_be(buf, 80))
+    };
+
     Ok(MrcHeader {
         nx,
         ny,
@@ -250,8 +261,40 @@ fn parse_header(buf: &[u8]) -> Result<MrcHeader> {
         imod_stamp,
         imod_flags,
         extended_header_size,
+        min_value,
+        max_value,
         little_endian,
     })
+}
+
+/// Whether the pixel type is signed (used for the EMAN2 min/max correction).
+fn pixel_type_is_signed(pt: PixelType) -> bool {
+    matches!(
+        pt,
+        PixelType::Int8 | PixelType::Int16 | PixelType::Int32
+    )
+}
+
+/// Apply the EMAN2 unsigned-data correction from MRCReader.java: if the stored
+/// data min/max fall outside the signed pixel-type range, promote INT16→UINT16
+/// and INT32→UINT32.
+fn correct_eman2_pixel_type(pt: PixelType, min_value: f64, max_value: f64) -> PixelType {
+    let bytes = pt.bytes_per_sample() as f64;
+    let range = 2f64.powf(bytes * 8.0) - 1.0;
+    let signed = pixel_type_is_signed(pt);
+    let pixel_type_min = if signed { -(range / 2.0) } else { 0.0 };
+    let pixel_type_max = pixel_type_min + range;
+
+    // Java: if (pixelTypeMax < maxValue || pixelTypeMin > minValue && signed)
+    if pixel_type_max < max_value || (pixel_type_min > min_value && signed) {
+        match pt {
+            PixelType::Int16 => PixelType::Uint16,
+            PixelType::Int32 => PixelType::Uint32,
+            other => other,
+        }
+    } else {
+        pt
+    }
 }
 
 fn valid_axis_permutation(mapc: i32, mapr: i32, maps: i32) -> bool {
@@ -259,26 +302,6 @@ fn valid_axis_permutation(mapc: i32, mapr: i32, maps: i32) -> bool {
         (mapc, mapr, maps),
         (1, 2, 3) | (1, 3, 2) | (2, 1, 3) | (2, 3, 1) | (3, 1, 2) | (3, 2, 1)
     )
-}
-
-fn has_explicit_origin(hdr: &MrcHeader) -> bool {
-    hdr.origin_x != 0.0 || hdr.origin_y != 0.0 || hdr.origin_z != 0.0
-}
-
-fn should_flip_y(hdr: &MrcHeader) -> bool {
-    if valid_axis_permutation(hdr.mapc, hdr.mapr, hdr.maps) && hdr.mapr != 2 {
-        return false;
-    }
-
-    let top_y = (hdr.ny - 1).max(0);
-    if has_explicit_origin(hdr) && hdr.origin_y.round() as i32 >= top_y {
-        return false;
-    }
-    if hdr.nystart >= top_y && top_y > 0 {
-        return false;
-    }
-
-    true
 }
 
 fn pixel_type_from_mode(mode: i32, imod_stamp: u32, imod_flags: i32) -> PixelType {
@@ -389,7 +412,10 @@ impl FormatReader for MrcReader {
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
 
         let hdr = parse_header(&buf)?;
-        let pixel_type = pixel_type_from_mode(hdr.mode, hdr.imod_stamp, hdr.imod_flags);
+        let mut pixel_type = pixel_type_from_mode(hdr.mode, hdr.imod_stamp, hdr.imod_flags);
+        // EMAN2 unsigned-data correction (MRCReader.java).
+        pixel_type =
+            correct_eman2_pixel_type(pixel_type, hdr.min_value as f64, hdr.max_value as f64);
         let is_rgb = hdr.mode == 16;
         let spp = if is_rgb { 3u32 } else { 1u32 };
 
@@ -398,7 +424,8 @@ impl FormatReader for MrcReader {
         let nz = hdr.nz.max(0) as u32;
 
         let data_offset = HEADER_SIZE + hdr.extended_header_size.max(0) as u64;
-        let flip_y = should_flip_y(&hdr);
+        // Per MRCReader.java the rows are always flipped (lower-left origin).
+        let flip_y = true;
 
         // Physical pixel size (if available)
         let mut series_metadata = std::collections::HashMap::new();
@@ -807,34 +834,64 @@ mod tests {
         assert_eq!(plane, vec![3, 4, 1, 2]);
     }
 
+    // MRCReader.java always reverses the rows regardless of axis permutation,
+    // Y-origin, or Y-start: planes are always stored with a lower-left origin.
     #[test]
-    fn mrc_reader_does_not_flip_when_row_axis_is_not_y() {
+    fn mrc_reader_flips_even_when_row_axis_is_not_y() {
         let path = write_mrc_fixture("row_axis_not_y", 2, 1, 3, 0, 0.0);
         let (plane, flip_y) = read_fixture(&path);
         fs::remove_file(path).ok();
 
-        assert!(!flip_y);
-        assert_eq!(plane, vec![1, 2, 3, 4]);
+        assert!(flip_y);
+        assert_eq!(plane, vec![3, 4, 1, 2]);
     }
 
     #[test]
-    fn mrc_reader_does_not_flip_when_y_origin_is_top_edge() {
+    fn mrc_reader_flips_even_when_y_origin_is_top_edge() {
         let path = write_mrc_fixture("origin_top", 1, 2, 3, 0, 1.0);
         let (plane, flip_y) = read_fixture(&path);
         fs::remove_file(path).ok();
 
-        assert!(!flip_y);
-        assert_eq!(plane, vec![1, 2, 3, 4]);
+        assert!(flip_y);
+        assert_eq!(plane, vec![3, 4, 1, 2]);
     }
 
     #[test]
-    fn mrc_reader_does_not_flip_when_y_start_is_top_edge() {
+    fn mrc_reader_flips_even_when_y_start_is_top_edge() {
         let path = write_mrc_fixture("start_top", 1, 2, 3, 1, 0.0);
         let (plane, flip_y) = read_fixture(&path);
         fs::remove_file(path).ok();
 
-        assert!(!flip_y);
-        assert_eq!(plane, vec![1, 2, 3, 4]);
+        assert!(flip_y);
+        assert_eq!(plane, vec![3, 4, 1, 2]);
+    }
+
+    #[test]
+    fn mrc_reader_promotes_eman2_unsigned_int16() {
+        // mode 1 → INT16, but stored DMAX exceeds the signed-16 range, so the
+        // EMAN2 correction promotes the type to UINT16 (MRCReader.java).
+        let path = temp_mrc_path("eman2_uint16");
+        let mut bytes = vec![0u8; HEADER_SIZE as usize];
+        bytes[0..4].copy_from_slice(&1i32.to_le_bytes()); // nx
+        bytes[4..8].copy_from_slice(&1i32.to_le_bytes()); // ny
+        bytes[8..12].copy_from_slice(&1i32.to_le_bytes()); // nz
+        bytes[12..16].copy_from_slice(&1i32.to_le_bytes()); // mode 1 = INT16
+        bytes[64..68].copy_from_slice(&1i32.to_le_bytes()); // mapc
+        bytes[68..72].copy_from_slice(&2i32.to_le_bytes()); // mapr
+        bytes[72..76].copy_from_slice(&3i32.to_le_bytes()); // maps
+        bytes[76..80].copy_from_slice(&0.0f32.to_le_bytes()); // DMIN
+        bytes[80..84].copy_from_slice(&60000.0f32.to_le_bytes()); // DMAX > 32767
+        bytes[208..212].copy_from_slice(b"MAP ");
+        bytes[212] = 0x44;
+        bytes[213] = 0x44;
+        bytes.extend_from_slice(&[0x00, 0x00]); // 1 sample
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reader = MrcReader::new();
+        reader.set_id(&path).unwrap();
+        let pt = reader.metadata().pixel_type;
+        fs::remove_file(path).ok();
+        assert_eq!(pt, PixelType::Uint16);
     }
 
     #[test]

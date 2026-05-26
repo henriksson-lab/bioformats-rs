@@ -27,6 +27,53 @@ impl EpsReader {
             pixels: Vec::new(),
         }
     }
+
+    /// Attempt to read the embedded TIFF preview of a DOS EPS file. Returns
+    /// `Ok(None)` if no valid TIFF preview is present.
+    fn try_tiff_preview(
+        &self,
+        data: &[u8],
+    ) -> Result<Option<(ImageMetadata, Vec<u8>)>> {
+        // DOS EPS magic: C5 D0 D3 C6. The header (little-endian) stores the
+        // TIFF preview offset at byte 20 and length at byte 24.
+        if data.len() < 30 {
+            return Ok(None);
+        }
+        let offset = u32::from_le_bytes([data[20], data[21], data[22], data[23]]) as usize;
+        let len = u32::from_le_bytes([data[24], data[25], data[26], data[27]]) as usize;
+        if offset == 0 || len == 0 || offset + len > data.len() {
+            return Ok(None);
+        }
+        let tiff_bytes = &data[offset..offset + len];
+        // Validate a TIFF byte-order/magic signature.
+        let is_tiff = tiff_bytes.len() >= 4
+            && ((tiff_bytes[0] == b'I' && tiff_bytes[1] == b'I' && tiff_bytes[2] == 42)
+                || (tiff_bytes[0] == b'M' && tiff_bytes[1] == b'M' && tiff_bytes[3] == 42));
+        if !is_tiff {
+            return Ok(None);
+        }
+
+        // Delegate to the project TiffReader via a temporary file, since it
+        // reads from a path.
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("bf_eps_preview_{}.tif", std::process::id()));
+        std::fs::write(&tmp, tiff_bytes).map_err(BioFormatsError::Io)?;
+
+        let result = (|| -> Result<(ImageMetadata, Vec<u8>)> {
+            let mut reader = crate::tiff::TiffReader::new();
+            reader.set_id(&tmp)?;
+            let mut meta = reader.metadata().clone();
+            meta.dimension_order = DimensionOrder::XYCZT;
+            meta.image_count = 1;
+            meta.size_z = 1;
+            meta.size_t = 1;
+            let pixels = reader.open_bytes(0)?;
+            Ok((meta, pixels))
+        })();
+
+        let _ = std::fs::remove_file(&tmp);
+        result.map(Some)
+    }
 }
 
 impl Default for EpsReader {
@@ -100,7 +147,11 @@ impl FormatReader for EpsReader {
         if header.len() < 4 {
             return false;
         }
-        // Must start with "%!" and contain "PS" in first 32 bytes
+        // DOS EPS binary header with embedded TIFF preview: C5 D0 D3 C6.
+        if header[0..4] == [0xC5, 0xD0, 0xD3, 0xC6] {
+            return true;
+        }
+        // Must start with "%!" and contain "PS" in first 32 bytes.
         let starts = header.starts_with(b"%!");
         let window = &header[..header.len().min(32)];
         let has_ps = window.windows(2).any(|w| w == b"PS");
@@ -109,9 +160,28 @@ impl FormatReader for EpsReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let data = fs::read(path).map_err(BioFormatsError::Io)?;
-        if data.len() < 4 || !self.is_this_type_by_bytes(&data[..data.len().min(64)]) {
+
+        // If the file does not start with "%!PS" it is a DOS EPS binary with an
+        // embedded TIFF preview (per the Java EPSReader). The DOS EPS header
+        // stores the TIFF offset/length as little-endian ints at byte 20/24.
+        let starts_with_ps = data
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        let is_ps = data[starts_with_ps..]
+            .iter()
+            .take(4)
+            .copied()
+            .eq(b"%!PS".iter().copied());
+        if !is_ps {
+            if let Some((meta, pixels)) = self.try_tiff_preview(&data)? {
+                self.meta = Some(meta);
+                self.pixels = pixels;
+                self.path = Some(path.to_path_buf());
+                return Ok(());
+            }
             return Err(BioFormatsError::UnsupportedFormat(
-                "not an EPS/PostScript raster file".into(),
+                "EPS: not a PostScript file and no embedded TIFF preview found".into(),
             ));
         }
 
