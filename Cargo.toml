@@ -1,11 +1,21 @@
 [package]
 name = "bioformats"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Pure Rust reimplementation of Bio-Formats — read/write scientific image formats"
 license-file = "LICENSE.txt"
 homepage = "https://www.openmicroscopy.org/bio-formats/"
-exclude = ["java-bioformats/", "*.jar", "bench/", "old/", "test/", "convo.txt"]
+repository = "https://github.com/henriksson-lab/bioformats-rs"
+readme = "README.md"
+keywords = ["microscopy", "bioformats", "image", "tiff", "ome"]
+categories = ["science", "multimedia::images", "parser-implementations"]
+include = [
+    "/src/**/*.rs",
+    "/benches/read_ome_tiff.rs",
+    "/README.md",
+    "/FEATURES.md",
+    "/LICENSE.txt",
+]
 
 [workspace]
 resolver = "2"
@@ -29,7 +39,7 @@ jpeg2k       = { version = "0.10", default-features = false, features = ["openjp
 serde         = { version = "1", features = ["derive"] }
 bincode       = "1"
 jpegxr        = { version = "0.3", optional = true }
-openslide-pure-rs = { path = "/home/mahogny/github/claude/openslide-rs", optional = true }
+openslide-pure-rs = { version = "0.1", path = "/home/mahogny/github/claude/openslide-rs", optional = true }
 
 [features]
 jpegxr = ["dep:jpegxr"]
