@@ -1,9 +1,11 @@
 use super::pixel_type::PixelType;
 use std::collections::HashMap;
 
-/// Controls how much metadata is parsed during `set_id`.
+/// Controls how much metadata is parsed during `set_id` for readers that
+/// explicitly implement metadata-level handling.
 ///
-/// Equivalent to Java Bio-Formats' `MetadataLevel`.
+/// This mirrors Java Bio-Formats' `MetadataLevel` API shape, but unsupported
+/// readers ignore it and parse their normal metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MetadataLevel {
     /// Minimum metadata: dimensions, pixel type, plane count. Fastest.
@@ -16,6 +18,9 @@ pub enum MetadataLevel {
 }
 
 /// Configurable metadata parsing options.
+///
+/// These options are best-effort: a reader must opt in by overriding
+/// `FormatReader::set_metadata_options`.
 #[derive(Debug, Clone, Default)]
 pub struct MetadataOptions {
     /// Controls the depth of metadata parsing.

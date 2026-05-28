@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 use crate::common::writer::FormatWriter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,14 @@ struct NrrdAxes {
     axis_z: Option<usize>,
     axis_c: Option<usize>,
     axis_t: Option<usize>,
+}
+
+fn resolve_nrrd_data_path(parent: &Path, value: &str) -> Result<PathBuf> {
+    confined_join(parent, value).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(
+            "NRRD detached data path must stay within the header directory".into(),
+        )
+    })
 }
 
 impl NrrdAxes {
@@ -145,7 +155,7 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
         }
 
         if data_file_list {
-            data_files.push(parent.join(trimmed));
+            data_files.push(resolve_nrrd_data_path(&parent, trimmed)?);
             continue;
         }
 
@@ -163,12 +173,18 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
 
             match key.as_str() {
                 "type" => pixel_type = nrrd_pixel_type(val),
-                "dimension" => dimension = val.parse().unwrap_or(0),
+                "dimension" => {
+                    dimension = val.parse().map_err(|_| {
+                        BioFormatsError::Format(format!("NRRD: invalid dimension value {val:?}"))
+                    })?;
+                }
                 "sizes" => {
-                    sizes = val
-                        .split_ascii_whitespace()
-                        .filter_map(|s| s.parse().ok())
-                        .collect();
+                    sizes.clear();
+                    for token in val.split_ascii_whitespace() {
+                        sizes.push(token.parse().map_err(|_| {
+                            BioFormatsError::Format(format!("NRRD: invalid size value {token:?}"))
+                        })?);
+                    }
                 }
                 "kinds" => {
                     kinds = val
@@ -204,15 +220,18 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
                     if val.eq_ignore_ascii_case("LIST") {
                         data_file_list = true;
                     } else {
-                        // Resolve relative to the .nhdr file
-                        data_file = Some(parent.join(val));
+                        data_file = Some(resolve_nrrd_data_path(&parent, val)?);
                     }
                 }
                 "byte skip" | "byteskip" => {
-                    byte_skip = val.parse().unwrap_or(0);
+                    byte_skip = val.parse().map_err(|_| {
+                        BioFormatsError::Format(format!("NRRD: invalid byte skip value {val:?}"))
+                    })?;
                 }
                 "line skip" | "lineskip" => {
-                    line_skip = val.parse().unwrap_or(0);
+                    line_skip = val.parse().map_err(|_| {
+                        BioFormatsError::Format(format!("NRRD: invalid line skip value {val:?}"))
+                    })?;
                 }
                 _ => {
                     extra.insert(key, val.to_string());
@@ -311,10 +330,11 @@ fn derive_axes(hdr: &NrrdHeader) -> NrrdAxes {
     }
 }
 
-fn total_sample_count(sizes: &[u32]) -> usize {
-    sizes
-        .iter()
-        .fold(1usize, |acc, size| acc.saturating_mul(*size as usize))
+fn total_sample_count(sizes: &[u32]) -> Result<usize> {
+    sizes.iter().try_fold(1usize, |acc, size| {
+        acc.checked_mul(*size as usize)
+            .ok_or_else(|| BioFormatsError::InvalidData("NRRD: total sample count overflow".into()))
+    })
 }
 
 fn data_start_offset(
@@ -393,8 +413,14 @@ impl NrrdReader {
         let ics_path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let bps = meta.pixel_type.bytes_per_sample();
-        let plane_bytes = meta.size_x as usize * meta.size_y as usize * meta.size_c as usize * bps;
-        let plane_offset = plane_index as u64 * plane_bytes as u64;
+        let plane_bytes = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(meta.size_c as usize))
+            .and_then(|samples| samples.checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::InvalidData("NRRD: plane size overflow".into()))?;
+        let plane_offset = (plane_index as usize)
+            .checked_mul(plane_bytes)
+            .ok_or_else(|| BioFormatsError::InvalidData("NRRD: plane offset overflow".into()))?;
         let axes = derive_axes(hdr);
 
         if hdr.data_files.len() == meta.image_count as usize {
@@ -431,7 +457,9 @@ impl NrrdReader {
             hdr.data_files.iter().map(|p| (p.clone(), 0)).collect()
         };
 
-        let expected_bytes = total_sample_count(&hdr.sizes) * bps;
+        let expected_bytes = total_sample_count(&hdr.sizes)?
+            .checked_mul(bps)
+            .ok_or_else(|| BioFormatsError::InvalidData("NRRD: byte count overflow".into()))?;
         // External data exists when the pixels live in a separate file
         // (.nhdr "data file" / detached LIST); inline NRRD data does not.
         let has_external_data = hdr.data_file.is_some() || !hdr.data_files.is_empty();
@@ -457,8 +485,10 @@ impl NrrdReader {
             && axes.axis_t.map_or(true, |a| a > axes.axis_z.unwrap_or(1))
             && axes.axis_z.map_or(true, |a| a >= 2);
         if can_slice {
-            let start = plane_offset as usize;
-            let end = start + plane_bytes;
+            let start = plane_offset;
+            let end = start.checked_add(plane_bytes).ok_or_else(|| {
+                BioFormatsError::InvalidData("NRRD: plane offset overflow".into())
+            })?;
             if end > all.len() {
                 return Err(BioFormatsError::InvalidData(
                     "NRRD: plane out of range".into(),
@@ -475,7 +505,9 @@ impl NrrdReader {
 
         let mut strides = vec![1usize; hdr.sizes.len()];
         for axis in 1..hdr.sizes.len() {
-            strides[axis] = strides[axis - 1] * hdr.sizes[axis - 1] as usize;
+            strides[axis] = strides[axis - 1]
+                .checked_mul(hdr.sizes[axis - 1] as usize)
+                .ok_or_else(|| BioFormatsError::InvalidData("NRRD: stride overflow".into()))?;
         }
 
         let z = plane_index % axes.size_z.max(1);
@@ -503,14 +535,43 @@ impl NrrdReader {
                     let sample_index = coords
                         .iter()
                         .zip(strides.iter())
-                        .map(|(coord, stride)| *coord as usize * *stride)
-                        .sum::<usize>();
-                    let src = sample_index * bps;
-                    let dst = ((y as usize * axes.size_x as usize + x as usize)
-                        * axes.size_c as usize
-                        + c as usize)
-                        * bps;
-                    buf[dst..dst + bps].copy_from_slice(&all[src..src + bps]);
+                        .try_fold(0usize, |acc, (coord, stride)| {
+                            (*coord as usize)
+                                .checked_mul(*stride)
+                                .and_then(|v| acc.checked_add(v))
+                        })
+                        .ok_or_else(|| {
+                            BioFormatsError::InvalidData("NRRD: sample offset overflow".into())
+                        })?;
+                    let src = sample_index.checked_mul(bps).ok_or_else(|| {
+                        BioFormatsError::InvalidData("NRRD: byte offset overflow".into())
+                    })?;
+                    let src_end = src.checked_add(bps).ok_or_else(|| {
+                        BioFormatsError::InvalidData("NRRD: byte offset overflow".into())
+                    })?;
+                    if src_end > all.len() {
+                        return Err(BioFormatsError::InvalidData(
+                            "NRRD: plane out of range".into(),
+                        ));
+                    }
+                    let dst = (y as usize)
+                        .checked_mul(axes.size_x as usize)
+                        .and_then(|row| row.checked_add(x as usize))
+                        .and_then(|px| px.checked_mul(axes.size_c as usize))
+                        .and_then(|base| base.checked_add(c as usize))
+                        .and_then(|sample| sample.checked_mul(bps))
+                        .ok_or_else(|| {
+                            BioFormatsError::InvalidData("NRRD: output offset overflow".into())
+                        })?;
+                    let dst_end = dst.checked_add(bps).ok_or_else(|| {
+                        BioFormatsError::InvalidData("NRRD: output offset overflow".into())
+                    })?;
+                    if dst_end > buf.len() {
+                        return Err(BioFormatsError::InvalidData(
+                            "NRRD: output plane offset is out of range".into(),
+                        ));
+                    }
+                    buf[dst..dst_end].copy_from_slice(&all[src..src_end]);
                 }
             }
         }
@@ -569,27 +630,59 @@ impl NrrdReader {
                     .ok_or(BioFormatsError::NotInitialized)?
                     .pixel_type;
                 let samples = max_bytes / bps.max(1);
-                let mut buf = vec![0u8; max_bytes];
-                for (i, token) in text.split_ascii_whitespace().take(samples).enumerate() {
+                let mut buf = Vec::with_capacity(max_bytes);
+                let mut tokens = text.split_ascii_whitespace();
+                for i in 0..samples {
+                    let token = tokens.next().ok_or_else(|| {
+                        BioFormatsError::InvalidData(
+                            "NRRD: ASCII data is shorter than expected".into(),
+                        )
+                    })?;
                     let dst = i * bps;
                     match pixel_type {
                         PixelType::Uint8 | PixelType::Int8 => {
-                            if let Ok(v) = token.parse::<u8>() {
-                                buf[dst] = v;
-                            }
+                            let v = token.parse::<u8>().map_err(|_| {
+                                BioFormatsError::InvalidData("NRRD: malformed ASCII sample".into())
+                            })?;
+                            buf.push(v);
                         }
                         PixelType::Uint16 | PixelType::Int16 => {
-                            if let Ok(v) = token.parse::<u16>() {
-                                buf[dst..dst + 2].copy_from_slice(&v.to_le_bytes());
-                            }
+                            let v = token.parse::<u16>().map_err(|_| {
+                                BioFormatsError::InvalidData("NRRD: malformed ASCII sample".into())
+                            })?;
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                        PixelType::Uint32 | PixelType::Int32 => {
+                            let v = token.parse::<u32>().map_err(|_| {
+                                BioFormatsError::InvalidData("NRRD: malformed ASCII sample".into())
+                            })?;
+                            buf.extend_from_slice(&v.to_le_bytes());
                         }
                         PixelType::Float32 => {
-                            if let Ok(v) = token.parse::<f32>() {
-                                buf[dst..dst + 4].copy_from_slice(&v.to_le_bytes());
-                            }
+                            let v = token.parse::<f32>().map_err(|_| {
+                                BioFormatsError::InvalidData("NRRD: malformed ASCII sample".into())
+                            })?;
+                            buf.extend_from_slice(&v.to_le_bytes());
                         }
-                        _ => {}
+                        PixelType::Float64 => {
+                            let v = token.parse::<f64>().map_err(|_| {
+                                BioFormatsError::InvalidData("NRRD: malformed ASCII sample".into())
+                            })?;
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                        PixelType::Bit => {
+                            let v = token.parse::<u8>().map_err(|_| {
+                                BioFormatsError::InvalidData("NRRD: malformed ASCII sample".into())
+                            })?;
+                            buf.push(v);
+                        }
                     }
+                    debug_assert_eq!(buf.len(), dst + bps);
+                }
+                if buf.len() != max_bytes {
+                    return Err(BioFormatsError::InvalidData(
+                        "NRRD: ASCII data is shorter than expected".into(),
+                    ));
                 }
                 buf
             }
@@ -608,6 +701,59 @@ impl NrrdReader {
             }
         };
         Ok(data)
+    }
+}
+
+#[cfg(test)]
+mod sidecar_path_tests {
+    use super::*;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_nrrd_{name}_{nanos}.nrrd"))
+    }
+
+    #[test]
+    fn ascii_payload_rejects_truncated_samples() {
+        let path = tmp_path("truncated_ascii");
+        std::fs::write(
+            &path,
+            b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 3 1\nencoding: ascii\n\n1 2",
+        )
+        .unwrap();
+
+        let mut reader = NrrdReader::new();
+        reader.set_id(&path).unwrap();
+        let err = reader
+            .open_bytes(0)
+            .expect_err("truncated ASCII payload should be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(message) if message.contains("shorter"))
+        );
+    }
+
+    #[test]
+    fn ascii_payload_rejects_malformed_samples() {
+        let path = tmp_path("malformed_ascii");
+        std::fs::write(
+            &path,
+            b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 3 1\nencoding: ascii\n\n1 nope 3",
+        )
+        .unwrap();
+
+        let mut reader = NrrdReader::new();
+        reader.set_id(&path).unwrap();
+        let err = reader
+            .open_bytes(0)
+            .expect_err("malformed ASCII payload should be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(message) if message.contains("malformed"))
+        );
     }
 }
 
@@ -685,7 +831,9 @@ impl FormatReader for NrrdReader {
             is_rgb: axes.size_c == 3 || axes.size_c == 4,
             is_interleaved: true,
             is_indexed: false,
-            is_little_endian: hdr.endian,
+            // Multi-byte big-endian samples are normalized to little-endian in
+            // open_bytes, so expose the byte order callers actually receive.
+            is_little_endian: true,
             resolution_count: 1,
             series_metadata,
             lookup_table: None,
@@ -718,7 +866,9 @@ impl FormatReader for NrrdReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -738,18 +888,8 @@ impl FormatReader for NrrdReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let spp = meta.size_c as usize;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * spp * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("NRRD", &full, meta, meta.size_c as usize, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -805,6 +945,23 @@ impl FormatWriter for NrrdWriter {
             .unwrap_or(false)
     }
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        if meta.size_c.max(1) > 1 && !meta.is_rgb {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "NRRD writer cannot safely preserve non-RGB C planes with the current plane API"
+                    .into(),
+            ));
+        }
+        if !meta.is_rgb && meta.size_t.max(1) > 1 && (2..=16).contains(&meta.size_x) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "NRRD writer cannot safely preserve T when the leading X axis would be read as C"
+                    .into(),
+            ));
+        }
+        if meta.is_rgb && !matches!(meta.size_c, 3 | 4) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "NRRD writer supports RGB planes only when size_c is 3 or 4".into(),
+            ));
+        }
         self.meta = Some(meta.clone());
         Ok(())
     }
@@ -816,28 +973,71 @@ impl FormatWriter for NrrdWriter {
         self.planes.clear();
         Ok(())
     }
-    fn save_bytes(&mut self, _: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "NRRD",
+            meta,
+            self.planes.len(),
+            plane_index,
+            data.len(),
+        )?;
         self.planes.push(data.to_vec());
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let _path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_complete("NRRD", meta, self.planes.len())?;
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
         let f = File::create(&path).map_err(BioFormatsError::Io)?;
         let mut w = std::io::BufWriter::new(f);
 
-        let nz = self.planes.len();
+        let size_z = meta.size_z.max(1);
+        let size_t = meta.size_t.max(1);
         let bps = meta.pixel_type.bytes_per_sample();
 
         writeln!(w, "NRRD0004").map_err(BioFormatsError::Io)?;
         writeln!(w, "type: {}", nrrd_type_str(meta.pixel_type)).map_err(BioFormatsError::Io)?;
-        let dim = if nz > 1 { 3 } else { 2 };
-        writeln!(w, "dimension: {}", dim).map_err(BioFormatsError::Io)?;
-        if nz > 1 {
-            writeln!(w, "sizes: {} {} {}", meta.size_x, meta.size_y, nz)
-                .map_err(BioFormatsError::Io)?;
+        if meta.is_rgb {
+            let mut sizes = vec![meta.size_c.max(1), meta.size_x, meta.size_y];
+            if size_z > 1 || size_t > 1 {
+                sizes.push(size_z);
+            }
+            if size_t > 1 {
+                sizes.push(size_t);
+            }
+            writeln!(w, "dimension: {}", sizes.len()).map_err(BioFormatsError::Io)?;
+            writeln!(
+                w,
+                "sizes: {}",
+                sizes
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+            .map_err(BioFormatsError::Io)?;
         } else {
-            writeln!(w, "sizes: {} {}", meta.size_x, meta.size_y).map_err(BioFormatsError::Io)?;
+            let mut sizes = vec![meta.size_x, meta.size_y];
+            if size_z > 1 || size_t > 1 {
+                sizes.push(size_z);
+            }
+            if size_t > 1 {
+                sizes.push(size_t);
+            }
+            writeln!(w, "dimension: {}", sizes.len()).map_err(BioFormatsError::Io)?;
+            writeln!(
+                w,
+                "sizes: {}",
+                sizes
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+            .map_err(BioFormatsError::Io)?;
         }
         if bps > 1 {
             writeln!(w, "endian: little").map_err(BioFormatsError::Io)?;
@@ -854,5 +1054,94 @@ impl FormatWriter for NrrdWriter {
     }
     fn can_do_stacks(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_nrrd_{nanos}_{name}"))
+    }
+
+    #[test]
+    fn detached_data_file_rejects_parent_escape() {
+        let dir = temp_path("escape_single");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image.nhdr");
+        std::fs::write(
+            &path,
+            b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 1 1\nencoding: raw\ndata file: ../pixels.raw\n",
+        )
+        .unwrap();
+
+        let err = parse_nrrd_header(&path).unwrap_err();
+
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("must stay within"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn detached_list_rejects_parent_escape() {
+        let dir = temp_path("escape_list");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image.nhdr");
+        std::fs::write(
+            &path,
+            b"NRRD0004\ntype: uint8\ndimension: 3\nsizes: 1 1 2\nencoding: raw\ndata file: LIST\nplane0.raw\n../plane1.raw\n",
+        )
+        .unwrap();
+
+        let err = parse_nrrd_header(&path).unwrap_err();
+
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("must stay within"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn header_rejects_malformed_dimension_sizes_and_skips() {
+        let cases: &[(&str, &[u8], &str)] = &[
+            (
+                "bad_dimension",
+                b"NRRD0004\ntype: uint8\ndimension: nope\nsizes: 1 1\nencoding: raw\n\n",
+                "invalid dimension",
+            ),
+            (
+                "bad_size",
+                b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 1 nope\nencoding: raw\n\n",
+                "invalid size",
+            ),
+            (
+                "bad_byte_skip",
+                b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 1 1\nencoding: raw\nbyte skip: nope\n\n",
+                "invalid byte skip",
+            ),
+            (
+                "bad_line_skip",
+                b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 1 1\nencoding: raw\nline skip: nope\n\n",
+                "invalid line skip",
+            ),
+        ];
+
+        for (name, bytes, expected) in cases {
+            let path = temp_path(name);
+            std::fs::write(&path, bytes).unwrap();
+            let err = parse_nrrd_header(&path).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "{name}: unexpected error: {err}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

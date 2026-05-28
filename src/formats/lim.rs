@@ -176,7 +176,9 @@ impl FormatReader for LimReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -294,7 +296,7 @@ impl FormatReader for TillVisionReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("vws"))
+            .map(|e| e.eq_ignore_ascii_case("vws") || e.eq_ignore_ascii_case("pst"))
             .unwrap_or(false)
     }
 
@@ -334,11 +336,10 @@ impl FormatReader for TillVisionReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        &self
-            .series
+        self.series
             .get(self.current_series)
-            .expect("set_id not called")
-            .meta
+            .map(|series| &series.meta)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

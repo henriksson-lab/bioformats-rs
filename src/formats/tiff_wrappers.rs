@@ -5,9 +5,10 @@
 
 use std::path::Path;
 
-use crate::common::error::Result;
+use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
+use crate::common::region::validate_region;
 
 // ---------------------------------------------------------------------------
 // Minimal XML helpers (shared by the Leica SCN, Ventana, XLEF ports)
@@ -331,6 +332,9 @@ impl FormatReader for NdpiReader {
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
     }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -380,9 +384,7 @@ struct ScnImage {
 
 impl ScnImage {
     fn lookup(&self, z: u32, c: u32, r: u32) -> Option<&ScnDimension> {
-        self.dims
-            .iter()
-            .find(|d| d.z == z && d.c == c && d.r == r)
+        self.dims.iter().find(|d| d.z == z && d.c == c && d.r == r)
     }
 }
 
@@ -484,7 +486,10 @@ impl LeicaScnReader {
                             size_r: 1,
                             ..ScnImage::default()
                         };
-                        img.dims.push(ScnDimension { ifd, ..Default::default() });
+                        img.dims.push(ScnDimension {
+                            ifd,
+                            ..Default::default()
+                        });
                         // A supplemental image interrupts the current image.
                         if let Some(cur) = current.take() {
                             images.push(cur);
@@ -595,10 +600,16 @@ impl LeicaScnReader {
                 };
                 meta.size_z = img.size_z.max(1);
                 meta.size_t = 1;
-                meta.size_c = if is_rgb { spp as u32 } else { img.size_c.max(1) };
+                meta.size_c = if is_rgb {
+                    spp as u32
+                } else {
+                    img.size_c.max(1)
+                };
                 meta.is_rgb = is_rgb;
                 meta.bits_per_pixel = bps as u8;
-                let sample_format = ifd.get_u16(crate::tiff::ifd::tag::SAMPLE_FORMAT).unwrap_or(1);
+                let sample_format = ifd
+                    .get_u16(crate::tiff::ifd::tag::SAMPLE_FORMAT)
+                    .unwrap_or(1);
                 meta.pixel_type = tiff_pixel_type(bps, sample_format);
                 meta.is_indexed = matches!(photometric, crate::tiff::ifd::Photometric::Palette);
             }
@@ -617,8 +628,10 @@ impl LeicaScnReader {
             }
             if let Some(mag) = &img.obj_mag {
                 if let Ok(m) = mag.parse::<f64>() {
-                    meta.series_metadata
-                        .insert("leica.objective_magnification".into(), MetadataValue::Float(m));
+                    meta.series_metadata.insert(
+                        "leica.objective_magnification".into(),
+                        MetadataValue::Float(m),
+                    );
                 }
             }
             if let Some(na) = &img.illum_na {
@@ -634,16 +647,22 @@ impl LeicaScnReader {
                 );
             }
             if let Some(model) = &img.dev_model {
-                meta.series_metadata
-                    .insert("leica.device.model".into(), MetadataValue::String(model.clone()));
+                meta.series_metadata.insert(
+                    "leica.device.model".into(),
+                    MetadataValue::String(model.clone()),
+                );
             }
             if let Some(ver) = &img.dev_version {
-                meta.series_metadata
-                    .insert("leica.device.version".into(), MetadataValue::String(ver.clone()));
+                meta.series_metadata.insert(
+                    "leica.device.version".into(),
+                    MetadataValue::String(ver.clone()),
+                );
             }
             if let Some(date) = &img.creation_date {
-                meta.series_metadata
-                    .insert("leica.creation_date".into(), MetadataValue::String(date.clone()));
+                meta.series_metadata.insert(
+                    "leica.creation_date".into(),
+                    MetadataValue::String(date.clone()),
+                );
             }
             // Leica units are nanometres; physical size in micrometres.
             if img.v_size_x > 0 && meta.size_x > 0 {
@@ -741,6 +760,9 @@ impl FormatReader for LeicaScnReader {
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
     }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +842,11 @@ impl VentanaReader {
 
     fn first_description(&self) -> Option<String> {
         let series = self.inner.series_list();
-        let v = series.first()?.metadata.series_metadata.get("ImageDescription")?;
+        let v = series
+            .first()?
+            .metadata
+            .series_metadata
+            .get("ImageDescription")?;
         if let crate::common::metadata::MetadataValue::String(s) = v {
             Some(s.clone())
         } else {
@@ -863,7 +889,11 @@ impl VentanaReader {
                         .get("AOIIndex")
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(areas.len() as i64),
-                    tile_rows: info.attrs.get("NumRows").and_then(|s| s.parse().ok()).unwrap_or(0),
+                    tile_rows: info
+                        .attrs
+                        .get("NumRows")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
                     tile_columns: info
                         .attrs
                         .get("NumCols")
@@ -879,7 +909,10 @@ impl VentanaReader {
                     {
                         let a = &tags[j].attrs;
                         let overlap = VentanaOverlap {
-                            a: a.get("Tile1").and_then(|s| s.parse::<i64>().ok()).unwrap_or(1) - 1,
+                            a: a.get("Tile1")
+                                .and_then(|s| s.parse::<i64>().ok())
+                                .unwrap_or(1)
+                                - 1,
                             x: a.get("OverlapX")
                                 .and_then(|s| s.parse::<f64>().ok())
                                 .map(|f| f as i64)
@@ -998,8 +1031,10 @@ impl VentanaReader {
                 }
             }
 
-            let mut column_y_adjust: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-            let mut column_x_adjust: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+            let mut column_y_adjust: std::collections::HashMap<i64, i64> =
+                std::collections::HashMap::new();
+            let mut column_x_adjust: std::collections::HashMap<i64, i64> =
+                std::collections::HashMap::new();
             let mut right_sum = 0.0f64;
             let mut up_sum = 0.0f64;
             let mut right_count = 0;
@@ -1024,7 +1059,8 @@ impl VentanaReader {
                         up_count += 1;
                     }
                     "LEFT" => {
-                        let tc = Self::get_tile_column(overlap.a, area.tile_rows, area.tile_columns);
+                        let tc =
+                            Self::get_tile_column(overlap.a, area.tile_rows, area.tile_columns);
                         column_x_adjust.insert(tc, overlap.x);
                         if overlap.y <= 0 {
                             column_y_adjust.insert(tc, overlap.y);
@@ -1052,12 +1088,12 @@ impl VentanaReader {
                     all_even = false;
                 }
             }
-            if (all_odd || all_even) && first_value.is_some() {
+            if let Some(first_value) = first_value.filter(|_| all_odd || all_even) {
                 for i in 0..area.tile_columns {
                     if (i % 2 == 0 && all_odd) || (i % 2 == 1 && all_even) {
                         continue;
                     }
-                    column_y_adjust.entry(i).or_insert_with(|| first_value.unwrap());
+                    column_y_adjust.entry(i).or_insert(first_value);
                 }
             }
             for &adjust in column_y_adjust.values() {
@@ -1147,7 +1183,9 @@ impl VentanaReader {
     }
 
     fn enrich_metadata(&mut self) {
-        let Some(desc) = self.first_description() else { return };
+        let Some(desc) = self.first_description() else {
+            return;
+        };
         if !desc.contains("iScan") {
             return;
         }
@@ -1218,9 +1256,9 @@ impl VentanaReader {
                 continue;
             }
             // Read the source tile from the base TIFF layout.
-            let src = self
-                .inner
-                .open_bytes_region(0, tile.base_x as u32, tile.base_y as u32, tw, th)?;
+            let src =
+                self.inner
+                    .open_bytes_region(0, tile.base_x as u32, tile.base_y as u32, tw, th)?;
             let src_row = tw as usize * bpp_pixel;
             for row in iy0..iy1 {
                 let src_y = (row - ty0) as usize;
@@ -1285,6 +1323,9 @@ impl FormatReader for VentanaReader {
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         // Reassemble only the full-resolution image (series 0, resolution 0).
         if self.reassemble && self.inner.series() == 0 && self.inner.resolution() == 0 {
+            if p != 0 {
+                return Err(BioFormatsError::PlaneOutOfRange(p));
+            }
             let (fx, fy) = (self.full_x, self.full_y);
             return self.assemble_region(0, 0, fx, fy);
         }
@@ -1292,6 +1333,10 @@ impl FormatReader for VentanaReader {
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         if self.reassemble && self.inner.series() == 0 && self.inner.resolution() == 0 {
+            if p != 0 {
+                return Err(BioFormatsError::PlaneOutOfRange(p));
+            }
+            validate_region("Ventana", self.full_x, self.full_y, x, y, w, h)?;
             return self.assemble_region(x, y, w, h);
         }
         self.inner.open_bytes_region(p, x, y, w, h)
@@ -1304,6 +1349,9 @@ impl FormatReader for VentanaReader {
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
     }
 }
 
@@ -1465,6 +1513,9 @@ impl FormatReader for NikonElementsTiffReader {
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
     }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1593,6 +1644,9 @@ impl FormatReader for FeiTiffReader {
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
     }
 }
 
@@ -1727,6 +1781,9 @@ impl FormatReader for OlympusSisTiffReader {
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
     }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1858,6 +1915,9 @@ impl FormatReader for ImprovisionTiffReader {
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
     }
 }
 
@@ -2042,6 +2102,9 @@ impl FormatReader for ZeissApotomeTiffReader {
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
     }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2164,6 +2227,9 @@ impl FormatReader for FluoviewTiffReader {
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
     }
 }
 
@@ -2345,5 +2411,8 @@ impl FormatReader for MolecularDevicesTiffReader {
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
     }
 }

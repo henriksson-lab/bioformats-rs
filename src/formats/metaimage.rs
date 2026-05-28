@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 use crate::common::writer::FormatWriter;
 
 fn meta_pixel_type(s: &str) -> PixelType {
@@ -39,6 +41,24 @@ fn meta_type_str(pt: PixelType) -> &'static str {
         PixelType::Float32 => "MET_FLOAT",
         PixelType::Float64 => "MET_DOUBLE",
     }
+}
+
+fn parse_meta_scalar<T>(value: &str, field: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    value.parse().map_err(|_| {
+        BioFormatsError::Format(format!(
+            "MetaImage: invalid numeric value for {field}: {value}"
+        ))
+    })
+}
+
+fn parse_meta_sizes(value: &str) -> Result<Vec<u32>> {
+    value
+        .split_ascii_whitespace()
+        .map(|s| parse_meta_scalar(s, "DimSize"))
+        .collect()
 }
 
 struct MhdHeader {
@@ -84,14 +104,11 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
             match key.as_str() {
                 "NDIMS" | "NIMS" | "OBJECTTYPE" => {
                     if key == "NDIMS" {
-                        ndims = val.parse().unwrap_or(3);
+                        ndims = parse_meta_scalar(val, "NDims")?;
                     }
                 }
                 "DIMSIZE" | "DIM_SIZE" => {
-                    sizes = val
-                        .split_ascii_whitespace()
-                        .filter_map(|s| s.parse().ok())
-                        .collect();
+                    sizes = parse_meta_sizes(val)?;
                 }
                 "ELEMENTTYPE" => pixel_type = meta_pixel_type(val),
                 "ELEMENTBYTEORDERMSB" => little_endian = !val.eq_ignore_ascii_case("true"),
@@ -109,6 +126,23 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
                 }
             }
         }
+    }
+
+    if ndims == 0 || ndims > 3 {
+        return Err(BioFormatsError::Format(format!(
+            "MetaImage: unsupported NDims value {ndims}"
+        )));
+    }
+    if sizes.len() != ndims {
+        return Err(BioFormatsError::Format(format!(
+            "MetaImage: DimSize has {} value(s), expected {ndims}",
+            sizes.len()
+        )));
+    }
+    if sizes.iter().any(|&size| size == 0) {
+        return Err(BioFormatsError::Format(
+            "MetaImage: DimSize values must be positive".into(),
+        ));
     }
 
     Ok(MhdHeader {
@@ -149,14 +183,26 @@ impl MetaImageReader {
         let mhd_path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let bps = meta.pixel_type.bytes_per_sample();
-        let plane_bytes = meta.size_x as usize * meta.size_y as usize * meta.size_c as usize * bps;
-        let plane_offset = plane_index as u64 * plane_bytes as u64;
+        let plane_bytes = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|v| v.checked_mul(meta.size_c as usize))
+            .and_then(|v| v.checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::InvalidData("MetaImage: plane size overflow".into()))?;
+        let plane_offset = (plane_index as u64)
+            .checked_mul(plane_bytes as u64)
+            .ok_or_else(|| {
+                BioFormatsError::InvalidData("MetaImage: plane offset overflow".into())
+            })?;
 
         let data_path = match &hdr.data_file {
             Some(s) if s.eq_ignore_ascii_case("LOCAL") => mhd_path.clone(),
             Some(s) => {
                 let parent = mhd_path.parent().unwrap_or(Path::new("."));
-                parent.join(s)
+                confined_join(parent, s).ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "MetaImage: ElementDataFile escapes image directory: {s}"
+                    ))
+                })?
             }
             None => {
                 // Try replacing .mhd extension with .raw
@@ -172,8 +218,12 @@ impl MetaImageReader {
             let mut dec = flate2::read::ZlibDecoder::new(f);
             let mut all = Vec::new();
             dec.read_to_end(&mut all).map_err(BioFormatsError::Io)?;
-            let start = plane_offset as usize;
-            let end = start + plane_bytes;
+            let start = usize::try_from(plane_offset).map_err(|_| {
+                BioFormatsError::InvalidData("MetaImage: plane offset overflow".into())
+            })?;
+            let end = start.checked_add(plane_bytes).ok_or_else(|| {
+                BioFormatsError::InvalidData("MetaImage: plane range overflow".into())
+            })?;
             if end > all.len() {
                 return Err(BioFormatsError::InvalidData(
                     "MetaImage: plane out of range".into(),
@@ -181,7 +231,9 @@ impl MetaImageReader {
             }
             all[start..end].to_vec()
         } else {
-            let offset = hdr.data_offset + plane_offset;
+            let offset = hdr.data_offset.checked_add(plane_offset).ok_or_else(|| {
+                BioFormatsError::InvalidData("MetaImage: plane offset overflow".into())
+            })?;
             f.seek(SeekFrom::Start(offset))
                 .map_err(BioFormatsError::Io)?;
             let mut buf = vec![0u8; plane_bytes];
@@ -282,7 +334,9 @@ impl FormatReader for MetaImageReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -302,16 +356,8 @@ impl FormatReader for MetaImageReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("MetaImage", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -354,6 +400,11 @@ impl FormatWriter for MetaImageWriter {
             .unwrap_or(false)
     }
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        if meta.size_c.max(1) > 1 || meta.size_t.max(1) > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "MetaImage writer does not preserve C/T axes; write Z stacks only".into(),
+            ));
+        }
         self.meta = Some(meta.clone());
         Ok(())
     }
@@ -365,11 +416,22 @@ impl FormatWriter for MetaImageWriter {
         self.planes.clear();
         Ok(())
     }
-    fn save_bytes(&mut self, _: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "MetaImage",
+            meta,
+            self.planes.len(),
+            plane_index,
+            data.len(),
+        )?;
         self.planes.push(data.to_vec());
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let _path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_complete("MetaImage", meta, self.planes.len())?;
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
 

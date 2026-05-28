@@ -17,8 +17,10 @@ use crate::common::ome_metadata::{
     create_lsid, OmeChannel, OmeImage, OmeInstrument, OmeMetadata, OmeObjective, OmePlate, OmeWell,
     OmeWellSample,
 };
+use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 /// A single image plane referenced by the .xdce metadata.
 #[derive(Clone, Default)]
@@ -191,7 +193,12 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                     b"Image" => {
                         m.total_images += 1;
                         if let Some(file) = attr_val(e, "filename") {
-                            current_image_file = Some(dir.join(file));
+                            current_image_file =
+                                Some(confined_join(&dir, &file).ok_or_else(|| {
+                                    BioFormatsError::Format(format!(
+                                        "InCell companion filename escapes image directory: {file}"
+                                    ))
+                                })?);
                         }
                     }
                     b"Identifier" => {
@@ -216,7 +223,9 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                             .as_ref()
                             .and_then(|p| p.extension())
                             .and_then(|e| e.to_str())
-                            .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+                            .map(|e| {
+                                e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")
+                            })
                             .unwrap_or(false);
                         let plane = ImagePlane {
                             filename: if exists { filename } else { None },
@@ -331,9 +340,7 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                     }
                     b"TimeSchedule" => {
-                        m.do_t = attr_val(e, "enabled")
-                            .map(|v| v == "true")
-                            .unwrap_or(true);
+                        m.do_t = attr_val(e, "enabled").map(|v| v == "true").unwrap_or(true);
                     }
                     _ => {}
                 }
@@ -428,7 +435,12 @@ impl InCellReader {
         let mut plate_wells: Vec<(usize, usize)> = Vec::new();
         for row in 0..m.well_rows {
             for col in 0..m.well_cols {
-                if m.plate_map.get(row).and_then(|r| r.get(col)).copied().unwrap_or(false) {
+                if m.plate_map
+                    .get(row)
+                    .and_then(|r| r.get(col))
+                    .copied()
+                    .unwrap_or(false)
+                {
                     plate_wells.push((row, col));
                 }
             }
@@ -569,10 +581,7 @@ fn series_to_well_field(
 ) -> (usize, usize) {
     let well_ordinal = series / field_count;
     let field = series % field_count;
-    let (row, col) = plate_wells
-        .get(well_ordinal)
-        .copied()
-        .unwrap_or((0, 0));
+    let (row, col) = plate_wells.get(well_ordinal).copied().unwrap_or((0, 0));
     (row * well_cols.max(1) + col, field)
 }
 
@@ -651,7 +660,7 @@ impl FormatReader for InCellReader {
     fn metadata(&self) -> &ImageMetadata {
         self.series
             .get(self.current_series)
-            .expect("set_id not called")
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -691,12 +700,18 @@ impl FormatReader for InCellReader {
         let mut f = std::fs::File::open(&tiff_path).map_err(BioFormatsError::Io)?;
         let len = f.metadata().map_err(BioFormatsError::Io)?.len();
         let mut buf = vec![0u8; plane_bytes];
-        if len > plane_bytes as u64 {
-            f.seek(SeekFrom::Start(128)).map_err(BioFormatsError::Io)?;
-            let available = (len - 128).min(plane_bytes as u64) as usize;
-            f.read_exact(&mut buf[..available])
-                .map_err(BioFormatsError::Io)?;
+        let offset = 128u64;
+        let end = offset.checked_add(plane_bytes as u64).ok_or_else(|| {
+            BioFormatsError::InvalidData("InCell .im plane offset overflows".into())
+        })?;
+        if end > len {
+            return Err(BioFormatsError::InvalidData(format!(
+                "InCell .im plane exceeds file length: need bytes {offset}..{end}, file length {len}"
+            )));
         }
+        f.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
@@ -709,16 +724,11 @@ impl FormatReader for InCellReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.series.get(self.current_series).unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("InCell", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -863,13 +873,127 @@ fn format_well_label(naming: &str, index: usize) -> String {
     if naming.is_empty() {
         return (index + 1).to_string();
     }
-    let last = naming.chars().last().unwrap();
+    let Some(last) = naming.chars().last() else {
+        return (index + 1).to_string();
+    };
     let prefix: String = naming.chars().take(naming.chars().count() - 1).collect();
     if last.is_ascii_digit() {
-        let base = last.to_digit(10).unwrap() as usize;
+        let base = last.to_digit(10).unwrap_or(0) as usize;
         format!("{}{}", prefix, index + base)
     } else {
         let ch = (last as u8).wrapping_add(index as u8) as char;
         format!("{}{}", prefix, ch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bioformats_incell_test_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            name
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn initialized_reader() -> InCellReader {
+        let mut reader = InCellReader::new();
+        reader.series.push(ImageMetadata {
+            size_x: 2,
+            size_y: 2,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        });
+        reader.image_files.push(vec![ImagePlane::default()]);
+        reader
+    }
+
+    #[test]
+    fn open_bytes_region_rejects_out_of_bounds_without_panicking() {
+        let mut reader = initialized_reader();
+
+        let err = reader.open_bytes_region(0, 1, 0, 2, 1).unwrap_err();
+
+        assert!(
+            err.to_string().contains("outside image bounds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_bytes_region_crops_missing_plane_zero_buffer() {
+        let mut reader = initialized_reader();
+
+        let crop = reader.open_bytes_region(0, 1, 0, 1, 2).unwrap();
+
+        assert_eq!(crop, vec![0, 0]);
+    }
+
+    #[test]
+    fn incell_rejects_companion_filename_that_escapes_directory() {
+        for (name, filename) in [
+            ("relative", "../outside.tif".to_string()),
+            (
+                "absolute",
+                std::env::temp_dir()
+                    .join("outside.tif")
+                    .display()
+                    .to_string(),
+            ),
+        ] {
+            let dir = temp_dir(&format!("escape_{name}"));
+            let xml = dir.join("plate.xdce");
+            std::fs::write(
+                &xml,
+                format!(
+                    r#"<InCell><Image filename="{filename}"><Identifier field_index="0" z_index="0" wave_index="0" time_index="0"/></Image></InCell>"#
+                ),
+            )
+            .unwrap();
+
+            let err = match parse_incell_xml(&xml) {
+                Ok(_) => panic!("{name}: escaped InCell companion unexpectedly parsed"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("escapes image directory"),
+                "{name}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn incell_accepts_confined_relative_companion_filename() {
+        let dir = temp_dir("relative_ok");
+        let image_dir = dir.join("Images");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        let image = image_dir.join("a.tif");
+        std::fs::write(&image, []).unwrap();
+        let xml = dir.join("plate.xdce");
+        std::fs::write(
+            &xml,
+            r#"<InCell><Image filename="Images/a.tif"><Identifier field_index="0" z_index="0" wave_index="0" time_index="0"/></Image></InCell>"#,
+        )
+        .unwrap();
+
+        let meta = parse_incell_xml(&xml).unwrap();
+        let plane = meta.image_files[0][0][0][0].as_ref().unwrap();
+
+        assert_eq!(plane.filename.as_ref(), Some(&image));
+        assert!(plane.is_tiff);
     }
 }

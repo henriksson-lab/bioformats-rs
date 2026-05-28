@@ -12,6 +12,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 pub struct PsdReader {
     path: Option<PathBuf>,
@@ -54,7 +55,7 @@ fn read_u64_be(r: &mut impl Read) -> std::io::Result<u64> {
 }
 
 /// Decode PackBits RLE-encoded data.
-fn decode_packbits(src: &[u8], expected_bytes: usize) -> Vec<u8> {
+fn decode_packbits(src: &[u8], expected_bytes: usize) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(expected_bytes);
     let mut i = 0;
     while i < src.len() && out.len() < expected_bytes {
@@ -63,23 +64,39 @@ fn decode_packbits(src: &[u8], expected_bytes: usize) -> Vec<u8> {
         if n >= 0 {
             // Copy next n+1 bytes literally
             let count = (n as usize) + 1;
-            let end = (i + count).min(src.len());
+            let end = i.checked_add(count).ok_or_else(|| {
+                BioFormatsError::InvalidData("PSD PackBits row count overflow".into())
+            })?;
+            if end > src.len() {
+                return Err(BioFormatsError::InvalidData(
+                    "PSD PackBits row is truncated".into(),
+                ));
+            }
             out.extend_from_slice(&src[i..end]);
             i += count;
         } else if n != -128 {
             // Repeat next byte (-n+1) times
             let count = ((-n) as usize) + 1;
-            if i < src.len() {
-                let val = src[i];
-                i += 1;
-                for _ in 0..count {
-                    out.push(val);
-                }
+            if i >= src.len() {
+                return Err(BioFormatsError::InvalidData(
+                    "PSD PackBits row is truncated".into(),
+                ));
+            }
+            let val = src[i];
+            i += 1;
+            for _ in 0..count {
+                out.push(val);
             }
         }
         // n == -128: no-op
     }
-    out
+    if out.len() < expected_bytes {
+        return Err(BioFormatsError::InvalidData(
+            "PSD PackBits row is shorter than expected".into(),
+        ));
+    }
+    out.truncate(expected_bytes);
+    Ok(out)
 }
 
 fn pixel_type_from_depth(depth: u16) -> PixelType {
@@ -189,13 +206,8 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         let mut out = Vec::with_capacity(total_bytes);
         let mut offset = 0;
         for &rc in &row_counts {
-            let decoded = decode_packbits(&compressed[offset..offset + rc], row_bytes);
-            let decoded_len = decoded.len();
+            let decoded = decode_packbits(&compressed[offset..offset + rc], row_bytes)?;
             out.extend_from_slice(&decoded);
-            // Pad if short
-            if decoded_len < row_bytes {
-                out.resize(out.len() + (row_bytes - decoded_len), 0);
-            }
             offset += rc;
         }
         out
@@ -217,8 +229,9 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     // Convert from planar to interleaved, preserving every channel so that
     // alpha (RGBA), CMYK, and Lab data are not dropped.
     let pixels = if output_channels > 1 {
-        let mut interleaved =
-            Vec::with_capacity(width as usize * height as usize * output_channels * bytes_per_sample);
+        let mut interleaved = Vec::with_capacity(
+            width as usize * height as usize * output_channels * bytes_per_sample,
+        );
         for i in 0..(width as usize * height as usize) {
             for c in 0..output_channels {
                 let src_off = c * plane_bytes + i * bytes_per_sample;
@@ -264,6 +277,28 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     Ok((meta, pixels))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packbits_rejects_truncated_literal_payload() {
+        let err = decode_packbits(&[2, 10, 11], 3)
+            .expect_err("short PackBits literal should be rejected");
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(message) if message.contains("truncated"))
+        );
+    }
+
+    #[test]
+    fn packbits_rejects_short_decoded_row() {
+        let err = decode_packbits(&[0, 10], 2).expect_err("short PackBits row should be rejected");
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(message) if message.contains("shorter"))
+        );
+    }
+}
+
 impl FormatReader for PsdReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -307,7 +342,9 @@ impl FormatReader for PsdReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -326,18 +363,8 @@ impl FormatReader for PsdReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let channels = meta.size_c as usize;
-        let row_bytes = meta.size_x as usize * channels * bps;
-        let out_row = w as usize * channels * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * channels * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("PSD", &full, meta, meta.size_c as usize, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

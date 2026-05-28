@@ -16,6 +16,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 pub struct ImarisReader {
     path: Option<PathBuf>,
@@ -311,7 +312,7 @@ impl FormatReader for ImarisReader {
         self.resolutions
             .get(self.current_resolution)
             .or_else(|| self.resolutions.first())
-            .expect("set_id not called")
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn resolution_count(&self) -> usize {
@@ -355,8 +356,7 @@ impl FormatReader for ImarisReader {
             None => true,
         };
         if need_load {
-            let data_path =
-                format!("DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data");
+            let data_path = format!("DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data");
             let path = self
                 .path
                 .as_ref()
@@ -421,16 +421,8 @@ impl FormatReader for ImarisReader {
         let meta = self
             .resolutions
             .get(self.current_resolution)
-            .unwrap();
-        let bps = self.bytes_per_sample;
-        let row_bytes = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src_start = (y as usize + r) * row_bytes + x as usize * bps;
-            out.extend_from_slice(&full[src_start..src_start + out_row]);
-        }
-        Ok(out)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Imaris", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {

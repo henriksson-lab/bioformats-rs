@@ -42,6 +42,10 @@ fn write_i32_le(buf: &mut [u8], offset: usize, value: i32) {
     buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn write_i32_be(buf: &mut [u8], offset: usize, value: i32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+
 fn fixed_ascii<const N: usize>(text: &str) -> [u8; N] {
     let mut out = [0u8; N];
     let bytes = text.as_bytes();
@@ -135,6 +139,92 @@ fn eps_reader_accepts_bioformats_binary_image_subset() {
     assert_eq!(reader.metadata().size_y, 2);
     assert_eq!(reader.metadata().size_c, 1);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 8, 7, 6]);
+}
+
+#[test]
+fn aim_rejects_missing_magic_zero_dimensions_and_short_payload() {
+    let random = tmp("random.aim");
+    let mut bytes = vec![0u8; 512];
+    bytes[56..60].copy_from_slice(&1i32.to_le_bytes());
+    bytes[60..64].copy_from_slice(&1i32.to_le_bytes());
+    bytes[64..68].copy_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&[1, 2]);
+    std::fs::write(&random, bytes).unwrap();
+    let mut reader = bioformats::formats::aim::AimReader::new();
+    let err = reader.set_id(&random).unwrap_err();
+    assert!(err.to_string().contains("AIMDATA"));
+    let _ = std::fs::remove_file(&random);
+
+    let zero = tmp("zero.aim");
+    let mut bytes = vec![0u8; 512];
+    bytes[..12].copy_from_slice(b"AIMDATA_V020");
+    bytes[60..64].copy_from_slice(&1i32.to_le_bytes());
+    bytes[64..68].copy_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&[1, 2]);
+    std::fs::write(&zero, bytes).unwrap();
+    let mut reader = bioformats::formats::aim::AimReader::new();
+    let err = reader.set_id(&zero).unwrap_err();
+    assert!(err.to_string().contains("non-positive AIM width"));
+    let _ = std::fs::remove_file(&zero);
+
+    let short = tmp("short.aim");
+    let mut bytes = vec![0u8; 512];
+    bytes[..12].copy_from_slice(b"AIMDATA_V020");
+    bytes[56..60].copy_from_slice(&2i32.to_le_bytes());
+    bytes[60..64].copy_from_slice(&2i32.to_le_bytes());
+    bytes[64..68].copy_from_slice(&1i32.to_le_bytes());
+    bytes[160..512].fill(b'x');
+    bytes.extend_from_slice(&[1, 2]);
+    std::fs::write(&short, bytes).unwrap();
+    let mut reader = bioformats::formats::aim::AimReader::new();
+    let err = reader.set_id(&short).unwrap_err();
+    assert!(err.to_string().contains("shorter than declared"));
+    let _ = std::fs::remove_file(&short);
+
+    let short_isq = tmp("short.isq");
+    let mut bytes = vec![0u8; 512];
+    bytes[..16].copy_from_slice(b"CTDATA-HEADER_V1");
+    bytes[28..32].copy_from_slice(&1i32.to_le_bytes());
+    bytes[32..36].copy_from_slice(&1i32.to_le_bytes());
+    bytes[36..40].copy_from_slice(&1i32.to_le_bytes());
+    std::fs::write(&short_isq, bytes).unwrap();
+    let mut reader = bioformats::formats::aim::AimReader::new();
+    let err = reader.set_id(&short_isq).unwrap_err();
+    assert!(err.to_string().contains("shorter than declared"));
+    let _ = std::fs::remove_file(&short_isq);
+}
+
+#[test]
+fn gatan_rejects_weak_dm_magic_and_short_dm2_payload() {
+    let reader = bioformats::formats::gatan::GatanReader::new();
+    assert!(!reader.is_this_type_by_bytes(&[0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0,]));
+    assert!(!reader.is_this_type_by_bytes(&[0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,]));
+    assert!(reader.is_this_type_by_bytes(&[0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,]));
+    assert!(reader.is_this_type_by_bytes(&[0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,]));
+
+    let dm2 = tmp("short.dm2");
+    let mut bytes = vec![0u8; 24];
+    bytes[..4].copy_from_slice(&0x003d_0000i32.to_be_bytes());
+    bytes[16..18].copy_from_slice(&2i16.to_be_bytes());
+    bytes[18..20].copy_from_slice(&2i16.to_be_bytes());
+    bytes[20..22].copy_from_slice(&1i16.to_be_bytes());
+    bytes[22..24].copy_from_slice(&0i16.to_be_bytes());
+    std::fs::write(&dm2, bytes).unwrap();
+    let mut dm2_reader = bioformats::formats::gatan::Dm2Reader::new();
+    let err = dm2_reader.set_id(&dm2).unwrap_err();
+    assert!(err.to_string().contains("shorter than declared"));
+    let _ = std::fs::remove_file(dm2);
+
+    let zero = tmp("zero.dm2");
+    let mut bytes = vec![0u8; 24];
+    bytes[..4].copy_from_slice(&0x003d_0000i32.to_be_bytes());
+    bytes[18..20].copy_from_slice(&1i16.to_be_bytes());
+    bytes[20..22].copy_from_slice(&1i16.to_be_bytes());
+    std::fs::write(&zero, bytes).unwrap();
+    let mut dm2_reader = bioformats::formats::gatan::Dm2Reader::new();
+    let err = dm2_reader.set_id(&zero).unwrap_err();
+    assert!(err.to_string().contains("non-positive"));
+    let _ = std::fs::remove_file(zero);
 }
 
 // ---- AFM/SPM/SEM synthetic-pixel audit ------------------------------------
@@ -234,13 +324,13 @@ fn topometrix_region_crops_real_pixels() {
 fn build_gel_tiff(w: u16, h: u16, pixels_le: &[u8], extra: &[(u16, u16, u32)]) -> Vec<u8> {
     // type codes: 3 = SHORT, 4 = LONG, 5 = RATIONAL
     let mut entries: Vec<(u16, u16, u32, u32)> = vec![
-        (256, 3, 1, w as u32),  // ImageWidth
-        (257, 3, 1, h as u32),  // ImageLength
-        (258, 3, 1, 16),        // BitsPerSample
-        (259, 3, 1, 1),         // Compression = none
-        (262, 3, 1, 1),         // PhotometricInterpretation = BlackIsZero
-        (277, 3, 1, 1),         // SamplesPerPixel
-        (278, 3, 1, h as u32),  // RowsPerStrip
+        (256, 3, 1, w as u32), // ImageWidth
+        (257, 3, 1, h as u32), // ImageLength
+        (258, 3, 1, 16),       // BitsPerSample
+        (259, 3, 1, 1),        // Compression = none
+        (262, 3, 1, 1),        // PhotometricInterpretation = BlackIsZero
+        (277, 3, 1, 1),        // SamplesPerPixel
+        (278, 3, 1, h as u32), // RowsPerStrip
     ];
     for &(tag, ty, val) in extra {
         entries.push((tag, ty, 1, val));
@@ -258,7 +348,8 @@ fn build_gel_tiff(w: u16, h: u16, pixels_le: &[u8], extra: &[(u16, u16, u32)]) -
     let rational_start = ifd_start + ifd_size;
 
     // Resolve out-of-line RATIONAL values, recording their offsets.
-    let mut rational_offsets: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+    let mut rational_offsets: std::collections::HashMap<u16, u32> =
+        std::collections::HashMap::new();
     for &(tag, ty, _cnt, val) in &entries {
         if ty == 5 {
             let off = rational_start + rational_area.len() as u32;
@@ -515,6 +606,21 @@ fn perkinelmer_and_openlab_reject_short_payloads_instead_of_padding() {
         "{err:?}"
     );
     let _ = std::fs::remove_file(raw);
+
+    let raw = tmp("bad_magic_openlab.raw");
+    let mut data = vec![0u8; 288];
+    data[8..12].copy_from_slice(&1i32.to_be_bytes());
+    data[12..16].copy_from_slice(&1i32.to_be_bytes());
+    data[16..20].copy_from_slice(&8i32.to_be_bytes());
+    data.extend_from_slice(&[1]);
+    std::fs::write(&raw, data).unwrap();
+    let mut openlab = bioformats::formats::perkinelmer::OpenlabRawReader::new();
+    let err = openlab.set_id(&raw).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("LBLB magic")),
+        "{err:?}"
+    );
+    let _ = std::fs::remove_file(raw);
 }
 
 #[test]
@@ -652,6 +758,30 @@ fn lim_requires_declared_header_and_crops_real_pixels() {
 }
 
 #[test]
+fn tillvision_pst_entrypoint_reads_sidecar_inf_pixels() {
+    let pst = tmp("direct_tillvision.pst");
+    let inf = tmp("direct_tillvision.inf");
+    std::fs::write(
+        &inf,
+        "Width=3\nHeight=2\nBands=1\nSlices=1\nFrames=1\nDatatype=2\n",
+    )
+    .unwrap();
+    std::fs::write(&pst, [1, 2, 3, 4, 5, 6]).unwrap();
+
+    let mut reader = ImageReader::open(&pst).unwrap();
+    assert_eq!(reader.metadata().size_x, 3);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
+        vec![2, 3, 5, 6]
+    );
+
+    let _ = std::fs::remove_file(pst);
+    let _ = std::fs::remove_file(inf);
+}
+
+#[test]
 fn simfcs_requires_whole_frames_and_crops_real_pixels() {
     let short = tmp("short_frame.b64");
     std::fs::write(&short, [1, 2, 3]).unwrap();
@@ -670,11 +800,141 @@ fn simfcs_requires_whole_frames_and_crops_real_pixels() {
 
     let mut reader = bioformats::formats::simfcs::SimfcsReader::new();
     reader.set_id(&path).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    reader.set_series(0).unwrap();
+    assert!(matches!(
+        reader.set_series(1),
+        Err(BioFormatsError::SeriesOutOfRange(1))
+    ));
     assert_eq!(
         reader.open_bytes_region(0, 1, 1, 2, 1).unwrap(),
         vec![99, 2]
     );
+    assert!(reader.open_bytes_region(0, 255, 0, 2, 1).is_err());
+    assert!(reader.open_bytes_region(0, 0, 0, 0, 1).is_err());
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn dcimg_rejects_out_of_bounds_regions() {
+    let path = tmp("region_bounds.dcimg");
+    let mut data = vec![0u8; 64];
+    data[0..5].copy_from_slice(b"DCIMG");
+    data[16..20].copy_from_slice(&64u32.to_le_bytes());
+    data[20..24].copy_from_slice(&1u32.to_le_bytes());
+    data[32..36].copy_from_slice(&2u32.to_le_bytes());
+    data[36..40].copy_from_slice(&2u32.to_le_bytes());
+    data[40..44].copy_from_slice(&8u32.to_le_bytes());
+    data[48..52].copy_from_slice(&2u32.to_le_bytes());
+    data.extend_from_slice(&[1, 2, 3, 4]);
+    std::fs::write(&path, &data).unwrap();
+
+    let mut reader = bioformats::formats::hamamatsu::DcimgReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![2, 4]);
+    assert!(reader.open_bytes_region(0, 1, 0, 2, 1).is_err());
+    assert!(reader.open_bytes_region(0, 0, 0, 0, 1).is_err());
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn clinical_raw_readers_reject_out_of_bounds_regions() {
+    let dir = isolated_tmp_dir("clinical_regions");
+
+    let inveon_hdr = dir.join("scan.hdr");
+    let inveon_img = dir.join("scan.img");
+    std::fs::write(
+        &inveon_hdr,
+        b"x_dimension 2\ny_dimension 2\nz_dimension 1\ndata_type 1\n",
+    )
+    .unwrap();
+    std::fs::write(&inveon_img, [1, 2, 3, 4]).unwrap();
+    let mut inveon = bioformats::formats::clinical::InveonReader::new();
+    inveon.set_id(&inveon_hdr).unwrap();
+    assert_eq!(inveon.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![2, 4]);
+    assert!(inveon.open_bytes_region(0, 1, 0, 2, 1).is_err());
+    assert!(inveon.open_bytes_region(0, 0, 0, 0, 1).is_err());
+
+    let fdf = dir.join("scan.fdf");
+    let mut fdf_bytes =
+        b"#!/usr/local/fdf/startup\nint matrix[] = {2, 2};\nint bits = 8;\n\x0c".to_vec();
+    fdf_bytes.extend_from_slice(&[1, 2, 3, 4]);
+    std::fs::write(&fdf, fdf_bytes).unwrap();
+    let mut fdf_reader = bioformats::formats::clinical::FdfReader::new();
+    fdf_reader.set_id(&fdf).unwrap();
+    assert_eq!(
+        fdf_reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+        vec![4, 2]
+    );
+    assert!(fdf_reader.open_bytes_region(0, 1, 0, 2, 1).is_err());
+    assert!(fdf_reader.open_bytes_region(0, 0, 0, 0, 1).is_err());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn clinical_readers_reject_fake_default_metadata() {
+    let dir = isolated_tmp_dir("clinical_defaults");
+
+    let bad_hdr = dir.join("fake.hdr");
+    let bad_img = dir.join("fake.img");
+    std::fs::write(&bad_hdr, b"not an inveon header\n").unwrap();
+    std::fs::write(&bad_img, [1]).unwrap();
+    let mut inveon = bioformats::formats::clinical::InveonReader::new();
+    let err = inveon.set_id(&bad_hdr).unwrap_err();
+    assert!(err.to_string().contains("x_dimension"));
+
+    let short_img_hdr = dir.join("short.hdr");
+    let short_img = dir.join("short.img");
+    std::fs::write(
+        &short_img_hdr,
+        b"x_dimension 2\ny_dimension 2\nz_dimension 1\ndata_type 1\n",
+    )
+    .unwrap();
+    std::fs::write(&short_img, [1, 2, 3]).unwrap();
+    let mut inveon = bioformats::formats::clinical::InveonReader::new();
+    let err = inveon.set_id(&short_img_hdr).unwrap_err();
+    assert!(err.to_string().contains("shorter than declared"));
+
+    let random_fdf = dir.join("random.fdf");
+    std::fs::write(&random_fdf, [1]).unwrap();
+    let mut fdf = bioformats::formats::clinical::FdfReader::new();
+    let err = fdf.set_id(&random_fdf).unwrap_err();
+    assert!(err.to_string().contains("FDF"));
+
+    let missing_bits_fdf = dir.join("missing_bits.fdf");
+    std::fs::write(
+        &missing_bits_fdf,
+        b"#!/usr/local/fdf/startup\nint matrix[] = {1, 1};\n\x0c\x01",
+    )
+    .unwrap();
+    let mut fdf = bioformats::formats::clinical::FdfReader::new();
+    let err = fdf.set_id(&missing_bits_fdf).unwrap_err();
+    assert!(err.to_string().contains("bits"));
+
+    let bad_ecat = dir.join("bad.v");
+    let mut ecat = vec![0u8; 1538];
+    ecat[1024..1026].copy_from_slice(&6i16.to_be_bytes());
+    ecat[1028..1030].copy_from_slice(&1i16.to_be_bytes());
+    ecat[1030..1032].copy_from_slice(&1i16.to_be_bytes());
+    std::fs::write(&bad_ecat, ecat).unwrap();
+    let mut reader = bioformats::formats::clinical::Ecat7Reader::new();
+    let err = reader.set_id(&bad_ecat).unwrap_err();
+    assert!(err.to_string().contains("MATRIX"));
+
+    let zero_ecat = dir.join("zero.v");
+    let mut ecat = vec![0u8; 1538];
+    ecat[..6].copy_from_slice(b"MATRIX");
+    ecat[1024..1026].copy_from_slice(&6i16.to_be_bytes());
+    ecat[1028..1030].copy_from_slice(&1i16.to_be_bytes());
+    ecat[1030..1032].copy_from_slice(&1i16.to_be_bytes());
+    std::fs::write(&zero_ecat, ecat).unwrap();
+    let mut reader = bioformats::formats::clinical::Ecat7Reader::new();
+    let err = reader.set_id(&zero_ecat).unwrap_err();
+    assert!(err.to_string().contains("zero image dimensions"));
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -717,7 +977,7 @@ fn mias_placeholder_readers_reject_or_require_real_payloads() {
     let _ = std::fs::remove_file(&ser);
 
     let short_al3d = tmp("short_payload.al3d");
-    let mut al3d = vec![0u8; 24];
+    let mut al3d = vec![0u8; 512];
     al3d[..4].copy_from_slice(b"AL3D");
     al3d[8..12].copy_from_slice(&2u32.to_le_bytes());
     al3d[12..16].copy_from_slice(&2u32.to_le_bytes());
@@ -730,6 +990,36 @@ fn mias_placeholder_readers_reject_or_require_real_payloads() {
         "{err:?}"
     );
     let _ = std::fs::remove_file(&short_al3d);
+
+    let bad_al3d = tmp("bad_magic.al3d");
+    let mut al3d = vec![0u8; 512];
+    al3d[8..12].copy_from_slice(&1u32.to_le_bytes());
+    al3d[12..16].copy_from_slice(&1u32.to_le_bytes());
+    al3d[16..20].copy_from_slice(&1u32.to_le_bytes());
+    al3d.extend_from_slice(&[1]);
+    std::fs::write(&bad_al3d, al3d).unwrap();
+    let mut reader = bioformats::formats::mias::Al3dReader::new();
+    let err = reader.set_id(&bad_al3d).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("AL3D magic")),
+        "{err:?}"
+    );
+    let _ = std::fs::remove_file(&bad_al3d);
+
+    let zero_al3d = tmp("zero_dim.al3d");
+    let mut al3d = vec![0u8; 512];
+    al3d[..4].copy_from_slice(b"AL3D");
+    al3d[12..16].copy_from_slice(&1u32.to_le_bytes());
+    al3d[16..20].copy_from_slice(&1u32.to_le_bytes());
+    al3d.extend_from_slice(&[1]);
+    std::fs::write(&zero_al3d, al3d).unwrap();
+    let mut reader = bioformats::formats::mias::Al3dReader::new();
+    let err = reader.set_id(&zero_al3d).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("zero image dimensions")),
+        "{err:?}"
+    );
+    let _ = std::fs::remove_file(&zero_al3d);
 
     let path = tmp("real_payload.top");
     let mut top = vec![0u8; 128];
@@ -791,6 +1081,96 @@ fn zip_delegates_inner_image_and_has_no_placeholder_pixels() {
         matches!(err, BioFormatsError::UnsupportedFormat(_)),
         "{err:?}"
     );
+}
+
+#[test]
+fn zip_preserves_companion_file_relative_paths() {
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("zip_companion_paths");
+    let zip_path = dir.join("sample.zip");
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+
+    let header = "ics_version\t1.0\nlayout\torder\tbits x y\nlayout\tsizes\t8 2 2\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n";
+    zip.start_file("README.txt", options).unwrap();
+    zip.write_all(b"not an image").unwrap();
+    zip.start_file("sample.ics", options).unwrap();
+    zip.write_all(header.as_bytes()).unwrap();
+    zip.start_file("sample.ids", options).unwrap();
+    zip.write_all(&[1, 2, 3, 4]).unwrap();
+    zip.finish().unwrap();
+
+    let mut reader = ImageReader::open(&zip_path).unwrap();
+
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn zip_primary_entry_requires_base_name_boundary() {
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("zip_primary_boundary");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    let wrong_tiff = dir.join("wrong.tif");
+    ImageWriter::save(&wrong_tiff, &meta, &[vec![99]]).unwrap();
+    let wrong_bytes = std::fs::read(&wrong_tiff).unwrap();
+
+    let right_tiff = dir.join("right.tif");
+    ImageWriter::save(&right_tiff, &meta, &[vec![7]]).unwrap();
+    let right_bytes = std::fs::read(&right_tiff).unwrap();
+
+    let zip_path = dir.join("sample.zip");
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("sample2.tif", options).unwrap();
+    zip.write_all(&wrong_bytes).unwrap();
+    zip.start_file("sample.tif", options).unwrap();
+    zip.write_all(&right_bytes).unwrap();
+    zip.finish().unwrap();
+
+    let mut reader = ImageReader::open(&zip_path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![7]);
+}
+
+#[test]
+fn zip_skips_non_numeric_text_entries_before_images() {
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("zip_skips_text");
+    let tiff_src = dir.join("source.tif");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+    let pixels = vec![7u8, 9];
+    ImageWriter::save(&tiff_src, &meta, &[pixels.clone()]).unwrap();
+    let tiff_bytes = std::fs::read(&tiff_src).unwrap();
+
+    let zip_path = dir.join("bundle.zip");
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("notes.csv", options).unwrap();
+    zip.write_all(b"not,image,data\n").unwrap();
+    zip.start_file("frame.tif", options).unwrap();
+    zip.write_all(&tiff_bytes).unwrap();
+    zip.finish().unwrap();
+
+    let mut reader = ImageReader::open(&zip_path).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), pixels);
 }
 
 #[test]
@@ -1339,6 +1719,36 @@ fn misc4_raw_payload_readers_crop_real_pixels() {
 }
 
 #[test]
+fn text_table_readers_reject_ragged_or_nonnumeric_rows() {
+    let csv_path = tmp("ragged.csv");
+    std::fs::write(&csv_path, b"1 2 3\n4 5\n").unwrap();
+    let mut csv = bioformats::formats::misc4::TextImageReader::new();
+    let err = csv.set_id(&csv_path).unwrap_err();
+    assert!(
+        err.to_string().contains("inconsistent column counts"),
+        "unexpected CSV error: {err}"
+    );
+
+    let txt_path = tmp("ragged.txt");
+    std::fs::write(&txt_path, b"1,2\n3,4,5\n").unwrap();
+    let mut txt = bioformats::formats::misc::TextReader::new();
+    let err = txt.set_id(&txt_path).unwrap_err();
+    assert!(
+        err.to_string().contains("inconsistent column counts"),
+        "unexpected text error: {err}"
+    );
+
+    let asc_path = tmp("bad_tecan.asc");
+    std::fs::write(&asc_path, b"1\t2\n3\tbad\n").unwrap();
+    let mut asc = bioformats::formats::hcs2::TecanReader::new();
+    let err = asc.set_id(&asc_path).unwrap_err();
+    assert!(
+        err.to_string().contains("non-numeric cell"),
+        "unexpected Tecan error: {err}"
+    );
+}
+
+#[test]
 fn hamamatsu_his_reads_java_style_multiseries_and_rgb_regions() {
     let path = tmp("java_style_multi.his");
     let mut data = Vec::new();
@@ -1545,6 +1955,54 @@ fn ics1_uses_explicit_companion_filename() {
 }
 
 #[test]
+fn ics1_rejects_companion_filename_that_escapes_directory() {
+    let ics = tmp("escaped_companion.ics");
+    std::fs::write(
+        &ics,
+        "ics_version\t1.0\nfilename\t../escaped.ids\nlayout\torder\tbits x y\nlayout\tsizes\t8 1 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+    )
+    .unwrap();
+
+    let mut reader = ImageReader::open(&ics).unwrap();
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        err.to_string().contains("escapes image directory"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn ics_rejects_malformed_numeric_header_values() {
+    for (name, line) in [
+        ("bad_size", "layout\tsizes\t8 2 BAD\n"),
+        ("bad_bits", "layout\tsignificant_bits\tBAD\n"),
+        ("bad_byte_order", "representation\tbyte_order\t1 BAD\n"),
+        ("bad_version", "ics_version\tBAD\n"),
+    ] {
+        let ics = tmp(&format!("ics_{name}.ics"));
+        let header = if name == "bad_version" {
+            format!(
+                "{line}layout\torder\tbits x y\nlayout\tsizes\t8 1 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\nend\n"
+            )
+        } else {
+            format!(
+                "ics_version\t2.0\nlayout\torder\tbits x y\n{line}representation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tcompression\tuncompressed\nend\n"
+            )
+        };
+        std::fs::write(&ics, header).unwrap();
+
+        let err = match ImageReader::open(&ics) {
+            Ok(_) => panic!("{name}: malformed ICS header unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("ICS invalid numeric value"),
+            "{name}: unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
 fn ics_big_endian_pixels_are_byte_swapped() {
     let ics = tmp("big_endian_ics1.ics");
     let companion = tmp("big_endian_ics1.ids");
@@ -1559,6 +2017,149 @@ fn ics_big_endian_pixels_are_byte_swapped() {
     let mut reader = ImageReader::open(&ics).unwrap();
     assert!(!reader.metadata().is_little_endian);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![0x34, 0x12, 0xcd, 0xab]);
+}
+
+#[test]
+fn ics_non_rgb_channels_are_separate_planes() {
+    let ics = tmp("non_rgb_channels.ics");
+    let companion = tmp("non_rgb_channels.ids");
+
+    let header = format!(
+        "ics_version\t1.0\nfilename\t{}\nlayout\torder\tbits x y ch\nlayout\tsizes\t8 2 1 2\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+        companion.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::write(&ics, header).unwrap();
+    std::fs::write(&companion, [1, 2, 11, 12]).unwrap();
+
+    let mut reader = ImageReader::open(&ics).unwrap();
+    assert!(!reader.metadata().is_rgb);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![11, 12]);
+    assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(), vec![12]);
+}
+
+#[test]
+fn ics_writer_counts_channel_axis_in_layout_parameters() {
+    let path = tmp("ics_rgb_parameters.ics");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_c = 3;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+    meta.image_count = 1;
+
+    ImageWriter::save(&path, &meta, &[vec![1, 2, 3]]).unwrap();
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_string());
+
+    assert!(contents.contains("layout\tparameters\t4"));
+    assert!(contents.contains("layout\torder\tbits x y ch"));
+}
+
+#[test]
+fn nifti_extra_dimension_channels_are_separate_planes_not_samples() {
+    let path = tmp("extra_dim_channels.nii");
+    let mut bytes = vec![0u8; 352];
+    bytes[0..4].copy_from_slice(&348i32.to_le_bytes());
+    bytes[40..42].copy_from_slice(&5u16.to_le_bytes()); // ndim
+    bytes[42..44].copy_from_slice(&2u16.to_le_bytes()); // X
+    bytes[44..46].copy_from_slice(&1u16.to_le_bytes()); // Y
+    bytes[46..48].copy_from_slice(&1u16.to_le_bytes()); // Z
+    bytes[48..50].copy_from_slice(&1u16.to_le_bytes()); // T
+    bytes[50..52].copy_from_slice(&2u16.to_le_bytes()); // extra dim -> C planes
+    bytes[70..72].copy_from_slice(&2i16.to_le_bytes()); // uint8
+    bytes[72..74].copy_from_slice(&8i16.to_le_bytes());
+    bytes[108..112].copy_from_slice(&352f32.to_le_bytes());
+    bytes[344..348].copy_from_slice(b"n+1\0");
+    bytes.extend_from_slice(&[1, 2, 3, 4]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+
+    assert_eq!(reader.metadata().size_c, 2);
+    assert!(!reader.metadata().is_rgb);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 4]);
+}
+
+#[test]
+fn nifti_rejects_invalid_or_non_positive_dimensions() {
+    for (name, dims, expected) in [
+        (
+            "bad_ndim",
+            [8i16, 1, 1, 1, 1, 1, 1, 1],
+            "invalid dimension count",
+        ),
+        ("zero_x", [2i16, 0, 1, 1, 1, 1, 1, 1], "non-positive SizeX"),
+        (
+            "negative_y",
+            [2i16, 1, -1, 1, 1, 1, 1, 1],
+            "non-positive SizeY",
+        ),
+    ] {
+        let path = tmp(&format!("nifti_{name}.nii"));
+        let mut bytes = vec![0u8; 352];
+        bytes[0..4].copy_from_slice(&348i32.to_le_bytes());
+        for (i, dim) in dims.iter().enumerate() {
+            bytes[40 + i * 2..42 + i * 2].copy_from_slice(&dim.to_le_bytes());
+        }
+        bytes[70..72].copy_from_slice(&2i16.to_le_bytes());
+        bytes[72..74].copy_from_slice(&8i16.to_le_bytes());
+        bytes[108..112].copy_from_slice(&352f32.to_le_bytes());
+        bytes[344..348].copy_from_slice(b"n+1\0");
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = match ImageReader::open(&path) {
+            Ok(_) => panic!("{name}: malformed NIfTI unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(expected),
+            "{name}: unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn viff_rejects_non_positive_counts_and_short_payload() {
+    let zero_channels = tmp("zero_channels.viff");
+    let mut bytes = vec![0u8; 1024];
+    bytes[..2].copy_from_slice(&[0xab, 0x01]);
+    write_i32_be(&mut bytes, 520, 1);
+    write_i32_be(&mut bytes, 524, 1);
+    write_i32_be(&mut bytes, 556, 1);
+    write_i32_be(&mut bytes, 560, 0);
+    write_i32_be(&mut bytes, 564, 1);
+    bytes.push(7);
+    std::fs::write(&zero_channels, bytes).unwrap();
+    let err = match ImageReader::open(&zero_channels) {
+        Ok(_) => panic!("VIFF with zero channels unexpectedly opened"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("non-positive channel count"));
+    let _ = std::fs::remove_file(zero_channels);
+
+    let short = tmp("short.viff");
+    let mut bytes = vec![0u8; 1024];
+    bytes[..2].copy_from_slice(&[0xab, 0x01]);
+    write_i32_be(&mut bytes, 520, 2);
+    write_i32_be(&mut bytes, 524, 2);
+    write_i32_be(&mut bytes, 556, 1);
+    write_i32_be(&mut bytes, 560, 1);
+    write_i32_be(&mut bytes, 564, 1);
+    bytes.extend_from_slice(&[1, 2, 3]);
+    std::fs::write(&short, bytes).unwrap();
+    let err = match ImageReader::open(&short) {
+        Ok(_) => panic!("short VIFF unexpectedly opened"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("shorter than declared"));
+    let _ = std::fs::remove_file(short);
 }
 
 // ---- MRC -------------------------------------------------------------------
@@ -2011,6 +2612,67 @@ fn metaimage_mhd_round_trip() {
     assert_eq!(rb, data);
 }
 
+#[test]
+fn metaimage_rejects_malformed_dimensions() {
+    for (name, header) in [
+        (
+            "bad_ndims",
+            "ObjectType = Image\nNDims = bad\nDimSize = 1 1 1\nElementType = MET_UCHAR\nElementDataFile = LOCAL\n",
+        ),
+        (
+            "bad_dimsize",
+            "ObjectType = Image\nNDims = 3\nDimSize = 1 nope 1\nElementType = MET_UCHAR\nElementDataFile = LOCAL\n",
+        ),
+        (
+            "short_dimsize",
+            "ObjectType = Image\nNDims = 3\nDimSize = 1 1\nElementType = MET_UCHAR\nElementDataFile = LOCAL\n",
+        ),
+        (
+            "zero_dimsize",
+            "ObjectType = Image\nNDims = 3\nDimSize = 1 0 1\nElementType = MET_UCHAR\nElementDataFile = LOCAL\n",
+        ),
+    ] {
+        let path = tmp(&format!("metaimage_{name}.mha"));
+        std::fs::write(&path, header).unwrap();
+
+        let err = match ImageReader::open(&path) {
+            Ok(_) => panic!("{name}: malformed MetaImage header unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("MetaImage:"),
+            "{name}: unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn metaimage_rejects_detached_data_file_that_escapes_directory() {
+    for (name, data_file) in [
+        ("relative_escape", "../outside.raw".to_string()),
+        (
+            "absolute_escape",
+            std::env::temp_dir()
+                .join("outside.raw")
+                .display()
+                .to_string(),
+        ),
+    ] {
+        let path = tmp(&format!("metaimage_{name}.mhd"));
+        let header = format!(
+            "ObjectType = Image\nNDims = 2\nDimSize = 1 1\nElementType = MET_UCHAR\nElementDataFile = {data_file}\n"
+        );
+        std::fs::write(&path, header).unwrap();
+
+        let mut reader = ImageReader::open(&path).unwrap();
+        let err = reader.open_bytes(0).unwrap_err();
+        assert!(
+            err.to_string().contains("ElementDataFile escapes"),
+            "{name}: unexpected error: {err}"
+        );
+    }
+}
+
 // ---- OME-XML ---------------------------------------------------------------
 
 #[test]
@@ -2038,6 +2700,13 @@ fn ome_xml_uses_bindata_big_endian_when_pixels_omits_it() {
 }
 
 #[test]
+fn ome_xml_name_detection_accepts_ome_xml_suffix() {
+    let path = tmp("suffix.ome.xml");
+    let reader = bioformats::formats::ome::OmeXmlReader::new();
+    assert!(reader.is_this_type_by_name(&path));
+}
+
+#[test]
 fn ome_xml_slices_multichannel_bindata_with_samples_per_pixel() {
     let path = tmp("rgb_bindata.ome");
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -2051,6 +2720,39 @@ fn ome_xml_slices_multichannel_bindata_with_samples_per_pixel() {
     assert_eq!(reader.metadata().image_count, 2);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3]);
     assert_eq!(reader.open_bytes(1).unwrap(), vec![4, 5, 6]);
+}
+
+#[test]
+fn ome_xml_rejects_multiple_logical_rgb_channels() {
+    let path = tmp("multi_logical_rgb.ome");
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="1" SizeY="1" SizeZ="1" SizeC="6" SizeT="1"><Channel ID="Channel:0:0" SamplesPerPixel="3"/><Channel ID="Channel:0:1" SamplesPerPixel="3"/></Pixels></Image></OME>"#;
+    std::fs::write(&path, xml).unwrap();
+
+    let err = match ImageReader::open(&path) {
+        Ok(_) => panic!("multi-logical-channel RGB OME-XML unexpectedly opened"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("multiple logical RGB channels")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn ome_xml_attribute_matching_does_not_confuse_physical_size_with_size() {
+    let path = tmp("physical_size_before_size.ome");
+    std::fs::write(
+        &path,
+        r#"<OME><Image><Pixels PhysicalSizeX="0.25" PhysicalSizeY="0.5" SizeX="512" SizeY="128" SizeZ="1" SizeC="1" SizeT="1" Type="uint8" DimensionOrder="XYZCT"/></Image></OME>"#,
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::ome::OmeXmlReader::new();
+    reader.set_id(&path).unwrap();
+
+    assert_eq!(reader.metadata().size_x, 512);
+    assert_eq!(reader.metadata().size_y, 128);
 }
 
 #[test]
@@ -2176,6 +2878,54 @@ fn dicom_skips_undefined_length_explicit_sequence_before_image_tags() {
     assert_eq!(reader.metadata().size_x, 2);
     assert_eq!(reader.metadata().size_y, 2);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn dicom_rejects_invalid_or_zero_number_of_frames() {
+    for (name, value) in [("invalid", b"abc".as_slice()), ("zero", b"0".as_slice())] {
+        let path = tmp(&format!("dicom_bad_number_of_frames_{name}.dcm"));
+        let mut bytes = Vec::new();
+
+        dicom_elem_explicit(&mut bytes, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+        dicom_elem_explicit(&mut bytes, 0x0028, 0x0008, b"IS", value);
+        dicom_elem_explicit(&mut bytes, 0x0028, 0x0010, b"US", &2u16.to_le_bytes());
+        dicom_elem_explicit(&mut bytes, 0x0028, 0x0011, b"US", &2u16.to_le_bytes());
+        dicom_elem_explicit(&mut bytes, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+        dicom_elem_explicit(&mut bytes, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+        dicom_elem_explicit(&mut bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+        dicom_elem_explicit(&mut bytes, 0x7FE0, 0x0010, b"OB", &[1, 2, 3, 4]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = match ImageReader::open(&path) {
+            Ok(_) => panic!("{name}: malformed NumberOfFrames unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("NumberOfFrames"),
+            "{name}: unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn dicom_accepts_valid_number_of_frames() {
+    let path = tmp("dicom_two_number_of_frames.dcm");
+    let mut bytes = Vec::new();
+
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0008, b"IS", b"2");
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0010, b"US", &2u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0011, b"US", &2u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x7FE0, 0x0010, b"OB", &[1, 2, 3, 4, 5, 6, 7, 8]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.metadata().size_z, 2);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
 }
 
 #[test]
@@ -2313,6 +3063,11 @@ fn bdv_preserves_companion_xml_original_metadata() {
         metadata.get("bdv_xml"),
         Some(MetadataValue::String(value)) if value.contains("<SpimData>")
     ));
+    let err = reader.open_bytes_region(0, 2, 0, 2, 1).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::Format(ref message) if message.contains("outside image bounds")),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -2398,6 +3153,44 @@ fn imaris_rejects_short_dataset_instead_of_zero_filling_plane() {
 }
 
 #[test]
+fn imaris_rejects_out_of_bounds_region() {
+    let path = tmp("region_bounds_ims.ims");
+    let _ = std::fs::remove_file(&path);
+
+    let mut file = hdf5_pure::FileBuilder::new();
+    let mut info = file.create_group("DataSetInfo");
+    let mut image = info.create_group("Image");
+    image.set_attr("X", hdf5_pure::AttrValue::String("3".to_string()));
+    image.set_attr("Y", hdf5_pure::AttrValue::String("2".to_string()));
+    image.set_attr("Z", hdf5_pure::AttrValue::String("1".to_string()));
+    info.add_group(image.finish());
+    file.add_group(info.finish());
+
+    let mut dataset = file.create_group("DataSet");
+    let mut res = dataset.create_group("ResolutionLevel 0");
+    let mut time = res.create_group("TimePoint 0");
+    let mut channel = time.create_group("Channel 0");
+    channel
+        .create_dataset("Data")
+        .with_u8_data(&[1u8, 2, 3, 4, 5, 6])
+        .with_shape(&[1, 2, 3]);
+    time.add_group(channel.finish());
+    res.add_group(time.finish());
+    dataset.add_group(res.finish());
+    file.add_group(dataset.finish());
+    file.write(&path).unwrap();
+
+    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    reader.set_id(&path).unwrap();
+    let err = reader.open_bytes_region(0, 2, 0, 2, 1).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::Format(ref message) if message.contains("outside image bounds")),
+        "{err:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn cellh5_preserves_hdf5_attributes_and_dataset_metadata() {
     let path = tmp("metadata_parity_cellh5.ch5");
     let _ = std::fs::remove_file(&path);
@@ -2463,6 +3256,72 @@ fn cellh5_preserves_hdf5_attributes_and_dataset_metadata() {
         Some(MetadataValue::String(value))
             if value == "shape=[1, 2, 1, 2, 3]; dtype_size=2"
     ));
+}
+
+#[test]
+fn cellh5_rejects_zero_dataset_axes() {
+    let path = tmp("zero_axis_cellh5.ch5");
+    let _ = std::fs::remove_file(&path);
+
+    let mut file = hdf5_pure::FileBuilder::new();
+    let mut sample = file.create_group("sample");
+    let mut zero = sample.create_group("0");
+    let mut plate = zero.create_group("plate");
+    let mut plate0 = plate.create_group("Plate0");
+    let mut experiment = plate0.create_group("experiment");
+    let mut well = experiment.create_group("A01");
+    let mut positions = well.create_group("position");
+    let mut site = positions.create_group("1");
+    let mut image = site.create_group("image");
+    image
+        .create_dataset("channel")
+        .with_u16_data(&[])
+        .with_shape(&[1, 1, 0, 1, 1]);
+    site.add_group(image.finish());
+    positions.add_group(site.finish());
+    well.add_group(positions.finish());
+    experiment.add_group(well.finish());
+    plate0.add_group(experiment.finish());
+    plate.add_group(plate0.finish());
+    zero.add_group(plate.finish());
+    sample.add_group(zero.finish());
+    file.add_group(sample.finish());
+    file.write(&path).unwrap();
+
+    let mut reader = bioformats::formats::cellh5::CellH5Reader::new();
+    let err = reader.set_id(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid Z dimension 0"),
+        "unexpected CellH5 error: {err}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn spe_rejects_zero_dimensions_and_short_payload() {
+    let zero = tmp("zero.spe");
+    let mut bytes = vec![0u8; 4100];
+    bytes[108..110].copy_from_slice(&3i16.to_le_bytes());
+    bytes[656..658].copy_from_slice(&1u16.to_le_bytes());
+    bytes[1446..1450].copy_from_slice(&1i32.to_le_bytes());
+    std::fs::write(&zero, bytes).unwrap();
+    let mut reader = bioformats::formats::spe::SpeReader::new();
+    let err = reader.set_id(&zero).unwrap_err();
+    assert!(err.to_string().contains("non-positive width"));
+    let _ = std::fs::remove_file(&zero);
+
+    let short = tmp("short.spe");
+    let mut bytes = vec![0u8; 4100];
+    bytes[42..44].copy_from_slice(&2u16.to_le_bytes());
+    bytes[656..658].copy_from_slice(&2u16.to_le_bytes());
+    bytes[108..110].copy_from_slice(&3i16.to_le_bytes());
+    bytes[1446..1450].copy_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&[1, 2]);
+    std::fs::write(&short, bytes).unwrap();
+    let mut reader = bioformats::formats::spe::SpeReader::new();
+    let err = reader.set_id(&short).unwrap_err();
+    assert!(err.to_string().contains("shorter than declared"));
+    let _ = std::fs::remove_file(&short);
 }
 
 #[test]
@@ -2975,7 +3834,7 @@ fn zvi_preserves_tag_stream_ids_names_and_values() {
         item.extend_from_slice(&0i32.to_le_bytes()); // tidx
         item.extend_from_slice(&[0u8; 4]); // skip
         item.extend_from_slice(&0i32.to_le_bytes()); // tileIndex
-        // skipBytes(len - 8) == pad
+                                                     // skipBytes(len - 8) == pad
         item.extend_from_slice(&vec![0u8; pad as usize]);
         // 5 more VT_EMPTY tags.
         item.extend_from_slice(&[0u8; 10]);
@@ -2984,7 +3843,7 @@ fn zvi_preserves_tag_stream_ids_names_and_values() {
         // sizeX, sizeY
         item.extend_from_slice(&1i32.to_le_bytes()); // sizeX
         item.extend_from_slice(&1i32.to_le_bytes()); // sizeY
-        // skipBytes(4)
+                                                     // skipBytes(4)
         item.extend_from_slice(&[0u8; 4]);
         // bpp (1 => UINT8, grayscale)
         item.extend_from_slice(&1i32.to_le_bytes());
@@ -3142,6 +4001,70 @@ fn animated_png_is_rejected_instead_of_first_frame_flattened() {
     };
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("animated PNG"))
+    );
+}
+
+#[test]
+fn amira_ascii_rejects_malformed_or_short_planes() {
+    let malformed = tmp("malformed_ascii.am");
+    std::fs::write(
+        &malformed,
+        b"# AmiraMesh 3D ASCII 2.0\ndefine Lattice 2 1 1\nLattice { byte Data } @1\n@1\n1 bad\n",
+    )
+    .unwrap();
+    let mut reader = bioformats::formats::amira::AmiraReader::new();
+    reader.set_id(&malformed).unwrap();
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        err.to_string().contains("non-integer sample"),
+        "unexpected malformed Amira error: {err}"
+    );
+
+    let short = tmp("short_ascii.am");
+    std::fs::write(
+        &short,
+        b"# AmiraMesh 3D ASCII 2.0\ndefine Lattice 2 1 1\nLattice { byte Data } @1\n@1\n1\n",
+    )
+    .unwrap();
+    let mut reader = bioformats::formats::amira::AmiraReader::new();
+    reader.set_id(&short).unwrap();
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        err.to_string().contains("has 1 samples, expected 2"),
+        "unexpected short Amira error: {err}"
+    );
+}
+
+#[test]
+fn amira_rejects_invalid_lattice_dimensions() {
+    let path = tmp("bad_lattice.am");
+    std::fs::write(
+        &path,
+        b"# AmiraMesh 3D ASCII 2.0\ndefine Lattice nope 1 1\nLattice { byte Data } @1\n@1\n1\n",
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::amira::AmiraReader::new();
+    let err = reader.set_id(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid lattice width"),
+        "unexpected Amira lattice error: {err}"
+    );
+}
+
+#[test]
+fn mng_is_explicit_unsupported_instead_of_delegating_to_png() {
+    let path = tmp("unsupported.mng");
+    std::fs::write(&path, b"\x8aMNG\r\n\x1a\n").unwrap();
+
+    let err = match ImageReader::open(&path) {
+        Ok(_) => panic!("MNG should be explicitly unsupported"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(&err, BioFormatsError::UnsupportedFormat(message) if message.contains("MNG container parsing")),
+        "unexpected error: {err}"
     );
 }
 

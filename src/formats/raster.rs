@@ -164,7 +164,9 @@ impl FormatReader for GenericReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, idx: u32) -> Result<Vec<u8>> {
@@ -245,7 +247,9 @@ fn load_gif_frames(path: &Path) -> Result<(ImageMetadata, Vec<Vec<u8>>)> {
     }
 
     if frames.is_empty() {
-        return Err(BioFormatsError::InvalidData("GIF contains no frames".into()));
+        return Err(BioFormatsError::InvalidData(
+            "GIF contains no frames".into(),
+        ));
     }
 
     let image_count = frames.len() as u32;
@@ -312,7 +316,9 @@ impl FormatReader for GifReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, idx: u32) -> Result<Vec<u8>> {
@@ -393,6 +399,7 @@ pub fn farbfeld_reader() -> impl FormatReader {
 pub struct TgaWriter {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    wrote: bool,
 }
 
 impl TgaWriter {
@@ -400,6 +407,7 @@ impl TgaWriter {
         TgaWriter {
             path: None,
             meta: None,
+            wrote: false,
         }
     }
 }
@@ -418,7 +426,31 @@ impl FormatWriter for TgaWriter {
             .unwrap_or(false)
     }
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        let logical_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+        let required_planes = meta
+            .size_z
+            .max(1)
+            .checked_mul(logical_c)
+            .and_then(|v| v.checked_mul(meta.size_t.max(1)))
+            .ok_or_else(|| BioFormatsError::Format("TGA writer plane count overflow".into()))?;
+        if required_planes > 1 || meta.image_count > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "TGA writer supports only one plane".into(),
+            ));
+        }
+        if meta.pixel_type != PixelType::Uint8 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "TGA writer only supports Uint8 data".into(),
+            ));
+        }
+        if meta.size_c != 1 && !(meta.is_rgb && matches!(meta.size_c, 3 | 4)) {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TGA writer supports grayscale or RGB/RGBA Uint8 data, got {} channels",
+                meta.size_c
+            )));
+        }
         self.meta = Some(meta.clone());
+        self.wrote = false;
         Ok(())
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -431,14 +463,31 @@ impl FormatWriter for TgaWriter {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.wrote = false;
         Ok(())
     }
     fn save_bytes(&mut self, idx: u32, data: &[u8]) -> Result<()> {
         if idx != 0 {
             return Err(BioFormatsError::Format("TGA: single plane only".into()));
         }
+        if self.wrote {
+            return Err(BioFormatsError::Format(
+                "TGA writer supports only one plane".into(),
+            ));
+        }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let expected = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(meta.size_c as usize))
+            .ok_or_else(|| BioFormatsError::Format("TGA writer image plane is too large".into()))?;
+        if data.len() != expected {
+            return Err(BioFormatsError::InvalidData(format!(
+                "TGA writer: plane 0 has {} bytes, expected {}",
+                data.len(),
+                expected
+            )));
+        }
         let (w, h) = (meta.size_x, meta.size_y);
         let spp = meta.size_c as usize;
         let img: image::DynamicImage = match spp {
@@ -459,7 +508,9 @@ impl FormatWriter for TgaWriter {
             }
         };
         img.save(path)
-            .map_err(|e| BioFormatsError::Format(e.to_string()))
+            .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+        self.wrote = true;
+        Ok(())
     }
     fn can_do_stacks(&self) -> bool {
         false

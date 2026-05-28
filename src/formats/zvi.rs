@@ -17,6 +17,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 pub struct ZviReader {
     path: Option<PathBuf>,
@@ -238,16 +239,24 @@ fn skip_next_tag(s: &mut Cursor) {
         None => return,
     };
     match ty {
-        0 | 1 => {}                 // VT_EMPTY / VT_NULL
-        2 | 11 => { s.skip(2); }    // VT_I2 / VT_BOOL (readShort)
-        3 | 22 | 19 | 23 | 4 => { s.skip(4); } // VT_I4/INT/UI4/UINT/R4
-        5 | 7 | 20 | 21 => { s.skip(8); } // VT_R8/DATE/I8/UI8
+        0 | 1 => {} // VT_EMPTY / VT_NULL
+        2 | 11 => {
+            s.skip(2);
+        } // VT_I2 / VT_BOOL (readShort)
+        3 | 22 | 19 | 23 | 4 => {
+            s.skip(4);
+        } // VT_I4/INT/UI4/UINT/R4
+        5 | 7 | 20 | 21 => {
+            s.skip(8);
+        } // VT_R8/DATE/I8/UI8
         8 | 69 => {
             // VT_BSTR / VT_STORED_OBJECT: int length then string
             let len = s.read_i32().unwrap_or(0).max(0) as usize;
             s.read_string(len);
         }
-        9 | 13 => { s.skip(16); } // VT_DISPATCH / VT_UNKNOWN
+        9 | 13 => {
+            s.skip(16);
+        } // VT_DISPATCH / VT_UNKNOWN
         63 | 65 => {
             // VT_BLOB: int length then skip
             let len = s.read_i32().unwrap_or(0).max(0) as usize;
@@ -627,7 +636,9 @@ impl FormatReader for ZviReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn resolution_count(&self) -> usize {
@@ -696,12 +707,14 @@ impl FormatReader for ZviReader {
 
         // Trim to a single plane's worth of bytes (Java reads exactly
         // sizeX * sizeY * pixel bytes via readPlane).
-        let plane_bytes =
-            meta.size_x as usize * meta.size_y as usize * self.bytes_per_pixel;
+        let plane_bytes = meta.size_x as usize * meta.size_y as usize * self.bytes_per_pixel;
         if pixels.len() > plane_bytes {
             pixels.truncate(plane_bytes);
         } else if pixels.len() < plane_bytes {
-            pixels.resize(plane_bytes, 0);
+            return Err(BioFormatsError::InvalidData(format!(
+                "ZVI plane decoded to {} bytes, expected {plane_bytes}",
+                pixels.len()
+            )));
         }
 
         // BGR storage: reverse channel bytes in groups for RGB images (but not
@@ -732,25 +745,25 @@ impl FormatReader for ZviReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bpp = self.bytes_per_pixel;
-        let row_bytes = meta.size_x as usize * bpp;
-        let out_row = w as usize * bpp;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src_start = (y as usize + r) * row_bytes + x as usize * bpp;
-            out.extend_from_slice(&full[src_start..src_start + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let bps = meta.pixel_type.bytes_per_sample();
+        let samples_per_pixel = self
+            .bytes_per_pixel
+            .checked_div(bps)
+            .filter(|samples| {
+                *samples > 0 && samples.checked_mul(bps) == Some(self.bytes_per_pixel)
+            })
+            .ok_or_else(|| BioFormatsError::Format("ZVI pixel size is inconsistent".into()))?;
+        crop_full_plane("ZVI", &full, meta, samples_per_pixel, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(0, tx, ty, tw, th)
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -789,7 +802,7 @@ mod tests {
         item.extend_from_slice(&[0u8; 4]); // skip(4)
         item.extend_from_slice(&tile.to_le_bytes());
         item.extend_from_slice(&vec![0u8; pad as usize]); // skip(len - 8)
-        // 5 more VT_EMPTY tags.
+                                                          // 5 more VT_EMPTY tags.
         item.extend_from_slice(&[0u8; 10]);
         // skip(4)
         item.extend_from_slice(&[0u8; 4]);
@@ -838,6 +851,7 @@ mod tests {
         // Series 1 -> tile 1.
         reader.set_series(1).unwrap();
         assert_eq!(reader.open_bytes(0).unwrap(), vec![22]);
+        assert!(reader.open_bytes_region(0, 1, 0, 1, 1).is_err());
 
         assert!(reader.set_series(2).is_err());
 
@@ -860,6 +874,31 @@ mod tests {
         reader.set_id(&path).unwrap();
         assert_eq!(reader.series_count(), 1);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![99]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zvi_rejects_short_decoded_plane_instead_of_padding() {
+        let path = temp_path("short_plane");
+        let mut item = build_item(0, 0, 0, 0, 99);
+        item.truncate(item.len() - 4);
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            comp.create_storage_all("/Image/Item(1)").unwrap();
+            comp.create_stream("/Image/Item(1)/CONTENTS")
+                .unwrap()
+                .write_all(&item)
+                .unwrap();
+        }
+
+        let mut reader = ZviReader::new();
+        reader.set_id(&path).unwrap();
+        let err = reader.open_bytes(0).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("decoded to 0 bytes")),
+            "{err:?}"
+        );
 
         let _ = std::fs::remove_file(path);
     }

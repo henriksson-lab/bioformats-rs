@@ -12,35 +12,23 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 // ── DM image data types ───────────────────────────────────────────────────────
-fn dm_pixel_type(dm_type: i32) -> PixelType {
+fn dm_pixel_type_and_bytes(dm_type: i32) -> Result<(PixelType, usize)> {
     match dm_type {
-        1 => PixelType::Int16,
-        2 => PixelType::Float32,
-        6 => PixelType::Uint8,
-        7 => PixelType::Int32,
-        9 => PixelType::Int8,
-        10 => PixelType::Uint16,
-        11 => PixelType::Uint32,
-        12 => PixelType::Float64,
-        23 => PixelType::Uint8,
-        _ => PixelType::Uint16, // fallback
-    }
-}
-
-fn dm_bytes_per_pixel(dm_type: i32) -> usize {
-    match dm_type {
-        1 => 2,  // int16
-        2 => 4,  // float32
-        6 => 1,  // uint8
-        7 => 4,  // int32
-        9 => 1,  // int8
-        10 => 2, // uint16
-        11 => 4, // uint32
-        12 => 8, // float64
-        23 => 1, // uint8
-        _ => 2,
+        1 => Ok((PixelType::Int16, 2)),
+        2 => Ok((PixelType::Float32, 4)),
+        6 => Ok((PixelType::Uint8, 1)),
+        7 => Ok((PixelType::Int32, 4)),
+        9 => Ok((PixelType::Int8, 1)),
+        10 => Ok((PixelType::Uint16, 2)),
+        11 => Ok((PixelType::Uint32, 4)),
+        12 => Ok((PixelType::Float64, 8)),
+        23 => Ok((PixelType::Uint8, 1)),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "Gatan DM unsupported data type {other}"
+        ))),
     }
 }
 
@@ -306,12 +294,10 @@ impl<R: Read + Seek> DmReader<R> {
                     u64::from_be_bytes(b)
                 }))
             }
-            _ => {
-                // Unknown scalar: skip 4 bytes and return placeholder
-                let mut b = [0u8; 4];
-                let _ = self.r.read_exact(&mut b);
-                Ok(DmValue::Int(0))
-            }
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported DM scalar type {other}"),
+            )),
         }
     }
 
@@ -606,13 +592,24 @@ impl FormatReader for GatanReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        if header.len() < 4 {
+        if header.len() < 16 {
             return false;
         }
         // DM3: first 4 bytes big-endian = 3
         // DM4: first 4 bytes big-endian = 4
         let v = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-        v == 3 || v == 4
+        match v {
+            3 => {
+                let byte_order = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+                byte_order <= 1
+            }
+            4 => {
+                let byte_order =
+                    u32::from_be_bytes([header[12], header[13], header[14], header[15]]);
+                byte_order <= 1
+            }
+            _ => false,
+        }
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -665,7 +662,7 @@ impl FormatReader for GatanReader {
             BioFormatsError::Format("DM3/DM4: could not find image data in tag tree".into())
         })?;
 
-        let pixel_type = dm_pixel_type(img.dm_data_type);
+        let (pixel_type, bytes_per_pixel) = dm_pixel_type_and_bytes(img.dm_data_type)?;
         let image_count = img.depth.max(1);
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
@@ -685,7 +682,7 @@ impl FormatReader for GatanReader {
             size_c: 1,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: (dm_bytes_per_pixel(img.dm_data_type) * 8) as u8,
+            bits_per_pixel: (bytes_per_pixel * 8) as u8,
             image_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
@@ -733,7 +730,9 @@ impl FormatReader for GatanReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -766,17 +765,8 @@ impl FormatReader for GatanReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Gatan", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -880,7 +870,10 @@ impl<'a> Be<'a> {
     /// Read `len` bytes as an ISO-8859-1 string.
     fn read_string(&mut self, len: usize) -> String {
         let end = (self.pos + len).min(self.data.len());
-        let s: String = self.data[self.pos..end].iter().map(|&b| b as char).collect();
+        let s: String = self.data[self.pos..end]
+            .iter()
+            .map(|&b| b as char)
+            .collect();
         self.pos = end;
         s
     }
@@ -1085,12 +1078,7 @@ fn parse_dm2_extra_tags(s: &mut Be<'_>, meta: &mut HashMap<String, MetadataValue
             if p + 4 > s.len() {
                 break;
             }
-            let v = f32::from_be_bytes([
-                s.data[p],
-                s.data[p + 1],
-                s.data[p + 2],
-                s.data[p + 3],
-            ]);
+            let v = f32::from_be_bytes([s.data[p], s.data[p + 1], s.data[p + 2], s.data[p + 3]]);
             s.skip(4);
             v.to_string()
         } else if length == 2 {
@@ -1177,10 +1165,17 @@ impl FormatReader for Dm2Reader {
 
         // readInt() magic (4) + skipBytes(8) -> offset 12: footerOffset int + 16.
         // Then sizeX short(16), sizeY short(18), bpp short(20), signed short(22).
-        let width = i16::from_be_bytes([bytes[12], bytes[13]]).max(1) as u32;
-        let height = i16::from_be_bytes([bytes[14], bytes[15]]).max(1) as u32;
-        let bpp = i16::from_be_bytes([bytes[16], bytes[17]]) as i32;
-        let signed = i16::from_be_bytes([bytes[18], bytes[19]]) == 1;
+        let width_i = i16::from_be_bytes([bytes[16], bytes[17]]);
+        let height_i = i16::from_be_bytes([bytes[18], bytes[19]]);
+        if width_i <= 0 || height_i <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "DM2 header has non-positive image dimensions".into(),
+            ));
+        }
+        let width = width_i as u32;
+        let height = height_i as u32;
+        let bpp = i16::from_be_bytes([bytes[20], bytes[21]]) as i32;
+        let signed = i16::from_be_bytes([bytes[22], bytes[23]]) == 1;
 
         let pixel_type = dm2_pixel_type_from_bytes(bpp, signed)?;
         let bps = pixel_type.bytes_per_sample();
@@ -1189,7 +1184,19 @@ impl FormatReader for Dm2Reader {
 
         // Tag/metadata scan, starting after the pixel plane plus the 35-byte gap
         // that GatanDM2Reader skips (skipBytes(planeSize + 35)).
-        let plane_size = width as usize * height as usize * bps;
+        let plane_size = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::Format("DM2 plane size overflows".into()))?;
+        let required_len = (DM2_HEADER_SIZE as usize)
+            .checked_add(plane_size)
+            .ok_or_else(|| BioFormatsError::Format("DM2 file size overflows".into()))?;
+        if bytes.len() < required_len {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "DM2 pixel payload is shorter than declared ({} < {required_len})",
+                bytes.len()
+            )));
+        }
         let scan_start = DM2_HEADER_SIZE as usize + plane_size + 35;
         let (name, date, time) = parse_dm2_metadata(&bytes, scan_start, &mut meta_map);
         if let Some(n) = name {
@@ -1253,7 +1260,9 @@ impl FormatReader for Dm2Reader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1283,17 +1292,8 @@ impl FormatReader for Dm2Reader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("DM2", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

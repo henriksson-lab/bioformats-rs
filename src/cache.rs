@@ -1,14 +1,14 @@
 //! Plane cache framework — caches decoded pixel data in memory.
 //!
 //! Equivalent to Java Bio-Formats' `loci.formats.cache` package.
-//! Provides configurable caching strategies for multi-dimensional image data,
-//! reducing redundant decompression of frequently-accessed planes.
+//! Provides configurable cache capacities for decoded planes, reducing
+//! redundant decompression of frequently-accessed planes.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::common::error::Result;
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{ImageMetadata, MetadataOptions};
 use crate::common::ome_metadata::OmeMetadata;
 use crate::common::reader::FormatReader;
 
@@ -17,10 +17,15 @@ use crate::common::reader::FormatReader;
 pub enum CacheStrategy {
     /// Keep the N most recently accessed planes (LRU eviction).
     Lru(usize),
-    /// Keep planes in a rectangular neighbourhood around the current position.
-    /// The parameter is the radius in each dimension.
+    /// Use an LRU cache sized for a rectangular neighbourhood radius.
+    ///
+    /// This is a capacity preset only; it does not prefetch neighbouring
+    /// planes.
     Rectangle(usize),
-    /// Keep planes along the current Z, C, T axes (crosshair pattern).
+    /// Use an LRU cache sized for a crosshair-style working set.
+    ///
+    /// This is a capacity preset only; it does not prefetch planes along the
+    /// Z/C/T axes.
     Crosshair,
     /// No caching — always read from the inner reader.
     None,
@@ -49,7 +54,12 @@ impl CachedReader {
     pub fn new(inner: Box<dyn FormatReader>, strategy: CacheStrategy) -> Self {
         let max_planes = match strategy {
             CacheStrategy::Lru(n) => n,
-            CacheStrategy::Rectangle(r) => (2 * r + 1).pow(3), // cube neighbourhood
+            CacheStrategy::Rectangle(r) => r
+                .checked_mul(2)
+                .and_then(|diameter| diameter.checked_add(1))
+                .and_then(|diameter| diameter.checked_mul(diameter))
+                .and_then(|area| area.checked_mul(r.saturating_mul(2).saturating_add(1)))
+                .unwrap_or(usize::MAX),
             CacheStrategy::Crosshair => 256,
             CacheStrategy::None => 0,
         };
@@ -177,7 +187,73 @@ impl FormatReader for CachedReader {
     fn resolution(&self) -> usize {
         self.inner.resolution()
     }
+    fn set_metadata_options(&mut self, options: MetadataOptions) {
+        self.inner.set_metadata_options(options);
+    }
     fn ome_metadata(&self) -> Option<OmeMetadata> {
         self.inner.ome_metadata()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::error::BioFormatsError;
+    use crate::common::metadata::ImageMetadata;
+    use std::path::Path;
+
+    struct EmptyReader;
+
+    impl FormatReader for EmptyReader {
+        fn is_this_type_by_name(&self, _path: &Path) -> bool {
+            false
+        }
+        fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+            false
+        }
+        fn set_id(&mut self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn series_count(&self) -> usize {
+            1
+        }
+        fn set_series(&mut self, _s: usize) -> Result<()> {
+            Ok(())
+        }
+        fn series(&self) -> usize {
+            0
+        }
+        fn metadata(&self) -> &ImageMetadata {
+            crate::common::reader::uninitialized_metadata()
+        }
+        fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+            Err(BioFormatsError::NotInitialized)
+        }
+        fn open_bytes_region(
+            &mut self,
+            _plane_index: u32,
+            _x: u32,
+            _y: u32,
+            _w: u32,
+            _h: u32,
+        ) -> Result<Vec<u8>> {
+            Err(BioFormatsError::NotInitialized)
+        }
+        fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+            Err(BioFormatsError::NotInitialized)
+        }
+    }
+
+    #[test]
+    fn rectangle_cache_capacity_saturates_instead_of_overflowing() {
+        let reader = CachedReader::new(
+            Box::new(EmptyReader),
+            CacheStrategy::Rectangle(usize::MAX / 2),
+        );
+
+        assert_eq!(reader.max_planes, usize::MAX);
     }
 }

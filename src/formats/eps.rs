@@ -30,10 +30,7 @@ impl EpsReader {
 
     /// Attempt to read the embedded TIFF preview of a DOS EPS file. Returns
     /// `Ok(None)` if no valid TIFF preview is present.
-    fn try_tiff_preview(
-        &self,
-        data: &[u8],
-    ) -> Result<Option<(ImageMetadata, Vec<u8>)>> {
+    fn try_tiff_preview(&self, data: &[u8]) -> Result<Option<(ImageMetadata, Vec<u8>)>> {
         // DOS EPS magic: C5 D0 D3 C6. The header (little-endian) stores the
         // TIFF preview offset at byte 20 and length at byte 24.
         if data.len() < 30 {
@@ -358,7 +355,9 @@ impl FormatReader for EpsReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -379,7 +378,9 @@ impl FormatReader for EpsReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        if x > meta.size_x || y > meta.size_y || x + w > meta.size_x || y + h > meta.size_y {
+        if x.checked_add(w).is_none_or(|end| end > meta.size_x)
+            || y.checked_add(h).is_none_or(|end| end > meta.size_y)
+        {
             return Err(BioFormatsError::InvalidData(
                 "EPS requested region is outside image bounds".into(),
             ));
@@ -445,6 +446,29 @@ impl FormatWriter for EpsWriter {
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        let logical_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+        let required_planes = meta
+            .size_z
+            .max(1)
+            .checked_mul(logical_c)
+            .and_then(|v| v.checked_mul(meta.size_t.max(1)))
+            .ok_or_else(|| BioFormatsError::Format("EPS writer plane count overflow".into()))?;
+        if required_planes > 1 || meta.image_count > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "EPS writer supports only one plane".into(),
+            ));
+        }
+        if meta.pixel_type != PixelType::Uint8 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "EPS writer supports only 8-bit pixel data".into(),
+            ));
+        }
+        if meta.size_c != 1 && !(meta.is_rgb && meta.size_c == 3) {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "EPS writer supports grayscale (1) or RGB (3), got spp={}",
+                meta.size_c
+            )));
+        }
         self.meta = Some(meta.clone());
         self.planes.clear();
         Ok(())
@@ -540,7 +564,28 @@ impl FormatWriter for EpsWriter {
         Ok(())
     }
 
-    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if !self.planes.is_empty() {
+            return Err(BioFormatsError::Format(
+                "EPS writer supports only one plane".into(),
+            ));
+        }
+        let expected = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(meta.size_c as usize))
+            .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
+            .ok_or_else(|| BioFormatsError::Format("EPS image plane is too large".into()))?;
+        if data.len() != expected {
+            return Err(BioFormatsError::Format(format!(
+                "EPS writer: plane 0 has {} bytes, expected {}",
+                data.len(),
+                expected
+            )));
+        }
         self.planes.push(data.to_vec());
         Ok(())
     }

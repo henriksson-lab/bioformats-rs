@@ -22,6 +22,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 const HEADER_SIZE: u64 = 4100;
 
@@ -123,11 +124,9 @@ impl FormatReader for SpeReader {
         //  XML_OFFSET = 678 (long)
         //  HEADER_VER =1992 (int)
         let datatype = r_i16_le(&hdr, 108);
-        let xdim = r_u16_le(&hdr, 42).max(1) as u32;
-        let ydim = r_u16_le(&hdr, 656).max(1) as u32;
-        // Java: numFrames falls back to getStackSize() when < 1, but the common
-        // path is NUM_FRAMES; keep at least 1 frame.
-        let numframes = r_i32_le(&hdr, 1446).max(1) as u32;
+        let xdim = positive_u16_dim(r_u16_le(&hdr, 42), "width")?;
+        let ydim = positive_u16_dim(r_u16_le(&hdr, 656), "height")?;
+        let numframes = positive_i32_dim(r_i32_le(&hdr, 1446), "frame count")?;
         let exposure = r_i32_le(&hdr, 10);
         let header_ver = r_i32_le(&hdr, 1992);
         let xml_offset = r_i64_le(&hdr, 678);
@@ -147,6 +146,13 @@ impl FormatReader for SpeReader {
             )));
         }
         let (pixel_type, bpp) = spe_pixel_type(datatype);
+        validate_spe_payload(
+            f.metadata().map_err(BioFormatsError::Io)?.len(),
+            xdim,
+            ydim,
+            numframes,
+            pixel_type,
+        )?;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         if exposure > 0 {
@@ -155,20 +161,14 @@ impl FormatReader for SpeReader {
         if !date.is_empty() {
             meta_map.insert("date".into(), MetadataValue::String(date));
         }
-        meta_map.insert(
-            "HEADER_VER".into(),
-            MetadataValue::Int(header_ver as i64),
-        );
+        meta_map.insert("HEADER_VER".into(), MetadataValue::Int(header_ver as i64));
 
         // SPE 3.0 XML footer: detected when HEADER_VER >= 3 or XML_OFFSET > 0.
         // Matching SPEReader.java, the binary-header dimensions are authoritative
         // and the file is flagged metadata-incomplete; we additionally expose the
         // raw footer XML text so downstream callers can inspect it.
         if header_ver >= 3 || xml_offset > 0 {
-            meta_map.insert(
-                "XML_OFFSET".into(),
-                MetadataValue::Int(xml_offset),
-            );
+            meta_map.insert("XML_OFFSET".into(), MetadataValue::Int(xml_offset));
             meta_map.insert("metadataComplete".into(), MetadataValue::Bool(false));
             if xml_offset > 0 {
                 if let Ok(xml) = read_xml_footer(&mut f, xml_offset as u64) {
@@ -226,7 +226,9 @@ impl FormatReader for SpeReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -255,16 +257,8 @@ impl FormatReader for SpeReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("SPE", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -282,4 +276,48 @@ impl FormatReader for SpeReader {
         // to per-plane OME PlaneDeltaT, so we mirror the pixel-only mapping.
         Some(OmeMetadata::from_image_metadata(meta))
     }
+}
+
+fn positive_u16_dim(value: u16, label: &str) -> Result<u32> {
+    if value == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "SPE header has non-positive {label}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+fn positive_i32_dim(value: i32, label: &str) -> Result<u32> {
+    if value <= 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "SPE header has non-positive {label}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+fn validate_spe_payload(
+    file_len: u64,
+    size_x: u32,
+    size_y: u32,
+    frames: u32,
+    pixel_type: PixelType,
+) -> Result<()> {
+    let plane_bytes = (size_x as u64)
+        .checked_mul(size_y as u64)
+        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample() as u64))
+        .ok_or_else(|| BioFormatsError::Format("SPE plane size overflows".into()))?;
+    let required_len = HEADER_SIZE
+        .checked_add(
+            plane_bytes
+                .checked_mul(frames as u64)
+                .ok_or_else(|| BioFormatsError::Format("SPE payload size overflows".into()))?,
+        )
+        .ok_or_else(|| BioFormatsError::Format("SPE payload size overflows".into()))?;
+    if file_len < required_len {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "SPE pixel payload is shorter than declared ({file_len} < {required_len})"
+        )));
+    }
+    Ok(())
 }

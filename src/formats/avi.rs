@@ -518,7 +518,11 @@ impl FormatReader for AviReader {
             size_c,
             size_t: 1,
             pixel_type,
-            bits_per_pixel: if pixel_type == PixelType::Uint16 { 16 } else { 8 },
+            bits_per_pixel: if pixel_type == PixelType::Uint16 {
+                16
+            } else {
+                8
+            },
             image_count: n_frames,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: out_is_rgb,
@@ -564,7 +568,9 @@ impl FormatReader for AviReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -601,8 +607,13 @@ impl FormatReader for AviReader {
                 Some((idx, plane)) if *idx + 1 == plane_index => plane.clone(),
                 _ => Vec::new(),
             };
-            let plane =
-                crate::common::codec::decompress_cinepak(&raw, width, height, bit_count as u32, &prev)?;
+            let plane = crate::common::codec::decompress_cinepak(
+                &raw,
+                width,
+                height,
+                bit_count as u32,
+                &prev,
+            )?;
             self.last_cinepak = Some((plane_index, plane.clone()));
             return Ok(plane);
         }
@@ -662,15 +673,19 @@ impl FormatReader for AviReader {
         let row_bytes = width as usize * channels * bytes_per_sample;
         let stored_row_samples = width as usize * src_channels;
         // Stored rows are padded to a 4-byte boundary.
-        let stored_row_bytes_unpadded = stored_row_samples
-            * (if bit_count == 16 { 2 } else { bytes_per_sample });
+        let stored_row_bytes_unpadded =
+            stored_row_samples * (if bit_count == 16 { 2 } else { bytes_per_sample });
         let stored_row = (stored_row_bytes_unpadded + 3) & !3;
         let plane_bytes = row_bytes * height as usize;
 
-        let read_size = (stored_row * height as usize).min(stored_size as usize);
-        let mut buf = vec![0u8; stored_row * height as usize];
-        let n = read_size.min(buf.len());
-        f.read_exact(&mut buf[..n]).map_err(BioFormatsError::Io)?;
+        let required_size = stored_row * height as usize;
+        if (stored_size as usize) < required_size {
+            return Err(BioFormatsError::InvalidData(format!(
+                "AVI: uncompressed frame chunk is too short: got {stored_size}, expected at least {required_size}"
+            )));
+        }
+        let mut buf = vec![0u8; required_size];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
 
         let y8 = compression == AVI_Y8;
         let mut out = vec![0u8; plane_bytes];
@@ -863,6 +878,31 @@ fn avi_writer_layout(
     })
 }
 
+fn validate_avi_writer_metadata(meta: &ImageMetadata) -> Result<bool> {
+    if meta.pixel_type != PixelType::Uint8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "AVI writer supports only 8-bit pixel data".into(),
+        ));
+    }
+
+    let is_rgb = meta.is_rgb;
+    if is_rgb {
+        if meta.size_c != 3 || !meta.is_interleaved {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "AVI writer supports only interleaved RGB Uint8 data with 3 channels".into(),
+            ));
+        }
+    } else if meta.size_c.max(1) != 1 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "AVI writer supports grayscale or RGB Uint8 data, got {} non-RGB channels",
+            meta.size_c
+        )));
+    }
+
+    crate::formats::stack_writer::expected_plane_count("AVI", meta)?;
+    Ok(is_rgb)
+}
+
 impl crate::common::writer::FormatWriter for AviWriter {
     fn is_this_type(&self, path: &Path) -> bool {
         let ext = path
@@ -873,6 +913,7 @@ impl crate::common::writer::FormatWriter for AviWriter {
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        validate_avi_writer_metadata(meta)?;
         self.meta = Some(meta.clone());
         self.planes.clear();
         Ok(())
@@ -883,19 +924,31 @@ impl crate::common::writer::FormatWriter for AviWriter {
         Ok(())
     }
 
-    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "AVI",
+            meta,
+            self.planes.len(),
+            plane_index,
+            data.len(),
+        )?;
         self.planes.push(data.to_vec());
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
-        let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let _path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let height = meta.size_y;
-        let is_rgb = meta.is_rgb && meta.size_c >= 3;
+        let is_rgb = validate_avi_writer_metadata(meta)?;
         let bpp: u16 = if is_rgb { 24 } else { 8 };
-        let layout = avi_writer_layout(&meta, is_rgb, self.planes.len())?;
+        let expected_planes = crate::formats::stack_writer::expected_plane_count("AVI", meta)?;
+        let layout = avi_writer_layout(meta, is_rgb, expected_planes as usize)?;
+        crate::formats::stack_writer::validate_complete("AVI", meta, self.planes.len())?;
+        let _meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
         let row_bytes = layout.row_bytes;
         let padded_row = layout.padded_row;
         let padded_frame = layout.padded_frame;

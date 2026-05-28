@@ -29,9 +29,7 @@
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::ImageMetadata;
-use crate::common::ome_metadata::{
-    create_lsid, OmeMetadata, OmePlate, OmeWell, OmeWellSample,
-};
+use crate::common::ome_metadata::{create_lsid, OmeMetadata, OmePlate, OmeWell, OmeWellSample};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::tiff::ifd::IfdValue;
@@ -153,26 +151,31 @@ impl FlexReader {
         let plate_count = self.plate_count.max(1);
 
         // effectiveFieldCount: 1 when wellCount*plateCount == files.
-        let effective_field_count =
-            if (well_count * plate_count) as usize == self.flex_files.len() {
-                1
-            } else {
-                field_count
-            };
+        let effective_field_count = if (well_count * plate_count) as usize == self.flex_files.len()
+        {
+            1
+        } else {
+            field_count
+        };
 
-        let lengths = [field_count as usize, well_count as usize, plate_count as usize];
+        let lengths = [
+            field_count as usize,
+            well_count as usize,
+            plate_count as usize,
+        ];
         let pos = raster_to_position(&lengths, series);
 
         let zero_well = well_count == 1 && effective_field_count == 1;
         let (row, col) = if zero_well {
             (0, 0)
         } else {
-            self.well_number
-                .get(pos[1])
-                .copied()
-                .unwrap_or((0, 0))
+            self.well_number.get(pos[1]).copied().unwrap_or((0, 0))
         };
-        let field = if effective_field_count == 1 { 0 } else { pos[0] as u32 };
+        let field = if effective_field_count == 1 {
+            0
+        } else {
+            pos[0] as u32
+        };
 
         self.flex_files
             .iter()
@@ -306,7 +309,11 @@ fn read_uint(buf: &[u8], off: usize, n: usize, little_endian: bool) -> u64 {
 /// Write an unsigned integer of `n` bytes into `buf` at `off`.
 fn write_uint(buf: &mut [u8], off: usize, n: usize, value: u64, little_endian: bool) {
     for i in 0..n {
-        let shift = if little_endian { 8 * i } else { 8 * (n - 1 - i) };
+        let shift = if little_endian {
+            8 * i
+        } else {
+            8 * (n - 1 - i)
+        };
         if let Some(slot) = buf.get_mut(off + i) {
             *slot = ((value >> shift) & 0xff) as u8;
         }
@@ -719,8 +726,7 @@ impl FormatReader for FlexReader {
         self.plate_count = 1;
 
         // seriesCount = plateCount * wellCount * fieldCount.
-        let series_count =
-            (self.plate_count * self.well_count * self.field_count).max(1) as usize;
+        let series_count = (self.plate_count * self.well_count * self.field_count).max(1) as usize;
 
         // Apply factor widening to the (single) base metadata.
         let mut base_meta = self
@@ -817,7 +823,7 @@ impl FormatReader for FlexReader {
         } else {
             self.series_meta
                 .get(self.series)
-                .expect("set_id not called")
+                .unwrap_or(crate::common::reader::uninitialized_metadata())
         }
     }
 
@@ -857,6 +863,12 @@ impl FormatReader for FlexReader {
     }
 
     fn ome_metadata(&self) -> Option<OmeMetadata> {
+        if std::ptr::eq(
+            self.metadata(),
+            crate::common::reader::uninitialized_metadata(),
+        ) {
+            return None;
+        }
         let mut ome = OmeMetadata::from_image_metadata(self.metadata());
         if self.single_file {
             return Some(ome);
@@ -896,14 +908,17 @@ impl FormatReader for FlexReader {
 
         for i in 0..series_count {
             let pos = raster_to_position(&lengths, i);
-            let (row, col) = self
-                .well_number
-                .get(pos[1])
-                .copied()
-                .unwrap_or((0, 0));
+            let (row, col) = self.well_number.get(pos[1]).copied().unwrap_or((0, 0));
             let field = pos[0] as u32;
             well_map.entry((row, col)).or_default().push(OmeWellSample {
-                id: Some(create_lsid("WellSample", &[pos[2], (row * self.well_columns + col) as usize, field as usize])),
+                id: Some(create_lsid(
+                    "WellSample",
+                    &[
+                        pos[2],
+                        (row * self.well_columns + col) as usize,
+                        field as usize,
+                    ],
+                )),
                 index: i as u32,
                 image_ref: Some(i),
                 position_x: None,
@@ -948,7 +963,8 @@ mod tests {
 
     #[test]
     fn mea_picture_paths_get_flex_extension() {
-        let mea = r#"<root><Picture path="dir/002003001"/><Picture path="dir\002003002.flex"/></root>"#;
+        let mea =
+            r#"<root><Picture path="dir/002003001"/><Picture path="dir\002003002.flex"/></root>"#;
         let names = parse_mea_flex_names(mea);
         assert_eq!(names, vec!["dir/002003001.flex", "dir/002003002.flex"]);
     }

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::tiff::TiffReader;
@@ -54,7 +55,11 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn new(data: &'a [u8], little: bool) -> Self {
-        Cursor { data, pos: 0, little }
+        Cursor {
+            data,
+            pos: 0,
+            little,
+        }
     }
     fn seek(&mut self, p: usize) {
         self.pos = p.min(self.data.len());
@@ -216,7 +221,9 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
             for _ in 0..temp_images {
                 let name = c.read_string(name_length);
                 if !name.is_empty() {
-                    files.push(dir.join(name.trim()));
+                    if let Some(path) = confined_join(dir, &name) {
+                        files.push(path);
+                    }
                 }
             }
         }
@@ -259,7 +266,7 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
         if let Some(&dim_ptr) = ifd.get(&DIMDESCR) {
             c.seek(dim_ptr);
             c.skip(4); // version/unused
-            // ms.rgb = in.readInt() == 20
+                       // ms.rgb = in.readInt() == 20
             let voxel = c.read_i32();
             if voxel == 20 {
                 is_rgb = true;
@@ -279,7 +286,7 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
             };
 
             let _resolution = c.read_i32(); // bits per pixel / real-world resolution
-            // Maximum/Minimum voxel intensity strings (getString(true)).
+                                            // Maximum/Minimum voxel intensity strings (getString(true)).
             for _ in 0..2 {
                 let l = c.read_i32().max(0) as usize * 2;
                 c.skip(l);
@@ -346,7 +353,10 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
                     format!("{dim_prefix} type"),
                     MetadataValue::String(dim_type.to_string()),
                 );
-                meta_map.insert(format!("{dim_prefix} size"), MetadataValue::Int(size as i64));
+                meta_map.insert(
+                    format!("{dim_prefix} size"),
+                    MetadataValue::Int(size as i64),
+                );
                 meta_map.insert(
                     format!("{dim_prefix} distance between sub-dimensions"),
                     MetadataValue::Int(distance as i64),
@@ -523,11 +533,10 @@ impl FormatReader for LeiReader {
         self.series
     }
     fn metadata(&self) -> &ImageMetadata {
-        &self
-            .series_list
+        self.series_list
             .get(self.series)
-            .expect("set_id not called")
-            .meta
+            .map(|series| &series.meta)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -552,7 +561,14 @@ impl FormatReader for LeiReader {
         let mut r = TiffReader::new();
         r.set_id(file)?;
         let inner = r.metadata().image_count.max(1);
-        r.open_bytes(page % inner)
+        if page >= inner {
+            return Err(BioFormatsError::Format(format!(
+                "LEI: TIFF page {page} out of range for {} ({} pages)",
+                file.display(),
+                inner
+            )));
+        }
+        r.open_bytes(page)
     }
 
     fn open_bytes_region(
@@ -590,14 +606,20 @@ pub(crate) fn crop_region(
     h: u32,
 ) -> Result<Vec<u8>> {
     let bps = meta.pixel_type.bytes_per_sample();
-    let samples = if meta.is_rgb { meta.size_c.max(1) as usize } else { 1 };
+    let samples = if meta.is_rgb {
+        meta.size_c.max(1) as usize
+    } else {
+        1
+    };
     let pixel = bps * samples;
     let full_w = meta.size_x as usize;
     let full_h = meta.size_y as usize;
     let row = full_w * pixel;
 
     // Validate that the requested region lies within the plane.
-    if (x + w) as usize > full_w || (y + h) as usize > full_h {
+    if x.checked_add(w).is_none_or(|end| end as usize > full_w)
+        || y.checked_add(h).is_none_or(|end| end as usize > full_h)
+    {
         return Err(BioFormatsError::Format(format!(
             "region {}x{}+{}+{} exceeds plane {}x{}",
             w, h, x, y, full_w, full_h
@@ -660,4 +682,57 @@ fn tiff_has_tag(header: &[u8], target: u16) -> bool {
         p += 12; // each IFD entry is 12 bytes
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ImageWriter;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_lei_{nanos}_{name}"))
+    }
+
+    #[test]
+    fn lei_companion_tiff_page_uses_exact_index() {
+        let tiff = temp_path("single_page.tif");
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 2,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 2,
+            ..Default::default()
+        };
+        let tiff_meta = ImageMetadata {
+            size_z: 1,
+            image_count: 1,
+            ..meta.clone()
+        };
+        ImageWriter::save(&tiff, &tiff_meta, &[vec![17]]).unwrap();
+        let mut reader = LeiReader {
+            path: None,
+            series_list: vec![LeiSeries {
+                meta,
+                files: vec![tiff.clone()],
+            }],
+            series: 0,
+        };
+
+        let err = reader.open_bytes(1).unwrap_err();
+
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("TIFF page 1 out of range")),
+            "unexpected error: {err:?}"
+        );
+        let _ = std::fs::remove_file(tiff);
+    }
 }

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 use crate::tiff::ifd::Ifd;
 use crate::tiff::ifd::IfdValue;
 use crate::tiff::parser::TiffParser;
@@ -135,7 +136,11 @@ fn read_uic_dims(path: &Path, ifd: &Ifd, mm_planes: u32) -> Option<UicDims> {
             }
             let num = rd_u32(off);
             let den = rd_u32(off + 4);
-            let z = if den != 0 { num as f64 / den as f64 } else { 0.0 };
+            let z = if den != 0 {
+                num as f64 / den as f64
+            } else {
+                0.0
+            };
             if z != 0.0 {
                 size_z += 1;
             }
@@ -156,7 +161,11 @@ fn read_uic_dims(path: &Path, ifd: &Ifd, mm_planes: u32) -> Option<UicDims> {
     if let Some(IfdValue::Rational(waves)) = ifd.get(UIC3_TAG) {
         let mut unique: Vec<f64> = Vec::new();
         for (n, d) in waves {
-            let v = if *d != 0 { *n as f64 / *d as f64 } else { *n as f64 };
+            let v = if *d != 0 {
+                *n as f64 / *d as f64
+            } else {
+                *n as f64
+            };
             if !unique.iter().any(|u| (*u - v).abs() < f64::EPSILON) {
                 unique.push(v);
             }
@@ -198,7 +207,11 @@ fn decode_date(julian: i32) -> String {
     let e = ((b - d) as f64 / 30.6001) as i64;
     let day = b - d - (30.6001 * e as f64) as i64;
     let month = if (e as f64) < 13.5 { e - 1 } else { e - 13 };
-    let year = if (month as f64) > 2.5 { c - 4716 } else { c - 4715 };
+    let year = if (month as f64) > 2.5 {
+        c - 4716
+    } else {
+        c - 4715
+    };
     format!("{:02}/{:02}/{}", day, month, year)
 }
 
@@ -249,11 +262,12 @@ fn parse_uic_per_plane_metadata(
                 break;
             };
             let label = int_format_max(i, mm_planes);
-            let z = if den != 0 { num as f64 / den as f64 } else { 0.0 };
-            out.insert(
-                format!("zDistance[{label}]"),
-                MetadataValue::Float(z),
-            );
+            let z = if den != 0 {
+                num as f64 / den as f64
+            } else {
+                0.0
+            };
+            out.insert(format!("zDistance[{label}]"), MetadataValue::Float(z));
             // creation date (4B) and time (4B)
             if let (Some(date_raw), Some(time_raw)) = (rd_i32(off + 8), rd_i32(off + 12)) {
                 out.insert(
@@ -273,7 +287,11 @@ fn parse_uic_per_plane_metadata(
     // UIC3: one wavelength rational per plane.
     if let Some(IfdValue::Rational(waves)) = ifd.get(UIC3_TAG) {
         for (i, (n, d)) in waves.iter().enumerate() {
-            let v = if *d != 0 { *n as f64 / *d as f64 } else { *n as f64 };
+            let v = if *d != 0 {
+                *n as f64 / *d as f64
+            } else {
+                *n as f64
+            };
             let label = int_format_max(i as u32, mm_planes);
             out.insert(format!("Wavelength [{label}]"), MetadataValue::Float(v));
         }
@@ -742,7 +760,11 @@ fn build_nd_grid(nd_path: &Path, info: &NdInfo) -> NdGrid {
         }
     }
 
-    let size_z = if !has_z.is_empty() && !has_z[0] { 1 } else { zc };
+    let size_z = if !has_z.is_empty() && !has_z[0] {
+        1
+    } else {
+        zc
+    };
     NdGrid {
         stks,
         size_z: size_z.max(1) as u32,
@@ -762,7 +784,12 @@ impl MetamorphReader {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let bps = meta.pixel_type.bytes_per_sample();
-        let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
+        let plane_bytes = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(bps))
+            .ok_or_else(|| {
+                BioFormatsError::InvalidData("MetaMorph STK plane byte count overflow".into())
+            })?;
 
         // Find the first strip offset of the first IFD.
         let f = File::open(path).map_err(BioFormatsError::Io)?;
@@ -778,17 +805,27 @@ impl MetamorphReader {
                 ))
             }
         };
-        let offset = base_offset + plane_index as u64 * plane_bytes as u64;
+        let offset = (plane_index as u64)
+            .checked_mul(plane_bytes as u64)
+            .and_then(|delta| base_offset.checked_add(delta))
+            .ok_or_else(|| {
+                BioFormatsError::InvalidData("MetaMorph STK plane offset overflow".into())
+            })?;
 
         let mut file = File::open(path).map_err(BioFormatsError::Io)?;
         let len = file.metadata().map_err(BioFormatsError::Io)?.len();
-        let mut out = vec![0u8; plane_bytes];
-        if offset < len {
-            file.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
-            let available = (len - offset).min(plane_bytes as u64) as usize;
-            file.read_exact(&mut out[..available])
-                .map_err(BioFormatsError::Io)?;
+        let end = offset.checked_add(plane_bytes as u64).ok_or_else(|| {
+            BioFormatsError::InvalidData("MetaMorph STK plane end offset overflow".into())
+        })?;
+        if end > len {
+            return Err(BioFormatsError::InvalidData(format!(
+                "MetaMorph STK plane {plane_index} is truncated: need bytes {offset}..{end}, file length {len}"
+            )));
         }
+        let mut out = vec![0u8; plane_bytes];
+        file.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
+        file.read_exact(&mut out).map_err(BioFormatsError::Io)?;
         Ok(out)
     }
 }
@@ -899,7 +936,7 @@ impl FormatReader for MetamorphReader {
         self.metas
             .get(self.series)
             .or(self.meta.as_ref())
-            .expect("set_id not called")
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -948,15 +985,7 @@ impl FormatReader for MetamorphReader {
         if self.stks.is_some() {
             let full = self.open_bytes(plane_index)?;
             let meta = self.metas.get(self.series).unwrap();
-            let bps = meta.pixel_type.bytes_per_sample();
-            let row = meta.size_x as usize * bps;
-            let out_row = w as usize * bps;
-            let mut out = Vec::with_capacity(h as usize * out_row);
-            for r in 0..h as usize {
-                let src = &full[(y as usize + r) * row..];
-                out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-            }
-            return Ok(out);
+            return crop_full_plane("MetaMorph STK", &full, meta, 1, x, y, w, h);
         }
         let inner_count = self.inner.metadata().image_count;
         if plane_index < inner_count {
@@ -965,15 +994,7 @@ impl FormatReader for MetamorphReader {
         // Crop from the concatenated-strip plane.
         let full = self.read_concatenated_plane(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
+        crop_full_plane("MetaMorph STK", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1245,7 +1266,10 @@ impl MetamorphReader {
             // Missing file: return a blank plane (Java returns the buffer as-is).
             None => {
                 let bps = meta.pixel_type.bytes_per_sample();
-                return Ok(Some(vec![0u8; meta.size_x as usize * meta.size_y as usize * bps]));
+                return Ok(Some(vec![
+                    0u8;
+                    meta.size_x as usize * meta.size_y as usize * bps
+                ]));
             }
         };
         let mut reader = MetamorphReader::new();
@@ -1365,7 +1389,10 @@ mod tests {
         assert_eq!(info.n_stage_positions, 2);
         assert!(info.do_wave);
         assert_eq!(info.n_wavelengths, Some(2));
-        assert_eq!(info.wave_names, vec!["FITC".to_string(), "DAPI".to_string()]);
+        assert_eq!(
+            info.wave_names,
+            vec!["FITC".to_string(), "DAPI".to_string()]
+        );
         assert!(info.use_wave_names);
         assert!(!info.do_z_series);
     }

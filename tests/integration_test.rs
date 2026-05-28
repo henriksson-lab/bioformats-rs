@@ -731,9 +731,220 @@ fn test_tiff_ycbcr_subsampled_decodes_to_planar_rgb() {
     let mut reader = ImageReader::open(&path).expect("open failed");
     assert_eq!(reader.metadata().size_c, 3);
     assert!(reader.metadata().is_rgb);
+    assert!(!reader.metadata().is_interleaved);
     assert_eq!(
         reader.open_bytes(0).expect("open_bytes failed"),
         vec![10, 20, 30, 40, 10, 20, 30, 40, 10, 20, 30, 40]
+    );
+}
+
+#[test]
+fn test_tiff_missing_rows_per_strip_defaults_to_full_height() {
+    let path = std::env::temp_dir().join("bioformats_missing_rows_per_strip_valid.tif");
+    let data_offset = 8 + 2 + 9 * 12 + 4;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42u16.to_le_bytes());
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    bytes.extend_from_slice(&9u16.to_le_bytes());
+
+    fn short_entry(bytes: &mut Vec<u8>, tag: u16, value: u16) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+    }
+    fn long_entry(bytes: &mut Vec<u8>, tag: u16, value: u32) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    short_entry(&mut bytes, 256, 2);
+    short_entry(&mut bytes, 257, 2);
+    short_entry(&mut bytes, 258, 8);
+    short_entry(&mut bytes, 259, 1);
+    short_entry(&mut bytes, 262, 1);
+    long_entry(&mut bytes, 273, data_offset as u32);
+    short_entry(&mut bytes, 277, 1);
+    long_entry(&mut bytes, 279, 4);
+    short_entry(&mut bytes, 284, 1);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&[1, 2, 3, 4]);
+
+    std::fs::write(&path, bytes).expect("fixture write failed");
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn test_tiff_short_stripped_data_returns_error() {
+    let path = std::env::temp_dir().join("bioformats_short_strip.tif");
+    let data_offset = 8 + 2 + 10 * 12 + 4;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42u16.to_le_bytes());
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    bytes.extend_from_slice(&10u16.to_le_bytes());
+
+    fn short_entry(bytes: &mut Vec<u8>, tag: u16, value: u16) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+    }
+    fn long_entry(bytes: &mut Vec<u8>, tag: u16, value: u32) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    short_entry(&mut bytes, 256, 2);
+    short_entry(&mut bytes, 257, 2);
+    short_entry(&mut bytes, 258, 8);
+    short_entry(&mut bytes, 259, 1);
+    short_entry(&mut bytes, 262, 1);
+    long_entry(&mut bytes, 273, data_offset as u32);
+    short_entry(&mut bytes, 277, 1);
+    short_entry(&mut bytes, 278, 2);
+    long_entry(&mut bytes, 279, 2);
+    short_entry(&mut bytes, 284, 1);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&[1, 2]);
+
+    std::fs::write(&path, bytes).expect("fixture write failed");
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    let err = reader.open_bytes(0).expect_err("short strip should fail");
+    assert!(err.to_string().contains("decompressed to 2 bytes"));
+}
+
+#[test]
+fn test_tiff_tiled_chunky_subbyte_uses_packed_rows() {
+    let path = std::env::temp_dir().join("bioformats_tiled_chunky_1bit.tif");
+    let data_offset = 8 + 2 + 10 * 12 + 4;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42u16.to_le_bytes());
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    bytes.extend_from_slice(&10u16.to_le_bytes());
+
+    fn short_entry(bytes: &mut Vec<u8>, tag: u16, value: u16) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+    }
+    fn long_entry(bytes: &mut Vec<u8>, tag: u16, value: u32) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    short_entry(&mut bytes, 256, 4);
+    short_entry(&mut bytes, 257, 2);
+    short_entry(&mut bytes, 258, 1);
+    short_entry(&mut bytes, 259, 1);
+    short_entry(&mut bytes, 262, 1);
+    short_entry(&mut bytes, 322, 4);
+    short_entry(&mut bytes, 323, 2);
+    long_entry(&mut bytes, 324, data_offset as u32);
+    long_entry(&mut bytes, 325, 2);
+    short_entry(&mut bytes, 277, 1);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&[0b1010_0000, 0b0101_0000]);
+
+    std::fs::write(&path, bytes).expect("fixture write failed");
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![1, 0, 1, 0, 0, 1, 0, 1]
+    );
+    assert_eq!(
+        reader
+            .open_bytes_region(0, 1, 0, 2, 2)
+            .expect("region failed"),
+        vec![0, 1, 1, 0]
+    );
+}
+
+#[test]
+fn test_tiff_tiled_planar_subbyte_uses_packed_rows() {
+    let path = std::env::temp_dir().join("bioformats_tiled_planar_1bit.tif");
+    let bits_offset = 8 + 2 + 11 * 12 + 4;
+    let tile_offsets_offset = bits_offset + 6;
+    let tile_counts_offset = tile_offsets_offset + 12;
+    let data_offset = tile_counts_offset + 12;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42u16.to_le_bytes());
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    bytes.extend_from_slice(&11u16.to_le_bytes());
+
+    fn short_entry(bytes: &mut Vec<u8>, tag: u16, value: u16) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+    }
+    fn offset_entry(bytes: &mut Vec<u8>, tag: u16, typ: u16, count: u32, offset: u32) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&typ.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    short_entry(&mut bytes, 256, 4);
+    short_entry(&mut bytes, 257, 2);
+    offset_entry(&mut bytes, 258, 3, 3, bits_offset);
+    short_entry(&mut bytes, 259, 1);
+    short_entry(&mut bytes, 262, 2);
+    short_entry(&mut bytes, 322, 4);
+    short_entry(&mut bytes, 323, 2);
+    offset_entry(&mut bytes, 324, 4, 3, tile_offsets_offset);
+    short_entry(&mut bytes, 277, 3);
+    offset_entry(&mut bytes, 325, 4, 3, tile_counts_offset);
+    short_entry(&mut bytes, 284, 2);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    for _ in 0..3 {
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+    }
+    for off in [data_offset, data_offset + 2, data_offset + 4] {
+        bytes.extend_from_slice(&off.to_le_bytes());
+    }
+    for count in [2u32, 2, 2] {
+        bytes.extend_from_slice(&count.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[
+        0b1010_0000,
+        0b0101_0000,
+        0b1100_0000,
+        0b0011_0000,
+        0b1111_0000,
+        0b0000_0000,
+    ]);
+
+    std::fs::write(&path, bytes).expect("fixture write failed");
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0]
+    );
+    assert_eq!(
+        reader
+            .open_bytes_region(0, 1, 0, 2, 2)
+            .expect("region failed"),
+        vec![0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0]
     );
 }
 

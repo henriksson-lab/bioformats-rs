@@ -223,7 +223,10 @@ fn find_html(path: &Path) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
     let parent = path.parent()?;
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     // Java: base = name up to last space; report = "<base> Report.html".
     if let Some(space) = name.rfind(' ') {
         let base = &name[..space];
@@ -234,14 +237,12 @@ fn find_html(path: &Path) -> Option<PathBuf> {
     }
     // Fall back to the first .html file in the directory.
     std::fs::read_dir(parent).ok().and_then(|rd| {
-        rd.filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("html"))
-                    .unwrap_or(false)
-            })
+        rd.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("html"))
+                .unwrap_or(false)
+        })
     })
 }
 
@@ -289,10 +290,11 @@ fn find_pixels_offset(
     if plane_count == 0 {
         return Ok(marker_pos);
     }
-    let skip = (len.saturating_sub(marker_pos).saturating_sub(plane_count * plane_size))
+    let skip = (len
+        .saturating_sub(marker_pos)
+        .saturating_sub(plane_count * plane_size))
         / plane_count;
     let mut fp = marker_pos + skip;
-    fp = fp.saturating_sub(HEADER_MARKER.len() as u64);
     // PIXELS_MARKER last byte is 0x3f; nudge forward if present.
     if let Some(&b) = bytes.get(fp as usize) {
         let _ = little_endian;
@@ -358,8 +360,9 @@ impl FormatReader for VisitechReader {
         // Only keep .xys files that actually contain the header marker (real
         // pixel data); this also rejects the synthetic text-only test file.
         let plane_count = (vmeta.size_z as u64) * (vmeta.size_t as u64);
-        let plane_size =
-            (vmeta.size_x as u64) * (vmeta.size_y as u64) * vmeta.pixel_type.bytes_per_sample() as u64;
+        let plane_size = (vmeta.size_x as u64)
+            * (vmeta.size_y as u64)
+            * vmeta.pixel_type.bytes_per_sample() as u64;
 
         let mut valid_files = Vec::new();
         let mut offsets = Vec::new();
@@ -399,7 +402,10 @@ impl FormatReader for VisitechReader {
             let size_c = channels_per_series;
             let image_count = vmeta.size_z * size_c * vmeta.size_t;
             let mut sm: HashMap<String, MetadataValue> = HashMap::new();
-            sm.insert("format".into(), MetadataValue::String("Visitech XYS".into()));
+            sm.insert(
+                "format".into(),
+                MetadataValue::String("Visitech XYS".into()),
+            );
             // Java: store.setImageName("Position " + (i + 1), i);
             sm.insert(
                 "image_name".into(),
@@ -468,7 +474,7 @@ impl FormatReader for VisitechReader {
     fn metadata(&self) -> &ImageMetadata {
         self.series_meta
             .get(self.series)
-            .expect("set_id not called")
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -480,13 +486,11 @@ impl FormatReader for VisitechReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let plane = (meta.size_x as usize)
-            * (meta.size_y as usize)
-            * meta.pixel_type.bytes_per_sample();
+        let plane =
+            (meta.size_x as usize) * (meta.size_y as usize) * meta.pixel_type.bytes_per_sample();
         let div = (meta.size_z * meta.size_t).max(1);
         // Java: fileIndex = series * sizeC + no / div; planeIndex = no % div.
-        let file_index =
-            (series as u32 * self.channels_per_series + plane_index / div) as usize;
+        let file_index = (series as u32 * self.channels_per_series + plane_index / div) as usize;
         let plane_in_file = (plane_index % div) as u64;
 
         if file_index >= self.files.len() || file_index >= self.pixel_offsets.len() {
@@ -500,18 +504,19 @@ impl FormatReader for VisitechReader {
 
         // padding between planes (Java: (length - fp - div*plane) / (div-1)).
         let padding = if div > 1 {
-            (file_len.saturating_sub(base).saturating_sub(div as u64 * plane as u64))
+            (file_len
+                .saturating_sub(base)
+                .saturating_sub(div as u64 * plane as u64))
                 / (div as u64 - 1)
         } else {
             0
         };
 
         let offset = base + (plane as u64 + padding) * plane_in_file;
-        f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane];
-        let n = f.read(&mut buf).map_err(BioFormatsError::Io)?;
-        buf.truncate(n.max(0));
-        buf.resize(plane, 0);
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 

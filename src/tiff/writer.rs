@@ -59,10 +59,17 @@ impl TiffWriter {
 
     /// Convenience: set OME metadata from an `OmeMetadata` struct.
     /// Must be called after `set_metadata` so the pixel metadata is available.
-    pub fn set_ome_metadata(&mut self, ome: &crate::common::ome_metadata::OmeMetadata) {
+    pub fn set_ome_metadata(
+        &mut self,
+        ome: &crate::common::ome_metadata::OmeMetadata,
+    ) -> Result<()> {
         if let Some(meta) = &self.meta {
+            let mut ome = ome.clone();
+            ome.populate_pixels(meta, 0)?;
+            ome.verify_minimum_populated(meta, 0)?;
             self.ome_xml = Some(ome.to_ome_xml(meta));
         }
+        Ok(())
     }
 }
 
@@ -121,6 +128,14 @@ fn long_entry(tag: u16, value: u32) -> Entry {
     }
 }
 
+fn classic_tiff_u32(value: u64, field: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        BioFormatsError::Format(format!(
+            "classic TIFF {field} {value} exceeds 32-bit offset/count limit"
+        ))
+    })
+}
+
 fn sample_format(pt: PixelType) -> u16 {
     match pt {
         PixelType::Int8 | PixelType::Int16 | PixelType::Int32 => 2,
@@ -177,8 +192,35 @@ fn expected_plane_len(meta: &ImageMetadata) -> Result<usize> {
     })
 }
 
-fn expected_plane_count(meta: &ImageMetadata) -> u32 {
-    meta.image_count.max(1)
+fn expected_plane_count(meta: &ImageMetadata) -> Result<u32> {
+    let effective_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+    let dimension_planes = meta
+        .size_z
+        .max(1)
+        .checked_mul(effective_c)
+        .and_then(|v| v.checked_mul(meta.size_t.max(1)))
+        .ok_or_else(|| BioFormatsError::Format("TIFF writer: plane count overflows u32".into()))?;
+    let image_count = meta.image_count.max(1);
+    if image_count > dimension_planes {
+        return Err(BioFormatsError::Format(format!(
+            "TIFF writer: metadata image_count {image_count} exceeds dimensional plane count {dimension_planes}"
+        )));
+    }
+    Ok(dimension_planes)
+}
+
+fn validate_tiff_writer_metadata(meta: &ImageMetadata) -> Result<()> {
+    if meta.pixel_type == PixelType::Bit {
+        return Err(BioFormatsError::Format(
+            "TIFF writer does not support PixelType::Bit until 1-bit output is packed".into(),
+        ));
+    }
+    if meta.is_rgb && meta.size_c > 1 && !meta.is_interleaved {
+        return Err(BioFormatsError::Format(
+            "TIFF writer writes chunky RGB and does not support planar RGB metadata".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn expected_plane_len_for_dims(meta: &ImageMetadata, width: u32, height: u32) -> Result<usize> {
@@ -203,7 +245,7 @@ fn pyramid_level_dimensions(meta: &ImageMetadata, level_idx: usize) -> Result<(u
 }
 
 fn validate_pyramid_levels(meta: &ImageMetadata, levels: &[Vec<Vec<u8>>]) -> Result<()> {
-    let expected_planes = expected_plane_count(meta) as usize;
+    let expected_planes = expected_plane_count(meta)? as usize;
     for (level_idx, level) in levels.iter().enumerate() {
         if level.len() != expected_planes {
             return Err(BioFormatsError::Format(format!(
@@ -278,6 +320,13 @@ impl PyramidOmeTiffWriter {
             .clone();
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
+        if self.levels.is_empty() {
+            return Err(BioFormatsError::Format(
+                "No resolution levels provided".into(),
+            ));
+        }
+        validate_pyramid_levels(&meta, &self.levels)?;
+
         let f = File::create(path).map_err(BioFormatsError::Io)?;
         let mut w = BufWriter::new(f);
 
@@ -285,13 +334,6 @@ impl PyramidOmeTiffWriter {
         w.write_all(b"II").map_err(BioFormatsError::Io)?;
         write_le_u16(&mut w, 42).map_err(BioFormatsError::Io)?;
         write_le_u32(&mut w, 0).map_err(BioFormatsError::Io)?; // placeholder for IFD offset
-
-        if self.levels.is_empty() {
-            return Err(BioFormatsError::Format(
-                "No resolution levels provided".into(),
-            ));
-        }
-        validate_pyramid_levels(&meta, &self.levels)?;
 
         let comp_tag = compression_tag(self.compression);
         let spp = if meta.is_rgb { meta.size_c } else { 1 } as u16;
@@ -356,7 +398,7 @@ impl PyramidOmeTiffWriter {
                         tag: 273,
                         typ: long_type().0,
                         count: 1,
-                        value_or_offset: strip_offset as u32,
+                        value_or_offset: classic_tiff_u32(strip_offset, "strip offset")?,
                     },
                     short_entry(277, spp),
                     long_entry(278, sub_height),
@@ -364,7 +406,7 @@ impl PyramidOmeTiffWriter {
                         tag: 279,
                         typ: long_type().0,
                         count: 1,
-                        value_or_offset: strip_byte_count as u32,
+                        value_or_offset: classic_tiff_u32(strip_byte_count, "strip byte count")?,
                     },
                     short_entry(284, 1),
                 ];
@@ -451,7 +493,7 @@ impl PyramidOmeTiffWriter {
             let sub_offsets = &sub_ifd_offsets[plane_idx];
             if num_sub_levels > 0 {
                 for &off in sub_offsets {
-                    extra.extend_from_slice(&(off as u32).to_le_bytes());
+                    extra.extend_from_slice(&classic_tiff_u32(off, "SubIFD offset")?.to_le_bytes());
                 }
             }
 
@@ -474,7 +516,7 @@ impl PyramidOmeTiffWriter {
                 tag: 273,
                 typ: long_type().0,
                 count: 1,
-                value_or_offset: strip_offset as u32,
+                value_or_offset: classic_tiff_u32(strip_offset, "strip offset")?,
             });
             entries.push(short_entry(277, spp));
             entries.push(long_entry(278, meta.size_y));
@@ -482,7 +524,7 @@ impl PyramidOmeTiffWriter {
                 tag: 279,
                 typ: long_type().0,
                 count: 1,
-                value_or_offset: strip_byte_count as u32,
+                value_or_offset: classic_tiff_u32(strip_byte_count, "strip byte count")?,
             });
             entries.push(Entry {
                 tag: 282,
@@ -555,33 +597,46 @@ impl PyramidOmeTiffWriter {
                             ifd_bytes[off + 7],
                         ]);
                         if count > 1 {
-                            let abs_off = extra_file_off as u32;
+                            let abs_off = classic_tiff_u32(extra_file_off, "extra-data offset")?;
                             ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                         }
                     }
                     270 => {
-                        let abs_off = (extra_file_off + desc_extra_offset as u64) as u32;
+                        let abs_off = classic_tiff_u32(
+                            extra_file_off + desc_extra_offset as u64,
+                            "ImageDescription offset",
+                        )?;
                         ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     282 => {
                         let bps_extra = if spp > 1 { spp as u64 * 2 } else { 0 };
                         let desc_extra = desc_bytes.as_ref().map(|d| d.len() as u64).unwrap_or(0);
-                        let abs_off = (extra_file_off + bps_extra + desc_extra) as u32;
+                        let abs_off = classic_tiff_u32(
+                            extra_file_off + bps_extra + desc_extra,
+                            "XResolution offset",
+                        )?;
                         ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     283 => {
                         let bps_extra = if spp > 1 { spp as u64 * 2 } else { 0 };
                         let desc_extra = desc_bytes.as_ref().map(|d| d.len() as u64).unwrap_or(0);
-                        let abs_off = (extra_file_off + bps_extra + desc_extra + 8) as u32;
+                        let abs_off = classic_tiff_u32(
+                            extra_file_off + bps_extra + desc_extra + 8,
+                            "YResolution offset",
+                        )?;
                         ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     330 => {
                         if sub_offsets.len() == 1 {
                             // Inline single offset
-                            ifd_bytes[off + 8..off + 12]
-                                .copy_from_slice(&(sub_offsets[0] as u32).to_le_bytes());
+                            ifd_bytes[off + 8..off + 12].copy_from_slice(
+                                &classic_tiff_u32(sub_offsets[0], "SubIFD offset")?.to_le_bytes(),
+                            );
                         } else {
-                            let abs_off = (extra_file_off + sub_ifd_extra_offset as u64) as u32;
+                            let abs_off = classic_tiff_u32(
+                                extra_file_off + sub_ifd_extra_offset as u64,
+                                "SubIFD offset-array offset",
+                            )?;
                             ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                         }
                     }
@@ -592,7 +647,10 @@ impl PyramidOmeTiffWriter {
             // Patch next-IFD offset
             let next_ifd: u32 = if plane_idx + 1 < level0_planes {
                 // We need to compute where the next IFD will be
-                (ifd_start + ifd_data_len as u64 + extra.len() as u64) as u32
+                classic_tiff_u32(
+                    ifd_start + ifd_data_len as u64 + extra.len() as u64,
+                    "next IFD offset",
+                )?
             } else {
                 0
             };
@@ -605,7 +663,11 @@ impl PyramidOmeTiffWriter {
 
         // Patch header with first IFD offset
         w.seek(SeekFrom::Start(4)).map_err(BioFormatsError::Io)?;
-        write_le_u32(&mut w, first_ifd_offset as u32).map_err(BioFormatsError::Io)?;
+        write_le_u32(
+            &mut w,
+            classic_tiff_u32(first_ifd_offset, "first IFD offset")?,
+        )
+        .map_err(BioFormatsError::Io)?;
 
         w.flush().map_err(BioFormatsError::Io)?;
         self.path = None;
@@ -626,13 +688,11 @@ impl FormatWriter for PyramidOmeTiffWriter {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(
-            ext.as_deref(),
-            Some("tif") | Some("tiff") | Some("ome.tif") | Some("ome.tiff")
-        )
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        validate_tiff_writer_metadata(meta)?;
         self.meta = Some(meta.clone());
         Ok(())
     }
@@ -658,7 +718,7 @@ impl FormatWriter for PyramidOmeTiffWriter {
                 "Pyramid TIFF writer: planes must be written in order; expected {expected_plane}, got {plane_index}"
             )));
         }
-        let expected_count = expected_plane_count(meta);
+        let expected_count = expected_plane_count(meta)?;
         if plane_index >= expected_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
@@ -692,6 +752,7 @@ impl FormatWriter for TiffWriter {
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        validate_tiff_writer_metadata(meta)?;
         self.meta = Some(meta.clone());
         Ok(())
     }
@@ -723,7 +784,7 @@ impl FormatWriter for TiffWriter {
                 self.planes_written, plane_index
             )));
         }
-        let expected_count = expected_plane_count(meta);
+        let expected_count = expected_plane_count(meta)?;
         if plane_index >= expected_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
@@ -750,10 +811,9 @@ impl FormatWriter for TiffWriter {
     }
 
     fn close(&mut self) -> Result<()> {
-        let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
-        let expected_count = expected_plane_count(&meta);
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let expected_count = expected_plane_count(&meta)?;
         if self.planes_written != expected_count {
-            self.meta = Some(meta);
             return Err(BioFormatsError::Format(format!(
                 "TIFF writer: wrote {} planes, expected {}",
                 self.planes_written, expected_count
@@ -849,7 +909,7 @@ impl FormatWriter for TiffWriter {
                     tag: 273,
                     typ: long_type().0,
                     count: 1,
-                    value_or_offset: strip_offset as u32,
+                    value_or_offset: classic_tiff_u32(strip_offset, "strip offset")?,
                 },
                 short_entry(277, spp as u16),
                 long_entry(278, meta.size_y), // RowsPerStrip = full image height
@@ -857,7 +917,7 @@ impl FormatWriter for TiffWriter {
                     tag: 279,
                     typ: long_type().0,
                     count: 1,
-                    value_or_offset: strip_byte_count as u32,
+                    value_or_offset: classic_tiff_u32(strip_byte_count, "strip byte count")?,
                 },
                 Entry {
                     tag: 282,
@@ -958,22 +1018,34 @@ impl FormatWriter for TiffWriter {
                             blob.ifd_bytes[off + 7],
                         ]);
                         if count > 1 {
-                            let abs_off = (extra_file_off + blob.bps_offset as u64) as u32;
+                            let abs_off = classic_tiff_u32(
+                                extra_file_off + blob.bps_offset as u64,
+                                "BitsPerSample offset",
+                            )?;
                             blob.ifd_bytes[off + 8..off + 12]
                                 .copy_from_slice(&abs_off.to_le_bytes());
                         }
                     }
                     282 => {
-                        let abs_off = (extra_file_off + blob.xres_offset as u64) as u32;
+                        let abs_off = classic_tiff_u32(
+                            extra_file_off + blob.xres_offset as u64,
+                            "XResolution offset",
+                        )?;
                         blob.ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     283 => {
-                        let abs_off = (extra_file_off + blob.yres_offset as u64) as u32;
+                        let abs_off = classic_tiff_u32(
+                            extra_file_off + blob.yres_offset as u64,
+                            "YResolution offset",
+                        )?;
                         blob.ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     270 => {
                         // ImageDescription — offset into extra data
-                        let abs_off = (extra_file_off + blob.desc_offset as u64) as u32;
+                        let abs_off = classic_tiff_u32(
+                            extra_file_off + blob.desc_offset as u64,
+                            "ImageDescription offset",
+                        )?;
                         blob.ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     // StripOffsets / StripByteCounts are already absolute (set from plane_strips)
@@ -983,7 +1055,7 @@ impl FormatWriter for TiffWriter {
 
             // Patch next-IFD offset (last 4 bytes of ifd_bytes)
             let next_ifd: u32 = if plane_idx + 1 < plane_count {
-                ifd_file_offsets[plane_idx + 1] as u32
+                classic_tiff_u32(ifd_file_offsets[plane_idx + 1], "next IFD offset")?
             } else {
                 0
             };
@@ -997,10 +1069,15 @@ impl FormatWriter for TiffWriter {
 
         // Patch header: write first_ifd_file_offset at byte 4
         w.seek(SeekFrom::Start(4)).map_err(BioFormatsError::Io)?;
-        write_le_u32(w, first_ifd_file_offset as u32).map_err(BioFormatsError::Io)?;
+        write_le_u32(
+            w,
+            classic_tiff_u32(first_ifd_file_offset, "first IFD offset")?,
+        )
+        .map_err(BioFormatsError::Io)?;
 
         w.flush().map_err(BioFormatsError::Io)?;
         self.file = None;
+        self.meta = None;
         self.plane_strips.clear();
         self.planes_written = 0;
         Ok(())

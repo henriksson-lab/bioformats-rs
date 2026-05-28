@@ -9,6 +9,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 fn r_u32_le(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
@@ -124,10 +125,10 @@ impl FormatReader for NorpixReader {
         let compressed = matches!(desc_fmt, 100 | 102);
 
         let (pixel_type, bpp, channels): (PixelType, u8, u32) = match desc_fmt {
-            0 | 100 => (PixelType::Uint8, 8, 1),  // mono 8-bit (raw / JPEG)
-            1 => (PixelType::Uint16, 16, 1),      // mono 16-bit
-            2 | 102 => (PixelType::Uint8, 8, 3),  // color BGR24 (raw / JPEG)
-            101 => (PixelType::Uint16, 16, 1),    // mono 16-bit alt
+            0 | 100 => (PixelType::Uint8, 8, 1), // mono 8-bit (raw / JPEG)
+            1 => (PixelType::Uint16, 16, 1),     // mono 16-bit
+            2 | 102 => (PixelType::Uint8, 8, 3), // color BGR24 (raw / JPEG)
+            101 => (PixelType::Uint16, 16, 1),   // mono 16-bit alt
             _ => {
                 // fall back on bit_depth
                 if bit_depth <= 8 {
@@ -242,7 +243,9 @@ impl FormatReader for NorpixReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -270,7 +273,8 @@ impl FormatReader for NorpixReader {
                 .map(|next| next.saturating_sub(4))
                 .unwrap_or(file_len);
             let len = end.saturating_sub(start) as usize;
-            f.seek(SeekFrom::Start(start)).map_err(BioFormatsError::Io)?;
+            f.seek(SeekFrom::Start(start))
+                .map_err(BioFormatsError::Io)?;
             let mut jpeg = vec![0u8; len];
             f.read_exact(&mut jpeg).map_err(BioFormatsError::Io)?;
             let decoded = crate::common::codec::decompress_jpeg(&jpeg)?;
@@ -306,17 +310,9 @@ impl FormatReader for NorpixReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let spp = meta.size_c as usize;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * spp * bps..x as usize * spp * bps + out_row]);
-        }
-        Ok(out)
+        crop_full_plane("Norpix SEQ", &full, meta, spp, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -341,10 +337,7 @@ impl FormatReader for NorpixReader {
                         the_z: z,
                         the_c: 0,
                         the_t: 0,
-                        delta_t: self
-                            .timestamps
-                            .get(i as usize)
-                            .map(|t| t - base),
+                        delta_t: self.timestamps.get(i as usize).map(|t| t - base),
                         ..Default::default()
                     }
                 })
@@ -572,7 +565,9 @@ impl FormatReader for IplabReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -602,17 +597,9 @@ impl FormatReader for IplabReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let spp = if meta.is_rgb { 3usize } else { 1usize };
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * spp * bps..x as usize * spp * bps + out_row]);
-        }
-        Ok(out)
+        crop_full_plane("IPLab", &full, meta, spp, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

@@ -54,9 +54,8 @@ fn load_pcx(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     // Java: seek(1); version=read(); skip(1); bitsPerPixel=read();
     let version = header[1] as i32;
     let _bits_per_pixel = header[3];
-    let read_i16 = |off: usize| -> i32 {
-        i16::from_le_bytes([header[off], header[off + 1]]) as i32
-    };
+    let read_i16 =
+        |off: usize| -> i32 { i16::from_le_bytes([header[off], header[off + 1]]) as i32 };
     let x_min = read_i16(4);
     let y_min = read_i16(6);
     let x_max = read_i16(8);
@@ -238,7 +237,9 @@ impl FormatReader for PcxReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -264,7 +265,9 @@ impl FormatReader for PcxReader {
         let sh = meta.size_y as usize;
         let channels = meta.size_c as usize;
         let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
-        if x + w > sw || y + h > sh {
+        if x.checked_add(w).is_none_or(|end| end > sw)
+            || y.checked_add(h).is_none_or(|end| end > sh)
+        {
             return Err(BioFormatsError::InvalidData(
                 "PCX: requested region out of bounds".into(),
             ));

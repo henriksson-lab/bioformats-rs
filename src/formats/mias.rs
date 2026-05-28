@@ -13,6 +13,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -39,18 +40,6 @@ fn simple_meta(w: u32, h: u32, z: u32, pt: PixelType) -> ImageMetadata {
         modulo_c: None,
         modulo_t: None,
     }
-}
-
-fn region_crop(full: &[u8], meta: &ImageMetadata, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
-    let bps = meta.pixel_type.bytes_per_sample();
-    let row = meta.size_x as usize * bps;
-    let out_row = w as usize * bps;
-    let mut out = Vec::with_capacity(h as usize * out_row);
-    for r in 0..h as usize {
-        let src = &full[(y as usize + r) * row..];
-        out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-    }
-    out
 }
 
 fn checked_payload_len(meta: &ImageMetadata) -> Result<u64> {
@@ -168,20 +157,18 @@ impl FormatReader for CellWorxReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
     fn series(&self) -> usize {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -236,13 +223,25 @@ impl Default for Al3dReader {
 
 fn parse_al3d(path: &Path) -> Result<ImageMetadata> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-    if data.len() < 24 {
-        return Err(BioFormatsError::Format("AL3D file too short".into()));
+    if data.len() < AL3D_DATA_OFFSET as usize {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "AL3D file too short for declared header offset".into(),
+        ));
+    }
+    if &data[..4] != AL3D_MAGIC {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "AL3D file is missing AL3D magic".into(),
+        ));
     }
     // Offset 8: width (u32 LE), 12: height (u32 LE), 16: depth (u32 LE)
-    let width = u32::from_le_bytes([data[8], data[9], data[10], data[11]]).max(1);
-    let height = u32::from_le_bytes([data[12], data[13], data[14], data[15]]).max(1);
-    let depth = u32::from_le_bytes([data[16], data[17], data[18], data[19]]).max(1);
+    let width = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let height = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+    let depth = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+    if width == 0 || height == 0 || depth == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "AL3D file has zero image dimensions".into(),
+        ));
+    }
     // Offset 20: data_type (u16 LE)
     let data_type = u16::from_le_bytes([data[20], data[21]]);
     let pixel_type = match data_type {
@@ -304,7 +303,9 @@ impl FormatReader for Al3dReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -337,8 +338,8 @@ impl FormatReader for Al3dReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        Ok(region_crop(&full, meta, x, y, w, h))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("AL3D", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -377,7 +378,7 @@ impl Default for FeiSerReader {
 
 fn parse_ser(path: &Path) -> Result<ImageMetadata> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-    if data.len() < 30 {
+    if data.len() < 32 {
         return Err(BioFormatsError::UnsupportedFormat(
             "FEI SER header is too short for safe image decoding".to_string(),
         ));
@@ -432,20 +433,18 @@ impl FormatReader for FeiSerReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        0
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
     fn series(&self) -> usize {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -572,7 +571,9 @@ impl FormatReader for OxfordInstrumentsReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -604,8 +605,8 @@ impl FormatReader for OxfordInstrumentsReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        Ok(region_crop(&full, meta, x, y, w, h))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Oxford Instruments", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -731,7 +732,9 @@ impl MiasReader {
         let well_dir = if base.is_dir() {
             base.clone()
         } else {
-            base.parent().map(|p| p.to_path_buf()).unwrap_or(base.clone())
+            base.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(base.clone())
         };
         let plate_dir = well_dir
             .parent()
@@ -923,8 +926,7 @@ fn collect_well_tiffs(well_dir: &Path) -> Vec<PathBuf> {
             for p in &paths {
                 if p.is_dir() {
                     if let Ok(sub) = std::fs::read_dir(p) {
-                        let mut subpaths: Vec<PathBuf> =
-                            sub.flatten().map(|e| e.path()).collect();
+                        let mut subpaths: Vec<PathBuf> = sub.flatten().map(|e| e.path()).collect();
                         subpaths.sort();
                         for sp in subpaths {
                             if let Some(name) = sp.file_name().and_then(|n| n.to_str()) {
@@ -1018,7 +1020,7 @@ impl FormatReader for MiasReader {
     fn metadata(&self) -> &ImageMetadata {
         self.series
             .get(self.current_series)
-            .expect("set_id not called")
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1067,8 +1069,7 @@ impl FormatReader for MiasReader {
 
         for row in 0..tile_rows {
             for col in 0..tile_cols {
-                let tile_index =
-                    ((plane_index * tile_rows + row) * tile_cols + col) as usize;
+                let tile_index = ((plane_index * tile_rows + row) * tile_cols + col) as usize;
                 let tiff_path = {
                     let well = self
                         .wells
@@ -1118,8 +1119,11 @@ impl FormatReader for MiasReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.series.get(self.current_series).unwrap();
-        Ok(region_crop(&full, meta, x, y, w, h))
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("MIAS", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

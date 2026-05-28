@@ -1,0 +1,11 @@
+[package]
+name = "ome-metakit"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "First-pass Rust reader for OME Metakit database files"
+repository = "https://github.com/henriksson-lab/bioformats-rs"
+
+[lib]
+name = "ome_metakit"
+path = "src/lib.rs"

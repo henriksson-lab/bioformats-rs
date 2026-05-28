@@ -51,8 +51,8 @@ impl FormatReader for LifReader {
             .unwrap_or(false)
     }
 
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        !header.is_empty() && header[0] == LIF_MAGIC
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -62,7 +62,7 @@ impl FormatReader for LifReader {
 
         if !self.is_this_type_by_name(path) {
             let header = std::fs::read(path).map_err(BioFormatsError::Io)?;
-            if !self.is_this_type_by_bytes(&header) {
+            if header.first().copied() != Some(LIF_MAGIC) {
                 return Err(BioFormatsError::Format("Not a Leica LIF file".into()));
             }
         }
@@ -78,15 +78,11 @@ impl FormatReader for LifReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
-        if series != 0 {
-            return Err(BioFormatsError::SeriesOutOfRange(series));
-        }
-        self.current_series = series;
-        Ok(())
+        Err(BioFormatsError::SeriesOutOfRange(series))
     }
 
     fn series(&self) -> usize {
@@ -94,7 +90,7 @@ impl FormatReader for LifReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        &self.meta
+        crate::common::reader::uninitialized_metadata()
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {

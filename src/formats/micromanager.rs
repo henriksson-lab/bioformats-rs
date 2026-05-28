@@ -151,8 +151,7 @@ impl Position {
     /// Resolve the TIFF file for a given plane index, mirroring Java `getFile`.
     fn file_for_plane(&self, no: u32) -> Option<PathBuf> {
         let m = &self.meta;
-        let (z, c, t) =
-            Self::zct_coords(m.dimension_order, m.size_z, m.size_c, m.size_t, no);
+        let (z, c, t) = Self::zct_coords(m.dimension_order, m.size_z, m.size_c, m.size_t, no);
         let key = Index { z, c, t };
         if let Some(p) = self.file_name_map.get(&key) {
             return Some(p.clone());
@@ -245,8 +244,14 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
     let image_count = channels * slices * frames;
 
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-    meta_map.insert("format".into(), MetadataValue::String("MicroManager".into()));
-    meta_map.insert("pixel_type_str".into(), MetadataValue::String(pixel_type_str));
+    meta_map.insert(
+        "format".into(),
+        MetadataValue::String("MicroManager".into()),
+    );
+    meta_map.insert(
+        "pixel_type_str".into(),
+        MetadataValue::String(pixel_type_str),
+    );
 
     // Richer metadata, mirroring Java MicromanagerReader.parsePosition:
     //   channel names (ChNames), channel colors (ChColors), pixel calibration
@@ -497,11 +502,10 @@ impl FormatReader for MicromanagerReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        &self
-            .positions
+        self.positions
             .get(self.series)
-            .expect("set_id not called")
-            .meta
+            .map(|position| &position.meta)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

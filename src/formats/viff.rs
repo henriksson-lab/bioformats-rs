@@ -17,9 +17,15 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::validate_region;
 
 fn read_i32(buf: &[u8], offset: usize, little: bool) -> i32 {
-    let b = [buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]];
+    let b = [
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ];
     if little {
         i32::from_le_bytes(b)
     } else {
@@ -35,27 +41,27 @@ struct ViffParsed {
 fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
     // Need at least the fixed 1024-byte header.
     if data.len() < 584 {
-        return Err(BioFormatsError::Format("VIFF/Khoros header too short".into()));
+        return Err(BioFormatsError::Format(
+            "VIFF/Khoros header too short".into(),
+        ));
     }
 
     // skipBytes(4); order(true); dependency = readInt() [big-endian].
     let dependency = read_i32(data, 4, false);
 
     // Comment block: readString(512) at pos 8..520.
-    let comment = String::from_utf8_lossy(&data[8..520]).trim_end_matches('\0').to_string();
+    let comment = String::from_utf8_lossy(&data[8..520])
+        .trim_end_matches('\0')
+        .to_string();
 
     // Remaining reads use little-endian iff dependency is 4 or 8.
     let little = dependency == 4 || dependency == 8;
 
-    let size_x = read_i32(data, 520, little).max(0) as u32;
-    let size_y = read_i32(data, 524, little).max(0) as u32;
+    let size_x = positive_i32_dim(read_i32(data, 520, little), "width")?;
+    let size_y = positive_i32_dim(read_i32(data, 524, little), "height")?;
     // skipBytes(28) -> pos 556
-    let mut image_count = read_i32(data, 556, little);
-    if image_count == 0 {
-        image_count = 1;
-    }
-    let image_count = image_count.max(1) as u32;
-    let mut size_c = read_i32(data, 560, little).max(1) as u32;
+    let image_count = positive_i32_dim(read_i32(data, 556, little), "image count")?;
+    let mut size_c = positive_i32_dim(read_i32(data, 560, little), "channel count")?;
 
     let type_code = read_i32(data, 564, little);
     let pixel_type = match type_code {
@@ -81,14 +87,16 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
         size_c = lut_c as u32;
         // n = readInt() at 584.
         if data.len() < 588 {
-            return Err(BioFormatsError::Format("VIFF/Khoros header too short for LUT".into()));
+            return Err(BioFormatsError::Format(
+                "VIFF/Khoros header too short for LUT".into(),
+            ));
         }
         let n = read_i32(data, 584, little).max(0) as usize;
         // skipBytes(436): pos 588 -> 1024. LUT bytes start at 1024.
         let lut_start = 1024usize;
-        let lut_bytes = (lut_c as usize).checked_mul(n).ok_or_else(|| {
-            BioFormatsError::Format("VIFF/Khoros LUT size overflow".into())
-        })?;
+        let lut_bytes = (lut_c as usize)
+            .checked_mul(n)
+            .ok_or_else(|| BioFormatsError::Format("VIFF/Khoros LUT size overflow".into()))?;
         if lut_start + lut_bytes > data.len() {
             return Err(BioFormatsError::Format(
                 "VIFF/Khoros LUT extends past end of file".into(),
@@ -123,12 +131,6 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
     } else {
         // skipBytes(440): pos 584 -> 1024.
         offset = 1024;
-    }
-
-    if size_x == 0 || size_y == 0 {
-        return Err(BioFormatsError::Format(
-            "VIFF/Khoros header is missing image dimensions".into(),
-        ));
     }
 
     let is_indexed = lookup_table.is_some();
@@ -167,7 +169,41 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
         modulo_t: None,
     };
 
+    validate_viff_payload(data.len() as u64, offset, &meta)?;
+
     Ok(ViffParsed { meta, offset })
+}
+
+fn positive_i32_dim(value: i32, label: &str) -> Result<u32> {
+    if value <= 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "VIFF/Khoros header has non-positive {label}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+fn validate_viff_payload(file_len: u64, data_offset: u64, meta: &ImageMetadata) -> Result<()> {
+    let plane_bytes = (meta.size_x as u64)
+        .checked_mul(meta.size_y as u64)
+        .and_then(|px| px.checked_mul(meta.size_c as u64))
+        .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample() as u64))
+        .ok_or_else(|| BioFormatsError::Format("VIFF/Khoros payload size overflows".into()))?;
+    let required_len = data_offset
+        .checked_add(
+            plane_bytes
+                .checked_mul(meta.image_count as u64)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("VIFF/Khoros payload size overflows".into())
+                })?,
+        )
+        .ok_or_else(|| BioFormatsError::Format("VIFF/Khoros payload size overflows".into()))?;
+    if file_len < required_len {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "VIFF/Khoros pixel payload is shorter than declared ({file_len} < {required_len})"
+        )));
+    }
+    Ok(())
 }
 
 pub struct ViffReader {
@@ -247,7 +283,9 @@ impl FormatReader for ViffReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -276,14 +314,26 @@ impl FormatReader for ViffReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        validate_region("VIFF", meta.size_x, meta.size_y, x, y, w, h)?;
         let bps = meta.pixel_type.bytes_per_sample();
         // Planar (non-interleaved) layout: each channel is a separate plane.
         let channels = meta.size_c as usize;
-        let plane = meta.size_x as usize * meta.size_y as usize * bps;
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let out_plane = w as usize * h as usize * bps;
+        let plane = meta
+            .size_x
+            .checked_mul(meta.size_y)
+            .and_then(|px| (px as usize).checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::Format("VIFF plane is too large".into()))?;
+        let row = (meta.size_x as usize)
+            .checked_mul(bps)
+            .ok_or_else(|| BioFormatsError::Format("VIFF row is too large".into()))?;
+        let out_row = (w as usize)
+            .checked_mul(bps)
+            .ok_or_else(|| BioFormatsError::Format("VIFF region row is too large".into()))?;
+        let out_plane = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::Format("VIFF region is too large".into()))?;
         let mut out = vec![0u8; out_plane * channels];
         for c in 0..channels {
             let src_plane = &full[c * plane..(c + 1) * plane];

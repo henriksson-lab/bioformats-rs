@@ -20,6 +20,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 // ── VR codes that use 4-byte length (reserved 2 bytes + uint32) ──────────────
 fn vr_has_long_length(vr: &[u8; 2]) -> bool {
@@ -769,7 +770,22 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
             (0x0028, 0x0008) => {
                 // Number of Frames (IS string)
                 let s = ascii_trim(&value);
-                attrs.number_of_frames = s.trim().parse().unwrap_or(1);
+                let trimmed = s.trim();
+                let frames = if trimmed.is_empty() {
+                    1
+                } else {
+                    trimmed.parse().map_err(|_| {
+                        BioFormatsError::InvalidData(format!(
+                            "DICOM: invalid NumberOfFrames value: {trimmed}"
+                        ))
+                    })?
+                };
+                if frames == 0 {
+                    return Err(BioFormatsError::InvalidData(
+                        "DICOM: NumberOfFrames must be positive".into(),
+                    ));
+                }
+                attrs.number_of_frames = frames;
             }
             (0x0028, 0x0004) => attrs.photometric_interpretation = ascii_trim(&value),
             (0x0028, 0x0010) => attrs.rows = read_u16(&value),
@@ -923,7 +939,10 @@ fn timestamp_microseconds(v: Option<&str>) -> i128 {
         return 0;
     }
     let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let hours = digits.get(0..2).and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+    let hours = digits
+        .get(0..2)
+        .and_then(|s| s.parse::<i128>().ok())
+        .unwrap_or(0);
     let mut total = hours * 60 * 60;
     if let Some(m) = digits.get(2..4).and_then(|s| s.parse::<i128>().ok()) {
         total += m * 60;
@@ -1024,8 +1043,7 @@ fn build_dicom_file_list(
 
             let reader = DicomReader::new();
             for file in files {
-                let file_abs =
-                    std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                let file_abs = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
                 if file_abs == abs {
                     continue;
                 }
@@ -1055,10 +1073,16 @@ fn build_dicom_file_list(
                     }
                     if pos < bucket.len() {
                         bucket[pos] = Some(file_abs.clone());
-                    } else if !bucket.iter().any(|f| f.as_deref() == Some(file_abs.as_path())) {
+                    } else if !bucket
+                        .iter()
+                        .any(|f| f.as_deref() == Some(file_abs.as_path()))
+                    {
                         bucket.push(Some(file_abs.clone()));
                     }
-                } else if !bucket.iter().any(|f| f.as_deref() == Some(file_abs.as_path())) {
+                } else if !bucket
+                    .iter()
+                    .any(|f| f.as_deref() == Some(file_abs.as_path()))
+                {
                     while position > bucket.len() {
                         bucket.push(None);
                     }
@@ -1383,10 +1407,8 @@ fn invert_monochrome1(
             //   maxPixelValue = maxPixelRange + (centerPixelValue / 2);
             //   if (maxPixelRange == -1 || centerPixelValue < (maxPixelRange/2))
             //     maxPixelValue = defaultMinMax(pixelType)[1];
-            let mut max_pixel_value =
-                max_pixel_range as i64 + (center_pixel_value as i64) / 2;
-            if max_pixel_range == -1 || (center_pixel_value as i64) < (max_pixel_range as i64) / 2
-            {
+            let mut max_pixel_value = max_pixel_range as i64 + (center_pixel_value as i64) / 2;
+            if max_pixel_range == -1 || (center_pixel_value as i64) < (max_pixel_range as i64) / 2 {
                 max_pixel_value = default_max_value(meta);
             }
             for px in buf.chunks_exact_mut(2) {
@@ -1486,6 +1508,14 @@ fn decode_dicom_rle(
             "DICOM RLE: invalid segment count {num_segments}"
         )));
     }
+    let expected_segments = ec
+        .checked_mul(bpp)
+        .ok_or_else(|| BioFormatsError::InvalidData("DICOM RLE: segment count overflow".into()))?;
+    if num_segments < expected_segments {
+        return Err(BioFormatsError::InvalidData(format!(
+            "DICOM RLE: {num_segments} segments, expected at least {expected_segments}"
+        )));
+    }
 
     // Read segment offsets and derive per-segment lengths.
     let mut offsets = Vec::with_capacity(num_segments + 1);
@@ -1500,15 +1530,24 @@ fn decode_dicom_rle(
     let mut segments: Vec<Vec<u8>> = Vec::with_capacity(num_segments);
     for s in 0..num_segments {
         let start = offsets[s];
-        let end = offsets[s + 1].max(start).min(data.len());
+        let end = offsets[s + 1];
         if start > data.len() {
             return Err(BioFormatsError::Format(
                 "DICOM RLE: segment offset past end of fragment".into(),
             ));
         }
-        let mut seg = crate::common::codec::decompress_packbits(&data[start..end])?;
-        // Each segment should yield exactly `plane` bytes; pad/truncate to be safe.
-        seg.resize(plane, 0);
+        if end < start || end > data.len() {
+            return Err(BioFormatsError::InvalidData(
+                "DICOM RLE: invalid segment offset table".into(),
+            ));
+        }
+        let seg = crate::common::codec::decompress_packbits(&data[start..end])?;
+        if seg.len() != plane {
+            return Err(BioFormatsError::InvalidData(format!(
+                "DICOM RLE: segment {s} decoded to {} bytes, expected {plane}",
+                seg.len()
+            )));
+        }
         segments.push(seg);
     }
 
@@ -1521,9 +1560,6 @@ fn decode_dicom_rle(
         for j in 0..bpp {
             // Most-significant plane first in segment order.
             let seg_index = c * bpp + (bpp - 1 - j);
-            if seg_index >= segments.len() {
-                continue;
-            }
             let seg = &segments[seg_index];
             for p in 0..plane {
                 out[(p * ec + c) * bpp + j] = seg[p];
@@ -1827,7 +1863,9 @@ impl FormatReader for DicomReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1993,18 +2031,8 @@ impl FormatReader for DicomReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let spp = meta.size_c as usize;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * spp * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("DICOM", &full, meta, meta.size_c as usize, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -2110,13 +2138,27 @@ fn write_elem_str(
 ) -> std::io::Result<()> {
     let mut data = s.as_bytes().to_vec();
     if data.len() % 2 != 0 {
-        data.push(0x20);
+        data.push(if vr == b"UI" { 0x00 } else { 0x20 });
     } // pad to even
     write_elem(w, group, elem, vr, &data)
 }
 
 fn write_elem_u16(w: &mut impl Write, group: u16, elem: u16, v: u16) -> std::io::Result<()> {
     write_elem(w, group, elem, b"US", &v.to_le_bytes())
+}
+
+fn dicom_writer_bits(meta: &ImageMetadata) -> (u16, u16) {
+    let allocated = match meta.pixel_type {
+        PixelType::Bit => 1,
+        _ => (meta.pixel_type.bytes_per_sample() * 8) as u16,
+    };
+    let requested = u16::from(meta.bits_per_pixel);
+    let stored = if requested == 0 || requested > allocated || (requested == 8 && allocated != 8) {
+        allocated
+    } else {
+        requested
+    };
+    (allocated, stored)
 }
 
 /// Generate a simple UID based on timestamp + counter.
@@ -2140,6 +2182,11 @@ impl crate::common::writer::FormatWriter for DicomWriter {
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        if meta.pixel_type == PixelType::Bit {
+            return Err(BioFormatsError::Format(
+                "DICOM writer does not support PixelType::Bit".into(),
+            ));
+        }
         self.meta = Some(meta.clone());
         self.planes.clear();
         Ok(())
@@ -2150,12 +2197,29 @@ impl crate::common::writer::FormatWriter for DicomWriter {
         Ok(())
     }
 
-    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "DICOM",
+            meta,
+            self.planes.len(),
+            plane_index,
+            data.len(),
+        )?;
         self.planes.push(data.to_vec());
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let _path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_complete("DICOM", meta, self.planes.len())?;
+        if meta.size_x > u16::MAX as u32 || meta.size_y > u16::MAX as u32 {
+            return Err(BioFormatsError::Format(format!(
+                "DICOM writer: dimensions {}x{} exceed 16-bit Rows/Columns limit",
+                meta.size_x, meta.size_y
+            )));
+        }
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
 
@@ -2210,7 +2274,7 @@ impl crate::common::writer::FormatWriter for DicomWriter {
             .map_err(BioFormatsError::Io)?;
 
         // Image module
-        let bps = meta.bits_per_pixel as u16;
+        let (bits_allocated, bits_stored) = dicom_writer_bits(&meta);
         let spp = if meta.is_rgb { meta.size_c as u16 } else { 1 };
         let photometric = if meta.is_rgb { "RGB" } else { "MONOCHROME2" };
         let pixel_rep: u16 = match meta.pixel_type {
@@ -2220,11 +2284,16 @@ impl crate::common::writer::FormatWriter for DicomWriter {
 
         write_elem_u16(&mut w, 0x0028, 0x0002, spp).map_err(BioFormatsError::Io)?; // SamplesPerPixel
         write_elem_str(&mut w, 0x0028, 0x0004, b"CS", photometric).map_err(BioFormatsError::Io)?;
+        if meta.is_rgb {
+            let planar_configuration = if meta.is_interleaved { 0 } else { 1 };
+            write_elem_u16(&mut w, 0x0028, 0x0006, planar_configuration)
+                .map_err(BioFormatsError::Io)?; // PlanarConfiguration
+        }
         write_elem_u16(&mut w, 0x0028, 0x0010, meta.size_y as u16).map_err(BioFormatsError::Io)?; // Rows
         write_elem_u16(&mut w, 0x0028, 0x0011, meta.size_x as u16).map_err(BioFormatsError::Io)?; // Columns
-        write_elem_u16(&mut w, 0x0028, 0x0100, bps).map_err(BioFormatsError::Io)?; // BitsAllocated
-        write_elem_u16(&mut w, 0x0028, 0x0101, bps).map_err(BioFormatsError::Io)?; // BitsStored
-        write_elem_u16(&mut w, 0x0028, 0x0102, bps - 1).map_err(BioFormatsError::Io)?; // HighBit
+        write_elem_u16(&mut w, 0x0028, 0x0100, bits_allocated).map_err(BioFormatsError::Io)?; // BitsAllocated
+        write_elem_u16(&mut w, 0x0028, 0x0101, bits_stored).map_err(BioFormatsError::Io)?; // BitsStored
+        write_elem_u16(&mut w, 0x0028, 0x0102, bits_stored - 1).map_err(BioFormatsError::Io)?; // HighBit
         write_elem_u16(&mut w, 0x0028, 0x0103, pixel_rep).map_err(BioFormatsError::Io)?; // PixelRepresentation
 
         if self.planes.len() > 1 {
@@ -2244,12 +2313,17 @@ impl crate::common::writer::FormatWriter for DicomWriter {
             .map_err(BioFormatsError::Io)?;
         w.write_all(&0x0010u16.to_le_bytes())
             .map_err(BioFormatsError::Io)?;
-        w.write_all(b"OW").map_err(BioFormatsError::Io)?;
+        let pixel_data_vr = if bits_allocated <= 8 { b"OB" } else { b"OW" };
+        w.write_all(pixel_data_vr).map_err(BioFormatsError::Io)?;
         w.write_all(&[0u8; 2]).map_err(BioFormatsError::Io)?; // reserved
-        w.write_all(&(total_bytes as u32).to_le_bytes())
+        let padded_total_bytes = total_bytes + (total_bytes % 2);
+        w.write_all(&(padded_total_bytes as u32).to_le_bytes())
             .map_err(BioFormatsError::Io)?;
         for plane in &self.planes {
             w.write_all(plane).map_err(BioFormatsError::Io)?;
+        }
+        if total_bytes % 2 != 0 {
+            w.write_all(&[0]).map_err(BioFormatsError::Io)?;
         }
 
         w.flush().map_err(BioFormatsError::Io)?;

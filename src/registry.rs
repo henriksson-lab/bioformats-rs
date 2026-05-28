@@ -4,6 +4,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::peek_header;
 use crate::common::metadata::ImageMetadata;
 use crate::common::ome_metadata::OmeMetadata;
+use crate::common::path::confined_join;
 use crate::common::reader::FormatReader;
 
 /// The top-level reader that auto-detects the file format and delegates to the
@@ -304,14 +305,14 @@ impl ImageReader {
 }
 
 pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
-    let header = peek_header(path, 512).unwrap_or_default();
+    let header = peek_header(path, 512)?;
     let mut best_error = None;
 
     // TIFF-based vendor wrappers often have no magic beyond TIFF itself.
     // Give non-generic TIFF extensions a chance before the broad TiffReader
     // byte signature accepts the file.
     if is_tiff_header(&header) {
-        for mut r in tiff_wrapper_readers_for_extension(path) {
+        for mut r in tiff_wrapper_readers_for_extension(path, &header) {
             match r.set_id(path) {
                 Ok(()) => return Ok(r),
                 Err(err) => remember_set_id_error(&mut best_error, err),
@@ -327,6 +328,10 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
                 Err(err @ BioFormatsError::UnsupportedFormat(_))
                     if unsupported_magic_error_is_terminal(&err) =>
                 {
+                    if has_fake_extension(path) && terminal_magic_allows_fake_fallback(&err) {
+                        remember_set_id_error(&mut best_error, err);
+                        continue;
+                    }
                     return Err(err);
                 }
                 Err(err) => remember_set_id_error(&mut best_error, err),
@@ -356,6 +361,59 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
         .unwrap_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string())))
 }
 
+fn has_fake_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("fake"))
+        .unwrap_or(false)
+}
+
+fn terminal_magic_allows_fake_fallback(err: &BioFormatsError) -> bool {
+    matches!(
+        err,
+        BioFormatsError::UnsupportedFormat(message)
+            if message.contains("Bruker OPUS spectral image decoding")
+    )
+}
+
+/// Select a likely reader without calling `set_id`.
+///
+/// This is used only for memoized metadata cache hits where the file stamp and
+/// cached metadata shape have already been validated and callers may never read
+/// pixels. Name matching is tried before broad magic matching so extension
+/// fallbacks that previously succeeded after a magic-reader `set_id` rejection
+/// can still use their cached metadata without paying the full parse cost.
+pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn FormatReader>> {
+    let header = peek_header(path, 512)?;
+
+    if is_tiff_header(&header) {
+        let readers = if is_generic_tiff_extension(path) {
+            generic_tiff_name_wrappers(path, &header)
+        } else {
+            tiff_wrapper_readers_for_extension(path, &header)
+        };
+        if let Some(reader) = readers.into_iter().next() {
+            return Ok(reader);
+        }
+    }
+
+    for r in all_readers() {
+        if r.is_this_type_by_name(path) {
+            return Ok(r);
+        }
+    }
+
+    for r in all_readers() {
+        if r.is_this_type_by_bytes(&header) {
+            return Ok(r);
+        }
+    }
+
+    Err(BioFormatsError::UnsupportedFormat(
+        path.display().to_string(),
+    ))
+}
+
 fn is_tiff_header(header: &[u8]) -> bool {
     header.len() >= 4
         && (header[0..2] == [0x49, 0x49] || header[0..2] == [0x4D, 0x4D])
@@ -365,7 +423,7 @@ fn is_tiff_header(header: &[u8]) -> bool {
             || header[2..4] == [0, 43])
 }
 
-fn tiff_wrapper_readers_for_extension(path: &Path) -> Vec<Box<dyn FormatReader>> {
+fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn FormatReader>> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -412,20 +470,231 @@ fn tiff_wrapper_readers_for_extension(path: &Path) -> Vec<Box<dyn FormatReader>>
         Some("xlef") => vec![boxed_reader(crate::formats::flim2::XlefReader::new())],
         Some("ctf") => vec![boxed_reader(crate::formats::flim2::MicroCtReader::new())],
         Some("ndpis") => vec![boxed_reader(crate::formats::flim2::NdpisReader::new())],
-        // MIAS datasets are plain TIFFs, so the generic TiffReader would win the
-        // magic pass. Give MiasReader a chance first, but ONLY when the file is
-        // genuinely a MIAS plane (a Well<xxxx> directory + mode/z/t naming), so
-        // ordinary .tif files still fall through to the generic TiffReader.
+        // Generic .tif/.tiff TIFF wrappers only run early when they can be
+        // identified from wrapper-specific metadata. Several wrapper readers
+        // otherwise accept by extension and delegate to TiffReader, which would
+        // steal ordinary TIFF files from explicit generic TIFF handling.
         Some("tif") | Some("tiff") => {
-            let mias = crate::formats::mias::MiasReader::new();
-            if mias.is_this_type_by_name(path) {
-                vec![boxed_reader(mias)]
-            } else {
-                Vec::new()
+            // MIAS datasets are plain TIFFs, so the generic TiffReader would
+            // win the magic pass. Give MiasReader a chance first, but ONLY when
+            // the file is genuinely a MIAS plane (a Well<xxxx> directory +
+            // mode/z/t naming), so ordinary .tif files still fall through.
+            let mut readers = generic_tiff_name_wrappers(path, header);
+
+            if let Some(description) = tiff_image_description(path) {
+                readers.extend(generic_tiff_wrappers_for_description(
+                    ext.as_deref().unwrap_or_default(),
+                    &description,
+                ));
             }
+
+            readers
         }
         _ => Vec::new(),
     }
+}
+
+fn is_generic_tiff_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "tif" | "tiff"))
+        .unwrap_or(false)
+}
+
+fn generic_tiff_name_wrappers(path: &Path, header: &[u8]) -> Vec<Box<dyn FormatReader>> {
+    let mut readers = Vec::new();
+    let mias = crate::formats::mias::MiasReader::new();
+    if mias.is_this_type_by_name(path) {
+        readers.push(boxed_reader(mias));
+    }
+    if has_prairie_xml_sibling(path) {
+        readers.push(boxed_reader(crate::formats::prairie::PrairieReader::new()));
+    }
+    let lei = crate::formats::lei::LeiReader::new();
+    if has_lei_sibling(path) && lei.is_this_type_by_bytes(header) {
+        readers.push(boxed_reader(lei));
+    }
+    readers
+}
+
+fn has_prairie_xml_sibling(path: &Path) -> bool {
+    find_prairie_xml_sibling(path)
+        .and_then(|xml| std::fs::read_to_string(&xml).ok().map(|text| (xml, text)))
+        .map(|(xml_path, text)| {
+            let prefix = text.get(..text.len().min(256)).unwrap_or(&text);
+            prefix.contains("<PVScan") && prairie_xml_references_tiff(&xml_path, &text, path)
+        })
+        .unwrap_or(false)
+}
+
+fn prairie_xml_references_tiff(xml_path: &Path, xml: &str, tiff_path: &Path) -> bool {
+    let Some(xml_dir) = xml_path.parent() else {
+        return false;
+    };
+    xml.lines().any(|line| {
+        line.contains("<File")
+            && extract_xml_attr(line, "filename")
+                .and_then(|value| confined_join(xml_dir, value))
+                .map(|candidate| candidate == tiff_path)
+                .unwrap_or(false)
+    })
+}
+
+fn extract_xml_attr<'a>(text: &'a str, attr: &str) -> Option<&'a str> {
+    let search = format!("{attr}=\"");
+    let start = text.find(search.as_str())? + search.len();
+    let end = text[start..].find('"')? + start;
+    Some(&text[start..end])
+}
+
+fn find_prairie_xml_sibling(path: &Path) -> Option<std::path::PathBuf> {
+    let parent = path.parent()?;
+    let mut prefix = path.file_stem()?.to_str()?.to_string();
+    loop {
+        let cand = parent.join(format!("{prefix}.xml"));
+        if cand.exists() {
+            return Some(cand);
+        }
+        match prefix.rfind('_') {
+            Some(i) => prefix.truncate(i),
+            None => break,
+        }
+    }
+    std::fs::read_dir(parent).ok().and_then(|rd| {
+        rd.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("xml"))
+                .unwrap_or(false)
+        })
+    })
+}
+
+fn has_lei_sibling(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(mut prefix) = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    loop {
+        if parent.join(format!("{prefix}.lei")).exists()
+            || parent.join(format!("{prefix}.LEI")).exists()
+        {
+            return true;
+        }
+        match prefix.rfind('_') {
+            Some(i) => prefix.truncate(i),
+            None => return false,
+        }
+    }
+}
+
+fn tiff_image_description(path: &Path) -> Option<String> {
+    let mut reader = crate::tiff::TiffReader::new();
+    reader.set_id(path).ok()?;
+    let description = reader
+        .series_list()
+        .first()?
+        .metadata
+        .series_metadata
+        .get("ImageDescription")?;
+    if let crate::common::metadata::MetadataValue::String(value) = description {
+        Some(value.clone())
+    } else {
+        None
+    }
+}
+
+fn generic_tiff_wrappers_for_description(
+    ext: &str,
+    description: &str,
+) -> Vec<Box<dyn FormatReader>> {
+    let mut readers = Vec::new();
+
+    match ext {
+        "tif" => {
+            readers.extend(hcs_tiff_wrappers_for_description(description));
+
+            if description.contains("[Acquisition Parameters]") || description.contains("FluoView")
+            {
+                readers.push(boxed_reader(
+                    crate::formats::tiff_wrappers::FluoviewTiffReader::new(),
+                ));
+            }
+            if description.contains("<Zeiss")
+                || description.contains("<zeiss")
+                || description.contains("<ApoTome")
+                || description.contains("AxioVision")
+            {
+                readers.push(boxed_reader(
+                    crate::formats::tiff_wrappers::ZeissApotomeTiffReader::new(),
+                ));
+            }
+            if description.contains("<MetaXpress")
+                || description.contains("Molecular Devices")
+                || description.contains("<PlateID")
+            {
+                readers.push(boxed_reader(
+                    crate::formats::tiff_wrappers::MolecularDevicesTiffReader::new(),
+                ));
+            }
+        }
+        "tiff" => {
+            if description.contains("<variant") || description.contains("NIS-Elements") {
+                readers.push(boxed_reader(
+                    crate::formats::tiff_wrappers::NikonElementsTiffReader::new(),
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    readers
+}
+
+fn hcs_tiff_wrappers_for_description(description: &str) -> Vec<Box<dyn FormatReader>> {
+    let mut readers = Vec::new();
+    let lower = description.to_ascii_lowercase();
+
+    if lower.contains("metaxpress")
+        || lower.contains("molecular devices")
+        || lower.contains("<plateid")
+    {
+        readers.push(boxed_reader(
+            crate::formats::hcs2::MetaxpressTiffReader::new(),
+        ));
+    }
+    if lower.contains("simplepci") || lower.contains("simple pci") || lower.contains("hcimage") {
+        readers.push(boxed_reader(
+            crate::formats::hcs2::SimplePciTiffReader::new(),
+        ));
+    }
+    if lower.contains("ionpath") || lower.contains("mibi") || lower.contains("mibiscope") {
+        readers.push(boxed_reader(
+            crate::formats::hcs2::IonpathMibiTiffReader::new(),
+        ));
+    }
+    if lower.contains("beckman coulter mias") {
+        readers.push(boxed_reader(crate::formats::hcs2::MiasTiffReader::new()));
+    }
+    if lower.contains("trestle") {
+        readers.push(boxed_reader(crate::formats::hcs2::TrestleReader::new()));
+    }
+    if lower.contains("tissuefaxs") || lower.contains("tissuegnostics") {
+        readers.push(boxed_reader(crate::formats::hcs2::TissueFaxsReader::new()));
+    }
+    if lower.contains("mikroscan") || lower.contains("microvision instruments") {
+        readers.push(boxed_reader(
+            crate::formats::hcs2::MikroscanTiffReader::new(),
+        ));
+    }
+
+    readers
 }
 
 fn boxed_reader<T: FormatReader + 'static>(reader: T) -> Box<dyn FormatReader> {
@@ -458,7 +727,10 @@ fn unsupported_magic_error_is_terminal(err: &BioFormatsError) -> bool {
 mod tests {
     use super::ImageReader;
     use crate::common::error::BioFormatsError;
-    use crate::common::metadata::MetadataValue;
+    use crate::common::metadata::{ImageMetadata, MetadataValue};
+    use crate::common::pixel_type::PixelType;
+    use crate::common::reader::FormatReader;
+    use crate::ImageWriter;
     use std::io::Write;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -469,6 +741,12 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("bioformats_registry_{nanos}_{name}"))
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = temp_path(name);
+        std::fs::create_dir(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -501,6 +779,34 @@ mod tests {
     }
 
     #[test]
+    fn terminal_unsupported_magic_still_allows_extension_fallback() {
+        let path = temp_path("magic_opus_but_fake.fake");
+        std::fs::write(&path, b"\x0a\x01not really opus").unwrap();
+
+        let reader = ImageReader::open(&path).expect("fake extension fallback failed");
+
+        assert_eq!(reader.metadata().size_x, 512);
+        assert_eq!(reader.metadata().size_y, 512);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_missing_file_preserves_io_not_found() {
+        let path = temp_path("missing.fake");
+        let _ = std::fs::remove_file(&path);
+
+        let err = match ImageReader::open(&path) {
+            Ok(_) => panic!("missing file unexpectedly opened"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, BioFormatsError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound),
+            "expected NotFound IO error, got {err:?}"
+        );
+    }
+
+    #[test]
     fn tiff_wrapper_extension_dispatch_runs_before_generic_tiff_reader() {
         let path = temp_path("wrapper_metadata.ndpi");
         write_minimal_ndpi_tiff(&path, 20.0);
@@ -515,6 +821,244 @@ mod tests {
     }
 
     #[test]
+    fn generic_tif_wrapper_dispatch_uses_fluoview_metadata_signature() {
+        let path = temp_path("fluoview_metadata.tif");
+        write_minimal_tiff_with_description(&path, "[Acquisition Parameters]\nLaser=488\n");
+
+        let reader = ImageReader::open(&path).expect("Fluoview wrapper dispatch failed");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("fluoview.Laser"),
+            Some(MetadataValue::String(value)) if value == "488"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_tif_without_wrapper_signature_still_uses_generic_tiff() {
+        let path = temp_path("plain_metadata.tif");
+        write_minimal_tiff_with_description(&path, "Laser=488\n");
+
+        let reader = ImageReader::open(&path).expect("generic TIFF dispatch failed");
+
+        assert_eq!(reader.metadata().size_x, 1);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert!(
+            !reader
+                .metadata()
+                .series_metadata
+                .keys()
+                .any(|key| key.starts_with("fluoview.")),
+            "plain TIFF should not be claimed by Fluoview wrapper"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_tif_hcs_wrapper_dispatch_uses_metadata_signature() {
+        let path = temp_path("simplepci_metadata.tif");
+        write_minimal_tiff_with_description(&path, "Created by SimplePCI HCImage\n");
+
+        let reader = ImageReader::open(&path).expect("SimplePCI wrapper dispatch failed");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("hcs2.wrapper"),
+            Some(MetadataValue::String(value)) if value == "SimplePciTiffReader"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_tif_hcs_words_without_vendor_signature_still_uses_generic_tiff() {
+        let path = temp_path("plain_hcs_words.tif");
+        write_minimal_tiff_with_description(&path, "Plate image with well A01\n");
+
+        let reader = ImageReader::open(&path).expect("generic TIFF dispatch failed");
+
+        assert!(
+            !reader
+                .metadata()
+                .series_metadata
+                .contains_key("hcs2.wrapper"),
+            "plain TIFF should not be claimed by HCS2 TIFF wrapper"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prairie_companion_tiff_entry_dispatches_before_generic_tiff() {
+        let dir = temp_dir("prairie_tiff_entry");
+        let tiff = dir.join("scan_001.tif");
+        write_minimal_tiff_with_description(&tiff, "plain TIFF");
+        std::fs::write(
+            dir.join("scan.xml"),
+            r#"<PVScan>
+<PVStateValue key="pixelsPerLine" value="1"/>
+<PVStateValue key="linesPerFrame" value="1"/>
+<PVStateValue key="bitDepth" value="8"/>
+<Sequence>
+<Frame index="0">
+<File filename="scan_001.tif" channel="1"/>
+</Frame>
+</Sequence>
+</PVScan>"#,
+        )
+        .unwrap();
+
+        let reader = ImageReader::open(&tiff).expect("Prairie TIFF entry should dispatch");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("format"),
+            Some(MetadataValue::String(value)) if value == "Prairie TIFF"
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prairie_tiff_predispatch_requires_xml_file_reference() {
+        let dir = temp_dir("prairie_tiff_unrelated");
+        let prairie_tiff = dir.join("scan_001.tif");
+        let unrelated_tiff = dir.join("unrelated.tif");
+        write_minimal_tiff_with_description(&prairie_tiff, "plain TIFF");
+        write_minimal_tiff_with_description(&unrelated_tiff, "plain TIFF");
+        std::fs::write(
+            dir.join("scan.xml"),
+            r#"<PVScan>
+<PVStateValue key="pixelsPerLine" value="1"/>
+<PVStateValue key="linesPerFrame" value="1"/>
+<PVStateValue key="bitDepth" value="8"/>
+<Sequence>
+<Frame index="0">
+<File filename="scan_001.tif" channel="1"/>
+</Frame>
+</Sequence>
+</PVScan>"#,
+        )
+        .unwrap();
+
+        let reader = ImageReader::open(&unrelated_tiff).expect("unrelated TIFF should open");
+
+        assert!(
+            !matches!(
+                reader.metadata().series_metadata.get("format"),
+                Some(MetadataValue::String(value)) if value == "Prairie TIFF"
+            ),
+            "unreferenced TIFF was claimed by Prairie pre-dispatch"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prairie_tiff_predispatch_rejects_escaping_xml_reference() {
+        let dir = temp_dir("prairie_tiff_escape");
+        let tiff = dir.join("scan_001.tif");
+        write_minimal_tiff_with_description(&tiff, "plain TIFF");
+        std::fs::write(
+            dir.join("scan.xml"),
+            r#"<PVScan>
+<PVStateValue key="pixelsPerLine" value="1"/>
+<PVStateValue key="linesPerFrame" value="1"/>
+<PVStateValue key="bitDepth" value="8"/>
+<Sequence>
+<Frame index="0">
+<File filename="../scan_001.tif" channel="1"/>
+</Frame>
+</Sequence>
+</PVScan>"#,
+        )
+        .unwrap();
+
+        let reader = ImageReader::open(&tiff).expect("TIFF should still open generically");
+
+        assert!(
+            !matches!(
+                reader.metadata().series_metadata.get("format"),
+                Some(MetadataValue::String(value)) if value == "Prairie TIFF"
+            ),
+            "escaping XML reference was accepted by Prairie pre-dispatch"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leica_tcs_single_multipage_tiff_maps_later_planes_to_later_pages() {
+        let dir = temp_dir("leica_tcs_pages");
+        let tiff = dir.join("stack.tif");
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 2,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 2,
+            ..Default::default()
+        };
+        ImageWriter::save(&tiff, &meta, &[vec![11], vec![22]]).unwrap();
+        let xml = dir.join("scan.xml");
+        std::fs::write(
+            &xml,
+            r#"<LEICA>
+<Image Width="1" Height="1"/>
+<DimensionDescription DimID="1" NumberOfElements="1" BytesInc="1"/>
+<DimensionDescription DimID="2" NumberOfElements="1"/>
+<DimensionDescription DimID="3" NumberOfElements="2"/>
+<Attachment Name="stack.tif"/>
+</LEICA>"#,
+        )
+        .unwrap();
+
+        let mut reader = crate::formats::prairie::LeicaTcsReader::new();
+        reader.set_id(&xml).unwrap();
+
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![22]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leica_tcs_single_multipage_tiff_rejects_missing_exact_page() {
+        let dir = temp_dir("leica_tcs_page_out_of_range");
+        let tiff = dir.join("stack.tif");
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        };
+        ImageWriter::save(&tiff, &meta, &[vec![11]]).unwrap();
+        let xml = dir.join("scan.xml");
+        std::fs::write(
+            &xml,
+            r#"<LEICA>
+<Image Width="1" Height="1"/>
+<DimensionDescription DimID="1" NumberOfElements="1" BytesInc="1"/>
+<DimensionDescription DimID="2" NumberOfElements="1"/>
+<DimensionDescription DimID="3" NumberOfElements="2"/>
+<Attachment Name="stack.tif"/>
+</LEICA>"#,
+        )
+        .unwrap();
+
+        let mut reader = crate::formats::prairie::LeicaTcsReader::new();
+        reader.set_id(&xml).unwrap();
+        let err = reader.open_bytes(1).unwrap_err();
+
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("TIFF page 1 out of range")),
+            "unexpected error: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn registered_unsupported_stubs_do_not_open_with_fake_metadata() {
         for (name, expected) in [
             (
@@ -525,11 +1069,11 @@ mod tests {
             ("sample.lof", "Leica LOF is a proprietary binary format"),
             (
                 "sample.oir",
-                "Olympus OIR format requires OLE2 container parsing",
+                "Olympus OIR format requires proprietary Olympus FluoView stream parsing",
             ),
             (
                 "sample.acff",
-                "Volocity Library format requires OLE2/Compound Document container parsing",
+                "Volocity Library format requires Volocity-specific OLE2 stream parsing",
             ),
             // NOTE: XRM/TXRM are no longer stubs — XrmReader is a real CFB-based
             // reader. It rejects fake/short input with a genuine CFB error
@@ -783,6 +1327,45 @@ mod tests {
             bytes.extend_from_slice(&entry);
         }
         bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.push(7);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_minimal_tiff_with_description(path: &PathBuf, description: &str) {
+        let mut desc = description.as_bytes().to_vec();
+        desc.push(0);
+
+        let ifd_entry_count = 11u32;
+        let ifd_start = 8u32;
+        let desc_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let pixel_start = desc_start + desc.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),                          // ImageWidth
+            tiff_entry(257, 4, 1, 1),                          // ImageLength
+            tiff_entry(258, 3, 1, 8),                          // BitsPerSample
+            tiff_entry(259, 3, 1, 1),                          // Compression
+            tiff_entry(262, 3, 1, 1),                          // PhotometricInterpretation
+            tiff_entry(270, 2, desc.len() as u32, desc_start), // ImageDescription
+            tiff_entry(273, 4, 1, pixel_start),                // StripOffsets
+            tiff_entry(277, 3, 1, 1),                          // SamplesPerPixel
+            tiff_entry(278, 4, 1, 1),                          // RowsPerStrip
+            tiff_entry(279, 4, 1, 1),                          // StripByteCounts
+            tiff_entry(284, 3, 1, 1),                          // PlanarConfiguration
+        ];
+
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&desc);
         bytes.push(7);
 
         std::fs::write(path, bytes).unwrap();

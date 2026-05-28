@@ -61,16 +61,16 @@ macro_rules! placeholder_reader {
                 Ok(())
             }
 
-            fn series_count(&self) -> usize { 1 }
+            fn series_count(&self) -> usize { 0 }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+                Err(BioFormatsError::SeriesOutOfRange(s))
             }
 
             fn series(&self) -> usize { 0 }
 
             fn metadata(&self) -> &ImageMetadata {
-                self.meta.as_ref().expect("set_id not called")
+                self.meta.as_ref().unwrap_or(crate::common::reader::uninitialized_metadata())
             }
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -200,7 +200,9 @@ impl FormatReader for PicoQuantReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -456,7 +458,9 @@ impl FormatReader for RhkReader {
                 (width as u64)
                     .checked_mul(height as u64)
                     .and_then(|p| p.checked_mul(bps))
-                    .ok_or_else(|| BioFormatsError::Format("RHK SPM plane size overflows".into()))?,
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("RHK SPM plane size overflows".into())
+                    })?,
             )
             .ok_or_else(|| BioFormatsError::Format("RHK SPM plane size overflows".into()))?;
         if expected > data.len() as u64 {
@@ -537,7 +541,9 @@ impl FormatReader for RhkReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -707,7 +713,9 @@ impl FormatReader for QuesantReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -915,7 +923,9 @@ impl FormatReader for JpkReader {
         if self.is_tiff {
             self.inner.metadata()
         } else {
-            self.meta.as_ref().expect("set_id not called")
+            self.meta
+                .as_ref()
+                .unwrap_or(crate::common::reader::uninitialized_metadata())
         }
     }
 
@@ -1143,7 +1153,9 @@ impl FormatReader for WatopReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1353,7 +1365,9 @@ impl FormatReader for VgSamReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1560,7 +1574,9 @@ impl FormatReader for UbmReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1786,7 +1802,9 @@ impl FormatReader for SeikoReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

@@ -67,7 +67,7 @@ ImageWriter::save(Path::new("output.tif"), &meta, &planes)?;
 
 | Format | Extensions | Notes |
 |--------|-----------|-------|
-| TIFF / OME-TIFF / BigTIFF | `.tif` `.tiff` `.btf` | Full IFD parser; strip and tile layout; LZW, Deflate, PackBits, JPEG, Zstd |
+| TIFF / OME-TIFF | `.tif` `.tiff` | Full IFD parser; strip and tile layout; LZW, Deflate, PackBits, JPEG, Zstd. BigTIFF is read-only. |
 | PNG | `.png` | 8-bit and 16-bit; grayscale and RGB |
 | JPEG | `.jpg` `.jpeg` | 8-bit RGB |
 | BMP | `.bmp` | 8-bit RGB |
@@ -142,7 +142,7 @@ Roughly **108 complete, 42 partial, 36 stub** out of ~185 registered readers
 | Khoros VIFF | `.xv` `.viff` | ✅ | KhorosReader parity (byte-order, pixel types, LUT) |
 | Apple PICT | `.pict` `.pct` | ✅ | Bitmap/pixmap/packbits + JPEG-in-PICT |
 | ZIP container | `.zip` | ✅ | Delegates primary entry to any auto-detected reader |
-| MNG / APNG | `.mng` `.apng` | 🟡 | First frame only |
+| APNG / MNG | `.apng` `.mng` | ⛔ | Animated PNG and MNG are explicitly rejected/stubbed |
 | Text / CSV image | `.txt` `.csv` | 🟡 | Parsed as Float32; no distinct Java counterpart |
 | AVI (video) | `.avi` | ✅ | Uncompressed/16-bit/Y8 + MSRLE, MS Video 1, Cinepak, JPEG/MJPEG |
 | Fake (test format) | `.fake` | ✅ | Synthetic gradient generator |
@@ -181,7 +181,7 @@ Roughly **108 complete, 42 partial, 36 stub** out of ~185 registered readers
 | Tecan plate ASCII | `.asc` | ✅ | Tab-separated plate → Float32 |
 | Yokogawa CV7000/8000 | `.wpi` `.mlf` `.mrf` | ✅ | `.wpi`/`.mlf`/`.mrf` XML index → well/field series + OME plate |
 | MetaXpress / SimplePCI / MIAS / Trestle / TissueFAXS / Mikroscan / Ionpath MIBI TIFFs | `.tif` | 🟡 | Extension-only TIFF delegate; no format-specific assembly |
-| Cellomics | `.c01` `.dib` | 🟡 | zlib + DIB decoded; `.mdb` metadata needs MS-Access lib |
+| Cellomics | `.c01` `.dib` | 🟡 | zlib + DIB decoded; sibling `.mdb` channel metadata via `mdbtools-rs` |
 | CellWorX | `.htd` `.pnl` | ⛔ | Parses HTD dims but `set_id` unsupported |
 
 ### Whole-slide / pyramidal TIFF
@@ -218,7 +218,7 @@ Roughly **108 complete, 42 partial, 36 stub** out of ~185 registered readers
 | Hasselblad Imacon / Image-Pro IPW | `.fff` `.ipw` | ✅ | Imacon XML tag; IPW OLE2 multi-TIFF |
 | Hamamatsu DCIMG | `.dcimg` | 🟡 | v0/v1 + four-corner correction (no Java reference) |
 | Norpix StreamPix | `.seq` | 🟡 | JPEG frames + timestamps (no Java reference) |
-| TillVision | `.vws` | 🟡 | PST+INF sidecar; embedded VWS unsupported |
+| TillVision | `.vws` `.pst` | 🟡 | PST+INF sidecar; embedded VWS unsupported |
 | Canon RAW / Minolta MRW / DNG (CFA) | `.cr2` `.crw` `.mrw` `.dng` | ✅ | CFA Bayer interpolation + bit unpacking + DNG EXIF/maker-note white-balance |
 | Photoshop / QPTIFF / NIS TIFF wrappers | `.tif` `.qptiff` `.nif` | 🟡 | Plain TIFF delegate; vendor metadata not parsed |
 | Hamamatsu VMS/VMU | `.vms` `.vmu` | ⛔ | JPEG tile decoding not ported |

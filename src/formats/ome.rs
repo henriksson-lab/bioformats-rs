@@ -21,9 +21,10 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
+use crate::common::region::{crop_full_plane, validate_region};
 
 struct ParsedOmeSeries {
     meta: ImageMetadata,
@@ -94,7 +95,13 @@ fn base64_decode(input: &str) -> Vec<u8> {
 /// Extract the value of `attr` from an XML element start tag.
 fn xml_attr(tag: &str, attr: &str) -> Option<String> {
     let needle = format!("{}=", attr);
-    let pos = tag.find(&needle)?;
+    let pos = tag.match_indices(&needle).find_map(|(pos, _)| {
+        tag[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_ascii_whitespace() || c == '<')
+            .then_some(pos)
+    })?;
     let rest = &tag[pos + needle.len()..];
     // Value may be quoted with " or '
     let quote = rest.chars().next()?;
@@ -116,10 +123,20 @@ fn tag_local_name(tag: &str) -> &str {
 }
 
 fn start_tag_at(xml: &str, pos: usize) -> &str {
-    let end = xml[pos..]
-        .find('>')
-        .map(|e| pos + e + 1)
-        .unwrap_or(xml.len());
+    let mut quote = None;
+    let mut end = xml.len();
+    for (rel, ch) in xml[pos..].char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == '>' => {
+                end = pos + rel + ch.len_utf8();
+                break;
+            }
+            None => {}
+        }
+    }
     &xml[pos..end]
 }
 
@@ -246,10 +263,7 @@ fn parse_bindata_blocks(pixels_xml: &str) -> (Vec<Vec<u8>>, Option<String>) {
         if first_big_endian.is_none() {
             first_big_endian = xml_attr(tag, "BigEndian").or_else(|| xml_attr(tag, "bigendian"));
         }
-        let content_start = tag
-            .find('>')
-            .map(|e| pos + e + 1)
-            .unwrap_or(pos + tag.len());
+        let content_start = pos + tag.len();
         let content_end = end_tag_start_after(pixels_xml, pos, "BinData").unwrap_or(content_start);
         let b64_text = pixels_xml.get(content_start..content_end).unwrap_or("");
         blocks.push(base64_decode(b64_text));
@@ -278,10 +292,7 @@ fn parse_tiff_data(pixels_xml: &str) -> Vec<ParsedTiffData> {
     for pos in tag_positions(pixels_xml, "TiffData") {
         let tag = start_tag_at(pixels_xml, pos);
         // Extract the body of the TiffData element to look for a nested <UUID>.
-        let body_start = tag
-            .find('>')
-            .map(|e| pos + e + 1)
-            .unwrap_or(pos + tag.len());
+        let body_start = pos + tag.len();
         // A self-closing <TiffData/> has no body.
         let self_closing = tag.trim_end().ends_with("/>");
         let body_end = if self_closing {
@@ -297,11 +308,19 @@ fn parse_tiff_data(pixels_xml: &str) -> Vec<ParsedTiffData> {
             .and_then(|up| xml_attr(start_tag_at(body, up), "FileName"));
 
         out.push(ParsedTiffData {
-            ifd: xml_attr(tag, "IFD").and_then(|s| s.parse().ok()).unwrap_or(0),
+            ifd: xml_attr(tag, "IFD")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             plane_count: xml_attr(tag, "PlaneCount").and_then(|s| s.parse().ok()),
-            first_z: xml_attr(tag, "FirstZ").and_then(|s| s.parse().ok()).unwrap_or(0),
-            first_c: xml_attr(tag, "FirstC").and_then(|s| s.parse().ok()).unwrap_or(0),
-            first_t: xml_attr(tag, "FirstT").and_then(|s| s.parse().ok()).unwrap_or(0),
+            first_z: xml_attr(tag, "FirstZ")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            first_c: xml_attr(tag, "FirstC")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            first_t: xml_attr(tag, "FirstT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             filename,
         });
     }
@@ -379,16 +398,34 @@ fn advance_ome_plane(
 /// the directory containing the `.ome` file. Returns `None` if the file does
 /// not exist (mirrors Java `normalizeFilename` + existence check).
 fn resolve_companion(base_dir: Option<&Path>, filename: &str) -> Option<PathBuf> {
-    let candidate = match base_dir {
-        Some(dir) => dir.join(filename),
-        None => PathBuf::from(filename),
+    let trimmed = filename.trim();
+    let filename_path = Path::new(trimmed);
+    let (candidate, allow_basename_retry) = match base_dir {
+        Some(dir) if filename_path.is_absolute() => (None, true),
+        Some(dir) => (confined_join(dir, trimmed), false),
+        None => {
+            let path = PathBuf::from(trimmed);
+            if path.is_absolute()
+                || filename_path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return None;
+            }
+            (Some(path), false)
+        }
     };
-    if candidate.exists() {
-        return Some(candidate);
+    if let Some(candidate) = candidate {
+        if candidate.exists() {
+            return Some(candidate);
+        }
     }
     // Old writers stored absolute paths in UUID.FileName; retry with just the
     // basename relative to the metadata directory (Java OMETiffReader).
-    if let (Some(dir), Some(base)) = (base_dir, Path::new(filename).file_name()) {
+    if allow_basename_retry {
+        let (Some(dir), Some(base)) = (base_dir, filename_path.file_name()) else {
+            return None;
+        };
         let retry = dir.join(base);
         if retry.exists() {
             return Some(retry);
@@ -409,13 +446,7 @@ fn companion_is_little_endian(path: &Path) -> Result<bool> {
 /// (non-OME) TIFF, so its IFDs map sequentially onto series planes; we locate
 /// the series whose `ifd_indices` contains the target IFD and read the matching
 /// plane index from it.
-fn read_external_plane(
-    plane: &ExternalPlane,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-) -> Result<Vec<u8>> {
+fn read_external_plane(plane: &ExternalPlane, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
     let mut reader = crate::tiff::TiffReader::new();
     reader.set_id(&plane.path)?;
 
@@ -489,6 +520,26 @@ fn build_external_plane_map(
 
     // Track "certain" planes so that fill-down stops at explicitly-started planes.
     let mut certain = vec![false; num];
+    for td in tiff_data {
+        let mut z = td.first_z;
+        let mut c = td.first_c;
+        let mut t = td.first_t;
+        if c_one_indexed == Some(true) && c > 0 {
+            c -= 1;
+        }
+        if z_one_indexed == Some(true) && z > 0 {
+            z -= 1;
+        }
+        if t_one_indexed == Some(true) && t > 0 {
+            t -= 1;
+        }
+        if z >= size_z || c >= eff_c || t >= size_t {
+            continue;
+        }
+        if let Some(index) = ome_plane_index(z, c, t, size_z, eff_c, size_t, order) {
+            certain[index] = true;
+        }
+    }
 
     for td in tiff_data {
         let mut z = td.first_z;
@@ -604,6 +655,12 @@ fn parse_ome_xml_series_with_base(
         } else {
             logical_c
         };
+        if max_spp > 1 && effective_c > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "OME-XML: multiple logical RGB channels are not representable by ImageMetadata"
+                    .into(),
+            ));
+        }
         let image_count = size_z
             .checked_mul(effective_c)
             .and_then(|v| v.checked_mul(size_t))
@@ -712,11 +769,11 @@ impl Default for OmeXmlReader {
 
 impl FormatReader for OmeXmlReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("ome"))
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase());
+        matches!(name.as_deref(), Some(n) if n.ends_with(".ome") || n.ends_with(".ome.xml"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -745,7 +802,7 @@ impl FormatReader for OmeXmlReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        self.series.len().max(1)
+        self.series.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
         if s >= self.series_count() {
@@ -759,7 +816,10 @@ impl FormatReader for OmeXmlReader {
         self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        &self.series[self.current_series].meta
+        self.series
+            .get(self.current_series)
+            .map(|series| &series.meta)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -827,6 +887,7 @@ impl FormatReader for OmeXmlReader {
                         return read_external_plane(&ext, x, y, w, h);
                     }
                     _ => {
+                        validate_region("OME-XML", meta.size_x, meta.size_y, x, y, w, h)?;
                         let bps = meta.pixel_type.bytes_per_sample();
                         let samples = if meta.is_rgb { meta.size_c as usize } else { 1 };
                         return Ok(vec![0u8; w as usize * h as usize * bps * samples]);
@@ -836,7 +897,8 @@ impl FormatReader for OmeXmlReader {
         }
         let full = self.open_bytes(plane_index)?;
         let meta = self.metadata();
-        crop_full_plane("OME-XML", &full, meta, 1, x, y, w, h)
+        let samples = if meta.is_rgb { meta.size_c as usize } else { 1 };
+        crop_full_plane("OME-XML", &full, meta, samples, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -941,18 +1003,30 @@ impl crate::common::writer::FormatWriter for OmeXmlWriter {
         Ok(())
     }
 
-    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "OME-XML",
+            meta,
+            self.planes.len(),
+            plane_index,
+            data.len(),
+        )?;
         self.planes.push(data.to_vec());
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
-        let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_complete("OME-XML", &meta, self.planes.len())?;
 
-        let ome = self.ome.take().unwrap_or_else(|| {
-            crate::common::ome_metadata::OmeMetadata::from_image_metadata(&meta)
-        });
+        let mut ome = self
+            .ome
+            .clone()
+            .unwrap_or_else(|| crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta));
+        ome.populate_pixels(meta, 0)?;
+        ome.verify_minimum_populated(meta, 0)?;
 
         // Build OME-XML with inline BinData
         use std::fmt::Write;
@@ -1022,7 +1096,10 @@ impl crate::common::writer::FormatWriter for OmeXmlWriter {
 
         xml.push_str("</Pixels></Image></OME>");
 
-        fs::write(&path, xml.as_bytes()).map_err(BioFormatsError::Io)?;
+        fs::write(path, xml.as_bytes()).map_err(BioFormatsError::Io)?;
+        self.meta = None;
+        self.path = None;
+        self.ome = None;
         self.planes.clear();
         Ok(())
     }
@@ -1035,6 +1112,15 @@ impl crate::common::writer::FormatWriter for OmeXmlWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_ome_{nanos}_{name}"))
+    }
 
     #[test]
     fn parses_tiffdata_with_uuid_filename() {
@@ -1086,6 +1172,57 @@ mod tests {
     }
 
     #[test]
+    fn external_plane_map_does_not_basename_retry_relative_escape() {
+        let dir = temp_path("escape_companions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let companion = dir.join("plane.tif");
+        std::fs::write(&companion, b"not used by map test").unwrap();
+
+        let td = vec![ParsedTiffData {
+            ifd: 0,
+            plane_count: Some(1),
+            first_z: 0,
+            first_c: 0,
+            first_t: 0,
+            filename: Some("../plane.tif".into()),
+        }];
+
+        let map = build_external_plane_map(&td, Some(&dir), 1, 1, 1, DimensionOrder::XYZCT);
+
+        assert_eq!(map.len(), 1);
+        assert!(map[0].is_none());
+        let _ = std::fs::remove_file(companion);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn external_plane_map_basename_retries_absolute_legacy_path() {
+        let dir = temp_path("absolute_companions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let companion = dir.join("plane.tif");
+        std::fs::write(&companion, b"not used by map test").unwrap();
+
+        let td = vec![ParsedTiffData {
+            ifd: 0,
+            plane_count: Some(1),
+            first_z: 0,
+            first_c: 0,
+            first_t: 0,
+            filename: Some("/old/location/plane.tif".into()),
+        }];
+
+        let map = build_external_plane_map(&td, Some(&dir), 1, 1, 1, DimensionOrder::XYZCT);
+
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map[0].as_ref().map(|p| p.path.as_path()),
+            Some(companion.as_path())
+        );
+        let _ = std::fs::remove_file(companion);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
     fn external_plane_map_fills_down_when_planecount_absent() {
         // Single TiffData with no PlaneCount should fill IFDs 0..N sequentially.
         let td = vec![ParsedTiffData {
@@ -1103,11 +1240,85 @@ mod tests {
     }
 
     #[test]
+    fn external_plane_map_fill_down_stops_at_later_explicit_start() {
+        let dir = temp_path("companions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let companion = dir.join("plane.tif");
+        std::fs::write(&companion, b"not used by map test").unwrap();
+
+        let td = vec![
+            ParsedTiffData {
+                ifd: 0,
+                plane_count: None,
+                first_z: 0,
+                first_c: 0,
+                first_t: 0,
+                filename: Some("plane.tif".into()),
+            },
+            ParsedTiffData {
+                ifd: 10,
+                plane_count: Some(1),
+                first_z: 0,
+                first_c: 2,
+                first_t: 0,
+                filename: Some("plane.tif".into()),
+            },
+        ];
+
+        let map = build_external_plane_map(&td, Some(&dir), 1, 4, 1, DimensionOrder::XYZCT);
+
+        assert_eq!(map[0].as_ref().map(|p| p.ifd), Some(0));
+        assert_eq!(map[1].as_ref().map(|p| p.ifd), Some(1));
+        assert_eq!(map[2].as_ref().map(|p| p.ifd), Some(10));
+        assert!(map[3].is_none());
+        let _ = std::fs::remove_file(companion);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn inline_rgb_region_uses_rgb_stride() {
+        let path = temp_path("rgb.ome");
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" Name="quoted > delimiter" DimensionOrder="XYZCT" Type="uint8" SizeX="2" SizeY="2" SizeZ="1" SizeC="3" SizeT="1"><Channel ID="Channel:0:0" SamplesPerPixel="3"/><BinData BigEndian="false">AQIDBAUGBwgJCgsM</BinData></Pixels></Image></OME>"#;
+        std::fs::write(&path, xml).unwrap();
+
+        let mut reader = OmeXmlReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+            vec![4, 5, 6, 10, 11, 12]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_external_region_is_bounds_checked() {
+        let path = temp_path("missing_external.ome");
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="2" SizeY="2" SizeZ="1" SizeC="1" SizeT="1"><TiffData IFD="0" PlaneCount="1"><UUID FileName="missing.tif">urn:uuid:missing</UUID></TiffData></Pixels></Image></OME>"#;
+        std::fs::write(&path, xml).unwrap();
+
+        let mut reader = OmeXmlReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert!(reader.open_bytes_region(0, 2, 0, 1, 1).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn ome_plane_index_matches_dimension_order() {
         // XYZCT: index = t*Z*C + c*Z + z
-        assert_eq!(ome_plane_index(1, 0, 0, 3, 2, 4, DimensionOrder::XYZCT), Some(1));
-        assert_eq!(ome_plane_index(0, 1, 0, 3, 2, 4, DimensionOrder::XYZCT), Some(3));
+        assert_eq!(
+            ome_plane_index(1, 0, 0, 3, 2, 4, DimensionOrder::XYZCT),
+            Some(1)
+        );
+        assert_eq!(
+            ome_plane_index(0, 1, 0, 3, 2, 4, DimensionOrder::XYZCT),
+            Some(3)
+        );
         // Out of range -> None
-        assert_eq!(ome_plane_index(3, 0, 0, 3, 2, 4, DimensionOrder::XYZCT), None);
+        assert_eq!(
+            ome_plane_index(3, 0, 0, 3, 2, 4, DimensionOrder::XYZCT),
+            None
+        );
     }
 }

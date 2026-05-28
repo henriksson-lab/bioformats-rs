@@ -166,7 +166,13 @@ pub(crate) mod cfa {
                         ncomps += 1;
                     }
                     let v = (sum / ncomps) as i16;
-                    unpack_bytes(v as i64, buf, row * width * 6 + col * 6 + 2, 2, little_endian);
+                    unpack_bytes(
+                        v as i64,
+                        buf,
+                        row * width * 6 + col * 6 + 2,
+                        2,
+                        little_endian,
+                    );
                 } else {
                     unpack_bytes(
                         s[plane + row * width + col] as i64,
@@ -288,7 +294,13 @@ pub(crate) mod cfa {
                         }
                     }
                     let v = (sum / ncomps) as i16;
-                    unpack_bytes(v as i64, buf, row * width * 6 + col * 6 + 4, 2, little_endian);
+                    unpack_bytes(
+                        v as i64,
+                        buf,
+                        row * width * 6 + col * 6 + 4,
+                        2,
+                        little_endian,
+                    );
                 } else {
                     unpack_bytes(
                         s[2 * plane + row * width + col] as i64,
@@ -487,7 +499,9 @@ impl FormatReader for PcoRawReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -717,7 +731,8 @@ impl FormatReader for BioRadGelReader {
 
         // Seek to baseFP + skip and read dimensions + bpp.
         let dims_pos = (base_fp + skip).max(0) as u64;
-        f.seek(SeekFrom::Start(dims_pos)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(dims_pos))
+            .map_err(BioFormatsError::Io)?;
 
         let mut size_x = (read_i16(&mut f, little_endian)? as u16) as u32;
         let mut size_y = (read_i16(&mut f, little_endian)? as u16) as u32;
@@ -781,7 +796,9 @@ impl FormatReader for BioRadGelReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1044,7 +1061,7 @@ impl FormatReader for L2dReader {
     fn metadata(&self) -> &ImageMetadata {
         self.metadata
             .get(self.current_series)
-            .expect("set_id not called")
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1472,7 +1489,9 @@ impl FormatReader for ImaconReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
@@ -1591,9 +1610,6 @@ pub struct IpwReader {
 }
 
 impl IpwReader {
-    /// OLE2/CFB magic bytes (D0 CF 11 E0).
-    const MAGIC: [u8; 4] = [0xd0, 0xcf, 0x11, 0xe0];
-
     pub fn new() -> Self {
         IpwReader {
             path: None,
@@ -1617,10 +1633,7 @@ impl IpwReader {
 
     /// Extract an embedded stream to a temp file, returning an initialised
     /// `TiffReader` plus the temp path to clean up.
-    fn open_embedded_tiff(
-        &self,
-        stream_path: &str,
-    ) -> Result<(crate::tiff::TiffReader, PathBuf)> {
+    fn open_embedded_tiff(&self, stream_path: &str) -> Result<(crate::tiff::TiffReader, PathBuf)> {
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut comp =
             cfb::open(path).map_err(|e| BioFormatsError::Format(format!("IPW CFB open: {e}")))?;
@@ -1682,8 +1695,8 @@ impl FormatReader for IpwReader {
         )
     }
 
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 4 && header[..4] == Self::MAGIC
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1829,7 +1842,9 @@ impl FormatReader for IpwReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -2058,9 +2073,9 @@ mod tests {
         // Greens at (0,0) and (1,1).
         s[plane] = 10; // G(0,0): channel 1, row 0, col 0
         s[plane + 1 * w + 1] = 40; // G(1,1)
-        // Red at (0,1).
+                                   // Red at (0,1).
         s[1] = 20; // R(0,1): channel 0, row 0, col 1
-        // Blue at (1,0).
+                   // Blue at (1,0).
         s[2 * plane + 1 * w + 0] = 30; // B(1,0)
 
         let mut buf = vec![0u8; plane * 3 * 2];

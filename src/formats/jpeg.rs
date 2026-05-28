@@ -95,7 +95,9 @@ impl FormatReader for JpegReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -134,6 +136,7 @@ pub struct JpegWriter {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     quality: u8,
+    wrote: bool,
 }
 
 impl JpegWriter {
@@ -142,6 +145,7 @@ impl JpegWriter {
             path: None,
             meta: None,
             quality: 90,
+            wrote: false,
         }
     }
     pub fn with_quality(mut self, q: u8) -> Self {
@@ -165,12 +169,25 @@ impl FormatWriter for JpegWriter {
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        let logical_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+        let required_planes = meta
+            .size_z
+            .max(1)
+            .checked_mul(logical_c)
+            .and_then(|v| v.checked_mul(meta.size_t.max(1)))
+            .ok_or_else(|| BioFormatsError::Format("JPEG writer plane count overflow".into()))?;
+        if required_planes > 1 || meta.image_count > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "JPEG writer supports only one plane".into(),
+            ));
+        }
         if meta.pixel_type != PixelType::Uint8 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "JPEG writer only supports Uint8".into(),
             ));
         }
         self.meta = Some(meta.clone());
+        self.wrote = false;
         Ok(())
     }
 
@@ -183,8 +200,14 @@ impl FormatWriter for JpegWriter {
     }
 
     fn close(&mut self) -> Result<()> {
+        if self.path.is_some() && !self.wrote {
+            return Err(BioFormatsError::Format(
+                "JPEG writer closed before plane 0 was written".into(),
+            ));
+        }
         self.path = None;
         self.meta = None;
+        self.wrote = false;
         Ok(())
     }
 
@@ -192,6 +215,11 @@ impl FormatWriter for JpegWriter {
         if plane_index != 0 {
             return Err(BioFormatsError::Format(
                 "JPEG writer supports only one plane".into(),
+            ));
+        }
+        if self.wrote {
+            return Err(BioFormatsError::Format(
+                "JPEG writer already wrote plane 0".into(),
             ));
         }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
@@ -219,7 +247,9 @@ impl FormatWriter for JpegWriter {
             self.quality,
         );
         img.write_with_encoder(encoder)
-            .map_err(|e| BioFormatsError::Format(e.to_string()))
+            .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+        self.wrote = true;
+        Ok(())
     }
 
     fn can_do_stacks(&self) -> bool {

@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 use crate::common::writer::FormatWriter;
 
 // ---- header parsing ---------------------------------------------------------
@@ -63,7 +65,7 @@ impl IcsHeader {
 
             match tokens[0].to_ascii_lowercase().as_str() {
                 "ics_version" if tokens.len() >= 2 => {
-                    hdr.version = tokens[1].parse().unwrap_or(1.0);
+                    hdr.version = parse_ics_scalar(tokens[1], "ics_version")?;
                 }
                 "filename" if tokens.len() >= 2 => {
                     hdr.filename = Some(PathBuf::from(tokens[1..].join(" ")));
@@ -73,10 +75,11 @@ impl IcsHeader {
                         hdr.order = tokens[2..].iter().map(|s| s.to_ascii_lowercase()).collect();
                     }
                     "sizes" => {
-                        hdr.sizes = tokens[2..].iter().filter_map(|s| s.parse().ok()).collect();
+                        hdr.sizes = parse_ics_list(&tokens[2..], "layout sizes")?;
                     }
                     "significant_bits" | "significant bits" if tokens.len() >= 3 => {
-                        hdr.significant_bits = tokens[2].parse().unwrap_or(8);
+                        hdr.significant_bits =
+                            parse_ics_scalar(tokens[2], "layout significant_bits")?;
                     }
                     _ => {}
                 },
@@ -86,7 +89,7 @@ impl IcsHeader {
                         "sign" => hdr.sign = tokens[2].to_ascii_lowercase(),
                         "byte_order" | "byteorder" => {
                             hdr.byte_order =
-                                tokens[2..].iter().filter_map(|s| s.parse().ok()).collect();
+                                parse_ics_list(&tokens[2..], "representation byte_order")?;
                         }
                         "compression" if tokens.len() >= 3 => {
                             hdr.gzip_compressed =
@@ -109,6 +112,25 @@ impl IcsHeader {
         hdr.data_offset = data_offset;
         Ok(hdr)
     }
+}
+
+fn parse_ics_scalar<T>(value: &str, field: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    value.parse().map_err(|_| {
+        BioFormatsError::Format(format!("ICS invalid numeric value for {field}: {value}"))
+    })
+}
+
+fn parse_ics_list<T>(values: &[&str], field: &str) -> Result<Vec<T>>
+where
+    T: std::str::FromStr,
+{
+    values
+        .iter()
+        .map(|value| parse_ics_scalar(value, field))
+        .collect()
 }
 
 /// Port of MetadataTools.makeSaneDimensionOrder: ensure all of X,Y,Z,C,T are
@@ -313,24 +335,24 @@ impl IcsReader {
         }
     }
 
-    fn data_path(ics_path: &Path, hdr: &IcsHeader) -> PathBuf {
+    fn data_path(ics_path: &Path, hdr: &IcsHeader) -> Result<PathBuf> {
         if hdr.version < 2.0 {
             // ICS1: companion data file, named explicitly when available.
             if let Some(filename) = &hdr.filename {
-                if filename.is_absolute() {
-                    filename.clone()
-                } else {
-                    ics_path
-                        .parent()
-                        .unwrap_or_else(|| Path::new(""))
-                        .join(filename)
-                }
+                let name = filename.to_string_lossy();
+                confined_join(ics_path.parent().unwrap_or_else(|| Path::new("")), &name).ok_or_else(
+                    || {
+                        BioFormatsError::Format(format!(
+                            "ICS companion filename escapes image directory: {name}"
+                        ))
+                    },
+                )
             } else {
                 let stem = ics_path.file_stem().unwrap_or_default();
-                ics_path.with_file_name(format!("{}.ids", stem.to_string_lossy()))
+                Ok(ics_path.with_file_name(format!("{}.ids", stem.to_string_lossy())))
             }
         } else {
-            ics_path.to_path_buf()
+            Ok(ics_path.to_path_buf())
         }
     }
 
@@ -345,45 +367,190 @@ impl IcsReader {
         Ok(buf)
     }
 
+    fn plane_coords(meta: &ImageMetadata, plane_index: u32) -> (u32, u32, u32) {
+        let c_count = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+        let z_count = meta.size_z.max(1);
+        let t_count = meta.size_t.max(1);
+        let mut rem = plane_index;
+        let mut z = 0;
+        let mut c = 0;
+        let mut t = 0;
+
+        for axis in match meta.dimension_order {
+            DimensionOrder::XYCTZ => ['C', 'T', 'Z'],
+            DimensionOrder::XYCZT => ['C', 'Z', 'T'],
+            DimensionOrder::XYTCZ => ['T', 'C', 'Z'],
+            DimensionOrder::XYTZC => ['T', 'Z', 'C'],
+            DimensionOrder::XYZCT => ['Z', 'C', 'T'],
+            DimensionOrder::XYZTC => ['Z', 'T', 'C'],
+        } {
+            match axis {
+                'Z' => {
+                    z = rem % z_count;
+                    rem /= z_count;
+                }
+                'C' => {
+                    c = rem % c_count;
+                    rem /= c_count;
+                }
+                'T' => {
+                    t = rem % t_count;
+                    rem /= t_count;
+                }
+                _ => {}
+            }
+        }
+        (z, c, t)
+    }
+
+    fn axis_coords_for_plane(&self, meta: &ImageMetadata, plane_index: u32) -> Result<Vec<u32>> {
+        let hdr = self
+            .header
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let (z, mut c_linear, mut t_linear) = Self::plane_coords(meta, plane_index);
+        let mut coords = Vec::with_capacity(hdr.order.len());
+
+        for (axis, &size) in hdr.order.iter().zip(hdr.sizes.iter()) {
+            let coord = match axis.as_str() {
+                "bits" | "x" | "width" | "y" | "height" => 0,
+                "z" | "depth" => z,
+                "t" | "time" => {
+                    let n = size.max(1);
+                    let coord = t_linear % n;
+                    t_linear /= n;
+                    coord
+                }
+                _ => {
+                    if meta.is_rgb {
+                        0
+                    } else {
+                        let n = size.max(1);
+                        let coord = c_linear % n;
+                        c_linear /= n;
+                        coord
+                    }
+                }
+            };
+            coords.push(coord);
+        }
+        Ok(coords)
+    }
+
+    fn data_payload(&self) -> Result<Vec<u8>> {
+        let hdr = self
+            .header
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let ics_path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let data_path = Self::data_path(ics_path, hdr)?;
+        let mut f = File::open(&data_path).map_err(BioFormatsError::Io)?;
+
+        f.seek(SeekFrom::Start(hdr.data_offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut data = Vec::new();
+        if hdr.gzip_compressed {
+            let mut dec = flate2::read::GzDecoder::new(f);
+            dec.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
+        } else {
+            f.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
+        }
+        Ok(data)
+    }
+
     fn load_raw_data(&self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let hdr = self
             .header
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?;
-        let ics_path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let bytes_per_sample = meta.pixel_type.bytes_per_sample();
-        let plane_bytes = (meta.size_x * meta.size_y * meta.size_c) as usize * bytes_per_sample;
-        let plane_offset = plane_index as u64 * plane_bytes as u64;
+        let samples_per_pixel = if meta.is_rgb { meta.size_c.max(1) } else { 1 } as usize;
+        let plane_samples = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(samples_per_pixel))
+            .ok_or_else(|| BioFormatsError::InvalidData("ICS plane size overflow".into()))?;
+        let plane_bytes = plane_samples
+            .checked_mul(bytes_per_sample)
+            .ok_or_else(|| BioFormatsError::InvalidData("ICS plane byte size overflow".into()))?;
 
-        let data_path = Self::data_path(ics_path, hdr);
-        let data_offset = hdr.data_offset + plane_offset;
-
-        let mut f = File::open(&data_path).map_err(BioFormatsError::Io)?;
-
-        if hdr.gzip_compressed {
-            // Decompress all then seek; gzip doesn't support random access
-            f.seek(SeekFrom::Start(hdr.data_offset))
-                .map_err(BioFormatsError::Io)?;
-            let mut dec = flate2::read::GzDecoder::new(f);
-            let mut all = Vec::new();
-            dec.read_to_end(&mut all).map_err(BioFormatsError::Io)?;
-            let start = plane_offset as usize;
-            let end = start + plane_bytes;
-            if end > all.len() {
-                return Err(BioFormatsError::InvalidData(
-                    "plane out of range in ICS data".into(),
-                ));
+        let payload = self.data_payload()?;
+        let fixed_coords = self.axis_coords_for_plane(meta, plane_index)?;
+        let mut strides = vec![0usize; hdr.order.len()];
+        let mut stride = 1usize;
+        for (i, (axis, &size)) in hdr.order.iter().zip(hdr.sizes.iter()).enumerate() {
+            if axis == "bits" {
+                strides[i] = 0;
+                continue;
             }
-            self.normalize_endianness(all[start..end].to_vec())
-        } else {
-            f.seek(SeekFrom::Start(data_offset))
-                .map_err(BioFormatsError::Io)?;
-            let mut buf = vec![0u8; plane_bytes];
-            f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-            self.normalize_endianness(buf)
+            strides[i] = stride;
+            stride = stride
+                .checked_mul(size.max(1) as usize)
+                .ok_or_else(|| BioFormatsError::InvalidData("ICS axis size overflow".into()))?;
         }
+
+        let x_axis = hdr
+            .order
+            .iter()
+            .position(|axis| axis == "x" || axis == "width")
+            .ok_or_else(|| BioFormatsError::Format("ICS missing X axis".into()))?;
+        let y_axis = hdr
+            .order
+            .iter()
+            .position(|axis| axis == "y" || axis == "height")
+            .ok_or_else(|| BioFormatsError::Format("ICS missing Y axis".into()))?;
+        let channel_axis = meta
+            .is_rgb
+            .then(|| {
+                hdr.order.iter().position(|axis| {
+                    !matches!(
+                        axis.as_str(),
+                        "bits" | "x" | "width" | "y" | "height" | "z" | "depth" | "t" | "time"
+                    )
+                })
+            })
+            .flatten();
+
+        let mut out = vec![0u8; plane_bytes];
+        for y in 0..meta.size_y as usize {
+            for x in 0..meta.size_x as usize {
+                for s in 0..samples_per_pixel {
+                    let mut coords = fixed_coords.clone();
+                    coords[x_axis] = x as u32;
+                    coords[y_axis] = y as u32;
+                    if let Some(axis) = channel_axis {
+                        coords[axis] = s as u32;
+                    }
+                    let sample_index = coords
+                        .iter()
+                        .zip(strides.iter())
+                        .try_fold(0usize, |acc, (&coord, &stride)| {
+                            (coord as usize)
+                                .checked_mul(stride)
+                                .and_then(|v| acc.checked_add(v))
+                        })
+                        .ok_or_else(|| {
+                            BioFormatsError::InvalidData("ICS sample offset overflow".into())
+                        })?;
+                    let src = sample_index.checked_mul(bytes_per_sample).ok_or_else(|| {
+                        BioFormatsError::InvalidData("ICS byte offset overflow".into())
+                    })?;
+                    let end = src.checked_add(bytes_per_sample).ok_or_else(|| {
+                        BioFormatsError::InvalidData("ICS byte offset overflow".into())
+                    })?;
+                    if end > payload.len() {
+                        return Err(BioFormatsError::InvalidData(
+                            "plane out of range in ICS data".into(),
+                        ));
+                    }
+                    let dst =
+                        ((y * meta.size_x as usize + x) * samples_per_pixel + s) * bytes_per_sample;
+                    out[dst..dst + bytes_per_sample].copy_from_slice(&payload[src..end]);
+                }
+            }
+        }
+        self.normalize_endianness(out)
     }
 }
 
@@ -438,7 +605,9 @@ impl FormatReader for IcsReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -458,18 +627,9 @@ impl FormatReader for IcsReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let spp = meta.size_c as usize;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * spp * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let samples_per_pixel = if meta.is_rgb { meta.size_c.max(1) } else { 1 } as usize;
+        crop_full_plane("ICS", &full, meta, samples_per_pixel, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -526,12 +686,23 @@ impl FormatWriter for IcsWriter {
         Ok(())
     }
 
-    fn save_bytes(&mut self, _idx: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, idx: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "ICS",
+            meta,
+            self.planes.len(),
+            idx,
+            data.len(),
+        )?;
         self.planes.push(data.to_vec());
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let _path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_complete("ICS", meta, self.planes.len())?;
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
 
@@ -552,13 +723,6 @@ impl FormatWriter for IcsWriter {
             path.file_stem().unwrap_or_default().to_string_lossy()
         )
         .map_err(BioFormatsError::Io)?;
-        writeln!(
-            f,
-            "layout\tparameters\t{}",
-            4 + if meta.size_z > 1 { 1 } else { 0 } + if meta.size_t > 1 { 1 } else { 0 }
-        )
-        .map_err(BioFormatsError::Io)?;
-
         let mut order_parts = vec!["bits", "x", "y"];
         let mut size_parts = vec![
             bps.to_string(),
@@ -578,6 +742,7 @@ impl FormatWriter for IcsWriter {
             size_parts.push(meta.size_c.to_string());
         }
 
+        writeln!(f, "layout\tparameters\t{}", order_parts.len()).map_err(BioFormatsError::Io)?;
         writeln!(f, "layout\torder\t{}", order_parts.join(" ")).map_err(BioFormatsError::Io)?;
         writeln!(f, "layout\tsizes\t{}", size_parts.join(" ")).map_err(BioFormatsError::Io)?;
         writeln!(f, "layout\tsignificant_bits\t{}", bps).map_err(BioFormatsError::Io)?;

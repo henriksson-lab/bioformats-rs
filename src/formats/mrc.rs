@@ -11,6 +11,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 use crate::common::writer::FormatWriter;
 
 // ---- header -----------------------------------------------------------------
@@ -269,10 +270,7 @@ fn parse_header(buf: &[u8]) -> Result<MrcHeader> {
 
 /// Whether the pixel type is signed (used for the EMAN2 min/max correction).
 fn pixel_type_is_signed(pt: PixelType) -> bool {
-    matches!(
-        pt,
-        PixelType::Int8 | PixelType::Int16 | PixelType::Int32
-    )
+    matches!(pt, PixelType::Int8 | PixelType::Int16 | PixelType::Int32)
 }
 
 /// Apply the EMAN2 unsigned-data correction from MRCReader.java: if the stored
@@ -512,7 +510,9 @@ impl FormatReader for MrcReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -556,18 +556,8 @@ impl FormatReader for MrcReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let spp = meta.size_c as usize;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * spp * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("MRC", &full, meta, meta.size_c as usize, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -636,6 +626,11 @@ impl FormatWriter for MrcWriter {
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        if meta.size_t.max(1) > 1 || (meta.size_c.max(1) > 1 && !meta.is_rgb) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "MRC writer preserves only Z stacks and RGB samples, not non-RGB C/T axes".into(),
+            ));
+        }
         self.meta = Some(meta.clone());
         Ok(())
     }
@@ -649,12 +644,23 @@ impl FormatWriter for MrcWriter {
         Ok(())
     }
 
-    fn save_bytes(&mut self, _idx: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, idx: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "MRC",
+            meta,
+            self.planes.len(),
+            idx,
+            data.len(),
+        )?;
         self.planes.push(data.to_vec());
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let _path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_complete("MRC", meta, self.planes.len())?;
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
 
@@ -703,8 +709,12 @@ impl FormatWriter for MrcWriter {
         w.write_all(&hdr).map_err(BioFormatsError::Io)?;
 
         // Write planes (flip rows — MRC is bottom-up)
-        let row_bytes =
-            meta.size_x as usize * meta.size_c as usize * meta.pixel_type.bytes_per_sample();
+        let samples = if meta.is_rgb {
+            meta.size_c.max(1) as usize
+        } else {
+            1
+        };
+        let row_bytes = meta.size_x as usize * samples * meta.pixel_type.bytes_per_sample();
         for plane in &self.planes {
             for row in (0..meta.size_y as usize).rev() {
                 w.write_all(&plane[row * row_bytes..(row + 1) * row_bytes])

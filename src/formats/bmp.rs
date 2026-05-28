@@ -84,7 +84,18 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     }
 
     // First header (14 bytes): magic(2), fileSize(4), reserved(4), offset(4).
-    let global = rd_i32(&data, 10) as usize; // offset to pixel data
+    let global_i32 = rd_i32(&data, 10); // offset to pixel data
+    if global_i32 < 0 {
+        return Err(BioFormatsError::InvalidData(
+            "BMP: negative pixel data offset".into(),
+        ));
+    }
+    let global = global_i32 as usize;
+    if global > data.len() {
+        return Err(BioFormatsError::InvalidData(
+            "BMP: pixel data offset exceeds file length".into(),
+        ));
+    }
 
     // Second header (40-byte BITMAPINFOHEADER): headerSize(4) then dims.
     let mut size_x = rd_i32(&data, 18);
@@ -118,9 +129,21 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     // fall back to the standard 5-6-5 (16-bit) / 8-8-8-8 (32-bit) defaults.
     let mut bitfields: Option<(u32, u32, u32, u32)> = None;
     if compression == BMP_BITFIELDS {
-        let mut red = if data.len() >= 58 { rd_u32(&data, 54) } else { 0 };
-        let mut green = if data.len() >= 62 { rd_u32(&data, 58) } else { 0 };
-        let mut blue = if data.len() >= 66 { rd_u32(&data, 62) } else { 0 };
+        let mut red = if data.len() >= 58 {
+            rd_u32(&data, 54)
+        } else {
+            0
+        };
+        let mut green = if data.len() >= 62 {
+            rd_u32(&data, 58)
+        } else {
+            0
+        };
+        let mut blue = if data.len() >= 66 {
+            rd_u32(&data, 62)
+        } else {
+            0
+        };
         // Alpha mask: present in BITMAPV4HEADER+. Only trust it for 32-bit and
         // when it sits before the pixel data offset.
         let mut alpha = if bpp_total == 32 && data.len() >= 70 && global >= 70 {
@@ -220,6 +243,14 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
             // The output row this source row maps to.
             let out_row = if invert_y { src_row } else { h - 1 - src_row };
             let row_start = pos;
+            let row_end = row_start.checked_add(row_bytes).ok_or_else(|| {
+                BioFormatsError::InvalidData("BMP: pixel row offset overflow".into())
+            })?;
+            if row_end > data.len() {
+                return Err(BioFormatsError::InvalidData(
+                    "BMP: pixel data is shorter than expected".into(),
+                ));
+            }
             // Read samples for this row.
             for i in 0..(w * effective_c) {
                 let sample_byte0 = row_start + i * (bpp_u / 8).max(1);
@@ -227,15 +258,11 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
                     // sub-byte or byte samples
                     let bit_off = i * bpp_u;
                     let byte_i = row_start + bit_off / 8;
-                    let val = if byte_i < data.len() {
-                        if bpp_u == 8 {
-                            data[byte_i]
-                        } else {
-                            let shift = 8 - bpp_u - (bit_off % 8);
-                            (data[byte_i] >> shift) & ((1u16 << bpp_u) - 1) as u8
-                        }
+                    let val = if bpp_u == 8 {
+                        data[byte_i]
                     } else {
-                        0
+                        let shift = 8 - bpp_u - (bit_off % 8);
+                        (data[byte_i] >> shift) & ((1u16 << bpp_u) - 1) as u8
                     };
                     buf[out_row * w * effective_c + i] = val;
                 } else {
@@ -243,7 +270,7 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
                     let dst = (out_row * w * effective_c + i) * nb;
                     for b in 0..nb {
                         let s = sample_byte0 + b;
-                        buf[dst + b] = if s < data.len() { data[s] } else { 0 };
+                        buf[dst + b] = data[s];
                     }
                 }
             }
@@ -359,17 +386,22 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         let (rmask, gmask, bmask, amask) = bitfields.unwrap();
         let packed_bytes = (bpp_total / 8) as usize; // 2 for 16-bit, 4 for 32-bit
         let out_c = size_c as usize; // 3 (RGB) or 4 (RGBA)
-        // Source row length (packed pixels), padded to a 4-byte boundary.
+                                     // Source row length (packed pixels), padded to a 4-byte boundary.
         let row_bytes = w * packed_bytes;
         let padded_row = (row_bytes + 3) & !3;
         let mut pos = global;
         for src_row in 0..h {
             let out_row = if invert_y { src_row } else { h - 1 - src_row };
+            let row_end = pos.checked_add(row_bytes).ok_or_else(|| {
+                BioFormatsError::InvalidData("BMP: pixel row offset overflow".into())
+            })?;
+            if row_end > data.len() {
+                return Err(BioFormatsError::InvalidData(
+                    "BMP: pixel data is shorter than expected".into(),
+                ));
+            }
             for px in 0..w {
                 let sp = pos + px * packed_bytes;
-                if sp + packed_bytes > data.len() {
-                    continue;
-                }
                 let pixel: u32 = match packed_bytes {
                     2 => u16::from_le_bytes([data[sp], data[sp + 1]]) as u32,
                     _ => rd_u32(&data, sp),
@@ -493,7 +525,9 @@ impl FormatReader for BmpReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -514,7 +548,11 @@ impl FormatReader for BmpReader {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
         // Output is interleaved with size_c samples per pixel (indexed -> 1).
-        let channels = if meta.is_indexed { 1 } else { meta.size_c as usize };
+        let channels = if meta.is_indexed {
+            1
+        } else {
+            meta.size_c as usize
+        };
         crop_full_plane("BMP", &full, meta, channels, x, y, w, h)
     }
 
@@ -533,6 +571,7 @@ use crate::common::writer::FormatWriter;
 pub struct BmpWriter {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    wrote: bool,
 }
 
 impl BmpWriter {
@@ -540,6 +579,7 @@ impl BmpWriter {
         BmpWriter {
             path: None,
             meta: None,
+            wrote: false,
         }
     }
 }
@@ -559,12 +599,30 @@ impl FormatWriter for BmpWriter {
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        let logical_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+        let required_planes = meta
+            .size_z
+            .max(1)
+            .checked_mul(logical_c)
+            .and_then(|v| v.checked_mul(meta.size_t.max(1)))
+            .ok_or_else(|| BioFormatsError::Format("BMP writer plane count overflow".into()))?;
+        if required_planes > 1 || meta.image_count > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "BMP writer supports only one plane".into(),
+            ));
+        }
         if meta.pixel_type != PixelType::Uint8 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "BMP writer only supports Uint8".into(),
             ));
         }
+        if !meta.is_rgb || meta.size_c != 3 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "BMP writer only supports RGB Uint8 data".into(),
+            ));
+        }
         self.meta = Some(meta.clone());
+        self.wrote = false;
         Ok(())
     }
 
@@ -577,8 +635,14 @@ impl FormatWriter for BmpWriter {
     }
 
     fn close(&mut self) -> Result<()> {
+        if self.path.is_some() && !self.wrote {
+            return Err(BioFormatsError::Format(
+                "BMP writer closed before plane 0 was written".into(),
+            ));
+        }
         self.path = None;
         self.meta = None;
+        self.wrote = false;
         Ok(())
     }
 
@@ -586,6 +650,11 @@ impl FormatWriter for BmpWriter {
         if plane_index != 0 {
             return Err(BioFormatsError::Format(
                 "BMP writer supports only one plane".into(),
+            ));
+        }
+        if self.wrote {
+            return Err(BioFormatsError::Format(
+                "BMP writer already wrote plane 0".into(),
             ));
         }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
@@ -597,7 +666,9 @@ impl FormatWriter for BmpWriter {
             .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?;
 
         img.save(path)
-            .map_err(|e| BioFormatsError::Format(e.to_string()))
+            .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+        self.wrote = true;
+        Ok(())
     }
 
     fn can_do_stacks(&self) -> bool {
@@ -635,14 +706,7 @@ mod tests {
     }
 
     /// Build a minimal BMP header for a BITFIELDS image.
-    fn write_bmp(
-        path: &Path,
-        w: i32,
-        h: i32,
-        bpp: u16,
-        masks: &[u32],
-        pixel_data: &[u8],
-    ) {
+    fn write_bmp(path: &Path, w: i32, h: i32, bpp: u16, masks: &[u32], pixel_data: &[u8]) {
         let palette_or_mask_bytes = masks.len() * 4;
         let header = 14 + 40 + palette_or_mask_bytes;
         let mut buf: Vec<u8> = Vec::new();
@@ -651,7 +715,7 @@ mod tests {
         buf.extend_from_slice(&((header + pixel_data.len()) as u32).to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
         buf.extend_from_slice(&(header as u32).to_le_bytes()); // pixel offset
-        // BITMAPINFOHEADER (40 bytes)
+                                                               // BITMAPINFOHEADER (40 bytes)
         buf.extend_from_slice(&40u32.to_le_bytes());
         buf.extend_from_slice(&w.to_le_bytes());
         buf.extend_from_slice(&h.to_le_bytes());
@@ -671,6 +735,29 @@ mod tests {
         f.write_all(&buf).unwrap();
     }
 
+    fn write_raw_bmp(path: &Path, w: i32, h: i32, bpp: u16, pixel_data: &[u8]) {
+        let header = 14 + 40;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"BM");
+        buf.extend_from_slice(&((header + pixel_data.len()) as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&(header as u32).to_le_bytes());
+        buf.extend_from_slice(&40u32.to_le_bytes());
+        buf.extend_from_slice(&w.to_le_bytes());
+        buf.extend_from_slice(&h.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&bpp.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(pixel_data);
+        let mut f = File::create(path).unwrap();
+        f.write_all(&buf).unwrap();
+    }
+
     #[test]
     fn bitfields_16bit_565() {
         // 1x1 image, 5-6-5. Encode pure red (max R), pure green, pure blue.
@@ -678,14 +765,7 @@ mod tests {
         let path = tmp_path("bf16");
         let red: u16 = 0x1F << 11; // R=31, G=0, B=0
         let row = [red.to_le_bytes()[0], red.to_le_bytes()[1], 0, 0]; // padded to 4 bytes
-        write_bmp(
-            &path,
-            1,
-            1,
-            16,
-            &[0xF800, 0x07E0, 0x001F],
-            &row,
-        );
+        write_bmp(&path, 1, 1, 16, &[0xF800, 0x07E0, 0x001F], &row);
         let (meta, buf) = load_bmp(&path).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(meta.size_c, 3);
@@ -719,5 +799,30 @@ mod tests {
         assert_eq!(buf[1], 0x20);
         assert_eq!(buf[2], 0x30);
         assert_eq!(buf[3], 0x80);
+    }
+
+    #[test]
+    fn raw_payload_rejects_truncated_rows() {
+        let path = tmp_path("raw_truncated");
+        // 2x2 24-bit rows need 6 pixel bytes each, padded to 8 bytes. This
+        // provides only one complete row, so the second must not decode as
+        // zero-filled pixels.
+        write_raw_bmp(&path, 2, 2, 24, &[1, 2, 3, 4, 5, 6, 0, 0]);
+        let err = load_bmp(&path).expect_err("truncated raw BMP payload should be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(message) if message.contains("shorter"))
+        );
+    }
+
+    #[test]
+    fn bitfields_payload_rejects_truncated_rows() {
+        let path = tmp_path("bitfields_truncated");
+        write_bmp(&path, 2, 1, 16, &[0xF800, 0x07E0, 0x001F], &[0x00, 0xF8]);
+        let err = load_bmp(&path).expect_err("truncated bitfields BMP payload should be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(message) if message.contains("shorter"))
+        );
     }
 }

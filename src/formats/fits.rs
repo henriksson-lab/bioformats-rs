@@ -12,6 +12,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 use crate::common::writer::FormatWriter;
 
 const BLOCK: usize = 2880;
@@ -94,7 +95,9 @@ fn read_hdu(f: &mut File) -> Result<Option<FitsHdu>> {
                 }
                 k if k.starts_with("NAXIS") => {
                     if let Some(v) = val.and_then(parse_int_value) {
-                        let axis: usize = k[5..].parse().unwrap_or(0);
+                        let axis: usize = k[5..].parse().map_err(|_| {
+                            BioFormatsError::Format(format!("FITS: invalid NAXIS keyword {k:?}"))
+                        })?;
                         if axis > 0 {
                             if dims.len() < axis {
                                 dims.resize(axis, 1);
@@ -279,7 +282,10 @@ impl FormatReader for FitsReader {
         self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        &self.series[self.current_series].metadata
+        self.series
+            .get(self.current_series)
+            .map(|series| &series.metadata)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -317,16 +323,12 @@ impl FormatReader for FitsReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = &self.series[self.current_series].metadata;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
+        let meta = &self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?
+            .metadata;
+        crop_full_plane("FITS", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -394,6 +396,11 @@ impl FormatWriter for FitsWriter {
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        if meta.size_c.max(1) > 1 || meta.size_t.max(1) > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FITS writer does not preserve C/T axes; write Z stacks only".into(),
+            ));
+        }
         self.meta = Some(meta.clone());
         Ok(())
     }
@@ -405,12 +412,23 @@ impl FormatWriter for FitsWriter {
         self.planes.clear();
         Ok(())
     }
-    fn save_bytes(&mut self, _: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "FITS",
+            meta,
+            self.planes.len(),
+            plane_index,
+            data.len(),
+        )?;
         self.planes.push(data.to_vec());
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let _path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_complete("FITS", meta, self.planes.len())?;
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
         let f = File::create(&path).map_err(BioFormatsError::Io)?;
@@ -593,6 +611,29 @@ mod tests {
         assert_eq!(reader.series_count(), 1);
         assert_eq!(reader.open_bytes(0).expect("primary plane"), vec![9, 10]);
         assert!(reader.set_series(1).is_err());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fits_rejects_malformed_naxis_keyword() {
+        let path = temp_fits_path("bad_naxis_keyword");
+        let mut bytes = header(vec![
+            fits_record("SIMPLE", "                   T"),
+            fits_record("BITPIX", "                   8"),
+            fits_record("NAXIS", "                   2"),
+            fits_record("NAXISX", "                   1"),
+            fits_record("NAXIS2", "                   1"),
+        ]);
+        bytes.extend_from_slice(&padded_block(vec![42]));
+        std::fs::write(&path, bytes).expect("write synthetic FITS");
+
+        let mut reader = FitsReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid NAXIS keyword"),
+            "unexpected FITS error: {err}"
+        );
 
         let _ = std::fs::remove_file(path);
     }

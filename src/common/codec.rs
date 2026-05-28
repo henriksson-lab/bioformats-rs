@@ -135,13 +135,35 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
     let width = components[0].width() as usize;
     let height = components[0].height() as usize;
     let n_components = components.len();
+    let first_precision = components[0].precision();
+    let component_pixels = width.checked_mul(height).ok_or_else(|| {
+        BioFormatsError::Codec("JPEG 2000: component dimensions are too large".into())
+    })?;
+
+    for (idx, component) in components.iter().enumerate() {
+        if component.width() as usize != width || component.height() as usize != height {
+            return Err(BioFormatsError::Codec(format!(
+                "JPEG 2000: unsupported component geometry mismatch at component {idx}"
+            )));
+        }
+        if component.precision() != first_precision {
+            return Err(BioFormatsError::Codec(format!(
+                "JPEG 2000: unsupported component precision mismatch at component {idx}"
+            )));
+        }
+        if component.data().len() < component_pixels {
+            return Err(BioFormatsError::Codec(format!(
+                "JPEG 2000: component {idx} data is shorter than its geometry"
+            )));
+        }
+    }
 
     // Determine bytes per sample from the first component's precision.
     // jpeg2k component samples are i32; narrow by taking the low `bps` bytes of
     // the two's-complement representation (preserving sign bits for signed data),
     // rather than casting i32 -> u16 which would silently drop bits for any
     // precision > 16 that happened to fall into the 2-byte path.
-    let prec = components[0].precision() as usize;
+    let prec = first_precision as usize;
     let bps = if prec <= 8 {
         1
     } else if prec <= 16 {
@@ -150,7 +172,11 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
         4
     };
 
-    let mut out = Vec::with_capacity(width * height * n_components * bps);
+    let out_len = component_pixels
+        .checked_mul(n_components)
+        .and_then(|v| v.checked_mul(bps))
+        .ok_or_else(|| BioFormatsError::Codec("JPEG 2000: decoded image is too large".into()))?;
+    let mut out = Vec::with_capacity(out_len);
     // Interleave components pixel by pixel (RGBRGB...)
     for y in 0..height {
         for x in 0..width {
@@ -585,17 +611,18 @@ pub fn decompress_msvideo(data: &[u8], width: u32, height: u32, bpp: u32) -> Res
     //      4  5  6  7
     //      0  1  2  3   (bottom row)
     // A set bit selects color_a (`ca`); a clear bit selects color_b (`cb`).
-    let put_2color = |out: &mut [u8], base_x: usize, base_y: usize, flags: u16, ca: u16, cb: u16| {
-        for bit in 0..16usize {
-            let col = bit % 4;
-            let row_from_bottom = bit / 4;
-            let px = base_x + col;
-            // base_y is the top of the block; bit row 0 is the bottom row.
-            let py = base_y + (3 - row_from_bottom);
-            let color = if (flags >> bit) & 1 == 1 { ca } else { cb };
-            put(out, px, py, color);
-        }
-    };
+    let put_2color =
+        |out: &mut [u8], base_x: usize, base_y: usize, flags: u16, ca: u16, cb: u16| {
+            for bit in 0..16usize {
+                let col = bit % 4;
+                let row_from_bottom = bit / 4;
+                let px = base_x + col;
+                // base_y is the top of the block; bit row 0 is the bottom row.
+                let py = base_y + (3 - row_from_bottom);
+                let color = if (flags >> bit) & 1 == 1 { ca } else { cb };
+                put(out, px, py, color);
+            }
+        };
 
     let mut i = 0usize;
     let mut block_index = 0usize; // in encoder (bottom-up) order
@@ -1898,7 +1925,15 @@ fn cinepak_put_v1(
         let rgb = e[q];
         for dy in 0..2usize {
             for dx in 0..2usize {
-                cinepak_set_pixel(out, width, height, channels, mb_x + qx + dx, mb_y + qy + dy, rgb);
+                cinepak_set_pixel(
+                    out,
+                    width,
+                    height,
+                    channels,
+                    mb_x + qx + dx,
+                    mb_y + qy + dy,
+                    rgb,
+                );
             }
         }
     }
@@ -1928,7 +1963,15 @@ fn cinepak_put_v4(
         cinepak_set_pixel(out, width, height, channels, mb_x + qx, mb_y + qy, e[0]);
         cinepak_set_pixel(out, width, height, channels, mb_x + qx + 1, mb_y + qy, e[1]);
         cinepak_set_pixel(out, width, height, channels, mb_x + qx, mb_y + qy + 1, e[2]);
-        cinepak_set_pixel(out, width, height, channels, mb_x + qx + 1, mb_y + qy + 1, e[3]);
+        cinepak_set_pixel(
+            out,
+            width,
+            height,
+            channels,
+            mb_x + qx + 1,
+            mb_y + qy + 1,
+            e[3],
+        );
     }
 }
 
@@ -1988,7 +2031,9 @@ pub fn decompress_cinepak(
     }
 
     if data.len() < 10 {
-        return Err(BioFormatsError::Codec("Cinepak: frame header too short".into()));
+        return Err(BioFormatsError::Codec(
+            "Cinepak: frame header too short".into(),
+        ));
     }
     // Frame header: flags(1), length(3), width(2 BE), height(2 BE), strips(2 BE).
     let num_strips = rd_be_u16(data, 8)? as usize;
@@ -2028,16 +2073,15 @@ pub fn decompress_cinepak(
             strip_end, strip_top,
         )?;
 
-        strip_y0 = strip_top
-            + {
-                // advance by the strip height (in macroblocks * 4)
-                let h = bottom.saturating_sub(top);
-                if h > 0 {
-                    h
-                } else {
-                    0
-                }
-            };
+        strip_y0 = strip_top + {
+            // advance by the strip height (in macroblocks * 4)
+            let h = bottom.saturating_sub(top);
+            if h > 0 {
+                h
+            } else {
+                0
+            }
+        };
         pos = strip_end;
     }
 
@@ -2359,8 +2403,8 @@ mod tests {
         // in the bottom-up bit layout is the bottom display row.
         let data = [
             0x0f, 0x00, // flags (byte_b < 0x80 => 2-color)
-            100, // color_a (selected by set bits)
-            200, // color_b (selected by clear bits)
+            100,  // color_a (selected by set bits)
+            200,  // color_b (selected by clear bits)
         ];
         let out = decompress_msvideo(&data, 4, 4, 1).expect("MSVideo 8-bit decode");
         // Rows 0..2 (top three display rows) are color_b; row 3 (bottom) is color_a.
@@ -2746,8 +2790,7 @@ mod tests {
 
     #[test]
     fn cinepak_rejects_zero_dimensions() {
-        let err = decompress_cinepak(&[0u8; 10], 0, 4, 24, &[])
-            .expect_err("zero width must fail");
+        let err = decompress_cinepak(&[0u8; 10], 0, 4, 24, &[]).expect_err("zero width must fail");
         assert!(matches!(err, BioFormatsError::InvalidData(_)));
     }
 
@@ -2793,9 +2836,7 @@ mod tests {
 
     #[test]
     fn bmp_tile_decodes_to_interleaved_rgb() {
-        let pixels = vec![
-            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120,
-        ];
+        let pixels = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
         let encoded = encode_rgb(&pixels, 2, 2, image::ImageFormat::Bmp);
         let out = decompress_bmp(&encoded).expect("BMP decode");
         assert_eq!(out, pixels, "BMP tile must decode to interleaved RGB bytes");

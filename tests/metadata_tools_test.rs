@@ -1,6 +1,7 @@
 use bioformats::{
     create_lsid, DimensionOrder, ImageMetadata, MetadataValue, ModuloAnnotation, OmeAnnotation,
-    OmeMetadata, PixelType,
+    OmeChannel, OmeDichroic, OmeFilter, OmeImage, OmeInstrument, OmeLightSource, OmeMetadata,
+    PixelType,
 };
 use std::collections::HashMap;
 
@@ -51,6 +52,23 @@ fn metadata_tools_helpers_populate_and_verify_minimum_pixels() {
         ome.images[0].modulo_z.as_ref().unwrap().modulo_type,
         "phase"
     );
+    ome.verify_minimum_populated(&meta, 0).unwrap();
+}
+
+#[test]
+fn metadata_tools_rgb_uses_one_channel_with_multiple_samples() {
+    let mut meta = populated_meta();
+    meta.size_z = 1;
+    meta.size_c = 3;
+    meta.size_t = 1;
+    meta.image_count = 1;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+
+    let ome = OmeMetadata::from_image_metadata(&meta);
+
+    assert_eq!(ome.images[0].channels.len(), 1);
+    assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
     ome.verify_minimum_populated(&meta, 0).unwrap();
 }
 
@@ -117,4 +135,235 @@ fn metadata_tools_helpers_store_channel_globals_and_original_metadata() {
     assert!(xml.contains(r#"Namespace="openmicroscopy.org/bioformats/channel-global-min-max""#));
     assert!(xml.contains(r#"<M K="Channel">Channel:0:2</M>"#));
     assert!(xml.contains(r#"<M K="AcquisitionMode">test</M>"#));
+}
+
+#[test]
+fn ome_metadata_parser_decodes_entities_and_matches_exact_attributes() {
+    let xml = r#"
+<ome:OME xmlns:ome="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <ome:Image ObjectiveID="not-an-image-id" ID="Image:0" Name="A&amp;B &lt;image&gt;">
+    <ome:Description>first &amp; second</ome:Description>
+    <ome:Pixels ID="Pixels:0" PhysicalSizeX="500" PhysicalSizeXUnit="nm" SizeX="1" SizeY="1" SizeZ="1" SizeC="1" SizeT="1">
+      <ome:Channel ID="Channel:0:0" Name="DAPI &amp; FITC" SamplesPerPixel="1"/>
+    </ome:Pixels>
+  </ome:Image>
+  <ome:StructuredAnnotations>
+    <ome:MapAnnotation ID="Annotation:0" Namespace="ns&amp;value">
+      <ome:Value><ome:M K="key&amp;1">value &amp; one</ome:M></ome:Value>
+    </ome:MapAnnotation>
+  </ome:StructuredAnnotations>
+</ome:OME>"#;
+
+    let ome = OmeMetadata::from_ome_xml(xml);
+
+    assert_eq!(ome.images.len(), 1);
+    assert_eq!(ome.images[0].name.as_deref(), Some("A&B <image>"));
+    assert_eq!(ome.images[0].description.as_deref(), Some("first & second"));
+    assert_eq!(ome.images[0].physical_size_x, Some(0.5));
+    assert_eq!(
+        ome.images[0].channels[0].name.as_deref(),
+        Some("DAPI & FITC")
+    );
+    match &ome.annotations[0] {
+        OmeAnnotation::MapAnnotation {
+            namespace, values, ..
+        } => {
+            assert_eq!(namespace.as_deref(), Some("ns&value"));
+            assert_eq!(values, &vec![("key&1".into(), "value & one".into())]);
+        }
+        _ => panic!("expected map annotation"),
+    }
+}
+
+#[test]
+fn ome_metadata_parser_handles_gt_inside_quoted_start_tag_attribute() {
+    let xml = r#"
+<ome:OME xmlns:ome="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <ome:Image ID="Image:0">
+    <ome:Pixels ID="Pixels:0" Name="quoted > delimiter" PhysicalSizeX="2" PhysicalSizeXUnit="µm" SizeX="1" SizeY="1" SizeZ="1" SizeC="1" SizeT="1">
+      <ome:Channel ID="Channel:0:0" Name="DAPI" SamplesPerPixel="1"/>
+    </ome:Pixels>
+  </ome:Image>
+</ome:OME>"#;
+
+    let ome = OmeMetadata::from_ome_xml(xml);
+
+    assert_eq!(ome.images[0].physical_size_x, Some(2.0));
+    assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+}
+
+#[test]
+fn ome_metadata_serializer_writes_only_image_described_by_single_core_metadata() {
+    let meta = populated_meta();
+    let ome = OmeMetadata {
+        images: vec![
+            OmeImage {
+                name: Some("first".into()),
+                channels: vec![OmeChannel {
+                    samples_per_pixel: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            OmeImage {
+                name: Some("second".into()),
+                channels: vec![OmeChannel {
+                    samples_per_pixel: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let xml = ome.to_ome_xml(&meta);
+
+    assert_eq!(xml.matches("<Image ").count(), 1);
+    assert!(xml.contains(r#"Name="first""#));
+    assert!(!xml.contains(r#"Name="second""#));
+}
+
+#[test]
+fn ome_metadata_verify_rejects_extra_channels() {
+    let mut meta = populated_meta();
+    meta.size_c = 1;
+    meta.image_count = meta.size_z * meta.size_c * meta.size_t;
+    let ome = OmeMetadata {
+        images: vec![OmeImage {
+            channels: vec![
+                OmeChannel {
+                    samples_per_pixel: 1,
+                    ..Default::default()
+                },
+                OmeChannel {
+                    samples_per_pixel: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let err = ome.verify_minimum_populated(&meta, 0).unwrap_err();
+    assert!(
+        matches!(err, bioformats::BioFormatsError::InvalidData(ref message) if message.contains("metadata SizeC requires 1")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn ome_metadata_verify_rejects_wrong_rgb_samples_per_pixel() {
+    let mut meta = populated_meta();
+    meta.size_c = 3;
+    meta.image_count = meta.size_z * meta.size_t;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+    let ome = OmeMetadata {
+        images: vec![OmeImage {
+            channels: vec![OmeChannel {
+                samples_per_pixel: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let err = ome.verify_minimum_populated(&meta, 0).unwrap_err();
+    assert!(
+        matches!(err, bioformats::BioFormatsError::InvalidData(ref message) if message.contains("SamplesPerPixel=3")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn add_channel_global_min_max_rejects_missing_channel() {
+    let mut ome = OmeMetadata {
+        images: vec![OmeImage {
+            channels: vec![OmeChannel {
+                samples_per_pixel: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let err = ome.add_channel_global_min_max(0, 1, 0.0, 1.0).unwrap_err();
+    assert!(
+        matches!(err, bioformats::BioFormatsError::InvalidData(ref message) if message.contains("missing OME Channel")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn ome_metadata_serializer_generates_unique_instrument_ids() {
+    let mut meta = populated_meta();
+    meta.size_c = 1;
+    meta.image_count = meta.size_z * meta.size_c * meta.size_t;
+    let ome = OmeMetadata {
+        instruments: vec![OmeInstrument {
+            light_sources: vec![OmeLightSource::default(), OmeLightSource::default()],
+            filters: vec![OmeFilter::default(), OmeFilter::default()],
+            dichroics: vec![OmeDichroic::default(), OmeDichroic::default()],
+            ..Default::default()
+        }],
+        images: vec![OmeImage {
+            channels: vec![OmeChannel {
+                samples_per_pixel: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let xml = ome.to_ome_xml(&meta);
+
+    assert!(xml.contains(r#"ID="LightSource:0:0""#));
+    assert!(xml.contains(r#"ID="LightSource:0:1""#));
+    assert!(xml.contains(r#"ID="Filter:0:0""#));
+    assert!(xml.contains(r#"ID="Filter:0:1""#));
+    assert!(xml.contains(r#"ID="Dichroic:0:0""#));
+    assert!(xml.contains(r#"ID="Dichroic:0:1""#));
+}
+
+#[test]
+fn ome_metadata_serializer_sanitizes_light_source_element_names() {
+    let mut meta = populated_meta();
+    meta.size_c = 1;
+    meta.image_count = meta.size_z * meta.size_c * meta.size_t;
+    let ome = OmeMetadata {
+        instruments: vec![OmeInstrument {
+            light_sources: vec![
+                OmeLightSource {
+                    id: Some("LightSource:0".into()),
+                    light_source_type: Some("Laser Source".into()),
+                    ..Default::default()
+                },
+                OmeLightSource {
+                    id: Some("LightSource:1".into()),
+                    light_source_type: Some("LED".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        images: vec![OmeImage {
+            channels: vec![OmeChannel {
+                samples_per_pixel: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let xml = ome.to_ome_xml(&meta);
+
+    assert!(xml.contains(r#"<GenericExcitationSource ID="LightSource:0""#));
+    assert!(xml.contains(r#"<LightEmittingDiode ID="LightSource:1""#));
+    assert!(!xml.contains("<Laser Source"));
 }

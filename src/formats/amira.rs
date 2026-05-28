@@ -9,6 +9,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 // ─── Amira Mesh ───────────────────────────────────────────────────────────────
 
@@ -69,12 +70,37 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
         if t.starts_with("define Lattice") {
             let parts: Vec<&str> = t.split_ascii_whitespace().collect();
             if parts.len() >= 5 {
-                nx = parts[2].parse().unwrap_or(0);
-                ny = parts[3].parse().unwrap_or(0);
-                nz = parts[4].parse().unwrap_or(1);
+                nx = parts[2].parse().map_err(|_| {
+                    BioFormatsError::Format(format!(
+                        "Amira Mesh: invalid lattice width {:?}",
+                        parts[2]
+                    ))
+                })?;
+                ny = parts[3].parse().map_err(|_| {
+                    BioFormatsError::Format(format!(
+                        "Amira Mesh: invalid lattice height {:?}",
+                        parts[3]
+                    ))
+                })?;
+                nz = parts[4].parse().map_err(|_| {
+                    BioFormatsError::Format(format!(
+                        "Amira Mesh: invalid lattice depth {:?}",
+                        parts[4]
+                    ))
+                })?;
             } else if parts.len() >= 4 {
-                nx = parts[2].parse().unwrap_or(0);
-                ny = parts[3].parse().unwrap_or(0);
+                nx = parts[2].parse().map_err(|_| {
+                    BioFormatsError::Format(format!(
+                        "Amira Mesh: invalid lattice width {:?}",
+                        parts[2]
+                    ))
+                })?;
+                ny = parts[3].parse().map_err(|_| {
+                    BioFormatsError::Format(format!(
+                        "Amira Mesh: invalid lattice height {:?}",
+                        parts[3]
+                    ))
+                })?;
                 nz = 1;
             }
         }
@@ -160,35 +186,73 @@ impl AmiraReader {
         // Read all of the remaining text and tokenize. ASCII Amira streams store
         // values plane-major; skip the planes before the requested one.
         let mut text = String::new();
-        reader.read_to_string(&mut text).map_err(BioFormatsError::Io)?;
+        reader
+            .read_to_string(&mut text)
+            .map_err(BioFormatsError::Io)?;
         let skip = plane_index as usize * count;
 
+        let tokens: Vec<&str> = text
+            .split_ascii_whitespace()
+            .skip(skip)
+            .take(count)
+            .collect();
+        if tokens.len() != count {
+            return Err(BioFormatsError::InvalidData(format!(
+                "Amira ASCII plane {plane_index} has {} samples, expected {count}",
+                tokens.len()
+            )));
+        }
+
         let mut out = vec![0u8; count * bps];
-        for (i, tok) in text.split_ascii_whitespace().skip(skip).take(count).enumerate() {
+        for (i, tok) in tokens.into_iter().enumerate() {
             let dst = &mut out[i * bps..(i + 1) * bps];
             match pixel_type {
                 PixelType::Float32 => {
-                    let v: f32 = tok.parse().unwrap_or(0.0);
+                    let v: f32 = tok.parse().map_err(|_| {
+                        BioFormatsError::InvalidData(format!(
+                            "Amira ASCII plane {plane_index} contains non-Float32 sample {tok:?}"
+                        ))
+                    })?;
                     dst.copy_from_slice(&v.to_le_bytes());
                 }
                 PixelType::Float64 => {
-                    let v: f64 = tok.parse().unwrap_or(0.0);
+                    let v: f64 = tok.parse().map_err(|_| {
+                        BioFormatsError::InvalidData(format!(
+                            "Amira ASCII plane {plane_index} contains non-Float64 sample {tok:?}"
+                        ))
+                    })?;
                     dst.copy_from_slice(&v.to_le_bytes());
                 }
                 PixelType::Int32 => {
-                    let v: i32 = tok.parse().unwrap_or(0);
+                    let v: i32 = tok.parse().map_err(|_| {
+                        BioFormatsError::InvalidData(format!(
+                            "Amira ASCII plane {plane_index} contains non-Int32 sample {tok:?}"
+                        ))
+                    })?;
                     dst.copy_from_slice(&v.to_le_bytes());
                 }
                 PixelType::Uint16 => {
-                    let v: u16 = tok.parse().unwrap_or(0);
+                    let v: u16 = tok.parse().map_err(|_| {
+                        BioFormatsError::InvalidData(format!(
+                            "Amira ASCII plane {plane_index} contains non-Uint16 sample {tok:?}"
+                        ))
+                    })?;
                     dst.copy_from_slice(&v.to_le_bytes());
                 }
                 PixelType::Int16 => {
-                    let v: i16 = tok.parse().unwrap_or(0);
+                    let v: i16 = tok.parse().map_err(|_| {
+                        BioFormatsError::InvalidData(format!(
+                            "Amira ASCII plane {plane_index} contains non-Int16 sample {tok:?}"
+                        ))
+                    })?;
                     dst.copy_from_slice(&v.to_le_bytes());
                 }
                 _ => {
-                    let v: i64 = tok.parse().unwrap_or(0);
+                    let v: i64 = tok.parse().map_err(|_| {
+                        BioFormatsError::InvalidData(format!(
+                            "Amira ASCII plane {plane_index} contains non-integer sample {tok:?}"
+                        ))
+                    })?;
                     dst[0] = v as u8;
                 }
             }
@@ -267,7 +331,9 @@ impl FormatReader for AmiraReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -299,16 +365,8 @@ impl FormatReader for AmiraReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Amira", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -465,7 +523,9 @@ impl FormatReader for SpiderReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -493,16 +553,8 @@ impl FormatReader for SpiderReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = 4usize;
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Spider", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

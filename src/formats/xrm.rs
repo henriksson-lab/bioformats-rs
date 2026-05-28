@@ -6,16 +6,15 @@
 //! plane streams from `Root Entry/ImageData/ImageN`.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::ole::{cfb_path_without_root, OleFile};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
-const XRM_CFB_MAGIC: &[u8; 8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
 const IMAGE_DATA: &str = "/ImageData/";
 
 pub struct XrmReader {
@@ -49,8 +48,8 @@ impl FormatReader for XrmReader {
         matches!(ext.as_deref(), Some("xrm") | Some("txrm") | Some("txm"))
     }
 
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= XRM_CFB_MAGIC.len() && &header[..XRM_CFB_MAGIC.len()] == XRM_CFB_MAGIC
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -85,7 +84,9 @@ impl FormatReader for XrmReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -104,13 +105,8 @@ impl FormatReader for XrmReader {
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
 
-        let mut comp =
-            cfb::open(&path).map_err(|e| BioFormatsError::Format(format!("XRM CFB open: {e}")))?;
-        let mut stream = comp
-            .open_stream(&stream_path)
-            .map_err(|e| BioFormatsError::Format(format!("XRM stream {stream_path}: {e}")))?;
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).map_err(BioFormatsError::Io)?;
+        let mut ole = OleFile::open(&path)?;
+        let raw = ole.document_bytes(&stream_path)?;
 
         xrm_flip_rows(&raw, meta)
     }
@@ -139,8 +135,7 @@ impl FormatReader for XrmReader {
 }
 
 fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
-    let mut comp =
-        cfb::open(path).map_err(|e| BioFormatsError::Format(format!("XRM CFB open: {e}")))?;
+    let mut ole = OleFile::open(path)?;
 
     let mut size_x = None;
     let mut size_y = None;
@@ -148,31 +143,31 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
     let mut metadata = HashMap::new();
     let mut image_paths = Vec::new();
 
-    let paths: Vec<String> = comp
-        .walk()
-        .filter(|entry| entry.is_stream())
-        .map(|entry| normalize_cfb_path(&entry.path().to_string_lossy()))
+    let paths: Vec<String> = ole
+        .document_list()
+        .into_iter()
+        .map(|path| normalize_cfb_path(&path))
         .collect();
 
     for path in paths {
         if path.starts_with(IMAGE_DATA) {
             image_paths.push(path);
         } else if path == "/ImageInfo/ImageWidth" {
-            let v = read_xrm_i32(&mut comp, &path)?;
+            let v = read_xrm_i32(&mut ole, &path)?;
             size_x = Some(v);
             metadata.insert(
                 "Image Details: Image width (pixels)".into(),
                 MetadataValue::Int(v as i64),
             );
         } else if path == "/ImageInfo/ImageHeight" {
-            let v = read_xrm_i32(&mut comp, &path)?;
+            let v = read_xrm_i32(&mut ole, &path)?;
             size_y = Some(v);
             metadata.insert(
                 "Image Details: Image height (pixels)".into(),
                 MetadataValue::Int(v as i64),
             );
         } else if path == "/ImageInfo/DataType" {
-            let code = read_xrm_i32(&mut comp, &path)?;
+            let code = read_xrm_i32(&mut ole, &path)?;
             let (ty, label) = xrm_pixel_type(code)?;
             pixel_type = Some(ty);
             metadata.insert(
@@ -180,14 +175,14 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
                 MetadataValue::String(label.into()),
             );
         } else if path == "/ImageInfo/FileType" {
-            if let Ok(value) = read_xrm_string(&mut comp, &path) {
+            if let Ok(value) = read_xrm_string(&mut ole, &path) {
                 metadata.insert(
                     "Image Details: File type".into(),
                     MetadataValue::String(value),
                 );
             }
         } else if path == "/ImageInfo/PixelSize" {
-            if let Ok(value) = read_xrm_f32(&mut comp, &path) {
+            if let Ok(value) = read_xrm_f32(&mut ole, &path) {
                 metadata.insert(
                     "Image Details: Pixel size (um)".into(),
                     MetadataValue::Float(value as f64),
@@ -205,18 +200,20 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
 
     let size_x = size_x.ok_or_else(|| {
         BioFormatsError::UnsupportedFormat("Zeiss XRM/TXRM missing ImageInfo/ImageWidth".into())
-    })? as u32;
+    })?;
     let size_y = size_y.ok_or_else(|| {
         BioFormatsError::UnsupportedFormat("Zeiss XRM/TXRM missing ImageInfo/ImageHeight".into())
-    })? as u32;
+    })?;
+    if size_x <= 0 || size_y <= 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Zeiss XRM/TXRM has invalid non-positive image dimensions".into(),
+        ));
+    }
+    let size_x = size_x as u32;
+    let size_y = size_y as u32;
     let pixel_type = pixel_type.ok_or_else(|| {
         BioFormatsError::UnsupportedFormat("Zeiss XRM/TXRM missing ImageInfo/DataType".into())
     })?;
-    if size_x == 0 || size_y == 0 {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "Zeiss XRM/TXRM has invalid zero image dimensions".into(),
-        ));
-    }
 
     let bits = (pixel_type.bytes_per_sample() * 8) as u8;
     let image_count = image_paths.len() as u32;
@@ -245,37 +242,31 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
 }
 
 fn normalize_cfb_path(path: &str) -> String {
-    path.replace('\\', "/").replace("/Root Entry", "")
+    format!("/{}", cfb_path_without_root(path))
 }
 
-fn read_xrm_stream(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str) -> Result<Vec<u8>> {
-    let mut stream = comp
-        .open_stream(path)
-        .or_else(|_| comp.open_stream(format!("/Root Entry{path}")))
-        .map_err(|e| BioFormatsError::Format(format!("XRM stream {path}: {e}")))?;
-    let mut data = Vec::new();
-    stream.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
-    Ok(data)
+fn read_xrm_stream(ole: &mut OleFile, path: &str) -> Result<Vec<u8>> {
+    ole.document_bytes(path)
 }
 
-fn read_xrm_i32(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str) -> Result<i32> {
-    let data = read_xrm_stream(comp, path)?;
+fn read_xrm_i32(ole: &mut OleFile, path: &str) -> Result<i32> {
+    let data = read_xrm_stream(ole, path)?;
     let bytes = data
         .get(..4)
         .ok_or_else(|| BioFormatsError::Format(format!("XRM stream {path} is shorter than i32")))?;
     Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn read_xrm_f32(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str) -> Result<f32> {
-    let data = read_xrm_stream(comp, path)?;
+fn read_xrm_f32(ole: &mut OleFile, path: &str) -> Result<f32> {
+    let data = read_xrm_stream(ole, path)?;
     let bytes = data
         .get(..4)
         .ok_or_else(|| BioFormatsError::Format(format!("XRM stream {path} is shorter than f32")))?;
     Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn read_xrm_string(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str) -> Result<String> {
-    let data = read_xrm_stream(comp, path)?;
+fn read_xrm_string(ole: &mut OleFile, path: &str) -> Result<String> {
+    let data = read_xrm_stream(ole, path)?;
     Ok(String::from_utf8_lossy(&data)
         .trim_matches(char::from(0))
         .trim()
@@ -398,6 +389,25 @@ mod tests {
         let err = XrmReader::new().set_id(&path).unwrap_err();
         assert!(
             matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("ImageHeight")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xrm_rejects_non_positive_dimensions_before_casting() {
+        let path = temp_path("negative_width.txm");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            write_i32_stream(&mut comp, "/ImageInfo/ImageWidth", -2);
+            write_i32_stream(&mut comp, "/ImageInfo/ImageHeight", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/DataType", 3);
+            write_stream(&mut comp, "/ImageData/Image1", &[0; 4]);
+        }
+
+        let err = XrmReader::new().set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("non-positive")),
             "{err:?}"
         );
         let _ = std::fs::remove_file(path);

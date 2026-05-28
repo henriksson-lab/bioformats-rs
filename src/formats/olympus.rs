@@ -66,9 +66,7 @@ impl FileSource {
                 let mut stream = comp
                     .open_stream(&norm)
                     .or_else(|_| comp.open_stream(stream_path))
-                    .map_err(|e| {
-                        BioFormatsError::Format(format!("OIB stream {norm}: {e}"))
-                    })?;
+                    .map_err(|e| BioFormatsError::Format(format!("OIB stream {norm}: {e}")))?;
                 let mut buf = Vec::new();
                 stream.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
                 Ok(buf)
@@ -252,7 +250,11 @@ impl OifReader {
             .walk()
             .filter(|e| e.is_stream())
             .map(|e| e.path().to_string_lossy().to_string())
-            .find(|p| p.replace('\\', "/").to_ascii_lowercase().ends_with("oibinfo.txt"))
+            .find(|p| {
+                p.replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with("oibinfo.txt")
+            })
             .ok_or_else(|| {
                 BioFormatsError::Format("OIB: OibInfo.txt not found in compound document".into())
             })?;
@@ -264,9 +266,8 @@ impl OifReader {
         let info_text = decode_text(&info_data);
 
         let (oif_name, mapping) = map_oib_files(&info_text);
-        let oif_name = oif_name.ok_or_else(|| {
-            BioFormatsError::Format("OIB: no .oif entry in OibInfo.txt".into())
-        })?;
+        let oif_name = oif_name
+            .ok_or_else(|| BioFormatsError::Format("OIB: no .oif entry in OibInfo.txt".into()))?;
 
         self.source = FileSource::Oib {
             path: oib_path.to_path_buf(),
@@ -619,7 +620,12 @@ impl OifReader {
                 let mut reader = TiffReader::new();
                 reader.set_id(Path::new(&tiff_name))?;
                 let inner = reader.metadata().image_count.max(1);
-                reader.open_bytes((image as u32) % inner)
+                if image as u32 >= inner {
+                    return Err(BioFormatsError::Format(format!(
+                        "OIF/OIB: logical plane {plane_index} maps to TIFF page {image}, but {tiff_name} has {inner} page(s)"
+                    )));
+                }
+                reader.open_bytes(image as u32)
             }
             FileSource::Oib { .. } => {
                 // Read the embedded TIFF into a temp file, then parse it. The
@@ -635,7 +641,12 @@ impl OifReader {
                 let mut reader = TiffReader::new();
                 let r = reader.set_id(&tmp).and_then(|_| {
                     let inner = reader.metadata().image_count.max(1);
-                    reader.open_bytes((image as u32) % inner)
+                    if image as u32 >= inner {
+                        return Err(BioFormatsError::Format(format!(
+                            "OIF/OIB: logical plane {plane_index} maps to TIFF page {image}, but {tiff_name} has {inner} page(s)"
+                        )));
+                    }
+                    reader.open_bytes(image as u32)
                 });
                 let _ = std::fs::remove_file(&tmp);
                 r
@@ -747,7 +758,12 @@ fn probe_tiff(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8)> {
     let mut r = TiffReader::new();
     let res = r.set_id(&tmp).ok().map(|_| {
         let tm = r.metadata();
-        (tm.pixel_type, tm.is_little_endian, tm.is_rgb, tm.bits_per_pixel)
+        (
+            tm.pixel_type,
+            tm.is_little_endian,
+            tm.is_rgb,
+            tm.bits_per_pixel,
+        )
     });
     let _ = std::fs::remove_file(&tmp);
     res
@@ -778,7 +794,10 @@ fn rand_suffix(bytes: &[u8]) -> u64 {
     // cheap, deterministic-ish unique suffix
     let pid = std::process::id() as u64;
     let len = bytes.len() as u64;
-    let h = bytes.iter().take(16).fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
+    let h = bytes
+        .iter()
+        .take(16)
+        .fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
     pid ^ (len << 16) ^ h
 }
 
@@ -837,7 +856,9 @@ impl FormatReader for OifReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -871,13 +892,30 @@ impl FormatReader for OifReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::pixel_type::PixelType;
+    use crate::writer_registry::ImageWriter;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bioformats_olympus_test_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            name
+        ))
+    }
 
     #[test]
     fn ini_parses_sections_and_keys() {
         let text = "[File Info]\r\nDataName=\"image.tif\"\r\n[Axis 2 Parameters]\r\nNumber=3\r\n";
         let ini = IniList::parse(text);
         assert_eq!(
-            ini.table("File Info").and_then(|t| t.get("DataName")).map(String::as_str),
+            ini.table("File Info")
+                .and_then(|t| t.get("DataName"))
+                .map(String::as_str),
             Some("image.tif")
         );
         assert_eq!(
@@ -934,5 +972,52 @@ mod tests {
             parse_dimension_order("XYZCT"),
             DimensionOrder::XYZCT
         ));
+    }
+
+    #[test]
+    fn oif_rejects_logical_plane_without_physical_tiff_page() {
+        let root = temp_path("repeat_plane.oif");
+        let companion = root.with_file_name(format!(
+            "{}.files",
+            root.file_stem().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&companion).unwrap();
+
+        let tiff = companion.join("plane0.tif");
+        let mut tiff_meta = ImageMetadata::default();
+        tiff_meta.size_x = 2;
+        tiff_meta.size_y = 2;
+        tiff_meta.pixel_type = PixelType::Uint8;
+        tiff_meta.image_count = 1;
+        ImageWriter::save(&tiff, &tiff_meta, &[vec![1, 2, 3, 4]]).unwrap();
+
+        let pty = companion.join("plane0.pty");
+        std::fs::write(
+            &pty,
+            "[File Info]\nDataName=plane0.tif\n[Axis 0 Parameters]\nNumber=1\n[Axis 1 Parameters]\nNumber=1\n[Axis 2 Parameters]\nNumber=2\n[Axis 3 Parameters]\nNumber=2\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            &root,
+            "[ProfileSaveInfo]\nIniFileName0=plane0.pty\n[Axis 0 Parameters Common]\nAxisCode=X\nMaxSize=2\n[Axis 1 Parameters Common]\nAxisCode=Y\nMaxSize=2\n[Axis 2 Parameters Common]\nAxisCode=C\nMaxSize=2\n[Axis 3 Parameters Common]\nAxisCode=Z\nMaxSize=2\n[Reference Image Parameter]\nImageDepth=1\nValidBitCounts=8\n",
+        )
+        .unwrap();
+
+        let mut reader = OifReader::new();
+        reader.set_id(&root).unwrap();
+        assert_eq!(reader.metadata().image_count, 4);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+
+        let err = reader.open_bytes(1).unwrap_err();
+        assert!(
+            err.to_string().contains("maps to TIFF page 1"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_file(root);
+        let _ = std::fs::remove_file(pty);
+        let _ = std::fs::remove_file(tiff);
+        let _ = std::fs::remove_dir(companion);
     }
 }

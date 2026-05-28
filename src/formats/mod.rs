@@ -57,6 +57,7 @@ pub mod sem;
 pub mod simfcs;
 pub mod spe;
 pub mod spm;
+pub(crate) mod stack_writer;
 pub mod svs;
 pub mod tiff_wrappers;
 pub mod viff;

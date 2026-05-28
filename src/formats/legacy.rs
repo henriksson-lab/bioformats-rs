@@ -13,6 +13,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::{crop_full_plane, validate_region};
 
 fn region_crop(full: &[u8], meta: &ImageMetadata, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
     let bps = meta.pixel_type.bytes_per_sample();
@@ -178,7 +179,9 @@ impl FormatReader for KodakBipReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -210,8 +213,8 @@ impl FormatReader for KodakBipReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        Ok(region_crop(&full, meta, x, y, w, h))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Kodak BIP", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -288,7 +291,9 @@ impl FormatReader for WoolzReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -476,7 +481,9 @@ fn decode_pict_jpeg(
     // jpegOffsets[0] = filePointer + 2 (current position is just past opcode).
     let first = c.position() + 2;
     if first >= data.len() {
-        return Err(BioFormatsError::Format("PICT: truncated JPEG payload".into()));
+        return Err(BioFormatsError::Format(
+            "PICT: truncated JPEG payload".into(),
+        ));
     }
 
     // Collect the start offsets of each embedded JPEG stream, following the
@@ -783,13 +790,16 @@ fn read_pict_rows(
             if pixel_size == 16 {
                 unpack_pict_16_packbits(packed, width)?
             } else {
-                let mut out = decompress_packbits(packed)?;
+                let out = decompress_packbits(packed)?;
                 let min_len = match pixel_size {
                     24 | 32 => width.saturating_mul(comp_count),
                     _ => row_bytes.max(width),
                 };
                 if out.len() < min_len {
-                    out.resize(min_len, 0);
+                    return Err(BioFormatsError::InvalidData(format!(
+                        "PICT PackBits row decoded to {} bytes, expected at least {min_len}",
+                        out.len()
+                    )));
                 }
                 out
             }
@@ -904,10 +914,15 @@ fn expand_pict_bits(bit_size: u8, input: &[u8], out_len: usize) -> Result<Vec<u8
             }
             let shift = 8 - bit_size * (i + 1);
             out.push((byte >> shift) & mask);
+            if out.len() == out_len {
+                return Ok(out);
+            }
         }
     }
-    out.resize(out_len, 0);
-    Ok(out)
+    Err(BioFormatsError::InvalidData(format!(
+        "PICT bit row expanded to {} pixels, expected {out_len}",
+        out.len()
+    )))
 }
 
 fn unpack_pict_16_packbits(input: &[u8], width: usize) -> Result<Vec<u8>> {
@@ -940,7 +955,13 @@ fn unpack_pict_16_packbits(input: &[u8], width: usize) -> Result<Vec<u8>> {
             }
         }
     }
-    out.resize(width * 2, 0);
+    if out.len() != width * 2 {
+        return Err(BioFormatsError::InvalidData(format!(
+            "PICT PackBits16 row decoded to {} bytes, expected {}",
+            out.len(),
+            width * 2
+        )));
+    }
     Ok(out)
 }
 
@@ -1025,7 +1046,9 @@ impl FormatReader for PictReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1048,11 +1071,7 @@ impl FormatReader for PictReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if x.checked_add(w).is_none_or(|v| v > meta.size_x)
-            || y.checked_add(h).is_none_or(|v| v > meta.size_y)
-        {
-            return Err(BioFormatsError::InvalidData("region out of bounds".into()));
-        }
+        validate_region("PICT", meta.size_x, meta.size_y, x, y, w, h)?;
         Ok(pict_region_crop(&full, meta, x, y, w, h))
     }
 
@@ -1158,6 +1177,26 @@ mod tests {
             reader.open_bytes_region(0, 2, 0, 3, 2).unwrap(),
             vec![3, 4, 5, 11, 12, 13]
         );
+        let err = reader.open_bytes_region(0, 0, 0, 0, 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("width and height must be non-zero"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_v2_packbits_short_row_is_rejected() {
+        let path = tmp("packbits_short");
+        let mut data = pict_v2_prefix(8, 1);
+        append_pixmap_8(&mut data, 8, 1, &[&[3, 1, 2, 3, 4]]);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = PictReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(err.to_string().contains("PackBits row decoded"));
 
         std::fs::remove_file(path).ok();
     }

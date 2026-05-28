@@ -14,6 +14,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 // ── NIfTI datatype codes ─────────────────────────────────────────────────────
 //
@@ -65,9 +66,9 @@ const HDR_SIZE: usize = 348;
 #[derive(Debug)]
 struct NiftiHeader {
     /// Number of dimensions (dim[0])
-    ndim: u16,
+    ndim: i16,
     /// dim[1..ndim]
-    dim: [u16; 7],
+    dim: [i16; 7],
     datatype: i16,
     bitpix: i16,
     /// pixdim[1..ndim] — voxel spacing
@@ -86,14 +87,6 @@ fn read_i16(buf: &[u8], off: usize, le: bool) -> i16 {
         i16::from_le_bytes(b)
     } else {
         i16::from_be_bytes(b)
-    }
-}
-fn read_u16_h(buf: &[u8], off: usize, le: bool) -> u16 {
-    let b = [buf[off], buf[off + 1]];
-    if le {
-        u16::from_le_bytes(b)
-    } else {
-        u16::from_be_bytes(b)
     }
 }
 fn read_f32(buf: &[u8], off: usize, le: bool) -> f32 {
@@ -125,10 +118,15 @@ fn parse_header(buf: &[u8]) -> Result<NiftiHeader> {
         ));
     };
 
-    let ndim = read_u16_h(buf, 40, le);
-    let mut dim = [0u16; 7];
+    let ndim = read_i16(buf, 40, le);
+    if !(1..=7).contains(&ndim) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "NIfTI/Analyze invalid dimension count {ndim}"
+        )));
+    }
+    let mut dim = [0i16; 7];
     for i in 0..7 {
-        dim[i] = read_u16_h(buf, 42 + i * 2, le);
+        dim[i] = read_i16(buf, 42 + i * 2, le);
     }
 
     let datatype = read_i16(buf, 70, le);
@@ -173,17 +171,21 @@ fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
     // Java reads sizeX=dim[1], sizeY=dim[2], sizeZ=dim[3], sizeT=dim[4] and
     // then multiplies sizeC by the extra dims dim[5..] when nDimensions > 4.
     // In this struct hdr.dim[0..6] correspond to NIfTI dim[1..7].
-    let size_x = hdr.dim[0].max(1) as u32;
-    let size_y = hdr.dim[1].max(1) as u32;
-    let mut size_z = hdr.dim[2] as u32;
-    let mut size_t = hdr.dim[3] as u32;
+    let size_x = positive_dim(hdr.dim[0], "SizeX")?;
+    let size_y = positive_dim(hdr.dim[1], "SizeY")?;
+    let mut size_z = optional_dim(hdr.dim[2], "SizeZ")?;
+    let mut size_t = optional_dim(hdr.dim[3], "SizeT")?;
 
     // extraDims = dim[5], dim[6], dim[7] → hdr.dim[4], hdr.dim[5], hdr.dim[6].
     let extra_dims = [hdr.dim[4], hdr.dim[5], hdr.dim[6]];
     let mut size_c = 1u32;
     if hdr.ndim > 4 {
         for d in extra_dims.iter().take(hdr.ndim as usize - 4) {
-            size_c *= (*d).max(1) as u32;
+            size_c = size_c
+                .checked_mul(positive_dim(*d, "extra dimension")?)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("NIfTI/Analyze channel count overflows".into())
+                })?;
         }
     }
 
@@ -197,7 +199,10 @@ fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
     // Java computes imageCount = sizeZ * sizeT * sizeC BEFORE populatePixelType
     // overrides sizeC for colour datatypes, so the colour override does not
     // change imageCount.
-    let image_count = size_z * size_t * size_c;
+    let image_count = size_z
+        .checked_mul(size_t)
+        .and_then(|n| n.checked_mul(size_c))
+        .ok_or_else(|| BioFormatsError::Format("NIfTI/Analyze image count overflows".into()))?;
 
     // Pixel type; colour datatypes (128/2304) also override sizeC.
     let (pixel_type, color_size_c) = nifti_pixel_type(hdr.datatype)?;
@@ -266,6 +271,24 @@ fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
     })
 }
 
+fn positive_dim(value: i16, label: &str) -> Result<u32> {
+    if value <= 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "NIfTI/Analyze header has non-positive {label}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+fn optional_dim(value: i16, label: &str) -> Result<u32> {
+    if value < 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "NIfTI/Analyze header has negative {label}"
+        )));
+    }
+    Ok(value.max(1) as u32)
+}
+
 // ── Reader ────────────────────────────────────────────────────────────────────
 
 pub struct NiftiReader {
@@ -297,7 +320,12 @@ impl NiftiReader {
             .ok_or(BioFormatsError::NotInitialized)?;
 
         let bps = meta.pixel_type.bytes_per_sample();
-        let plane_bytes = (meta.size_x * meta.size_y * meta.size_c) as usize * bps;
+        let samples = if meta.is_rgb {
+            meta.size_c.max(1) as usize
+        } else {
+            1
+        };
+        let plane_bytes = meta.size_x as usize * meta.size_y as usize * samples * bps;
         let plane_offset = plane_index as u64 * plane_bytes as u64;
 
         let f = File::open(data_path).map_err(BioFormatsError::Io)?;
@@ -429,7 +457,9 @@ impl FormatReader for NiftiReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -449,18 +479,13 @@ impl FormatReader for NiftiReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let spp = meta.size_c as usize;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * spp * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let samples = if meta.is_rgb {
+            meta.size_c.max(1) as usize
+        } else {
+            1
+        };
+        crop_full_plane("NIfTI", &full, meta, samples, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

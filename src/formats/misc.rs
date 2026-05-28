@@ -1,8 +1,8 @@
 //! Placeholder readers for miscellaneous / proprietary formats.
 //!
-//! These readers are extension-only (or magic-byte only for JPEG 2000) and
-//! return 512×512 uint8 placeholder metadata with zeroed pixel data.
-//! Full decoding is not implemented.
+//! Extension-only placeholder readers return `UnsupportedFormat` instead of
+//! exposing synthetic metadata or zero-filled planes. Partial readers in this
+//! module only decode documented/simple payload cases.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -62,16 +62,16 @@ macro_rules! placeholder_reader {
                 Ok(())
             }
 
-            fn series_count(&self) -> usize { 1 }
+            fn series_count(&self) -> usize { 0 }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+                Err(BioFormatsError::SeriesOutOfRange(s))
             }
 
             fn series(&self) -> usize { 0 }
 
             fn metadata(&self) -> &ImageMetadata {
-                self.meta.as_ref().expect("set_id not called")
+                self.meta.as_ref().unwrap_or(crate::common::reader::uninitialized_metadata())
             }
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -149,15 +149,11 @@ impl FormatReader for QuickTimeReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -165,7 +161,9 @@ impl FormatReader for QuickTimeReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -195,20 +193,17 @@ impl FormatReader for QuickTimeReader {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Multiple-image Network Graphics — delegates to PNG
+// 2. Multiple-image Network Graphics
 // ---------------------------------------------------------------------------
 /// MNG (Multiple-image Network Graphics) reader (`.mng`).
 ///
-/// MNG is PNG-based; delegates to `PngReader` for the first frame.
-pub struct MngReader {
-    inner: crate::formats::png::PngReader,
-}
+/// MNG is PNG-related, but it is a distinct animation/container format and
+/// cannot be decoded by treating the file as a PNG stream.
+pub struct MngReader;
 
 impl MngReader {
     pub fn new() -> Self {
-        MngReader {
-            inner: crate::formats::png::PngReader::new(),
-        }
+        MngReader
     }
 }
 
@@ -231,38 +226,36 @@ impl FormatReader for MngReader {
         false
     }
 
-    fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path).map_err(|_| {
-            BioFormatsError::UnsupportedFormat(
-                "MNG file could not be opened as PNG (MNG animation may require dedicated parser)"
-                    .to_string(),
-            )
-        })
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "MNG container parsing is not yet implemented".to_string(),
+        ))
     }
 
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        0
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        crate::common::reader::uninitialized_metadata()
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        Err(BioFormatsError::PlaneOutOfRange(p))
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let _ = (x, y, w, h);
+        Err(BioFormatsError::PlaneOutOfRange(p))
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+        Err(BioFormatsError::PlaneOutOfRange(p))
     }
 }
 
@@ -271,8 +264,8 @@ impl FormatReader for MngReader {
 // ---------------------------------------------------------------------------
 /// Volocity Library reader (`.acff`).
 ///
-/// Volocity Library files use OLE2/Compound Document format which requires
-/// a dedicated OLE2 container parser not currently available in pure Rust.
+/// Volocity Library files use OLE2/Compound Document format; the remaining
+/// missing piece is the Volocity-specific stream schema.
 pub struct VolocityLibraryReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -308,7 +301,7 @@ impl FormatReader for VolocityLibraryReader {
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Volocity Library format requires OLE2/Compound Document container parsing".to_string(),
+            "Volocity Library format requires Volocity-specific OLE2 stream parsing".to_string(),
         ))
     }
 
@@ -319,15 +312,11 @@ impl FormatReader for VolocityLibraryReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -335,32 +324,28 @@ impl FormatReader for VolocityLibraryReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Volocity Library format requires OLE2/Compound Document container parsing".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
+        plane_index: u32,
         _x: u32,
         _y: u32,
         _w: u32,
         _h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Volocity Library format requires OLE2/Compound Document container parsing".to_string(),
-        ))
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Volocity Library format requires OLE2/Compound Document container parsing".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 }
 
@@ -417,15 +402,11 @@ impl FormatReader for SlideBookReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -433,7 +414,9 @@ impl FormatReader for SlideBookReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -507,11 +490,9 @@ mod netcdf3 {
         /// only the prefix is inspected by callers.
         pub fn as_string(&self) -> String {
             match self.nc_type {
-                NC_CHAR | NC_BYTE => {
-                    String::from_utf8_lossy(&self.raw)
-                        .trim_end_matches('\0')
-                        .to_string()
-                }
+                NC_CHAR | NC_BYTE => String::from_utf8_lossy(&self.raw)
+                    .trim_end_matches('\0')
+                    .to_string(),
                 _ => String::new(),
             }
         }
@@ -685,11 +666,7 @@ mod netcdf3 {
                 let total = nelems * elem_size;
                 let raw = c.take(total)?.to_vec();
                 c.align4(total);
-                attrs.push(Attribute {
-                    name,
-                    nc_type,
-                    raw,
-                });
+                attrs.push(Attribute { name, nc_type, raw });
             }
             Ok(attrs)
         }
@@ -729,10 +706,13 @@ mod netcdf3 {
         }
 
         pub fn dimension(&self, name: &str) -> Option<u32> {
-            self.dims
-                .iter()
-                .find(|d| d.name == name)
-                .map(|d| if d.length == 0 { self.num_recs } else { d.length })
+            self.dims.iter().find(|d| d.name == name).map(|d| {
+                if d.length == 0 {
+                    self.num_recs
+                } else {
+                    d.length
+                }
+            })
         }
 
         pub fn variable(&self, name: &str) -> Option<&Variable> {
@@ -746,7 +726,13 @@ mod netcdf3 {
                 let len = self
                     .dims
                     .get(id)
-                    .map(|d| if d.length == 0 { self.num_recs } else { d.length })
+                    .map(|d| {
+                        if d.length == 0 {
+                            self.num_recs
+                        } else {
+                            d.length
+                        }
+                    })
                     .unwrap_or(1);
                 acc.saturating_mul(len.max(1) as usize)
             })
@@ -785,8 +771,8 @@ impl MincReader {
     /// dimensions with `time` as the optional T axis. NetCDF stores values in
     /// big-endian byte order on disk.
     fn set_id_netcdf3(&mut self, path: &Path) -> Result<()> {
-        use std::io::Read as _;
         use netcdf3::{NetCdf3, NC_BYTE, NC_CHAR, NC_DOUBLE, NC_FLOAT, NC_INT, NC_SHORT};
+        use std::io::Read as _;
 
         let mut bytes = Vec::new();
         std::fs::File::open(path)
@@ -797,9 +783,7 @@ impl MincReader {
         let nc = NetCdf3::parse_header(&bytes)?;
 
         let image = nc.variable("image").ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat(
-                "MINC/NetCDF: no 'image' variable found".to_string(),
-            )
+            BioFormatsError::UnsupportedFormat("MINC/NetCDF: no 'image' variable found".to_string())
         })?;
 
         // signtype attribute (NC_CHAR): "signed__" / "unsigned" — Java keys off
@@ -1025,7 +1009,11 @@ impl FormatReader for MincReader {
                 let raw = ds
                     .read_u8()
                     .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
-                let pt = if signed { PixelType::Int8 } else { PixelType::Uint8 };
+                let pt = if signed {
+                    PixelType::Int8
+                } else {
+                    PixelType::Uint8
+                };
                 (pt, 8, raw)
             }
             DType::U16 | DType::I16 => {
@@ -1037,7 +1025,11 @@ impl FormatReader for MincReader {
                 for v in &raw {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                let pt = if signed { PixelType::Int16 } else { PixelType::Uint16 };
+                let pt = if signed {
+                    PixelType::Int16
+                } else {
+                    PixelType::Uint16
+                };
                 (pt, 16, bytes)
             }
             DType::U32 | DType::I32 => {
@@ -1049,7 +1041,11 @@ impl FormatReader for MincReader {
                 for v in &raw {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                let pt = if signed { PixelType::Int32 } else { PixelType::Uint32 };
+                let pt = if signed {
+                    PixelType::Int32
+                } else {
+                    PixelType::Uint32
+                };
                 (pt, 32, bytes)
             }
             DType::F32 => {
@@ -1117,15 +1113,11 @@ impl FormatReader for MincReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -1133,7 +1125,9 @@ impl FormatReader for MincReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1167,15 +1161,7 @@ impl FormatReader for MincReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let start = (y as usize + row) * row_bytes + x as usize * bps;
-            out.extend_from_slice(&full[start..start + out_row]);
-        }
-        Ok(out)
+        crop_full_plane("MINC/HDF5", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1242,15 +1228,11 @@ impl FormatReader for OpenlabLiffReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -1258,7 +1240,9 @@ impl FormatReader for OpenlabLiffReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -1422,15 +1406,11 @@ impl FormatReader for Jpeg2000Reader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -1438,7 +1418,9 @@ impl FormatReader for Jpeg2000Reader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1460,17 +1442,7 @@ impl FormatReader for Jpeg2000Reader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let nc = meta.size_c as usize;
-        let pixel_bytes = bps * nc;
-        let row_bytes = meta.size_x as usize * pixel_bytes;
-        let out_row = w as usize * pixel_bytes;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src_offset = (y as usize + r) * row_bytes + x as usize * pixel_bytes;
-            out.extend_from_slice(&full[src_offset..src_offset + out_row]);
-        }
-        Ok(out)
+        crop_full_plane("JPEG-2000", &full, meta, meta.size_c as usize, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1536,15 +1508,11 @@ impl FormatReader for SedatReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -1552,7 +1520,9 @@ impl FormatReader for SedatReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -1705,7 +1675,9 @@ impl FormatReader for SmCameraReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1803,11 +1775,18 @@ impl FormatReader for TextReader {
             if line.is_empty() {
                 continue;
             }
-            let cells: Vec<f32> = line
+            let mut cells: Vec<f32> = Vec::new();
+            for cell in line
                 .split(|c: char| c == ',' || c == '\t' || c == ' ')
                 .filter(|s| !s.is_empty())
-                .map(|s| s.trim().parse::<f64>().unwrap_or(0.0) as f32)
-                .collect();
+            {
+                let value = cell.trim().parse::<f64>().map_err(|_| {
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "TextReader: non-numeric cell {cell:?}"
+                    ))
+                })?;
+                cells.push(value as f32);
+            }
             if !cells.is_empty() {
                 rows.push(cells);
             }
@@ -1818,12 +1797,17 @@ impl FormatReader for TextReader {
             ));
         }
         let height = rows.len() as u32;
-        let width = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
-        // Build Float32 pixel buffer (row-major, zero-padded for short rows)
+        let width = rows[0].len();
+        if rows.iter().any(|row| row.len() != width) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "TextReader: rows have inconsistent column counts".to_string(),
+            ));
+        }
+        let width = width as u32;
+        // Build Float32 pixel buffer (row-major).
         let mut pixel_data = Vec::with_capacity((width * height * 4) as usize);
         for row in &rows {
-            for x in 0..width as usize {
-                let val = if x < row.len() { row[x] } else { 0.0f32 };
+            for &val in row {
                 pixel_data.extend_from_slice(&val.to_le_bytes());
             }
         }
@@ -1877,7 +1861,9 @@ impl FormatReader for TextReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

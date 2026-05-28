@@ -1,6 +1,6 @@
 [package]
 name = "bioformats"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Pure Rust reimplementation of Bio-Formats — read/write scientific image formats"
 license-file = "LICENSE.txt"
@@ -12,12 +12,15 @@ categories = ["science", "multimedia::images", "parser-implementations"]
 include = [
     "/src/**/*.rs",
     "/benches/read_ome_tiff.rs",
+    "/examples/**/*.rs",
+    "/tests/**/*.rs",
     "/README.md",
     "/LICENSE.txt",
 ]
 
 [workspace]
 resolver = "2"
+members = ["src/ome-metakit"]
 exclude = ["bench"]
 
 [dependencies]
@@ -39,6 +42,7 @@ serde         = { version = "1", features = ["derive"] }
 bincode       = "1"
 jpegxr        = { version = "0.3", optional = true }
 openslide-pure-rs = { version = "0.1", path = "/home/mahogny/github/claude/openslide-rs", optional = true }
+mdbtools      = { package = "mdbtools-rs", version = "0.1", git = "https://github.com/henriksson-lab/mdbtools-rs" }
 
 [features]
 jpegxr = ["dep:jpegxr"]

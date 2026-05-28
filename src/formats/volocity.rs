@@ -75,7 +75,12 @@ impl FormatReader for VolocityReader {
         }
     }
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 2 && (&header[..2] == b"JL" || &header[..2] == b"LJ")
+        let _ = header;
+        // Java accepts a two-byte "JL"/"LJ" stream signature, but that is too
+        // weak for global detection while this reader is unsupported: it can
+        // preempt unrelated formats and return a terminal unsupported error.
+        // Keep Volocity detection path/name based.
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -106,7 +111,9 @@ impl FormatReader for VolocityReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         let _ = p;
@@ -146,8 +153,8 @@ mod tests {
     #[test]
     fn volocity_matches_java_stream_signature() {
         let reader = VolocityReader::new();
-        assert!(reader.is_this_type_by_bytes(b"JLabcdef"));
-        assert!(reader.is_this_type_by_bytes(b"LJabcdef"));
+        assert!(!reader.is_this_type_by_bytes(b"JLabcdef"));
+        assert!(!reader.is_this_type_by_bytes(b"LJabcdef"));
         assert!(!reader.is_this_type_by_bytes(b"JXabcdef"));
         assert!(!reader.is_this_type_by_bytes(b"J"));
     }

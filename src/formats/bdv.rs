@@ -17,6 +17,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 pub struct BdvReader {
     path: Option<PathBuf>,
@@ -307,7 +308,9 @@ impl FormatReader for BdvReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn resolution_count(&self) -> usize {
@@ -381,23 +384,16 @@ impl FormatReader for BdvReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let row_bytes = meta.size_x as usize * 2;
-        let out_row = w as usize * 2;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src_start = (y as usize + r) * row_bytes + x as usize * 2;
-            out.extend_from_slice(&full[src_start..src_start + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("BDV", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(0, tx, ty, tw, th)
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }

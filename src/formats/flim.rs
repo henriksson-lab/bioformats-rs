@@ -298,7 +298,9 @@ fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
     let mut incr: u16 = 1;
 
     // Measurement-descriptor block (MeasureInfo) carries authoritative dims.
-    if no_of_meas_desc_blocks > 0 && meas_desc_block_length >= 211 && meas_desc_block_offs < file_len
+    if no_of_meas_desc_blocks > 0
+        && meas_desc_block_length >= 211
+        && meas_desc_block_offs < file_len
     {
         f.seek(SeekFrom::Start(meas_desc_block_offs))
             .map_err(BioFormatsError::Io)?;
@@ -689,7 +691,9 @@ impl FormatReader for SdtReader {
         self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -729,26 +733,14 @@ impl FormatReader for SdtReader {
         if &signature == b"PK" {
             // For ZIP blocks we cannot random-seek; decode and skip channels by
             // reading from the start of the decompressed stream.
-            read_sdt_zip_plane(
-                &mut f,
-                &block,
-                size_x,
-                size_y,
-                times,
-                time_bin,
-            )
+            read_sdt_zip_plane(&mut f, &block, size_x, size_y, times, time_bin)
         } else {
             // Skip to the requested channel within the block.
-            f.seek(SeekFrom::Current(channel as i64 * channel_plane_size as i64))
-                .map_err(BioFormatsError::Io)?;
-            read_sdt_raw_plane(
-                &mut f,
-                size_x,
-                size_y,
-                times,
-                time_bin,
-                plane_bytes,
-            )
+            f.seek(SeekFrom::Current(
+                channel as i64 * channel_plane_size as i64,
+            ))
+            .map_err(BioFormatsError::Io)?;
+            read_sdt_raw_plane(&mut f, size_x, size_y, times, time_bin, plane_bytes)
         }
     }
 
@@ -931,7 +923,9 @@ impl FormatReader for LiFlimReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

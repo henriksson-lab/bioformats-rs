@@ -14,6 +14,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 // ── SimFCS Reader ─────────────────────────────────────────────────────────────
 
@@ -112,13 +113,13 @@ impl FormatReader for SimfcsReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if s == 0 && self.meta.is_some() {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
     fn series(&self) -> usize {
@@ -126,7 +127,9 @@ impl FormatReader for SimfcsReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -156,18 +159,8 @@ impl FormatReader for SimfcsReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        validate_region(meta, x, y, w, h)?;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = 256 * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("SimFCS", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -178,21 +171,6 @@ impl FormatReader for SimfcsReader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
-}
-
-fn validate_region(meta: &ImageMetadata, x: u32, y: u32, w: u32, h: u32) -> Result<()> {
-    let x2 = x
-        .checked_add(w)
-        .ok_or_else(|| BioFormatsError::Format("SimFCS region width overflows".to_string()))?;
-    let y2 = y
-        .checked_add(h)
-        .ok_or_else(|| BioFormatsError::Format("SimFCS region height overflows".to_string()))?;
-    if x2 > meta.size_x || y2 > meta.size_y {
-        return Err(BioFormatsError::Format(
-            "SimFCS region is outside image bounds".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 // ── Lambert FLIM Reader ───────────────────────────────────────────────────────
@@ -238,7 +216,7 @@ impl FormatReader for LambertFlimReader {
             return false;
         }
         let s = std::str::from_utf8(&header[..header.len().min(256)]).unwrap_or("");
-        s.contains("Lambert") || s.contains("GlobalImages") || s.starts_with('#')
+        s.contains("Lambert") || s.contains("GlobalImages")
     }
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
@@ -254,39 +232,37 @@ impl FormatReader for LambertFlimReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
     fn series(&self) -> usize {
         0
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(Self::unsupported())
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
+        plane_index: u32,
         _x: u32,
         _y: u32,
         _w: u32,
         _h: u32,
     ) -> Result<Vec<u8>> {
-        Err(Self::unsupported())
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(Self::unsupported())
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 }

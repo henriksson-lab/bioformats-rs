@@ -2,10 +2,11 @@
 //!
 //! Detects ZIP files by magic bytes PK\x03\x04. Following the Java `ZipReader`,
 //! this wraps an inner auto-detecting `ImageReader` over the archive entries:
-//! all entries are extracted to a temporary directory, the "primary" entry is
-//! selected (the one whose name starts with the archive's base name, else the
-//! first entry), and the matching format reader is chosen by auto-detection
-//! (not restricted to TIFF).
+//! all entries are extracted to a temporary directory preserving their safe
+//! relative paths, the "primary" entry is selected (the one whose name matches
+//! the archive's base name or uses it as a delimited prefix, else the first
+//! entry), and the matching format reader is chosen by auto-detection (not
+//! restricted to TIFF).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,32 @@ impl ZipReader {
     fn inner_mut(&mut self) -> Result<&mut ImageReader> {
         self.inner.as_mut().ok_or(BioFormatsError::NotInitialized)
     }
+
+    fn safe_entry_path(name: &str) -> Option<PathBuf> {
+        let mut rel = PathBuf::new();
+        for component in Path::new(name).components() {
+            match component {
+                std::path::Component::Normal(part) => rel.push(part),
+                std::path::Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        (!rel.as_os_str().is_empty()).then_some(rel)
+    }
+
+    fn primary_name_matches_base(name: &str, base: &str) -> bool {
+        if base.is_empty() {
+            return false;
+        }
+        let Some(rest) = name.strip_prefix(base) else {
+            return false;
+        };
+        rest.is_empty()
+            || matches!(
+                rest.as_bytes().first(),
+                Some(b'.' | b'_' | b'-' | b'/' | b'\\')
+            )
+    }
 }
 
 impl Default for ZipReader {
@@ -67,13 +94,18 @@ impl FormatReader for ZipReader {
         let mut archive = zip::ZipArchive::new(file)
             .map_err(|e| BioFormatsError::Format(format!("ZIP open error: {e}")))?;
 
-        // Per the Java ZipReader, the preferred ("primary") entry is the one
-        // whose name begins with the archive's base name (file name minus the
-        // ".zip" suffix); otherwise the first regular entry is used.
+        // Per the Java ZipReader, the preferred ("primary") entry is based on
+        // the archive's base name (file name minus the ".zip" suffix). Require
+        // an exact match or a delimiter boundary so `sample2.tif` is not picked
+        // ahead of `sample.tif` for `sample.zip`.
         let inner_base = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.strip_suffix(".zip").or_else(|| n.strip_suffix(".ZIP")).unwrap_or(n))
+            .map(|n| {
+                n.strip_suffix(".zip")
+                    .or_else(|| n.strip_suffix(".ZIP"))
+                    .unwrap_or(n)
+            })
             .unwrap_or("")
             .to_string();
 
@@ -98,14 +130,14 @@ impl FormatReader for ZipReader {
                 continue;
             }
             let name = entry.name().to_string();
-            // Flatten the entry name to a safe leaf file name, but keep enough
-            // of the original to match the primary-entry rule.
-            let leaf = Path::new(&name)
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("entry"))
-                .to_string_lossy()
-                .to_string();
-            let out_path = dir.join(format!("{i}_{leaf}"));
+            let rel_path = match Self::safe_entry_path(&name) {
+                Some(path) => path,
+                None => continue,
+            };
+            let out_path = dir.join(rel_path);
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(BioFormatsError::Io)?;
+            }
 
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
@@ -114,7 +146,7 @@ impl FormatReader for ZipReader {
             if first_entry.is_none() {
                 first_entry = Some(out_path.clone());
             }
-            if primary_entry.is_none() && !inner_base.is_empty() && name.starts_with(&inner_base) {
+            if primary_entry.is_none() && Self::primary_name_matches_base(&name, &inner_base) {
                 primary_entry = Some(out_path.clone());
             }
             extracted_files.push(out_path);
@@ -125,23 +157,36 @@ impl FormatReader for ZipReader {
                 "Zip file does not contain any valid files".to_string(),
             )
         })?;
+        let mut candidates = Vec::with_capacity(extracted_files.len());
+        candidates.push(primary.clone());
+        for file in &extracted_files {
+            if file != &primary {
+                candidates.push(file.clone());
+            }
+        }
 
         self.extracted_dir = Some(dir);
         self.extracted_files = extracted_files;
 
-        // Delegate to the auto-detecting ImageReader, which picks the matching
-        // format reader for the primary entry (TIFF, PNG, JPEG, ND2, ...).
-        match ImageReader::open(&primary) {
-            Ok(reader) => {
-                self.inner = Some(reader);
-                Ok(())
-            }
-            Err(e) => {
-                // Clean up extracted files on failure.
-                let _ = self.close();
-                Err(e)
+        // Delegate to the auto-detecting ImageReader, preferring the primary
+        // entry but falling through to later archive entries such as images
+        // after a manifest/readme.
+        let mut last_error = None;
+        for candidate in candidates {
+            match ImageReader::open(&candidate) {
+                Ok(reader) => {
+                    self.inner = Some(reader);
+                    return Ok(());
+                }
+                Err(e) => last_error = Some(e),
             }
         }
+        let _ = self.close();
+        Err(last_error.unwrap_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "Zip file does not contain a recognized image entry".to_string(),
+            )
+        }))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -173,8 +218,8 @@ impl FormatReader for ZipReader {
     fn metadata(&self) -> &ImageMetadata {
         self.inner
             .as_ref()
-            .expect("set_id not called")
-            .metadata()
+            .map(|inner| inner.metadata())
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

@@ -168,7 +168,9 @@ impl FormatReader for PngReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -206,6 +208,7 @@ use crate::common::writer::FormatWriter;
 pub struct PngWriter {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    wrote: bool,
 }
 
 impl PngWriter {
@@ -213,6 +216,7 @@ impl PngWriter {
         PngWriter {
             path: None,
             meta: None,
+            wrote: false,
         }
     }
 }
@@ -232,7 +236,20 @@ impl FormatWriter for PngWriter {
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        let logical_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+        let required_planes = meta
+            .size_z
+            .max(1)
+            .checked_mul(logical_c)
+            .and_then(|v| v.checked_mul(meta.size_t.max(1)))
+            .ok_or_else(|| BioFormatsError::Format("PNG writer plane count overflow".into()))?;
+        if required_planes > 1 || meta.image_count > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PNG writer supports only one plane".into(),
+            ));
+        }
         self.meta = Some(meta.clone());
+        self.wrote = false;
         Ok(())
     }
 
@@ -245,8 +262,14 @@ impl FormatWriter for PngWriter {
     }
 
     fn close(&mut self) -> Result<()> {
+        if self.path.is_some() && !self.wrote {
+            return Err(BioFormatsError::Format(
+                "PNG writer closed before plane 0 was written".into(),
+            ));
+        }
         self.path = None;
         self.meta = None;
+        self.wrote = false;
         Ok(())
     }
 
@@ -256,11 +279,28 @@ impl FormatWriter for PngWriter {
                 "PNG writer supports only one plane".into(),
             ));
         }
+        if self.wrote {
+            return Err(BioFormatsError::Format(
+                "PNG writer already wrote plane 0".into(),
+            ));
+        }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let (w, h) = (meta.size_x, meta.size_y);
         let spp = meta.size_c as usize;
+        let expected_len = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(spp))
+            .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
+            .ok_or_else(|| BioFormatsError::Format("PNG writer image plane is too large".into()))?;
+        if data.len() != expected_len {
+            return Err(BioFormatsError::InvalidData(format!(
+                "PNG writer: plane 0 has {} bytes, expected {}",
+                data.len(),
+                expected_len
+            )));
+        }
 
         let img: image::DynamicImage = match (meta.pixel_type, spp) {
             (PixelType::Uint8, 1) => image::GrayImage::from_raw(w, h, data.to_vec())
@@ -299,7 +339,9 @@ impl FormatWriter for PngWriter {
         };
 
         img.save(path)
-            .map_err(|e| BioFormatsError::Format(e.to_string()))
+            .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+        self.wrote = true;
+        Ok(())
     }
 
     fn can_do_stacks(&self) -> bool {

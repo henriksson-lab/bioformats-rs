@@ -205,40 +205,71 @@ fn parse_dir_entry(data: &[u8]) -> DirEntry {
     }
 }
 
-fn parse_directory_entries(data: &[u8], entry_count: usize) -> Vec<DirEntry> {
+fn czi_invalid_data(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn parse_directory_entries(data: &[u8], entry_count: usize) -> std::io::Result<Vec<DirEntry>> {
     let mut entries = Vec::with_capacity(entry_count);
 
     if entry_count == 0 {
-        return entries;
+        return Ok(entries);
     }
 
     // Synthetic fixtures in this crate historically wrote each directory entry
     // into the 256-byte subblock slot. Real CZI directory segments store compact
     // entries: 32 bytes plus 20 bytes per DimensionEntry.
-    let fixed_stride = if data.len() >= entry_count * 256 {
+    let fixed_stride = if entry_count
+        .checked_mul(256)
+        .is_some_and(|bytes| data.len() >= bytes)
+    {
         Some(256)
     } else {
         None
     };
 
     let mut off = 0usize;
-    for _ in 0..entry_count {
+    for entry_index in 0..entry_count {
         if off + 32 > data.len() {
-            break;
+            return Err(czi_invalid_data(format!(
+                "CZI directory entry {entry_index} is truncated before its fixed header"
+            )));
         }
         let dim_count = read_i32(data, off + 28).max(0) as usize;
-        let compact_len = 32 + dim_count * 20;
+        let compact_len = 32usize
+            .checked_add(dim_count.checked_mul(20).ok_or_else(|| {
+                czi_invalid_data(format!(
+                    "CZI directory entry {entry_index} dimension table size overflows"
+                ))
+            })?)
+            .ok_or_else(|| {
+                czi_invalid_data(format!(
+                    "CZI directory entry {entry_index} dimension table size overflows"
+                ))
+            })?;
         let entry_len = fixed_stride.unwrap_or(compact_len);
-        if off + compact_len > data.len() {
-            break;
+        let compact_end = off.checked_add(compact_len).ok_or_else(|| {
+            czi_invalid_data(format!(
+                "CZI directory entry {entry_index} offset overflows"
+            ))
+        })?;
+        if compact_end > data.len() {
+            return Err(czi_invalid_data(format!(
+                "CZI directory entry {entry_index} is truncated: need {compact_len} bytes, have {}",
+                data.len() - off
+            )));
         }
 
         let parse_len = entry_len.min(data.len() - off);
         entries.push(parse_dir_entry(&data[off..off + parse_len]));
-        off = off.saturating_add(entry_len);
+        off = off.checked_add(entry_len).ok_or_else(|| {
+            czi_invalid_data(format!(
+                "CZI directory entry {entry_index} offset overflows"
+            ))
+        })?;
     }
 
-    entries
+    Ok(entries)
 }
 
 // ---- file parsing ----------------------------------------------------------
@@ -277,13 +308,13 @@ struct CziParsed {
 /// ZeissCZIReader.calculateDimensions.
 #[derive(Default)]
 struct DimCounts {
-    positions: i32,    // S
-    acquisitions: i32, // B
-    angles: i32,       // V
-    mosaics: i32,      // M
-    rotations: i32,    // R -> modulo Z
+    positions: i32,     // S
+    acquisitions: i32,  // B
+    angles: i32,        // V
+    mosaics: i32,       // M
+    rotations: i32,     // R -> modulo Z
     illuminations: i32, // I -> modulo C
-    phases: i32,       // H -> modulo T
+    phases: i32,        // H -> modulo T
     /// True when "R" is a genuine rotation axis (some R.size > 1), as opposed to
     /// this crate's pyramid-resolution repurposing of "R".
     rotation_axis: bool,
@@ -367,7 +398,7 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
         if body_size > 0 {
             let mut entry_bytes = vec![0u8; body_size as usize];
             f.read_exact(&mut entry_bytes)?;
-            entries = parse_directory_entries(&entry_bytes, entry_count);
+            entries = parse_directory_entries(&entry_bytes, entry_count)?;
         }
     }
 
@@ -537,8 +568,7 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> CziParsed {
             None => true,
         }
     };
-    let rotation_axis =
-        max_r_size > 1 || (distinct_r_levels > 1 && all_r_same_xsize);
+    let rotation_axis = max_r_size > 1 || (distinct_r_levels > 1 && all_r_same_xsize);
     if rotation_axis && max_rot != i32::MIN && min_rot != i32::MAX {
         c.rotations = (max_rot - min_rot).max(1);
         c.rotation_axis = true;
@@ -698,17 +728,13 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> CziParsed {
                 // ZeissCZIReader:947-950 (guarded by !isGroupFiles(); this crate
                 // never groups files, so the guard is always satisfied).
                 if c.positions > 1
-                    && plane_count
-                        == (image_count_full * series_count as u32) / c.positions as u32
+                    && plane_count == (image_count_full * series_count as u32) / c.positions as u32
                 {
                     series_count /= c.positions;
                     c.positions = 1;
                     position_collapsed = true;
                 }
-            } else if plane_count == t_count
-                || plane_count == image_count_full
-                || c.positions > 1
-            {
+            } else if plane_count == t_count || plane_count == image_count_full || c.positions > 1 {
                 // ZeissCZIReader:952-960: image was fully fused; collapse to one
                 // series. (!isGroupFiles() is always true here.)
                 c.positions = 1;
@@ -953,10 +979,7 @@ fn parse_modulo_labels(xml: &str, name: &str) -> Vec<String> {
         let value_start = start + open_needle.len();
         if let Some(rel_end) = xml[value_start..].find(&close_needle) {
             let value = &xml[value_start..value_start + rel_end];
-            let labels: Vec<String> = value
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect();
+            let labels: Vec<String> = value.split_whitespace().map(|s| s.to_string()).collect();
             if labels.len() > 1 {
                 return labels;
             }
@@ -1115,17 +1138,21 @@ fn decode_12bit_camera(data: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
     let mut decoded = vec![0u8; max_bytes];
 
     let four_bits_len = (max_bytes / 2) * 3;
+    let required_bytes = four_bits_len.div_ceil(2);
+    if data.len() < required_bytes {
+        return Err(BioFormatsError::InvalidData(format!(
+            "CZI 12-bit camera payload is too short: got {}, expected at least {required_bytes}",
+            data.len()
+        )));
+    }
     let mut four_bits = vec![0u8; four_bits_len];
 
     // Read 4-bit groups MSB-first from the packed input.
     let mut bit_pos = 0usize;
     for nibble in four_bits.iter_mut() {
         let byte_index = bit_pos / 8;
-        if byte_index >= data.len() {
-            break;
-        }
         let in_byte_shift = 4 - (bit_pos % 8);
-        *nibble = ((data[byte_index] >> in_byte_shift) & 0x0f) as u8;
+        *nibble = (data[byte_index] >> in_byte_shift) & 0x0f;
         bit_pos += 4;
     }
 
@@ -1364,7 +1391,11 @@ impl CziReader {
         // Logical-channel offset for the per-pixel-type split (ZeissCZIReader:2152
         // `c = dimension.start - plane.pixelTypeIndex`): the requested channel `c`
         // corresponds to entry C-start `c + pixelTypeIndex`.
-        let c_with_offset = c + if multi_pt { series.pixel_type_index as u32 } else { 0 };
+        let c_with_offset = c + if multi_pt {
+            series.pixel_type_index as u32
+        } else {
+            0
+        };
 
         // "R" selects rotation (rotation_axis) or pyramid resolution otherwise.
         let want_r = if self.rotation_axis {
@@ -1475,25 +1506,56 @@ impl CziReader {
         pixel_bytes: usize,
         off_x: i32,
         off_y: i32,
-    ) {
+    ) -> Result<()> {
         let tile_x = (entry.dim_start("X").max(0) - off_x).max(0) as u32;
         let tile_y = (entry.dim_start("Y").max(0) - off_y).max(0) as u32;
         let tile_w = entry.dim_stored_size("X").max(0) as u32;
         let tile_h = entry.dim_stored_size("Y").max(0) as u32;
+        if tile_w > 0 && tile_x >= out_width {
+            return Err(BioFormatsError::Format(format!(
+                "CZI tile X bounds exceed output plane: x={tile_x}, width={tile_w}, output width={out_width}"
+            )));
+        }
+        if tile_h > 0 && tile_y >= out_height {
+            return Err(BioFormatsError::Format(format!(
+                "CZI tile Y bounds exceed output plane: y={tile_y}, height={tile_h}, output height={out_height}"
+            )));
+        }
         let copy_w = tile_w.min(out_width.saturating_sub(tile_x));
         let copy_h = tile_h.min(out_height.saturating_sub(tile_y));
-        let src_row_bytes = tile_w as usize * pixel_bytes;
-        let dst_row_bytes = out_width as usize * pixel_bytes;
-        let copy_bytes = copy_w as usize * pixel_bytes;
+        let src_row_bytes = (tile_w as usize).checked_mul(pixel_bytes).ok_or_else(|| {
+            BioFormatsError::Format("CZI tile source row byte count overflows".into())
+        })?;
+        let dst_row_bytes = (out_width as usize)
+            .checked_mul(pixel_bytes)
+            .ok_or_else(|| {
+                BioFormatsError::Format("CZI tile destination row byte count overflows".into())
+            })?;
+        let copy_bytes = (copy_w as usize)
+            .checked_mul(pixel_bytes)
+            .ok_or_else(|| BioFormatsError::Format("CZI tile copy byte count overflows".into()))?;
 
         for row in 0..copy_h as usize {
             let src_off = row * src_row_bytes;
             let dst_off = ((tile_y as usize + row) * dst_row_bytes) + tile_x as usize * pixel_bytes;
-            if src_off + copy_bytes <= tile.len() && dst_off + copy_bytes <= out.len() {
-                out[dst_off..dst_off + copy_bytes]
-                    .copy_from_slice(&tile[src_off..src_off + copy_bytes]);
+            if src_off + copy_bytes > tile.len() {
+                return Err(BioFormatsError::Format(format!(
+                    "CZI tile row {row} exceeds decoded tile buffer: need {} bytes, have {}",
+                    src_off + copy_bytes,
+                    tile.len()
+                )));
             }
+            if dst_off + copy_bytes > out.len() {
+                return Err(BioFormatsError::Format(format!(
+                    "CZI tile row {row} exceeds output plane buffer: need {} bytes, have {}",
+                    dst_off + copy_bytes,
+                    out.len()
+                )));
+            }
+            out[dst_off..dst_off + copy_bytes]
+                .copy_from_slice(&tile[src_off..src_off + copy_bytes]);
         }
+        Ok(())
     }
 }
 
@@ -1535,7 +1597,11 @@ impl FormatReader for CziReader {
 
         let first = parsed.series.first();
         let (init_w, init_h, init_res_count) = first
-            .and_then(|s| s.resolutions.first().map(|r| (r.width, r.height, s.resolutions.len())))
+            .and_then(|s| {
+                s.resolutions
+                    .first()
+                    .map(|r| (r.width, r.height, s.resolutions.len()))
+            })
             .unwrap_or((0, 0, 1));
 
         self.meta = Some(ImageMetadata {
@@ -1611,7 +1677,9 @@ impl FormatReader for CziReader {
         self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1645,10 +1713,18 @@ impl FormatReader for CziReader {
         for entry in entries {
             let tile_w = entry.dim_stored_size("X").max(0) as usize;
             let tile_h = entry.dim_stored_size("Y").max(0) as usize;
-            let tile_expected = tile_w * tile_h * pixel_bytes;
-            let mut tile = Self::read_subblock(path, &entry, pixel_bytes)?;
-            tile.truncate(tile_expected);
-            tile.resize(tile_expected, 0);
+            let tile_expected = tile_w
+                .checked_mul(tile_h)
+                .and_then(|n| n.checked_mul(pixel_bytes))
+                .ok_or_else(|| BioFormatsError::Format("CZI tile byte count overflows".into()))?;
+            let tile = Self::read_subblock(path, &entry, pixel_bytes)?;
+            if tile.len() != tile_expected {
+                return Err(BioFormatsError::Format(format!(
+                    "CZI decoded tile byte count {} does not match expected {}",
+                    tile.len(),
+                    tile_expected
+                )));
+            }
             // Place the tile at its normalized position. When a tile's stored size
             // already spans the whole stitched image, it sits at the origin.
             let full_tile =
@@ -1667,7 +1743,7 @@ impl FormatReader for CziReader {
                 pixel_bytes,
                 off_x,
                 off_y,
-            );
+            )?;
         }
         if meta.is_rgb && self.packed_spp >= 3 {
             swap_bgr_to_rgb(&mut out, bps, self.packed_spp as usize);
@@ -1745,6 +1821,16 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn czi_12bit_camera_rejects_truncated_payload() {
+        let err = decode_12bit_camera(&[0xab, 0xcd], 8).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("12-bit camera payload is too short"),
+            "unexpected error: {err}"
+        );
+    }
 
     fn put_i32(buf: &mut [u8], off: usize, value: i32) {
         buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
@@ -2101,6 +2187,19 @@ mod tests {
     }
 
     #[test]
+    fn czi_directory_rejects_truncated_declared_entry() {
+        let mut entry = directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0);
+        entry.truncate(40);
+
+        let err = parse_directory_entries(&entry, 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("directory entry 0 is truncated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn czi_bgr24_keeps_logical_channels_separate_from_packed_samples() {
         let planes = vec![vec![1, 2, 3, 4, 5, 6], vec![7, 8, 9, 10, 11, 12]];
         let path = write_synthetic_bgr_czi("bgr24_logical_c", 3, &planes);
@@ -2173,6 +2272,54 @@ mod tests {
         );
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_rejects_short_decoded_tile_instead_of_padding() {
+        let entries = vec![(directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0), vec![1])];
+        let path = write_synthetic_czi_entries("short_tile", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        let err = reader.open_bytes(0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("decoded tile byte count 1 does not match expected 2"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_rejects_long_decoded_tile_instead_of_truncating() {
+        let entries = vec![(directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0), vec![1, 2, 3])];
+        let path = write_synthetic_czi_entries("long_tile", entries);
+        let mut reader = CziReader::new();
+        reader.set_id(&path).unwrap();
+
+        let err = reader.open_bytes(0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("decoded tile byte count 3 does not match expected 2"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_rejects_tile_outside_output_instead_of_skipping_copy() {
+        let entry = parse_dir_entry(&directory_entry_dims(0, 0, 0, 1, 0, 1, 1, 0));
+        let mut out = vec![0u8; 1];
+
+        let err = CziReader::assemble_entry(&mut out, 1, 1, &[7], &entry, 1, 0, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tile X bounds exceed output plane"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, vec![0]);
     }
 
     #[test]
@@ -2468,7 +2615,9 @@ mod tests {
             "<TrackSetup><PalmSlider>true</PalmSlider></TrackSetup>"
         ));
         // Negative cases.
-        assert!(!check_palm("<TrackSetup><PalmSlider>false</PalmSlider></TrackSetup>"));
+        assert!(!check_palm(
+            "<TrackSetup><PalmSlider>false</PalmSlider></TrackSetup>"
+        ));
         assert!(!check_palm(r#"<LsmTag Name="Gain">3</LsmTag>"#));
         assert!(!check_palm(""));
     }

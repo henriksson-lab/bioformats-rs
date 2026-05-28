@@ -17,6 +17,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 const CELLH5_METADATA_NODE_LIMIT: usize = 512;
 
@@ -214,25 +215,49 @@ fn collect_hdf5_metadata(
 /// Derive (sizeX, sizeY, sizeZ, sizeC, sizeT) from a CellH5 dataset shape.
 /// The canonical layout is 5D `[c, t, z, y, x]` (CellH5Reader.java#getShape:
 /// `ctzyx`); lower-rank fixtures are accepted for robustness.
-fn dims_from_shape(shape: &[u64]) -> Option<(u32, u32, u32, u32, u32)> {
+fn shape_dim(value: u64, label: &str) -> Result<u32> {
+    if value == 0 || value > u32::MAX as u64 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "CellH5: invalid {label} dimension {value}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+fn dims_from_shape(shape: &[u64]) -> Result<(u32, u32, u32, u32, u32)> {
     match shape.len() {
-        5 => Some((
-            shape[4] as u32,
-            shape[3] as u32,
-            (shape[2] as u32).max(1),
-            (shape[0] as u32).max(1),
-            (shape[1] as u32).max(1),
+        5 => Ok((
+            shape_dim(shape[4], "X")?,
+            shape_dim(shape[3], "Y")?,
+            shape_dim(shape[2], "Z")?,
+            shape_dim(shape[0], "C")?,
+            shape_dim(shape[1], "T")?,
         )),
-        4 => Some((
-            shape[3] as u32,
-            shape[2] as u32,
+        4 => Ok((
+            shape_dim(shape[3], "X")?,
+            shape_dim(shape[2], "Y")?,
             1,
-            (shape[0] as u32).max(1),
-            (shape[1] as u32).max(1),
+            shape_dim(shape[0], "C")?,
+            shape_dim(shape[1], "T")?,
         )),
-        3 => Some((shape[2] as u32, shape[1] as u32, 1, 1, shape[0] as u32)),
-        2 => Some((shape[1] as u32, shape[0] as u32, 1, 1, 1)),
-        _ => None,
+        3 => Ok((
+            shape_dim(shape[2], "X")?,
+            shape_dim(shape[1], "Y")?,
+            1,
+            1,
+            shape_dim(shape[0], "T")?,
+        )),
+        2 => Ok((
+            shape_dim(shape[1], "X")?,
+            shape_dim(shape[0], "Y")?,
+            1,
+            1,
+            1,
+        )),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "CellH5: unsupported dataset rank {}",
+            shape.len()
+        ))),
     }
 }
 
@@ -261,11 +286,11 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
         let shape = ds.shape().unwrap_or_default();
         let (size_x, size_y, size_z, size_c, size_t) =
-            dims_from_shape(&shape).ok_or_else(|| {
-                BioFormatsError::UnsupportedFormat(format!(
-                    "CellH5: unsupported dataset rank {} for {ds_path}",
-                    shape.len()
-                ))
+            dims_from_shape(&shape).map_err(|err| match err {
+                BioFormatsError::UnsupportedFormat(message) => {
+                    BioFormatsError::UnsupportedFormat(format!("{message} for {ds_path}"))
+                }
+                other => other,
             })?;
 
         let pixel_type = match ds.dtype().map(hdf5_dtype_size).unwrap_or(2) {
@@ -391,11 +416,10 @@ impl FormatReader for CellH5Reader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        &self
-            .series
+        self.series
             .get(self.current_series)
-            .expect("set_id not called")
-            .meta
+            .map(|series| &series.meta)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn resolution_count(&self) -> usize {
@@ -495,22 +519,10 @@ impl FormatReader for CellH5Reader {
             .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?
             .meta;
-        let bps = (meta.bits_per_pixel / 8) as usize;
-        let row_bytes = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src_start = (y as usize + r) * row_bytes + x as usize * bps;
-            if src_start + out_row <= full.len() {
-                out.extend_from_slice(&full[src_start..src_start + out_row]);
-            } else {
-                out.extend(std::iter::repeat(0u8).take(out_row));
-            }
-        }
-        Ok(out)
+        crop_full_plane("CellH5", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = &self
             .series
             .get(self.current_series)
@@ -520,6 +532,6 @@ impl FormatReader for CellH5Reader {
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(0, tx, ty, tw, th)
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }

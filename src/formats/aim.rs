@@ -12,6 +12,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 pub struct AimReader {
     path: Option<PathBuf>,
@@ -68,6 +69,7 @@ fn read_i64_le(f: &mut std::fs::File) -> Result<i64> {
 
 fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+    let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
 
     // Peek the first 16 bytes to determine the format flavour.
     let mut version = [0u8; 16];
@@ -81,11 +83,17 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     if is_isq {
         // ISQ: 512-byte header, dimensions as i32 LE at offsets 28/32/36.
         f.seek(SeekFrom::Start(28)).map_err(BioFormatsError::Io)?;
-        let w = read_i32_le(&mut f)?.max(1) as u32;
-        let h = read_i32_le(&mut f)?.max(1) as u32;
-        let d = read_i32_le(&mut f)?.max(1) as u32;
+        let w = positive_dim(read_i32_le(&mut f)?, "ISQ width")?;
+        let h = positive_dim(read_i32_le(&mut f)?, "ISQ height")?;
+        let d = positive_dim(read_i32_le(&mut f)?, "ISQ depth")?;
         let meta = aim_metadata(w, h, d);
+        validate_payload_len(file_len, 512, &meta)?;
         return Ok((meta, 512));
+    }
+    if !version_str.starts_with("AIMDATA") {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "AIM file is missing AIMDATA header".into(),
+        ));
     }
 
     // AIM path (port of AIMReader.java). littleEndian = true.
@@ -94,18 +102,18 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
 
     let (w, h, d) = if wider_offsets {
         f.seek(SeekFrom::Start(96)).map_err(BioFormatsError::Io)?;
-        let w = read_i64_le(&mut f)? as i32;
-        let h = read_i64_le(&mut f)? as i32;
-        let d = read_i64_le(&mut f)? as i32;
+        let w = positive_dim_i64(read_i64_le(&mut f)?, "AIM width")?;
+        let h = positive_dim_i64(read_i64_le(&mut f)?, "AIM height")?;
+        let d = positive_dim_i64(read_i64_le(&mut f)?, "AIM depth")?;
         f.seek(SeekFrom::Start(280)).map_err(BioFormatsError::Io)?;
-        (w.max(1) as u32, h.max(1) as u32, d.max(1) as u32)
+        (w, h, d)
     } else {
         f.seek(SeekFrom::Start(56)).map_err(BioFormatsError::Io)?;
-        let w = read_i32_le(&mut f)?;
-        let h = read_i32_le(&mut f)?;
-        let d = read_i32_le(&mut f)?;
+        let w = positive_dim(read_i32_le(&mut f)?, "AIM width")?;
+        let h = positive_dim(read_i32_le(&mut f)?, "AIM height")?;
+        let d = positive_dim(read_i32_le(&mut f)?, "AIM depth")?;
         f.seek(SeekFrom::Start(160)).map_err(BioFormatsError::Io)?;
-        (w.max(1) as u32, h.max(1) as u32, d.max(1) as u32)
+        (w, h, d)
     };
 
     // A variable-length NUL-terminated processing-log string precedes the
@@ -113,6 +121,7 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     let (processing_log, pixel_offset) = read_cstring(&mut f)?;
 
     let mut meta = aim_metadata(w, h, d);
+    validate_payload_len(file_len, pixel_offset, &meta)?;
     // Store the processing log lines as global metadata (key  value pairs).
     for line in processing_log.split('\n') {
         let line = line.trim();
@@ -129,6 +138,44 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     }
 
     Ok((meta, pixel_offset))
+}
+
+fn positive_dim(value: i32, label: &str) -> Result<u32> {
+    if value <= 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "AIM header has non-positive {label}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+fn positive_dim_i64(value: i64, label: &str) -> Result<u32> {
+    if value <= 0 || value > u32::MAX as i64 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "AIM header has invalid {label}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+fn validate_payload_len(file_len: u64, data_offset: u64, meta: &ImageMetadata) -> Result<()> {
+    let plane_bytes = (meta.size_x as u64)
+        .checked_mul(meta.size_y as u64)
+        .and_then(|px| px.checked_mul(meta.pixel_type.bytes_per_sample() as u64))
+        .ok_or_else(|| BioFormatsError::Format("AIM plane size overflows".into()))?;
+    let required_len = data_offset
+        .checked_add(
+            plane_bytes
+                .checked_mul(meta.image_count as u64)
+                .ok_or_else(|| BioFormatsError::Format("AIM payload size overflows".into()))?,
+        )
+        .ok_or_else(|| BioFormatsError::Format("AIM payload size overflows".into()))?;
+    if file_len < required_len {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "AIM pixel payload is shorter than declared ({file_len} < {required_len})"
+        )));
+    }
+    Ok(())
 }
 
 fn aim_metadata(width: u32, height: u32, depth: u32) -> ImageMetadata {
@@ -166,9 +213,9 @@ impl FormatReader for AimReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // ISQ magic, or AIM "AIMDATA_V030" version marker.
+        // ISQ magic, or AIM version marker.
         (header.len() >= 16 && &header[..16] == b"CTDATA-HEADER_V1")
-            || (header.len() >= 12 && &header[..12] == b"AIMDATA_V030")
+            || (header.len() >= 7 && &header[..7] == b"AIMDATA")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -201,7 +248,9 @@ impl FormatReader for AimReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -230,17 +279,8 @@ impl FormatReader for AimReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for row in 0..h as usize {
-            let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("AIM", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

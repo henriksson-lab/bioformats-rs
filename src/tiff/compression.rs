@@ -26,21 +26,8 @@ pub fn decompress(
         Compression::PackBits => decompress_packbits(data)?,
         Compression::JpegNew => decompress_jpeg(data)?,
         Compression::Jpeg => {
-            // Old-style JPEG: prepend tables from tag 347 if present
             if let Some(tables) = jpeg_tables {
-                let mut combined = Vec::with_capacity(tables.len() + data.len());
-                // tables is a JFIF stream; merge into the tile stream at byte 2
-                // Simple approach: create a fresh JFIF with the tables bytes inserted
-                if tables.len() > 2 && tables[0] == 0xFF && tables[1] == 0xD8 {
-                    // Prefix: SOI from tables then tables content (skip SOI of data)
-                    combined.extend_from_slice(tables);
-                    // Append data after its SOI marker
-                    if data.len() > 2 {
-                        combined.extend_from_slice(&data[2..]);
-                    }
-                } else {
-                    combined.extend_from_slice(data);
-                }
+                let combined = merge_old_style_jpeg_tables(tables, data);
                 decompress_jpeg(&combined)?
             } else {
                 decompress_jpeg(data)?
@@ -112,6 +99,36 @@ pub fn decompress(
     }
 
     Ok(out)
+}
+
+fn merge_old_style_jpeg_tables(tables: &[u8], data: &[u8]) -> Vec<u8> {
+    if !starts_with_soi(tables) {
+        return data.to_vec();
+    }
+
+    let table_payload = strip_optional_eoi(&tables[2..]);
+    let scan_payload = if starts_with_soi(data) {
+        &data[2..]
+    } else {
+        data
+    };
+    let mut combined = Vec::with_capacity(2 + table_payload.len() + scan_payload.len());
+    combined.extend_from_slice(&[0xff, 0xd8]);
+    combined.extend_from_slice(table_payload);
+    combined.extend_from_slice(scan_payload);
+    combined
+}
+
+fn starts_with_soi(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == 0xff && data[1] == 0xd8
+}
+
+fn strip_optional_eoi(data: &[u8]) -> &[u8] {
+    if data.len() >= 2 && data[data.len() - 2] == 0xff && data[data.len() - 1] == 0xd9 {
+        &data[..data.len() - 2]
+    } else {
+        data
+    }
 }
 
 fn decompress_thunderscan(
@@ -537,7 +554,7 @@ mod tests {
         JpegEncoder::new(&mut jpeg)
             .encode(&[12, 34, 56], 1, 1, ColorType::Rgb8.into())
             .expect("JPEG fixture encode failed");
-        let comment_table = [0xff, 0xd8, 0xff, 0xfe, 0x00, 0x02];
+        let comment_table = [0xff, 0xd8, 0xff, 0xfe, 0x00, 0x02, 0xff, 0xd9];
 
         let out = decompress(
             &jpeg,

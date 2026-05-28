@@ -51,13 +51,22 @@ fn r_f32(b: &[u8], off: usize, le: bool) -> f32 {
     }
 }
 
+fn positive_i32_dim(value: i32, label: &str) -> Result<u32> {
+    if value <= 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "DeltaVision header has non-positive {label}"
+        )));
+    }
+    Ok(value as u32)
+}
+
 /// Pixel type codes used in .dv files (matches Java DeltavisionReader.getPixelType)
 fn dv_pixel_type(mode: i32) -> (PixelType, u8) {
     match mode {
         0 => (PixelType::Uint8, 8),
         1 => (PixelType::Int16, 16),
         2 => (PixelType::Float32, 32),
-        3 => (PixelType::Int16, 16),   // 16 bit complex — report as int16
+        3 => (PixelType::Int16, 16), // 16 bit complex — report as int16
         4 => (PixelType::Float32, 32), // 64 bit complex — report as float
         6 => (PixelType::Uint16, 16),
         7 => (PixelType::Int32, 32),
@@ -611,11 +620,20 @@ impl FormatReader for DeltavisionReader {
 
         // Detect endianness
         let magic_le = i16::from_le_bytes([hdr[96], hdr[97]]);
-        let le = magic_le == DV_MAGIC_LE;
+        let magic_be = i16::from_be_bytes([hdr[96], hdr[97]]);
+        let le = if magic_le == DV_MAGIC_LE {
+            true
+        } else if magic_be == DV_MAGIC_LE {
+            false
+        } else {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "DeltaVision header is missing PRIISM magic".into(),
+            ));
+        };
 
-        let num_x = r_i32(&hdr, 0, le).max(1) as u32;
-        let num_y = r_i32(&hdr, 4, le).max(1) as u32;
-        let num_z = r_i32(&hdr, 8, le).max(1) as u32; // total sections
+        let num_x = positive_i32_dim(r_i32(&hdr, 0, le), "width")?;
+        let num_y = positive_i32_dim(r_i32(&hdr, 4, le), "height")?;
+        let num_z = positive_i32_dim(r_i32(&hdr, 8, le), "section count")?;
         let mode = r_i32(&hdr, 12, le);
         let ext_hdr_size = r_i32(&hdr, 92, le).max(0) as u64;
         // pixel spacings
@@ -853,7 +871,7 @@ impl FormatReader for DeltavisionReader {
     fn metadata(&self) -> &ImageMetadata {
         self.series
             .get(self.current_series)
-            .expect("set_id not called")
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -873,15 +891,19 @@ impl FormatReader for DeltavisionReader {
         let offset = self.data_offset + file_plane_index * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        let mut stored = vec![0u8; plane_bytes];
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
-        if offset < file_len {
-            f.seek(SeekFrom::Start(offset))
-                .map_err(BioFormatsError::Io)?;
-            let available = (file_len - offset).min(plane_bytes as u64) as usize;
-            f.read_exact(&mut stored[..available])
-                .map_err(BioFormatsError::Io)?;
+        let end = offset.checked_add(plane_bytes as u64).ok_or_else(|| {
+            BioFormatsError::InvalidData("DeltaVision plane offset overflows".into())
+        })?;
+        if end > file_len {
+            return Err(BioFormatsError::InvalidData(format!(
+                "DeltaVision plane {plane_index} exceeds file length: need bytes {offset}..{end}, file length {file_len}"
+            )));
         }
+        f.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut stored = vec![0u8; plane_bytes];
+        f.read_exact(&mut stored).map_err(BioFormatsError::Io)?;
 
         let mut buf = vec![0u8; plane_bytes];
         for y in 0..meta.size_y as usize {
@@ -1078,6 +1100,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn rejects_missing_magic_and_non_positive_dimensions() {
+        let missing_magic = temp_dv_path("missing_magic");
+        let mut hdr = vec![0u8; HEADER_SIZE];
+        write_i32(&mut hdr, 0, 1);
+        write_i32(&mut hdr, 4, 1);
+        write_i32(&mut hdr, 8, 1);
+        fs::write(&missing_magic, hdr).unwrap();
+
+        let mut reader = DeltavisionReader::new();
+        let err = reader.set_id(&missing_magic).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("PRIISM magic")),
+            "{err:?}"
+        );
+        let _ = fs::remove_file(&missing_magic);
+
+        let zero_width = write_synthetic_dv("zero_width", 0, 1, 1, 0, 1, 0, 1, &[&[7]]);
+        let mut reader = DeltavisionReader::new();
+        let err = reader.set_id(&zero_width).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("non-positive width")),
+            "{err:?}"
+        );
+        let _ = fs::remove_file(&zero_width);
+    }
+
     fn write_synthetic_dv_with_extended_headers(
         name: &str,
         size_x: i32,
@@ -1224,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_plane_returns_available_bytes_and_zero_fills_tail() {
+    fn truncated_plane_returns_error_instead_of_zero_filling_tail() {
         let truncated = [1, 2, 3];
         let path = write_synthetic_dv("truncated_plane", 2, 2, 1, 5, 1, 0, 1, &[&truncated]);
 
@@ -1235,8 +1284,11 @@ mod tests {
         assert_eq!(meta.size_x, 2);
         assert_eq!(meta.size_y, 2);
 
-        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 0, 1, 2]);
-        assert_eq!(reader.open_bytes_region(0, 0, 0, 2, 1).unwrap(), vec![3, 0]);
+        let err = reader.open_bytes(0).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("exceeds file length")),
+            "{err:?}"
+        );
 
         fs::remove_file(path).ok();
     }

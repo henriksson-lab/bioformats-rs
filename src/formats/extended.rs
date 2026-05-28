@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::ome_metadata::{
     create_lsid, OmeImage, OmeMetadata, OmePlate, OmeWell, OmeWellSample,
 };
@@ -149,16 +149,16 @@ macro_rules! placeholder_reader {
                 Ok(())
             }
 
-            fn series_count(&self) -> usize { 1 }
+            fn series_count(&self) -> usize { 0 }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+                Err(BioFormatsError::SeriesOutOfRange(s))
             }
 
             fn series(&self) -> usize { 0 }
 
             fn metadata(&self) -> &ImageMetadata {
-                self.meta.as_ref().expect("set_id not called")
+                self.meta.as_ref().unwrap_or(crate::common::reader::uninitialized_metadata())
             }
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -618,9 +618,10 @@ impl FormatReader for GelReader {
         self.inner.set_id(path)?;
 
         // Inspect the first IFD for the private Molecular Dynamics tags.
-        let first = self.inner.ifd(0).ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat("GEL TIFF has no IFDs".into())
-        })?;
+        let first = self
+            .inner
+            .ifd(0)
+            .ok_or_else(|| BioFormatsError::UnsupportedFormat("GEL TIFF has no IFDs".into()))?;
         if first.get(MD_FILETAG).is_none() {
             // Not a Molecular Dynamics GEL TIFF.
             return Err(BioFormatsError::UnsupportedFormat(
@@ -693,7 +694,9 @@ impl FormatReader for GelReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -984,7 +987,9 @@ impl FormatReader for ImspectorReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1222,7 +1227,9 @@ impl FormatReader for HamamatsuVmsReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1327,6 +1334,197 @@ fn parse_legacy_cellomics_header(data: &[u8]) -> Result<(u32, u32, u32, PixelTyp
     Ok((w, h, 1, pt, bpp, 52))
 }
 
+fn cellomics_plate_prefix(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let bytes = stem.as_bytes();
+    for i in 0..bytes.len().saturating_sub(3) {
+        if bytes[i] == b'_'
+            && bytes[i + 1].is_ascii_alphabetic()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+        {
+            return Some(stem[..i].to_string());
+        }
+    }
+    None
+}
+
+fn find_cellomics_mdb(path: &Path) -> Option<PathBuf> {
+    let plate_prefix = cellomics_plate_prefix(path)?;
+    let dir = path.parent()?;
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .find_map(|entry| {
+            let candidate = entry.path();
+            let is_mdb = candidate
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("mdb"))
+                .unwrap_or(false);
+            let matches_plate = candidate
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with(&plate_prefix))
+                .unwrap_or(false);
+            if is_mdb && matches_plate {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+}
+
+fn cellomics_channel_metadata_from_table(
+    table: &crate::common::mdb::MdbTable,
+) -> HashMap<String, MetadataValue> {
+    let mut column_index = HashMap::new();
+    for (i, column) in table.columns.iter().enumerate() {
+        column_index.insert(column.to_ascii_lowercase(), i);
+    }
+
+    let mut metadata = HashMap::new();
+    for (channel, row) in table.rows.iter().enumerate() {
+        let prefix = format!("cellomics.channel.{channel}");
+        if let Some(value) = mdb_row_value(row, &column_index, "name") {
+            metadata.insert(
+                format!("{prefix}.name"),
+                MetadataValue::String(value.to_string()),
+            );
+        }
+        if let Some(value) = mdb_row_value(row, &column_index, "exposuretime") {
+            let value = value.trim();
+            if let Ok(exposure) = value.parse::<f64>() {
+                metadata.insert(
+                    format!("{prefix}.exposure_time"),
+                    MetadataValue::Float(exposure),
+                );
+            } else {
+                metadata.insert(
+                    format!("{prefix}.exposure_time"),
+                    MetadataValue::String(value.to_string()),
+                );
+            }
+        }
+        if let Some(value) = mdb_row_value(row, &column_index, "compositecolor") {
+            let value = value.trim();
+            if let Ok(color) = value.parse::<i64>() {
+                metadata.insert(
+                    format!("{prefix}.composite_color"),
+                    MetadataValue::Int(color),
+                );
+            } else {
+                metadata.insert(
+                    format!("{prefix}.composite_color"),
+                    MetadataValue::String(value.to_string()),
+                );
+            }
+        }
+    }
+    metadata
+}
+
+fn mdb_row_value<'a>(
+    row: &'a [String],
+    column_index: &HashMap<String, usize>,
+    name: &str,
+) -> Option<&'a str> {
+    let value = row.get(*column_index.get(name)?)?.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn read_cellomics_mdb_metadata(path: &Path) -> HashMap<String, MetadataValue> {
+    let mut metadata = HashMap::new();
+    let Some(mdb_path) = find_cellomics_mdb(path) else {
+        return metadata;
+    };
+
+    metadata.insert(
+        "cellomics.mdb_file".into(),
+        MetadataValue::String(mdb_path.display().to_string()),
+    );
+    match crate::common::mdb::parse_table(&mdb_path, "asnProtocolChannel") {
+        Ok(Some(table)) => metadata.extend(cellomics_channel_metadata_from_table(&table)),
+        Ok(None) => {
+            metadata.insert(
+                "cellomics.mdb_missing_table".into(),
+                MetadataValue::String("asnProtocolChannel".into()),
+            );
+        }
+        Err(e) => {
+            metadata.insert(
+                "cellomics.mdb_error".into(),
+                MetadataValue::String(e.to_string()),
+            );
+        }
+    }
+    metadata
+}
+
+#[cfg(test)]
+mod cellomics_mdb_tests {
+    use super::{cellomics_channel_metadata_from_table, cellomics_plate_prefix};
+    use crate::common::mdb::MdbTable;
+    use crate::common::metadata::MetadataValue;
+    use std::path::Path;
+
+    #[test]
+    fn cellomics_plate_prefix_matches_well_token() {
+        assert_eq!(
+            cellomics_plate_prefix(Path::new("Plate42_A01f00d1.c01")).as_deref(),
+            Some("Plate42")
+        );
+        assert_eq!(
+            cellomics_plate_prefix(Path::new("Plate_2024_H12.c01")).as_deref(),
+            Some("Plate_2024")
+        );
+        assert!(cellomics_plate_prefix(Path::new("not_cellomics.c01")).is_none());
+    }
+
+    #[test]
+    fn cellomics_mdb_channel_table_maps_expected_columns() {
+        let table = MdbTable {
+            name: "asnProtocolChannel".into(),
+            columns: vec![
+                "Name".into(),
+                "ExposureTime".into(),
+                "CompositeColor".into(),
+                "Ignored".into(),
+            ],
+            rows: vec![
+                vec!["DAPI".into(), "35.5".into(), "16711680".into(), "x".into()],
+                vec!["FITC".into(), "n/a".into(), "green".into(), "x".into()],
+            ],
+        };
+
+        let metadata = cellomics_channel_metadata_from_table(&table);
+        assert!(matches!(
+            metadata.get("cellomics.channel.0.name"),
+            Some(MetadataValue::String(v)) if v == "DAPI"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.channel.0.exposure_time"),
+            Some(MetadataValue::Float(v)) if (*v - 35.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.channel.0.composite_color"),
+            Some(MetadataValue::Int(16711680))
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.channel.1.exposure_time"),
+            Some(MetadataValue::String(v)) if v == "n/a"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.channel.1.composite_color"),
+            Some(MetadataValue::String(v)) if v == "green"
+        ));
+    }
+}
+
 impl FormatReader for CellomicsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -1341,7 +1539,7 @@ impl FormatReader for CellomicsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let raw = std::fs::read(path).map_err(|e| BioFormatsError::Io(e))?;
+        let raw = std::fs::read(path).map_err(BioFormatsError::Io)?;
         // .c01 files are zlib-compressed after a 4-byte magic; .dib are raw.
         let is_c01 = path
             .extension()
@@ -1445,6 +1643,8 @@ impl FormatReader for CellomicsReader {
         self.path = Some(path.to_path_buf());
         self.pixel_offset = pixel_offset;
         self.data = data;
+        let series_metadata = read_cellomics_mdb_metadata(path);
+
         self.meta = Some(ImageMetadata {
             size_x: w,
             size_y: h,
@@ -1460,7 +1660,7 @@ impl FormatReader for CellomicsReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
-            series_metadata: HashMap::new(),
+            series_metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
@@ -1494,7 +1694,9 @@ impl FormatReader for CellomicsReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1726,14 +1928,13 @@ impl FormatReader for MrwReader {
         matches!(ext.as_deref(), Some("mrw"))
     }
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // First 4 bytes end with the "MRM" magic string.
-        header.len() >= 4 && &header[1..4] == b"MRM"
+        header.len() >= 4 && header[..4] == *b"\0MRM"
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        if data.len() < 8 || &data[1..4] != b"MRM" {
+        if data.len() < 8 || data[..4] != *b"\0MRM" {
             return Err(BioFormatsError::UnsupportedFormat(
-                "MRW: missing 'MRM' magic string".into(),
+                "MRW: missing '\\0MRM' magic string".into(),
             ));
         }
         // Big-endian throughout. offset = readInt(@4) + 8.
@@ -1778,6 +1979,11 @@ impl FormatReader for MrwReader {
                 if body + 12 <= data.len() {
                     let scale = &data[body..body + 4];
                     for i in 0..4 {
+                        if scale[i] >= 32 {
+                            return Err(BioFormatsError::UnsupportedFormat(
+                                "MRW: WBG scale value is too large".into(),
+                            ));
+                        }
                         let coeff = be_i16(body + 4 + i * 2) as f32;
                         wbg[i] = coeff / ((64u32 << scale[i]) as f32);
                     }
@@ -1792,6 +1998,16 @@ impl FormatReader for MrwReader {
             return Err(BioFormatsError::UnsupportedFormat(
                 "MRW: PRD block did not yield image dimensions".into(),
             ));
+        }
+        if sensor_w < size_x || sensor_h < size_y {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "MRW: sensor dimensions are smaller than image dimensions".into(),
+            ));
+        }
+        if data_size == 0 || data_size > 16 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "MRW: unsupported sample bit depth {data_size}"
+            )));
         }
 
         self.sensor_width = sensor_w;
@@ -1854,7 +2070,9 @@ impl FormatReader for MrwReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         if p != 0 {
@@ -2046,7 +2264,8 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Vec<YokogawaPlane> {
                         let p = YokogawaPlane {
                             row: (yk_attr_int(e, "bts:Row").unwrap_or(1) - 1).max(0) as u32,
                             column: (yk_attr_int(e, "bts:Column").unwrap_or(1) - 1).max(0) as u32,
-                            field: (yk_attr_int(e, "bts:FieldIndex").unwrap_or(1) - 1).max(0) as u32,
+                            field: (yk_attr_int(e, "bts:FieldIndex").unwrap_or(1) - 1).max(0)
+                                as u32,
                             z: (yk_attr_int(e, "bts:ZIndex").unwrap_or(1) - 1) as i32,
                             channel: (yk_attr_int(e, "bts:Ch").unwrap_or(1) - 1) as i32,
                             timepoint: (yk_attr_int(e, "bts:TimePoint").unwrap_or(1) - 1) as i32,
@@ -2225,8 +2444,10 @@ impl YokogawaReader {
             meta.size_c = size_c;
             meta.image_count = size_z * size_t * n_channels;
             meta.dimension_order = DimensionOrder::XYCZT;
-            meta.series_metadata
-                .insert("format".into(), crate::common::metadata::MetadataValue::String("Yokogawa CV7000".into()));
+            meta.series_metadata.insert(
+                "format".into(),
+                crate::common::metadata::MetadataValue::String("Yokogawa CV7000".into()),
+            );
             series.push(meta);
             plane_files.push(vec![None; planes_per_series]);
             series_well_field.push((well_ordinal, field));
@@ -2272,7 +2493,10 @@ impl YokogawaReader {
         self.plane_files = plane_files;
         self.plate = plate;
         self.series_well_field = series_well_field;
-        self.wells = wells.iter().map(|&w| (w / plate_columns, w % plate_columns)).collect();
+        self.wells = wells
+            .iter()
+            .map(|&w| (w / plate_columns, w % plate_columns))
+            .collect();
         self.fields = fields;
         self.physical_size_x = channels.first().and_then(|c| c.x_size).filter(|&v| v > 0.0);
         self.physical_size_y = channels.first().and_then(|c| c.y_size).filter(|&v| v > 0.0);
@@ -2363,7 +2587,7 @@ impl FormatReader for YokogawaReader {
     fn metadata(&self) -> &ImageMetadata {
         self.series
             .get(self.current_series)
-            .expect("set_id not called")
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         let meta = self
@@ -2435,12 +2659,7 @@ impl FormatReader for YokogawaReader {
         let mut images = Vec::with_capacity(self.series.len());
         for (s, (well_ordinal, field)) in self.series_well_field.iter().enumerate() {
             let (row, col) = self.wells.get(*well_ordinal).copied().unwrap_or((0, 0));
-            let name = format!(
-                "Well {}{}, Field {}",
-                yk_row_name(row),
-                col + 1,
-                field + 1
-            );
+            let name = format!("Well {}{}, Field {}", yk_row_name(row), col + 1, field + 1);
             let _ = s;
             images.push(OmeImage {
                 name: Some(name),
@@ -2574,7 +2793,9 @@ impl FormatReader for LeicaLofReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -2833,7 +3054,9 @@ impl FormatReader for PovRayReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -2986,7 +3209,9 @@ impl FormatReader for NafReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -3100,7 +3325,9 @@ impl FormatReader for BurleighReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -3195,7 +3422,7 @@ mod mrw_tests {
 
         // Compose blocks. Each block: 4-char name + be32 length + body.
         let mut blocks: Vec<u8> = Vec::new();
-        let mut push_block = |blocks: &mut Vec<u8>, name: &[u8; 4], body: &[u8]| {
+        let push_block = |blocks: &mut Vec<u8>, name: &[u8; 4], body: &[u8]| {
             blocks.extend_from_slice(name);
             blocks.extend_from_slice(&(body.len() as i32).to_be_bytes());
             blocks.extend_from_slice(body);
@@ -3288,6 +3515,36 @@ mod mrw_tests {
         assert_eq!(px(&plane, 0, 1, 2), 22); // blue  (0,1)
         assert_eq!(px(&plane, 1, 0, 0), 33); // red   (1,0)
         assert_eq!(px(&plane, 1, 1, 1), 44); // green (1,1)
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mrw_rejects_loose_magic_and_malformed_prd_values() {
+        let mut bytes = build_mrw(2, 2, 2, 2, 0, &[1, 2, 3, 4]);
+        bytes[0] = b'X';
+        let path = temp_path("bad_magic");
+        std::fs::write(&path, &bytes).unwrap();
+        let reader = MrwReader::new();
+        assert!(!reader.is_this_type_by_bytes(&bytes[..4]));
+        let err = MrwReader::new().set_id(&path).unwrap_err();
+        assert!(err.to_string().contains("\\0MRM"));
+        std::fs::remove_file(&path).ok();
+
+        let bytes = build_mrw(1, 1, 2, 2, 0, &[1]);
+        let path = temp_path("small_sensor");
+        std::fs::write(&path, &bytes).unwrap();
+        let err = MrwReader::new().set_id(&path).unwrap_err();
+        assert!(err.to_string().contains("sensor dimensions"));
+        std::fs::remove_file(&path).ok();
+
+        let mut bytes = build_mrw(2, 2, 2, 2, 0, &[1, 2, 3, 4]);
+        // WBG block starts after the 8-byte MRW prelude and the 32-byte PRD
+        // block. Its first body byte is the first scale value.
+        bytes[8 + 32 + 8] = 32;
+        let path = temp_path("bad_wbg_scale");
+        std::fs::write(&path, &bytes).unwrap();
+        let err = MrwReader::new().set_id(&path).unwrap_err();
+        assert!(err.to_string().contains("WBG scale"));
         std::fs::remove_file(&path).ok();
     }
 }

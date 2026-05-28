@@ -1,8 +1,8 @@
 //! Structured OME metadata — the Rust equivalent of Java Bio-Formats `IMetadata`.
 //!
-//! Populated by format readers that carry OME-XML or equivalent rich metadata
-//! (CZI, OME-TIFF, OME-XML). Readers without this information return `None`
-//! from [`crate::reader::FormatReader::ome_metadata`].
+//! `FormatReader::ome_metadata` returns a baseline OME model derived from core
+//! image metadata by default. Readers that carry OME-XML or equivalent rich
+//! metadata (CZI, OME-TIFF, OME-XML, etc.) enrich that baseline.
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{ImageMetadata, MetadataValue};
@@ -13,7 +13,7 @@ const ORIGINAL_METADATA_NS: &str = "openmicroscopy.org/bioformats/original-metad
 // ─── Public types ────────────────────────────────────────────────────────────
 
 /// Top-level metadata store — one [`OmeImage`] per image series.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeMetadata {
     pub images: Vec<OmeImage>,
     pub instruments: Vec<OmeInstrument>,
@@ -35,7 +35,7 @@ pub fn create_lsid(object_type: &str, indexes: &[usize]) -> String {
 }
 
 /// Metadata for one image series.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeImage {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -64,7 +64,7 @@ pub struct OmeImage {
 }
 
 /// Per-channel metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeChannel {
     pub name: Option<String>,
     /// Samples (components) per pixel — 1 for greyscale, 3 for RGB.
@@ -78,7 +78,7 @@ pub struct OmeChannel {
 }
 
 /// Instrument metadata (microscope, objectives, detectors, light sources).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeInstrument {
     pub id: Option<String>,
     pub microscope_model: Option<String>,
@@ -91,7 +91,7 @@ pub struct OmeInstrument {
 }
 
 /// Objective lens metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeObjective {
     pub id: Option<String>,
     pub model: Option<String>,
@@ -111,7 +111,7 @@ pub struct OmeObjective {
 }
 
 /// Detector metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeDetector {
     pub id: Option<String>,
     pub model: Option<String>,
@@ -123,7 +123,7 @@ pub struct OmeDetector {
 }
 
 /// Light source metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeLightSource {
     pub id: Option<String>,
     pub model: Option<String>,
@@ -135,7 +135,7 @@ pub struct OmeLightSource {
 }
 
 /// Optical filter metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeFilter {
     pub id: Option<String>,
     pub model: Option<String>,
@@ -148,7 +148,7 @@ pub struct OmeFilter {
 }
 
 /// Dichroic mirror metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeDichroic {
     pub id: Option<String>,
     pub model: Option<String>,
@@ -156,7 +156,7 @@ pub struct OmeDichroic {
 }
 
 /// Light path: the combination of filters and dichroics used for a channel.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeLightPath {
     pub excitation_filter_ids: Vec<String>,
     pub dichroic_id: Option<String>,
@@ -164,7 +164,7 @@ pub struct OmeLightPath {
 }
 
 /// Region of interest.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeROI {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -172,7 +172,7 @@ pub struct OmeROI {
 }
 
 /// A single shape within an ROI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum OmeShape {
     Rectangle {
         x: f64,
@@ -223,7 +223,7 @@ pub enum OmeShape {
 }
 
 /// Experimenter metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeExperimenter {
     pub id: Option<String>,
     pub first_name: Option<String>,
@@ -233,7 +233,7 @@ pub struct OmeExperimenter {
 }
 
 /// Annotation (key-value or structured).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum OmeAnnotation {
     /// Simple key-value string annotation.
     MapAnnotation {
@@ -256,7 +256,7 @@ pub enum OmeAnnotation {
 }
 
 /// High-Content Screening plate metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmePlate {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -266,7 +266,7 @@ pub struct OmePlate {
 }
 
 /// A well in an HCS plate.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeWell {
     pub id: Option<String>,
     pub row: u32,
@@ -275,7 +275,7 @@ pub struct OmeWell {
 }
 
 /// A field/site within a well.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeWellSample {
     pub id: Option<String>,
     pub index: u32,
@@ -286,7 +286,7 @@ pub struct OmeWellSample {
 }
 
 /// Screen metadata (collection of plates).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeScreen {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -294,7 +294,7 @@ pub struct OmeScreen {
 }
 
 /// Experiment metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeExperiment {
     pub id: Option<String>,
     pub experiment_type: Option<String>,
@@ -302,7 +302,7 @@ pub struct OmeExperiment {
 }
 
 /// Dataset metadata — a named collection of images.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeDataset {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -312,7 +312,7 @@ pub struct OmeDataset {
 }
 
 /// Per-plane metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmePlane {
     pub the_z: u32,
     pub the_c: u32,
@@ -403,12 +403,11 @@ impl OmeMetadata {
                 xml.push_str("/>");
             }
 
-            for ls in &inst.light_sources {
-                let ls_tag = ls
-                    .light_source_type
-                    .as_deref()
+            for (li, ls) in inst.light_sources.iter().enumerate() {
+                let ls_tag = ome_light_source_tag(ls.light_source_type.as_deref())
                     .unwrap_or("GenericExcitationSource");
-                let ls_id = ls.id.as_deref().unwrap_or("LightSource:0");
+                let default_ls_id = format!("LightSource:{ii}:{li}");
+                let ls_id = ls.id.as_deref().unwrap_or(&default_ls_id);
                 let _ = write!(xml, r#"<{ls_tag} ID="{}""#, xml_escape(ls_id));
                 if let Some(v) = &ls.model {
                     let _ = write!(xml, r#" Model="{}""#, xml_escape(v));
@@ -419,26 +418,28 @@ impl OmeMetadata {
                 xml.push_str("/>");
             }
 
-            for fi in &inst.filters {
-                let f_id = fi.id.as_deref().unwrap_or("Filter:0");
+            for (fi, filter) in inst.filters.iter().enumerate() {
+                let default_f_id = format!("Filter:{ii}:{fi}");
+                let f_id = filter.id.as_deref().unwrap_or(&default_f_id);
                 let _ = write!(xml, r#"<Filter ID="{}""#, xml_escape(f_id));
-                if let Some(v) = &fi.model {
+                if let Some(v) = &filter.model {
                     let _ = write!(xml, r#" Model="{}""#, xml_escape(v));
                 }
-                if let Some(v) = &fi.filter_type {
+                if let Some(v) = &filter.filter_type {
                     let _ = write!(xml, r#" Type="{}""#, xml_escape(v));
                 }
-                if let Some(v) = fi.cut_in {
+                if let Some(v) = filter.cut_in {
                     let _ = write!(xml, r#" CutIn="{v}""#);
                 }
-                if let Some(v) = fi.cut_out {
+                if let Some(v) = filter.cut_out {
                     let _ = write!(xml, r#" CutOut="{v}""#);
                 }
                 xml.push_str("/>");
             }
 
-            for dc in &inst.dichroics {
-                let d_id = dc.id.as_deref().unwrap_or("Dichroic:0");
+            for (di, dc) in inst.dichroics.iter().enumerate() {
+                let default_d_id = format!("Dichroic:{ii}:{di}");
+                let d_id = dc.id.as_deref().unwrap_or(&default_d_id);
                 let _ = write!(xml, r#"<Dichroic ID="{}""#, xml_escape(d_id));
                 if let Some(v) = &dc.model {
                     let _ = write!(xml, r#" Model="{}""#, xml_escape(v));
@@ -449,7 +450,15 @@ impl OmeMetadata {
             xml.push_str("</Instrument>");
         }
 
-        for (i, img) in self.images.iter().enumerate() {
+        let images = if self.images.is_empty() {
+            Vec::new()
+        } else {
+            // This serializer is given one ImageMetadata, so it can only write
+            // dimensions/pixel type honestly for one OME Image.
+            self.images.iter().take(1).collect()
+        };
+
+        for (i, img) in images.into_iter().enumerate() {
             let _ = write!(
                 xml,
                 r#"<Image ID="Image:{i}" Name="{}">"#,
@@ -503,7 +512,12 @@ impl OmeMetadata {
             xml.push('>');
 
             // Channels
-            for (ci, ch) in img.channels.iter().enumerate() {
+            let channel_count = if meta.is_rgb {
+                1
+            } else {
+                meta.size_c.max(1) as usize
+            };
+            for (ci, ch) in img.channels.iter().take(channel_count).enumerate() {
                 let _ = write!(
                     xml,
                     r#"<Channel ID="Channel:{i}:{ci}" SamplesPerPixel="{}""#,
@@ -677,6 +691,17 @@ fn ome_pixel_type_str(pt: crate::pixel::PixelType) -> &'static str {
     }
 }
 
+fn ome_light_source_tag(value: Option<&str>) -> Option<&'static str> {
+    match value.unwrap_or("GenericExcitationSource") {
+        "Laser" => Some("Laser"),
+        "Arc" => Some("Arc"),
+        "Filament" => Some("Filament"),
+        "LightEmittingDiode" | "LED" => Some("LightEmittingDiode"),
+        "GenericExcitationSource" => Some("GenericExcitationSource"),
+        _ => None,
+    }
+}
+
 // ─── Parsers ──────────────────────────────────────────────────────────────────
 
 impl OmeMetadata {
@@ -697,7 +722,11 @@ impl OmeMetadata {
         }
 
         let spp = if meta.is_rgb { meta.size_c.max(1) } else { 1 };
-        let channel_count = meta.size_c.max(1) as usize;
+        let channel_count = if meta.is_rgb {
+            1
+        } else {
+            meta.size_c.max(1) as usize
+        };
         let image = &mut self.images[image_index];
         if image.channels.len() < channel_count {
             image
@@ -729,9 +758,10 @@ impl OmeMetadata {
             ));
         }
 
+        let effective_c = if meta.is_rgb { 1 } else { meta.size_c };
         let expected_planes = meta
             .size_z
-            .checked_mul(meta.size_c)
+            .checked_mul(effective_c)
             .and_then(|v| v.checked_mul(meta.size_t))
             .ok_or_else(|| BioFormatsError::InvalidData("Z/C/T plane count overflow".into()))?;
         if meta.image_count < expected_planes {
@@ -744,22 +774,35 @@ impl OmeMetadata {
         let image = self.images.get(image_index).ok_or_else(|| {
             BioFormatsError::InvalidData(format!("missing OME Image at index {image_index}"))
         })?;
-        if image.channels.len() < meta.size_c as usize {
+        let expected_channels = if meta.is_rgb { 1 } else { meta.size_c as usize };
+        if image.channels.len() < expected_channels {
             return Err(BioFormatsError::InvalidData(format!(
-                "OME Image {image_index} has {} channels but SizeC is {}",
+                "OME Image {image_index} has {} channels but requires {expected_channels}",
                 image.channels.len(),
-                meta.size_c
+            )));
+        }
+        if image.channels.len() > expected_channels {
+            return Err(BioFormatsError::InvalidData(format!(
+                "OME Image {image_index} has {} channels but metadata SizeC requires {expected_channels}",
+                image.channels.len(),
             )));
         }
         if image
             .channels
             .iter()
-            .take(meta.size_c as usize)
+            .take(expected_channels)
             .any(|channel| channel.samples_per_pixel == 0)
         {
             return Err(BioFormatsError::InvalidData(
                 "minimum metadata requires SamplesPerPixel for every channel".into(),
             ));
+        }
+        if meta.is_rgb && image.channels[0].samples_per_pixel != meta.size_c.max(1) {
+            return Err(BioFormatsError::InvalidData(format!(
+                "RGB metadata requires one OME channel with SamplesPerPixel={}, got {}",
+                meta.size_c.max(1),
+                image.channels[0].samples_per_pixel
+            )));
         }
         Ok(())
     }
@@ -772,9 +815,12 @@ impl OmeMetadata {
         global_min: f64,
         global_max: f64,
     ) -> Result<()> {
-        if self.images.get(image_index).is_none() {
+        let image = self.images.get(image_index).ok_or_else(|| {
+            BioFormatsError::InvalidData(format!("missing OME Image at index {image_index}"))
+        })?;
+        if channel_index >= image.channels.len() {
             return Err(BioFormatsError::InvalidData(format!(
-                "missing OME Image at index {image_index}"
+                "missing OME Channel at index {image_index}:{channel_index}"
             )));
         }
         self.annotations.push(OmeAnnotation::MapAnnotation {
@@ -845,18 +891,15 @@ impl OmeMetadata {
     /// `ImageDescription` tags.
     pub fn from_ome_xml(xml: &str) -> Self {
         let mut images = Vec::new();
-        let lower_xml = xml.to_ascii_lowercase();
 
         for img_start in all_tag_positions(xml, "Image") {
             let img_tag = start_tag_at(xml, img_start);
             let name = xml_attr(img_tag, "Name");
 
-            let img_end = lower_xml[img_start..]
-                .find("</image>")
-                .map(|p| p + img_start + "</image>".len())
+            let img_end = find_end_tag(xml, "Image", img_start)
+                .map(|p| xml[p..].find('>').map(|e| p + e + 1).unwrap_or(xml.len()))
                 .unwrap_or(xml.len());
             let img_xml = &xml[img_start..img_end];
-            let img_lower = img_xml.to_ascii_lowercase();
 
             let description = xml_inner_text(img_xml, "Description");
 
@@ -886,9 +929,12 @@ impl OmeMetadata {
             // Parse channels and planes from within the <Pixels> block.
             let pixels_end = pixels_pos
                 .and_then(|p| {
-                    img_lower[p..]
-                        .find("</pixels>")
-                        .map(|e| p + e + "</pixels>".len())
+                    find_end_tag(img_xml, "Pixels", p).map(|e| {
+                        img_xml[e..]
+                            .find('>')
+                            .map(|gt| e + gt + 1)
+                            .unwrap_or(img_xml.len())
+                    })
                 })
                 .unwrap_or(img_xml.len());
             let pixels_xml = pixels_pos.map(|p| &img_xml[p..pixels_end]);
@@ -923,9 +969,8 @@ impl OmeMetadata {
             if i >= images.len() {
                 break;
             }
-            let img_end = lower_xml[img_start..]
-                .find("</image>")
-                .map(|p| p + img_start + "</image>".len())
+            let img_end = find_end_tag(xml, "Image", img_start)
+                .map(|p| xml[p..].find('>').map(|e| p + e + 1).unwrap_or(xml.len()))
                 .unwrap_or(xml.len());
             let img_xml = &xml[img_start..img_end];
 
@@ -1084,16 +1129,14 @@ fn parse_planes(pixels_xml: &str) -> Vec<OmePlane> {
 // ─── Instrument parsing ──────────────────────────────────────────────────────
 
 fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
-    let lower = xml.to_ascii_lowercase();
     all_tag_positions(xml, "Instrument")
         .into_iter()
         .map(|pos| {
             let tag = start_tag_at(xml, pos);
             let id = xml_attr(tag, "ID");
 
-            let inst_end = lower[pos..]
-                .find("</instrument>")
-                .map(|e| pos + e + "</instrument>".len())
+            let inst_end = find_end_tag(xml, "Instrument", pos)
+                .map(|e| xml[e..].find('>').map(|gt| e + gt + 1).unwrap_or(xml.len()))
                 .unwrap_or(xml.len());
             let inst_xml = &xml[pos..inst_end];
 
@@ -1212,7 +1255,6 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
 // ─── ROI parsing ────────────────────────────────────────────────────────────
 
 fn parse_rois(xml: &str) -> Vec<OmeROI> {
-    let lower = xml.to_ascii_lowercase();
     all_tag_positions(xml, "ROI")
         .into_iter()
         .map(|pos| {
@@ -1220,19 +1262,23 @@ fn parse_rois(xml: &str) -> Vec<OmeROI> {
             let id = xml_attr(tag, "ID");
             let name = xml_attr(tag, "Name");
 
-            let roi_end = lower[pos..]
-                .find("</roi>")
-                .map(|e| pos + e + "</roi>".len())
+            let roi_end = find_end_tag(xml, "ROI", pos)
+                .map(|e| xml[e..].find('>').map(|gt| e + gt + 1).unwrap_or(xml.len()))
                 .unwrap_or(xml.len());
             let roi_xml = &xml[pos..roi_end];
 
             // Find the <Union> block containing shapes
             let union_xml = {
-                let roi_lower = roi_xml.to_ascii_lowercase();
-                let u_start = roi_lower.find("<union");
-                let u_end = roi_lower.find("</union>");
+                let u_start = all_tag_positions(roi_xml, "Union").into_iter().next();
+                let u_end = u_start.and_then(|s| find_end_tag(roi_xml, "Union", s));
                 match (u_start, u_end) {
-                    (Some(s), Some(e)) => &roi_xml[s..e + "</union>".len()],
+                    (Some(s), Some(e)) => {
+                        let end = roi_xml[e..]
+                            .find('>')
+                            .map(|gt| e + gt + 1)
+                            .unwrap_or(roi_xml.len());
+                        &roi_xml[s..end]
+                    }
                     _ => roi_xml,
                 }
             };
@@ -1385,14 +1431,15 @@ fn parse_points_attr(s: &str) -> Vec<(f64, f64)> {
 // ─── Annotation parsing ─────────────────────────────────────────────────────
 
 fn parse_structured_annotations(xml: &str) -> Vec<OmeAnnotation> {
-    let lower = xml.to_ascii_lowercase();
-    let sa_start = match lower.find("<structuredannotations") {
+    let sa_start = match all_tag_positions(xml, "StructuredAnnotations")
+        .into_iter()
+        .next()
+    {
         Some(p) => p,
         None => return Vec::new(),
     };
-    let sa_end = lower[sa_start..]
-        .find("</structuredannotations>")
-        .map(|e| sa_start + e + "</structuredannotations>".len())
+    let sa_end = find_end_tag(xml, "StructuredAnnotations", sa_start)
+        .map(|e| xml[e..].find('>').map(|gt| e + gt + 1).unwrap_or(xml.len()))
         .unwrap_or(xml.len());
     let sa_xml = &xml[sa_start..sa_end];
 
@@ -1403,10 +1450,13 @@ fn parse_structured_annotations(xml: &str) -> Vec<OmeAnnotation> {
         let tag = start_tag_at(sa_xml, pos);
         let id = xml_attr(tag, "ID");
         let namespace = xml_attr(tag, "Namespace");
-        let ann_lower = sa_xml[pos..].to_ascii_lowercase();
-        let ann_end = ann_lower
-            .find("</mapannotation>")
-            .map(|e| pos + e + "</mapannotation>".len())
+        let ann_end = find_end_tag(sa_xml, "MapAnnotation", pos)
+            .map(|e| {
+                sa_xml[e..]
+                    .find('>')
+                    .map(|gt| e + gt + 1)
+                    .unwrap_or(sa_xml.len())
+            })
             .unwrap_or(sa_xml.len());
         let ann_xml = &sa_xml[pos..ann_end];
 
@@ -1417,9 +1467,8 @@ fn parse_structured_annotations(xml: &str) -> Vec<OmeAnnotation> {
             if let Some(key) = xml_attr(m_tag, "K") {
                 // Get inner text between > and </M>
                 let after_tag = m_pos + m_tag.len();
-                let m_lower = ann_xml[after_tag..].to_ascii_lowercase();
-                if let Some(close) = m_lower.find("</m>") {
-                    let val = ann_xml[after_tag..after_tag + close].trim().to_string();
+                if let Some(close) = find_end_tag(ann_xml, "M", after_tag) {
+                    let val = xml_unescape(ann_xml[after_tag..close].trim());
                     values.push((key, val));
                 }
             }
@@ -1436,10 +1485,13 @@ fn parse_structured_annotations(xml: &str) -> Vec<OmeAnnotation> {
         let tag = start_tag_at(sa_xml, pos);
         let id = xml_attr(tag, "ID");
         let namespace = xml_attr(tag, "Namespace");
-        let ann_lower = sa_xml[pos..].to_ascii_lowercase();
-        let ann_end = ann_lower
-            .find("</commentannotation>")
-            .map(|e| pos + e + "</commentannotation>".len())
+        let ann_end = find_end_tag(sa_xml, "CommentAnnotation", pos)
+            .map(|e| {
+                sa_xml[e..]
+                    .find('>')
+                    .map(|gt| e + gt + 1)
+                    .unwrap_or(sa_xml.len())
+            })
             .unwrap_or(sa_xml.len());
         let ann_xml = &sa_xml[pos..ann_end];
         let value = xml_inner_text(ann_xml, "Value").unwrap_or_default();
@@ -1455,10 +1507,13 @@ fn parse_structured_annotations(xml: &str) -> Vec<OmeAnnotation> {
         let tag = start_tag_at(sa_xml, pos);
         let id = xml_attr(tag, "ID");
         let namespace = xml_attr(tag, "Namespace");
-        let ann_lower = sa_xml[pos..].to_ascii_lowercase();
-        let ann_end = ann_lower
-            .find("</tagannotation>")
-            .map(|e| pos + e + "</tagannotation>".len())
+        let ann_end = find_end_tag(sa_xml, "TagAnnotation", pos)
+            .map(|e| {
+                sa_xml[e..]
+                    .find('>')
+                    .map(|gt| e + gt + 1)
+                    .unwrap_or(sa_xml.len())
+            })
             .unwrap_or(sa_xml.len());
         let ann_xml = &sa_xml[pos..ann_end];
         let value = xml_inner_text(ann_xml, "Value").unwrap_or_default();
@@ -1544,65 +1599,166 @@ fn metadata_value_to_string(value: &MetadataValue) -> String {
 
 /// Extract the value of `attr` from an XML start-tag string (case-insensitive).
 fn xml_attr(tag_text: &str, attr: &str) -> Option<String> {
-    let lower = tag_text.to_ascii_lowercase();
-    let needle = format!("{}=", attr.to_ascii_lowercase());
-    let pos = lower.find(&needle)?;
-    let rest = &tag_text[pos + needle.len()..];
-    let quote = rest.chars().next()?;
-    if quote == '"' || quote == '\'' {
-        let inner = &rest[1..];
-        let end = inner.find(quote)?;
-        Some(inner[..end].to_string())
-    } else {
-        let end = rest
-            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-            .unwrap_or(rest.len());
-        Some(rest[..end].to_string())
+    let attr_lc = attr.to_ascii_lowercase();
+    let mut pos = tag_text.find(char::is_whitespace)?;
+    let bytes = tag_text.as_bytes();
+
+    while pos < tag_text.len() {
+        while pos < tag_text.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= tag_text.len() || bytes[pos] == b'>' || bytes[pos] == b'/' {
+            break;
+        }
+
+        let name_start = pos;
+        while pos < tag_text.len() {
+            let b = bytes[pos];
+            if b == b'=' || b.is_ascii_whitespace() || b == b'>' || b == b'/' {
+                break;
+            }
+            pos += 1;
+        }
+        let name = &tag_text[name_start..pos];
+
+        while pos < tag_text.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= tag_text.len() || bytes[pos] != b'=' {
+            while pos < tag_text.len() && bytes[pos] != b'>' && !bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            continue;
+        }
+        pos += 1;
+        while pos < tag_text.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= tag_text.len() {
+            break;
+        }
+
+        let value = if bytes[pos] == b'"' || bytes[pos] == b'\'' {
+            let quote = bytes[pos];
+            pos += 1;
+            let value_start = pos;
+            while pos < tag_text.len() && bytes[pos] != quote {
+                pos += 1;
+            }
+            let raw = &tag_text[value_start..pos];
+            pos = (pos + 1).min(tag_text.len());
+            raw
+        } else {
+            let value_start = pos;
+            while pos < tag_text.len()
+                && !bytes[pos].is_ascii_whitespace()
+                && bytes[pos] != b'>'
+                && bytes[pos] != b'/'
+            {
+                pos += 1;
+            }
+            &tag_text[value_start..pos]
+        };
+
+        if local_name(name).eq_ignore_ascii_case(&attr_lc) {
+            return Some(xml_unescape(value));
+        }
     }
+    None
 }
 
 /// Return the start-tag string beginning at `pos` (from `<` up to and including `>`).
 fn start_tag_at(xml: &str, pos: usize) -> &str {
-    let end = xml[pos..]
-        .find('>')
-        .map(|p| p + pos + 1)
-        .unwrap_or(xml.len());
+    let mut quote = None;
+    let mut end = xml.len();
+    for (rel, ch) in xml[pos..].char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == '>' => {
+                end = pos + rel + ch.len_utf8();
+                break;
+            }
+            None => {}
+        }
+    }
     &xml[pos..end]
 }
 
 /// Find the trimmed text content of the first `<tag>…</tag>` (case-insensitive).
 fn xml_inner_text(xml: &str, tag: &str) -> Option<String> {
-    let lower = xml.to_ascii_lowercase();
-    let tag_lc = tag.to_ascii_lowercase();
-    let open = format!("<{}", tag_lc);
-    let close = format!("</{}>", tag_lc);
-    let tag_start = lower.find(&open)?;
-    let content_start = lower[tag_start..].find('>')? + tag_start + 1;
-    let content_end = lower[content_start..].find(&close)? + content_start;
-    Some(xml[content_start..content_end].trim().to_string())
+    let tag_start = all_tag_positions(xml, tag).into_iter().next()?;
+    let content_start = tag_start + start_tag_at(xml, tag_start).len();
+    let content_end = find_end_tag(xml, tag, content_start)?;
+    Some(xml_unescape(xml[content_start..content_end].trim()))
 }
 
 /// Return byte positions of every `<tag` occurrence (case-insensitive),
 /// being careful not to match longer tag names (e.g. `<Channel` vs `<Channels`).
 fn all_tag_positions(xml: &str, tag: &str) -> Vec<usize> {
-    let lower = xml.to_ascii_lowercase();
-    let open = format!("<{}", tag.to_ascii_lowercase());
-    let open_len = open.len();
+    let tag_lc = tag.to_ascii_lowercase();
     let mut positions = Vec::new();
     let mut pos = 0;
-    while let Some(rel) = lower[pos..].find(&open) {
+    while let Some(rel) = xml[pos..].find('<') {
         let abs = pos + rel;
-        let after = abs + open_len;
-        if after < lower.len() {
-            let c = lower.as_bytes()[after];
-            // Ensure this is not a longer tag name
-            if c == b'>' || c == b'/' || c.is_ascii_whitespace() {
-                positions.push(abs);
+        if abs + 1 >= xml.len() {
+            break;
+        }
+        let next = xml.as_bytes()[abs + 1];
+        if next == b'/' || next == b'!' || next == b'?' {
+            pos = abs + 1;
+            continue;
+        }
+        let name_start = abs + 1;
+        let mut name_end = name_start;
+        while name_end < xml.len() {
+            let b = xml.as_bytes()[name_end];
+            if b == b'>' || b == b'/' || b.is_ascii_whitespace() {
+                break;
             }
+            name_end += 1;
+        }
+        if local_name(&xml[name_start..name_end]).eq_ignore_ascii_case(&tag_lc) {
+            positions.push(abs);
         }
         pos = abs + 1;
     }
     positions
+}
+
+fn find_end_tag(xml: &str, tag: &str, start: usize) -> Option<usize> {
+    let tag_lc = tag.to_ascii_lowercase();
+    let mut pos = start;
+    while let Some(rel) = xml[pos..].find("</") {
+        let abs = pos + rel;
+        let name_start = abs + 2;
+        let mut name_end = name_start;
+        while name_end < xml.len() {
+            let b = xml.as_bytes()[name_end];
+            if b == b'>' || b.is_ascii_whitespace() {
+                break;
+            }
+            name_end += 1;
+        }
+        if local_name(&xml[name_start..name_end]).eq_ignore_ascii_case(&tag_lc) {
+            return Some(abs);
+        }
+        pos = abs + 2;
+    }
+    None
+}
+
+fn local_name(name: &str) -> &str {
+    name.rsplit_once(':')
+        .map(|(_, local)| local)
+        .unwrap_or(name)
+}
+
+fn xml_unescape(s: &str) -> String {
+    quick_xml::escape::unescape(s)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| s.to_string())
 }
 
 // ─── Unit conversions ─────────────────────────────────────────────────────────

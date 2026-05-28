@@ -10,6 +10,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 // ---------------------------------------------------------------------------
 // Macro: thin TIFF wrapper (extension-only detection)
@@ -46,7 +47,14 @@ macro_rules! tiff_wrapper {
             fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
 
             fn set_id(&mut self, path: &Path) -> Result<()> {
-                self.inner.set_id(path)
+                self.inner.set_id(path)?;
+                for series in self.inner.series_list_mut() {
+                    series.metadata.series_metadata.insert(
+                        "hcs2.wrapper".to_string(),
+                        MetadataValue::String(stringify!($name).to_string()),
+                    );
+                }
+                Ok(())
             }
 
             fn close(&mut self) -> Result<()> {
@@ -220,7 +228,15 @@ impl PlaneRef {
 /// Compute the plane index for (z, c, t) given dimension order and sizes.
 ///
 /// Mirrors `loci.formats.FormatTools.getIndex`.
-fn get_index(order: DimensionOrder, size_z: u32, size_c: u32, size_t: u32, z: u32, c: u32, t: u32) -> u32 {
+fn get_index(
+    order: DimensionOrder,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    z: u32,
+    c: u32,
+    t: u32,
+) -> u32 {
     let (s0, s1) = match order {
         DimensionOrder::XYZCT => (size_z, size_c),
         DimensionOrder::XYZTC => (size_z, size_t),
@@ -243,7 +259,13 @@ fn get_index(order: DimensionOrder, size_z: u32, size_c: u32, size_t: u32, z: u3
 
 /// Decompose `index` into (z, c, t) given dimension order and sizes.
 /// Mirrors `loci.formats.FormatTools.getZCTCoords`.
-fn get_zct_coords(order: DimensionOrder, size_z: u32, size_c: u32, size_t: u32, index: u32) -> (u32, u32, u32) {
+fn get_zct_coords(
+    order: DimensionOrder,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    index: u32,
+) -> (u32, u32, u32) {
     let (s0, s1) = match order {
         DimensionOrder::XYZCT => (size_z, size_c),
         DimensionOrder::XYZTC => (size_z, size_t),
@@ -351,30 +373,22 @@ impl HcsAssembly {
                 && t.src_w == 0
                 && t.src_h == 0
             {
-                if !t.filename.exists() || self.ensure_loaded(&t.filename).is_err() {
-                    return Ok(vec![0u8; nbytes]);
+                self.ensure_loaded(&t.filename)?;
+                let buf = self.tiff_reader.open_bytes(t.file_index)?;
+                if buf.len() == nbytes {
+                    return Ok(buf);
                 }
-                match self.tiff_reader.open_bytes(t.file_index) {
-                    Ok(buf) => {
-                        if buf.len() == nbytes {
-                            return Ok(buf);
-                        }
-                        let mut out = vec![0u8; nbytes];
-                        let n = buf.len().min(nbytes);
-                        out[..n].copy_from_slice(&buf[..n]);
-                        return Ok(out);
-                    }
-                    Err(_) => return Ok(vec![0u8; nbytes]),
-                }
+                let mut out = vec![0u8; nbytes];
+                let n = buf.len().min(nbytes);
+                out[..n].copy_from_slice(&buf[..n]);
+                return Ok(out);
             }
         }
 
         // General path: composite each tile's sub-rectangle into the plane.
         let mut out = vec![0u8; nbytes];
         for t in &plane.tiles {
-            if !t.filename.exists() || self.ensure_loaded(&t.filename).is_err() {
-                continue;
-            }
+            self.ensure_loaded(&t.filename)?;
             // Source region: explicit crop, or the whole source plane.
             let (sx, sy, sw, sh) = if t.src_w == 0 || t.src_h == 0 {
                 let sm = self.tiff_reader.metadata();
@@ -393,20 +407,25 @@ impl HcsAssembly {
             if copy_w == 0 || copy_h == 0 {
                 continue;
             }
-            let region =
-                match self
-                    .tiff_reader
-                    .open_bytes_region(t.file_index, sx, sy, copy_w as u32, copy_h as u32)
-                {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
+            let region = self.tiff_reader.open_bytes_region(
+                t.file_index,
+                sx,
+                sy,
+                copy_w as u32,
+                copy_h as u32,
+            )?;
             let src_row = copy_w * bps;
+            let expected = src_row * copy_h;
+            if region.len() < expected {
+                return Err(BioFormatsError::Format(format!(
+                    "HCS companion tile {} returned {} bytes for a {} byte region",
+                    t.filename.display(),
+                    region.len(),
+                    expected
+                )));
+            }
             for row in 0..copy_h {
                 let s = row * src_row;
-                if s + src_row > region.len() {
-                    break;
-                }
                 let d = (dy + row) * dst_row + dx * bps;
                 if d + src_row > out.len() {
                     break;
@@ -417,23 +436,17 @@ impl HcsAssembly {
         Ok(out)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta()?;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let start = (y as usize + r) * row + x as usize * bps;
-            let end = start + out_row;
-            if end <= full.len() {
-                out.extend_from_slice(&full[start..end]);
-            } else {
-                out.extend(std::iter::repeat(0u8).take(out_row));
-            }
-        }
-        Ok(out)
+        crop_full_plane("BD Pathway", &full, meta, 1, x, y, w, h)
     }
 }
 
@@ -452,7 +465,10 @@ fn make_series_meta(
     format: &str,
 ) -> ImageMetadata {
     let mut meta_map = HashMap::new();
-    meta_map.insert("format".to_string(), MetadataValue::String(format.to_string()));
+    meta_map.insert(
+        "format".to_string(),
+        MetadataValue::String(format.to_string()),
+    );
     ImageMetadata {
         size_x,
         size_y,
@@ -482,7 +498,13 @@ fn probe_tiff(path: &Path) -> Option<(u32, u32, PixelType, u8, bool)> {
     let mut tr = crate::tiff::TiffReader::new();
     if tr.set_id(path).is_ok() {
         let m = tr.metadata();
-        let out = (m.size_x, m.size_y, m.pixel_type, m.bits_per_pixel, m.is_little_endian);
+        let out = (
+            m.size_x,
+            m.size_y,
+            m.pixel_type,
+            m.bits_per_pixel,
+            m.is_little_endian,
+        );
         let _ = tr.close();
         Some(out)
     } else {
@@ -545,7 +567,7 @@ macro_rules! impl_assembled_reader {
                 self.asm
                     .series
                     .get(self.asm.current_series)
-                    .expect("set_id not called")
+                    .unwrap_or(crate::common::reader::uninitialized_metadata())
             }
 
             fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -592,7 +614,9 @@ pub struct BdReader {
 
 impl BdReader {
     pub fn new() -> Self {
-        BdReader { asm: HcsAssembly::new() }
+        BdReader {
+            asm: HcsAssembly::new(),
+        }
     }
 }
 
@@ -623,7 +647,9 @@ pub struct ColumbusReader {
 
 impl ColumbusReader {
     pub fn new() -> Self {
-        ColumbusReader { asm: HcsAssembly::new() }
+        ColumbusReader {
+            asm: HcsAssembly::new(),
+        }
     }
 }
 
@@ -671,7 +697,9 @@ pub struct OperettaReader {
 
 impl OperettaReader {
     pub fn new() -> Self {
-        OperettaReader { asm: HcsAssembly::new() }
+        OperettaReader {
+            asm: HcsAssembly::new(),
+        }
     }
 }
 
@@ -690,7 +718,10 @@ impl_assembled_reader!(
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if matches!(name.as_str(), "index.idx.xml" | "index.ref.xml" | "index.xml") {
+        if matches!(
+            name.as_str(),
+            "index.idx.xml" | "index.ref.xml" | "index.xml"
+        ) {
             return true;
         }
         if let Ok(data) = std::fs::read(path) {
@@ -718,7 +749,9 @@ pub struct ScanrReader {
 
 impl ScanrReader {
     pub fn new() -> Self {
-        ScanrReader { asm: HcsAssembly::new() }
+        ScanrReader {
+            asm: HcsAssembly::new(),
+        }
     }
 }
 
@@ -758,7 +791,9 @@ pub struct CellVoyagerReader {
 
 impl CellVoyagerReader {
     pub fn new() -> Self {
-        CellVoyagerReader { asm: HcsAssembly::new() }
+        CellVoyagerReader {
+            asm: HcsAssembly::new(),
+        }
     }
 }
 
@@ -923,7 +958,9 @@ impl FormatReader for InCell3000Reader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -938,7 +975,10 @@ impl FormatReader for InCell3000Reader {
 
         // Decompress the custom RLE stream, mirroring Java openBytes.
         // totalElements is measured in BYTES (sizeX*sizeY*2) in the Java code.
-        let total_bytes = size_x * size_y * 2;
+        let total_bytes = size_x
+            .checked_mul(size_y)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| BioFormatsError::Format("InCell 3000 plane size overflows".into()))?;
         let mut out: Vec<u8> = Vec::with_capacity(total_bytes);
         let mut pos = self.pixels_offset as usize;
         let rd16 = |buf: &[u8], off: usize| -> Option<u16> {
@@ -953,7 +993,9 @@ impl FormatReader for InCell3000Reader {
             pos += 2;
             if pixel as i64 > 32768 {
                 let count = (pixel as i64 - 32768) as usize;
-                let Some(start_value) = rd16(&data, pos) else { break };
+                let Some(start_value) = rd16(&data, pos) else {
+                    break;
+                };
                 pos += 2;
                 let fp = pos;
                 for i in 0..count {
@@ -974,8 +1016,11 @@ impl FormatReader for InCell3000Reader {
             }
         }
         if out.len() < total_bytes {
-            out.resize(total_bytes, 0);
-        } else {
+            return Err(BioFormatsError::InvalidData(format!(
+                "InCell 3000 decoded {} bytes, expected {total_bytes}",
+                out.len()
+            )));
+        } else if out.len() > total_bytes {
             out.truncate(total_bytes);
         }
         Ok(out)
@@ -991,20 +1036,7 @@ impl FormatReader for InCell3000Reader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let start = (y as usize + r) * row + x as usize * bps;
-            let end = start + out_row;
-            if end <= full.len() {
-                out.extend_from_slice(&full[start..end]);
-            } else {
-                out.extend(std::iter::repeat(0u8).take(out_row));
-            }
-        }
-        Ok(out)
+        crop_full_plane("RCPNL", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1162,12 +1194,17 @@ impl FormatReader for TecanReader {
             if line.is_empty() {
                 continue;
             }
-            // Tecan .asc files are tab-separated; also accept spaces
-            let cells: Vec<f32> = line
+            // Tecan .asc files are tab-separated; also accept spaces.
+            let mut cells: Vec<f32> = Vec::new();
+            for cell in line
                 .split(|c: char| c == '\t' || c == ' ')
                 .filter(|s| !s.is_empty())
-                .filter_map(|s| s.trim().parse::<f64>().ok().map(|v| v as f32))
-                .collect();
+            {
+                let value = cell.trim().parse::<f64>().map_err(|_| {
+                    BioFormatsError::Format(format!("Tecan: non-numeric cell {cell:?}"))
+                })?;
+                cells.push(value as f32);
+            }
             if !cells.is_empty() {
                 rows.push(cells);
             }
@@ -1178,12 +1215,17 @@ impl FormatReader for TecanReader {
             ));
         }
         let height = rows.len() as u32;
-        let width = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
-        // Build Float32 pixel buffer (row-major, zero-padded for short rows)
+        let width = rows[0].len();
+        if rows.iter().any(|row| row.len() != width) {
+            return Err(BioFormatsError::Format(
+                "Tecan: .asc rows have inconsistent column counts".to_string(),
+            ));
+        }
+        let width = width as u32;
+        // Build Float32 pixel buffer (row-major).
         let mut pixel_data = Vec::with_capacity((width * height * 4) as usize);
         for row in &rows {
-            for x in 0..width as usize {
-                let val = if x < row.len() { row[x] } else { 0.0f32 };
+            for &val in row {
                 pixel_data.extend_from_slice(&val.to_le_bytes());
             }
         }
@@ -1248,7 +1290,9 @@ impl FormatReader for TecanReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1271,19 +1315,7 @@ impl FormatReader for TecanReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bpp = 4usize; // Float32
-        let row_stride = meta.size_x as usize * bpp;
-        let mut buf = Vec::with_capacity(w as usize * h as usize * bpp);
-        for row in y..(y + h) {
-            let start = row as usize * row_stride + x as usize * bpp;
-            let end = start + w as usize * bpp;
-            if end <= self.pixel_data.len() {
-                buf.extend_from_slice(&self.pixel_data[start..end]);
-            } else {
-                buf.extend(std::iter::repeat(0u8).take(w as usize * bpp));
-            }
-        }
-        Ok(buf)
+        crop_full_plane("Tecan", &self.pixel_data, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1471,12 +1503,37 @@ mod operetta {
                 Ok(quick_xml::events::Event::Start(ref e)) => {
                     text_buf.clear();
                     current_name = super::xmlutil::local_name(e);
-                    handle_start(&current_name, e, &mut active_plane, &mut active_channel, &mut active_channel_id, &mut channels);
+                    handle_start(
+                        &current_name,
+                        e,
+                        &mut active_plane,
+                        &mut active_channel,
+                        &mut active_channel_id,
+                        &mut channels,
+                    );
                 }
                 Ok(quick_xml::events::Event::Empty(ref e)) => {
                     let name = super::xmlutil::local_name(e);
-                    handle_start(&name, e, &mut active_plane, &mut active_channel, &mut active_channel_id, &mut channels);
-                    handle_end(&name, "", &mut active_plane, &mut active_channel, &mut channels, &mut planes, &mut plate_rows, &mut plate_cols, &dir, &images_dir);
+                    handle_start(
+                        &name,
+                        e,
+                        &mut active_plane,
+                        &mut active_channel,
+                        &mut active_channel_id,
+                        &mut channels,
+                    );
+                    handle_end(
+                        &name,
+                        "",
+                        &mut active_plane,
+                        &mut active_channel,
+                        &mut channels,
+                        &mut planes,
+                        &mut plate_rows,
+                        &mut plate_cols,
+                        &dir,
+                        &images_dir,
+                    );
                     current_name.clear();
                 }
                 Ok(quick_xml::events::Event::Text(ref t)) => {
@@ -1489,9 +1546,26 @@ mod operetta {
                 }
                 Ok(quick_xml::events::Event::End(ref e)) => {
                     let name = super::xmlutil::local_name(e);
-                    handle_end(&current_name, &text_buf, &mut active_plane, &mut active_channel, &mut channels, &mut planes, &mut plate_rows, &mut plate_cols, &dir, &images_dir);
+                    handle_end(
+                        &current_name,
+                        &text_buf,
+                        &mut active_plane,
+                        &mut active_channel,
+                        &mut channels,
+                        &mut planes,
+                        &mut plate_rows,
+                        &mut plate_cols,
+                        &dir,
+                        &images_dir,
+                    );
                     // handle_end with element close ('Image'/'Entry') uses qName
-                    handle_close(&name, &mut active_plane, &mut active_channel, &channels, &mut planes);
+                    handle_close(
+                        &name,
+                        &mut active_plane,
+                        &mut active_channel,
+                        &channels,
+                        &mut planes,
+                    );
                     current_name.clear();
                     text_buf.clear();
                 }
@@ -1539,8 +1613,7 @@ mod operetta {
 
         // Build planes[series][plane] in dimension order XYCZT
         // (Java nested loop: for t { for z { for c { nextPlane++ } } } => C fastest).
-        let mut series_planes: Vec<Vec<Option<Plane>>> =
-            vec![vec![None; n_planes]; series_count];
+        let mut series_planes: Vec<Vec<Option<Plane>>> = vec![vec![None; n_planes]; series_count];
         let mut next_series = 0usize;
         for &r in &rows {
             for &cc in &cols {
@@ -2025,9 +2098,9 @@ mod columbus {
                                         && p.channel == c as i32
                                         && p.z == z as i32
                                 }) {
-                                    let idx = super::get_index(
-                                        order, size_z, size_c, size_t, z, c, t,
-                                    ) as usize;
+                                    let idx =
+                                        super::get_index(order, size_z, size_c, size_t, z, c, t)
+                                            as usize;
                                     if idx < n_planes {
                                         if let Some(f) = p.file.clone() {
                                             sp[idx] = PlaneRef::whole(f, p.file_index);
@@ -2348,7 +2421,11 @@ mod scanr {
             || (list.len() as i32) < n_timepoints * n_channels * n_slices * n_wells * n_pos
         {
             let denom = n_channels * n_wells * n_pos * n_slices;
-            n_timepoints = if denom > 0 { (list.len() as i32) / denom } else { 0 };
+            n_timepoints = if denom > 0 {
+                (list.len() as i32) / denom
+            } else {
+                0
+            };
             if n_timepoints == 0 {
                 n_timepoints = 1;
             }
@@ -2662,7 +2739,13 @@ mod scanr {
             }
         }
 
-        fn on_val(&mut self, key: &str, v: &str, valid_channel: &mut bool, well_index: &mut String) {
+        fn on_val(
+            &mut self,
+            key: &str,
+            v: &str,
+            valid_channel: &mut bool,
+            well_index: &mut String,
+        ) {
             match key {
                 "columns/well" => self.field_columns = v.parse().unwrap_or(0),
                 "rows/well" => self.field_rows = v.parse().unwrap_or(0),
@@ -2684,7 +2767,11 @@ mod scanr {
                     }
                 }
                 "well selection table + cDNA" => {
-                    if v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    if v.chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
                         *well_index = v.to_string();
                         if let Ok(n) = v.parse::<i32>() {
                             self.well_numbers.insert(self.well_count as i32, n);
@@ -2730,7 +2817,11 @@ mod bd {
         out
     }
 
-    fn get<'a>(ini: &'a Map<String, Map<String, String>>, sect: &str, key: &str) -> Option<&'a String> {
+    fn get<'a>(
+        ini: &'a Map<String, Map<String, String>>,
+        sect: &str,
+        key: &str,
+    ) -> Option<&'a String> {
         ini.get(sect).and_then(|s| s.get(key))
     }
 
@@ -2783,8 +2874,12 @@ mod bd {
                 } else if ext.as_deref() == Some("xyz") {
                     if let Ok(t) = std::fs::read_to_string(&p) {
                         let xyz = parse_ini(&t);
-                        let enabled = get(&xyz, "Z1Axis", "Z1AxisEnabled").map(|s| s == "1").unwrap_or(false)
-                            && get(&xyz, "Z1Axis", "Z1AxisMode").map(|s| s == "1").unwrap_or(false);
+                        let enabled = get(&xyz, "Z1Axis", "Z1AxisEnabled")
+                            .map(|s| s == "1")
+                            .unwrap_or(false)
+                            && get(&xyz, "Z1Axis", "Z1AxisMode")
+                                .map(|s| s == "1")
+                                .unwrap_or(false);
                         if enabled {
                             z_axis_value = get(&xyz, "Z1Axis", "Z1AxisValue")
                                 .and_then(|s| s.trim().parse::<f64>().ok());
@@ -2814,11 +2909,17 @@ mod bd {
             .unwrap_or(16);
 
         // Montage (fields packed in a single TIFF).
-        let montage = get(&exp, "Image", "Montaged").map(|s| s == "1").unwrap_or(false);
+        let montage = get(&exp, "Image", "Montaged")
+            .map(|s| s == "1")
+            .unwrap_or(false);
         let (field_rows, field_cols) = if montage {
             (
-                get(&exp, "Image", "TilesY").and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(1),
-                get(&exp, "Image", "TilesX").and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(1),
+                get(&exp, "Image", "TilesY")
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .unwrap_or(1),
+                get(&exp, "Image", "TilesX")
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .unwrap_or(1),
             )
         } else {
             (1, 1)
@@ -2952,10 +3053,11 @@ mod bd {
                 // Map each plane to its file via getFilename logic.
                 let mut sp = vec![PlaneRef::default(); image_count];
                 for plane in 0..image_count {
-                    let (z, c, t) = super::get_zct_coords(
-                        order, size_z, size_c, size_t, plane as u32,
-                    );
-                    if let Some(f) = bd_filename(tiffs, &channel_names, c, z, t, order, size_z, size_t) {
+                    let (z, c, t) =
+                        super::get_zct_coords(order, size_z, size_c, size_t, plane as u32);
+                    if let Some(f) =
+                        bd_filename(tiffs, &channel_names, c, z, t, order, size_z, size_t)
+                    {
                         sp[plane] = if n_fields == 1 {
                             PlaneRef::whole(f, 0)
                         } else {
@@ -3169,7 +3271,14 @@ mod cellvoyager {
                 let mut field_index = 1;
                 let mut out = Vec::new();
                 for a in areas_el.children("Area") {
-                    let area = read_area(&a, &mut field_index, pixel_width, pixel_height, tile_w, tile_h);
+                    let area = read_area(
+                        &a,
+                        &mut field_index,
+                        pixel_width,
+                        pixel_height,
+                        tile_w,
+                        tile_h,
+                    );
                     out.push(area);
                 }
                 out
@@ -3188,7 +3297,10 @@ mod cellvoyager {
                 if !enabled {
                     continue;
                 }
-                let number = w.child_text(&["Number"]).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+                let number = w
+                    .child_text(&["Number"])
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
                 let areas = if let Some(shared) = &shared_areas {
                     shared.clone()
                 } else if let Some(areas_el) = w.child(&["Areas"]) {
@@ -3196,7 +3308,16 @@ mod cellvoyager {
                     areas_el
                         .children("Area")
                         .iter()
-                        .map(|a| read_area(a, &mut field_index, pixel_width, pixel_height, tile_w, tile_h))
+                        .map(|a| {
+                            read_area(
+                                a,
+                                &mut field_index,
+                                pixel_width,
+                                pixel_height,
+                                tile_w,
+                                tile_h,
+                            )
+                        })
                         .collect()
                 } else {
                     Vec::new()
@@ -3485,5 +3606,150 @@ mod cellvoyager {
             let real = root.children.pop().unwrap_or_default();
             Dom { root: real }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::writer::FormatWriter;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(name: &str) -> PathBuf {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("bioformats_hcs2_{id}_{name}"))
+    }
+
+    fn test_meta(width: u32, height: u32) -> ImageMetadata {
+        make_series_meta(
+            width,
+            height,
+            1,
+            1,
+            1,
+            PixelType::Uint8,
+            8,
+            true,
+            DimensionOrder::XYZCT,
+            "HCS test",
+        )
+    }
+
+    fn assembly_with_plane(meta: ImageMetadata, plane: PlaneRef) -> HcsAssembly {
+        let mut asm = HcsAssembly::new();
+        asm.series = vec![meta];
+        asm.planes = vec![vec![plane]];
+        asm
+    }
+
+    fn write_tiff(path: &Path, meta: &ImageMetadata, data: &[u8]) {
+        let mut writer = crate::tiff::TiffWriter::new();
+        writer.set_metadata(meta).unwrap();
+        writer.set_id(path).unwrap();
+        writer.save_bytes(0, data).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn hcs_assembly_empty_plane_ref_stays_black() {
+        let meta = test_meta(3, 2);
+        let mut asm = assembly_with_plane(meta, PlaneRef::default());
+
+        let bytes = asm.open_bytes(0).unwrap();
+
+        assert_eq!(bytes, vec![0; 6]);
+    }
+
+    #[test]
+    fn hcs_assembly_missing_referenced_whole_tile_returns_error() {
+        let meta = test_meta(3, 2);
+        let missing = temp_path("missing_whole_tile.tif");
+        let mut asm = assembly_with_plane(meta, PlaneRef::whole(missing, 0));
+
+        let err = asm.open_bytes(0).unwrap_err();
+
+        assert!(
+            err.to_string().contains("IO error"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hcs_assembly_unreadable_referenced_region_tile_returns_error() {
+        let meta = test_meta(4, 2);
+        let bad = temp_path("bad_region_tile.tif");
+        std::fs::write(&bad, b"not a tiff").unwrap();
+        let plane = PlaneRef {
+            tiles: vec![Tile {
+                filename: bad.clone(),
+                file_index: 0,
+                src_x: 0,
+                src_y: 0,
+                src_w: 2,
+                src_h: 2,
+                dst_x: 1,
+                dst_y: 0,
+            }],
+        };
+        let mut asm = assembly_with_plane(meta, plane);
+
+        let err = asm.open_bytes(0).unwrap_err();
+
+        assert!(
+            err.to_string().contains("TIFF") || err.to_string().contains("Unsupported format"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(bad);
+    }
+
+    #[test]
+    fn hcs_assembly_referenced_region_read_error_is_not_black() {
+        let tile_meta = test_meta(2, 2);
+        let path = temp_path("one_plane_region_tile.tif");
+        write_tiff(&path, &tile_meta, &[1, 2, 3, 4]);
+        let plane = PlaneRef {
+            tiles: vec![Tile {
+                filename: path.clone(),
+                file_index: 1,
+                src_x: 0,
+                src_y: 0,
+                src_w: 2,
+                src_h: 2,
+                dst_x: 0,
+                dst_y: 0,
+            }],
+        };
+        let mut asm = assembly_with_plane(test_meta(2, 2), plane);
+
+        let err = asm.open_bytes(0).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Plane index 1 out of range"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn incell3000_rejects_short_decoded_plane_instead_of_padding() {
+        let path = temp_path("short.frm");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&6i16.to_le_bytes()); // pixels offset
+        bytes.extend_from_slice(&2i16.to_le_bytes()); // size X
+        bytes.extend_from_slice(&33i16.to_le_bytes()); // one plane, one row
+        bytes.extend_from_slice(&0x1234u16.to_le_bytes()); // one of two pixels
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = InCell3000Reader::new();
+        reader.set_id(&path).unwrap();
+        let err = reader.open_bytes(0).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("decoded 2 bytes")),
+            "{err:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -51,14 +51,14 @@ impl FormatReader for BrukerOpusReader {
         }
     }
 
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // OPUS magic: first byte 0x0A, second byte in {0,1,2}
-        header.len() >= 2 && header[0] == 0x0A && header[1] <= 0x02
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.meta = None;
-        self.path = Some(path.to_path_buf());
+        let _ = path;
+        self.path = None;
         Err(BioFormatsError::UnsupportedFormat(
             OPUS_UNSUPPORTED.to_string(),
         ))
@@ -70,30 +70,22 @@ impl FormatReader for BrukerOpusReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        0
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
     fn series(&self) -> usize {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Err(BioFormatsError::UnsupportedFormat(
-            OPUS_UNSUPPORTED.to_string(),
-        ))
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
@@ -154,7 +146,8 @@ impl FormatReader for IssFlimReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.meta = None;
-        self.path = Some(path.to_path_buf());
+        let _ = path;
+        self.path = None;
         Err(BioFormatsError::UnsupportedFormat(
             ISS_UNSUPPORTED.to_string(),
         ))
@@ -166,30 +159,22 @@ impl FormatReader for IssFlimReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        0
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
     fn series(&self) -> usize {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Err(BioFormatsError::UnsupportedFormat(
-            ISS_UNSUPPORTED.to_string(),
-        ))
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {

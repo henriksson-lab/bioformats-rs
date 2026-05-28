@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::tiff::TiffReader;
@@ -51,10 +52,7 @@ struct PFrame {
 
 impl PFrame {
     fn file_for_channel(&self, channel: i32) -> Option<&PFile> {
-        self.files
-            .iter()
-            .find(|f| f.channel == channel)
-            .or_else(|| self.files.first())
+        self.files.iter().find(|f| f.channel == channel)
     }
 }
 
@@ -155,14 +153,12 @@ fn find_prairie_xml(path: &Path) -> Option<PathBuf> {
     }
     // Fall back to the first .xml in the directory.
     std::fs::read_dir(parent).ok().and_then(|rd| {
-        rd.filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("xml"))
-                    .unwrap_or(false)
-            })
+        rd.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("xml"))
+                .unwrap_or(false)
+        })
     })
 }
 
@@ -182,7 +178,10 @@ struct PrairieParse {
 /// metadata.
 fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
     let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-    let dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
 
     let mut width = 0u32;
     let mut height = 0u32;
@@ -241,7 +240,8 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
 
         // Per-axis micronsPerPixel: <IndexedValue index="XAxis" value="0.5"/>.
         if line.contains("micronsPerPixel") || line.contains("IndexedValue") {
-            if let (Some(idx), Some(val)) = (extract_attr(line, "index"), extract_attr(line, "value"))
+            if let (Some(idx), Some(val)) =
+                (extract_attr(line, "index"), extract_attr(line, "value"))
             {
                 if let Ok(v) = val.parse::<f64>() {
                     if v > 0.0 {
@@ -393,9 +393,10 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
                         .map(|s| s == "0")
                         .unwrap_or(true);
                     if is_zero {
-                        if let (Some(axis), Some(val)) =
-                            (cur_axis, extract_attr(line, "value").and_then(|v| v.parse::<f64>().ok()))
-                        {
+                        if let (Some(axis), Some(val)) = (
+                            cur_axis,
+                            extract_attr(line, "value").and_then(|v| v.parse::<f64>().ok()),
+                        ) {
                             if let Some(f) = cur_frame.as_mut() {
                                 match axis {
                                     'x' if f.pos_x.is_none() => f.pos_x = Some(val),
@@ -442,9 +443,12 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
                         .entry(format!("channel_name[{}]", channel))
                         .or_insert(MetadataValue::String(cname));
                 }
+                let Some(filename) = confined_join(&dir, fname) else {
+                    continue;
+                };
                 let pfile = PFile {
                     channel,
-                    filename: dir.join(fname),
+                    filename,
                     page,
                 };
                 if cur_frame.is_none() {
@@ -478,7 +482,9 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
         sequences.push(seq);
     }
 
-    let has_files = sequences.iter().any(|s| s.frames.iter().any(|f| !f.files.is_empty()));
+    let has_files = sequences
+        .iter()
+        .any(|s| s.frames.iter().any(|f| !f.files.is_empty()));
     if !has_files {
         return Err(BioFormatsError::UnsupportedFormat(
             "PrairieView XML does not reference any companion TIFF image files".into(),
@@ -646,15 +652,17 @@ fn positions_match(sequences: &[Sequence], size_t: usize, size_p: usize) -> bool
             let Some(initial_frame) = initial_sequence.frame(index) else {
                 break;
             };
-            let (xi, yi, zi) = (initial_frame.pos_x, initial_frame.pos_y, initial_frame.pos_z);
+            let (xi, yi, zi) = (
+                initial_frame.pos_x,
+                initial_frame.pos_y,
+                initial_frame.pos_z,
+            );
             for t in 1..size_t {
                 let seq = &sequences[size_p * t + p];
                 let Some(frame) = seq.frame(index) else {
                     continue;
                 };
-                if !pos_eq(frame.pos_x, xi)
-                    || !pos_eq(frame.pos_y, yi)
-                    || !pos_eq(frame.pos_z, zi)
+                if !pos_eq(frame.pos_x, xi) || !pos_eq(frame.pos_y, yi) || !pos_eq(frame.pos_z, zi)
                 {
                     return false;
                 }
@@ -689,8 +697,7 @@ impl PrairieReader {
         let sequence = self.sequences.get(seq_idx)?;
 
         // frameIndex(seq, z, t, s) = (framesAreTime ? t : z) + indexMin.
-        let frame_attr_index =
-            (if frames_are_time { t } else { z }) as i32 + sequence.index_min();
+        let frame_attr_index = (if frames_are_time { t } else { z }) as i32 + sequence.index_min();
         let frame = sequence.frame(frame_attr_index)?;
 
         let channel = *self.channels.get(c as usize).unwrap_or(&1);
@@ -770,7 +777,9 @@ impl FormatReader for PrairieReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.metas.get(self.series).expect("set_id not called")
+        self.metas
+            .get(self.series)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -782,15 +791,19 @@ impl FormatReader for PrairieReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let (tiff_path, page) = self.file_for_plane(plane_index).ok_or_else(|| {
-            BioFormatsError::Format(format!(
-                "Prairie: no file for plane {}",
-                plane_index
-            ))
+            BioFormatsError::Format(format!("Prairie: no file for plane {}", plane_index))
         })?;
         let mut tiff = TiffReader::new();
         tiff.set_id(&tiff_path)?;
         let inner = tiff.metadata().image_count.max(1);
-        tiff.open_bytes(page % inner)
+        if page >= inner {
+            return Err(BioFormatsError::Format(format!(
+                "Prairie: TIFF page {page} out of range for {} ({} pages)",
+                tiff_path.display(),
+                inner
+            )));
+        }
+        tiff.open_bytes(page)
     }
 
     fn open_bytes_region(
@@ -950,7 +963,9 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
                 if fname.to_ascii_lowercase().ends_with(".tif")
                     || fname.to_ascii_lowercase().ends_with(".tiff")
                 {
-                    tiff_files.push(dir.join(&fname));
+                    if let Some(path) = confined_join(dir, &fname) {
+                        tiff_files.push(path);
+                    }
                 }
             }
         }
@@ -1086,7 +1101,9 @@ impl FormatReader for LeicaTcsReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1094,10 +1111,21 @@ impl FormatReader for LeicaTcsReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let tiff_path = self.tiff_files[plane_index as usize % self.tiff_files.len()].clone();
+        let file_count = self.tiff_files.len();
+        let file_index = plane_index as usize % file_count;
+        let page = plane_index as usize / file_count;
+        let tiff_path = self.tiff_files[file_index].clone();
         let mut tiff = crate::tiff::TiffReader::new();
         tiff.set_id(&tiff_path)?;
-        tiff.open_bytes(0)
+        let inner = tiff.metadata().image_count.max(1) as usize;
+        if page >= inner {
+            return Err(BioFormatsError::Format(format!(
+                "Leica TCS: TIFF page {page} out of range for {} ({} pages)",
+                tiff_path.display(),
+                inner
+            )));
+        }
+        tiff.open_bytes(page as u32)
     }
 
     fn open_bytes_region(
@@ -1126,6 +1154,22 @@ impl FormatReader for LeicaTcsReader {
 #[cfg(test)]
 mod prairie_tests {
     use super::*;
+    use crate::ImageWriter;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_prairie_{nanos}_{name}"))
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = temp_path(name);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
 
     /// Build a sequence with a single frame at index 0 carrying the given XYZ
     /// stage position.
@@ -1187,5 +1231,65 @@ mod prairie_tests {
             seq_at(2.0, 2.0, 2.0), // p1 t1
         ];
         assert!(!positions_match(&seqs, 2, 2));
+    }
+
+    #[test]
+    fn prairie_missing_channel_does_not_fall_back_to_first_file() {
+        let frame = PFrame {
+            index: 0,
+            files: vec![PFile {
+                channel: 1,
+                filename: PathBuf::from("channel_1.tif"),
+                page: 0,
+            }],
+            pos_x: None,
+            pos_y: None,
+            pos_z: None,
+        };
+
+        assert!(frame.file_for_channel(2).is_none());
+    }
+
+    #[test]
+    fn prairie_companion_tiff_page_uses_exact_index() {
+        let dir = temp_dir("exact_page");
+        let tiff = dir.join("scan_001.tif");
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        };
+        ImageWriter::save(&tiff, &meta, &[vec![9]]).unwrap();
+        let xml = dir.join("scan.xml");
+        std::fs::write(
+            &xml,
+            r#"<PVScan>
+<PVStateValue key="pixelsPerLine" value="1"/>
+<PVStateValue key="linesPerFrame" value="1"/>
+<PVStateValue key="bitDepth" value="8"/>
+<Sequence>
+<Frame index="0">
+<File filename="scan_001.tif" channel="1" page="2"/>
+</Frame>
+</Sequence>
+</PVScan>"#,
+        )
+        .unwrap();
+
+        let mut reader = PrairieReader::new();
+        reader.set_id(&xml).unwrap();
+        let err = reader.open_bytes(0).unwrap_err();
+
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("TIFF page 1 out of range")),
+            "unexpected error: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

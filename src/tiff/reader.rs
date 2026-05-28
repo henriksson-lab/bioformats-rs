@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::read_bytes_at;
-use crate::common::metadata::DimensionOrder;
+use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 
 use super::compression::decompress;
@@ -94,6 +94,7 @@ pub struct TiffReader {
     series: Vec<TiffSeries>,
     current_series: usize,
     current_resolution: usize,
+    current_resolution_metadata: Option<ImageMetadata>,
     /// OME-XML embedded in the first IFD's ImageDescription, if present.
     ome_xml: Option<String>,
 }
@@ -105,6 +106,7 @@ impl TiffReader {
             series: Vec::new(),
             current_series: 0,
             current_resolution: 0,
+            current_resolution_metadata: None,
             ome_xml: None,
         }
     }
@@ -126,6 +128,7 @@ impl TiffReader {
         self.series = series;
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_resolution_metadata = None;
     }
 
     /// Number of parsed IFDs in the open file.
@@ -135,7 +138,10 @@ impl TiffReader {
 
     /// Whether the file was parsed as little-endian.
     pub fn is_little_endian(&self) -> bool {
-        self.file.as_ref().map(|f| f.parser.little_endian).unwrap_or(true)
+        self.file
+            .as_ref()
+            .map(|f| f.parser.little_endian)
+            .unwrap_or(true)
     }
 
     /// Access a raw IFD by index (for extracting vendor-specific tags).
@@ -238,7 +244,11 @@ impl TiffReader {
         let rows_per_strip = if is_tiled {
             0
         } else {
-            ifd.get_u32(tag::ROWS_PER_STRIP).unwrap_or(0)
+            if ifd.get(tag::ROWS_PER_STRIP).is_some() {
+                ifd.get_u32(tag::ROWS_PER_STRIP).unwrap_or(0)
+            } else {
+                height
+            }
         };
 
         let strip_offsets = ifd.get_vec_u64(tag::STRIP_OFFSETS);
@@ -396,7 +406,7 @@ impl TiffReader {
                     image_count,
                     dimension_order: crate::common::metadata::DimensionOrder::XYZTC,
                     is_rgb,
-                    is_interleaved: info.planar_config == 1,
+                    is_interleaved: is_interleaved_rgb(info),
                     is_indexed,
                     is_little_endian: little_endian,
                     resolution_count: 1,
@@ -475,7 +485,7 @@ impl TiffReader {
                         first_info.photometric,
                         Photometric::Rgb | Photometric::YCbCr
                     ),
-                is_interleaved: first_info.planar_config == 1,
+                is_interleaved: is_interleaved_rgb(&first_info),
                 is_indexed: first_info.photometric == Photometric::Palette,
                 is_little_endian: little_endian,
                 resolution_count: 1,
@@ -752,7 +762,7 @@ impl TiffReader {
             image_count: 1,
             dimension_order: crate::common::metadata::DimensionOrder::XYZTC,
             is_rgb,
-            is_interleaved: info.planar_config == 1,
+            is_interleaved: is_interleaved_rgb(info),
             is_indexed,
             is_little_endian: little_endian,
             resolution_count: 1,
@@ -804,6 +814,33 @@ impl TiffReader {
                 .copied()
                 .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
         }
+    }
+
+    fn resolution_metadata(&self, level: usize) -> Result<Option<ImageMetadata>> {
+        if level == 0 {
+            return Ok(None);
+        }
+
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::SeriesOutOfRange(self.current_series))?;
+        let sub_ifds = series.sub_resolutions.get(level - 1).ok_or_else(|| {
+            BioFormatsError::Format(format!("resolution level {level} out of range"))
+        })?;
+        let first_ifd = sub_ifds
+            .first()
+            .and_then(|&idx| file.ifds.get(idx))
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!("resolution level {level} has no planes"))
+            })?;
+
+        let mut meta = series.metadata.clone();
+        meta.size_x = first_ifd.image_width().unwrap_or(meta.size_x);
+        meta.size_y = first_ifd.image_length().unwrap_or(meta.size_y);
+        meta.image_count = sub_ifds.len() as u32;
+        Ok(Some(meta))
     }
 
     /// Read raw bytes for one plane from the file.
@@ -864,11 +901,11 @@ impl TiffReader {
         let subbyte_samples = info.bits_per_sample < 8;
         let ycbcr = info.photometric == Photometric::YCbCr;
         let row_bytes = if ycbcr {
-            ycbcr_row_bytes(info.width, 1, info.ycbcr_subsampling)
+            checked_ycbcr_strip_bytes(info.width, 1, info.ycbcr_subsampling)?
         } else if packed_row_layout {
-            packed_row_bytes(info.width, effective_spp, info.bits_per_sample) as u32
+            checked_packed_row_bytes(info.width, effective_spp, info.bits_per_sample)?
         } else {
-            info.width * effective_spp * bytes_per_sample
+            checked_row_bytes(info.width, effective_spp, bytes_per_sample)?
         };
 
         let rows_per_strip = if info.rows_per_strip == 0 || info.rows_per_strip >= info.height {
@@ -878,20 +915,28 @@ impl TiffReader {
         };
 
         // We assemble the full plane row-by-row, then crop to [x, y, w, h].
-        let mut plane_rows: Vec<u8> = Vec::with_capacity((h * row_bytes) as usize);
+        let requested_rows_bytes = checked_mul_usize(h as usize, row_bytes, "TIFF crop row bytes")?;
+        let mut plane_rows: Vec<u8> =
+            checked_vec_with_capacity(requested_rows_bytes, "TIFF crop rows")?;
         // For subsampled YCbCr, RGB is accumulated per-plane (R then G then B) as
         // strips are decoded, so partial-row reads (a strip overlapping only part of
         // the requested y range) work like Java's per-block unpacking.
         let mut ycbcr_r: Vec<u8> = Vec::new();
         let mut ycbcr_g: Vec<u8> = Vec::new();
         let mut ycbcr_b: Vec<u8> = Vec::new();
+        let y_end = y
+            .checked_add(h)
+            .ok_or_else(|| BioFormatsError::Format("TIFF region y range overflows".into()))?;
 
         for strip_idx in 0..info.strip_offsets.len() {
-            let strip_start_row = strip_idx as u32 * rows_per_strip;
-            let strip_end_row = (strip_start_row + rows_per_strip).min(info.height);
+            let strip_start_row = checked_strip_start_row(strip_idx, rows_per_strip)?;
+            let strip_end_row = strip_start_row
+                .checked_add(rows_per_strip)
+                .unwrap_or(u32::MAX)
+                .min(info.height);
 
             // Skip strips entirely above or below the requested region
-            if strip_end_row <= y || strip_start_row >= y + h {
+            if strip_end_row <= y || strip_start_row >= y_end {
                 continue;
             }
 
@@ -902,9 +947,9 @@ impl TiffReader {
             apply_fill_order(&mut compressed, info.fill_order, info.compression);
             let strip_rows = strip_end_row - strip_start_row;
             let expected = if ycbcr {
-                ycbcr_strip_bytes(info.width, strip_rows, info.ycbcr_subsampling)
+                checked_ycbcr_strip_bytes(info.width, strip_rows, info.ycbcr_subsampling)?
             } else {
-                (strip_rows * row_bytes) as usize
+                checked_mul_usize(strip_rows as usize, row_bytes, "TIFF strip byte count")?
             };
 
             let mut strip_data = decompress(
@@ -920,11 +965,14 @@ impl TiffReader {
                 info.jpeg_tables.as_deref(),
                 info.nikon_compression_options.as_ref(),
             )?;
+            if info.compression != Compression::Nikon {
+                require_decompressed_len("strip", strip_idx, strip_data.len(), expected)?;
+            }
             strip_data.truncate(expected);
 
             // Crop rows within this strip to the requested y range
             let row_start = y.saturating_sub(strip_start_row) as usize;
-            let row_end = (y + h - strip_start_row).min(strip_rows) as usize;
+            let row_end = y_end.saturating_sub(strip_start_row).min(strip_rows) as usize;
 
             if ycbcr {
                 // Decode this strip's subsampled YCbCr to planar RGB covering the
@@ -937,30 +985,68 @@ impl TiffReader {
                     info.ycbcr_subsampling,
                     info.ycbcr_coefficients,
                 )?;
-                let plane_len = (info.width * strip_rows) as usize;
+                let plane_len = checked_mul_usize(
+                    info.width as usize,
+                    strip_rows as usize,
+                    "TIFF YCbCr plane length",
+                )?;
                 let row_w = info.width as usize;
-                let r_plane = &rgb[0..plane_len];
-                let g_plane = &rgb[plane_len..2 * plane_len];
-                let b_plane = &rgb[2 * plane_len..3 * plane_len];
-                ycbcr_r.extend_from_slice(&r_plane[row_start * row_w..row_end * row_w]);
-                ycbcr_g.extend_from_slice(&g_plane[row_start * row_w..row_end * row_w]);
-                ycbcr_b.extend_from_slice(&b_plane[row_start * row_w..row_end * row_w]);
+                let two_plane_len = checked_mul_usize(2, plane_len, "TIFF YCbCr plane length")?;
+                let three_plane_len = checked_mul_usize(3, plane_len, "TIFF YCbCr plane length")?;
+                let r_plane = rgb.get(0..plane_len).ok_or_else(|| {
+                    BioFormatsError::Format("TIFF YCbCr decoded R plane is truncated".into())
+                })?;
+                let g_plane = rgb.get(plane_len..two_plane_len).ok_or_else(|| {
+                    BioFormatsError::Format("TIFF YCbCr decoded G plane is truncated".into())
+                })?;
+                let b_plane = rgb.get(two_plane_len..three_plane_len).ok_or_else(|| {
+                    BioFormatsError::Format("TIFF YCbCr decoded B plane is truncated".into())
+                })?;
+                let rows_start = checked_mul_usize(row_start, row_w, "TIFF YCbCr crop offset")?;
+                let rows_end = checked_mul_usize(row_end, row_w, "TIFF YCbCr crop offset")?;
+                ycbcr_r.extend_from_slice(r_plane.get(rows_start..rows_end).ok_or_else(|| {
+                    BioFormatsError::Format(
+                        "TIFF YCbCr R crop range is outside decoded data".into(),
+                    )
+                })?);
+                ycbcr_g.extend_from_slice(g_plane.get(rows_start..rows_end).ok_or_else(|| {
+                    BioFormatsError::Format(
+                        "TIFF YCbCr G crop range is outside decoded data".into(),
+                    )
+                })?);
+                ycbcr_b.extend_from_slice(b_plane.get(rows_start..rows_end).ok_or_else(|| {
+                    BioFormatsError::Format(
+                        "TIFF YCbCr B crop range is outside decoded data".into(),
+                    )
+                })?);
                 continue;
             }
 
             for row in row_start..row_end {
-                let rs = row * row_bytes as usize;
-                let re = rs + row_bytes as usize;
-                if re <= strip_data.len() {
-                    plane_rows.extend_from_slice(&strip_data[rs..re]);
+                let rs = checked_mul_usize(row, row_bytes, "TIFF strip row offset")?;
+                let re = rs.checked_add(row_bytes).ok_or_else(|| {
+                    BioFormatsError::Format("TIFF strip row range overflows".into())
+                })?;
+                if let Some(row_data) = strip_data.get(rs..re) {
+                    plane_rows.extend_from_slice(row_data);
+                } else if info.compression != Compression::Nikon {
+                    return Err(BioFormatsError::InvalidData(format!(
+                        "TIFF strip {strip_idx} row {row} is outside decoded data"
+                    )));
                 }
             }
         }
 
         if ycbcr {
             if x == 0 && w == info.width {
-                let mut out =
-                    Vec::with_capacity(ycbcr_r.len() + ycbcr_g.len() + ycbcr_b.len());
+                let ycbcr_len = ycbcr_r
+                    .len()
+                    .checked_add(ycbcr_g.len())
+                    .and_then(|v| v.checked_add(ycbcr_b.len()))
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("TIFF YCbCr output length overflows".into())
+                    })?;
+                let mut out = checked_vec_with_capacity(ycbcr_len, "TIFF YCbCr output")?;
                 out.extend_from_slice(&ycbcr_r);
                 out.extend_from_slice(&ycbcr_g);
                 out.extend_from_slice(&ycbcr_b);
@@ -970,7 +1056,14 @@ impl TiffReader {
             let r = crop_unpacked_rows(&ycbcr_r, info.width, 1, x, w, h);
             let g = crop_unpacked_rows(&ycbcr_g, info.width, 1, x, w, h);
             let b = crop_unpacked_rows(&ycbcr_b, info.width, 1, x, w, h);
-            let mut out = Vec::with_capacity(r.len() + g.len() + b.len());
+            let ycbcr_len = r
+                .len()
+                .checked_add(g.len())
+                .and_then(|v| v.checked_add(b.len()))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("TIFF YCbCr output length overflows".into())
+                })?;
+            let mut out = checked_vec_with_capacity(ycbcr_len, "TIFF YCbCr output")?;
             out.extend_from_slice(&r);
             out.extend_from_slice(&g);
             out.extend_from_slice(&b);
@@ -1008,8 +1101,14 @@ impl TiffReader {
                 info.bits_per_sample,
                 file.parser.little_endian,
             );
-            let mut out =
-                crop_unpacked_rows(&unpacked, info.width, effective_spp * bytes_per_sample, x, w, h);
+            let mut out = crop_unpacked_rows(
+                &unpacked,
+                info.width,
+                effective_spp * bytes_per_sample,
+                x,
+                w,
+                h,
+            );
             apply_photometric(
                 &mut out,
                 info.photometric,
@@ -1031,13 +1130,25 @@ impl TiffReader {
             return Ok(plane_rows);
         }
 
-        let x_start = (x * effective_spp * bytes_per_sample) as usize;
-        let x_len = (w * effective_spp * bytes_per_sample) as usize;
-        let full_row = row_bytes as usize;
-        let mut out = Vec::with_capacity(h as usize * x_len);
+        let x_start = checked_row_bytes(x, effective_spp, bytes_per_sample)?;
+        let x_len = checked_row_bytes(w, effective_spp, bytes_per_sample)?;
+        let full_row = row_bytes;
+        let out_len = checked_mul_usize(h as usize, x_len, "TIFF cropped output length")?;
+        let mut out = checked_vec_with_capacity(out_len, "TIFF cropped output")?;
         for row in 0..h as usize {
-            let src = &plane_rows[row * full_row..];
-            out.extend_from_slice(&src[x_start..x_start + x_len]);
+            let row_start = checked_mul_usize(row, full_row, "TIFF plane row offset")?;
+            let row_end = row_start
+                .checked_add(full_row)
+                .ok_or_else(|| BioFormatsError::Format("TIFF plane row range overflows".into()))?;
+            let src = plane_rows.get(row_start..row_end).ok_or_else(|| {
+                BioFormatsError::InvalidData(format!("TIFF decoded plane row {row} is missing"))
+            })?;
+            let x_end = x_start
+                .checked_add(x_len)
+                .ok_or_else(|| BioFormatsError::Format("TIFF crop x range overflows".into()))?;
+            out.extend_from_slice(src.get(x_start..x_end).ok_or_else(|| {
+                BioFormatsError::Format("TIFF crop range is outside decoded row".into())
+            })?);
         }
         Ok(out)
     }
@@ -1057,30 +1168,50 @@ impl TiffReader {
         // (one sample per pixel) padded to a byte boundary, matching Java's per-row
         // skipBits handling in TiffParser.unpackBytes.
         let channel_row_bytes = if subbyte {
-            packed_row_bytes(info.width, 1, info.bits_per_sample) as u32
+            checked_packed_row_bytes(info.width, 1, info.bits_per_sample)?
         } else {
-            info.width * bytes_per_sample
+            checked_row_bytes(info.width, 1, bytes_per_sample)?
         };
         let rows_per_strip = if info.rows_per_strip == 0 || info.rows_per_strip >= info.height {
             info.height
         } else {
             info.rows_per_strip
         };
-        let strips_per_channel = (info.height + rows_per_strip - 1) / rows_per_strip;
-        let x_start = (x * bytes_per_sample) as usize;
-        let x_len = (w * bytes_per_sample) as usize;
-        let mut out = Vec::with_capacity(h as usize * x_len * info.samples_per_pixel as usize);
+        let strips_per_channel = div_ceil_u32(info.height, rows_per_strip);
+        let x_start = checked_row_bytes(x, 1, bytes_per_sample)?;
+        let x_len = checked_row_bytes(w, 1, bytes_per_sample)?;
+        let out_len =
+            checked_mul_usize(h as usize, x_len, "TIFF cropped output length").and_then(|v| {
+                checked_mul_usize(
+                    v,
+                    info.samples_per_pixel as usize,
+                    "TIFF cropped output length",
+                )
+            })?;
+        let mut out = checked_vec_with_capacity(out_len, "TIFF cropped output")?;
+        let y_end = y
+            .checked_add(h)
+            .ok_or_else(|| BioFormatsError::Format("TIFF region y range overflows".into()))?;
 
         for channel in 0..info.samples_per_pixel as usize {
-            let mut channel_rows = Vec::with_capacity((h * channel_row_bytes) as usize);
+            let channel_capacity =
+                checked_mul_usize(h as usize, channel_row_bytes, "TIFF channel row bytes")?;
+            let mut channel_rows =
+                checked_vec_with_capacity(channel_capacity, "TIFF channel rows")?;
             for strip in 0..strips_per_channel as usize {
-                let strip_start_row = strip as u32 * rows_per_strip;
-                let strip_end_row = (strip_start_row + rows_per_strip).min(info.height);
-                if strip_end_row <= y || strip_start_row >= y + h {
+                let strip_start_row = checked_strip_start_row(strip, rows_per_strip)?;
+                let strip_end_row = strip_start_row
+                    .checked_add(rows_per_strip)
+                    .unwrap_or(u32::MAX)
+                    .min(info.height);
+                if strip_end_row <= y || strip_start_row >= y_end {
                     continue;
                 }
 
-                let strip_idx = channel * strips_per_channel as usize + strip;
+                let strip_idx = channel
+                    .checked_mul(strips_per_channel as usize)
+                    .and_then(|v| v.checked_add(strip))
+                    .ok_or_else(|| BioFormatsError::Format("TIFF strip index overflows".into()))?;
                 if strip_idx >= info.strip_offsets.len()
                     || strip_idx >= info.strip_byte_counts.len()
                 {
@@ -1091,7 +1222,11 @@ impl TiffReader {
                 let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
                 apply_fill_order(&mut compressed, info.fill_order, info.compression);
                 let strip_rows = strip_end_row - strip_start_row;
-                let expected = (strip_rows * channel_row_bytes) as usize;
+                let expected = checked_mul_usize(
+                    strip_rows as usize,
+                    channel_row_bytes,
+                    "TIFF strip byte count",
+                )?;
                 let mut strip_data = decompress(
                     &compressed,
                     info.compression,
@@ -1105,15 +1240,24 @@ impl TiffReader {
                     info.jpeg_tables.as_deref(),
                     info.nikon_compression_options.as_ref(),
                 )?;
+                if info.compression != Compression::Nikon {
+                    require_decompressed_len("strip", strip_idx, strip_data.len(), expected)?;
+                }
                 strip_data.truncate(expected);
 
                 let row_start = y.saturating_sub(strip_start_row) as usize;
-                let row_end = (y + h - strip_start_row).min(strip_rows) as usize;
+                let row_end = y_end.saturating_sub(strip_start_row).min(strip_rows) as usize;
                 for row in row_start..row_end {
-                    let rs = row * channel_row_bytes as usize;
-                    let re = rs + channel_row_bytes as usize;
-                    if re <= strip_data.len() {
-                        channel_rows.extend_from_slice(&strip_data[rs..re]);
+                    let rs = checked_mul_usize(row, channel_row_bytes, "TIFF strip row offset")?;
+                    let re = rs.checked_add(channel_row_bytes).ok_or_else(|| {
+                        BioFormatsError::Format("TIFF strip row range overflows".into())
+                    })?;
+                    if let Some(row_data) = strip_data.get(rs..re) {
+                        channel_rows.extend_from_slice(row_data);
+                    } else if info.compression != Compression::Nikon {
+                        return Err(BioFormatsError::InvalidData(format!(
+                            "TIFF strip {strip_idx} row {row} is outside decoded data"
+                        )));
                     }
                 }
             }
@@ -1145,10 +1289,23 @@ impl TiffReader {
             if x == 0 && w == info.width {
                 out.extend_from_slice(&channel_rows);
             } else {
-                let full_row = channel_row_bytes as usize;
+                let full_row = channel_row_bytes;
+                let x_end = x_start
+                    .checked_add(x_len)
+                    .ok_or_else(|| BioFormatsError::Format("TIFF crop x range overflows".into()))?;
                 for row in 0..h as usize {
-                    let src = &channel_rows[row * full_row..];
-                    out.extend_from_slice(&src[x_start..x_start + x_len]);
+                    let row_start = checked_mul_usize(row, full_row, "TIFF channel row offset")?;
+                    let row_end = row_start.checked_add(full_row).ok_or_else(|| {
+                        BioFormatsError::Format("TIFF channel row range overflows".into())
+                    })?;
+                    let src = channel_rows.get(row_start..row_end).ok_or_else(|| {
+                        BioFormatsError::InvalidData(format!(
+                            "TIFF decoded channel {channel} row {row} is missing"
+                        ))
+                    })?;
+                    out.extend_from_slice(src.get(x_start..x_end).ok_or_else(|| {
+                        BioFormatsError::Format("TIFF crop range is outside decoded row".into())
+                    })?);
                 }
             }
         }
@@ -1181,7 +1338,15 @@ impl TiffReader {
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
         let effective_spp = info.samples_per_pixel as u32;
-        let tile_row_bytes = (info.tile_width * effective_spp * bytes_per_sample) as usize;
+        let subbyte = info.bits_per_sample < 8;
+        let packed_tile_row_bytes =
+            packed_row_bytes(info.tile_width, effective_spp, info.bits_per_sample);
+        let unpacked_tile_row_bytes = (info.tile_width * effective_spp * bytes_per_sample) as usize;
+        let tile_row_bytes = if subbyte {
+            packed_tile_row_bytes
+        } else {
+            unpacked_tile_row_bytes
+        };
         let tile_data_bytes = tile_row_bytes * info.tile_height as usize;
         let tiles_across = (info.width + info.tile_width - 1) / info.tile_width;
 
@@ -1216,7 +1381,17 @@ impl TiffReader {
                     info.jpeg_tables.as_deref(),
                     info.nikon_compression_options.as_ref(),
                 )?;
-                tile_data.resize(tile_data_bytes, 0);
+                require_decompressed_len("tile", tile_idx, tile_data.len(), tile_data_bytes)?;
+                tile_data.truncate(tile_data_bytes);
+                if subbyte {
+                    tile_data = unpack_subbyte_samples(
+                        &tile_data,
+                        info.tile_width,
+                        info.tile_height,
+                        effective_spp,
+                        info.bits_per_sample,
+                    );
+                }
                 apply_photometric(
                     &mut tile_data,
                     info.photometric,
@@ -1236,9 +1411,14 @@ impl TiffReader {
                 let copy_w = ((info.tile_width - src_x as u32).min(w - dst_x as u32)) as usize;
                 let copy_h = ((info.tile_height - src_y as u32).min(h - dst_y as u32)) as usize;
                 let copy_bytes = copy_w * effective_spp as usize * bytes_per_sample as usize;
+                let src_row_bytes = if subbyte {
+                    unpacked_tile_row_bytes
+                } else {
+                    tile_row_bytes
+                };
 
                 for row in 0..copy_h {
-                    let src_off = ((src_y + row) * tile_row_bytes)
+                    let src_off = ((src_y + row) * src_row_bytes)
                         + src_x * effective_spp as usize * bytes_per_sample as usize;
                     let dst_off = ((dst_y + row) * out_row_bytes)
                         + dst_x * effective_spp as usize * bytes_per_sample as usize;
@@ -1305,7 +1485,8 @@ impl TiffReader {
                     info.jpeg_tables.as_deref(),
                     info.nikon_compression_options.as_ref(),
                 )?;
-                tile_data.resize(tile_data_bytes, 0);
+                require_decompressed_len("tile", tile_idx, tile_data.len(), tile_data_bytes)?;
+                tile_data.truncate(tile_data_bytes);
 
                 // Decode the tile's YCbCr blocks to planar RGB at tile resolution.
                 let rgb = decode_ycbcr_chunky(
@@ -1396,7 +1577,8 @@ impl TiffReader {
                     }
                     let offset = info.tile_offsets[tile_idx];
                     let byte_count = info.tile_byte_counts[tile_idx] as usize;
-                    let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+                    let mut compressed =
+                        read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
                     apply_fill_order(&mut compressed, info.fill_order, info.compression);
                     let mut tile_data = decompress(
                         &compressed,
@@ -1411,7 +1593,8 @@ impl TiffReader {
                         info.jpeg_tables.as_deref(),
                         info.nikon_compression_options.as_ref(),
                     )?;
-                    tile_data.resize(tile_data_bytes, 0);
+                    require_decompressed_len("tile", tile_idx, tile_data.len(), tile_data_bytes)?;
+                    tile_data.truncate(tile_data_bytes);
                     if subbyte {
                         // Unpack the packed bits of this tile to one byte per sample.
                         tile_data = unpack_subbyte_samples(
@@ -1460,6 +1643,10 @@ impl TiffReader {
     }
 }
 
+fn is_interleaved_rgb(info: &IfdInfo) -> bool {
+    info.planar_config == 1 && info.photometric != Photometric::YCbCr
+}
+
 fn pixel_type_from_bps_format(
     bps: u16,
     sample_format: u16,
@@ -1500,6 +1687,20 @@ fn validate_region(info: &IfdInfo, x: u32, y: u32, w: u32, h: u32) -> Result<()>
         )));
     }
 
+    Ok(())
+}
+
+fn require_decompressed_len(
+    block_kind: &str,
+    block_index: usize,
+    actual: usize,
+    expected: usize,
+) -> Result<()> {
+    if actual < expected {
+        return Err(BioFormatsError::InvalidData(format!(
+            "TIFF {block_kind} {block_index} decompressed to {actual} bytes, expected {expected}"
+        )));
+    }
     Ok(())
 }
 
@@ -1726,12 +1927,38 @@ fn build_ome_plane_map(image: &OmeTiffImage, physical_ifd_count: usize) -> Vec<O
         return map;
     }
 
+    let mut z_one_indexed: Option<bool> = None;
+    let mut c_one_indexed: Option<bool> = None;
+    let mut t_one_indexed: Option<bool> = None;
+    for td in &image.tiff_data {
+        if td.first_c >= image.effective_c && c_one_indexed.is_none() {
+            c_one_indexed = Some(true);
+        } else if td.first_c == 0 {
+            c_one_indexed = Some(false);
+        }
+        if td.first_z >= image.size_z && z_one_indexed.is_none() {
+            z_one_indexed = Some(true);
+        } else if td.first_z == 0 {
+            z_one_indexed = Some(false);
+        }
+        if td.first_t >= image.size_t && t_one_indexed.is_none() {
+            t_one_indexed = Some(true);
+        } else if td.first_t == 0 {
+            t_one_indexed = Some(false);
+        }
+        if td.first_z == 0 && td.first_c == 0 && td.first_t == 0 {
+            break;
+        }
+    }
+
     let mut explicit_starts = vec![false; plane_count];
     for td in &image.tiff_data {
+        let (first_z, first_c, first_t) =
+            normalize_ome_tiff_coordinates(td, z_one_indexed, c_one_indexed, t_one_indexed);
         if let Some(logical) = ome_plane_index(
-            td.first_z,
-            td.first_c,
-            td.first_t,
+            first_z,
+            first_c,
+            first_t,
             image.size_z,
             image.effective_c,
             image.size_t,
@@ -1745,10 +1972,12 @@ fn build_ome_plane_map(image: &OmeTiffImage, physical_ifd_count: usize) -> Vec<O
     }
 
     for td in &image.tiff_data {
+        let (first_z, first_c, first_t) =
+            normalize_ome_tiff_coordinates(td, z_one_indexed, c_one_indexed, t_one_indexed);
         let Some(start_logical) = ome_plane_index(
-            td.first_z,
-            td.first_c,
-            td.first_t,
+            first_z,
+            first_c,
+            first_t,
             image.size_z,
             image.effective_c,
             image.size_t,
@@ -1759,9 +1988,9 @@ fn build_ome_plane_map(image: &OmeTiffImage, physical_ifd_count: usize) -> Vec<O
         let limit = td
             .plane_count
             .unwrap_or_else(|| plane_count.saturating_sub(start_logical));
-        let mut z = td.first_z;
-        let mut c = td.first_c;
-        let mut t = td.first_t;
+        let mut z = first_z;
+        let mut c = first_c;
+        let mut t = first_t;
         for offset in 0..limit {
             if offset > 0 && !advance_ome_plane(&mut z, &mut c, &mut t, image) {
                 break;
@@ -1789,6 +2018,27 @@ fn build_ome_plane_map(image: &OmeTiffImage, physical_ifd_count: usize) -> Vec<O
     }
 
     map
+}
+
+fn normalize_ome_tiff_coordinates(
+    td: &OmeTiffData,
+    z_one_indexed: Option<bool>,
+    c_one_indexed: Option<bool>,
+    t_one_indexed: Option<bool>,
+) -> (u32, u32, u32) {
+    let mut z = td.first_z;
+    let mut c = td.first_c;
+    let mut t = td.first_t;
+    if z_one_indexed == Some(true) && z > 0 {
+        z -= 1;
+    }
+    if c_one_indexed == Some(true) && c > 0 {
+        c -= 1;
+    }
+    if t_one_indexed == Some(true) && t > 0 {
+        t -= 1;
+    }
+    (z, c, t)
 }
 
 fn xml_attr(tag_text: &str, attr: &str) -> Option<String> {
@@ -2061,6 +2311,57 @@ fn packed_row_bytes(width: u32, samples_per_pixel: u32, bits_per_sample: u16) ->
     (width as usize * samples_per_pixel as usize * bits_per_sample as usize + 7) / 8
 }
 
+fn checked_mul_usize(a: usize, b: usize, context: &str) -> Result<usize> {
+    a.checked_mul(b)
+        .ok_or_else(|| BioFormatsError::Format(format!("{context} overflows usize")))
+}
+
+fn checked_vec_with_capacity<T>(capacity: usize, context: &str) -> Result<Vec<T>> {
+    const MAX_TIFF_BUFFER_BYTES: usize = 1 << 31;
+    if capacity > MAX_TIFF_BUFFER_BYTES {
+        return Err(BioFormatsError::Format(format!(
+            "{context} is too large to allocate"
+        )));
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| BioFormatsError::Format(format!("{context} allocation failed")))?;
+    Ok(out)
+}
+
+fn checked_row_bytes(width: u32, samples_per_pixel: u32, bytes_per_sample: u32) -> Result<usize> {
+    checked_mul_usize(
+        width as usize,
+        samples_per_pixel as usize,
+        "TIFF row samples",
+    )
+    .and_then(|v| checked_mul_usize(v, bytes_per_sample as usize, "TIFF row bytes"))
+}
+
+fn checked_packed_row_bytes(
+    width: u32,
+    samples_per_pixel: u32,
+    bits_per_sample: u16,
+) -> Result<usize> {
+    let bits = checked_mul_usize(
+        width as usize,
+        samples_per_pixel as usize,
+        "TIFF row samples",
+    )
+    .and_then(|v| checked_mul_usize(v, bits_per_sample as usize, "TIFF packed row bits"))?;
+    bits.checked_add(7)
+        .map(|v| v / 8)
+        .ok_or_else(|| BioFormatsError::Format("TIFF packed row bytes overflow".into()))
+}
+
+fn checked_strip_start_row(strip_idx: usize, rows_per_strip: u32) -> Result<u32> {
+    let row = (strip_idx as u64)
+        .checked_mul(rows_per_strip as u64)
+        .ok_or_else(|| BioFormatsError::Format("TIFF strip row offset overflows".into()))?;
+    u32::try_from(row)
+        .map_err(|_| BioFormatsError::Format("TIFF strip row offset overflows u32".into()))
+}
+
 fn unpack_subbyte_samples(
     data: &[u8],
     width: u32,
@@ -2210,16 +2511,35 @@ fn is_unsupported_ycbcr(info: &IfdInfo) -> bool {
         )
 }
 
-fn ycbcr_row_bytes(width: u32, rows: u32, subsampling: (u16, u16)) -> u32 {
-    ycbcr_strip_bytes(width, rows, subsampling) as u32
-}
-
 fn ycbcr_strip_bytes(width: u32, rows: u32, subsampling: (u16, u16)) -> usize {
     let h = subsampling.0.max(1) as u32;
     let v = subsampling.1.max(1) as u32;
     let blocks_x = (width + h - 1) / h;
     let blocks_y = (rows + v - 1) / v;
     (blocks_x * blocks_y * (h * v + 2)) as usize
+}
+
+fn checked_ycbcr_strip_bytes(width: u32, rows: u32, subsampling: (u16, u16)) -> Result<usize> {
+    let h = subsampling.0.max(1) as u64;
+    let v = subsampling.1.max(1) as u64;
+    let blocks_x = (width as u64)
+        .checked_add(h - 1)
+        .ok_or_else(|| BioFormatsError::Format("TIFF YCbCr block width overflows".into()))?
+        / h;
+    let blocks_y = (rows as u64)
+        .checked_add(v - 1)
+        .ok_or_else(|| BioFormatsError::Format("TIFF YCbCr block height overflows".into()))?
+        / v;
+    let samples_per_block = h
+        .checked_mul(v)
+        .and_then(|value| value.checked_add(2))
+        .ok_or_else(|| BioFormatsError::Format("TIFF YCbCr block size overflows".into()))?;
+    let bytes = blocks_x
+        .checked_mul(blocks_y)
+        .and_then(|value| value.checked_mul(samples_per_block))
+        .ok_or_else(|| BioFormatsError::Format("TIFF YCbCr strip bytes overflow".into()))?;
+    usize::try_from(bytes)
+        .map_err(|_| BioFormatsError::Format("TIFF YCbCr strip bytes overflow usize".into()))
 }
 
 fn decode_ycbcr_chunky(
@@ -2231,9 +2551,10 @@ fn decode_ycbcr_chunky(
 ) -> Result<Vec<u8>> {
     let hsub = subsampling.0.max(1) as u32;
     let vsub = subsampling.1.max(1) as u32;
-    let mut r = vec![0u8; (width * height) as usize];
-    let mut g = vec![0u8; (width * height) as usize];
-    let mut b = vec![0u8; (width * height) as usize];
+    let plane_len = checked_mul_usize(width as usize, height as usize, "TIFF YCbCr plane length")?;
+    let mut r = vec![0u8; plane_len];
+    let mut g = vec![0u8; plane_len];
+    let mut b = vec![0u8; plane_len];
     let mut offset = 0usize;
 
     for block_y in (0..height).step_by(vsub as usize) {
@@ -2343,12 +2664,7 @@ impl crate::common::reader::FormatReader for TiffReader {
             .map(|e| e.to_ascii_lowercase());
         matches!(
             ext.as_deref(),
-            Some("tif")
-                | Some("tiff")
-                | Some("ome.tif")
-                | Some("ome.tiff")
-                | Some("btf")
-                | Some("tf8")
+            Some("tif") | Some("tiff") | Some("btf") | Some("tf8")
         )
     }
 
@@ -2403,6 +2719,7 @@ impl crate::common::reader::FormatReader for TiffReader {
         self.file = Some(tf);
         self.current_series = 0;
         self.current_resolution = 0;
+        self.current_resolution_metadata = None;
         // Parse SubIFD chains for pyramid support
         self.parse_sub_ifds()?;
         self.add_nikon_raw_sub_ifd_series()?;
@@ -2412,6 +2729,7 @@ impl crate::common::reader::FormatReader for TiffReader {
     fn close(&mut self) -> Result<()> {
         self.file = None;
         self.series.clear();
+        self.current_resolution_metadata = None;
         self.ome_xml = None;
         Ok(())
     }
@@ -2425,6 +2743,8 @@ impl crate::common::reader::FormatReader for TiffReader {
             return Err(BioFormatsError::SeriesOutOfRange(series));
         }
         self.current_series = series;
+        self.current_resolution = 0;
+        self.current_resolution_metadata = None;
         Ok(())
     }
 
@@ -2433,7 +2753,13 @@ impl crate::common::reader::FormatReader for TiffReader {
     }
 
     fn metadata(&self) -> &crate::common::metadata::ImageMetadata {
-        &self.series[self.current_series].metadata
+        if let Some(meta) = &self.current_resolution_metadata {
+            return meta;
+        }
+        self.series
+            .get(self.current_series)
+            .map(|series| &series.metadata)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -2487,6 +2813,7 @@ impl crate::common::reader::FormatReader for TiffReader {
             )));
         }
         self.current_resolution = level;
+        self.current_resolution_metadata = self.resolution_metadata(level)?;
         Ok(())
     }
 
@@ -2564,6 +2891,39 @@ mod tests {
         let mut maker_note = b"Nikon\0\x02\0\0\0".to_vec();
         maker_note.extend_from_slice(&nested);
         maker_note
+    }
+
+    #[test]
+    fn ome_tiff_plane_map_accepts_one_indexed_tiffdata_coordinates() {
+        let image = OmeTiffImage {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 2,
+            effective_c: 2,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            dimension_order: DimensionOrder::XYZCT,
+            tiff_data: vec![
+                OmeTiffData {
+                    ifd: 0,
+                    plane_count: Some(1),
+                    first_z: 1,
+                    first_c: 1,
+                    first_t: 1,
+                },
+                OmeTiffData {
+                    ifd: 1,
+                    plane_count: Some(1),
+                    first_z: 1,
+                    first_c: 2,
+                    first_t: 1,
+                },
+            ],
+        };
+
+        assert_eq!(build_ome_plane_map(&image, 2), vec![Some(0), Some(1)]);
     }
 
     fn synthetic_nikon_compressed_tiff() -> Vec<u8> {
@@ -2680,6 +3040,53 @@ mod tests {
         data
     }
 
+    fn synthetic_huge_chunky_stripped_tiff() -> Vec<u8> {
+        let main_ifd_offset = 8u32;
+        let entry_count = 9u16;
+        let ifd_bytes = 2 + entry_count as u32 * 12 + 4;
+        let pixel_offset = main_ifd_offset + ifd_bytes;
+        let pixels = [1u8, 2, 3, 4];
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, main_ifd_offset);
+
+        push_u16_le(&mut data, entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, u32::MAX);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 1);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, tag::COMPRESSION, 1);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 2);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, pixel_offset);
+        push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 4);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 1);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+        push_u32_le(&mut data, 0);
+        data.extend_from_slice(&pixels);
+        data
+    }
+
+    #[test]
+    fn stripped_reader_rejects_huge_row_without_wrapping_or_allocating() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-huge-stripped-row-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_huge_chunky_stripped_tiff()).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let err = reader.open_bytes_region(0, 0, 0, 1, 1).unwrap_err();
+
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("too large") || message.contains("overflows")),
+            "unexpected error: {err:?}"
+        );
+    }
+
     #[test]
     fn nikon_34713_reader_routes_parsed_maker_note_options_to_decoder() {
         let path = std::env::temp_dir().join(format!(
@@ -2752,13 +3159,13 @@ mod tests {
         buf.extend_from_slice(b"II");
         push_u16_le(&mut buf, 42);
         push_u32_le(&mut buf, 8); // first IFD at offset 8
-        // IFD at offset 8: one entry, rational[3] stored out-of-line.
+                                  // IFD at offset 8: one entry, rational[3] stored out-of-line.
         push_u16_le(&mut buf, 1); // entry count
-        // Entry table is 2 + 12 + 4 = 18 bytes -> rational data starts at 8+18=26.
+                                  // Entry table is 2 + 12 + 4 = 18 bytes -> rational data starts at 8+18=26.
         let rational_offset = 26u32;
         push_ifd_rational(&mut buf, WB, 3, rational_offset);
         push_u32_le(&mut buf, 0); // next IFD
-        // Rational data (3 x (num, den)).
+                                  // Rational data (3 x (num, den)).
         for (n, d) in [r, g, b] {
             push_u32_le(&mut buf, n);
             push_u32_le(&mut buf, d);
@@ -2817,7 +3224,11 @@ mod tests {
         push_ifd_long(&mut data, tag::STRIP_OFFSETS, strip_offset);
         push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 2);
         push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
-        push_ifd_long(&mut data, super::super::nikon::EXIF_IFD_TAG, exif_ifd_offset);
+        push_ifd_long(
+            &mut data,
+            super::super::nikon::EXIF_IFD_TAG,
+            exif_ifd_offset,
+        );
         push_u32_le(&mut data, 0);
 
         // EXIF IFD: just the MAKER_NOTE (undefined).
@@ -2833,10 +3244,8 @@ mod tests {
         data.extend_from_slice(&maker_note);
         data.extend_from_slice(&pixels);
 
-        let path = std::env::temp_dir().join(format!(
-            "bioformats-rs-dng-wb-{}.tif",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("bioformats-rs-dng-wb-{}.tif", std::process::id()));
         fs::write(&path, &data).unwrap();
 
         let mut reader = TiffReader::new();

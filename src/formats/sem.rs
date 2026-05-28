@@ -141,16 +141,16 @@ macro_rules! placeholder_reader {
                 Ok(())
             }
 
-            fn series_count(&self) -> usize { 1 }
+            fn series_count(&self) -> usize { 0 }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+                Err(BioFormatsError::SeriesOutOfRange(s))
             }
 
             fn series(&self) -> usize { 0 }
 
             fn metadata(&self) -> &ImageMetadata {
-                self.meta.as_ref().expect("set_id not called")
+                self.meta.as_ref().unwrap_or(crate::common::reader::uninitialized_metadata())
             }
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -396,15 +396,11 @@ impl FormatReader for InrReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -412,7 +408,9 @@ impl FormatReader for InrReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -623,15 +621,11 @@ impl FormatReader for FeiPhilipsReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -639,7 +633,9 @@ impl FormatReader for FeiPhilipsReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -874,7 +870,9 @@ impl FormatReader for VeecoReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1021,15 +1019,11 @@ impl FormatReader for JeolReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -1037,7 +1031,9 @@ impl FormatReader for JeolReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1279,7 +1275,9 @@ impl FormatReader for HitachiReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1455,7 +1453,9 @@ impl FormatReader for LeoReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1541,15 +1541,11 @@ impl FormatReader for ZeissLmsReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -1557,7 +1553,9 @@ impl FormatReader for ZeissLmsReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

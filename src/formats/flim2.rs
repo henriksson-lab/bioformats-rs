@@ -12,6 +12,7 @@ use crate::common::io::read_bytes_at;
 use crate::common::metadata::ImageMetadata;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 use crate::tiff::ifd::{tag, Ifd};
 use crate::tiff::parser::TiffParser;
 
@@ -64,16 +65,16 @@ macro_rules! placeholder_reader {
                 Ok(())
             }
 
-            fn series_count(&self) -> usize { 1 }
+            fn series_count(&self) -> usize { 0 }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+                Err(BioFormatsError::SeriesOutOfRange(s))
             }
 
             fn series(&self) -> usize { 0 }
 
             fn metadata(&self) -> &ImageMetadata {
-                self.meta.as_ref().expect("set_id not called")
+                self.meta.as_ref().unwrap_or(crate::common::reader::uninitialized_metadata())
             }
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -142,16 +143,16 @@ macro_rules! placeholder_reader_u16_small {
                 Ok(())
             }
 
-            fn series_count(&self) -> usize { 1 }
+            fn series_count(&self) -> usize { 0 }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                if s != 0 { Err(BioFormatsError::SeriesOutOfRange(s)) } else { Ok(()) }
+                Err(BioFormatsError::SeriesOutOfRange(s))
             }
 
             fn series(&self) -> usize { 0 }
 
             fn metadata(&self) -> &ImageMetadata {
-                self.meta.as_ref().expect("set_id not called")
+                self.meta.as_ref().unwrap_or(crate::common::reader::uninitialized_metadata())
             }
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -850,7 +851,9 @@ impl FormatReader for NdpisReader {
             let mut r = crate::tiff::TiffReader::new();
             r.set_id(file)?;
             // Channel name from NDPI tag 65434 on the first IFD.
-            let name = r.ifd(0).and_then(|ifd| ifd.get_str(NDPI_TAG_CHANNEL).map(str::to_owned));
+            let name = r
+                .ifd(0)
+                .and_then(|ifd| ifd.get_str(NDPI_TAG_CHANNEL).map(str::to_owned));
             channel_names.push(name);
             readers.push(r);
         }
@@ -1016,7 +1019,9 @@ impl FormatReader for IvisionReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
@@ -1277,10 +1282,10 @@ impl ImarisTiffReader {
 
     fn enrich_metadata(&mut self) {
         use crate::common::metadata::MetadataValue;
-        let comment = self
-            .inner
-            .ifd(0)
-            .and_then(|ifd| ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION).map(str::to_owned));
+        let comment = self.inner.ifd(0).and_then(|ifd| {
+            ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION)
+                .map(str::to_owned)
+        });
         let Some(comment) = comment else { return };
         if !comment.starts_with('[') {
             return;
@@ -1486,8 +1491,8 @@ impl FormatReader for XlefReader {
 // ---------------------------------------------------------------------------
 /// Olympus OIR format reader (`.oir`).
 ///
-/// Olympus OIR format requires OLE2 container parsing with proprietary
-/// internal structure specific to Olympus FluoView software.
+/// Olympus OIR uses an OLE2 container; the remaining missing piece is the
+/// proprietary Olympus FluoView stream schema.
 pub struct OirReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -1523,7 +1528,7 @@ impl FormatReader for OirReader {
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Olympus OIR format requires OLE2 container parsing with proprietary Olympus FluoView structure".to_string()
+            "Olympus OIR format requires proprietary Olympus FluoView stream parsing".to_string(),
         ))
     }
 
@@ -1534,15 +1539,11 @@ impl FormatReader for OirReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -1550,32 +1551,28 @@ impl FormatReader for OirReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Olympus OIR format requires OLE2 container parsing".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
+        plane_index: u32,
         _x: u32,
         _y: u32,
         _w: u32,
         _h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Olympus OIR format requires OLE2 container parsing".to_string(),
-        ))
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Olympus OIR format requires OLE2 container parsing".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 }
 
@@ -1947,9 +1944,22 @@ impl EtsVolume {
         // available (CellSensReader.java:1463-1464: ms.sizeX = pyramid.width),
         // else the tile-grid extent.
         let mut levels = Vec::with_capacity(max_resolution);
-        let cols0 = if max_x[0] >= 1 { (max_x[0] + 1) as u32 } else { 1 };
-        let rows0 = if max_y[0] >= 1 { (max_y[0] + 1) as u32 } else { 1 };
-        let base_c = self.size_c * if max_c[0] > 0 { (max_c[0] + 1) as u32 } else { 1 };
+        let cols0 = if max_x[0] >= 1 {
+            (max_x[0] + 1) as u32
+        } else {
+            1
+        };
+        let rows0 = if max_y[0] >= 1 {
+            (max_y[0] + 1) as u32
+        } else {
+            1
+        };
+        let base_c = self.size_c
+            * if max_c[0] > 0 {
+                (max_c[0] + 1) as u32
+            } else {
+                1
+            };
         let size_x0 = self.pyramid_width.unwrap_or(cols0 * self.tile_x);
         let size_y0 = self.pyramid_height.unwrap_or(rows0 * self.tile_y);
         levels.push(EtsLevel {
@@ -1964,8 +1974,16 @@ impl EtsVolume {
 
         for i in 1..max_resolution {
             let prev = levels[i - 1].clone();
-            let cols = if max_x[i] >= 1 { (max_x[i] + 1) as u32 } else { 1 };
-            let rows = if max_y[i] >= 1 { (max_y[i] + 1) as u32 } else { 1 };
+            let cols = if max_x[i] >= 1 {
+                (max_x[i] + 1) as u32
+            } else {
+                1
+            };
+            let rows = if max_y[i] >= 1 {
+                (max_y[i] + 1) as u32
+            } else {
+                1
+            };
             let max_size_x = self.tile_x * cols;
             let max_size_y = self.tile_y * rows;
             // Java halving rule (CellSensReader.java:1510-1523).
@@ -1981,7 +1999,12 @@ impl EtsVolume {
             } else if sy > max_size_y {
                 sy = max_size_y;
             }
-            let sc = self.size_c * if max_c[i] > 0 { (max_c[i] + 1) as u32 } else { 1 };
+            let sc = self.size_c
+                * if max_c[i] > 0 {
+                    (max_c[i] + 1) as u32
+                } else {
+                    1
+                };
             levels.push(EtsLevel {
                 size_x: sx,
                 size_y: sy,
@@ -2129,10 +2152,11 @@ impl EtsVolume {
             }
         };
 
-        if buf.len() < tile_size {
-            buf.resize(tile_size, 0);
-        } else if buf.len() > tile_size {
-            buf.truncate(tile_size);
+        if buf.len() != tile_size {
+            return Err(BioFormatsError::InvalidData(format!(
+                "cellSens ETS tile decoded to {} bytes, expected {tile_size}",
+                buf.len()
+            )));
         }
 
         // BGR -> RGB swap for RAW component-order-1 multichannel tiles.
@@ -2207,8 +2231,7 @@ impl EtsVolume {
                 for trow in 0..inter_h {
                     let real_row = (trow + iy0 - ty) as usize;
                     let input_offset = pixel * (real_row * width as usize + intersection_x);
-                    if input_offset + row_len <= tile.len()
-                        && output_offset + row_len <= out.len()
+                    if input_offset + row_len <= tile.len() && output_offset + row_len <= out.len()
                     {
                         out[output_offset..output_offset + row_len]
                             .copy_from_slice(&tile[input_offset..input_offset + row_len]);
@@ -2231,8 +2254,7 @@ impl EtsVolume {
         let level = self.levels.get(resolution)?;
         let pt = self.pixel_type();
         let channels = self.rgb_channels();
-        let image_count =
-            level.size_z * level.size_t * (level.size_c / channels.max(1)).max(1);
+        let image_count = level.size_z * level.size_t * (level.size_c / channels.max(1)).max(1);
         Some(ImageMetadata {
             size_x: level.size_x,
             size_y: level.size_y,
@@ -2405,7 +2427,8 @@ impl<'a> VsiTagParser<'a> {
         self.data.get(off as usize..off as usize + n)
     }
     fn i16(&self, off: i64) -> i16 {
-        self.rd(off, 2).map_or(0, |b| i16::from_le_bytes([b[0], b[1]]))
+        self.rd(off, 2)
+            .map_or(0, |b| i16::from_le_bytes([b[0], b[1]]))
     }
     fn i32(&self, off: i64) -> i32 {
         self.rd(off, 4)
@@ -2534,8 +2557,7 @@ impl<'a> VsiTagParser<'a> {
                     self.found_channel_tag = false;
                 }
             } else if extended_field
-                && (real_type == VSI_PROPERTY_SET_VOLUME
-                    || real_type == VSI_NEW_MDIM_VOLUME_HEADER)
+                && (real_type == VSI_PROPERTY_SET_VOLUME || real_type == VSI_NEW_MDIM_VOLUME_HEADER)
             {
                 // Child prefix: getVolumeName(tag) for NEW_MDIM, else inherit the
                 // current tagPrefix (CellSensReader.java:1704-1720). When the MDIM
@@ -2742,14 +2764,18 @@ impl<'a> VsiTagParser<'a> {
             VSI_DOUBLE | VSI_DATE => {
                 let b = self.rd(off, 8)?;
                 Some(
-                    f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]).to_string(),
+                    f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                        .to_string(),
                 )
             }
             VSI_BOOLEAN => Some((self.rd(off, 1).map(|b| b[0]).unwrap_or(0) != 0).to_string()),
             VSI_TCHAR | VSI_UNICODE_TCHAR => {
                 let n = data_size.max(0) as usize;
                 let bytes = self.rd(off, n)?;
-                let s = String::from_utf8_lossy(bytes).replace('\0', "").trim().to_string();
+                let s = String::from_utf8_lossy(bytes)
+                    .replace('\0', "")
+                    .trim()
+                    .to_string();
                 // CHANNEL_NAME / STACK_NAME are captured straight from the string
                 // leaf (CellSensReader.java:1769-1778).
                 if self.metadata_index >= 0 {
@@ -2840,13 +2866,17 @@ impl CellSensReader {
     /// next to the `.vsi`. Mirrors the directory walk in `initFile`.
     fn find_ets_files(vsi_path: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        let Some(dir) = vsi_path.parent() else { return out };
+        let Some(dir) = vsi_path.parent() else {
+            return out;
+        };
         let stem = vsi_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
         let pixels_dir = dir.join(format!("_{}_", stem));
-        let Ok(stacks) = std::fs::read_dir(&pixels_dir) else { return out };
+        let Ok(stacks) = std::fs::read_dir(&pixels_dir) else {
+            return out;
+        };
         let mut stack_dirs: Vec<PathBuf> = stacks
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.is_dir())
@@ -2854,7 +2884,8 @@ impl CellSensReader {
         stack_dirs.sort();
         for stack in stack_dirs {
             if let Ok(files) = std::fs::read_dir(&stack) {
-                let mut paths: Vec<PathBuf> = files.filter_map(|e| e.ok().map(|e| e.path())).collect();
+                let mut paths: Vec<PathBuf> =
+                    files.filter_map(|e| e.ok().map(|e| e.path())).collect();
                 paths.sort();
                 for p in paths {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
@@ -2880,14 +2911,14 @@ impl CellSensReader {
         let i32_at = |off: usize| -> i32 { u32_at(off) as i32 };
         let u64_at = |off: usize| -> u64 {
             rd(off, 8)
-                .map(|b| {
-                    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-                })
+                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
                 .unwrap_or(0)
         };
 
         // Volume header (offset 0): "SIS" magic, then ints/longs.
-        let magic = String::from_utf8_lossy(rd(0, 4).unwrap_or(&[])).trim().to_string();
+        let magic = String::from_utf8_lossy(rd(0, 4).unwrap_or(&[]))
+            .trim()
+            .to_string();
         if magic != "SIS" {
             return Err(BioFormatsError::Format(format!(
                 "ETS file {:?}: unexpected magic {:?}",
@@ -2926,7 +2957,9 @@ impl CellSensReader {
         // color region begins at base + 32 + 68 = base + 100, always 40 bytes.
         let color_start = base + 32 + 4 * 17;
         let color_len = (size_c as usize).saturating_mul(bpp).min(40);
-        let background = rd(color_start, color_len).map(|b| b.to_vec()).unwrap_or_default();
+        let background = rd(color_start, color_len)
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
         let component_order = i32_at(color_start + 40);
         let use_pyramid = i32_at(color_start + 44) != 0;
         let bgr = component_order == 1 && compression == ETS_RAW;
@@ -3091,10 +3124,9 @@ impl CellSensReader {
                     format!("{p}.tile_size"),
                     MetadataValue::String(format!("{}x{}", v.tile_x, v.tile_y)),
                 );
-                s.metadata.series_metadata.insert(
-                    format!("{p}.size_c"),
-                    MetadataValue::Int(v.size_c as i64),
-                );
+                s.metadata
+                    .series_metadata
+                    .insert(format!("{p}.size_c"), MetadataValue::Int(v.size_c as i64));
                 s.metadata.series_metadata.insert(
                     format!("{p}.compression"),
                     MetadataValue::Int(v.compression as i64),
@@ -3133,10 +3165,7 @@ impl CellSensReader {
                 for (key, val) in strs {
                     if let Some(val) = val {
                         if !val.is_empty() {
-                            sm.insert(
-                                format!("{p}.{key}"),
-                                MetadataValue::String(val.clone()),
-                            );
+                            sm.insert(format!("{p}.{key}"), MetadataValue::String(val.clone()));
                         }
                     }
                 }
@@ -3186,10 +3215,7 @@ impl CellSensReader {
                 ];
                 for (key, list) in float_lists {
                     for (idx, x) in list.iter().enumerate() {
-                        sm.insert(
-                            format!("{p}.{key}.{idx}"),
-                            MetadataValue::Float(*x),
-                        );
+                        sm.insert(format!("{p}.{key}.{idx}"), MetadataValue::Float(*x));
                     }
                 }
                 // Z start position / Z increment (CellSensReader.java:1967-1972).
@@ -3219,10 +3245,7 @@ impl CellSensReader {
                 // empty-prefix exposures already emitted above as `exposure_time`;
                 // the prefixed default + the list of "other" exposures land here.
                 if let Some(x) = m.default_exposure_time {
-                    sm.insert(
-                        format!("{p}.default_exposure_time"),
-                        MetadataValue::Int(x),
-                    );
+                    sm.insert(format!("{p}.default_exposure_time"), MetadataValue::Int(x));
                 }
                 for (idx, x) in m.other_exposure_times.iter().enumerate() {
                     sm.insert(
@@ -3232,10 +3255,7 @@ impl CellSensReader {
                 }
                 // Objective types (CellSensReader.java:1924-1926).
                 for (idx, x) in m.objective_types.iter().enumerate() {
-                    sm.insert(
-                        format!("{p}.objective_type.{idx}"),
-                        MetadataValue::Int(*x),
-                    );
+                    sm.insert(format!("{p}.objective_type.{idx}"), MetadataValue::Int(*x));
                 }
             }
         }
@@ -3414,8 +3434,8 @@ impl FormatReader for CellSensReader {
 // ---------------------------------------------------------------------------
 /// Volocity clipping format reader (`.acff`).
 ///
-/// Volocity clipping files use OLE2/Compound Document format which requires
-/// a dedicated OLE2 container parser.
+/// Volocity clipping files use OLE2/Compound Document format; the remaining
+/// missing piece is the Volocity-specific stream schema.
 pub struct VolocityClippingReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -3451,8 +3471,7 @@ impl FormatReader for VolocityClippingReader {
 
     fn set_id(&mut self, _path: &Path) -> Result<()> {
         Err(BioFormatsError::UnsupportedFormat(
-            "Volocity clipping format requires OLE2/Compound Document container parsing"
-                .to_string(),
+            "Volocity clipping format requires Volocity-specific OLE2 stream parsing".to_string(),
         ))
     }
 
@@ -3463,15 +3482,11 @@ impl FormatReader for VolocityClippingReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        0
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
-        }
+        Err(BioFormatsError::SeriesOutOfRange(s))
     }
 
     fn series(&self) -> usize {
@@ -3479,35 +3494,28 @@ impl FormatReader for VolocityClippingReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Volocity clipping format requires OLE2/Compound Document container parsing"
-                .to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
+        plane_index: u32,
         _x: u32,
         _y: u32,
         _w: u32,
         _h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Volocity clipping format requires OLE2/Compound Document container parsing"
-                .to_string(),
-        ))
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Volocity clipping format requires OLE2/Compound Document container parsing"
-                .to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }
 }
 
@@ -3658,8 +3666,8 @@ impl FormatReader for BioRadScnReader {
             let line = line.trim_end_matches('\r').trim();
 
             if line.starts_with("Content-Type") {
-                current_type = line[line.find(' ').map(|i| i + 1).unwrap_or(line.len())..]
-                    .to_string();
+                current_type =
+                    line[line.find(' ').map(|i| i + 1).unwrap_or(line.len())..].to_string();
                 if let Some(b) = current_type.find("boundary") {
                     // boundary=<value> ; value ends at trailing quote/semicolon
                     let after = &current_type[b + "boundary".len()..];
@@ -3687,8 +3695,7 @@ impl FormatReader for BioRadScnReader {
                     let start = body_offset as usize;
                     let end = (start + current_length).min(bytes.len());
                     if start <= end {
-                        xml_blocks
-                            .push(String::from_utf8_lossy(&bytes[start..end]).into_owned());
+                        xml_blocks.push(String::from_utf8_lossy(&bytes[start..end]).into_owned());
                     }
                 }
             }
@@ -3837,7 +3844,9 @@ impl FormatReader for BioRadScnReader {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
@@ -3848,26 +3857,20 @@ impl FormatReader for BioRadScnReader {
         let plane = meta.size_x as usize * meta.size_y as usize * bpp;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut reader = BufReader::new(File::open(path).map_err(BioFormatsError::Io)?);
-        read_bytes_at(&mut reader, self.pixels_offset + (p as u64 * plane as u64), plane)
+        read_bytes_at(
+            &mut reader,
+            self.pixels_offset + (p as u64 * plane as u64),
+            plane,
+        )
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?.clone();
-        let bpp = (meta.bits_per_pixel as usize + 7) / 8;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         let full = self.open_bytes(p)?;
-        let full_w = meta.size_x as usize;
-        let out_row = w as usize * bpp;
-        let mut out = Vec::with_capacity(out_row * h as usize);
-        for row in 0..h as usize {
-            let src_row = (y as usize + row) * full_w * bpp;
-            let start = src_row + x as usize * bpp;
-            let end = start + out_row;
-            if end <= full.len() {
-                out.extend_from_slice(&full[start..end]);
-            } else {
-                out.resize(out.len() + out_row, 0);
-            }
-        }
-        Ok(out)
+        crop_full_plane("ScanR", &full, &meta, 1, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.open_bytes(p)
@@ -4030,13 +4033,19 @@ impl SlidebookTiffReader {
                 }
                 channel_name = Some(n.trim().to_string());
             }
-            if let Some(p) = ifd.get_str(SLIDEBOOK_PHYSICAL_SIZE_TAG).and_then(|s| s.trim().parse::<f64>().ok()) {
+            if let Some(p) = ifd
+                .get_str(SLIDEBOOK_PHYSICAL_SIZE_TAG)
+                .and_then(|s| s.trim().parse::<f64>().ok())
+            {
                 if p > 0.0 {
                     vendor.push(("slidebook.physical_size_x".into(), MetadataValue::Float(p)));
                     vendor.push(("slidebook.physical_size_y".into(), MetadataValue::Float(p)));
                 }
             }
-            if let Some(mag) = ifd.get_str(SLIDEBOOK_MAGNIFICATION_TAG).and_then(|s| s.trim().parse::<f64>().ok()) {
+            if let Some(mag) = ifd
+                .get_str(SLIDEBOOK_MAGNIFICATION_TAG)
+                .and_then(|s| s.trim().parse::<f64>().ok())
+            {
                 vendor.push(("slidebook.magnification".into(), MetadataValue::Float(mag)));
             }
             for (tag, key) in [
@@ -4790,7 +4799,11 @@ mod tests {
         parser.capture_metadata(VSI_EXPOSURE_TIME, "3000", "Microscope ");
 
         let m = &parser.pyramids[0].meta;
-        assert_eq!(m.exposure_times, vec![1000], "empty prefix -> exposureTimes");
+        assert_eq!(
+            m.exposure_times,
+            vec![1000],
+            "empty prefix -> exposureTimes"
+        );
         assert_eq!(m.default_exposure_time, Some(3000), "last prefixed wins");
         assert_eq!(m.other_exposure_times, vec![2000, 3000]);
     }

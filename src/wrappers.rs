@@ -805,7 +805,12 @@ impl MinMaxCalculator {
 
 /// Decode one sample at `offset`, returning `None` if the buffer is too short
 /// to hold a full sample of `pt` (rather than panicking on a truncated plane).
-fn read_sample_checked(data: &[u8], offset: usize, pt: PixelType, little_endian: bool) -> Option<f64> {
+fn read_sample_checked(
+    data: &[u8],
+    offset: usize,
+    pt: PixelType,
+    little_endian: bool,
+) -> Option<f64> {
     let n = pt.bytes_per_sample().max(1);
     let slice = data.get(offset..offset + n)?;
     let value = match pt {
