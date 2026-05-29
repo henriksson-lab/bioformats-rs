@@ -53,6 +53,7 @@ impl FormatReader for XrmReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, image_paths) = parse_xrm(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
@@ -68,11 +69,11 @@ impl FormatReader for XrmReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -217,6 +218,20 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
 
     let bits = (pixel_type.bytes_per_sample() * 8) as u8;
     let image_count = image_paths.len() as u32;
+    let plane_bytes = size_x
+        .checked_mul(size_y)
+        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample() as u32))
+        .ok_or_else(|| BioFormatsError::Format("XRM plane size overflows".into()))?
+        as usize;
+    for stream_path in &image_paths {
+        let raw = ole.document_bytes(stream_path)?;
+        if raw.len() < plane_bytes {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Zeiss XRM/TXRM stream {stream_path} is shorter than declared: got {}, expected {plane_bytes}",
+                raw.len()
+            )));
+        }
+    }
     let meta = ImageMetadata {
         size_x,
         size_y,

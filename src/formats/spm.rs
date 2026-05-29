@@ -1,108 +1,18 @@
 //! Scanning Probe Microscopy (SPM) and related format readers.
 //!
-//! Includes a real binary reader for PicoQuant TCSPC data and
-//! extension-only placeholder readers for various SPM/AFM platforms.
+//! Includes binary readers for PicoQuant TCSPC and several SPM/AFM platform
+//! layouts. Formats without a decoded native layout require explicit strict raw
+//! fixtures instead of heuristic dimensions.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
-
-// ---------------------------------------------------------------------------
-// Macro: extension-only placeholder reader (512x512 uint16)
-// ---------------------------------------------------------------------------
-#[allow(unused_macros)]
-macro_rules! placeholder_reader {
-    (
-        $(#[$attr:meta])*
-        pub struct $name:ident;
-        extensions: [$($ext:literal),+];
-    ) => {
-        $(#[$attr])*
-        pub struct $name {
-            path: Option<PathBuf>,
-            meta: Option<ImageMetadata>,
-        }
-
-        impl $name {
-            pub fn new() -> Self {
-                $name { path: None, meta: None }
-            }
-        }
-
-        impl Default for $name {
-            fn default() -> Self { Self::new() }
-        }
-
-        impl FormatReader for $name {
-            fn is_this_type_by_name(&self, path: &Path) -> bool {
-                let ext = path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_ascii_lowercase());
-                matches!(ext.as_deref(), $(Some($ext))|+)
-            }
-
-            fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
-
-            fn set_id(&mut self, _path: &Path) -> Result<()> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
-            }
-
-            fn close(&mut self) -> Result<()> {
-                self.path = None;
-                self.meta = None;
-                Ok(())
-            }
-
-            fn series_count(&self) -> usize { 0 }
-
-            fn set_series(&mut self, s: usize) -> Result<()> {
-                Err(BioFormatsError::SeriesOutOfRange(s))
-            }
-
-            fn series(&self) -> usize { 0 }
-
-            fn metadata(&self) -> &ImageMetadata {
-                self.meta.as_ref().unwrap_or(crate::common::reader::uninitialized_metadata())
-            }
-
-            fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
-            }
-
-            fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
-            }
-
-            fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
-            }
-
-            fn resolution_count(&self) -> usize { 1 }
-
-            fn set_resolution(&mut self, level: usize) -> Result<()> {
-                if level != 0 {
-                    Err(BioFormatsError::Format(format!("resolution {} out of range", level)))
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    };
-}
+use crate::common::region::{crop_full_plane, validate_region};
 
 // ===========================================================================
 // Binary reader — PicoQuant TCSPC / FLIM
@@ -116,12 +26,109 @@ pub struct PicoQuantReader {
     meta: Option<ImageMetadata>,
 }
 
+#[derive(Debug, Clone)]
+struct PicoQuantTag {
+    ident: String,
+    index: i32,
+    tag_type: u32,
+    value: i64,
+}
+
+const PTU_HEADER_LEN: usize = 16;
+const PTU_TAG_LEN: usize = 48;
+const PTU_TAG_INT8: u32 = 0x1000_0008;
+const PTU_TAG_BOOL8: u32 = 0x0000_0008;
+const PTU_TAG_FLOAT8: u32 = 0x2000_0008;
+const PTU_TAG_EMPTY8: u32 = 0xffff_0008;
+const PTU_TAG_ANSI_STRING: u32 = 0x4001_ffff;
+const PTU_TAG_WIDE_STRING: u32 = 0x4002_ffff;
+const PTU_TAG_BINARY_BLOB: u32 = 0xffff_ffff;
+
+fn picoquant_event_stream_unsupported() -> BioFormatsError {
+    BioFormatsError::UnsupportedFormat(
+        "PicoQuant TCSPC event-stream image reconstruction is unsupported; native PTU/PQRES event streams require explicit image dimensions for metadata and are not decoded to image planes without a strict image-plane payload".into(),
+    )
+}
+
 impl PicoQuantReader {
     pub fn new() -> Self {
         PicoQuantReader {
             path: None,
             meta: None,
         }
+    }
+
+    fn parse_unified_tags(data: &[u8]) -> Result<(Vec<PicoQuantTag>, usize)> {
+        if data.len() < PTU_HEADER_LEN || &data[0..6] != b"PQTTTR" {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant PTU missing PQTTTR magic".into(),
+            ));
+        }
+
+        let mut tags = Vec::new();
+        let mut offset = PTU_HEADER_LEN;
+        loop {
+            let record_end = offset.checked_add(PTU_TAG_LEN).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat("PicoQuant PTU tag offset overflows".into())
+            })?;
+            if record_end > data.len() {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "PicoQuant PTU tag table is truncated".into(),
+                ));
+            }
+
+            let ident_bytes = &data[offset..offset + 32];
+            let ident_len = ident_bytes
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(ident_bytes.len());
+            let ident = String::from_utf8_lossy(&ident_bytes[..ident_len]).into_owned();
+            let index = i32::from_le_bytes(data[offset + 32..offset + 36].try_into().unwrap());
+            let tag_type = u32::from_le_bytes(data[offset + 36..offset + 40].try_into().unwrap());
+            let value = i64::from_le_bytes(data[offset + 40..offset + 48].try_into().unwrap());
+            offset = record_end;
+
+            if matches!(
+                tag_type,
+                PTU_TAG_ANSI_STRING | PTU_TAG_WIDE_STRING | PTU_TAG_BINARY_BLOB
+            ) {
+                let len = usize::try_from(value).map_err(|_| {
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "PicoQuant PTU tag {ident} has negative payload length"
+                    ))
+                })?;
+                let payload_end = offset.checked_add(len).ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "PicoQuant PTU tag {ident} payload offset overflows"
+                    ))
+                })?;
+                if payload_end > data.len() {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "PicoQuant PTU tag {ident} payload is truncated"
+                    )));
+                }
+                offset = payload_end;
+            }
+
+            let is_end = ident == "Header_End";
+            tags.push(PicoQuantTag {
+                ident,
+                index,
+                tag_type,
+                value,
+            });
+            if is_end {
+                return Ok((tags, offset));
+            }
+        }
+    }
+
+    fn int_tag(tags: &[PicoQuantTag], names: &[&str]) -> Option<i64> {
+        tags.iter()
+            .find(|tag| {
+                tag.tag_type == PTU_TAG_INT8 && tag.index < 0 && names.contains(&tag.ident.as_str())
+            })
+            .map(|tag| tag.value)
     }
 }
 
@@ -145,36 +152,79 @@ impl FormatReader for PicoQuantReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let (tags, data_offset) = Self::parse_unified_tags(&data)?;
+        let width = Self::int_tag(&tags, &["ImgHdr_PixX", "ImgHdr_Pixels"]).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("PicoQuant PTU missing explicit image width".into())
+        })?;
+        let height = Self::int_tag(&tags, &["ImgHdr_PixY", "ImgHdr_Lines"]).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("PicoQuant PTU missing explicit image height".into())
+        })?;
+        let frames = Self::int_tag(&tags, &["ImgHdr_Frames", "ImgHdr_Frame"]).unwrap_or(1);
+        if width <= 0 || height <= 0 || frames <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant PTU image dimensions must be positive".into(),
+            ));
+        }
+        let width = u32::try_from(width).map_err(|_| {
+            BioFormatsError::UnsupportedFormat("PicoQuant PTU image width is too large".into())
+        })?;
+        let height = u32::try_from(height).map_err(|_| {
+            BioFormatsError::UnsupportedFormat("PicoQuant PTU image height is too large".into())
+        })?;
+        let frames = u32::try_from(frames).map_err(|_| {
+            BioFormatsError::UnsupportedFormat("PicoQuant PTU frame count is too large".into())
+        })?;
 
-        // Read first 4096 bytes as lossy string for header parsing
-        let header_bytes = &data[..data.len().min(4096)];
-        let text = String::from_utf8_lossy(header_bytes).into_owned();
-
-        let mut width: u32 = 64;
-        let mut height: u32 = 64;
-        let mut size_z: u32 = 1;
-
-        for line in text.lines() {
-            if let Some(val) = line.strip_prefix("ImgHdr_Pixels=") {
-                if let Ok(n) = val.trim().parse::<u32>() {
-                    width = n;
-                }
-            } else if let Some(val) = line.strip_prefix("ImgHdr_Lines=") {
-                if let Ok(n) = val.trim().parse::<u32>() {
-                    height = n;
-                }
-            } else if let Some(val) = line.strip_prefix("ImgHdr_Frame=") {
-                if let Ok(n) = val.trim().parse::<u32>() {
-                    size_z = n;
-                }
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert(
+            "ptu.data_offset".into(),
+            MetadataValue::Int(data_offset as i64),
+        );
+        for tag in &tags {
+            if matches!(
+                tag.tag_type,
+                PTU_TAG_INT8 | PTU_TAG_BOOL8 | PTU_TAG_FLOAT8 | PTU_TAG_EMPTY8
+            ) {
+                let key = if tag.index >= 0 {
+                    format!("ptu.{}[{}]", tag.ident, tag.index)
+                } else {
+                    format!("ptu.{}", tag.ident)
+                };
+                let value = match tag.tag_type {
+                    PTU_TAG_BOOL8 => MetadataValue::Bool(tag.value != 0),
+                    PTU_TAG_FLOAT8 => MetadataValue::Float(f64::from_bits(tag.value as u64)),
+                    _ => MetadataValue::Int(tag.value),
+                };
+                series_metadata.insert(key, value);
             }
         }
 
-        let _ = (width, height, size_z);
-        Err(BioFormatsError::UnsupportedFormat(
-            "PicoQuant TCSPC event stream decoding to image planes is not implemented".into(),
-        ))
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: frames,
+            pixel_type: PixelType::Uint32,
+            bits_per_pixel: 32,
+            image_count: frames,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
@@ -184,14 +234,16 @@ impl FormatReader for PicoQuantReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
 
@@ -210,23 +262,23 @@ impl FormatReader for PicoQuantReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Err(BioFormatsError::UnsupportedFormat(
-            "PicoQuant TCSPC event stream decoding to image planes is not implemented".into(),
-        ))
+        Err(picoquant_event_stream_unsupported())
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let _ = (plane_index, w, h);
-        Err(BioFormatsError::UnsupportedFormat(
-            "PicoQuant TCSPC event stream decoding to image planes is not implemented".into(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        validate_region("PicoQuant", meta.size_x, meta.size_y, x, y, w, h)?;
+        Err(picoquant_event_stream_unsupported())
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -255,15 +307,163 @@ impl FormatReader for PicoQuantReader {
 }
 
 // ===========================================================================
-// Helper: compute square dimensions from file size assuming uint16
+// Helpers for strict raw SPM subsets.
 // ===========================================================================
 
-/// Given a file size and a data offset, compute square dimensions assuming
-/// uint16 (2 bytes per pixel). Returns (width, height).
 fn unsupported_raw_spm(format_name: &str) -> BioFormatsError {
     BioFormatsError::UnsupportedFormat(format!(
-        "{format_name} binary layout is not implemented; refusing heuristic dimensions"
+        "{format_name} native binary layout is unsupported unless explicit strict raw data is present; refusing heuristic dimensions"
     ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpmStrictRawLayout {
+    data_offset: u64,
+    plane_bytes: u64,
+}
+
+fn read_le_u32_spm(data: &[u8], offset: usize, label: &str, format_name: &str) -> Result<u32> {
+    let bytes = data.get(offset..offset + 4).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("{format_name} strict header missing {label}"))
+    })?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_le_u16_spm(data: &[u8], offset: usize, label: &str, format_name: &str) -> Result<u16> {
+    let bytes = data.get(offset..offset + 2).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("{format_name} strict header missing {label}"))
+    })?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_le_u64_spm(data: &[u8], offset: usize, label: &str, format_name: &str) -> Result<u64> {
+    let bytes = data.get(offset..offset + 8).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("{format_name} strict header missing {label}"))
+    })?;
+    Ok(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+fn parse_strict_spm_raw(
+    path: &Path,
+    magic: &[u8],
+    format_name: &str,
+) -> Result<(ImageMetadata, SpmStrictRawLayout)> {
+    let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    if !data.starts_with(magic) {
+        return Err(unsupported_raw_spm(format_name));
+    }
+
+    let width_offset = magic.len();
+    let height_offset = width_offset + 4;
+    let planes_offset = height_offset + 4;
+    let pixel_type_offset = planes_offset + 4;
+    let reserved_offset = pixel_type_offset + 2;
+    let data_offset_offset = reserved_offset + 2;
+    let fixed_header_len = data_offset_offset + 8;
+
+    let width = read_le_u32_spm(&data, width_offset, "width", format_name)?;
+    let height = read_le_u32_spm(&data, height_offset, "height", format_name)?;
+    let planes = read_le_u32_spm(&data, planes_offset, "plane count", format_name)?;
+    if width == 0 || height == 0 || planes == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "{format_name} strict header dimensions must be non-zero"
+        )));
+    }
+
+    let pixel_type_code = read_le_u16_spm(&data, pixel_type_offset, "pixel type", format_name)?;
+    let (pixel_type, bits_per_pixel) = match pixel_type_code {
+        1 => (PixelType::Uint8, 8),
+        2 => (PixelType::Uint16, 16),
+        _ => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "{format_name} strict header has unsupported pixel type code {pixel_type_code}"
+            )));
+        }
+    };
+    let reserved = read_le_u16_spm(&data, reserved_offset, "reserved field", format_name)?;
+    if reserved != 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "{format_name} strict header reserved field must be zero"
+        )));
+    }
+
+    let data_offset = read_le_u64_spm(&data, data_offset_offset, "data offset", format_name)?;
+    if data_offset < fixed_header_len as u64 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "{format_name} strict data offset points into header"
+        )));
+    }
+
+    let plane_bytes = (width as u64)
+        .checked_mul(height as u64)
+        .and_then(|n| n.checked_mul(pixel_type.bytes_per_sample() as u64))
+        .ok_or_else(|| BioFormatsError::Format(format!("{format_name} plane size overflows")))?;
+    let payload_len = plane_bytes
+        .checked_mul(planes as u64)
+        .ok_or_else(|| BioFormatsError::Format(format!("{format_name} payload size overflows")))?;
+    let expected_len = data_offset
+        .checked_add(payload_len)
+        .ok_or_else(|| BioFormatsError::Format(format!("{format_name} file size overflows")))?;
+    if data.len() as u64 != expected_len {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "{format_name} strict payload length mismatch: got {}, expected {expected_len}",
+            data.len()
+        )));
+    }
+
+    Ok((
+        ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: planes,
+            pixel_type,
+            bits_per_pixel,
+            image_count: planes,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        },
+        SpmStrictRawLayout {
+            data_offset,
+            plane_bytes,
+        },
+    ))
+}
+
+fn read_strict_spm_raw_plane(
+    path: &Path,
+    layout: SpmStrictRawLayout,
+    plane_index: u32,
+) -> Result<Vec<u8>> {
+    let offset = layout
+        .data_offset
+        .checked_add(
+            layout
+                .plane_bytes
+                .checked_mul(plane_index as u64)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("SPM strict plane offset overflows".into())
+                })?,
+        )
+        .ok_or_else(|| BioFormatsError::Format("SPM strict plane offset overflows".into()))?;
+    let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+    f.seek(SeekFrom::Start(offset))
+        .map_err(BioFormatsError::Io)?;
+    let mut buf = vec![0u8; layout.plane_bytes as usize];
+    f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+    Ok(buf)
 }
 
 // ===========================================================================
@@ -365,6 +565,7 @@ impl FormatReader for RhkReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if data.len() < Self::HEADER_SIZE as usize {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -525,10 +726,13 @@ impl FormatReader for RhkReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -646,19 +850,21 @@ impl FormatReader for RhkReader {
 
 /// Quesant AFM reader (`.afm`).
 ///
-/// Binary header then raw data. Falls back to raw uint16 square heuristic.
+/// Strict raw subset only; native Quesant AFM layout is not decoded.
 pub struct QuesantReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
+    layout: Option<SpmStrictRawLayout>,
 }
 
 impl QuesantReader {
+    const STRICT_RAW_MAGIC: &'static [u8] = b"BFQUESANTAFMRAW!";
+
     pub fn new() -> Self {
         QuesantReader {
             path: None,
             meta: None,
-            data_offset: 0,
+            layout: None,
         }
     }
 }
@@ -681,30 +887,38 @@ impl FormatReader for QuesantReader {
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+        _header.starts_with(Self::STRICT_RAW_MAGIC)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let _ = path;
-        Err(unsupported_raw_spm("Quesant AFM"))
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+        let (meta, layout) = parse_strict_spm_raw(path, Self::STRICT_RAW_MAGIC, "Quesant AFM")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.data_offset = 0;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
 
@@ -719,20 +933,35 @@ impl FormatReader for QuesantReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let _ = plane_index;
-        Err(unsupported_raw_spm("Quesant AFM"))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        read_strict_spm_raw_plane(
+            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
+            self.layout.ok_or(BioFormatsError::NotInitialized)?,
+            plane_index,
+        )
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let _ = (plane_index, _x, _y, w, h);
-        Err(unsupported_raw_spm("Quesant AFM"))
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("Quesant AFM", &full, &meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -807,6 +1036,8 @@ impl FormatReader for JpkReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        let _ = self.inner.close();
         // A .jpk file is itself a TIFF; parse it directly.
         self.inner.set_id(path)?;
 
@@ -897,13 +1128,15 @@ impl FormatReader for JpkReader {
         if self.is_tiff {
             self.inner.series_count()
         } else {
-            1
+            0
         }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
         if self.is_tiff {
             self.inner.set_series(s)
+        } else if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
         } else if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -1043,6 +1276,7 @@ impl FormatReader for WatopReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if data.len() < Self::HEADER_SIZE {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -1137,10 +1371,13 @@ impl FormatReader for WatopReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -1281,6 +1518,7 @@ impl FormatReader for VgSamReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if data.len() < Self::PIXEL_OFFSET {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -1349,10 +1587,13 @@ impl FormatReader for VgSamReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -1486,6 +1727,7 @@ impl FormatReader for UbmReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if data.len() < Self::HEADER_SIZE {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -1558,10 +1800,13 @@ impl FormatReader for UbmReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -1704,6 +1949,7 @@ impl FormatReader for SeikoReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if data.len() < Self::HEADER_SIZE {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -1786,10 +2032,13 @@ impl FormatReader for SeikoReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {

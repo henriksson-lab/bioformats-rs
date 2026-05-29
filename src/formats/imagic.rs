@@ -27,6 +27,15 @@ fn r_i32_le(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+fn positive_i32_dim(value: i32, label: &str) -> Result<u32> {
+    if value <= 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "IMAGIC {label} is non-positive ({value})"
+        )));
+    }
+    Ok(value as u32)
+}
+
 fn imagic_pixel_type(type_str: &str) -> Result<(PixelType, u8)> {
     match type_str {
         "REAL" => Ok((PixelType::Float32, 32)),
@@ -38,8 +47,9 @@ fn imagic_pixel_type(type_str: &str) -> Result<(PixelType, u8)> {
         "RECO" => Err(BioFormatsError::UnsupportedFormat(
             "Unsupported pixel type 'RECO'".into(),
         )),
-        // Default to float32 if the type string is unrecognized.
-        _ => Ok((PixelType::Float32, 32)),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "IMAGIC unsupported pixel type '{type_str}'"
+        ))),
     }
 }
 
@@ -78,17 +88,13 @@ impl FormatReader for ImagicReader {
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
         // The IMAGIC header has no fixed magic; upstream relies on the .hed
-        // suffix plus the presence of a matching .img file. As a byte-level
-        // heuristic, validate that the type string at offset 56 is one of the
-        // known IMAGIC pixel format tags.
-        if header.len() < 60 {
-            return false;
-        }
-        let type_str = std::str::from_utf8(&header[56..60]).unwrap_or("");
-        matches!(type_str, "REAL" | "INTG" | "PACK" | "COMP" | "RECO")
+        // suffix plus the presence of a matching .img file.
+        let _ = header;
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // Determine .hed and .img paths
         let stem = path.file_stem().unwrap_or_default();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -107,21 +113,43 @@ impl FormatReader for ImagicReader {
         // Read first .hed record
         let mut f = File::open(&hed_path).map_err(BioFormatsError::Io)?;
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
-        let num_images = (file_len / HDR_RECORD_BYTES as u64).max(1);
+        if file_len < HDR_RECORD_BYTES as u64 {
+            return Err(BioFormatsError::Format(
+                "IMAGIC header file is shorter than one record".into(),
+            ));
+        }
+        let num_images = file_len / HDR_RECORD_BYTES as u64;
 
         let mut rec = vec![0u8; HDR_RECORD_BYTES];
         f.read_exact(&mut rec).map_err(BioFormatsError::Io)?;
 
         // Java layout: skip 16, read 6 ints (date/time, 24 bytes), skip 8,
         // then sizeY @48, sizeX @52, 4-char type string @56.
-        let size_y = r_i32_le(&rec, 48).max(1) as u32;
-        let size_x = r_i32_le(&rec, 52).max(1) as u32;
+        let size_y = positive_i32_dim(r_i32_le(&rec, 48), "height")?;
+        let size_x = positive_i32_dim(r_i32_le(&rec, 52), "width")?;
         let type_str = std::str::from_utf8(&rec[56..60])
             .unwrap_or("")
             .trim_end_matches(char::from(0))
             .to_string();
 
         let (pixel_type, bpp) = imagic_pixel_type(&type_str)?;
+        let plane_bytes = (size_x as u64)
+            .checked_mul(size_y as u64)
+            .and_then(|v| v.checked_mul(pixel_type.bytes_per_sample() as u64))
+            .ok_or_else(|| BioFormatsError::Format("IMAGIC plane byte count overflows".into()))?;
+        let required_img_len = plane_bytes
+            .checked_mul(num_images)
+            .ok_or_else(|| BioFormatsError::Format("IMAGIC pixel byte count overflows".into()))?;
+        let img_len = File::open(&img_path)
+            .map_err(BioFormatsError::Io)?
+            .metadata()
+            .map_err(BioFormatsError::Io)?
+            .len();
+        if img_len < required_img_len {
+            return Err(BioFormatsError::Format(format!(
+                "IMAGIC pixel payload is truncated: need {required_img_len} bytes, found {img_len}"
+            )));
+        }
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert("format".into(), MetadataValue::String("IMAGIC-5 EM".into()));
@@ -161,9 +189,12 @@ impl FormatReader for ImagicReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {

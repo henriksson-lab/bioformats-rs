@@ -299,10 +299,10 @@ struct ParsedItem {
 /// Parse one ZVI item ("/Image/Item(N)/CONTENTS") stream.
 ///
 /// Port of the per-image parsing in ZeissZVIReader.fillMetadataPass1.
-fn parse_zvi_item(data: &[u8]) -> Option<ParsedItem> {
+fn parse_zvi_item(data: &[u8]) -> Result<Option<ParsedItem>> {
     // Image streams smaller than this are metadata-only and skipped by Java.
     if data.len() <= 1024 {
-        return None;
+        return Ok(None);
     }
 
     let mut s = Cursor::new(data);
@@ -313,14 +313,25 @@ fn parse_zvi_item(data: &[u8]) -> Option<ParsedItem> {
     }
 
     s.skip(2);
-    let len = s.read_i32()? - 20;
+    let Some(len_raw) = s.read_i32() else {
+        return Ok(None);
+    };
+    let len = len_raw - 20;
     s.skip(8);
 
-    let zidx = s.read_i32()?;
-    let cidx = s.read_i32()?;
-    let tidx = s.read_i32()?;
+    let Some(zidx) = s.read_i32() else {
+        return Ok(None);
+    };
+    let Some(cidx) = s.read_i32() else {
+        return Ok(None);
+    };
+    let Some(tidx) = s.read_i32() else {
+        return Ok(None);
+    };
     s.skip(4);
-    let tile_index = s.read_i32()?;
+    let Some(tile_index) = s.read_i32() else {
+        return Ok(None);
+    };
 
     // skipBytes(len - 8)
     let skip_len = (len - 8).max(0) as usize;
@@ -332,14 +343,32 @@ fn parse_zvi_item(data: &[u8]) -> Option<ParsedItem> {
     }
 
     s.skip(4);
-    let size_x = s.read_i32()?;
-    let size_y = s.read_i32()?;
+    let Some(size_x) = s.read_i32() else {
+        return Ok(None);
+    };
+    let Some(size_y) = s.read_i32() else {
+        return Ok(None);
+    };
     s.skip(4);
-    let bpp = s.read_i32()?;
+    let Some(bpp) = s.read_i32() else {
+        return Ok(None);
+    };
+    if size_x <= 0 || size_y <= 0 {
+        return Err(BioFormatsError::Format(format!(
+            "ZVI: invalid non-positive image dimensions {size_x}x{size_y}"
+        )));
+    }
+    if !matches!(bpp, 1 | 2 | 3 | 6) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "ZVI: unsupported bytes-per-pixel value {bpp}"
+        )));
+    }
     s.skip(4);
     s.skip(4);
 
-    let valid = s.read_i32()?;
+    let Some(valid) = s.read_i32() else {
+        return Ok(None);
+    };
     let check_bytes = data.get(s.pos..s.pos + 4).unwrap_or(&[]);
     let check = String::from_utf8_lossy(check_bytes).trim().to_string();
     s.skip(4);
@@ -353,7 +382,20 @@ fn parse_zvi_item(data: &[u8]) -> Option<ParsedItem> {
         data_offset += 8;
     }
 
-    Some(ParsedItem {
+    if !is_zlib && !is_jpeg {
+        let plane_bytes = (size_x as usize)
+            .checked_mul(size_y as usize)
+            .and_then(|px| px.checked_mul(bpp as usize))
+            .ok_or_else(|| BioFormatsError::Format("ZVI plane size overflows".into()))?;
+        let available = data.len().saturating_sub(data_offset);
+        if available < plane_bytes {
+            return Err(BioFormatsError::InvalidData(format!(
+                "ZVI raw plane is shorter than declared: got {available}, expected {plane_bytes}"
+            )));
+        }
+    }
+
+    Ok(Some(ParsedItem {
         z: zidx.max(0) as u32,
         c: cidx.max(0) as u32,
         t: tidx.max(0) as u32,
@@ -364,7 +406,7 @@ fn parse_zvi_item(data: &[u8]) -> Option<ParsedItem> {
         data_offset,
         is_zlib,
         is_jpeg,
-    })
+    }))
 }
 
 fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, usize)> {
@@ -411,7 +453,7 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
             continue;
         }
 
-        let Some(item) = parse_zvi_item(&data) else {
+        let Some(item) = parse_zvi_item(&data)? else {
             continue;
         };
 
@@ -599,6 +641,7 @@ impl FormatReader for ZviReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, planes, bpp, is_rgb, tile_count) = parse_zvi(path)?;
         self.meta = Some(meta);
         self.planes = planes;
@@ -620,7 +663,11 @@ impl FormatReader for ZviReader {
     }
 
     fn series_count(&self) -> usize {
-        self.tile_count.max(1)
+        if self.meta.is_some() {
+            self.tile_count.max(1)
+        } else {
+            0
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
@@ -893,10 +940,9 @@ mod tests {
         }
 
         let mut reader = ZviReader::new();
-        reader.set_id(&path).unwrap();
-        let err = reader.open_bytes(0).unwrap_err();
+        let err = reader.set_id(&path).unwrap_err();
         assert!(
-            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("decoded to 0 bytes")),
+            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("shorter than declared")),
             "{err:?}"
         );
 

@@ -99,12 +99,14 @@ fn decode_packbits(src: &[u8], expected_bytes: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn pixel_type_from_depth(depth: u16) -> PixelType {
+fn pixel_type_from_depth(depth: u16) -> Result<PixelType> {
     match depth {
-        8 => PixelType::Uint8,
-        16 => PixelType::Uint16,
-        32 => PixelType::Float32,
-        _ => PixelType::Uint8,
+        8 => Ok(PixelType::Uint8),
+        16 => Ok(PixelType::Uint16),
+        32 => Ok(PixelType::Float32),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "PSD unsupported bit depth {depth}"
+        ))),
     }
 }
 
@@ -120,6 +122,11 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     }
 
     let version = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
+    if !matches!(version, 1 | 2) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "PSD unsupported version {version}"
+        )));
+    }
     let psb = version == 2;
 
     // Skip reserved 6 bytes
@@ -131,6 +138,22 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     let width = read_u32_be(&mut r).map_err(BioFormatsError::Io)?;
     let depth = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
     let color_mode = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
+    if channels == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "PSD channel count is non-positive".into(),
+        ));
+    }
+    if matches!(color_mode, 3 | 4) && channels < 3 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "PSD RGB/CMYK channel count is too small ({channels})"
+        )));
+    }
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "PSD dimensions are non-positive ({width}x{height})"
+        )));
+    }
+    let pixel_type = pixel_type_from_depth(depth)?;
 
     // Color Mode Data section. For palette images (mode 2) this holds a
     // 768-byte (3 x 256) RGB lookup table, stored plane-by-plane.
@@ -177,10 +200,16 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     // Image Data section
     let compression = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
 
-    let bytes_per_sample = (depth as usize + 7) / 8;
-    let row_bytes = width as usize * bytes_per_sample;
-    let plane_bytes = row_bytes * height as usize;
-    let total_bytes = plane_bytes * channels as usize;
+    let bytes_per_sample = pixel_type.bytes_per_sample();
+    let row_bytes = (width as usize)
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| BioFormatsError::Format("PSD row byte count overflows".into()))?;
+    let plane_bytes = row_bytes
+        .checked_mul(height as usize)
+        .ok_or_else(|| BioFormatsError::Format("PSD plane byte count overflows".into()))?;
+    let total_bytes = plane_bytes
+        .checked_mul(channels as usize)
+        .ok_or_else(|| BioFormatsError::Format("PSD pixel byte count overflows".into()))?;
 
     let pixel_data: Vec<u8> = if compression == 1 {
         // RLE: byte count table followed by compressed data
@@ -211,11 +240,15 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
             offset += rc;
         }
         out
-    } else {
+    } else if compression == 0 {
         // Raw
         let mut raw = vec![0u8; total_bytes];
         r.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
         raw
+    } else {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "PSD unsupported compression {compression}"
+        )));
     };
 
     // Color-mode semantics per the Java PSDReader:
@@ -246,8 +279,6 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     } else {
         pixel_data[..plane_bytes.min(pixel_data.len())].to_vec()
     };
-
-    let pixel_type = pixel_type_from_depth(depth);
 
     // Java: imageCount = sizeC / (isRGB ? 3 : 1).
     let image_count = (output_channels as u32 / if is_rgb { 3 } else { 1 }).max(1);
@@ -313,6 +344,7 @@ impl FormatReader for PsdReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, pixels) = load_psd(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
@@ -328,9 +360,12 @@ impl FormatReader for PsdReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {

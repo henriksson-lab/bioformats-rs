@@ -90,12 +90,33 @@ fn json_float(json: &str, key: &str) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
-fn pixel_type_from_str(s: &str) -> PixelType {
+fn positive_u32_from_json(json: &str, key: &str) -> Result<u32> {
+    let value = json_int(json, key)
+        .ok_or_else(|| BioFormatsError::Format(format!("MicroManager: missing {key}")))?;
+    u32::try_from(value)
+        .ok()
+        .filter(|&v| v > 0)
+        .ok_or_else(|| BioFormatsError::Format(format!("MicroManager: invalid {key} {value}")))
+}
+
+fn optional_positive_u32_from_json(json: &str, key: &str, default: u32) -> Result<u32> {
+    match json_int(json, key) {
+        Some(value) => u32::try_from(value)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| BioFormatsError::Format(format!("MicroManager: invalid {key} {value}"))),
+        None => Ok(default),
+    }
+}
+
+fn pixel_type_from_str(s: &str) -> Result<PixelType> {
     match s.to_uppercase().as_str() {
-        "GRAY8" | "RGB8" => PixelType::Uint8,
-        "GRAY16" | "RGB16" => PixelType::Uint16,
-        "GRAY32" | "RGB32" => PixelType::Float32,
-        _ => PixelType::Uint16,
+        "GRAY8" | "RGB8" => Ok(PixelType::Uint8),
+        "GRAY16" | "RGB16" => Ok(PixelType::Uint16),
+        "GRAY32" | "RGB32" => Ok(PixelType::Float32),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "MicroManager: unsupported PixelType {other}"
+        ))),
     }
 }
 
@@ -176,18 +197,19 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
     let summary_start = json.find("\"Summary\"").unwrap_or(0);
     let summary = &json[summary_start..];
 
-    let width = json_int(summary, "Width")
-        .ok_or_else(|| BioFormatsError::Format("MicroManager: missing Width".into()))?
-        as u32;
-    let height = json_int(summary, "Height")
-        .ok_or_else(|| BioFormatsError::Format("MicroManager: missing Height".into()))?
-        as u32;
-    let channels = json_int(summary, "Channels").unwrap_or(1).max(1) as u32;
-    let slices = json_int(summary, "Slices").unwrap_or(1).max(1) as u32;
-    let frames = json_int(summary, "Frames").unwrap_or(1).max(1) as u32;
+    let width = positive_u32_from_json(summary, "Width")?;
+    let height = positive_u32_from_json(summary, "Height")?;
+    let channels = optional_positive_u32_from_json(summary, "Channels", 1)?;
+    let slices = optional_positive_u32_from_json(summary, "Slices", 1)?;
+    let frames = optional_positive_u32_from_json(summary, "Frames", 1)?;
     let pixel_type_str = json_str(summary, "PixelType").unwrap_or_else(|| "GRAY16".into());
-    let mut pixel_type = pixel_type_from_str(&pixel_type_str);
-    let mut bits = json_int(summary, "BitDepth").unwrap_or(16) as u8;
+    let mut pixel_type = pixel_type_from_str(&pixel_type_str)?;
+    let mut bits = match json_int(summary, "BitDepth") {
+        Some(value) => u8::try_from(value).ok().filter(|&v| v > 0).ok_or_else(|| {
+            BioFormatsError::Format(format!("MicroManager: invalid BitDepth {value}"))
+        })?,
+        None => pixel_type.bytes_per_sample() as u8 * 8,
+    };
     let is_rgb_summary = pixel_type_str.starts_with("RGB");
 
     // Dimension order from "SlicesFirst": false -> XYCZT, else XYZCT (Java default).
@@ -241,7 +263,10 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
         }
     }
 
-    let image_count = channels * slices * frames;
+    let image_count = channels
+        .checked_mul(slices)
+        .and_then(|v| v.checked_mul(frames))
+        .ok_or_else(|| BioFormatsError::Format("MicroManager: image count overflow".into()))?;
 
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
     meta_map.insert(

@@ -121,13 +121,7 @@ struct AviParse {
 
 impl AviParse {
     fn new() -> Self {
-        Self {
-            width: 320,
-            height: 240,
-            bit_count: 24,
-            is_rgb: true,
-            ..Self::default()
-        }
+        Self::default()
     }
 }
 
@@ -396,6 +390,7 @@ impl FormatReader for AviReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
@@ -424,6 +419,16 @@ impl FormatReader for AviReader {
         let width = parsed.width;
         let height = parsed.height;
         let bit_count = parsed.bit_count;
+        if width == 0 || height == 0 {
+            return Err(BioFormatsError::InvalidData(
+                "AVI: missing or invalid video dimensions".into(),
+            ));
+        }
+        if bit_count == 0 {
+            return Err(BioFormatsError::InvalidData(
+                "AVI: missing or invalid bit depth".into(),
+            ));
+        }
         // For uncompressed data only the listed bit depths are supported.
         if compression == 0 && !matches!(bit_count, 8 | 16 | 24 | 32) {
             return Err(BioFormatsError::UnsupportedFormat(format!(
@@ -555,10 +560,10 @@ impl FormatReader for AviReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())

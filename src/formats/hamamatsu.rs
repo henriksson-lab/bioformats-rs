@@ -35,6 +35,15 @@ fn r_u64_le(b: &[u8], off: usize) -> u64 {
     ])
 }
 
+fn positive_u32_dim(value: u32, label: &str) -> Result<u32> {
+    if value == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "DCIMG {label} must be positive"
+        )));
+    }
+    Ok(value)
+}
+
 pub struct DcimgReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -76,6 +85,7 @@ impl FormatReader for DcimgReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut hdr = vec![0u8; 512];
         let n = f.read(&mut hdr).map_err(BioFormatsError::Io)?;
@@ -106,10 +116,10 @@ impl FormatReader for DcimgReader {
                 ));
             }
 
-            let n_frames = r_u32_le(&hdr, header_start + 60).max(1);
+            let n_frames = positive_u32_dim(r_u32_le(&hdr, header_start + 60), "frame count")?;
             let pixel_type_code = r_u32_le(&hdr, header_start + 64);
-            let width = r_u32_le(&hdr, header_start + 72).max(1);
-            let height = r_u32_le(&hdr, header_start + 76).max(1);
+            let width = positive_u32_dim(r_u32_le(&hdr, header_start + 72), "width")?;
+            let height = positive_u32_dim(r_u32_le(&hdr, header_start + 76), "height")?;
             let bytes_per_row = r_u32_le(&hdr, header_start + 80) as usize;
             let bytes_per_image = r_u32_le(&hdr, header_start + 84) as u64;
             let data_offset = header_size + r_u64_le(&hdr, header_start + 96);
@@ -127,9 +137,9 @@ impl FormatReader for DcimgReader {
             )
         } else {
             let header_size = r_u32_le(&hdr, 16) as u64;
-            let n_frames = r_u32_le(&hdr, 20).max(1);
-            let width = r_u32_le(&hdr, 32).max(1);
-            let height = r_u32_le(&hdr, 36).max(1);
+            let n_frames = positive_u32_dim(r_u32_le(&hdr, 20), "frame count")?;
+            let width = positive_u32_dim(r_u32_le(&hdr, 32), "width")?;
+            let height = positive_u32_dim(r_u32_le(&hdr, 36), "height")?;
             let bit_depth = r_u32_le(&hdr, 40);
             let bytes_per_row = r_u32_le(&hdr, 48) as usize;
             (
@@ -158,8 +168,13 @@ impl FormatReader for DcimgReader {
         } else {
             match pixel_type_code {
                 8 => (PixelType::Uint8, 8),
+                16 => (PixelType::Uint16, 16),
                 32 => (PixelType::Float32, 32),
-                _ => (PixelType::Uint16, 16), // default: 16-bit
+                other => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "DCIMG unsupported legacy bit depth {other}"
+                    )));
+                }
             }
         };
 
@@ -169,6 +184,41 @@ impl FormatReader for DcimgReader {
         } else {
             width as usize * bps
         };
+        let min_row = (width as usize)
+            .checked_mul(bps)
+            .ok_or_else(|| BioFormatsError::Format("DCIMG row byte count overflows".into()))?;
+        if bpr < min_row {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "DCIMG row stride {bpr} is shorter than declared image row {min_row}"
+            )));
+        }
+        let plane_bytes = (bpr as u64)
+            .checked_mul(height as u64)
+            .ok_or_else(|| BioFormatsError::Format("DCIMG plane byte count overflows".into()))?;
+        let frame_stride = if bytes_per_image > 0 {
+            if bytes_per_image < plane_bytes {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "DCIMG frame stride {bytes_per_image} is shorter than declared plane {plane_bytes}"
+                )));
+            }
+            bytes_per_image
+                .checked_add(frame_footer_size)
+                .ok_or_else(|| BioFormatsError::Format("DCIMG frame stride overflows".into()))?
+        } else {
+            plane_bytes
+        };
+        let payload_bytes = frame_stride
+            .checked_mul(n_frames as u64)
+            .ok_or_else(|| BioFormatsError::Format("DCIMG pixel payload size overflows".into()))?;
+        let required_len = data_offset.checked_add(payload_bytes).ok_or_else(|| {
+            BioFormatsError::Format("DCIMG pixel payload offset overflows".into())
+        })?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if file_len < required_len {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "DCIMG pixel payload is shorter than declared: need {required_len} bytes, found {file_len}"
+            )));
+        }
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert(
@@ -212,16 +262,20 @@ impl FormatReader for DcimgReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.data_offset = 0;
+        self.bytes_per_row = 0;
+        self.bytes_per_image = 0;
+        self.frame_footer_size = 0;
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if s == 0 && self.meta.is_some() {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
     fn series(&self) -> usize {

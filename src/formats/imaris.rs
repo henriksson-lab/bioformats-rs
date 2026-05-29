@@ -89,15 +89,9 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
         .group("DataSetInfo/Image")
         .map_err(|e| BioFormatsError::Format(format!("DataSetInfo/Image missing: {e}")))?;
 
-    let size_x = read_str_attr(&img_group, "X")
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(512);
-    let size_y = read_str_attr(&img_group, "Y")
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(512);
-    let size_z = read_str_attr(&img_group, "Z")
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(1);
+    let size_x = read_required_positive_attr(&img_group, "X")?;
+    let size_y = read_required_positive_attr(&img_group, "Y")?;
+    let size_z = read_required_positive_attr(&img_group, "Z")?;
 
     // ── Count channels ──────────────────────────────────────────────────────
     // Count groups named "Channel N" under DataSetInfo
@@ -109,7 +103,23 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
         size_c = members.iter().filter(|n| n.starts_with("Channel ")).count() as u32;
     }
     if size_c == 0 {
-        size_c = 1;
+        let tp0 = file
+            .group("DataSet/ResolutionLevel 0/TimePoint 0")
+            .map_err(|e| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "Imaris: no channel metadata and TimePoint 0 missing: {e}"
+                ))
+            })?;
+        size_c = hdf5_group_members(&tp0)
+            .unwrap_or_default()
+            .iter()
+            .filter(|n| n.starts_with("Channel "))
+            .count() as u32;
+        if size_c == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Imaris: no channels found".into(),
+            ));
+        }
     }
 
     // ── Count timepoints from DataSet/ResolutionLevel 0 ────────────────────
@@ -119,17 +129,18 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
                 .iter()
                 .filter(|n| n.starts_with("TimePoint "))
                 .count() as u32;
-            if n == 0 {
-                1
-            } else {
-                n
-            }
+            n
         } else {
-            1
+            0
         }
     } else {
-        1
+        0
     };
+    if size_t == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Imaris: no timepoints found".into(),
+        ));
+    }
 
     // ── Count resolution levels ─────────────────────────────────────────────
     let n_resolutions: usize = if let Ok(ds_group) = file.group("DataSet") {
@@ -138,30 +149,39 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
                 .iter()
                 .filter(|n| n.starts_with("ResolutionLevel "))
                 .count();
-            if n == 0 {
-                1
-            } else {
-                n
-            }
+            n
         } else {
-            1
+            0
         }
     } else {
-        1
+        0
     };
+    if n_resolutions == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Imaris: no resolution levels found".into(),
+        ));
+    }
 
     // ── Determine pixel type from first Data dataset ────────────────────────
     let data_path = "DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Data";
-    let (pixel_type, bytes_per_sample) = if let Ok(ds) = file.dataset(data_path) {
-        match ds.dtype().map(hdf5_dtype_size).unwrap_or(1) {
+    let ds = file.dataset(data_path).map_err(|e| {
+        BioFormatsError::UnsupportedFormat(format!("Imaris: missing {data_path}: {e}"))
+    })?;
+    let (pixel_type, bytes_per_sample) = {
+        match ds.dtype().map(hdf5_dtype_size).map_err(|e| {
+            BioFormatsError::Format(format!("Imaris: cannot read dtype for {data_path}: {e}"))
+        })? {
             1 => (PixelType::Uint8, 1usize),
             2 => (PixelType::Uint16, 2usize),
             4 => (PixelType::Uint32, 4usize),
-            _ => (PixelType::Uint8, 1usize),
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Imaris: unsupported dtype size {other} for {data_path}"
+                )));
+            }
         }
-    } else {
-        (PixelType::Uint8, 1usize)
     };
+    validate_ims_data_dataset(&file, data_path, size_x, size_y, size_z, bytes_per_sample)?;
 
     // ── Collect channel metadata ────────────────────────────────────────────
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
@@ -182,7 +202,7 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
     // DataSet/ResolutionLevel_N/TimePoint_0/Channel_0 for each sub-resolution
     // (level 0 uses the DataSetInfo/Image dimensions). sizeC and sizeT are
     // shared across all levels.
-    let image_count0 = size_z * size_c * size_t;
+    let image_count0 = checked_image_count(size_z, size_c, size_t, "base")?;
     let base_meta = ImageMetadata {
         size_x,
         size_y,
@@ -210,18 +230,42 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
     for level in 1..n_resolutions {
         let group_path = format!("DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0");
         let mut lvl = base_meta.clone();
-        if let Ok(g) = file.group(&group_path) {
-            if let Some(v) = read_int_attr(&g, "ImageSizeX") {
-                lvl.size_x = v;
+        let g = file.group(&group_path).map_err(|e| {
+            BioFormatsError::UnsupportedFormat(format!("Imaris: missing {group_path}: {e}"))
+        })?;
+        if let Some(v) = read_int_attr(&g, "ImageSizeX") {
+            if v == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Imaris: non-positive ImageSizeX for resolution {level}"
+                )));
             }
-            if let Some(v) = read_int_attr(&g, "ImageSizeY") {
-                lvl.size_y = v;
-            }
-            if let Some(v) = read_int_attr(&g, "ImageSizeZ") {
-                lvl.size_z = v;
-            }
+            lvl.size_x = v;
         }
-        lvl.image_count = lvl.size_z * lvl.size_c * lvl.size_t;
+        if let Some(v) = read_int_attr(&g, "ImageSizeY") {
+            if v == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Imaris: non-positive ImageSizeY for resolution {level}"
+                )));
+            }
+            lvl.size_y = v;
+        }
+        if let Some(v) = read_int_attr(&g, "ImageSizeZ") {
+            if v == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Imaris: non-positive ImageSizeZ for resolution {level}"
+                )));
+            }
+            lvl.size_z = v;
+        }
+        validate_ims_data_dataset(
+            &file,
+            &format!("DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data"),
+            lvl.size_x,
+            lvl.size_y,
+            lvl.size_z,
+            bytes_per_sample,
+        )?;
+        lvl.image_count = checked_image_count(lvl.size_z, lvl.size_c, lvl.size_t, "resolution")?;
         lvl.resolution_count = n_resolutions as u32;
         resolutions.push(lvl);
     }
@@ -232,6 +276,72 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
 /// Read an integer attribute (string- or numeric-encoded) from an HDF5 group.
 fn read_int_attr(group: &hdf5_pure::Group<'_>, attr: &str) -> Option<u32> {
     read_str_attr(group, attr).and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+fn read_required_positive_attr(group: &hdf5_pure::Group<'_>, attr: &str) -> Result<u32> {
+    let value = read_str_attr(group, attr).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("Imaris: missing Image {attr} attribute"))
+    })?;
+    let parsed = value.trim().parse::<u32>().map_err(|_| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "Imaris: invalid Image {attr} attribute {value:?}"
+        ))
+    })?;
+    if parsed == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Imaris: non-positive Image {attr} attribute"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn checked_image_count(size_z: u32, size_c: u32, size_t: u32, label: &str) -> Result<u32> {
+    size_z
+        .checked_mul(size_c)
+        .and_then(|v| v.checked_mul(size_t))
+        .ok_or_else(|| BioFormatsError::Format(format!("Imaris {label} image count overflows")))
+}
+
+fn validate_ims_data_dataset(
+    file: &hdf5_pure::File,
+    path: &str,
+    size_x: u32,
+    size_y: u32,
+    size_z: u32,
+    bytes_per_sample: usize,
+) -> Result<()> {
+    let ds = file
+        .dataset(path)
+        .map_err(|e| BioFormatsError::UnsupportedFormat(format!("Imaris: missing {path}: {e}")))?;
+    let shape = ds.shape().map_err(|e| {
+        BioFormatsError::Format(format!("Imaris: cannot read shape for {path}: {e}"))
+    })?;
+    if shape.len() != 3 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Imaris: {path} has unsupported rank {}",
+            shape.len()
+        )));
+    }
+    if shape[0] == 0 || shape[1] == 0 || shape[2] == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Imaris: {path} has zero dataset axis"
+        )));
+    }
+    let declared = [size_z as u64, size_y as u64, size_x as u64];
+    if shape != declared {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Imaris: {path} shape {shape:?} does not match declared {declared:?}"
+        )));
+    }
+    let dtype_size = ds.dtype().map(hdf5_dtype_size).map_err(|e| {
+        BioFormatsError::Format(format!("Imaris: cannot read dtype for {path}: {e}"))
+    })?;
+    if dtype_size != bytes_per_sample {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Imaris: {path} dtype size {dtype_size} does not match declared {bytes_per_sample}"
+        )));
+    }
+    Ok(())
 }
 
 fn hdf5_group_members(
@@ -276,6 +386,7 @@ impl FormatReader for ImarisReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (resolutions, bps) = parse_ims(path)?;
         self.resolutions = resolutions;
         self.path = Some(path.to_path_buf());
@@ -293,10 +404,13 @@ impl FormatReader for ImarisReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(!self.resolutions.is_empty())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.resolutions.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -316,7 +430,7 @@ impl FormatReader for ImarisReader {
     }
 
     fn resolution_count(&self) -> usize {
-        self.resolutions.len().max(1)
+        self.resolutions.len()
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {

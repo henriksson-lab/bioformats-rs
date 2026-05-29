@@ -12,7 +12,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
+use crate::common::region::{crop_full_plane, validate_region};
 
 pub struct AimReader {
     path: Option<PathBuf>,
@@ -219,6 +219,9 @@ impl FormatReader for AimReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.data_offset = 512;
         let (meta, data_offset) = load_aim_header(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
@@ -234,10 +237,10 @@ impl FormatReader for AimReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -278,6 +281,10 @@ impl FormatReader for AimReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        {
+            let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            validate_region("AIM", meta.size_x, meta.size_y, x, y, w, h)?;
+        }
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         crop_full_plane("AIM", &full, meta, 1, x, y, w, h)

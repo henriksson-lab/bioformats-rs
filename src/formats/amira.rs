@@ -9,7 +9,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
+use crate::common::region::{crop_full_plane, validate_region};
 
 // ─── Amira Mesh ───────────────────────────────────────────────────────────────
 
@@ -120,8 +120,12 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
                 PixelType::Int16
             } else if lo.contains("int") {
                 PixelType::Int32
+            } else if lo.contains("byte") {
+                PixelType::Uint8
             } else {
-                PixelType::Uint8 // "byte"
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Amira Mesh: unsupported lattice data type in {t:?}"
+                )));
             };
             // Extract @N section number
             if let Some(at_pos) = t.rfind('@') {
@@ -134,10 +138,11 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
         // Find @N marker in body — data starts on the next line
         if t == format!("@{}", data_section) {
             let data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
+            validate_positive_dims("Amira Mesh", nx, ny, nz)?;
             return Ok(AmiraHeader {
-                nx: nx.max(1),
-                ny: ny.max(1),
-                nz: nz.max(1),
+                nx,
+                ny,
+                nz,
                 pixel_type,
                 data_offset,
                 little_endian,
@@ -149,6 +154,46 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
     Err(BioFormatsError::Format(
         "Amira Mesh: could not find data section".into(),
     ))
+}
+
+fn validate_positive_dims(format: &str, width: u32, height: u32, depth: u32) -> Result<()> {
+    if width == 0 || height == 0 || depth == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "{format}: invalid non-positive dimensions {width}x{height}x{depth}"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_plane_bytes(format: &str, meta: &ImageMetadata) -> Result<u64> {
+    (meta.size_x as u64)
+        .checked_mul(meta.size_y as u64)
+        .and_then(|pixels| pixels.checked_mul(meta.pixel_type.bytes_per_sample() as u64))
+        .ok_or_else(|| BioFormatsError::Format(format!("{format}: plane size overflows")))
+}
+
+fn validate_payload_len(
+    format: &str,
+    path: &Path,
+    data_offset: u64,
+    meta: &ImageMetadata,
+) -> Result<()> {
+    let file_len = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
+    let required_len = data_offset
+        .checked_add(
+            checked_plane_bytes(format, meta)?
+                .checked_mul(meta.image_count as u64)
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!("{format}: payload size overflows"))
+                })?,
+        )
+        .ok_or_else(|| BioFormatsError::Format(format!("{format}: payload size overflows")))?;
+    if file_len < required_len {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "{format}: pixel payload is shorter than declared ({file_len} < {required_len})"
+        )));
+    }
+    Ok(())
 }
 
 pub struct AmiraReader {
@@ -281,11 +326,15 @@ impl FormatReader for AmiraReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.data_offset = 0;
+        self.ascii = false;
         let hdr = parse_amira_header(path)?;
         let image_count = hdr.nz;
         // ASCII-decoded planes are emitted as little-endian byte buffers.
         let little_endian = if hdr.ascii { true } else { hdr.little_endian };
-        self.meta = Some(ImageMetadata {
+        let meta = ImageMetadata {
             size_x: hdr.nx,
             size_y: hdr.ny,
             size_z: hdr.nz,
@@ -305,7 +354,11 @@ impl FormatReader for AmiraReader {
             modulo_z: None,
             modulo_c: None,
             modulo_t: None,
-        });
+        };
+        if !hdr.ascii {
+            validate_payload_len("Amira Mesh", path, hdr.data_offset, &meta)?;
+        }
+        self.meta = Some(meta);
         self.data_offset = hdr.data_offset;
         self.ascii = hdr.ascii;
         self.path = Some(path.to_path_buf());
@@ -318,10 +371,10 @@ impl FormatReader for AmiraReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -344,8 +397,7 @@ impl FormatReader for AmiraReader {
         if self.ascii {
             return self.read_ascii_plane(plane_index);
         }
-        let bps = meta.pixel_type.bytes_per_sample();
-        let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;
+        let plane_bytes = checked_plane_bytes("Amira Mesh", meta)? as usize;
         let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
@@ -364,6 +416,10 @@ impl FormatReader for AmiraReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        {
+            let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            validate_region("Amira", meta.size_x, meta.size_y, x, y, w, h)?;
+        }
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         crop_full_plane("Amira", &full, meta, 1, x, y, w, h)
@@ -397,19 +453,23 @@ fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
     let mut hdr = [0u8; 256]; // read first 256 bytes = enough for the key fields
     f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
 
-    let nslice = r_f32_le_w(&hdr, 0).abs() as u32;
-    let nrow = r_f32_le_w(&hdr, 4) as u32;
+    let nslice = spider_positive_u32(r_f32_le_w(&hdr, 0), "NSLICE")?;
+    let nrow = spider_positive_u32(r_f32_le_w(&hdr, 4), "NROW")?;
     let iform = r_f32_le_w(&hdr, 16) as i32;
-    let nsam = r_f32_le_w(&hdr, 44) as u32;
+    let nsam = spider_positive_u32(r_f32_le_w(&hdr, 44), "NSAM")?;
     let labbyt = r_f32_le_w(&hdr, 84) as u64;
 
-    let width = nsam.max(1);
-    let height = nrow.max(1);
+    let width = nsam;
+    let height = nrow;
     let nz = match iform {
-        1 => 1,              // single 2D image
-        3 => nslice.max(1),  // 3D volume
-        11 => nslice.max(1), // sequence of 2D images
-        _ => nslice.max(1),
+        1 | -1 => 1,                    // single 2D image
+        3 | -3 => nslice,               // 3D volume
+        11 | -11 | -21 | -22 => nslice, // sequence / known Spider variants
+        _ => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Spider: unsupported IFORM {iform}"
+            )))
+        }
     };
 
     let header_size = if labbyt > 0 {
@@ -420,13 +480,16 @@ fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
         labrec * nsam as u64 * 4
     };
 
-    if width == 0 || height == 0 {
-        return Err(BioFormatsError::Format(
-            "Spider: invalid image dimensions".into(),
-        ));
-    }
+    Ok((width, height, nz, header_size))
+}
 
-    Ok((width, height, nz.max(1), header_size))
+fn spider_positive_u32(value: f32, label: &str) -> Result<u32> {
+    if !value.is_finite() || value <= 0.0 || value.fract() != 0.0 || value > u32::MAX as f32 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Spider: invalid {label} dimension {value}"
+        )));
+    }
+    Ok(value as u32)
 }
 
 pub struct SpiderReader {
@@ -472,9 +535,12 @@ impl FormatReader for SpiderReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.data_offset = 0;
         let (width, height, nz, data_offset) = parse_spider_header(path)?;
         let image_count = nz;
-        self.meta = Some(ImageMetadata {
+        let meta = ImageMetadata {
             size_x: width,
             size_y: height,
             size_z: nz,
@@ -498,7 +564,9 @@ impl FormatReader for SpiderReader {
             modulo_z: None,
             modulo_c: None,
             modulo_t: None,
-        });
+        };
+        validate_payload_len("Spider", path, data_offset, &meta)?;
+        self.meta = Some(meta);
         self.data_offset = data_offset;
         self.path = Some(path.to_path_buf());
         Ok(())
@@ -510,10 +578,10 @@ impl FormatReader for SpiderReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -533,7 +601,7 @@ impl FormatReader for SpiderReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let plane_bytes = (meta.size_x * meta.size_y) as usize * 4;
+        let plane_bytes = checked_plane_bytes("Spider", meta)? as usize;
         let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
@@ -552,6 +620,10 @@ impl FormatReader for SpiderReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        {
+            let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            validate_region("Spider", meta.size_x, meta.size_y, x, y, w, h)?;
+        }
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         crop_full_plane("Spider", &full, meta, 1, x, y, w, h)

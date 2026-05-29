@@ -108,6 +108,16 @@ fn parse_eps_int(value: &str) -> Option<i32> {
     value.parse::<i32>().ok()
 }
 
+fn parse_positive_eps_u32(value: &str, label: &str) -> Result<u32> {
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| BioFormatsError::UnsupportedFormat(format!("EPS invalid {label}")))?;
+    u32::try_from(parsed)
+        .ok()
+        .filter(|&v| v > 0)
+        .ok_or_else(|| BioFormatsError::UnsupportedFormat(format!("EPS invalid {label}")))
+}
+
 fn parse_hex_payload(bytes: &[u8], offset: usize, expected: usize) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(expected);
     let mut high: Option<u8> = None;
@@ -223,8 +233,17 @@ impl FormatReader for EpsReader {
                             "EPS BoundingBox is not integer-valued".into(),
                         )
                     })?;
-                    width = x1.saturating_sub(x0).max(1) as u32;
-                    height = y1.saturating_sub(y0).max(1) as u32;
+                    if x1 <= x0 || y1 <= y0 {
+                        return Err(BioFormatsError::UnsupportedFormat(
+                            "EPS BoundingBox has non-positive dimensions".into(),
+                        ));
+                    }
+                    width = u32::try_from(x1 - x0).map_err(|_| {
+                        BioFormatsError::UnsupportedFormat("EPS BoundingBox is too large".into())
+                    })?;
+                    height = u32::try_from(y1 - y0).map_err(|_| {
+                        BioFormatsError::UnsupportedFormat("EPS BoundingBox is too large".into())
+                    })?;
                     metadata.insert(
                         "X-coordinate of origin".into(),
                         MetadataValue::Int(x0 as i64),
@@ -237,9 +256,9 @@ impl FormatReader for EpsReader {
             } else if let Some(rest) = trimmed.strip_prefix("%ImageData:") {
                 let parts: Vec<&str> = rest.split_whitespace().collect();
                 if parts.len() >= 4 {
-                    width = parts[0].parse::<u32>().unwrap_or(width).max(1);
-                    height = parts[1].parse::<u32>().unwrap_or(height).max(1);
-                    channels = parts[3].parse::<u32>().unwrap_or(channels).max(1);
+                    width = parse_positive_eps_u32(parts[0], "ImageData width")?;
+                    height = parse_positive_eps_u32(parts[1], "ImageData height")?;
+                    channels = parse_positive_eps_u32(parts[3], "ImageData channel count")?;
                 }
             } else if trimmed.starts_with("%%BeginBinary") {
                 binary = true;
@@ -255,8 +274,13 @@ impl FormatReader for EpsReader {
                         fields[2].parse::<u32>(),
                     ) {
                         if bits >= 8 {
-                            width = x.max(1);
-                            height = y.max(1);
+                            if x == 0 || y == 0 {
+                                return Err(BioFormatsError::UnsupportedFormat(
+                                    "EPS image operator has non-positive dimensions".into(),
+                                ));
+                            }
+                            width = x;
+                            height = y;
                         }
                     }
                 }

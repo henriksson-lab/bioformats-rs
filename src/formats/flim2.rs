@@ -4,7 +4,7 @@
 //! extension-only placeholder readers.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
@@ -15,6 +15,33 @@ use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 use crate::tiff::ifd::{tag, Ifd};
 use crate::tiff::parser::TiffParser;
+
+const OLE2_CFB_MAGIC: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+
+fn validate_ole2_cfb_header(path: &Path, format_name: &str) -> Result<()> {
+    let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut header = [0u8; 8];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+            return Err(BioFormatsError::Format(format!(
+                "{format_name} file is too short for OLE2 CFB header"
+            )));
+        }
+        Err(err) => return Err(BioFormatsError::Io(err)),
+    }
+    if header != OLE2_CFB_MAGIC {
+        let article = if format_name.starts_with("Olympus") {
+            "an"
+        } else {
+            "a"
+        };
+        return Err(BioFormatsError::Format(format!(
+            "Not {article} {format_name} OLE2 CFB file"
+        )));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Macros
@@ -55,7 +82,7 @@ macro_rules! placeholder_reader {
 
             fn set_id(&mut self, _path: &Path) -> Result<()> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
@@ -68,7 +95,8 @@ macro_rules! placeholder_reader {
             fn series_count(&self) -> usize { 0 }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                Err(BioFormatsError::SeriesOutOfRange(s))
+                let _ = s;
+                Err(BioFormatsError::NotInitialized)
             }
 
             fn series(&self) -> usize { 0 }
@@ -79,25 +107,26 @@ macro_rules! placeholder_reader {
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
             fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
             fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
         }
     };
 }
 
+#[allow(unused_macros)]
 macro_rules! placeholder_reader_u16_small {
     (
         $(#[$attr:meta])*
@@ -133,7 +162,7 @@ macro_rules! placeholder_reader_u16_small {
 
             fn set_id(&mut self, _path: &Path) -> Result<()> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
@@ -146,7 +175,8 @@ macro_rules! placeholder_reader_u16_small {
             fn series_count(&self) -> usize { 0 }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                Err(BioFormatsError::SeriesOutOfRange(s))
+                let _ = s;
+                Err(BioFormatsError::NotInitialized)
             }
 
             fn series(&self) -> usize { 0 }
@@ -157,19 +187,19 @@ macro_rules! placeholder_reader_u16_small {
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
             fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
             fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
         }
@@ -736,23 +766,426 @@ impl FormatReader for FlowSightReader {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Amnis/Luminex IM3 — 64x64 uint16 placeholder
+// 2. Amnis/Luminex IM3 — conservative synthetic raw subset
 // ---------------------------------------------------------------------------
-placeholder_reader_u16_small! {
-    /// Amnis/Luminex IM3 format placeholder reader (`.im3`).
-    pub struct Im3Reader;
-    extensions: ["im3"];
-    magic_bytes: false;
+const SYNTHETIC_IM3_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-IM3-RAW-V1\0";
+const SYNTHETIC_SLIDEBOOK7_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-SLIDEBOOK7-RAW-V1\0";
+const SYNTHETIC_OIR_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-OLYMPUS-OIR-RAW-V1\0";
+const SYNTHETIC_VOLOCITY_CLIPPING_MAGIC: &[u8] =
+    b"BIOFORMATS-RS-SYNTHETIC-VOLOCITY-CLIPPING-RAW-V1\0";
+const SYNTHETIC_IVISION_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-IVISION-IPM-RAW-V1\0";
+const SYNTHETIC_RAW_TRAILER_LEN: usize = 24;
+const SYNTHETIC_RAW_U8: u16 = 1;
+const SYNTHETIC_RAW_U16: u16 = 2;
+
+#[derive(Clone, Copy)]
+struct SyntheticRawSpec {
+    format_name: &'static str,
+    unsupported_message: &'static str,
+    extension: &'static str,
+    magic: &'static [u8],
+}
+
+#[derive(Clone, Copy)]
+struct SyntheticRawLayout {
+    payload_offset: u64,
+    plane_len: usize,
+}
+
+struct SyntheticRawState {
+    path: PathBuf,
+    meta: ImageMetadata,
+    layout: SyntheticRawLayout,
+}
+
+impl SyntheticRawSpec {
+    fn matches_name(self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        ext.as_deref() == Some(self.extension)
+    }
+
+    fn matches_bytes(self, header: &[u8]) -> bool {
+        header.starts_with(self.magic)
+    }
+}
+
+fn synthetic_raw_unsupported(spec: SyntheticRawSpec) -> BioFormatsError {
+    BioFormatsError::UnsupportedFormat(spec.unsupported_message.to_string())
+}
+
+fn synthetic_raw_pixel_type(spec: SyntheticRawSpec, code: u16) -> Result<(PixelType, u8)> {
+    match code {
+        SYNTHETIC_RAW_U8 => Ok((PixelType::Uint8, 8)),
+        SYNTHETIC_RAW_U16 => Ok((PixelType::Uint16, 16)),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "{} synthetic raw unsupported pixel type code {other}",
+            spec.format_name
+        ))),
+    }
+}
+
+fn checked_nonzero_dimension(spec: SyntheticRawSpec, label: &str, value: u32) -> Result<u32> {
+    if value == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{} synthetic raw {label} must be non-zero",
+            spec.format_name
+        )));
+    }
+    Ok(value)
+}
+
+fn checked_mul_usize(spec: SyntheticRawSpec, lhs: usize, rhs: usize, label: &str) -> Result<usize> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        BioFormatsError::Format(format!(
+            "{} synthetic raw {label} overflows",
+            spec.format_name
+        ))
+    })
+}
+
+fn parse_synthetic_raw(path: &Path, spec: SyntheticRawSpec) -> Result<SyntheticRawState> {
+    let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut magic = vec![0u8; spec.magic.len()];
+    match file.read_exact(&mut magic) {
+        Ok(()) if magic == spec.magic => {}
+        Ok(()) => return Err(synthetic_raw_unsupported(spec)),
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+            return Err(synthetic_raw_unsupported(spec));
+        }
+        Err(err) => return Err(BioFormatsError::Io(err)),
+    }
+
+    let mut trailer = [0u8; SYNTHETIC_RAW_TRAILER_LEN];
+    match file.read_exact(&mut trailer) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+            return Err(BioFormatsError::Format(format!(
+                "{} synthetic raw header is truncated",
+                spec.format_name
+            )));
+        }
+        Err(err) => return Err(BioFormatsError::Io(err)),
+    }
+
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes([
+            trailer[offset],
+            trailer[offset + 1],
+            trailer[offset + 2],
+            trailer[offset + 3],
+        ])
+    };
+    let size_x = checked_nonzero_dimension(spec, "width", read_u32(0))?;
+    let size_y = checked_nonzero_dimension(spec, "height", read_u32(4))?;
+    let size_z = checked_nonzero_dimension(spec, "Z size", read_u32(8))?;
+    let size_c = checked_nonzero_dimension(spec, "channel count", read_u32(12))?;
+    let size_t = checked_nonzero_dimension(spec, "timepoint count", read_u32(16))?;
+    let pixel_code = u16::from_le_bytes([trailer[20], trailer[21]]);
+    let reserved = u16::from_le_bytes([trailer[22], trailer[23]]);
+    if reserved != 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{} synthetic raw reserved header field must be zero",
+            spec.format_name
+        )));
+    }
+    let (pixel_type, bits_per_pixel) = synthetic_raw_pixel_type(spec, pixel_code)?;
+
+    let image_count = size_z
+        .checked_mul(size_c)
+        .and_then(|v| v.checked_mul(size_t))
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "{} synthetic raw image count overflows",
+                spec.format_name
+            ))
+        })?;
+    let samples = checked_mul_usize(spec, size_x as usize, size_y as usize, "plane sample count")?;
+    let plane_len = checked_mul_usize(
+        spec,
+        samples,
+        pixel_type.bytes_per_sample(),
+        "plane byte count",
+    )?;
+    let expected_payload_len =
+        checked_mul_usize(spec, plane_len, image_count as usize, "payload length")?;
+    let payload_offset = (spec.magic.len() + SYNTHETIC_RAW_TRAILER_LEN) as u64;
+    let expected_file_len = payload_offset
+        .checked_add(expected_payload_len as u64)
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "{} synthetic raw file length overflows",
+                spec.format_name
+            ))
+        })?;
+    let actual_file_len = file.metadata().map_err(BioFormatsError::Io)?.len();
+    if actual_file_len != expected_file_len {
+        return Err(BioFormatsError::InvalidData(format!(
+            "{} synthetic raw payload length is {}, expected {expected_payload_len}",
+            spec.format_name,
+            actual_file_len.saturating_sub(payload_offset)
+        )));
+    }
+
+    let meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z,
+        size_c,
+        size_t,
+        pixel_type,
+        bits_per_pixel,
+        image_count,
+        is_little_endian: true,
+        ..ImageMetadata::default()
+    };
+    Ok(SyntheticRawState {
+        path: path.to_path_buf(),
+        meta,
+        layout: SyntheticRawLayout {
+            payload_offset,
+            plane_len,
+        },
+    })
+}
+
+fn has_synthetic_raw_magic(path: &Path, spec: SyntheticRawSpec) -> Result<bool> {
+    let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut magic = vec![0u8; spec.magic.len()];
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(magic == spec.magic),
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        Err(err) => Err(BioFormatsError::Io(err)),
+    }
+}
+
+fn synthetic_raw_open_bytes(
+    state: &SyntheticRawState,
+    spec: SyntheticRawSpec,
+    p: u32,
+) -> Result<Vec<u8>> {
+    if p >= state.meta.image_count {
+        return Err(BioFormatsError::PlaneOutOfRange(p));
+    }
+    let offset = state
+        .layout
+        .payload_offset
+        .checked_add(
+            (p as u64)
+                .checked_mul(state.layout.plane_len as u64)
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "{} synthetic raw plane offset overflows",
+                        spec.format_name
+                    ))
+                })?,
+        )
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "{} synthetic raw plane offset overflows",
+                spec.format_name
+            ))
+        })?;
+    let mut reader = BufReader::new(File::open(&state.path).map_err(BioFormatsError::Io)?);
+    read_bytes_at(&mut reader, offset, state.layout.plane_len)
+}
+
+fn synthetic_raw_open_bytes_region(
+    state: &SyntheticRawState,
+    spec: SyntheticRawSpec,
+    p: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    let full = synthetic_raw_open_bytes(state, spec, p)?;
+    crop_full_plane(spec.format_name, &full, &state.meta, 1, x, y, w, h)
+}
+
+/// Amnis/Luminex IM3 format reader (`.im3`).
+pub struct Im3Reader {
+    state: Option<SyntheticRawState>,
+}
+
+impl Im3Reader {
+    pub fn new() -> Self {
+        Self { state: None }
+    }
+
+    fn spec() -> SyntheticRawSpec {
+        SyntheticRawSpec {
+            format_name: "IM3",
+            unsupported_message: "IM3 proprietary native decoding is unsupported; explicit synthetic raw fixtures are supported",
+            extension: "im3",
+            magic: SYNTHETIC_IM3_MAGIC,
+        }
+    }
+}
+
+impl Default for Im3Reader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for Im3Reader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        Self::spec().matches_name(path)
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::spec().matches_bytes(header)
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.state = Some(parse_synthetic_raw(path, Self::spec())?);
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.state = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        usize::from(self.state.is_some())
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.state.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.state
+            .as_ref()
+            .map(|state| &state.meta)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes(state, Self::spec(), p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes_region(state, Self::spec(), p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        let meta = self.metadata();
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(p, tx, ty, tw, th)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 3. 3i SlideBook 7 — 64x64 uint16 placeholder
+// 3. 3i SlideBook 7 — conservative synthetic raw subset
 // ---------------------------------------------------------------------------
-placeholder_reader_u16_small! {
-    /// 3i SlideBook 7 format placeholder reader (`.sld`).
-    pub struct SlideBook7Reader;
-    extensions: ["sld"];
-    magic_bytes: false;
+/// 3i SlideBook 7 format reader (`.sld`).
+pub struct SlideBook7Reader {
+    state: Option<SyntheticRawState>,
+}
+
+impl SlideBook7Reader {
+    pub fn new() -> Self {
+        Self { state: None }
+    }
+
+    fn spec() -> SyntheticRawSpec {
+        SyntheticRawSpec {
+            format_name: "SlideBook 7",
+            unsupported_message: "SlideBook 7 proprietary native decoding is unsupported; explicit synthetic raw fixtures are supported",
+            extension: "sld",
+            magic: SYNTHETIC_SLIDEBOOK7_MAGIC,
+        }
+    }
+}
+
+impl Default for SlideBook7Reader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for SlideBook7Reader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        Self::spec().matches_name(path)
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::spec().matches_bytes(header)
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.state = Some(parse_synthetic_raw(path, Self::spec())?);
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.state = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        usize::from(self.state.is_some())
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.state.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.state
+            .as_ref()
+            .map(|state| &state.meta)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes(state, Self::spec(), p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes_region(state, Self::spec(), p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        let meta = self.metadata();
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(p, tx, ty, tw, th)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -954,19 +1387,21 @@ impl FormatReader for NdpisReader {
 // 5. iVision IPM
 // ---------------------------------------------------------------------------
 /// iVision format reader (`.ipm`).
-///
-/// iVision is a proprietary format from BioVision Technologies with
-/// undocumented binary structure.
 pub struct IvisionReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    state: Option<SyntheticRawState>,
 }
 
 impl IvisionReader {
     pub fn new() -> Self {
-        IvisionReader {
-            path: None,
-            meta: None,
+        Self { state: None }
+    }
+
+    fn spec() -> SyntheticRawSpec {
+        SyntheticRawSpec {
+            format_name: "iVision IPM",
+            unsupported_message: "iVision IPM is a proprietary format from BioVision Technologies",
+            extension: "ipm",
+            magic: SYNTHETIC_IVISION_MAGIC,
         }
     }
 }
@@ -979,38 +1414,34 @@ impl Default for IvisionReader {
 
 impl FormatReader for IvisionReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("ipm"))
+        Self::spec().matches_name(path)
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::spec().matches_bytes(header)
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "iVision IPM is a proprietary format from BioVision Technologies".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.state = Some(parse_synthetic_raw(path, Self::spec())?);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
+        self.state = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.state.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if self.state.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
 
@@ -1019,34 +1450,36 @@ impl FormatReader for IvisionReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
+        self.state
             .as_ref()
+            .map(|state| &state.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "iVision IPM is a proprietary format from BioVision Technologies".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes(state, Self::spec(), plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "iVision IPM is a proprietary format from BioVision Technologies".to_string(),
-        ))
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes_region(state, Self::spec(), plane_index, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "iVision IPM is a proprietary format from BioVision Technologies".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.metadata();
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -1494,16 +1927,26 @@ impl FormatReader for XlefReader {
 /// Olympus OIR uses an OLE2 container; the remaining missing piece is the
 /// proprietary Olympus FluoView stream schema.
 pub struct OirReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    state: Option<SyntheticRawState>,
 }
 
 impl OirReader {
     pub fn new() -> Self {
-        OirReader {
-            path: None,
-            meta: None,
+        OirReader { state: None }
+    }
+
+    fn spec() -> SyntheticRawSpec {
+        SyntheticRawSpec {
+            format_name: "Olympus OIR",
+            unsupported_message:
+                "Olympus OIR format requires proprietary Olympus FluoView stream parsing",
+            extension: "oir",
+            magic: SYNTHETIC_OIR_MAGIC,
         }
+    }
+
+    fn unsupported() -> BioFormatsError {
+        synthetic_raw_unsupported(Self::spec())
     }
 }
 
@@ -1515,35 +1958,53 @@ impl Default for OirReader {
 
 impl FormatReader for OirReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("oir"))
+        Self::spec().matches_name(path)
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::spec().matches_bytes(header)
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Olympus OIR format requires proprietary Olympus FluoView stream parsing".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.state = None;
+        match has_synthetic_raw_magic(path, Self::spec()) {
+            Ok(true) => {
+                self.state = Some(parse_synthetic_raw(path, Self::spec())?);
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(BioFormatsError::Io(err)) if err.kind() == ErrorKind::NotFound => {
+                return Err(Self::unsupported());
+            }
+            Err(err) => return Err(err),
+        }
+
+        match validate_ole2_cfb_header(path, "Olympus OIR") {
+            Ok(()) => Err(Self::unsupported()),
+            Err(BioFormatsError::Io(err)) if err.kind() == ErrorKind::NotFound => {
+                Err(Self::unsupported())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
+        self.state = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.state.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.state.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1551,28 +2012,36 @@ impl FormatReader for OirReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
+        self.state
             .as_ref()
+            .map(|state| &state.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes(state, Self::spec(), plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes_region(state, Self::spec(), plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let meta = self.metadata();
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -2040,8 +2509,8 @@ impl EtsVolume {
         (w, h)
     }
 
-    fn pixel_type(&self) -> PixelType {
-        convert_ets_pixel_type(self.pixel_type_code).unwrap_or(PixelType::Uint8)
+    fn pixel_type(&self) -> Result<PixelType> {
+        convert_ets_pixel_type(self.pixel_type_code)
     }
 
     /// RGB channel count: ETS stores all channels in one tile when sizeC > 1.
@@ -2050,11 +2519,12 @@ impl EtsVolume {
     }
 
     /// Byte length of one decoded tile.
-    fn tile_size(&self) -> usize {
-        self.pixel_type().bytes_per_sample()
-            * self.rgb_channels() as usize
-            * self.tile_x as usize
-            * self.tile_y as usize
+    fn tile_size(&self) -> Result<usize> {
+        let bpp = self.pixel_type()?.bytes_per_sample();
+        bpp.checked_mul(self.rgb_channels() as usize)
+            .and_then(|v| v.checked_mul(self.tile_x as usize))
+            .and_then(|v| v.checked_mul(self.tile_y as usize))
+            .ok_or_else(|| BioFormatsError::Format("cellSens ETS tile byte count overflows".into()))
     }
 
     /// Build the tile coordinate for (resolution, row, col, z, c, t) and look up
@@ -2111,7 +2581,7 @@ impl EtsVolume {
         c: i32,
         t: i32,
     ) -> Result<Vec<u8>> {
-        let tile_size = self.tile_size();
+        let tile_size = self.tile_size()?;
         let Some(index) = self.find_tile(resolution, row, col, z, c, t) else {
             // Fill with background color, like Java.
             let mut tile = vec![0u8; tile_size];
@@ -2127,12 +2597,10 @@ impl EtsVolume {
         };
 
         let (_, offset, n_bytes) = self.tiles[index];
-        // For PNG/BMP the compressed size is the byte count; otherwise read the
-        // full tile_size of raw/codestream bytes.
-        let read_len = match self.compression {
-            ETS_PNG | ETS_BMP => n_bytes as usize,
-            _ => tile_size.max(n_bytes as usize),
-        };
+        // ETS chunk table byte counts define the exact stored tile payload.
+        // RAW counts are validated during parsing; compressed tiles are decoded
+        // from their declared codestream length.
+        let read_len = n_bytes as usize;
         let mut reader = BufReader::new(File::open(&self.path).map_err(BioFormatsError::Io)?);
         let raw = read_bytes_at(&mut reader, offset, read_len)?;
 
@@ -2161,7 +2629,7 @@ impl EtsVolume {
 
         // BGR -> RGB swap for RAW component-order-1 multichannel tiles.
         if self.bgr && self.rgb_channels() >= 3 {
-            let bpp = self.pixel_type().bytes_per_sample();
+            let bpp = self.pixel_type()?.bytes_per_sample();
             let channels = self.rgb_channels() as usize;
             let pixel = bpp * channels;
             for px in buf.chunks_mut(pixel) {
@@ -2183,7 +2651,7 @@ impl EtsVolume {
             .levels
             .get(resolution)
             .ok_or(BioFormatsError::PlaneOutOfRange(0))?;
-        let bpp = self.pixel_type().bytes_per_sample();
+        let bpp = self.pixel_type()?.bytes_per_sample();
         let channels = self.rgb_channels() as usize;
         let pixel = bpp * channels;
         let out_w = level.size_x as usize;
@@ -2250,12 +2718,15 @@ impl EtsVolume {
     }
 
     /// Per-level image metadata.
-    fn level_metadata(&self, resolution: usize) -> Option<ImageMetadata> {
-        let level = self.levels.get(resolution)?;
-        let pt = self.pixel_type();
+    fn level_metadata(&self, resolution: usize) -> Result<ImageMetadata> {
+        let level = self
+            .levels
+            .get(resolution)
+            .ok_or(BioFormatsError::PlaneOutOfRange(resolution as u32))?;
+        let pt = self.pixel_type()?;
         let channels = self.rgb_channels();
         let image_count = level.size_z * level.size_t * (level.size_c / channels.max(1)).max(1);
-        Some(ImageMetadata {
+        Ok(ImageMetadata {
             size_x: level.size_x,
             size_y: level.size_y,
             size_z: level.size_z.max(1),
@@ -2902,23 +3373,27 @@ impl CellSensReader {
     /// ETS is always little-endian.
     fn parse_ets(path: &Path) -> Result<EtsVolume> {
         let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let rd = |off: usize, n: usize| -> Option<&[u8]> { bytes.get(off..off + n) };
-        let u32_at = |off: usize| -> u32 {
-            rd(off, 4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .unwrap_or(0)
+        let rd = |off: usize, n: usize| -> Result<&[u8]> {
+            let end = off.checked_add(n).ok_or_else(|| {
+                BioFormatsError::Format(format!("ETS file {:?}: header offset overflows", path))
+            })?;
+            bytes.get(off..end).ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "ETS file {:?}: truncated header/table at offset {off}",
+                    path
+                ))
+            })
         };
-        let i32_at = |off: usize| -> i32 { u32_at(off) as i32 };
-        let u64_at = |off: usize| -> u64 {
-            rd(off, 8)
-                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-                .unwrap_or(0)
+        let u32_at = |off: usize| -> Result<u32> {
+            rd(off, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let i32_at = |off: usize| -> Result<i32> { Ok(u32_at(off)? as i32) };
+        let u64_at = |off: usize| -> Result<u64> {
+            rd(off, 8).map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         };
 
         // Volume header (offset 0): "SIS" magic, then ints/longs.
-        let magic = String::from_utf8_lossy(rd(0, 4).unwrap_or(&[]))
-            .trim()
-            .to_string();
+        let magic = String::from_utf8_lossy(rd(0, 4)?).trim().to_string();
         if magic != "SIS" {
             return Err(BioFormatsError::Format(format!(
                 "ETS file {:?}: unexpected magic {:?}",
@@ -2927,13 +3402,32 @@ impl CellSensReader {
         }
         // headerSize(4) version(8) nDimensions(12) addHeaderOffset(16, long)
         // addHeaderSize(24) reserved(28) usedChunkOffset(32, long) nUsedChunks(40)
-        let n_dimensions = u32_at(12);
-        let additional_header_offset = u64_at(16) as usize;
-        let used_chunk_offset = u64_at(32) as usize;
-        let n_used_chunks = u32_at(40) as usize;
+        let n_dimensions = u32_at(12)?;
+        if !(2..=16).contains(&n_dimensions) {
+            return Err(BioFormatsError::Format(format!(
+                "ETS file {:?}: unsupported dimension count {n_dimensions}",
+                path
+            )));
+        }
+        let additional_header_offset = usize::try_from(u64_at(16)?).map_err(|_| {
+            BioFormatsError::Format(format!(
+                "ETS file {:?}: additional header offset overflows",
+                path
+            ))
+        })?;
+        let used_chunk_offset = usize::try_from(u64_at(32)?).map_err(|_| {
+            BioFormatsError::Format(format!("ETS file {:?}: used chunk offset overflows", path))
+        })?;
+        let n_used_chunks = u32_at(40)? as usize;
+        if n_used_chunks == 0 {
+            return Err(BioFormatsError::Format(format!(
+                "ETS file {:?}: chunk table must contain at least one tile",
+                path
+            )));
+        }
 
         // Additional header (additionalHeaderOffset): "ETS" magic.
-        let more_magic = String::from_utf8_lossy(rd(additional_header_offset, 4).unwrap_or(&[]))
+        let more_magic = String::from_utf8_lossy(rd(additional_header_offset, 4)?)
             .trim()
             .to_string();
         if more_magic != "ETS" {
@@ -2947,39 +3441,87 @@ impl CellSensReader {
         // skip 4*17 (pixel info hints), color[sizeC*bpp], skip(40-color),
         // componentOrder(int), usePyramid(int).
         let base = additional_header_offset + 8;
-        let pixel_type_code = i32_at(base);
-        let size_c = u32_at(base + 4);
-        let compression = i32_at(base + 12);
-        let tile_x = u32_at(base + 20);
-        let tile_y = u32_at(base + 24);
+        let pixel_type_code = i32_at(base)?;
+        let size_c = u32_at(base + 4)?;
+        let compression = i32_at(base + 12)?;
+        let tile_x = u32_at(base + 20)?;
+        let tile_y = u32_at(base + 24)?;
+        if size_c == 0 || tile_x == 0 || tile_y == 0 {
+            return Err(BioFormatsError::Format(format!(
+                "ETS file {:?}: sizeC and tile dimensions must be non-zero",
+                path
+            )));
+        }
         let pixel_type = convert_ets_pixel_type(pixel_type_code)?;
         let bpp = pixel_type.bytes_per_sample();
+        let expected_tile_size = bpp
+            .checked_mul(size_c as usize)
+            .and_then(|v| v.checked_mul(tile_x as usize))
+            .and_then(|v| v.checked_mul(tile_y as usize))
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!("ETS file {:?}: tile byte count overflows", path))
+            })?;
         // color region begins at base + 32 + 68 = base + 100, always 40 bytes.
         let color_start = base + 32 + 4 * 17;
         let color_len = (size_c as usize).saturating_mul(bpp).min(40);
-        let background = rd(color_start, color_len)
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
-        let component_order = i32_at(color_start + 40);
-        let use_pyramid = i32_at(color_start + 44) != 0;
+        let background = rd(color_start, color_len)?.to_vec();
+        let component_order = i32_at(color_start + 40)?;
+        let use_pyramid = i32_at(color_start + 44)? != 0;
         let bgr = component_order == 1 && compression == ETS_RAW;
 
         // Used-chunk table at usedChunkOffset. Each entry:
         //   skip 4; nDimensions * int coordinate; long offset; int nBytes; skip 4.
+        let entry_len = 4usize
+            .checked_add(n_dimensions as usize * 4)
+            .and_then(|v| v.checked_add(8 + 4 + 4))
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "ETS file {:?}: chunk table length overflows",
+                    path
+                ))
+            })?;
+        let table_len = entry_len.checked_mul(n_used_chunks).ok_or_else(|| {
+            BioFormatsError::Format(format!("ETS file {:?}: chunk table length overflows", path))
+        })?;
+        rd(used_chunk_offset, table_len)?;
         let mut tiles = Vec::with_capacity(n_used_chunks);
         let mut off = used_chunk_offset;
         for _ in 0..n_used_chunks {
             off += 4;
             let mut coord = Vec::with_capacity(n_dimensions as usize);
             for _ in 0..n_dimensions {
-                coord.push(i32_at(off));
+                coord.push(i32_at(off)?);
                 off += 4;
             }
-            let tile_offset = u64_at(off);
+            let tile_offset = u64_at(off)?;
             off += 8;
-            let n_bytes = u32_at(off);
+            let n_bytes = u32_at(off)?;
             off += 4;
             off += 4; // reserved
+            if n_bytes == 0 {
+                return Err(BioFormatsError::Format(format!(
+                    "ETS file {:?}: tile byte count must be non-zero",
+                    path
+                )));
+            }
+            let tile_end = tile_offset.checked_add(n_bytes as u64).ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "ETS file {:?}: tile payload offset overflows",
+                    path
+                ))
+            })?;
+            if tile_end > bytes.len() as u64 {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "ETS file {:?}: tile payload extends past end of file",
+                    path
+                )));
+            }
+            if compression == ETS_RAW && n_bytes as usize != expected_tile_size {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "ETS file {:?}: RAW tile byte count is {}, expected {expected_tile_size}",
+                    path, n_bytes
+                )));
+            }
             tiles.push((coord, tile_offset, n_bytes));
         }
 
@@ -3297,6 +3839,7 @@ impl FormatReader for CellSensReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        let _ = self.close();
         self.inner.set_id(path).map_err(|_| {
             BioFormatsError::UnsupportedFormat(
                 "Olympus cellSens VSI: could not parse as TIFF (may require ETS companion files)"
@@ -3332,7 +3875,7 @@ impl FormatReader for CellSensReader {
                     volume,
                     resolution: 0,
                 };
-                self.ets_meta = self.ets[volume].level_metadata(0);
+                self.ets_meta = Some(self.ets[volume].level_metadata(0)?);
                 Ok(())
             }
             None => Err(BioFormatsError::SeriesOutOfRange(s)),
@@ -3370,7 +3913,7 @@ impl FormatReader for CellSensReader {
                     volume,
                     resolution: level,
                 };
-                self.ets_meta = self.ets[volume].level_metadata(level);
+                self.ets_meta = Some(self.ets[volume].level_metadata(level)?);
                 Ok(())
             }
         }
@@ -3437,16 +3980,26 @@ impl FormatReader for CellSensReader {
 /// Volocity clipping files use OLE2/Compound Document format; the remaining
 /// missing piece is the Volocity-specific stream schema.
 pub struct VolocityClippingReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    state: Option<SyntheticRawState>,
 }
 
 impl VolocityClippingReader {
     pub fn new() -> Self {
-        VolocityClippingReader {
-            path: None,
-            meta: None,
+        VolocityClippingReader { state: None }
+    }
+
+    fn spec() -> SyntheticRawSpec {
+        SyntheticRawSpec {
+            format_name: "Volocity clipping",
+            unsupported_message:
+                "Volocity clipping format requires Volocity-specific OLE2 stream parsing",
+            extension: "acff",
+            magic: SYNTHETIC_VOLOCITY_CLIPPING_MAGIC,
         }
+    }
+
+    fn unsupported() -> BioFormatsError {
+        synthetic_raw_unsupported(Self::spec())
     }
 }
 
@@ -3458,35 +4011,53 @@ impl Default for VolocityClippingReader {
 
 impl FormatReader for VolocityClippingReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("acff"))
+        Self::spec().matches_name(path)
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::spec().matches_bytes(header)
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Volocity clipping format requires Volocity-specific OLE2 stream parsing".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.state = None;
+        match has_synthetic_raw_magic(path, Self::spec()) {
+            Ok(true) => {
+                self.state = Some(parse_synthetic_raw(path, Self::spec())?);
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(BioFormatsError::Io(err)) if err.kind() == ErrorKind::NotFound => {
+                return Err(Self::unsupported());
+            }
+            Err(err) => return Err(err),
+        }
+
+        match validate_ole2_cfb_header(path, "Volocity clipping") {
+            Ok(()) => Err(Self::unsupported()),
+            Err(BioFormatsError::Io(err)) if err.kind() == ErrorKind::NotFound => {
+                Err(Self::unsupported())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
+        self.state = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.state.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.state.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -3494,28 +4065,36 @@ impl FormatReader for VolocityClippingReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
+        self.state
             .as_ref()
+            .map(|state| &state.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes(state, Self::spec(), plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        synthetic_raw_open_bytes_region(state, Self::spec(), plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let meta = self.metadata();
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -3639,6 +4218,7 @@ impl FormatReader for BioRadScnReader {
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         use crate::common::metadata::MetadataValue;
+        self.close()?;
         let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let text = String::from_utf8_lossy(&bytes);
         if !text.contains("Generated by Image Lab") {
@@ -3650,7 +4230,8 @@ impl FormatReader for BioRadScnReader {
         // Walk the MIME-multipart structure to find the pixel block offset and
         // collect text/xml blocks. We track byte offsets so the octet-stream
         // body offset matches the on-disk pixel position.
-        let mut pixels_offset = 0u64;
+        let mut pixels_offset: Option<u64> = None;
+        let mut pixels_length: Option<usize> = None;
         let mut current_type = String::new();
         let mut current_boundary = String::new();
         let mut current_length = 0usize;
@@ -3690,7 +4271,8 @@ impl FormatReader for BioRadScnReader {
                 // A blank line ends the headers of a part; its body follows.
                 let body_offset = (pos + line_len_with_nl) as u64;
                 if current_type == "application/octet-stream" {
-                    pixels_offset = body_offset;
+                    pixels_offset = Some(body_offset);
+                    pixels_length = Some(current_length);
                 } else if current_type == "text/xml" {
                     let start = body_offset as usize;
                     let end = (start + current_length).min(bytes.len());
@@ -3818,7 +4400,54 @@ impl FormatReader for BioRadScnReader {
             );
         }
 
-        meta.image_count = meta.size_z.max(1) * meta.size_t.max(1);
+        if meta.size_x == 0 || meta.size_y == 0 {
+            return Err(BioFormatsError::Format(
+                "Bio-Rad SCN: missing or invalid image dimensions".into(),
+            ));
+        }
+        if meta.size_c == 0 {
+            return Err(BioFormatsError::Format(
+                "Bio-Rad SCN: channel count must be non-zero".into(),
+            ));
+        }
+        let pixels_offset = pixels_offset.ok_or_else(|| {
+            BioFormatsError::Format("Bio-Rad SCN: missing pixel octet-stream part".into())
+        })?;
+        let pixels_length = pixels_length.ok_or_else(|| {
+            BioFormatsError::Format("Bio-Rad SCN: missing pixel octet-stream length".into())
+        })?;
+        let bpp = meta.pixel_type.bytes_per_sample();
+        let plane = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(bpp))
+            .ok_or_else(|| BioFormatsError::Format("Bio-Rad SCN: plane size overflows".into()))?;
+        meta.image_count = meta
+            .size_z
+            .max(1)
+            .checked_mul(meta.size_c.max(1))
+            .and_then(|v| v.checked_mul(meta.size_t.max(1)))
+            .ok_or_else(|| BioFormatsError::Format("Bio-Rad SCN: image count overflows".into()))?;
+        let expected_pixels = plane
+            .checked_mul(meta.image_count as usize)
+            .ok_or_else(|| {
+                BioFormatsError::Format("Bio-Rad SCN: pixel payload size overflows".into())
+            })?;
+        if pixels_length < expected_pixels {
+            return Err(BioFormatsError::Format(format!(
+                "Bio-Rad SCN: pixel payload is {pixels_length} bytes, expected at least {expected_pixels}"
+            )));
+        }
+        let pixel_end = pixels_offset
+            .checked_add(pixels_length as u64)
+            .ok_or_else(|| {
+                BioFormatsError::Format("Bio-Rad SCN: pixel payload end overflows".into())
+            })?;
+        if pixel_end > bytes.len() as u64 {
+            return Err(BioFormatsError::Format(
+                "Bio-Rad SCN: pixel payload extends beyond file".into(),
+            ));
+        }
+
         self.pixels_offset = pixels_offset;
         self.meta = Some(meta);
         self.path = Some(path.to_path_buf());
@@ -3831,7 +4460,7 @@ impl FormatReader for BioRadScnReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
         if s != 0 {
@@ -3853,7 +4482,7 @@ impl FormatReader for BioRadScnReader {
         if p >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(p));
         }
-        let bpp = (meta.bits_per_pixel as usize + 7) / 8;
+        let bpp = meta.pixel_type.bytes_per_sample();
         let plane = meta.size_x as usize * meta.size_y as usize * bpp;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut reader = BufReader::new(File::open(path).map_err(BioFormatsError::Io)?);
@@ -4144,6 +4773,372 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("bioformats_flowsight_{nanos}_{name}.cif"))
+    }
+
+    fn temp_flim2_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_flim2_{nanos}_{name}"))
+    }
+
+    fn write_synthetic_raw(
+        path: &Path,
+        magic: &[u8],
+        dims: (u32, u32, u32, u32, u32),
+        pixel_code: u16,
+        payload: &[u8],
+    ) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(magic);
+        bytes.extend_from_slice(&dims.0.to_le_bytes());
+        bytes.extend_from_slice(&dims.1.to_le_bytes());
+        bytes.extend_from_slice(&dims.2.to_le_bytes());
+        bytes.extend_from_slice(&dims.3.to_le_bytes());
+        bytes.extend_from_slice(&dims.4.to_le_bytes());
+        bytes.extend_from_slice(&pixel_code.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn assert_synthetic_raw_reader<R: FormatReader>(mut reader: R, path: &Path, format_name: &str) {
+        reader.set_id(path).expect("synthetic raw file");
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().size_x, 3);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().size_z, 1);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().size_t, 1);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+        assert_eq!(reader.metadata().bits_per_pixel, 16);
+        assert!(reader.metadata().is_little_endian);
+        assert_eq!(
+            reader.open_bytes(1).unwrap(),
+            [10u16, 11, 12, 13, 14, 15]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
+            [11u16, 12, 14, 15]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            reader.open_bytes(2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+        let err = reader.open_bytes_region(0, 2, 0, 2, 1).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains(format_name)),
+            "unexpected region error: {err:?}"
+        );
+    }
+
+    fn assert_ole2_placeholder_header_validation<R: FormatReader>(
+        mut reader: R,
+        ext: &str,
+        expected_bad_magic: &str,
+        expected_short: &str,
+        expected_unsupported: &str,
+    ) {
+        let short = temp_flim2_path(&format!("short.{ext}"));
+        std::fs::write(&short, [0xd0, 0xcf, 0x11]).unwrap();
+        let err = reader.set_id(&short).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains(expected_short)),
+            "unexpected short-file error: {err:?}"
+        );
+        let _ = std::fs::remove_file(&short);
+
+        let bad = temp_flim2_path(&format!("bad.{ext}"));
+        std::fs::write(&bad, b"not-ole2").unwrap();
+        let err = reader.set_id(&bad).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains(expected_bad_magic)),
+            "unexpected bad-magic error: {err:?}"
+        );
+        let _ = std::fs::remove_file(&bad);
+
+        let cfb = temp_flim2_path(&format!("cfb.{ext}"));
+        std::fs::write(&cfb, OLE2_CFB_MAGIC).unwrap();
+        let err = reader.set_id(&cfb).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains(expected_unsupported)),
+            "unexpected CFB unsupported error: {err:?}"
+        );
+        assert_eq!(reader.series_count(), 0);
+        assert_eq!(reader.metadata().size_x, 0);
+        let _ = std::fs::remove_file(&cfb);
+    }
+
+    #[test]
+    fn oir_and_volocity_clipping_validate_ole2_headers_before_unsupported() {
+        assert_ole2_placeholder_header_validation(
+            OirReader::new(),
+            "oir",
+            "Not an Olympus OIR OLE2 CFB file",
+            "Olympus OIR file is too short for OLE2 CFB header",
+            "Olympus OIR format requires proprietary Olympus FluoView stream parsing",
+        );
+        assert_ole2_placeholder_header_validation(
+            VolocityClippingReader::new(),
+            "acff",
+            "Not a Volocity clipping OLE2 CFB file",
+            "Volocity clipping file is too short for OLE2 CFB header",
+            "Volocity clipping format requires Volocity-specific OLE2 stream parsing",
+        );
+    }
+
+    #[test]
+    fn oir_and_volocity_clipping_read_explicit_synthetic_raw_subsets() {
+        let payload = [0u16, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let oir = temp_flim2_path("synthetic.oir");
+        write_synthetic_raw(
+            &oir,
+            SYNTHETIC_OIR_MAGIC,
+            (3, 2, 1, 2, 1),
+            SYNTHETIC_RAW_U16,
+            &payload,
+        );
+        assert!(OirReader::new().is_this_type_by_name(&oir));
+        assert!(OirReader::new().is_this_type_by_bytes(SYNTHETIC_OIR_MAGIC));
+        assert_synthetic_raw_reader(OirReader::new(), &oir, "Olympus OIR");
+        let _ = std::fs::remove_file(oir);
+
+        let acff = temp_flim2_path("synthetic.acff");
+        write_synthetic_raw(
+            &acff,
+            SYNTHETIC_VOLOCITY_CLIPPING_MAGIC,
+            (3, 2, 1, 2, 1),
+            SYNTHETIC_RAW_U16,
+            &payload,
+        );
+        assert!(VolocityClippingReader::new().is_this_type_by_name(&acff));
+        assert!(
+            VolocityClippingReader::new().is_this_type_by_bytes(SYNTHETIC_VOLOCITY_CLIPPING_MAGIC)
+        );
+        assert_synthetic_raw_reader(VolocityClippingReader::new(), &acff, "Volocity clipping");
+        let _ = std::fs::remove_file(acff);
+    }
+
+    #[test]
+    fn oir_and_volocity_clipping_synthetic_raw_validate_headers_and_payloads() {
+        let zero_width = temp_flim2_path("zero-width.oir");
+        write_synthetic_raw(
+            &zero_width,
+            SYNTHETIC_OIR_MAGIC,
+            (0, 2, 1, 1, 1),
+            SYNTHETIC_RAW_U8,
+            &[0, 1],
+        );
+        let err = OirReader::new().set_id(&zero_width).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("width")),
+            "unexpected zero-width error: {err:?}"
+        );
+        let _ = std::fs::remove_file(zero_width);
+
+        let unsupported_pixel = temp_flim2_path("pixel.acff");
+        write_synthetic_raw(
+            &unsupported_pixel,
+            SYNTHETIC_VOLOCITY_CLIPPING_MAGIC,
+            (1, 1, 1, 1, 1),
+            99,
+            &[0],
+        );
+        let err = VolocityClippingReader::new()
+            .set_id(&unsupported_pixel)
+            .unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("pixel type")),
+            "unexpected pixel type error: {err:?}"
+        );
+        let _ = std::fs::remove_file(unsupported_pixel);
+
+        let short_payload = temp_flim2_path("short-payload.acff");
+        write_synthetic_raw(
+            &short_payload,
+            SYNTHETIC_VOLOCITY_CLIPPING_MAGIC,
+            (2, 2, 1, 1, 1),
+            SYNTHETIC_RAW_U16,
+            &[0, 1],
+        );
+        let err = VolocityClippingReader::new()
+            .set_id(&short_payload)
+            .unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("payload length")),
+            "unexpected payload length error: {err:?}"
+        );
+        let _ = std::fs::remove_file(short_payload);
+    }
+
+    #[test]
+    fn im3_reads_explicit_synthetic_raw_subset() {
+        let path = temp_flim2_path("synthetic.im3");
+        let payload = [0u16, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        write_synthetic_raw(
+            &path,
+            SYNTHETIC_IM3_MAGIC,
+            (3, 2, 1, 2, 1),
+            SYNTHETIC_RAW_U16,
+            &payload,
+        );
+
+        assert!(Im3Reader::new().is_this_type_by_name(&path));
+        assert!(Im3Reader::new().is_this_type_by_bytes(SYNTHETIC_IM3_MAGIC));
+        assert_synthetic_raw_reader(Im3Reader::new(), &path, "IM3");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn slidebook7_reads_explicit_synthetic_raw_subset() {
+        let path = temp_flim2_path("synthetic.sld");
+        let payload = [0u16, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        write_synthetic_raw(
+            &path,
+            SYNTHETIC_SLIDEBOOK7_MAGIC,
+            (3, 2, 1, 2, 1),
+            SYNTHETIC_RAW_U16,
+            &payload,
+        );
+
+        assert!(SlideBook7Reader::new().is_this_type_by_name(&path));
+        assert!(SlideBook7Reader::new().is_this_type_by_bytes(SYNTHETIC_SLIDEBOOK7_MAGIC));
+        assert_synthetic_raw_reader(SlideBook7Reader::new(), &path, "SlideBook 7");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn im3_and_slidebook7_preserve_unsupported_for_nonmatching_files() {
+        let im3 = temp_flim2_path("realish.im3");
+        std::fs::write(&im3, b"not the synthetic im3 raw magic").unwrap();
+        let err = Im3Reader::new().set_id(&im3).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("IM3 proprietary")),
+            "unexpected IM3 unsupported error: {err:?}"
+        );
+        assert!(!Im3Reader::new().is_this_type_by_bytes(b"not the synthetic im3 raw magic"));
+        let _ = std::fs::remove_file(im3);
+
+        let sld = temp_flim2_path("realish.sld");
+        std::fs::write(&sld, b"not the synthetic slidebook raw magic").unwrap();
+        let err = SlideBook7Reader::new().set_id(&sld).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("SlideBook 7 proprietary")),
+            "unexpected SlideBook unsupported error: {err:?}"
+        );
+        assert!(!SlideBook7Reader::new()
+            .is_this_type_by_bytes(b"not the synthetic slidebook raw magic"));
+        let _ = std::fs::remove_file(sld);
+    }
+
+    #[test]
+    fn ivision_reads_explicit_synthetic_raw_subset() {
+        let path = temp_flim2_path("synthetic.ipm");
+        let payload = [0u16, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        write_synthetic_raw(
+            &path,
+            SYNTHETIC_IVISION_MAGIC,
+            (3, 2, 1, 2, 1),
+            SYNTHETIC_RAW_U16,
+            &payload,
+        );
+
+        assert!(IvisionReader::new().is_this_type_by_name(&path));
+        assert!(IvisionReader::new().is_this_type_by_bytes(SYNTHETIC_IVISION_MAGIC));
+        assert_synthetic_raw_reader(IvisionReader::new(), &path, "iVision IPM");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ivision_preserves_unsupported_for_nonmatching_files() {
+        let path = temp_flim2_path("realish.ipm");
+        std::fs::write(&path, b"not the synthetic ivision raw magic").unwrap();
+        let err = IvisionReader::new().set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("iVision IPM")),
+            "unexpected iVision unsupported error: {err:?}"
+        );
+        assert!(!IvisionReader::new().is_this_type_by_bytes(b"not the synthetic ivision raw magic"));
+        let mut reader = IvisionReader::new();
+        assert_eq!(reader.series_count(), 0);
+        assert_eq!(reader.metadata().size_x, 0);
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn synthetic_raw_subset_validates_header_and_payload() {
+        let zero_width = temp_flim2_path("zero-width.im3");
+        write_synthetic_raw(
+            &zero_width,
+            SYNTHETIC_IM3_MAGIC,
+            (0, 2, 1, 1, 1),
+            SYNTHETIC_RAW_U8,
+            &[0, 1],
+        );
+        let err = Im3Reader::new().set_id(&zero_width).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("width")),
+            "unexpected zero-width error: {err:?}"
+        );
+        let _ = std::fs::remove_file(zero_width);
+
+        let unsupported_pixel = temp_flim2_path("pixel.im3");
+        write_synthetic_raw(
+            &unsupported_pixel,
+            SYNTHETIC_IM3_MAGIC,
+            (1, 1, 1, 1, 1),
+            99,
+            &[0],
+        );
+        let err = Im3Reader::new().set_id(&unsupported_pixel).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("pixel type")),
+            "unexpected pixel type error: {err:?}"
+        );
+        let _ = std::fs::remove_file(unsupported_pixel);
+
+        let short_payload = temp_flim2_path("short-payload.sld");
+        write_synthetic_raw(
+            &short_payload,
+            SYNTHETIC_SLIDEBOOK7_MAGIC,
+            (2, 2, 1, 1, 1),
+            SYNTHETIC_RAW_U16,
+            &[0, 1],
+        );
+        let err = SlideBook7Reader::new().set_id(&short_payload).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("payload length")),
+            "unexpected payload length error: {err:?}"
+        );
+        let _ = std::fs::remove_file(short_payload);
     }
 
     fn short_entry(tag: u16, value: u16) -> TestEntry {
@@ -4693,6 +5688,146 @@ mod tests {
         };
         // maxX=2 -> (2+1)*100 = 300; maxY=1 -> (1+1)*200 = 400.
         assert_eq!(vol.max_pixel_extent(), (300, 400));
+    }
+
+    fn build_synthetic_ets(
+        n_dimensions: u32,
+        pixel_type_code: i32,
+        size_c: u32,
+        tile_x: u32,
+        tile_y: u32,
+        n_bytes: u32,
+        payload_len: usize,
+    ) -> Vec<u8> {
+        let additional_header_offset = 64usize;
+        let used_chunk_offset = 256usize;
+        let entry_len = 4 + n_dimensions as usize * 4 + 8 + 4 + 4;
+        let tile_offset = used_chunk_offset + entry_len;
+        let mut bytes = vec![0u8; tile_offset + payload_len];
+
+        bytes[0..4].copy_from_slice(b"SIS ");
+        bytes[12..16].copy_from_slice(&n_dimensions.to_le_bytes());
+        bytes[16..24].copy_from_slice(&(additional_header_offset as u64).to_le_bytes());
+        bytes[32..40].copy_from_slice(&(used_chunk_offset as u64).to_le_bytes());
+        bytes[40..44].copy_from_slice(&1u32.to_le_bytes());
+
+        bytes[additional_header_offset..additional_header_offset + 4].copy_from_slice(b"ETS ");
+        let base = additional_header_offset + 8;
+        bytes[base..base + 4].copy_from_slice(&pixel_type_code.to_le_bytes());
+        bytes[base + 4..base + 8].copy_from_slice(&size_c.to_le_bytes());
+        bytes[base + 12..base + 16].copy_from_slice(&ETS_RAW.to_le_bytes());
+        bytes[base + 20..base + 24].copy_from_slice(&tile_x.to_le_bytes());
+        bytes[base + 24..base + 28].copy_from_slice(&tile_y.to_le_bytes());
+
+        let mut off = used_chunk_offset + 4;
+        for coord in [0i32, 0].into_iter().take(n_dimensions as usize) {
+            bytes[off..off + 4].copy_from_slice(&coord.to_le_bytes());
+            off += 4;
+        }
+        bytes[off..off + 8].copy_from_slice(&(tile_offset as u64).to_le_bytes());
+        off += 8;
+        bytes[off..off + 4].copy_from_slice(&n_bytes.to_le_bytes());
+        for (i, b) in bytes[tile_offset..].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        bytes
+    }
+
+    #[test]
+    fn ets_parse_rejects_unsupported_pixel_type_instead_of_fallback() {
+        let path = temp_flim2_path("bad-pixel.ets");
+        std::fs::write(&path, build_synthetic_ets(2, 99, 1, 1, 1, 1, 1)).unwrap();
+
+        let err = CellSensReader::parse_ets(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("pixel type code 99")),
+            "{err:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ets_parse_rejects_malformed_tile_counts_before_metadata() {
+        let short_payload = temp_flim2_path("short-raw-tile.ets");
+        std::fs::write(
+            &short_payload,
+            build_synthetic_ets(2, ETS_PT_USHORT, 1, 2, 2, 2, 2),
+        )
+        .unwrap();
+        let err = CellSensReader::parse_ets(&short_payload).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("RAW tile byte count")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_file(short_payload);
+
+        let truncated_table = temp_flim2_path("truncated-table.ets");
+        let mut bytes = build_synthetic_ets(2, ETS_PT_UCHAR, 1, 1, 1, 1, 1);
+        bytes.truncate(260);
+        std::fs::write(&truncated_table, bytes).unwrap();
+        let err = CellSensReader::parse_ets(&truncated_table).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("truncated header/table")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_file(truncated_table);
+    }
+
+    #[test]
+    fn ets_parse_rejects_zero_dimensions_and_missing_payload() {
+        let zero_tile = temp_flim2_path("zero-tile.ets");
+        std::fs::write(
+            &zero_tile,
+            build_synthetic_ets(2, ETS_PT_UCHAR, 1, 0, 1, 1, 1),
+        )
+        .unwrap();
+        let err = CellSensReader::parse_ets(&zero_tile).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("non-zero")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_file(zero_tile);
+
+        let missing_payload = temp_flim2_path("missing-payload.ets");
+        std::fs::write(
+            &missing_payload,
+            build_synthetic_ets(2, ETS_PT_UCHAR, 1, 2, 2, 4, 2),
+        )
+        .unwrap();
+        let err = CellSensReader::parse_ets(&missing_payload).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("past end of file")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_file(missing_payload);
+    }
+
+    #[test]
+    fn cellsens_failed_set_id_clears_existing_state() {
+        let mut reader = CellSensReader::new();
+        reader.tiff_series = 1;
+        reader.ets.push(EtsVolume {
+            n_dimensions: 2,
+            size_c: 1,
+            tile_x: 1,
+            tile_y: 1,
+            pixel_type_code: ETS_PT_UCHAR,
+            tiles: vec![(vec![0, 0], 0, 1)],
+            ..Default::default()
+        });
+
+        let missing = temp_flim2_path("missing.vsi");
+        let err = reader.set_id(&missing).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("could not parse as TIFF")),
+            "{err:?}"
+        );
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.set_series(0),
+            Err(BioFormatsError::SeriesOutOfRange(0))
+        ));
     }
 
     /// Non-geometry acquisition metadata tags are captured into the pyramid meta

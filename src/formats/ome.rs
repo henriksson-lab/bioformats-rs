@@ -203,28 +203,39 @@ fn child_block<'a>(xml: &'a str, local_name: &str) -> Option<&'a str> {
     Some(&xml[pos..end])
 }
 
-fn attr_u32(tag: &str, attr: &str, default: u32) -> u32 {
-    xml_attr(tag, attr)
+fn attr_required_nonzero_u32(tag: &str, attr: &str) -> Result<u32> {
+    let value = xml_attr(tag, attr)
         .or_else(|| xml_attr(tag, &attr.to_ascii_lowercase()))
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(default)
-        .max(1)
+        .ok_or_else(|| BioFormatsError::Format(format!("OME-XML missing {attr}")))?;
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| BioFormatsError::Format(format!("OME-XML invalid {attr}: {value}")))?;
+    if parsed == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "OME-XML {attr} must be positive"
+        )));
+    }
+    Ok(parsed)
 }
 
-fn dimension_order_from_attr(value: &str) -> DimensionOrder {
-    match value.to_ascii_uppercase().as_str() {
+fn dimension_order_from_attr(value: &str) -> Result<DimensionOrder> {
+    Ok(match value.to_ascii_uppercase().as_str() {
         "XYZCT" => DimensionOrder::XYZCT,
         "XYZTC" => DimensionOrder::XYZTC,
         "XYCZT" => DimensionOrder::XYCZT,
         "XYCTZ" => DimensionOrder::XYCTZ,
         "XYTZC" => DimensionOrder::XYTZC,
         "XYTCZ" => DimensionOrder::XYTCZ,
-        _ => DimensionOrder::XYZCT,
-    }
+        _ => {
+            return Err(BioFormatsError::Format(format!(
+                "OME-XML unsupported DimensionOrder {value}"
+            )));
+        }
+    })
 }
 
-fn pixel_type_from_attr(value: &str) -> (PixelType, u8) {
-    match value.to_ascii_lowercase().as_str() {
+fn pixel_type_from_attr(value: &str) -> Result<(PixelType, u8)> {
+    Ok(match value.to_ascii_lowercase().as_str() {
         "int8" => (PixelType::Int8, 8),
         "uint8" => (PixelType::Uint8, 8),
         "int16" => (PixelType::Int16, 16),
@@ -233,26 +244,36 @@ fn pixel_type_from_attr(value: &str) -> (PixelType, u8) {
         "uint32" => (PixelType::Uint32, 32),
         "float" | "float32" => (PixelType::Float32, 32),
         "double" | "float64" => (PixelType::Float64, 64),
-        _ => (PixelType::Uint8, 8),
-    }
+        _ => {
+            return Err(BioFormatsError::Format(format!(
+                "OME-XML unsupported Type {value}"
+            )))
+        }
+    })
 }
 
-fn channel_samples_per_pixel(pixels_xml: &str, size_c: u32) -> Vec<u32> {
+fn channel_samples_per_pixel(pixels_xml: &str, size_c: u32) -> Result<Vec<u32>> {
     let mut samples = Vec::new();
     for pos in tag_positions(pixels_xml, "Channel") {
         let tag = start_tag_at(pixels_xml, pos);
-        samples.push(
-            xml_attr(tag, "SamplesPerPixel")
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(1)
-                .max(1),
-        );
+        let spp = match xml_attr(tag, "SamplesPerPixel") {
+            Some(value) => value.parse::<u32>().map_err(|_| {
+                BioFormatsError::Format(format!("OME-XML invalid SamplesPerPixel: {value}"))
+            })?,
+            None => 1,
+        };
+        if spp == 0 {
+            return Err(BioFormatsError::Format(
+                "OME-XML SamplesPerPixel must be positive".into(),
+            ));
+        }
+        samples.push(spp);
     }
     while samples.len() < size_c as usize {
         samples.push(1);
     }
     samples.truncate(size_c as usize);
-    samples
+    Ok(samples)
 }
 
 fn parse_bindata_blocks(pixels_xml: &str) -> (Vec<Vec<u8>>, Option<String>) {
@@ -629,20 +650,20 @@ fn parse_ome_xml_series_with_base(
         };
         let pixels_tag = start_tag_at(pixels_xml, 0);
 
-        let size_x = attr_u32(pixels_tag, "SizeX", 1);
-        let size_y = attr_u32(pixels_tag, "SizeY", 1);
-        let size_z = attr_u32(pixels_tag, "SizeZ", 1);
-        let logical_c = attr_u32(pixels_tag, "SizeC", 1);
-        let size_t = attr_u32(pixels_tag, "SizeT", 1);
+        let size_x = attr_required_nonzero_u32(pixels_tag, "SizeX")?;
+        let size_y = attr_required_nonzero_u32(pixels_tag, "SizeY")?;
+        let size_z = attr_required_nonzero_u32(pixels_tag, "SizeZ")?;
+        let logical_c = attr_required_nonzero_u32(pixels_tag, "SizeC")?;
+        let size_t = attr_required_nonzero_u32(pixels_tag, "SizeT")?;
         let type_str = xml_attr(pixels_tag, "Type")
             .or_else(|| xml_attr(pixels_tag, "type"))
-            .unwrap_or_else(|| "uint8".into());
-        let (pixel_type, bpp) = pixel_type_from_attr(&type_str);
+            .ok_or_else(|| BioFormatsError::Format("OME-XML missing Type".into()))?;
+        let (pixel_type, bpp) = pixel_type_from_attr(&type_str)?;
         let dim_order_str = xml_attr(pixels_tag, "DimensionOrder")
             .or_else(|| xml_attr(pixels_tag, "dimensionorder"))
-            .unwrap_or_else(|| "XYZCT".into());
-        let dim_order = dimension_order_from_attr(&dim_order_str);
-        let samples = channel_samples_per_pixel(pixels_xml, logical_c);
+            .ok_or_else(|| BioFormatsError::Format("OME-XML missing DimensionOrder".into()))?;
+        let dim_order = dimension_order_from_attr(&dim_order_str)?;
+        let samples = channel_samples_per_pixel(pixels_xml, logical_c)?;
         let max_spp = samples.iter().copied().max().unwrap_or(1);
         let is_rgb = max_spp > 1;
         let exposed_c = if is_rgb { max_spp } else { logical_c };
@@ -667,6 +688,45 @@ fn parse_ome_xml_series_with_base(
             .ok_or_else(|| BioFormatsError::Format("OME-XML plane count overflow".into()))?;
 
         let (planes, first_bindata_big_endian) = parse_bindata_blocks(pixels_xml);
+        if !planes.is_empty() {
+            let samples_per_plane = if is_rgb { exposed_c as usize } else { 1 };
+            let plane_bytes = (size_x as usize)
+                .checked_mul(size_y as usize)
+                .and_then(|v| v.checked_mul(pixel_type.bytes_per_sample()))
+                .and_then(|v| v.checked_mul(samples_per_plane))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("OME-XML plane byte count overflow".into())
+                })?;
+            let expected_total =
+                plane_bytes
+                    .checked_mul(image_count as usize)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("OME-XML pixel byte count overflow".into())
+                    })?;
+            if planes.len() == 1 {
+                if planes[0].len() < expected_total {
+                    return Err(BioFormatsError::Format(format!(
+                        "OME-XML BinData pixel payload is shorter than expected: {} < {expected_total}",
+                        planes[0].len()
+                    )));
+                }
+            } else {
+                if planes.len() < image_count as usize {
+                    return Err(BioFormatsError::Format(format!(
+                        "OME-XML has {} BinData planes but expected {image_count}",
+                        planes.len()
+                    )));
+                }
+                for (index, plane) in planes.iter().take(image_count as usize).enumerate() {
+                    if plane.len() < plane_bytes {
+                        return Err(BioFormatsError::Format(format!(
+                            "OME-XML BinData plane {index} is shorter than expected: {} < {plane_bytes}",
+                            plane.len()
+                        )));
+                    }
+                }
+            }
+        }
         let pixels_big_endian =
             xml_attr(pixels_tag, "BigEndian").or_else(|| xml_attr(pixels_tag, "bigendian"));
         let mut is_big_endian = pixels_big_endian
@@ -683,6 +743,15 @@ fn parse_ome_xml_series_with_base(
         if !inline_pixels_present {
             let tiff_data = parse_tiff_data(pixels_xml);
             if !tiff_data.is_empty() {
+                for td in &tiff_data {
+                    if let Some(filename) = td.filename.as_deref() {
+                        if resolve_companion(base_dir, filename).is_none() {
+                            return Err(BioFormatsError::Format(format!(
+                                "OME-XML companion TIFF not found: {filename}"
+                            )));
+                        }
+                    }
+                }
                 external_planes = build_external_plane_map(
                     &tiff_data,
                     base_dir,
@@ -782,6 +851,7 @@ impl FormatReader for OmeXmlReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let xml = fs::read_to_string(path).map_err(BioFormatsError::Io)?;
         // Companion TIFFs referenced from <UUID FileName="..."> are resolved
         // relative to the directory containing the .ome file.
@@ -1292,15 +1362,18 @@ mod tests {
     }
 
     #[test]
-    fn missing_external_region_is_bounds_checked() {
+    fn missing_external_companion_is_rejected_before_metadata() {
         let path = temp_path("missing_external.ome");
         let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="2" SizeY="2" SizeZ="1" SizeC="1" SizeT="1"><TiffData IFD="0" PlaneCount="1"><UUID FileName="missing.tif">urn:uuid:missing</UUID></TiffData></Pixels></Image></OME>"#;
         std::fs::write(&path, xml).unwrap();
 
         let mut reader = OmeXmlReader::new();
-        reader.set_id(&path).unwrap();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("companion TIFF not found"),
+            "{err:?}"
+        );
 
-        assert!(reader.open_bytes_region(0, 2, 0, 1, 1).is_err());
         let _ = std::fs::remove_file(path);
     }
 

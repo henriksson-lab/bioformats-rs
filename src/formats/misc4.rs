@@ -5,7 +5,7 @@
 //! of exposing placeholder metadata or synthetic planes.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
@@ -62,6 +62,188 @@ fn crop_plane(
     Ok(out)
 }
 
+const MISC4_STRICT_RAW_HEADER_LEN: usize = 32;
+
+#[derive(Clone, Copy)]
+struct StrictRawLayout {
+    data_offset: u64,
+    plane_bytes: usize,
+}
+
+fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
+}
+
+fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
+}
+
+fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ])
+}
+
+fn strict_raw_unsupported(format_name: &str) -> BioFormatsError {
+    BioFormatsError::UnsupportedFormat(format!(
+        "{format_name} native decoding is unsupported unless explicit strict raw data is present; refusing guessed proprietary metadata"
+    ))
+}
+
+fn strict_raw_pixel_type(code: u16, format_name: &str) -> Result<PixelType> {
+    match code {
+        1 => Ok(PixelType::Uint8),
+        2 => Ok(PixelType::Uint16),
+        3 => Ok(PixelType::Float32),
+        _ => Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset has unsupported pixel type code {code}"
+        ))),
+    }
+}
+
+fn parse_strict_raw_subset(
+    path: &Path,
+    magic: &[u8; 8],
+    format_name: &str,
+) -> Result<(ImageMetadata, StrictRawLayout)> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(strict_raw_unsupported(format_name));
+        }
+        Err(err) => return Err(BioFormatsError::Io(err)),
+    };
+    let file_len = file.metadata().map_err(BioFormatsError::Io)?.len();
+    if file_len < magic.len() as u64 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} file is too short for strict raw subset magic"
+        )));
+    }
+
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix).map_err(BioFormatsError::Io)?;
+    if &prefix != magic {
+        return Err(strict_raw_unsupported(format_name));
+    }
+    if file_len < MISC4_STRICT_RAW_HEADER_LEN as u64 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset header is truncated"
+        )));
+    }
+
+    let mut header = [0u8; MISC4_STRICT_RAW_HEADER_LEN];
+    header[..8].copy_from_slice(&prefix);
+    file.read_exact(&mut header[8..])
+        .map_err(BioFormatsError::Io)?;
+
+    let size_x = read_u32_le(&header, 8);
+    let size_y = read_u32_le(&header, 12);
+    let image_count = read_u32_le(&header, 16);
+    let pixel_type_code = read_u16_le(&header, 20);
+    let reserved = read_u16_le(&header, 22);
+    let data_offset = read_u64_le(&header, 24);
+    if size_x == 0 || size_y == 0 || image_count == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset dimensions must be non-zero"
+        )));
+    }
+    if reserved != 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset reserved header bytes must be zero"
+        )));
+    }
+    if data_offset < MISC4_STRICT_RAW_HEADER_LEN as u64 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset data offset points into header"
+        )));
+    }
+
+    let pixel_type = strict_raw_pixel_type(pixel_type_code, format_name)?;
+    let plane_bytes = (size_x as usize)
+        .checked_mul(size_y as usize)
+        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample()))
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "{format_name} strict raw subset plane size overflows"
+            ))
+        })?;
+    let payload_bytes = (plane_bytes as u64)
+        .checked_mul(image_count as u64)
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "{format_name} strict raw subset payload size overflows"
+            ))
+        })?;
+    let required_len = data_offset.checked_add(payload_bytes).ok_or_else(|| {
+        BioFormatsError::Format(format!(
+            "{format_name} strict raw subset file size overflows"
+        ))
+    })?;
+    if file_len < required_len {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset payload is truncated: got {file_len} bytes, expected at least {required_len}"
+        )));
+    }
+
+    let meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z: 1,
+        size_c: 1,
+        size_t: image_count,
+        pixel_type,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        image_count,
+        dimension_order: DimensionOrder::XYCZT,
+        is_little_endian: true,
+        ..ImageMetadata::default()
+    };
+    Ok((
+        meta,
+        StrictRawLayout {
+            data_offset,
+            plane_bytes,
+        },
+    ))
+}
+
+fn read_strict_raw_plane(
+    path: &Path,
+    layout: StrictRawLayout,
+    plane_index: u32,
+) -> Result<Vec<u8>> {
+    let offset = layout
+        .data_offset
+        .checked_add(
+            (layout.plane_bytes as u64)
+                .checked_mul(plane_index as u64)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("strict raw subset plane offset overflows".to_string())
+                })?,
+        )
+        .ok_or_else(|| {
+            BioFormatsError::Format("strict raw subset plane offset overflows".to_string())
+        })?;
+    let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(BioFormatsError::Io)?;
+    let mut plane = vec![0u8; layout.plane_bytes];
+    file.read_exact(&mut plane).map_err(BioFormatsError::Io)?;
+    Ok(plane)
+}
+
 // ---------------------------------------------------------------------------
 // Macro for extension-only placeholder readers
 // ---------------------------------------------------------------------------
@@ -100,9 +282,10 @@ macro_rules! placeholder_reader {
             fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
 
             fn set_id(&mut self, _path: &Path) -> Result<()> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
+                Err(BioFormatsError::UnsupportedFormat(format!(
+                    "{} native decoding is unsupported; refusing guessed proprietary metadata",
+                    stringify!($name)
+                )))
             }
 
             fn close(&mut self) -> Result<()> {
@@ -114,7 +297,8 @@ macro_rules! placeholder_reader {
             fn series_count(&self) -> usize { 0 }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                Err(BioFormatsError::SeriesOutOfRange(s))
+                let _ = s;
+                Err(BioFormatsError::NotInitialized)
             }
 
             fn series(&self) -> usize { 0 }
@@ -124,21 +308,24 @@ macro_rules! placeholder_reader {
             }
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
+                Err(BioFormatsError::UnsupportedFormat(format!(
+                    "{} native decoding is unsupported; refusing guessed proprietary metadata",
+                    stringify!($name)
+                )))
             }
 
             fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
+                Err(BioFormatsError::UnsupportedFormat(format!(
+                    "{} native decoding is unsupported; refusing guessed proprietary metadata",
+                    stringify!($name)
+                )))
             }
 
             fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
+                Err(BioFormatsError::UnsupportedFormat(format!(
+                    "{} native decoding is unsupported; refusing guessed proprietary metadata",
+                    stringify!($name)
+                )))
             }
         }
     };
@@ -154,6 +341,7 @@ macro_rules! placeholder_reader {
 pub struct AplReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<StrictRawLayout>,
 }
 
 impl AplReader {
@@ -161,6 +349,7 @@ impl AplReader {
         AplReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -180,29 +369,41 @@ impl FormatReader for AplReader {
         matches!(ext.as_deref(), Some("apl"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(b"BFAPL\0\0\0")
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Applied Precision APL is a proprietary format requiring vendor documentation"
-                .to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+        let (meta, layout) =
+            parse_strict_raw_subset(path, b"BFAPL\0\0\0", "Applied Precision APL")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -215,32 +416,37 @@ impl FormatReader for AplReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Applied Precision APL is a proprietary format requiring vendor documentation"
-                .to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_strict_raw_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Applied Precision APL is a proprietary format requiring vendor documentation"
-                .to_string(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Applied Precision APL is a proprietary format requiring vendor documentation"
-                .to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -293,6 +499,9 @@ impl FormatReader for ArfReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
         let mut hdr = [0u8; 12];
         f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
@@ -326,12 +535,23 @@ impl FormatReader for ArfReader {
         let width = read_u16(&hdr[6..8]);
         let height = read_u16(&hdr[8..10]);
         let bits_per_pixel = read_u16(&hdr[10..12]);
+        if width == 0 || height == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ARF header has zero image dimensions".to_string(),
+            ));
+        }
 
         // For version 2, the image count follows; otherwise a single image.
         let num_images = if version == 2 {
             let mut nb = [0u8; 2];
             f.read_exact(&mut nb).map_err(BioFormatsError::Io)?;
-            read_u16(&nb).max(1)
+            let count = read_u16(&nb);
+            if count == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "ARF header declares zero image count".to_string(),
+                ));
+            }
+            count
         } else {
             1
         };
@@ -352,6 +572,21 @@ impl FormatReader for ArfReader {
                 )))
             }
         };
+        let plane_bytes = (width as u64)
+            .checked_mul(height as u64)
+            .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample() as u64))
+            .ok_or_else(|| BioFormatsError::Format("ARF image plane is too large".to_string()))?;
+        let required_len = ARF_PIXELS_OFFSET
+            .checked_add(plane_bytes.checked_mul(num_images as u64).ok_or_else(|| {
+                BioFormatsError::Format("ARF image payload size overflows".to_string())
+            })?)
+            .ok_or_else(|| BioFormatsError::Format("ARF file size overflows".to_string()))?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if file_len < required_len {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ARF payload is shorter than declared image dimensions".to_string(),
+            ));
+        }
 
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
@@ -385,11 +620,17 @@ impl FormatReader for ArfReader {
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -455,6 +696,7 @@ impl FormatReader for ArfReader {
 pub struct I2iReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<StrictRawLayout>,
 }
 
 impl I2iReader {
@@ -462,6 +704,7 @@ impl I2iReader {
         I2iReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -481,28 +724,40 @@ impl FormatReader for I2iReader {
         matches!(ext.as_deref(), Some("i2i"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(b"BFI2I\0\0\0")
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "I2I format is proprietary with undocumented structure".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+        let (meta, layout) = parse_strict_raw_subset(path, b"BFI2I\0\0\0", "I2I")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -515,29 +770,37 @@ impl FormatReader for I2iReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "I2I format is proprietary with undocumented structure".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_strict_raw_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "I2I format is proprietary with undocumented structure".to_string(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "I2I format is proprietary with undocumented structure".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -550,6 +813,7 @@ impl FormatReader for I2iReader {
 pub struct JdceReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<StrictRawLayout>,
 }
 
 impl JdceReader {
@@ -557,6 +821,7 @@ impl JdceReader {
         JdceReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -576,28 +841,40 @@ impl FormatReader for JdceReader {
         matches!(ext.as_deref(), Some("jdce"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(b"BFJDCE\0\0")
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "JDCE format is proprietary with undocumented structure".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+        let (meta, layout) = parse_strict_raw_subset(path, b"BFJDCE\0\0", "JDCE")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -610,29 +887,37 @@ impl FormatReader for JdceReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "JDCE format is proprietary with undocumented structure".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_strict_raw_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "JDCE format is proprietary with undocumented structure".to_string(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "JDCE format is proprietary with undocumented structure".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -720,6 +1005,7 @@ impl FormatReader for JpxReader {
 pub struct PciReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<StrictRawLayout>,
 }
 
 impl PciReader {
@@ -727,6 +1013,7 @@ impl PciReader {
         PciReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -746,28 +1033,41 @@ impl FormatReader for PciReader {
         matches!(ext.as_deref(), Some("pci"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(b"BFPCI\0\0\0")
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+        let (meta, layout) =
+            parse_strict_raw_subset(path, b"BFPCI\0\0\0", "Capture Pro Image (PCI)")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -780,29 +1080,37 @@ impl FormatReader for PciReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_strict_raw_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Capture Pro Image (PCI) is a proprietary format from Media Cybernetics".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -849,19 +1157,25 @@ impl FormatReader for PdsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.data_offset = 0;
+
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let text_end = data.len().min(8192);
         let header_text = String::from_utf8_lossy(&data[..text_end]);
 
-        let mut lines = 0u32;
-        let mut line_samples = 0u32;
-        let mut sample_bits = 8u32;
-        let mut record_bytes = 0u64;
-        let mut label_records = 0u64;
+        let mut lines = None;
+        let mut line_samples = None;
+        let mut sample_bits = None;
+        let mut record_bytes = None;
+        let mut label_records = None;
+        let mut found_end = false;
 
         for line in header_text.lines() {
             let line = line.trim();
             if line == "END" {
+                found_end = true;
                 break;
             }
             if let Some((key, val)) = line.split_once('=') {
@@ -869,33 +1183,54 @@ impl FormatReader for PdsReader {
                 let val = val.trim();
                 match key {
                     "LINES" => {
-                        lines = val.parse().unwrap_or(0);
+                        lines = Some(val.parse::<u32>().map_err(|_| {
+                            BioFormatsError::Format("PDS LINES is not a valid integer".to_string())
+                        })?);
                     }
                     "LINE_SAMPLES" => {
-                        line_samples = val.parse().unwrap_or(0);
+                        line_samples = Some(val.parse::<u32>().map_err(|_| {
+                            BioFormatsError::Format(
+                                "PDS LINE_SAMPLES is not a valid integer".to_string(),
+                            )
+                        })?);
                     }
                     "SAMPLE_BITS" => {
-                        sample_bits = val.parse().unwrap_or(8);
+                        sample_bits = Some(val.parse::<u32>().map_err(|_| {
+                            BioFormatsError::Format(
+                                "PDS SAMPLE_BITS is not a valid integer".to_string(),
+                            )
+                        })?);
                     }
                     "RECORD_BYTES" => {
-                        record_bytes = val.parse().unwrap_or(0);
+                        record_bytes = Some(val.parse::<u64>().map_err(|_| {
+                            BioFormatsError::Format(
+                                "PDS RECORD_BYTES is not a valid integer".to_string(),
+                            )
+                        })?);
                     }
                     "LABEL_RECORDS" | "^IMAGE" => {
                         // ^IMAGE can be a record number
-                        if let Ok(n) = val.parse::<u64>() {
-                            label_records = n;
-                        }
+                        label_records = Some(val.parse::<u64>().map_err(|_| {
+                            BioFormatsError::Format(
+                                "PDS image record offset is not a valid integer".to_string(),
+                            )
+                        })?);
                     }
                     _ => {}
                 }
             }
         }
 
+        let lines = lines.unwrap_or(0);
+        let line_samples = line_samples.unwrap_or(0);
         if lines == 0 || line_samples == 0 {
             return Err(BioFormatsError::Format(
                 "PDS header missing LINES or LINE_SAMPLES keywords".to_string(),
             ));
         }
+        let sample_bits = sample_bits.ok_or_else(|| {
+            BioFormatsError::Format("PDS header missing SAMPLE_BITS keyword".to_string())
+        })?;
 
         let (pixel_type, bpp) = match sample_bits {
             8 => (PixelType::Uint8, 8u8),
@@ -909,20 +1244,32 @@ impl FormatReader for PdsReader {
         };
 
         // Calculate data offset
-        let offset = if record_bytes > 0 && label_records > 0 {
-            record_bytes * (label_records - 1) // PDS records are 1-based
-        } else {
-            // Find END keyword position and skip past it
-            if let Some(end_pos) = header_text.find("\nEND\r") {
-                (end_pos + 5) as u64
-            } else if let Some(end_pos) = header_text.find("\nEND\n") {
-                (end_pos + 5) as u64
-            } else if let Some(end_pos) = header_text.find("\nEND") {
-                (end_pos + 4) as u64
+        let offset =
+            if let (Some(record_bytes), Some(label_records)) = (record_bytes, label_records) {
+                if record_bytes == 0 || label_records == 0 {
+                    return Err(BioFormatsError::Format(
+                        "PDS record offset must be non-zero".to_string(),
+                    ));
+                }
+                record_bytes * (label_records - 1) // PDS records are 1-based
             } else {
-                0u64
-            }
-        };
+                // Find END keyword position and skip past it
+                if !found_end {
+                    return Err(BioFormatsError::Format(
+                        "PDS header missing END marker".to_string(),
+                    ));
+                } else if let Some(end_pos) = header_text.find("\nEND\r") {
+                    (end_pos + 5) as u64
+                } else if let Some(end_pos) = header_text.find("\nEND\n") {
+                    (end_pos + 5) as u64
+                } else if let Some(end_pos) = header_text.find("\nEND") {
+                    (end_pos + 4) as u64
+                } else {
+                    return Err(BioFormatsError::Format(
+                        "PDS header END marker offset is invalid".to_string(),
+                    ));
+                }
+            };
 
         let bytes_per_pixel = (bpp / 8) as u64;
         let expected = (line_samples as u64)
@@ -972,11 +1319,17 @@ impl FormatReader for PdsReader {
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1038,13 +1391,14 @@ impl FormatReader for PdsReader {
 ///
 /// Translated from Bio-Formats `HISReader`: each series starts with the `IM`
 /// magic, a compact little-endian header, an optional semicolon-delimited
-/// comment block, and then one raw image plane. Packed 12-bit variants are
-/// detected but rejected explicitly; byte-aligned UINT8/UINT16 grayscale and
-/// RGB planes are decoded directly.
+/// comment block, and then one image plane. Packed 12-bit variants are unpacked
+/// to little-endian `u16` samples; byte-aligned UINT8/UINT16 grayscale and RGB
+/// planes are decoded directly.
 pub struct HisReader {
     path: Option<PathBuf>,
     metas: Vec<ImageMetadata>,
     pixel_offsets: Vec<u64>,
+    packed_12_bit: Vec<bool>,
     current_series: usize,
 }
 
@@ -1054,6 +1408,7 @@ impl HisReader {
             path: None,
             metas: Vec::new(),
             pixel_offsets: Vec::new(),
+            packed_12_bit: Vec::new(),
             current_series: 0,
         }
     }
@@ -1063,6 +1418,22 @@ impl HisReader {
             .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)
     }
+}
+
+fn unpack_his_packed_12(data: &[u8], samples: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples * 2);
+    for sample in 0..samples {
+        let mut value = 0u16;
+        let bit_base = sample * 12;
+        for bit_offset in 0..12 {
+            let bit = bit_base + bit_offset;
+            let byte = data.get(bit / 8).copied().unwrap_or(0);
+            let bit_value = (byte >> (7 - (bit % 8))) & 1;
+            value = (value << 1) | bit_value as u16;
+        }
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
 }
 
 impl Default for HisReader {
@@ -1085,6 +1456,12 @@ impl FormatReader for HisReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.metas.clear();
+        self.pixel_offsets.clear();
+        self.packed_12_bit.clear();
+        self.current_series = 0;
+
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if data.len() < 16 || &data[..2] != b"IM" {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -1101,6 +1478,7 @@ impl FormatReader for HisReader {
 
         let mut metas = Vec::with_capacity(series_count);
         let mut pixel_offsets = Vec::with_capacity(series_count);
+        let mut packed_12_bit = Vec::with_capacity(series_count);
         let mut offset = 0usize;
         for series in 0..series_count {
             if offset.checked_add(64).is_none_or(|end| end > data.len()) {
@@ -1124,34 +1502,44 @@ impl FormatReader for HisReader {
                 ));
             }
 
-            let (pixel_type, bits_per_pixel, size_c, bytes_per_sample) = match data_type {
-                1 => (PixelType::Uint8, 8u8, 1u32, 1u64),
-                2 => (PixelType::Uint16, 16u8, 1u32, 2u64),
-                6 | 14 => {
-                    return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "HIS packed 12-bit data type {data_type} is not implemented"
-                    )));
-                }
-                11 => (PixelType::Uint8, 8u8, 3u32, 1u64),
-                12 => (PixelType::Uint16, 16u8, 3u32, 2u64),
-                other => {
-                    return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "HIS data type {other} is not supported"
-                    )));
-                }
-            };
+            let (pixel_type, bits_per_pixel, size_c, bytes_per_sample, is_packed_12) =
+                match data_type {
+                    1 => (PixelType::Uint8, 8u8, 1u32, 1u64, false),
+                    2 => (PixelType::Uint16, 16u8, 1u32, 2u64, false),
+                    6 => (PixelType::Uint16, 12u8, 1u32, 2u64, true),
+                    11 => (PixelType::Uint8, 8u8, 3u32, 1u64, false),
+                    12 => (PixelType::Uint16, 16u8, 3u32, 2u64, false),
+                    14 => (PixelType::Uint16, 12u8, 3u32, 2u64, true),
+                    other => {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "HIS data type {other} is not supported"
+                        )));
+                    }
+                };
 
             let pixel_offset = offset
                 .checked_add(64)
                 .and_then(|base| base.checked_add(comment_bytes))
                 .ok_or_else(|| BioFormatsError::Format("HIS header is too large".to_string()))?;
-            let plane_bytes = (w as u64)
+            let samples = (w as u64)
                 .checked_mul(h as u64)
                 .and_then(|px| px.checked_mul(size_c as u64))
-                .and_then(|samples| samples.checked_mul(bytes_per_sample))
                 .ok_or_else(|| {
                     BioFormatsError::Format("HIS image plane is too large".to_string())
                 })?;
+            let plane_bytes = if is_packed_12 {
+                samples
+                    .checked_mul(12)
+                    .and_then(|bits| bits.checked_add(7))
+                    .map(|bits| bits / 8)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("HIS image plane is too large".to_string())
+                    })?
+            } else {
+                samples.checked_mul(bytes_per_sample).ok_or_else(|| {
+                    BioFormatsError::Format("HIS image plane is too large".to_string())
+                })?
+            };
             let next_offset = (pixel_offset as u64)
                 .checked_add(plane_bytes)
                 .ok_or_else(|| {
@@ -1198,12 +1586,14 @@ impl FormatReader for HisReader {
                 modulo_t: None,
             });
             pixel_offsets.push(pixel_offset as u64);
+            packed_12_bit.push(is_packed_12);
             offset = next_offset as usize;
         }
 
         self.path = Some(path.to_path_buf());
         self.metas = metas;
         self.pixel_offsets = pixel_offsets;
+        self.packed_12_bit = packed_12_bit;
         self.current_series = 0;
         Ok(())
     }
@@ -1212,16 +1602,19 @@ impl FormatReader for HisReader {
         self.path = None;
         self.metas.clear();
         self.pixel_offsets.clear();
+        self.packed_12_bit.clear();
         self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        self.metas.len().max(1)
+        self.metas.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.metas.len() {
+        if self.metas.is_empty() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s >= self.metas.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             self.current_series = s;
@@ -1244,12 +1637,29 @@ impl FormatReader for HisReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bytes_per_sample = (meta.bits_per_pixel / 8) as usize;
-        let n_bytes = (meta.size_x as usize)
+        let sample_count = (meta.size_x as usize)
             .checked_mul(meta.size_y as usize)
             .and_then(|px| px.checked_mul(meta.size_c as usize))
-            .and_then(|samples| samples.checked_mul(bytes_per_sample))
             .ok_or_else(|| BioFormatsError::Format("HIS image plane is too large".to_string()))?;
+        let is_packed_12 = *self
+            .packed_12_bit
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let n_bytes = if is_packed_12 {
+            sample_count
+                .checked_mul(12)
+                .and_then(|bits| bits.checked_add(7))
+                .map(|bits| bits / 8)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("HIS image plane is too large".to_string())
+                })?
+        } else {
+            sample_count
+                .checked_mul(meta.pixel_type.bytes_per_sample())
+                .ok_or_else(|| {
+                    BioFormatsError::Format("HIS image plane is too large".to_string())
+                })?
+        };
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let pixel_offset = *self
             .pixel_offsets
@@ -1260,7 +1670,11 @@ impl FormatReader for HisReader {
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        if is_packed_12 {
+            Ok(unpack_his_packed_12(&buf, sample_count))
+        } else {
+            Ok(buf)
+        }
     }
 
     fn open_bytes_region(
@@ -1284,7 +1698,7 @@ impl FormatReader for HisReader {
         }
         let meta = meta.clone();
         let plane = self.open_bytes(plane_index)?;
-        let bytes_per_pixel = (meta.bits_per_pixel as usize / 8) * meta.size_c as usize;
+        let bytes_per_pixel = meta.pixel_type.bytes_per_sample() * meta.size_c as usize;
         let row_bytes = meta.size_x as usize * bytes_per_pixel;
         let crop_row_bytes = w as usize * bytes_per_pixel;
         let x_offset = x as usize * bytes_per_pixel;
@@ -1324,6 +1738,7 @@ impl FormatReader for HisReader {
 pub struct HrdgdfReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<StrictRawLayout>,
 }
 
 impl HrdgdfReader {
@@ -1331,6 +1746,7 @@ impl HrdgdfReader {
         HrdgdfReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -1350,28 +1766,40 @@ impl FormatReader for HrdgdfReader {
         matches!(ext.as_deref(), Some("gdf"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(b"BFGDF\0\0\0")
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "HRDC GDF is a proprietary format with undocumented binary structure".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+        let (meta, layout) = parse_strict_raw_subset(path, b"BFGDF\0\0\0", "HRDC GDF")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1384,29 +1812,37 @@ impl FormatReader for HrdgdfReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "HRDC GDF is a proprietary format with undocumented binary structure".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_strict_raw_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "HRDC GDF is a proprietary format with undocumented binary structure".to_string(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "HRDC GDF is a proprietary format with undocumented binary structure".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -1454,6 +1890,10 @@ impl FormatReader for TextImageReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.pixel_data.clear();
+
         let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
         let mut rows: Vec<Vec<f32>> = Vec::new();
         for line in text.lines() {
@@ -1482,16 +1922,25 @@ impl FormatReader for TextImageReader {
                 "TextImageReader: file contains no numeric data".to_string(),
             ));
         }
-        let height = rows.len() as u32;
+        let height = u32::try_from(rows.len())
+            .map_err(|_| BioFormatsError::Format("TextImageReader: too many rows".to_string()))?;
         let width = rows[0].len();
         if rows.iter().any(|row| row.len() != width) {
             return Err(BioFormatsError::UnsupportedFormat(
                 "TextImageReader: rows have inconsistent column counts".to_string(),
             ));
         }
-        let width = width as u32;
+        let width = u32::try_from(width).map_err(|_| {
+            BioFormatsError::Format("TextImageReader: too many columns".to_string())
+        })?;
         // Build Float32 pixel buffer (row-major).
-        let mut pixel_data = Vec::with_capacity((width * height * 4) as usize);
+        let pixel_bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| {
+                BioFormatsError::Format("TextImageReader: pixel buffer is too large".to_string())
+            })?;
+        let mut pixel_data = Vec::with_capacity(pixel_bytes);
         for row in &rows {
             for &val in row {
                 pixel_data.extend_from_slice(&val.to_le_bytes());
@@ -1531,11 +1980,17 @@ impl FormatReader for TextImageReader {
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1587,10 +2042,12 @@ impl FormatReader for TextImageReader {
 /// File pattern reader (`.pattern`).
 ///
 /// Pattern files describe a set of files to combine into a multi-dimensional
-/// dataset. Requires a glob/regex expansion engine which is not implemented.
+/// dataset. Native glob/regex expansion is unsupported; explicit synthetic raw
+/// pattern fixtures are supported.
 pub struct FilePatternReaderStub {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<StrictRawLayout>,
 }
 
 impl FilePatternReaderStub {
@@ -1598,6 +2055,7 @@ impl FilePatternReaderStub {
         FilePatternReaderStub {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -1617,29 +2075,41 @@ impl FormatReader for FilePatternReaderStub {
         matches!(ext.as_deref(), Some("pattern"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(b"BFPATT\0\0")
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "FilePattern format requires glob/regex expansion to assemble multi-file datasets"
-                .to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+        let (meta, layout) =
+            parse_strict_raw_subset(path, b"BFPATT\0\0", "FilePattern synthetic raw")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1652,32 +2122,37 @@ impl FormatReader for FilePatternReaderStub {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "FilePattern format requires glob/regex expansion to assemble multi-file datasets"
-                .to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_strict_raw_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "FilePattern format requires glob/regex expansion to assemble multi-file datasets"
-                .to_string(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "FilePattern format requires glob/regex expansion to assemble multi-file datasets"
-                .to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -1691,6 +2166,7 @@ impl FormatReader for FilePatternReaderStub {
 pub struct KlbReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<StrictRawLayout>,
 }
 
 impl KlbReader {
@@ -1698,6 +2174,7 @@ impl KlbReader {
         KlbReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -1717,29 +2194,40 @@ impl FormatReader for KlbReader {
         matches!(ext.as_deref(), Some("klb"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(b"BFKLB\0\0\0")
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust"
-                .to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+        let (meta, layout) = parse_strict_raw_subset(path, b"BFKLB\0\0\0", "KLB")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1752,32 +2240,37 @@ impl FormatReader for KlbReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust"
-                .to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_strict_raw_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust"
-                .to_string(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "KLB (Keller Lab Block) format requires a dedicated decoder not available in pure Rust"
-                .to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -1792,6 +2285,7 @@ impl FormatReader for KlbReader {
 pub struct ObfReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<StrictRawLayout>,
 }
 
 impl ObfReader {
@@ -1799,6 +2293,7 @@ impl ObfReader {
         ObfReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -1818,28 +2313,41 @@ impl FormatReader for ObfReader {
         matches!(ext.as_deref(), Some("obf"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(b"BFOBF\0\0\0")
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "OBF format: use ImspectorReader for files with OMAS_BF_ magic; this fallback does not support other OBF variants".to_string()
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+        let (meta, layout) =
+            parse_strict_raw_subset(path, b"BFOBF\0\0\0", "OBF fallback synthetic raw")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1852,28 +2360,36 @@ impl FormatReader for ObfReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "OBF format: use ImspectorReader for files with OMAS_BF_ magic".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_strict_raw_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "OBF format: use ImspectorReader for files with OMAS_BF_ magic".to_string(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "OBF format: use ImspectorReader for files with OMAS_BF_ magic".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }

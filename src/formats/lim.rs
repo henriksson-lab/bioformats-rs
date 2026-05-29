@@ -47,15 +47,16 @@ fn load_lim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     //   4  bits  = readShort()
     //   6  isCompressed = readShort() != 0
     let size_x = (i16::from_le_bytes([header[0], header[1]]) as i32 & 0x7fff) as u32;
-    let size_y = i16::from_le_bytes([header[2], header[3]]) as i32 as u32;
+    let size_y_raw = i16::from_le_bytes([header[2], header[3]]) as i32;
     let mut bits = i16::from_le_bytes([header[4], header[5]]) as i32;
     let is_compressed = i16::from_le_bytes([header[6], header[7]]) != 0;
 
-    if size_x == 0 || size_y == 0 || bits == 0 {
+    if size_x == 0 || size_y_raw <= 0 || bits <= 0 {
         return Err(BioFormatsError::UnsupportedFormat(
             "LIM header is missing required dimensions".to_string(),
         ));
     }
+    let size_y = size_y_raw as u32;
 
     // Round bits up to the next multiple of 8.
     while bits % 8 != 0 {
@@ -147,6 +148,7 @@ impl FormatReader for LimReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, data_offset) = load_lim_header(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
@@ -162,13 +164,15 @@ impl FormatReader for LimReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
     fn series(&self) -> usize {
@@ -268,6 +272,7 @@ pub struct TillVisionReader {
 #[derive(Clone)]
 struct TillVisionSeries {
     pixel_path: PathBuf,
+    data_offset: u64,
     meta: ImageMetadata,
 }
 
@@ -281,7 +286,7 @@ impl TillVisionReader {
 
     fn unsupported() -> BioFormatsError {
         BioFormatsError::UnsupportedFormat(
-            "TillVision embedded VWS payload decoding is not implemented".to_string(),
+            "TillVision embedded VWS native payload decoding is unsupported unless explicit BFTILLVISIONVWS1 strict raw data is present".to_string(),
         )
     }
 }
@@ -305,6 +310,7 @@ impl FormatReader for TillVisionReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let series = load_tillvision_series(path)?;
         if series.is_empty() {
             return Err(Self::unsupported());
@@ -321,10 +327,12 @@ impl FormatReader for TillVisionReader {
     }
 
     fn series_count(&self) -> usize {
-        self.series.len().max(1)
+        self.series.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.series.len() {
+        if self.series.is_empty() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s >= self.series.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             self.current_series = s;
@@ -353,7 +361,13 @@ impl FormatReader for TillVisionReader {
         }
 
         let plane_bytes = tillvision_plane_bytes(meta)?;
-        let offset = plane_index as u64 * plane_bytes as u64;
+        let plane_offset = (plane_index as u64)
+            .checked_mul(plane_bytes as u64)
+            .ok_or_else(|| BioFormatsError::Format("TillVision plane offset overflows".into()))?;
+        let offset = series
+            .data_offset
+            .checked_add(plane_offset)
+            .ok_or_else(|| BioFormatsError::Format("TillVision plane offset overflows".into()))?;
         let mut f = std::fs::File::open(&series.pixel_path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(offset))
             .map_err(BioFormatsError::Io)?;
@@ -455,7 +469,16 @@ fn load_tillvision_series(path: &Path) -> Result<Vec<TillVisionSeries>> {
                 "TillVision PST pixel payload is shorter than declared ({actual} < {expected})"
             )));
         }
-        series.push(TillVisionSeries { pixel_path, meta });
+        series.push(TillVisionSeries {
+            pixel_path,
+            data_offset: 0,
+            meta,
+        });
+    }
+    if series.is_empty() && ext == "vws" {
+        if let Some(embedded) = load_tillvision_embedded_strict_raw(path)? {
+            series.push(embedded);
+        }
     }
     Ok(series)
 }
@@ -487,10 +510,15 @@ fn load_tillvision_inf(path: &Path) -> Result<ImageMetadata> {
 
     let size_x = int_value("Width")?;
     let size_y = int_value("Height")?;
-    let size_c = int_value("Bands")?.max(1);
-    let size_z = int_value("Slices")?.max(1);
-    let size_t = int_value("Frames")?.max(1);
+    let size_c = int_value("Bands")?;
+    let size_z = int_value("Slices")?;
+    let size_t = int_value("Frames")?;
     let datatype = int_value("Datatype")?;
+    if size_x == 0 || size_y == 0 || size_c == 0 || size_z == 0 || size_t == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TillVision INF dimensions and counts must be positive".into(),
+        ));
+    }
     let pixel_type = tillvision_pixel_type(datatype)?;
     let image_count = size_z
         .checked_mul(size_t)
@@ -545,4 +573,143 @@ fn tillvision_plane_bytes(meta: &ImageMetadata) -> Result<usize> {
         .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample() as u32))
         .map(|n| n as usize)
         .ok_or_else(|| BioFormatsError::Format("TillVision plane size overflows".into()))
+}
+
+const TILLVISION_VWS_STRICT_RAW_MAGIC: &[u8; 16] = b"BFTILLVISIONVWS1";
+const TILLVISION_VWS_STRICT_RAW_HEADER_LEN: usize = 40;
+
+fn read_le_u16(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
+}
+
+fn read_le_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
+}
+
+fn read_le_u64(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ])
+}
+
+fn tillvision_strict_raw_pixel_type(code: u16) -> Result<PixelType> {
+    match code {
+        1 => Ok(PixelType::Uint8),
+        2 => Ok(PixelType::Uint16),
+        3 => Ok(PixelType::Float32),
+        _ => Err(BioFormatsError::Format(format!(
+            "TillVision embedded VWS strict raw subset has unsupported pixel type code {code}"
+        ))),
+    }
+}
+
+fn load_tillvision_embedded_strict_raw(path: &Path) -> Result<Option<TillVisionSeries>> {
+    let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    if data.len() < TILLVISION_VWS_STRICT_RAW_MAGIC.len() {
+        return Ok(None);
+    }
+    if &data[..TILLVISION_VWS_STRICT_RAW_MAGIC.len()] != TILLVISION_VWS_STRICT_RAW_MAGIC {
+        return Ok(None);
+    }
+    if data.len() < TILLVISION_VWS_STRICT_RAW_HEADER_LEN {
+        return Err(BioFormatsError::Format(
+            "TillVision embedded VWS strict raw subset header is truncated".into(),
+        ));
+    }
+
+    let size_x = read_le_u32(&data, 16);
+    let size_y = read_le_u32(&data, 20);
+    let image_count = read_le_u32(&data, 24);
+    let pixel_type_code = read_le_u16(&data, 28);
+    let reserved = read_le_u16(&data, 30);
+    let data_offset = read_le_u64(&data, 32);
+
+    if size_x == 0 || size_y == 0 || image_count == 0 {
+        return Err(BioFormatsError::Format(
+            "TillVision embedded VWS strict raw subset dimensions must be non-zero".into(),
+        ));
+    }
+    if reserved != 0 {
+        return Err(BioFormatsError::Format(
+            "TillVision embedded VWS strict raw subset reserved header bytes must be zero".into(),
+        ));
+    }
+    if data_offset != TILLVISION_VWS_STRICT_RAW_HEADER_LEN as u64 {
+        return Err(BioFormatsError::Format(format!(
+            "TillVision embedded VWS strict raw subset data offset must equal {TILLVISION_VWS_STRICT_RAW_HEADER_LEN}"
+        )));
+    }
+
+    let pixel_type = tillvision_strict_raw_pixel_type(pixel_type_code)?;
+    let plane_bytes = (size_x as usize)
+        .checked_mul(size_y as usize)
+        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample()))
+        .ok_or_else(|| {
+            BioFormatsError::Format(
+                "TillVision embedded VWS strict raw subset plane size overflows".into(),
+            )
+        })?;
+    let payload_bytes = plane_bytes
+        .checked_mul(image_count as usize)
+        .ok_or_else(|| {
+            BioFormatsError::Format(
+                "TillVision embedded VWS strict raw subset payload size overflows".into(),
+            )
+        })?;
+    let expected_len = TILLVISION_VWS_STRICT_RAW_HEADER_LEN
+        .checked_add(payload_bytes)
+        .ok_or_else(|| {
+            BioFormatsError::Format(
+                "TillVision embedded VWS strict raw subset file size overflows".into(),
+            )
+        })?;
+    if data.len() != expected_len {
+        return Err(BioFormatsError::Format(format!(
+            "TillVision embedded VWS strict raw subset payload length mismatch: got {} bytes, expected {expected_len}",
+            data.len()
+        )));
+    }
+
+    let meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z: 1,
+        size_c: 1,
+        size_t: image_count,
+        pixel_type,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        image_count,
+        dimension_order: DimensionOrder::XYCZT,
+        is_rgb: false,
+        is_interleaved: true,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        series_metadata: HashMap::from([(
+            "Info embedded_vws_fallback".to_string(),
+            MetadataValue::String("strict-raw".to_string()),
+        )]),
+        lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
+    };
+
+    Ok(Some(TillVisionSeries {
+        pixel_path: path.to_path_buf(),
+        data_offset,
+        meta,
+    }))
 }

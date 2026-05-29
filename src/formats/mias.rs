@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -56,6 +56,8 @@ fn checked_payload_len(meta: &ImageMetadata) -> Result<u64> {
 pub struct CellWorxReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    pixels: Vec<u8>,
+    plane_len: usize,
 }
 
 impl CellWorxReader {
@@ -63,6 +65,8 @@ impl CellWorxReader {
         CellWorxReader {
             path: None,
             meta: None,
+            pixels: Vec::new(),
+            plane_len: 0,
         }
     }
 }
@@ -73,47 +77,166 @@ impl Default for CellWorxReader {
     }
 }
 
-fn parse_htd(path: &Path) -> Result<ImageMetadata> {
+#[derive(Debug, Clone, Copy)]
+struct CellWorxLayout {
+    image_count: u32,
+    raw: Option<CellWorxRawLayout>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CellWorxRawLayout {
+    width: u32,
+    height: u32,
+    pixel_type: PixelType,
+    little_endian: bool,
+}
+
+fn parse_htd(path: &Path) -> Result<(CellWorxLayout, Option<String>)> {
     let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-    let mut x_sites = 1u32;
-    let mut y_sites = 1u32;
-    let mut timepoints = 1u32;
-    let mut z_steps = 1u32;
-    let mut wavelengths = 1u32;
+    let mut x_sites = None;
+    let mut y_sites = None;
+    let mut timepoints = None;
+    let mut z_steps = None;
+    let mut wavelengths = None;
+    let mut has_strict_raw_marker = false;
+    let mut raw_width = None;
+    let mut raw_height = None;
+    let mut raw_pixel_type = None;
+    let mut raw_little_endian = None;
+    let mut raw_file = None;
 
     for line in content.lines() {
         let line = line.trim();
-        if let Some(v) = htd_kv(line, "XSites") {
-            if let Ok(n) = v.parse() {
-                x_sites = n;
-            }
+        if line == "BF_CELLWORX_RAW_V1" {
+            has_strict_raw_marker = true;
+        } else if let Some(v) = htd_kv(line, "BioFormatsRaw") {
+            has_strict_raw_marker = parse_bool_htd("BioFormatsRaw", v)?;
+        } else if let Some(v) = htd_kv(line, "XSites") {
+            x_sites = Some(parse_positive_htd_u32("XSites", v)?);
         } else if let Some(v) = htd_kv(line, "YSites") {
-            if let Ok(n) = v.parse() {
-                y_sites = n;
-            }
+            y_sites = Some(parse_positive_htd_u32("YSites", v)?);
         } else if let Some(v) = htd_kv(line, "TimePoints") {
-            if let Ok(n) = v.parse() {
-                timepoints = n;
-            }
+            timepoints = Some(parse_positive_htd_u32("TimePoints", v)?);
         } else if let Some(v) = htd_kv(line, "ZSteps") {
-            if let Ok(n) = v.parse() {
-                z_steps = n;
-            }
+            z_steps = Some(parse_positive_htd_u32("ZSteps", v)?);
         } else if let Some(v) = htd_kv(line, "Wavelengths") {
-            if let Ok(n) = v.parse() {
-                wavelengths = n;
-            }
+            wavelengths = Some(parse_positive_htd_u32("Wavelengths", v)?);
+        } else if let Some(v) = htd_kv(line, "RawWidth") {
+            raw_width = Some(parse_positive_htd_u32("RawWidth", v)?);
+        } else if let Some(v) = htd_kv(line, "RawHeight") {
+            raw_height = Some(parse_positive_htd_u32("RawHeight", v)?);
+        } else if let Some(v) = htd_kv(line, "RawPixelType") {
+            raw_pixel_type = Some(parse_cellworx_pixel_type(v)?);
+        } else if let Some(v) = htd_kv(line, "RawLittleEndian") {
+            raw_little_endian = Some(parse_bool_htd("RawLittleEndian", v)?);
+        } else if let Some(v) = htd_kv(line, "RawFile") {
+            raw_file = Some(v.split(',').next().unwrap_or(v).trim().to_string());
         }
     }
 
-    let image_count = x_sites * y_sites * timepoints * z_steps * wavelengths;
-    let image_count = image_count.max(1);
-    Ok(simple_meta(512, 512, image_count, PixelType::Uint16))
+    let x_sites = x_sites.ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("CellWorX HTD header missing XSites".into())
+    })?;
+    let y_sites = y_sites.ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("CellWorX HTD header missing YSites".into())
+    })?;
+    let timepoints = timepoints.unwrap_or(1);
+    let z_steps = z_steps.unwrap_or(1);
+    let wavelengths = wavelengths.unwrap_or(1);
+    let image_count = x_sites
+        .checked_mul(y_sites)
+        .and_then(|n| n.checked_mul(timepoints))
+        .and_then(|n| n.checked_mul(z_steps))
+        .and_then(|n| n.checked_mul(wavelengths))
+        .ok_or_else(|| BioFormatsError::Format("CellWorX HTD image count overflows".into()))?;
+    let raw = if has_strict_raw_marker {
+        Some(CellWorxRawLayout {
+            width: raw_width.ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "CellWorX strict raw HTD header missing RawWidth".into(),
+                )
+            })?,
+            height: raw_height.ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "CellWorX strict raw HTD header missing RawHeight".into(),
+                )
+            })?,
+            pixel_type: raw_pixel_type.ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "CellWorX strict raw HTD header missing RawPixelType".into(),
+                )
+            })?,
+            little_endian: raw_little_endian.unwrap_or(true),
+        })
+    } else {
+        None
+    };
+
+    Ok((CellWorxLayout { image_count, raw }, raw_file))
 }
 
 fn htd_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let stripped = line.strip_prefix(key)?.trim_start();
     Some(stripped.strip_prefix(',')?.trim_start())
+}
+
+fn parse_positive_htd_u32(key: &str, value: &str) -> Result<u32> {
+    let value = value.split(',').next().unwrap_or(value).trim();
+    let n = value.parse::<u32>().map_err(|_| {
+        BioFormatsError::UnsupportedFormat(format!("CellWorX HTD header has invalid {key}"))
+    })?;
+    if n == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "CellWorX HTD header has zero {key}"
+        )));
+    }
+    Ok(n)
+}
+
+fn parse_bool_htd(key: &str, value: &str) -> Result<bool> {
+    let value = value.split(',').next().unwrap_or(value).trim();
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "CellWorX HTD header has invalid {key}"
+        ))),
+    }
+}
+
+fn parse_cellworx_pixel_type(value: &str) -> Result<PixelType> {
+    let value = value.split(',').next().unwrap_or(value).trim();
+    match value.to_ascii_lowercase().as_str() {
+        "uint8" | "u8" => Ok(PixelType::Uint8),
+        "uint16" | "u16" => Ok(PixelType::Uint16),
+        "int16" | "i16" => Ok(PixelType::Int16),
+        "uint32" | "u32" => Ok(PixelType::Uint32),
+        "int32" | "i32" => Ok(PixelType::Int32),
+        "float32" | "f32" => Ok(PixelType::Float32),
+        _ => Err(BioFormatsError::UnsupportedFormat(
+            "CellWorX strict raw HTD header has unsupported RawPixelType".into(),
+        )),
+    }
+}
+
+fn resolve_cellworx_raw_path(cfg_path: &Path, raw_file: Option<String>) -> Result<PathBuf> {
+    let raw_file = raw_file.ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("CellWorX strict raw HTD header missing RawFile".into())
+    })?;
+    let relative = Path::new(&raw_file);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+    {
+        return Err(BioFormatsError::Format(
+            "CellWorX strict raw RawFile must stay beside the HTD header".into(),
+        ));
+    }
+    Ok(cfg_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(relative))
 }
 
 impl FormatReader for CellWorxReader {
@@ -130,6 +253,7 @@ impl FormatReader for CellWorxReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // If .pnl, look for companion .htd
         let cfg_path = if path
             .extension()
@@ -142,25 +266,60 @@ impl FormatReader for CellWorxReader {
             path.to_path_buf()
         };
 
-        if cfg_path.exists() {
-            let _ = parse_htd(&cfg_path)?;
+        if !cfg_path.exists() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "CellWorX HTD/PNL companion header is missing".to_string(),
+            ));
         }
-        Err(BioFormatsError::UnsupportedFormat(
-            "CellWorX HTD/PNL companion image decoding is not implemented".to_string(),
-        ))
+        let (layout, raw_file) = parse_htd(&cfg_path)?;
+        let Some(raw) = layout.raw else {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "CellWorX HTD/PNL parsed {} declared planes; native companion image payload decoding is unsupported unless explicit BF_CELLWORX_RAW_V1 sidecar fields are present",
+                layout.image_count
+            )));
+        };
+
+        let raw_path = resolve_cellworx_raw_path(&cfg_path, raw_file)?;
+        let mut meta = simple_meta(raw.width, raw.height, layout.image_count, raw.pixel_type);
+        meta.is_little_endian = raw.little_endian;
+        meta.series_metadata.insert(
+            "CellWorX strict raw file".into(),
+            MetadataValue::String(raw_path.to_string_lossy().into_owned()),
+        );
+        let expected = checked_payload_len(&meta)?;
+        let pixels = std::fs::read(&raw_path).map_err(BioFormatsError::Io)?;
+        if pixels.len() as u64 != expected {
+            return Err(BioFormatsError::Format(format!(
+                "CellWorX strict raw payload length {} does not match declared length {expected}",
+                pixels.len()
+            )));
+        }
+        self.plane_len = expected as usize / meta.image_count as usize;
+        self.path = Some(cfg_path);
+        self.meta = Some(meta);
+        self.pixels = pixels;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.pixels.clear();
+        self.plane_len = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
     fn series(&self) -> usize {
         0
@@ -172,23 +331,25 @@ impl FormatReader for CellWorxReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        if plane_index != 0 {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Err(BioFormatsError::UnsupportedFormat(
-            "CellWorX HTD/PNL companion image decoding is not implemented".to_string(),
-        ))
+        let start = plane_index as usize * self.plane_len;
+        Ok(self.pixels[start..start + self.plane_len].to_vec())
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        self.open_bytes(plane_index)
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("CellWorX", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -248,7 +409,11 @@ fn parse_al3d(path: &Path) -> Result<ImageMetadata> {
         0 => PixelType::Uint8,
         1 => PixelType::Uint16,
         2 => PixelType::Float32,
-        _ => PixelType::Uint16,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "AL3D data type {other} is not supported"
+            )));
+        }
     };
     let meta = simple_meta(width, height, depth, pixel_type);
     let required_len = AL3D_DATA_OFFSET
@@ -290,13 +455,15 @@ impl FormatReader for Al3dReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
     fn series(&self) -> usize {
@@ -359,6 +526,7 @@ impl FormatReader for Al3dReader {
 pub struct FeiSerReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    data_offsets: Vec<u64>,
 }
 
 impl FeiSerReader {
@@ -366,6 +534,7 @@ impl FeiSerReader {
         FeiSerReader {
             path: None,
             meta: None,
+            data_offsets: Vec::new(),
         }
     }
 }
@@ -376,35 +545,212 @@ impl Default for FeiSerReader {
     }
 }
 
-fn parse_ser(path: &Path) -> Result<ImageMetadata> {
+#[derive(Debug)]
+struct SerParseResult {
+    meta: ImageMetadata,
+    data_offsets: Vec<u64>,
+}
+
+const SER_MAGIC: u16 = 0x0197;
+const SER_2D_IMAGE_DATA_TYPE: u32 = 0x4122;
+const SER_LONG_OFFSET_VERSION: u16 = 0x0220;
+const SER_2D_ELEMENT_HEADER_LEN: u64 = 50;
+
+fn read_u16_le(data: &[u8], offset: usize, label: &str) -> Result<u16> {
+    let bytes = data.get(offset..offset + 2).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("FEI SER header is too short for {label}"))
+    })?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32_le(data: &[u8], offset: usize, label: &str) -> Result<u32> {
+    let bytes = data.get(offset..offset + 4).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("FEI SER header is too short for {label}"))
+    })?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u64_le(data: &[u8], offset: usize, label: &str) -> Result<u64> {
+    let bytes = data.get(offset..offset + 8).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("FEI SER header is too short for {label}"))
+    })?;
+    Ok(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+fn ser_pixel_type(dtype: u16) -> Result<PixelType> {
+    match dtype {
+        1 => Ok(PixelType::Uint8),
+        2 => Ok(PixelType::Uint16),
+        3 => Ok(PixelType::Uint32),
+        4 => Ok(PixelType::Int8),
+        5 => Ok(PixelType::Int16),
+        6 => Ok(PixelType::Int32),
+        7 => Ok(PixelType::Float32),
+        8 => Ok(PixelType::Float64),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "FEI SER unsupported element pixel type {dtype}"
+        ))),
+    }
+}
+
+fn parse_ser_element_header(data: &[u8], offset: u64) -> Result<(u32, u32, PixelType, u64)> {
+    let offset_usize = usize::try_from(offset)
+        .map_err(|_| BioFormatsError::Format("FEI SER element offset overflows".into()))?;
+    let end = offset
+        .checked_add(SER_2D_ELEMENT_HEADER_LEN)
+        .ok_or_else(|| BioFormatsError::Format("FEI SER element header offset overflows".into()))?;
+    if end > data.len() as u64 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER image element header is shorter than declared".into(),
+        ));
+    }
+    let dtype = read_u16_le(data, offset_usize + 40, "element pixel type")?;
+    let width = read_u32_le(data, offset_usize + 42, "element width")?;
+    let height = read_u32_le(data, offset_usize + 46, "element height")?;
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER image element has zero image dimensions".into(),
+        ));
+    }
+    Ok((width, height, ser_pixel_type(dtype)?, end))
+}
+
+fn parse_ser(path: &Path) -> Result<SerParseResult> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-    if data.len() < 32 {
+    if data.len() < 28 {
         return Err(BioFormatsError::UnsupportedFormat(
             "FEI SER header is too short for safe image decoding".to_string(),
         ));
     }
-    // Bytes 4-5: data type id (LE u16). 1=u8,2=u16,3=u32,4=i8,5=i16,6=i32,7=f32,8=f64
-    let dtype = u16::from_le_bytes([data[4], data[5]]);
-    // Bytes 8-11: total element count (LE u32) — number of frames
-    let n_frames = u32::from_le_bytes([data[8], data[9], data[10], data[11]]).max(1);
-    // Bytes 24-27: width, 28-31: height (LE u32 at those positions in the tag)
-    let width = u32::from_le_bytes([data[24], data[25], data[26], data[27]]).max(1);
-    let height = if data.len() >= 32 {
-        u32::from_le_bytes([data[28], data[29], data[30], data[31]]).max(1)
+    let series_id = read_u16_le(&data, 0, "series id")?;
+    if series_id != SER_MAGIC {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER header is missing 0x0197 magic".into(),
+        ));
+    }
+    let version = read_u16_le(&data, 2, "series version")?;
+    let data_type_id = read_u32_le(&data, 4, "data type id")?;
+    if data_type_id != SER_2D_IMAGE_DATA_TYPE {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "FEI SER only supports 2D image data elements, found type 0x{data_type_id:04x}"
+        )));
+    }
+    let tag_type_id = read_u32_le(&data, 8, "tag type id")?;
+    let total = read_u32_le(&data, 12, "total element count")?;
+    let valid = read_u32_le(&data, 16, "valid element count")?;
+    if total == 0 || valid == 0 || valid > total {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER header has invalid element counts".into(),
+        ));
+    }
+
+    let (offset_array_offset, number_dimensions_offset) = if version >= SER_LONG_OFFSET_VERSION {
+        (read_u64_le(&data, 20, "offset array offset")?, 28usize)
     } else {
-        512
+        (
+            read_u32_le(&data, 20, "offset array offset")? as u64,
+            24usize,
+        )
     };
-    let pixel_type = match dtype {
-        1 => PixelType::Uint8,
-        2 => PixelType::Uint16,
-        3 | 6 => PixelType::Int32,
-        7 => PixelType::Float32,
-        8 => PixelType::Float64,
-        _ => PixelType::Uint16,
+    let number_dimensions = read_u32_le(&data, number_dimensions_offset, "dimension count")?;
+    if number_dimensions > 16 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER header has implausible dimension count".into(),
+        ));
+    }
+    if offset_array_offset == 0 || offset_array_offset >= data.len() as u64 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER offset array is missing or outside the file".into(),
+        ));
+    }
+
+    let offset_size = if version >= SER_LONG_OFFSET_VERSION {
+        8u64
+    } else {
+        4u64
     };
-    let width = if width > 65535 { 512 } else { width };
-    let height = if height > 65535 { 512 } else { height };
-    Ok(simple_meta(width, height, n_frames, pixel_type))
+    let offset_array_bytes = (valid as u64)
+        .checked_mul(offset_size)
+        .ok_or_else(|| BioFormatsError::Format("FEI SER offset array size overflows".into()))?;
+    let offset_array_end = offset_array_offset
+        .checked_add(offset_array_bytes)
+        .ok_or_else(|| BioFormatsError::Format("FEI SER offset array end overflows".into()))?;
+    if offset_array_end > data.len() as u64 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER offset array is shorter than declared".into(),
+        ));
+    }
+
+    let mut data_offsets = Vec::with_capacity(valid as usize);
+    let base = usize::try_from(offset_array_offset)
+        .map_err(|_| BioFormatsError::Format("FEI SER offset array offset overflows".into()))?;
+    for i in 0..valid as usize {
+        let entry_offset = base + i * offset_size as usize;
+        let element_offset = if offset_size == 8 {
+            read_u64_le(&data, entry_offset, "element offset")?
+        } else {
+            read_u32_le(&data, entry_offset, "element offset")? as u64
+        };
+        if element_offset == 0 || element_offset >= data.len() as u64 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FEI SER image element offset is missing or outside the file".into(),
+            ));
+        }
+        data_offsets.push(element_offset);
+    }
+
+    let (width, height, pixel_type, first_payload_offset) =
+        parse_ser_element_header(&data, data_offsets[0])?;
+    let plane_bytes = (width as u64)
+        .checked_mul(height as u64)
+        .and_then(|n| n.checked_mul(pixel_type.bytes_per_sample() as u64))
+        .ok_or_else(|| BioFormatsError::Format("FEI SER plane size overflows".into()))?;
+    let first_payload_end = first_payload_offset
+        .checked_add(plane_bytes)
+        .ok_or_else(|| BioFormatsError::Format("FEI SER payload end overflows".into()))?;
+    if first_payload_end > data.len() as u64 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FEI SER image payload is shorter than declared".into(),
+        ));
+    }
+    for &offset in data_offsets.iter().skip(1) {
+        let (frame_w, frame_h, frame_pixel_type, payload_offset) =
+            parse_ser_element_header(&data, offset)?;
+        if frame_w != width || frame_h != height || frame_pixel_type != pixel_type {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FEI SER mixed image element dimensions or pixel types are not supported".into(),
+            ));
+        }
+        let payload_end = payload_offset
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("FEI SER payload end overflows".into()))?;
+        if payload_end > data.len() as u64 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FEI SER image payload is shorter than declared".into(),
+            ));
+        }
+    }
+
+    let mut meta = simple_meta(width, height, valid, pixel_type);
+    meta.series_metadata.insert(
+        "format".to_string(),
+        MetadataValue::String("FEI SER".to_string()),
+    );
+    meta.series_metadata.insert(
+        "ser_version".to_string(),
+        MetadataValue::Int(version as i64),
+    );
+    meta.series_metadata.insert(
+        "ser_tag_type_id".to_string(),
+        MetadataValue::Int(tag_type_id as i64),
+    );
+    meta.series_metadata.insert(
+        "ser_number_dimensions".to_string(),
+        MetadataValue::Int(number_dimensions as i64),
+    );
+    Ok(SerParseResult { meta, data_offsets })
 }
 
 impl FormatReader for FeiSerReader {
@@ -421,22 +767,32 @@ impl FormatReader for FeiSerReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let _ = parse_ser(path)?;
-        Err(BioFormatsError::UnsupportedFormat(
-            "FEI SER payload decoding is not implemented".to_string(),
-        ))
+        let parsed = parse_ser(path)?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(parsed.meta);
+        self.data_offsets = parsed.data_offsets;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.data_offsets.clear();
         Ok(())
     }
     fn series_count(&self) -> usize {
-        0
+        if self.meta.is_some() {
+            1
+        } else {
+            0
+        }
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_some() && s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
     fn series(&self) -> usize {
         0
@@ -448,23 +804,43 @@ impl FormatReader for FeiSerReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        if plane_index != 0 {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Err(BioFormatsError::UnsupportedFormat(
-            "FEI SER payload decoding is not implemented".to_string(),
-        ))
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        let offset = *self
+            .data_offsets
+            .get(plane_index as usize)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let payload_offset = offset
+            .checked_add(SER_2D_ELEMENT_HEADER_LEN)
+            .ok_or_else(|| BioFormatsError::Format("FEI SER payload offset overflows".into()))?;
+        let plane_bytes =
+            meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample();
+        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(payload_offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; plane_bytes];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        Ok(buf)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        self.open_bytes(plane_index)
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("FEI SER", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -511,7 +887,11 @@ fn parse_oxford(path: &Path) -> Result<ImageMetadata> {
         0 => PixelType::Uint8,
         1 => PixelType::Uint16,
         2 => PixelType::Float32,
-        _ => PixelType::Uint16,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Oxford TOP data type {other} is not supported"
+            )));
+        }
     };
     if width == 0 || height == 0 {
         return Err(BioFormatsError::UnsupportedFormat(
@@ -558,13 +938,13 @@ impl FormatReader for OxfordInstrumentsReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if s == 0 && self.meta.is_some() {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
     fn series(&self) -> usize {
@@ -850,6 +1230,58 @@ impl MiasReader {
         let is_rgb = tm.is_rgb;
         let _ = self.tiff_reader.close();
 
+        for w in &wells {
+            let logical_planes = w
+                .size_z
+                .checked_mul(w.size_t)
+                .and_then(|n| n.checked_mul(w.size_c))
+                .ok_or_else(|| BioFormatsError::Format("MIAS: image count overflows".into()))?;
+            let expected_tiffs = logical_planes
+                .checked_mul(self.tile_rows.max(1))
+                .and_then(|n| n.checked_mul(self.tile_cols.max(1)))
+                .ok_or_else(|| BioFormatsError::Format("MIAS: TIFF count overflows".into()))?;
+            if w.tiffs.len() != expected_tiffs as usize {
+                return Err(BioFormatsError::Format(format!(
+                    "MIAS: well {} references {} TIFF file(s), expected {expected_tiffs}",
+                    w.well_number,
+                    w.tiffs.len()
+                )));
+            }
+            for tiff in &w.tiffs {
+                self.tiff_reader.set_id(tiff)?;
+                let tm = self.tiff_reader.metadata();
+                let (size_x, size_y, this_pixel_type, this_bits, pages) = (
+                    tm.size_x,
+                    tm.size_y,
+                    tm.pixel_type,
+                    tm.bits_per_pixel,
+                    tm.image_count.max(1),
+                );
+                let _ = self.tiff_reader.close();
+                if size_x != tile_w || size_y != tile_h {
+                    return Err(BioFormatsError::Format(format!(
+                        "MIAS: companion TIFF {} has dimensions {}x{}, expected {tile_w}x{tile_h}",
+                        tiff.display(),
+                        size_x,
+                        size_y
+                    )));
+                }
+                if this_pixel_type != pixel_type || this_bits != bits {
+                    return Err(BioFormatsError::Format(format!(
+                        "MIAS: companion TIFF {} has inconsistent pixel type",
+                        tiff.display()
+                    )));
+                }
+                if pages != 1 {
+                    return Err(BioFormatsError::Format(format!(
+                        "MIAS: companion TIFF {} has {} page(s), expected 1",
+                        tiff.display(),
+                        pages
+                    )));
+                }
+            }
+        }
+
         let mut series = Vec::with_capacity(wells.len());
         for w in &wells {
             let size_c = w.size_c * tiff_c;
@@ -863,9 +1295,15 @@ impl MiasReader {
                 crate::common::metadata::MetadataValue::Int(w.well_number),
             );
             let image_count = (w.size_z * w.size_t * w.size_c).max(1);
+            let size_x = tile_w
+                .checked_mul(self.tile_cols)
+                .ok_or_else(|| BioFormatsError::Format("MIAS: mosaic width overflows".into()))?;
+            let size_y = tile_h
+                .checked_mul(self.tile_rows)
+                .ok_or_else(|| BioFormatsError::Format("MIAS: mosaic height overflows".into()))?;
             series.push(ImageMetadata {
-                size_x: tile_w * self.tile_cols,
-                size_y: tile_h * self.tile_rows,
+                size_x,
+                size_y,
                 size_z: w.size_z,
                 size_c,
                 size_t: w.size_t,
@@ -970,6 +1408,7 @@ impl FormatReader for MiasReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // Robustly reject any .tif/.tiff that is not a genuine MIAS dataset so
         // that plain TIFFs fall through to the generic TiffReader. A real MIAS
         // file lives in a Well<xxxx> directory and uses the mode/z/t naming
@@ -1001,10 +1440,13 @@ impl FormatReader for MiasReader {
     }
 
     fn series_count(&self) -> usize {
-        self.series.len().max(1)
+        self.series.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.series.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s >= self.series_count() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {

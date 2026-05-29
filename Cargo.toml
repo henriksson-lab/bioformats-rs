@@ -1,6 +1,6 @@
 [package]
 name = "bioformats"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Pure Rust reimplementation of Bio-Formats — read/write scientific image formats"
 license-file = "LICENSE.txt"

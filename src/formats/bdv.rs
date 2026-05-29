@@ -33,7 +33,7 @@ impl BdvReader {
         BdvReader {
             path: None,
             meta: None,
-            n_resolutions: 1,
+            n_resolutions: 0,
             current_resolution: 0,
             size_t: 1,
             size_c: 1,
@@ -99,6 +99,11 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
                     .filter_map(|s| s.parse().ok())
                     .collect();
                 if parts.len() >= 3 {
+                    if parts[0] == 0 || parts[1] == 0 || parts[2] == 0 {
+                        return Err(BioFormatsError::UnsupportedFormat(
+                            "BDV XML has non-positive size axis".into(),
+                        ));
+                    }
                     size_x = parts[0];
                     size_y = parts[1];
                     size_z = parts[2];
@@ -109,9 +114,22 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
             if let (Some(first_str), Some(last_str)) =
                 (xml_find(&xml_str, "first"), xml_find(&xml_str, "last"))
             {
-                let first: u32 = first_str.parse().unwrap_or(0);
-                let last: u32 = last_str.parse().unwrap_or(0);
-                size_t = last.saturating_sub(first) + 1;
+                let first: u32 = first_str.parse().map_err(|_| {
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "BDV XML has invalid first timepoint {first_str:?}"
+                    ))
+                })?;
+                let last: u32 = last_str.parse().map_err(|_| {
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "BDV XML has invalid last timepoint {last_str:?}"
+                    ))
+                })?;
+                if last < first {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "BDV XML last timepoint {last} precedes first {first}"
+                    )));
+                }
+                size_t = last - first + 1;
                 meta_map.insert(
                     "bdv_timepoint_first".into(),
                     MetadataValue::Int(first as i64),
@@ -139,7 +157,9 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
                 .count() as u32;
         }
         if size_t == 0 {
-            size_t = 1;
+            return Err(BioFormatsError::UnsupportedFormat(
+                "BDV: no timepoint groups found".into(),
+            ));
         }
     }
 
@@ -158,30 +178,35 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
             }
         }
         if size_c == 0 {
-            size_c = 1;
+            return Err(BioFormatsError::UnsupportedFormat(
+                "BDV: no setup groups found under t00000".into(),
+            ));
         }
     }
 
     if size_x == 0 || size_y == 0 || size_z == 0 {
         // Infer from shape of t00000/s00/0/cells
-        if let Ok(ds) = file.dataset("t00000/s00/0/cells") {
-            let shape = ds.shape().unwrap_or_default();
-            if shape.len() == 3 {
-                size_z = shape[0] as u32;
-                size_y = shape[1] as u32;
-                size_x = shape[2] as u32;
-            }
+        let ds = file.dataset("t00000/s00/0/cells").map_err(|e| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "BDV: missing t00000/s00/0/cells for dimension inference: {e}"
+            ))
+        })?;
+        let shape = ds.shape().map_err(|e| {
+            BioFormatsError::Format(format!("BDV: cannot read cells dataset shape: {e}"))
+        })?;
+        if shape.len() != 3 || shape[0] == 0 || shape[1] == 0 || shape[2] == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "BDV: unsupported cells shape {shape:?}"
+            )));
         }
-        if size_x == 0 {
-            size_x = 512;
-        }
-        if size_y == 0 {
-            size_y = 512;
-        }
-        if size_z == 0 {
-            size_z = 1;
-        }
+        size_z = u32::try_from(shape[0])
+            .map_err(|_| BioFormatsError::Format("BDV Z dimension overflows".into()))?;
+        size_y = u32::try_from(shape[1])
+            .map_err(|_| BioFormatsError::Format("BDV Y dimension overflows".into()))?;
+        size_x = u32::try_from(shape[2])
+            .map_err(|_| BioFormatsError::Format("BDV X dimension overflows".into()))?;
     }
+    validate_bdv_cells_dataset(&file, "t00000/s00/0/cells", size_x, size_y, size_z)?;
 
     // ── Count resolution levels from s00/resolutions ────────────────────────
     let n_resolutions: usize = if let Ok(ds) = file.dataset("s00/resolutions") {
@@ -199,20 +224,24 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
                     .iter()
                     .filter(|n| n.parse::<usize>().is_ok())
                     .count();
-                if n > 0 {
-                    n
-                } else {
-                    1
-                }
+                n
             } else {
-                1
+                0
             }
         } else {
-            1
+            0
         }
     };
+    if n_resolutions == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "BDV: no resolution levels found".into(),
+        ));
+    }
 
-    let image_count = size_z * size_c * size_t;
+    let image_count = size_z
+        .checked_mul(size_c)
+        .and_then(|v| v.checked_mul(size_t))
+        .ok_or_else(|| BioFormatsError::Format("BDV image count overflows".into()))?;
     let meta = ImageMetadata {
         size_x,
         size_y,
@@ -257,6 +286,56 @@ fn hdf5_members(
     }
 }
 
+fn hdf5_dtype_size(dtype: hdf5_pure::DType) -> usize {
+    match dtype {
+        hdf5_pure::DType::I16 | hdf5_pure::DType::U16 => 2,
+        hdf5_pure::DType::I8 | hdf5_pure::DType::U8 => 1,
+        hdf5_pure::DType::F32
+        | hdf5_pure::DType::I32
+        | hdf5_pure::DType::U32
+        | hdf5_pure::DType::Enum(_) => 4,
+        hdf5_pure::DType::F64
+        | hdf5_pure::DType::I64
+        | hdf5_pure::DType::U64
+        | hdf5_pure::DType::ObjectReference => 8,
+        hdf5_pure::DType::Array(base, dims) => {
+            hdf5_dtype_size(*base) * dims.iter().copied().product::<u32>() as usize
+        }
+        _ => 0,
+    }
+}
+
+fn validate_bdv_cells_dataset(
+    file: &hdf5_pure::File,
+    path: &str,
+    size_x: u32,
+    size_y: u32,
+    size_z: u32,
+) -> Result<()> {
+    let ds = file
+        .dataset(path)
+        .map_err(|e| BioFormatsError::UnsupportedFormat(format!("BDV: missing {path}: {e}")))?;
+    let dtype_size = ds
+        .dtype()
+        .map(hdf5_dtype_size)
+        .map_err(|e| BioFormatsError::Format(format!("BDV: cannot read dtype for {path}: {e}")))?;
+    if dtype_size != 2 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "BDV: unsupported cells dtype size {dtype_size} for {path}"
+        )));
+    }
+    let shape = ds
+        .shape()
+        .map_err(|e| BioFormatsError::Format(format!("BDV: cannot read shape for {path}: {e}")))?;
+    let declared = [size_z as u64, size_y as u64, size_x as u64];
+    if shape != declared {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "BDV: {path} shape {shape:?} does not match declared {declared:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl FormatReader for BdvReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -273,6 +352,7 @@ impl FormatReader for BdvReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, n_res, size_t, size_c) = parse_bdv(path)?;
         self.meta = Some(meta);
         self.path = Some(path.to_path_buf());
@@ -286,16 +366,19 @@ impl FormatReader for BdvReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.n_resolutions = 1;
+        self.n_resolutions = 0;
         self.current_resolution = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -318,6 +401,9 @@ impl FormatReader for BdvReader {
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if level >= self.n_resolutions {
             return Err(BioFormatsError::Format(format!(
                 "resolution {level} out of range (max {})",

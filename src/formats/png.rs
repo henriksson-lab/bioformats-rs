@@ -134,6 +134,7 @@ impl FormatReader for PngReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         if contains_apng_animation_control(path)? {
             return Err(BioFormatsError::UnsupportedFormat(
                 "animated PNG is not supported; use a still PNG image".into(),
@@ -154,10 +155,10 @@ impl FormatReader for PngReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())

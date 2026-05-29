@@ -293,10 +293,18 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
                 other => other,
             })?;
 
-        let pixel_type = match ds.dtype().map(hdf5_dtype_size).unwrap_or(2) {
+        let dtype_size = ds.dtype().map(hdf5_dtype_size).map_err(|e| {
+            BioFormatsError::Format(format!("CellH5: cannot read dtype for {ds_path}: {e}"))
+        })?;
+        let pixel_type = match dtype_size {
             1 => PixelType::Uint8,
+            2 => PixelType::Uint16,
             4 => PixelType::Uint32,
-            _ => PixelType::Uint16,
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "CellH5: unsupported dtype size {other} for {ds_path}"
+                )));
+            }
         };
         let bytes_per_sample: usize = match pixel_type {
             PixelType::Uint8 => 1,
@@ -318,7 +326,12 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
             size_t,
             pixel_type,
             bits_per_pixel: (bytes_per_sample * 8) as u8,
-            image_count: size_z * size_c * size_t,
+            image_count: size_z
+                .checked_mul(size_c)
+                .and_then(|v| v.checked_mul(size_t))
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!("CellH5: image count overflows for {ds_path}"))
+                })?,
             // Storage is [c, t, z, y, x]: x,y fastest, then z, then t, then c.
             dimension_order: DimensionOrder::XYZTC,
             is_rgb: false,
@@ -384,6 +397,7 @@ impl FormatReader for CellH5Reader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let series = parse_cellh5(path)?;
         self.series = series;
         self.path = Some(path.to_path_buf());

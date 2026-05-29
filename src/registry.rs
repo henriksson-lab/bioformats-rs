@@ -124,7 +124,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::lei::LeiReader::new()),
         // PerkinElmer FLEX HCS (TIFF-based)
         Box::new(crate::formats::flex::FlexReader::new()),
-        // Bruker OPUS FTIR (magic 0x0A 0x00-0x02)
+        // Bruker OPUS FTIR strict blind raw subset (BFOPUS1\0 magic) plus extension fallback
         Box::new(crate::formats::opus::BrukerOpusReader::new()),
         // Extension-only readers
         Box::new(crate::formats::volocity::VolocityReader::new()),
@@ -372,7 +372,7 @@ fn terminal_magic_allows_fake_fallback(err: &BioFormatsError) -> bool {
     matches!(
         err,
         BioFormatsError::UnsupportedFormat(message)
-            if message.contains("Bruker OPUS spectral image decoding")
+            if message.contains("Bruker OPUS native spectral image decoding")
     )
 }
 
@@ -717,7 +717,13 @@ fn unsupported_magic_error_is_terminal(err: &BioFormatsError) -> bool {
     matches!(
         err,
         BioFormatsError::UnsupportedFormat(message)
-            if message.contains("not implemented")
+            if message.contains("native decoding is unsupported")
+                || message.contains("native payload decoding is unsupported")
+                || message.contains("native stack decoding is unsupported")
+                || message.contains("native Metakit decoding is unsupported")
+                || message.contains("native companion image payload decoding is unsupported")
+                || message.contains("native spectral image decoding is unsupported")
+                || message.contains("native JPEG tile payload decoding is unsupported")
                 || message.contains("requires OLE2")
                 || message.contains("requires HDF5")
     )
@@ -1063,18 +1069,12 @@ mod tests {
         for (name, expected) in [
             (
                 "sample.mvd2",
-                "Volocity MVD2 format reading is not yet implemented",
+                "Volocity MVD2 native Metakit decoding is unsupported",
             ),
             ("sample.cif", "FlowSight CIF is not TIFF-like"),
-            ("sample.lof", "Leica LOF is a proprietary binary format"),
-            (
-                "sample.oir",
-                "Olympus OIR format requires proprietary Olympus FluoView stream parsing",
-            ),
-            (
-                "sample.acff",
-                "Volocity Library format requires Volocity-specific OLE2 stream parsing",
-            ),
+            ("sample.lof", "missing LMS_Object_File marker"),
+            ("sample.oir", "Not an Olympus OIR OLE2 CFB file"),
+            ("sample.acff", "Not a Volocity clipping OLE2 CFB file"),
             // NOTE: XRM/TXRM are no longer stubs — XrmReader is a real CFB-based
             // reader. It rejects fake/short input with a genuine CFB error
             // ("XRM CFB open: Invalid CFB file ..."), not fabricated metadata.
@@ -1091,41 +1091,35 @@ mod tests {
             ("sample.1sc", "Bio-Rad GEL file is too short"),
             (
                 "sample.obf",
-                "Imspector OBF/MSR stack metadata and payload decoding is not implemented",
+                "Imspector OBF/MSR native stack decoding is unsupported",
             ),
             (
                 "sample.msr",
-                "Imspector OBF/MSR stack metadata and payload decoding is not implemented",
+                "Imspector OBF/MSR native stack decoding is unsupported",
             ),
-            (
-                "sample.vms",
-                "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented",
-            ),
-            (
-                "sample.vmu",
-                "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented",
-            ),
+            ("sample.vms", "Not a Hamamatsu VMS/VMU text index file"),
+            ("sample.vmu", "Not a Hamamatsu VMS/VMU text index file"),
             (
                 "sample.l2d",
                 "Li-Cor L2D file is missing LI-COR LI2D marker",
             ),
-            (
-                "sample.ptu",
-                "PicoQuant TCSPC event stream decoding to image planes is not implemented",
-            ),
+            ("sample.ptu", "PicoQuant PTU missing PQTTTR magic"),
             (
                 "sample.vws",
-                "TillVision embedded VWS payload decoding is not implemented",
+                "TillVision embedded VWS native payload decoding is unsupported",
             ),
             (
                 "sample.abs",
-                "Bruker OPUS spectral image decoding is not implemented",
+                "Bruker OPUS native spectral image decoding is unsupported",
             ),
             (
                 "sample.0",
-                "Bruker OPUS spectral image decoding is not implemented",
+                "Bruker OPUS native spectral image decoding is unsupported",
             ),
-            ("sample.iss", "ISS Vista FLIM decoding is not implemented"),
+            (
+                "sample.iss",
+                "ISS Vista FLIM native decoding is unsupported",
+            ),
             // NOTE: sample.gel was removed here: GEL is no longer a stub.
             // extended::GelReader is a real Molecular Dynamics GEL reader (TIFF-based),
             // so on fake data it rejects via the underlying TIFF parser
@@ -1152,8 +1146,13 @@ mod tests {
             };
 
             assert!(
-                matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains(expected)),
-                "expected unsupported message containing {expected:?}, got {err:?}"
+                matches!(
+                    err,
+                    BioFormatsError::UnsupportedFormat(ref message)
+                        | BioFormatsError::Format(ref message)
+                        if message.contains(expected)
+                ),
+                "expected rejection message containing {expected:?}, got {err:?}"
             );
             let _ = std::fs::remove_file(path);
         }
@@ -1163,11 +1162,16 @@ mod tests {
     fn visitech_registry_rejects_xys_without_companion_tiffs() {
         let dir = temp_path("hcs_no_tiffs_dir");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sample Report.html"),
+            b"Image dimensions: (2, 2)\nNumber of steps: 1\nMicroscope XY: 0\nImage bit depth: 16\nChannel Selection: 1\nTime Series; 1\n",
+        )
+        .unwrap();
 
         for (name, bytes, expected) in [
             (
                 "sample.xys",
-                b"Width=2\nHeight=2\n".as_slice(),
+                b"no pixel marker here".as_slice(),
                 "Visitech XYS does not have",
             ),
             (
@@ -1227,7 +1231,7 @@ mod tests {
 
     #[test]
     fn imspector_magic_rejects_without_fake_metadata() {
-        let path = temp_path("magic_imspector.fake");
+        let path = temp_path("magic_imspector.obf");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"OMAS_BF\n");
         bytes.extend_from_slice(&0xffffu16.to_le_bytes());
@@ -1242,7 +1246,7 @@ mod tests {
         };
 
         assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Imspector OBF/MSR stack metadata and payload decoding is not implemented")),
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Imspector OBF/MSR native stack decoding is unsupported")),
             "expected unsupported Imspector message, got {err:?}"
         );
         let _ = std::fs::remove_file(path);

@@ -853,6 +853,7 @@ impl FormatReader for MetamorphReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // Determine whether we were given an .nd/.scan companion or an STK.
         let ext = path
             .extension()
@@ -914,11 +915,14 @@ impl FormatReader for MetamorphReader {
     }
 
     fn series_count(&self) -> usize {
-        self.metas.len().max(1)
+        self.metas.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.metas.len().max(1) {
+        if self.metas.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        if s >= self.metas.len() {
             return Err(BioFormatsError::SeriesOutOfRange(s));
         }
         self.series = s;

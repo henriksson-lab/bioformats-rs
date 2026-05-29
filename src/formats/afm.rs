@@ -42,7 +42,7 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
 
     let mut width: Option<u32> = None;
     let mut height: Option<u32> = None;
-    let mut pixel_type = PixelType::Int16;
+    let mut pixel_type: Option<PixelType> = None;
     let mut data_offset: Option<u64> = None;
 
     // Scan for header lines
@@ -71,13 +71,17 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
                 height = Some(v);
             }
         } else if let Some(val) = kv_value(trimmed, "DataType") {
-            pixel_type = match val.to_ascii_lowercase().as_str() {
+            pixel_type = Some(match val.to_ascii_lowercase().as_str() {
                 "int16" | "short" => PixelType::Int16,
                 "uint16" | "ushort" => PixelType::Uint16,
                 "float32" | "float" => PixelType::Float32,
                 "int32" | "long" => PixelType::Int32,
-                _ => PixelType::Int16,
-            };
+                other => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "TopoMetrix unsupported DataType {other}"
+                    )));
+                }
+            });
         }
     }
 
@@ -90,6 +94,7 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
     let data_offset = data_offset.ok_or_else(|| {
         BioFormatsError::UnsupportedFormat("TopoMetrix header missing data marker".into())
     })?;
+    let pixel_type = pixel_type.unwrap_or(PixelType::Int16);
     let bps = pixel_type.bytes_per_sample();
     let plane_bytes = (width as u64)
         .checked_mul(height as u64)
@@ -346,7 +351,7 @@ fn parse_unisoku_hdr(path: &Path) -> Result<(ImageMetadata, PathBuf)> {
                 pixel_type = unisoku_pixel_type_from_ascii_data_type(type_token);
                 if pixel_type.is_none() {
                     return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "Unisoku ASCII data type {type_token} is not implemented"
+                        "Unisoku unsupported ASCII data type {type_token}"
                     )));
                 }
             }
@@ -382,7 +387,11 @@ fn parse_unisoku_hdr(path: &Path) -> Result<(ImageMetadata, PathBuf)> {
             let bits = bits.ok_or_else(|| {
                 BioFormatsError::UnsupportedFormat("Unisoku header missing BIT depth".into())
             })?;
-            if bits <= 16 {
+            if bits == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Unisoku header has invalid BIT depth".into(),
+                ));
+            } else if bits <= 16 {
                 PixelType::Int16
             } else {
                 PixelType::Int32

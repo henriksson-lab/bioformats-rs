@@ -110,6 +110,7 @@ impl FormatReader for SpeReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut hdr = vec![0u8; HEADER_SIZE as usize];
         f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
@@ -213,9 +214,12 @@ impl FormatReader for SpeReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {

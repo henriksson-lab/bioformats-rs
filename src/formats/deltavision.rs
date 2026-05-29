@@ -855,10 +855,12 @@ impl FormatReader for DeltavisionReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        self.series.len().max(1)
+        self.series.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.series_count() {
+        if self.series.is_empty() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s >= self.series_count() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             self.current_series = s;

@@ -85,6 +85,11 @@ fn load_pcx(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
             "PCX: invalid dimensions / plane count".into(),
         ));
     }
+    if bytes_per_line < size_x as usize {
+        return Err(BioFormatsError::InvalidData(
+            "PCX: bytes-per-line is shorter than image width".into(),
+        ));
+    }
 
     // Read the version-5 256-entry palette (located at end of file) for
     // single-plane images, marking the image as indexed.
@@ -208,6 +213,7 @@ impl FormatReader for PcxReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, pixels) = load_pcx(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
@@ -223,10 +229,10 @@ impl FormatReader for PcxReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())

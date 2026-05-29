@@ -417,11 +417,34 @@ impl FormatReader for MrcReader {
         let is_rgb = hdr.mode == 16;
         let spp = if is_rgb { 3u32 } else { 1u32 };
 
-        let nx = hdr.nx.max(0) as u32;
-        let ny = hdr.ny.max(0) as u32;
-        let nz = hdr.nz.max(0) as u32;
+        if hdr.nx <= 0 || hdr.ny <= 0 || hdr.nz <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "MRC header dimensions must be positive: nx={}, ny={}, nz={}",
+                hdr.nx, hdr.ny, hdr.nz
+            )));
+        }
+        let nx = hdr.nx as u32;
+        let ny = hdr.ny as u32;
+        let nz = hdr.nz as u32;
 
         let data_offset = HEADER_SIZE + hdr.extended_header_size.max(0) as u64;
+        let plane_bytes = (nx as u64)
+            .checked_mul(ny as u64)
+            .and_then(|v| v.checked_mul(spp as u64))
+            .and_then(|v| v.checked_mul(pixel_type.bytes_per_sample() as u64))
+            .ok_or_else(|| BioFormatsError::Format("MRC plane byte count overflows".into()))?;
+        let pixel_bytes = plane_bytes
+            .checked_mul(nz as u64)
+            .ok_or_else(|| BioFormatsError::Format("MRC pixel byte count overflows".into()))?;
+        let required_len = data_offset
+            .checked_add(pixel_bytes)
+            .ok_or_else(|| BioFormatsError::Format("MRC pixel payload offset overflows".into()))?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if file_len < required_len {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "MRC pixel payload is shorter than declared: need {required_len} bytes, found {file_len}"
+            )));
+        }
         // Per MRCReader.java the rows are always flipped (lower-left origin).
         let flip_y = true;
 
@@ -465,12 +488,12 @@ impl FormatReader for MrcReader {
         self.meta = Some(ImageMetadata {
             size_x: nx,
             size_y: ny,
-            size_z: nz.max(1),
+            size_z: nz,
             size_c: spp,
             size_t: 1,
             pixel_type,
             bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
-            image_count: nz.max(1),
+            image_count: nz,
             dimension_order: DimensionOrder::XYZTC,
             is_rgb,
             is_interleaved: true,

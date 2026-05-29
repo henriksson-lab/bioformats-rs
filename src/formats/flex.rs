@@ -186,8 +186,15 @@ impl FlexReader {
     /// Parse `<Array Name=.. Factor=..>` arrays and derive factors / widening.
     /// Returns the factor vector (`None` when all factors are 1) and updates
     /// `scaled_pixel_type` from the largest factor (Java semantics).
-    fn derive_factors(&mut self, total_planes: usize) -> Option<Vec<f64>> {
-        let mut xml = self.flex_xml()?;
+    fn derive_factors(&mut self, total_planes: usize) -> Result<Option<Vec<f64>>> {
+        if total_planes == 0 {
+            return Err(BioFormatsError::Format(
+                "Flex: TIFF file has no image planes".into(),
+            ));
+        }
+        let Some(mut xml) = self.flex_xml() else {
+            return Ok(None);
+        };
         let trimmed = xml.trim();
         if trimmed.ends_with(">>") || trimmed.ends_with('%') {
             xml = trimmed[..trimmed.len() - 1].to_string();
@@ -196,12 +203,26 @@ impl FlexReader {
         }
         let (_names, factors) = parse_flex_arrays(&xml);
 
-        let total_planes = total_planes.max(factors.len());
+        if !factors.is_empty() && factors.len() != total_planes {
+            return Err(BioFormatsError::Format(format!(
+                "Flex: XML Array count {} does not match TIFF plane count {}",
+                factors.len(),
+                total_planes
+            )));
+        }
+
         let mut factor_values = vec![1.0f64; total_planes];
         let mut max_idx = 0usize;
         let mut one_factors = true;
         for (i, f) in factors.iter().enumerate() {
-            let q = f.parse::<f64>().unwrap_or(1.0);
+            let q = f.parse::<f64>().map_err(|_| {
+                BioFormatsError::Format(format!("Flex: invalid Array Factor {f:?}"))
+            })?;
+            if !q.is_finite() || q <= 0.0 {
+                return Err(BioFormatsError::Format(format!(
+                    "Flex: invalid Array Factor {f:?}"
+                )));
+            }
             if i < factor_values.len() {
                 factor_values[i] = q;
                 if q > factor_values[max_idx] {
@@ -221,9 +242,9 @@ impl FlexReader {
         }
 
         if one_factors {
-            None
+            Ok(None)
         } else {
-            Some(factor_values)
+            Ok(Some(factor_values))
         }
     }
 
@@ -518,263 +539,295 @@ impl FormatReader for FlexReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        // Resolve the .flex entry point. If handed a .mea/.res, find a .flex in
-        // the same directory (Java initMeaFile/initResFile fall back to this).
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        let flex_entry: PathBuf = if matches!(ext.as_deref(), Some("flex")) {
-            path.to_path_buf()
-        } else {
-            // .mea / .res: locate a .flex in the same directory.
-            let dir = path.parent().unwrap_or_else(|| Path::new("."));
-            let mut found = None;
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                let mut candidates: Vec<PathBuf> = rd
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| e.eq_ignore_ascii_case("flex"))
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                candidates.sort();
-                found = candidates.into_iter().next();
-            }
-            found.ok_or_else(|| {
-                BioFormatsError::UnsupportedFormat(
-                    "Flex .mea/.res companion has no .flex files in its directory".into(),
-                )
-            })?
-        };
-
-        let measurement_files = find_measurement_files(&flex_entry);
-        // Parse .res for the plate acquisition start time.
-        for m in &measurement_files {
-            if m.extension()
+        let _ = self.close();
+        let result: Result<()> = (|| {
+            // Resolve the .flex entry point. If handed a .mea/.res, find a .flex in
+            // the same directory (Java initMeaFile/initResFile fall back to this).
+            let ext = path
+                .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("res"))
-                .unwrap_or(false)
-            {
-                if let Ok(text) = std::fs::read_to_string(m) {
-                    if let Some(d) = parse_res_date(&text) {
-                        self.plate_acq_start_time = Some(d);
-                    }
+                .map(|e| e.to_ascii_lowercase());
+            let flex_entry: PathBuf = if matches!(ext.as_deref(), Some("flex")) {
+                path.to_path_buf()
+            } else {
+                // .mea / .res: locate a .flex in the same directory.
+                let dir = path.parent().unwrap_or_else(|| Path::new("."));
+                let mut found = None;
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    let mut candidates: Vec<PathBuf> = rd
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.extension()
+                                .and_then(|e| e.to_str())
+                                .map(|e| e.eq_ignore_ascii_case("flex"))
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    candidates.sort();
+                    found = candidates.into_iter().next();
                 }
-            }
-        }
+                found.ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat(
+                        "Flex .mea/.res companion has no .flex files in its directory".into(),
+                    )
+                })?
+            };
 
-        // Determine the grouped file list. Prefer the .mea list when present.
-        let mut grouped: Vec<PathBuf> = Vec::new();
-        for m in &measurement_files {
-            if m.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("mea"))
-                .unwrap_or(false)
-            {
-                if let Ok(text) = std::fs::read_to_string(m) {
-                    let dir = flex_entry.parent().unwrap_or_else(|| Path::new("."));
-                    for rel in parse_mea_flex_names(&text) {
-                        // Match by file name within the .flex directory.
-                        let fname = rel.rsplit('/').next().unwrap_or(&rel);
-                        let candidate = dir.join(fname);
-                        if candidate.exists() {
-                            grouped.push(candidate);
+            let measurement_files = find_measurement_files(&flex_entry);
+            // Parse .res for the plate acquisition start time.
+            for m in &measurement_files {
+                if m.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("res"))
+                    .unwrap_or(false)
+                {
+                    if let Ok(text) = std::fs::read_to_string(m) {
+                        if let Some(d) = parse_res_date(&text) {
+                            self.plate_acq_start_time = Some(d);
                         }
                     }
                 }
             }
-        }
-        if grouped.is_empty() {
-            grouped = collect_flex_files(&flex_entry);
-        } else {
-            grouped.sort();
-            grouped.dedup();
-        }
-        self.measurement_files = measurement_files;
 
-        // Single-file fallback: cannot group by well pattern.
-        let entry_name = flex_entry
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        let groupable = grouped.len() > 1 || parse_well(entry_name).is_some();
-
-        if !groupable {
-            // ---- single-file mode (original behavior) ----
-            self.single_file = true;
-            self.inner.set_id(&flex_entry)?;
-            self.inner_path = Some(flex_entry.clone());
-
-            let total_planes: usize = (0..self.inner.series_count())
-                .map(|s| self.inner.series_list()[s].metadata.image_count as usize)
-                .sum();
-            let factors = self.derive_factors(total_planes);
-
-            if let Some(pt) = self.scaled_pixel_type {
-                let series = self.inner.series_list_mut();
-                if let Some(s0) = series.first_mut() {
-                    s0.metadata.pixel_type = pt;
-                    s0.metadata.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
+            // Determine the grouped file list. Prefer the .mea list when present.
+            let mut grouped: Vec<PathBuf> = Vec::new();
+            for m in &measurement_files {
+                if m.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("mea"))
+                    .unwrap_or(false)
+                {
+                    if let Ok(text) = std::fs::read_to_string(m) {
+                        let dir = flex_entry.parent().unwrap_or_else(|| Path::new("."));
+                        for rel in parse_mea_flex_names(&text) {
+                            // Match by file name within the .flex directory.
+                            let fname = rel.rsplit('/').next().unwrap_or(&rel);
+                            let candidate = dir.join(fname);
+                            if candidate.exists() {
+                                grouped.push(candidate);
+                            }
+                        }
+                    }
                 }
             }
-            // store the single file's factors as flex_files[0] for apply_factor.
-            self.flex_files = vec![FlexFile {
-                row: 0,
-                column: 0,
-                field: 0,
-                path: flex_entry,
-                factors,
-            }];
-            self.series = 0;
-            self.image_count = self
+            if grouped.is_empty() {
+                grouped = collect_flex_files(&flex_entry);
+            } else {
+                grouped.sort();
+                grouped.dedup();
+            }
+            self.measurement_files = measurement_files;
+
+            // Single-file fallback: cannot group by well pattern.
+            let entry_name = flex_entry
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let groupable = grouped.len() > 1 || parse_well(entry_name).is_some();
+
+            if !groupable {
+                // ---- single-file mode (original behavior) ----
+                self.single_file = true;
+                self.inner.set_id(&flex_entry)?;
+                self.inner_path = Some(flex_entry.clone());
+
+                let total_planes: usize = (0..self.inner.series_count())
+                    .map(|s| self.inner.series_list()[s].metadata.image_count as usize)
+                    .sum();
+                let factors = self.derive_factors(total_planes)?;
+
+                if let Some(pt) = self.scaled_pixel_type {
+                    let series = self.inner.series_list_mut();
+                    if let Some(s0) = series.first_mut() {
+                        s0.metadata.pixel_type = pt;
+                        s0.metadata.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
+                    }
+                }
+                // store the single file's factors as flex_files[0] for apply_factor.
+                self.flex_files = vec![FlexFile {
+                    row: 0,
+                    column: 0,
+                    field: 0,
+                    path: flex_entry,
+                    factors,
+                }];
+                self.series = 0;
+                self.image_count = self
+                    .inner
+                    .series_list()
+                    .first()
+                    .map(|s| s.metadata.image_count)
+                    .unwrap_or(0);
+                return Ok(());
+            }
+
+            // ---- multi-file HCS mode ----
+            self.single_file = false;
+
+            // Group files by well (row, col), each file within a well is a field.
+            // Build well list in (row, col) order; record well_number layout.
+            use std::collections::BTreeMap;
+            let mut wells: BTreeMap<(u32, u32), Vec<PathBuf>> = BTreeMap::new();
+            let mut max_row = 0u32;
+            let mut max_col = 0u32;
+            for f in &grouped {
+                let n = f.file_name().and_then(|x| x.to_str()).unwrap_or_default();
+                let (row, col) = if grouped.len() == 1 {
+                    (0, 0)
+                } else {
+                    parse_well(n).unwrap_or((0, 0))
+                };
+                max_row = max_row.max(row);
+                max_col = max_col.max(col);
+                wells.entry((row, col)).or_default().push(f.clone());
+            }
+            self.well_rows = max_row + 1;
+            self.well_columns = max_col + 1;
+            if grouped.len() == 1 {
+                self.well_rows = 1;
+                self.well_columns = 1;
+            }
+            self.well_count = wells.len() as u32;
+
+            // Build the flex_files list in well order, fields sorted within a well.
+            let mut flex_files: Vec<FlexFile> = Vec::new();
+            let mut well_number: Vec<(u32, u32)> = Vec::new();
+            let mut n_files_per_well = 1usize;
+            let mut expected_files_per_well: Option<usize> = None;
+            for (&(row, col), files) in &wells {
+                well_number.push((row, col));
+                let mut sorted = files.clone();
+                sorted.sort();
+                if let Some(expected) = expected_files_per_well {
+                    if sorted.len() != expected {
+                        return Err(BioFormatsError::Format(format!(
+                            "Flex: inconsistent field count for well ({row},{col}): got {}, expected {expected}",
+                            sorted.len()
+                        )));
+                    }
+                } else {
+                    expected_files_per_well = Some(sorted.len());
+                }
+                n_files_per_well = sorted.len();
+                // Java assigns the field index by sorted position within the well
+                // (FlexFile.field = field loop variable), but the filename's field
+                // digits (chars 6..9) are the authoritative field number. Use the
+                // filename field when the 14-char pattern is present, falling back
+                // to sorted position otherwise.
+                for (pos, p) in sorted.into_iter().enumerate() {
+                    let n = p.file_name().and_then(|x| x.to_str()).unwrap_or_default();
+                    let field = if n.len() == 14 {
+                        parse_field(n)
+                    } else {
+                        pos as u32
+                    };
+                    flex_files.push(FlexFile {
+                        row,
+                        column: col,
+                        field,
+                        path: p,
+                        factors: None,
+                    });
+                }
+            }
+            self.well_number = well_number;
+
+            // Parse the first file to obtain core dimensions + factors.
+            let first_path = flex_files[0].path.clone();
+            self.inner.set_id(&first_path)?;
+            self.inner_path = Some(first_path);
+            let n_planes = self
                 .inner
                 .series_list()
                 .first()
                 .map(|s| s.metadata.image_count)
                 .unwrap_or(0);
-            return Ok(());
-        }
-
-        // ---- multi-file HCS mode ----
-        self.single_file = false;
-
-        // Group files by well (row, col), each file within a well is a field.
-        // Build well list in (row, col) order; record well_number layout.
-        use std::collections::BTreeMap;
-        let mut wells: BTreeMap<(u32, u32), Vec<PathBuf>> = BTreeMap::new();
-        let mut max_row = 0u32;
-        let mut max_col = 0u32;
-        for f in &grouped {
-            let n = f.file_name().and_then(|x| x.to_str()).unwrap_or_default();
-            let (row, col) = if grouped.len() == 1 {
-                (0, 0)
-            } else {
-                parse_well(n).unwrap_or((0, 0))
-            };
-            max_row = max_row.max(row);
-            max_col = max_col.max(col);
-            wells.entry((row, col)).or_default().push(f.clone());
-        }
-        self.well_rows = max_row + 1;
-        self.well_columns = max_col + 1;
-        if grouped.len() == 1 {
-            self.well_rows = 1;
-            self.well_columns = 1;
-        }
-        self.well_count = wells.len() as u32;
-
-        // Build the flex_files list in well order, fields sorted within a well.
-        let mut flex_files: Vec<FlexFile> = Vec::new();
-        let mut well_number: Vec<(u32, u32)> = Vec::new();
-        let mut n_files_per_well = 1usize;
-        for (&(row, col), files) in &wells {
-            well_number.push((row, col));
-            let mut sorted = files.clone();
-            sorted.sort();
-            n_files_per_well = sorted.len();
-            // Java assigns the field index by sorted position within the well
-            // (FlexFile.field = field loop variable), but the filename's field
-            // digits (chars 6..9) are the authoritative field number. Use the
-            // filename field when the 14-char pattern is present, falling back
-            // to sorted position otherwise.
-            for (pos, p) in sorted.into_iter().enumerate() {
-                let n = p.file_name().and_then(|x| x.to_str()).unwrap_or_default();
-                let field = if n.len() == 14 {
-                    parse_field(n)
-                } else {
-                    pos as u32
-                };
-                flex_files.push(FlexFile {
-                    row,
-                    column: col,
-                    field,
-                    path: p,
-                    factors: None,
-                });
+            if n_planes == 0 {
+                return Err(BioFormatsError::Format(
+                    "Flex: first grouped file has no image planes".into(),
+                ));
             }
-        }
-        self.well_number = well_number;
 
-        // Parse the first file to obtain core dimensions + factors.
-        let first_path = flex_files[0].path.clone();
-        self.inner.set_id(&first_path)?;
-        self.inner_path = Some(first_path);
-        let n_planes = self
-            .inner
-            .series_list()
-            .first()
-            .map(|s| s.metadata.image_count)
-            .unwrap_or(0);
+            // Derive factors & widening from series-0 XML.
+            let factors = self.derive_factors(n_planes as usize)?;
+            flex_files[0].factors = factors;
 
-        // Derive factors & widening from series-0 XML.
-        let factors = self.derive_factors(n_planes as usize);
-        flex_files[0].factors = factors;
+            // populateCoreMetadata field logic (faithful to the common case):
+            // each file holds exactly imageCount planes => one field per file, so
+            // fieldCount = number of files per well (Java: `fieldCount *= nFiles`
+            // when fieldCount == 1). Fields-stored-within-a-file is rare and not
+            // reconstructed here.
+            let field_count = (n_files_per_well as u32).max(1);
+            self.field_count = field_count;
+            self.image_count = n_planes;
 
-        // populateCoreMetadata field logic (faithful to the common case):
-        // each file holds exactly imageCount planes => one field per file, so
-        // fieldCount = number of files per well (Java: `fieldCount *= nFiles`
-        // when fieldCount == 1). Fields-stored-within-a-file is rare and not
-        // reconstructed here.
-        let field_count = (n_files_per_well as u32).max(1);
-        self.field_count = field_count;
-        self.image_count = n_planes;
+            self.plate_count = 1;
 
-        self.plate_count = 1;
+            // seriesCount = plateCount * wellCount * fieldCount.
+            let series_count =
+                (self.plate_count * self.well_count * self.field_count).max(1) as usize;
 
-        // seriesCount = plateCount * wellCount * fieldCount.
-        let series_count = (self.plate_count * self.well_count * self.field_count).max(1) as usize;
-
-        // Apply factor widening to the (single) base metadata.
-        let mut base_meta = self
-            .inner
-            .series_list()
-            .first()
-            .map(|s| s.metadata.clone())
-            .ok_or_else(|| BioFormatsError::Format("Flex: no IFDs in first file".into()))?;
-        if let Some(pt) = self.scaled_pixel_type {
-            base_meta.pixel_type = pt;
-            base_meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
-        }
-
-        // Parse factors for the remaining files (each file may have its own XML).
-        for i in 1..flex_files.len() {
-            let p = flex_files[i].path.clone();
-            self.inner.set_id(&p)?;
-            self.inner_path = Some(p);
-            let np = self
+            // Apply factor widening to the (single) base metadata.
+            let mut base_meta = self
                 .inner
                 .series_list()
                 .first()
-                .map(|s| s.metadata.image_count)
-                .unwrap_or(n_planes);
-            let f = self.derive_factors(np as usize);
-            flex_files[i].factors = f;
-        }
-
-        // Plate name/barcode from the first file's XML.
-        if let Some(xml) = {
-            // rebind to first file to read its XML
-            let p = flex_files[0].path.clone();
-            if self.inner_path.as_deref() != Some(p.as_path()) {
-                self.inner.set_id(&p)?;
-                self.inner_path = Some(p);
+                .map(|s| s.metadata.clone())
+                .ok_or_else(|| BioFormatsError::Format("Flex: no IFDs in first file".into()))?;
+            if let Some(pt) = self.scaled_pixel_type {
+                base_meta.pixel_type = pt;
+                base_meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
             }
-            self.flex_xml()
-        } {
-            self.plate_barcode = xml_element_text(&xml, "Barcode");
-            self.plate_name = xml_element_text(&xml, "PlateName");
-        }
 
-        self.flex_files = flex_files;
-        self.series_meta = vec![base_meta; series_count];
-        self.series = 0;
-        // Bind inner to series 0's file.
-        self.bind_series(0)?;
-        Ok(())
+            // Parse factors for the remaining files (each file may have its own XML).
+            for i in 1..flex_files.len() {
+                let p = flex_files[i].path.clone();
+                self.inner.set_id(&p)?;
+                self.inner_path = Some(p.clone());
+                let np = self
+                    .inner
+                    .series_list()
+                    .first()
+                    .map(|s| s.metadata.image_count)
+                    .unwrap_or(n_planes);
+                if np != n_planes {
+                    return Err(BioFormatsError::Format(format!(
+                        "Flex: grouped file {} has {} planes, expected {}",
+                        p.display(),
+                        np,
+                        n_planes
+                    )));
+                }
+                let f = self.derive_factors(np as usize)?;
+                flex_files[i].factors = f;
+            }
+
+            // Plate name/barcode from the first file's XML.
+            if let Some(xml) = {
+                // rebind to first file to read its XML
+                let p = flex_files[0].path.clone();
+                if self.inner_path.as_deref() != Some(p.as_path()) {
+                    self.inner.set_id(&p)?;
+                    self.inner_path = Some(p);
+                }
+                self.flex_xml()
+            } {
+                self.plate_barcode = xml_element_text(&xml, "Barcode");
+                self.plate_name = xml_element_text(&xml, "PlateName");
+            }
+
+            self.flex_files = flex_files;
+            self.series_meta = vec![base_meta; series_count];
+            self.series = 0;
+            // Bind inner to series 0's file.
+            self.bind_series(0)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.close();
+        }
+        result
     }
 
     fn close(&mut self) -> Result<()> {
@@ -802,6 +855,9 @@ impl FormatReader for FlexReader {
 
     fn set_series(&mut self, s: usize) -> Result<()> {
         if self.single_file {
+            if self.inner.series_count() == 0 {
+                return Err(BioFormatsError::NotInitialized);
+            }
             self.inner.set_series(s)?;
             self.series = s;
             Ok(())

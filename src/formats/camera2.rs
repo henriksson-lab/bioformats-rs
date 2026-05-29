@@ -439,6 +439,7 @@ impl FormatReader for PcoRawReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let mut f = std::fs::File::open(path).map_err(|e| BioFormatsError::Io(e))?;
         let file_size = f.metadata().map_err(BioFormatsError::Io)?.len();
         let mut header = [0u8; 216];
@@ -458,7 +459,13 @@ impl FormatReader for PcoRawReader {
                 "PCO B16 header is too short to contain dimensions".into(),
             ));
         };
-        let expected = 216u64 + w as u64 * h as u64 * 2;
+        let expected = (w as u64)
+            .checked_mul(h as u64)
+            .and_then(|pixels| pixels.checked_mul(2))
+            .and_then(|bytes| bytes.checked_add(216))
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat("PCO B16 declared dimensions overflow".into())
+            })?;
         if file_size < expected {
             return Err(BioFormatsError::UnsupportedFormat(format!(
                 "PCO B16 file is too short for declared dimensions {w}x{h}"
@@ -483,10 +490,13 @@ impl FormatReader for PcoRawReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -672,6 +682,7 @@ impl FormatReader for BioRadGelReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
         let file_size = f.metadata().map_err(BioFormatsError::Io)?.len();
 
@@ -750,8 +761,13 @@ impl FormatReader for BioRadGelReader {
         // Java uses fp=false here; 4-byte support is FLOAT per the GEL spec, but
         // the reader declares an integer type. Follow Java: unsigned integer.
         let (pixel_type, bits) = match bpp {
+            2 => (PixelType::Uint16, 16u8),
             4 => (PixelType::Uint32, 32u8),
-            _ => (PixelType::Uint16, 16u8),
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Bio-Rad GEL: unsupported bytes per pixel {bpp}"
+                )))
+            }
         };
 
         if size_x == 0 || size_y == 0 {
@@ -759,8 +775,25 @@ impl FormatReader for BioRadGelReader {
                 "Bio-Rad GEL: invalid image dimensions".into(),
             ));
         }
-
         self.little_endian = little_endian;
+        let plane_size = (size_x as u64)
+            .checked_mul(size_y as u64)
+            .and_then(|pixels| pixels.checked_mul(pixel_type.bytes_per_sample() as u64))
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "Bio-Rad GEL: declared image is too large".into(),
+                )
+            })?;
+        let pixel_offset = self.pixel_seek(&mut f, plane_size, file_size)?;
+        if pixel_offset
+            .checked_add(plane_size)
+            .is_none_or(|end| end > file_size)
+        {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Bio-Rad GEL: file is too short for declared pixel payload".into(),
+            ));
+        }
+
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x,
@@ -780,10 +813,13 @@ impl FormatReader for BioRadGelReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -1017,6 +1053,7 @@ impl FormatReader for L2dReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let l2d_path = if path
             .extension()
             .and_then(|e| e.to_str())
@@ -1046,6 +1083,9 @@ impl FormatReader for L2dReader {
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.metadata.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s >= self.metadata.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -1253,6 +1293,7 @@ impl FormatReader for CanonRawReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // Legacy detection: exact fixed file length (CanonRawReader.java).
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         if len == Self::FILE_LENGTH {
@@ -1296,6 +1337,8 @@ impl FormatReader for CanonRawReader {
                 return Err(BioFormatsError::SeriesOutOfRange(s));
             }
             Ok(())
+        } else if self.inner.series_count() == 0 {
+            Err(BioFormatsError::NotInitialized)
         } else {
             self.inner.set_series(s)
         }
@@ -1424,6 +1467,7 @@ impl FormatReader for ImaconReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         self.inner.set_id(path)?;
 
         let first = self
@@ -1431,6 +1475,7 @@ impl FormatReader for ImaconReader {
             .ifd(0)
             .ok_or_else(|| BioFormatsError::UnsupportedFormat("Imacon: no IFD".into()))?;
         if first.get(Self::XML_TAG).is_none() {
+            let _ = self.inner.close();
             return Err(BioFormatsError::UnsupportedFormat(
                 "Imacon: TIFF is missing the XML tag (50457)".into(),
             ));
@@ -1477,10 +1522,17 @@ impl FormatReader for ImaconReader {
     }
 
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        if self.meta.is_some() {
+            self.inner.series_count()
+        } else {
+            0
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         self.inner.set_series(s)
     }
 
@@ -1669,19 +1721,33 @@ impl Default for IpwReader {
 }
 
 /// Parse the IPW `ImageInfo` description into (sizeC, sizeZ, sizeT).
-fn parse_ipw_image_info(text: &str) -> (Option<u32>, Option<u32>, Option<u32>) {
+fn parse_ipw_image_info(text: &str) -> Result<(Option<u32>, Option<u32>, Option<u32>)> {
     let (mut c, mut z, mut t) = (None, None, None);
     for line in text.split('\n') {
         if let Some((label, data)) = line.split_once('=') {
+            let label = label.trim();
             match label.trim() {
-                "channels" => c = data.trim().parse().ok(),
-                "slices" => z = data.trim().parse().ok(),
-                "frames" => t = data.trim().parse().ok(),
+                "channels" | "slices" | "frames" => {
+                    let value = data.trim().parse::<u32>().map_err(|_| {
+                        BioFormatsError::Format(format!("IPW: invalid {label} value"))
+                    })?;
+                    if value == 0 {
+                        return Err(BioFormatsError::Format(format!(
+                            "IPW: {label} must be positive"
+                        )));
+                    }
+                    match label {
+                        "channels" => c = Some(value),
+                        "slices" => z = Some(value),
+                        "frames" => t = Some(value),
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
     }
-    (c, z, t)
+    Ok((c, z, t))
 }
 
 impl FormatReader for IpwReader {
@@ -1700,6 +1766,7 @@ impl FormatReader for IpwReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let mut comp =
             cfb::open(path).map_err(|e| BioFormatsError::Format(format!("IPW CFB open: {e}")))?;
 
@@ -1762,7 +1829,7 @@ impl FormatReader for IpwReader {
                         "Image Description".into(),
                         MetadataValue::String(text.trim().to_string()),
                     );
-                    let (c, z, t) = parse_ipw_image_info(&text);
+                    let (c, z, t) = parse_ipw_image_info(&text)?;
                     size_c = c;
                     size_z = z;
                     size_t = t;
@@ -1781,9 +1848,9 @@ impl FormatReader for IpwReader {
         tiff.close().ok();
         std::fs::remove_file(&tmp).ok();
 
-        let mut size_z = size_z.unwrap_or(1).max(1);
-        let size_c = size_c.unwrap_or(1).max(1);
-        let size_t = size_t.unwrap_or(1).max(1);
+        let mut size_z = size_z.unwrap_or(1);
+        let size_c = size_c.unwrap_or(1);
+        let size_t = size_t.unwrap_or(1);
         // Java: if axis product == 1 but multiple planes exist, treat as Z.
         if size_z * size_c * size_t == 1 && image_count != 1 {
             size_z = image_count;
@@ -1826,10 +1893,13 @@ impl FormatReader for IpwReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {

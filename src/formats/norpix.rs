@@ -18,6 +18,24 @@ fn r_i32_le(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+fn positive_i32_dim(value: i32, label: &str) -> Result<u32> {
+    if value <= 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "IPLab {label} is non-positive ({value})"
+        )));
+    }
+    Ok(value as u32)
+}
+
+fn positive_u32_seq_dim(value: u32, label: &str) -> Result<u32> {
+    if value == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Norpix SEQ {label} is non-positive"
+        )));
+    }
+    Ok(value)
+}
+
 /// Read a StreamPix per-frame timestamp at `off`: u32 seconds since the Unix
 /// epoch followed by u16 milliseconds and u16 microseconds. Returns seconds as
 /// f64, or 0.0 if the timestamp lies past EOF.
@@ -110,16 +128,16 @@ impl FormatReader for NorpixReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut hdr = vec![0u8; 1024];
         f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
 
-        let n_frames = r_u32_le(&hdr, 548).max(1);
+        let n_frames = positive_u32_seq_dim(r_u32_le(&hdr, 548), "frame count")?;
         let true_image_size = r_u32_le(&hdr, 572);
         let desc_fmt = r_u32_le(&hdr, 592);
-        let width = r_u32_le(&hdr, 596).max(1);
-        let height = r_u32_le(&hdr, 600).max(1);
-        let bit_depth = r_u32_le(&hdr, 604);
+        let width = positive_u32_seq_dim(r_u32_le(&hdr, 596), "width")?;
+        let height = positive_u32_seq_dim(r_u32_le(&hdr, 600), "height")?;
         // StreamPix description-format codes: 0=mono8, 1=mono16, 2=BGR24,
         // 100=JPEG mono8, 101=mono16 (uncompressed), 102=JPEG BGR24.
         let compressed = matches!(desc_fmt, 100 | 102);
@@ -130,18 +148,19 @@ impl FormatReader for NorpixReader {
             2 | 102 => (PixelType::Uint8, 8, 3), // color BGR24 (raw / JPEG)
             101 => (PixelType::Uint16, 16, 1),   // mono 16-bit alt
             _ => {
-                // fall back on bit_depth
-                if bit_depth <= 8 {
-                    (PixelType::Uint8, 8, 1)
-                } else {
-                    (PixelType::Uint16, 16, 1)
-                }
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Norpix SEQ unsupported description format {desc_fmt}"
+                )))
             }
         };
 
         let bps = pixel_type.bytes_per_sample();
         // Uncompressed (raw) plane payload in bytes.
-        let plane_bytes = width as usize * height as usize * bps * channels as usize;
+        let plane_bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|v| v.checked_mul(bps))
+            .and_then(|v| v.checked_mul(channels as usize))
+            .ok_or_else(|| BioFormatsError::Format("Norpix SEQ plane size overflows".into()))?;
         // trueImageSize is the padded per-frame stride (image payload + trailing
         // timestamp + alignment) for uncompressed data.
         let frame_size = if !compressed && true_image_size as usize >= plane_bytes {
@@ -177,6 +196,23 @@ impl FormatReader for NorpixReader {
                 pos += 8;
             }
         } else {
+            let required_len = 1024u64
+                .checked_add(
+                    (n_frames as u64 - 1)
+                        .checked_mul(frame_size as u64)
+                        .and_then(|v| v.checked_add(plane_bytes as u64))
+                        .ok_or_else(|| {
+                            BioFormatsError::Format("Norpix SEQ payload size overflows".into())
+                        })?,
+                )
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Norpix SEQ payload offset overflows".into())
+                })?;
+            if file_len < required_len {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Norpix SEQ pixel payload is shorter than declared: need {required_len} bytes, found {file_len}"
+                )));
+            }
             for i in 0..n_frames as u64 {
                 let img_off = 1024 + i * frame_size as u64;
                 frame_offsets.push(img_off);
@@ -230,9 +266,12 @@ impl FormatReader for NorpixReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -480,15 +519,16 @@ impl FormatReader for IplabReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut hdr = vec![0u8; 96];
         f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
 
-        let width = r_i32_le(&hdr, 12).max(1) as u32;
-        let height = r_i32_le(&hdr, 16).max(1) as u32;
-        let depth = r_i32_le(&hdr, 20).max(1) as u32;
-        let n_channels = r_i32_le(&hdr, 24).max(1) as u32;
-        let n_frames = r_i32_le(&hdr, 28).max(1) as u32;
+        let width = positive_i32_dim(r_i32_le(&hdr, 12), "width")?;
+        let height = positive_i32_dim(r_i32_le(&hdr, 16), "height")?;
+        let depth = positive_i32_dim(r_i32_le(&hdr, 20), "depth")?;
+        let n_channels = positive_i32_dim(r_i32_le(&hdr, 24), "channel count")?;
+        let n_frames = positive_i32_dim(r_i32_le(&hdr, 28), "frame count")?;
         let data_type = r_i32_le(&hdr, 32);
 
         let (pixel_type, bpp, spp): (PixelType, u8, u32) = match data_type {
@@ -498,10 +538,31 @@ impl FormatReader for IplabReader {
             3 => (PixelType::Float32, 32, 1),
             4 => (PixelType::Uint8, 8, 1),
             5 => (PixelType::Uint8, 8, 3), // RGB
-            _ => (PixelType::Uint16, 16, 1),
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "IPLab unsupported data type {data_type}"
+                )))
+            }
         };
         let is_rgb = spp == 3;
         let image_count = depth * n_channels * n_frames;
+        let plane_bytes = (width as u64)
+            .checked_mul(height as u64)
+            .and_then(|v| v.checked_mul(spp as u64))
+            .and_then(|v| v.checked_mul(bpp as u64 / 8))
+            .ok_or_else(|| BioFormatsError::Format("IPLab plane byte count overflows".into()))?;
+        let pixel_bytes = plane_bytes
+            .checked_mul(image_count as u64)
+            .ok_or_else(|| BioFormatsError::Format("IPLab pixel byte count overflows".into()))?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        let required_len = 96u64
+            .checked_add(pixel_bytes)
+            .ok_or_else(|| BioFormatsError::Format("IPLab payload offset overflows".into()))?;
+        if file_len < required_len {
+            return Err(BioFormatsError::Format(format!(
+                "IPLab pixel payload is truncated: need {required_len} bytes, found {file_len}"
+            )));
+        }
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert("format".into(), MetadataValue::String("IPLab".into()));
@@ -517,8 +578,6 @@ impl FormatReader for IplabReader {
             "iplab.color_mode".into(),
             MetadataValue::Int(r_i32_le(&hdr, 36) as i64),
         );
-        let plane_bytes = (width * height) as u64 * spp as u64 * (bpp as u64 / 8);
-        let pixel_bytes = plane_bytes.saturating_mul(image_count as u64);
         meta_map.extend(read_iplab_tags(path, 96 + pixel_bytes).unwrap_or_default());
 
         self.meta = Some(ImageMetadata {
@@ -552,9 +611,12 @@ impl FormatReader for IplabReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {

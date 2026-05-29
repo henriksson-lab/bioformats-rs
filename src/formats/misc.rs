@@ -13,6 +13,188 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
+const MISC_STRICT_RAW_HEADER_LEN: usize = 40;
+
+#[derive(Clone, Copy)]
+struct MiscStrictRawLayout {
+    data_offset: u64,
+    plane_bytes: usize,
+}
+
+fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
+}
+
+fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
+}
+
+fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ])
+}
+
+fn strict_misc_raw_unsupported(format_name: &str) -> BioFormatsError {
+    BioFormatsError::UnsupportedFormat(format!(
+        "{format_name} native decoding is unsupported unless explicit strict raw data is present; refusing guessed proprietary metadata"
+    ))
+}
+
+fn strict_misc_raw_pixel_type(code: u16, format_name: &str) -> Result<PixelType> {
+    match code {
+        1 => Ok(PixelType::Uint8),
+        2 => Ok(PixelType::Uint16),
+        3 => Ok(PixelType::Float32),
+        _ => Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset has unsupported pixel type code {code}"
+        ))),
+    }
+}
+
+fn parse_misc_strict_raw_subset(
+    path: &Path,
+    magic: &[u8; 16],
+    format_name: &str,
+) -> Result<(ImageMetadata, MiscStrictRawLayout)> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(strict_misc_raw_unsupported(format_name));
+        }
+        Err(err) => return Err(BioFormatsError::Io(err)),
+    };
+
+    if data.len() < magic.len() {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} file is too short for strict raw subset magic"
+        )));
+    }
+    if &data[..magic.len()] != magic {
+        return Err(strict_misc_raw_unsupported(format_name));
+    }
+    if data.len() < MISC_STRICT_RAW_HEADER_LEN {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset header is truncated"
+        )));
+    }
+
+    let size_x = read_u32_le(&data, 16);
+    let size_y = read_u32_le(&data, 20);
+    let image_count = read_u32_le(&data, 24);
+    let pixel_type_code = read_u16_le(&data, 28);
+    let reserved = read_u16_le(&data, 30);
+    let data_offset = read_u64_le(&data, 32);
+
+    if size_x == 0 || size_y == 0 || image_count == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset dimensions must be non-zero"
+        )));
+    }
+    if reserved != 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset reserved header bytes must be zero"
+        )));
+    }
+    if data_offset != MISC_STRICT_RAW_HEADER_LEN as u64 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset data offset must equal {MISC_STRICT_RAW_HEADER_LEN}"
+        )));
+    }
+
+    let pixel_type = strict_misc_raw_pixel_type(pixel_type_code, format_name)?;
+    let plane_bytes = (size_x as usize)
+        .checked_mul(size_y as usize)
+        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample()))
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "{format_name} strict raw subset plane size overflows"
+            ))
+        })?;
+    let payload_bytes = plane_bytes
+        .checked_mul(image_count as usize)
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "{format_name} strict raw subset payload size overflows"
+            ))
+        })?;
+    let expected_len = MISC_STRICT_RAW_HEADER_LEN
+        .checked_add(payload_bytes)
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "{format_name} strict raw subset file size overflows"
+            ))
+        })?;
+    if data.len() != expected_len {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} strict raw subset payload length mismatch: got {} bytes, expected {expected_len}",
+            data.len()
+        )));
+    }
+
+    let meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z: 1,
+        size_c: 1,
+        size_t: image_count,
+        pixel_type,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        image_count,
+        dimension_order: DimensionOrder::XYCZT,
+        is_little_endian: true,
+        ..ImageMetadata::default()
+    };
+    Ok((
+        meta,
+        MiscStrictRawLayout {
+            data_offset,
+            plane_bytes,
+        },
+    ))
+}
+
+fn read_misc_strict_raw_plane(
+    path: &Path,
+    layout: MiscStrictRawLayout,
+    plane_index: u32,
+) -> Result<Vec<u8>> {
+    let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    let offset = (layout.data_offset as usize)
+        .checked_add(
+            layout
+                .plane_bytes
+                .checked_mul(plane_index as usize)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("strict raw subset plane offset overflows".to_string())
+                })?,
+        )
+        .ok_or_else(|| {
+            BioFormatsError::Format("strict raw subset plane offset overflows".to_string())
+        })?;
+    let end = offset
+        .checked_add(layout.plane_bytes)
+        .ok_or_else(|| BioFormatsError::Format("strict raw subset plane end overflows".into()))?;
+    if end > data.len() {
+        return Err(BioFormatsError::InvalidData(
+            "strict raw subset payload is shorter than declared metadata".to_string(),
+        ));
+    }
+    Ok(data[offset..end].to_vec())
+}
+
 // ---------------------------------------------------------------------------
 // Macro for extension-only placeholder readers
 // ---------------------------------------------------------------------------
@@ -51,9 +233,10 @@ macro_rules! placeholder_reader {
             fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
 
             fn set_id(&mut self, _path: &Path) -> Result<()> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
+                Err(BioFormatsError::UnsupportedFormat(format!(
+                    "{} native decoding is unsupported; refusing guessed proprietary metadata",
+                    stringify!($name)
+                )))
             }
 
             fn close(&mut self) -> Result<()> {
@@ -75,21 +258,24 @@ macro_rules! placeholder_reader {
             }
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
+                Err(BioFormatsError::UnsupportedFormat(format!(
+                    "{} native decoding is unsupported; refusing guessed proprietary metadata",
+                    stringify!($name)
+                )))
             }
 
             fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
+                Err(BioFormatsError::UnsupportedFormat(format!(
+                    "{} native decoding is unsupported; refusing guessed proprietary metadata",
+                    stringify!($name)
+                )))
             }
 
             fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-                Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
-                ))
+                Err(BioFormatsError::UnsupportedFormat(format!(
+                    "{} native decoding is unsupported; refusing guessed proprietary metadata",
+                    stringify!($name)
+                )))
             }
         }
     };
@@ -106,6 +292,9 @@ macro_rules! placeholder_reader {
 pub struct QuickTimeReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    sample_offsets: Vec<u64>,
+    sample_sizes: Vec<u32>,
+    samples_per_pixel: usize,
 }
 
 impl QuickTimeReader {
@@ -113,6 +302,9 @@ impl QuickTimeReader {
         QuickTimeReader {
             path: None,
             meta: None,
+            sample_offsets: Vec::new(),
+            sample_sizes: Vec::new(),
+            samples_per_pixel: 1,
         }
     }
 }
@@ -132,28 +324,42 @@ impl FormatReader for QuickTimeReader {
         matches!(ext.as_deref(), Some("mov") | Some("qt"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= 12 && (&header[4..8] == b"ftyp" || &header[4..8] == b"moov")
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime container parsing not yet implemented (MOV/QT files require complex atom-based container parsing with multiple codec variants)".to_string()
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let parsed = parse_quicktime(&data)?;
+        self.path = Some(path.to_path_buf());
+        self.sample_offsets = parsed.sample_offsets;
+        self.sample_sizes = parsed.sample_sizes;
+        self.samples_per_pixel = parsed.samples_per_pixel;
+        self.meta = Some(parsed.meta);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.sample_offsets.clear();
+        self.sample_sizes.clear();
+        self.samples_per_pixel = 1;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -166,30 +372,285 @@ impl FormatReader for QuickTimeReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime container parsing not yet implemented".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let index = plane_index as usize;
+        let offset = self.sample_offsets[index];
+        let sample_size = self.sample_sizes[index] as usize;
+        let expected = meta
+            .size_x
+            .checked_mul(meta.size_y)
+            .and_then(|px| (px as usize).checked_mul(self.samples_per_pixel))
+            .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
+            .ok_or_else(|| BioFormatsError::Format("QuickTime plane size overflows".into()))?;
+        if sample_size != expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime sample {plane_index} has {sample_size} bytes, expected {expected} for uncompressed pixels"
+            )));
+        }
+        let data = std::fs::read(self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?)
+            .map_err(BioFormatsError::Io)?;
+        let start = offset as usize;
+        let end = start
+            .checked_add(sample_size)
+            .ok_or_else(|| BioFormatsError::Format("QuickTime sample offset overflows".into()))?;
+        if end > data.len() {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime sample {plane_index} extends past end of file"
+            )));
+        }
+        Ok(data[start..end].to_vec())
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime container parsing not yet implemented".to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("QuickTime", &full, meta, self.samples_per_pixel, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime container parsing not yet implemented".to_string(),
-        ))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(_plane_index, tx, ty, tw, th)
     }
+}
+
+struct QuickTimeParsed {
+    meta: ImageMetadata,
+    sample_offsets: Vec<u64>,
+    sample_sizes: Vec<u32>,
+    samples_per_pixel: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Atom<'a> {
+    kind: [u8; 4],
+    start: usize,
+    data: &'a [u8],
+}
+
+fn be_u16_at(data: &[u8], offset: usize) -> Option<u16> {
+    data.get(offset..offset + 2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+}
+
+fn be_u32_at(data: &[u8], offset: usize) -> Option<u32> {
+    data.get(offset..offset + 4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn scan_atoms(data: &[u8], base: usize) -> Result<Vec<Atom<'_>>> {
+    let mut atoms = Vec::new();
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let size32 = be_u32_at(data, pos).unwrap() as usize;
+        let kind = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
+        let (header, size) = if size32 == 1 {
+            if pos + 16 > data.len() {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "QuickTime atom has truncated 64-bit size".into(),
+                ));
+            }
+            let size64 = u64::from_be_bytes([
+                data[pos + 8],
+                data[pos + 9],
+                data[pos + 10],
+                data[pos + 11],
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
+            ]);
+            (
+                16usize,
+                usize::try_from(size64).map_err(|_| {
+                    BioFormatsError::UnsupportedFormat("QuickTime atom size is too large".into())
+                })?,
+            )
+        } else if size32 == 0 {
+            (8usize, data.len() - pos)
+        } else {
+            (8usize, size32)
+        };
+        if size < header || pos + size > data.len() {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime atom {} has invalid size {size}",
+                String::from_utf8_lossy(&kind)
+            )));
+        }
+        atoms.push(Atom {
+            kind,
+            start: base + pos,
+            data: &data[pos + header..pos + size],
+        });
+        pos += size;
+    }
+    Ok(atoms)
+}
+
+fn find_child<'a>(atoms: &[Atom<'a>], kind: &[u8; 4]) -> Option<Atom<'a>> {
+    atoms.iter().copied().find(|atom| &atom.kind == kind)
+}
+
+fn first_descendant<'a>(data: &'a [u8], path: &[[u8; 4]]) -> Result<Option<Atom<'a>>> {
+    let mut atoms = scan_atoms(data, 0)?;
+    let mut current = None;
+    for kind in path {
+        let atom = match find_child(&atoms, kind) {
+            Some(atom) => atom,
+            None => return Ok(None),
+        };
+        current = Some(atom);
+        atoms = scan_atoms(atom.data, atom.start + 8)?;
+    }
+    Ok(current)
+}
+
+fn parse_quicktime(data: &[u8]) -> Result<QuickTimeParsed> {
+    if scan_atoms(data, 0)?.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime file has no atoms".into(),
+        ));
+    }
+    let stsd = first_descendant(
+        data,
+        &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd"],
+    )?
+    .ok_or_else(|| BioFormatsError::UnsupportedFormat("QuickTime missing stsd atom".into()))?;
+    let stsz = first_descendant(
+        data,
+        &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsz"],
+    )?
+    .ok_or_else(|| BioFormatsError::UnsupportedFormat("QuickTime missing stsz atom".into()))?;
+    let stco = first_descendant(
+        data,
+        &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stco"],
+    )?
+    .ok_or_else(|| BioFormatsError::UnsupportedFormat("QuickTime missing stco atom".into()))?;
+
+    if stsd.data.len() < 44 || be_u32_at(stsd.data, 4) != Some(1) {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsd must contain exactly one video sample description".into(),
+        ));
+    }
+    let entry = &stsd.data[8..];
+    let codec = entry.get(4..8).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("QuickTime stsd entry is truncated".into())
+    })?;
+    let width = be_u16_at(entry, 32).unwrap_or(0) as u32;
+    let height = be_u16_at(entry, 34).unwrap_or(0) as u32;
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime video sample entry has non-positive dimensions".into(),
+        ));
+    }
+    let samples_per_pixel = match codec {
+        b"raw " | b"RAW " | b"rgb " => 3usize,
+        b"gray" | b"GREY" | b"y800" => 1usize,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime codec {} is unsupported by the blind parser",
+                String::from_utf8_lossy(other)
+            )))
+        }
+    };
+
+    if stsz.data.len() < 12 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsz atom is truncated".into(),
+        ));
+    }
+    let uniform_size = be_u32_at(stsz.data, 4).unwrap();
+    let sample_count = be_u32_at(stsz.data, 8).unwrap() as usize;
+    let sample_sizes = if uniform_size != 0 {
+        vec![uniform_size; sample_count]
+    } else {
+        if stsz.data.len() < 12 + sample_count * 4 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime stsz sample table is truncated".into(),
+            ));
+        }
+        (0..sample_count)
+            .map(|i| be_u32_at(stsz.data, 12 + i * 4).unwrap())
+            .collect()
+    };
+    if sample_sizes.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime file declares no video samples".into(),
+        ));
+    }
+
+    if stco.data.len() < 8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stco atom is truncated".into(),
+        ));
+    }
+    let chunk_count = be_u32_at(stco.data, 4).unwrap() as usize;
+    if chunk_count != sample_sizes.len() || stco.data.len() < 8 + chunk_count * 4 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime blind parser requires one chunk offset per sample".into(),
+        ));
+    }
+    let sample_offsets: Vec<u64> = (0..chunk_count)
+        .map(|i| be_u32_at(stco.data, 8 + i * 4).unwrap() as u64)
+        .collect();
+    for (offset, size) in sample_offsets.iter().zip(&sample_sizes) {
+        let end = offset
+            .checked_add(*size as u64)
+            .ok_or_else(|| BioFormatsError::Format("QuickTime sample offset overflows".into()))?;
+        if end > data.len() as u64 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime sample extends past end of file".into(),
+            ));
+        }
+    }
+
+    let pixel_type = PixelType::Uint8;
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "quicktime.codec".into(),
+        crate::common::metadata::MetadataValue::String(String::from_utf8_lossy(codec).into_owned()),
+    );
+    let meta = ImageMetadata {
+        size_x: width,
+        size_y: height,
+        size_z: 1,
+        size_c: samples_per_pixel as u32,
+        size_t: sample_sizes.len() as u32,
+        pixel_type,
+        bits_per_pixel: 8,
+        image_count: sample_sizes.len() as u32,
+        dimension_order: DimensionOrder::XYZCT,
+        is_rgb: samples_per_pixel == 3,
+        is_interleaved: samples_per_pixel == 3,
+        is_indexed: false,
+        is_little_endian: false,
+        resolution_count: 1,
+        series_metadata: metadata,
+        lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
+    };
+    Ok(QuickTimeParsed {
+        meta,
+        sample_offsets,
+        sample_sizes,
+        samples_per_pixel,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -199,11 +660,21 @@ impl FormatReader for QuickTimeReader {
 ///
 /// MNG is PNG-related, but it is a distinct animation/container format and
 /// cannot be decoded by treating the file as a PNG stream.
-pub struct MngReader;
+pub struct MngReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    layout: Option<MiscStrictRawLayout>,
+}
+
+const MNG_STRICT_RAW_MAGIC: [u8; 16] = *b"BFMNGSTRICTRAW01";
 
 impl MngReader {
     pub fn new() -> Self {
-        MngReader
+        MngReader {
+            path: None,
+            meta: None,
+            layout: None,
+        }
     }
 }
 
@@ -222,40 +693,93 @@ impl FormatReader for MngReader {
         matches!(ext.as_deref(), Some("mng"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= MNG_STRICT_RAW_MAGIC.len()
+            && header[..MNG_STRICT_RAW_MAGIC.len()] == MNG_STRICT_RAW_MAGIC
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "MNG container parsing is not yet implemented".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(strict_misc_raw_unsupported("MNG strict raw"));
+            }
+            Err(err) => return Err(BioFormatsError::Io(err)),
+        };
+        if data.len() < MNG_STRICT_RAW_MAGIC.len()
+            || data[..MNG_STRICT_RAW_MAGIC.len()] != MNG_STRICT_RAW_MAGIC
+        {
+            return Err(strict_misc_raw_unsupported("MNG strict raw"));
+        }
+
+        let (meta, layout) =
+            parse_misc_strict_raw_subset(path, &MNG_STRICT_RAW_MAGIC, "MNG strict raw")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
     fn series(&self) -> usize {
         0
     }
     fn metadata(&self) -> &ImageMetadata {
-        crate::common::reader::uninitialized_metadata()
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
-    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(p))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        read_misc_strict_raw_plane(
+            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
+            self.layout.ok_or(BioFormatsError::NotInitialized)?,
+            plane_index,
+        )
     }
-    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let _ = (x, y, w, h);
-        Err(BioFormatsError::PlaneOutOfRange(p))
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("MNG strict raw", &full, meta, 1, x, y, w, h)
     }
-    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(p))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -269,13 +793,17 @@ impl FormatReader for MngReader {
 pub struct VolocityLibraryReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<MiscStrictRawLayout>,
 }
+
+const VOLOCITY_LIBRARY_STRICT_RAW_MAGIC: [u8; 16] = *b"BFVOLOCITYACFF01";
 
 impl VolocityLibraryReader {
     pub fn new() -> Self {
         VolocityLibraryReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -295,28 +823,60 @@ impl FormatReader for VolocityLibraryReader {
         matches!(ext.as_deref(), Some("acff"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= VOLOCITY_LIBRARY_STRICT_RAW_MAGIC.len()
+            && header[..VOLOCITY_LIBRARY_STRICT_RAW_MAGIC.len()]
+                == VOLOCITY_LIBRARY_STRICT_RAW_MAGIC
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Volocity Library format requires Volocity-specific OLE2 stream parsing".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.layout = None;
+
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(strict_misc_raw_unsupported("Volocity Library"));
+            }
+            Err(err) => return Err(BioFormatsError::Io(err)),
+        };
+        if data.len() < VOLOCITY_LIBRARY_STRICT_RAW_MAGIC.len()
+            || data[..VOLOCITY_LIBRARY_STRICT_RAW_MAGIC.len()] != VOLOCITY_LIBRARY_STRICT_RAW_MAGIC
+        {
+            return Err(strict_misc_raw_unsupported("Volocity Library"));
+        }
+
+        let (meta, layout) = parse_misc_strict_raw_subset(
+            path,
+            &VOLOCITY_LIBRARY_STRICT_RAW_MAGIC,
+            "Volocity Library",
+        )?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -330,22 +890,37 @@ impl FormatReader for VolocityLibraryReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        read_misc_strict_raw_plane(
+            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
+            self.layout.ok_or(BioFormatsError::NotInitialized)?,
+            plane_index,
+        )
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Volocity Library", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -359,13 +934,17 @@ impl FormatReader for VolocityLibraryReader {
 pub struct SlideBookReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<MiscStrictRawLayout>,
 }
+
+const SLIDEBOOK_STRICT_RAW_MAGIC: [u8; 16] = *b"BFSLIDEBOOKRAW1!";
 
 impl SlideBookReader {
     pub fn new() -> Self {
         SlideBookReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -385,28 +964,37 @@ impl FormatReader for SlideBookReader {
         matches!(ext.as_deref(), Some("sld"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= SLIDEBOOK_STRICT_RAW_MAGIC.len()
+            && header[..SLIDEBOOK_STRICT_RAW_MAGIC.len()] == SLIDEBOOK_STRICT_RAW_MAGIC
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "3i SlideBook format is proprietary with undocumented binary structure".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let (meta, layout) =
+            parse_misc_strict_raw_subset(path, &SLIDEBOOK_STRICT_RAW_MAGIC, "3i SlideBook")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if s == 0 && self.meta.is_some() {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -419,29 +1007,38 @@ impl FormatReader for SlideBookReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "3i SlideBook format is proprietary with undocumented binary structure".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        read_misc_strict_raw_plane(
+            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
+            self.layout.ok_or(BioFormatsError::NotInitialized)?,
+            plane_index,
+        )
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "3i SlideBook format is proprietary with undocumented binary structure".to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("3i SlideBook", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "3i SlideBook format is proprietary with undocumented binary structure".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -1113,11 +1710,15 @@ impl FormatReader for MincReader {
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if s == 0 && self.meta.is_some() {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1184,13 +1785,17 @@ impl FormatReader for MincReader {
 pub struct OpenlabLiffReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<MiscStrictRawLayout>,
 }
+
+const OPENLAB_LIFF_STRICT_RAW_MAGIC: [u8; 16] = *b"BFOPENLABLIFFRAW";
 
 impl OpenlabLiffReader {
     pub fn new() -> Self {
         OpenlabLiffReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -1210,29 +1815,40 @@ impl FormatReader for OpenlabLiffReader {
         matches!(ext.as_deref(), Some("liff"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= OPENLAB_LIFF_STRICT_RAW_MAGIC.len()
+            && header[..OPENLAB_LIFF_STRICT_RAW_MAGIC.len()] == OPENLAB_LIFF_STRICT_RAW_MAGIC
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "PerkinElmer Openlab LIFF is a proprietary format with undocumented binary structure"
-                .to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let (meta, layout) = parse_misc_strict_raw_subset(
+            path,
+            &OPENLAB_LIFF_STRICT_RAW_MAGIC,
+            "PerkinElmer Openlab LIFF",
+        )?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if s == 0 && self.meta.is_some() {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1245,32 +1861,38 @@ impl FormatReader for OpenlabLiffReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "PerkinElmer Openlab LIFF is a proprietary format with undocumented binary structure"
-                .to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        read_misc_strict_raw_plane(
+            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
+            self.layout.ok_or(BioFormatsError::NotInitialized)?,
+            plane_index,
+        )
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "PerkinElmer Openlab LIFF is a proprietary format with undocumented binary structure"
-                .to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("PerkinElmer Openlab LIFF", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "PerkinElmer Openlab LIFF is a proprietary format with undocumented binary structure"
-                .to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -1465,13 +2087,17 @@ impl FormatReader for Jpeg2000Reader {
 pub struct SedatReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<MiscStrictRawLayout>,
 }
+
+const SEDAT_STRICT_RAW_MAGIC: [u8; 16] = *b"BFSEDATLABRAW01!";
 
 impl SedatReader {
     pub fn new() -> Self {
         SedatReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -1491,28 +2117,37 @@ impl FormatReader for SedatReader {
         matches!(ext.as_deref(), Some("sedat"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= SEDAT_STRICT_RAW_MAGIC.len()
+            && header[..SEDAT_STRICT_RAW_MAGIC.len()] == SEDAT_STRICT_RAW_MAGIC
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Sedat Lab format is proprietary with undocumented binary structure".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        let (meta, layout) =
+            parse_misc_strict_raw_subset(path, &SEDAT_STRICT_RAW_MAGIC, "Sedat Lab")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if s == 0 && self.meta.is_some() {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
@@ -1525,29 +2160,38 @@ impl FormatReader for SedatReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Sedat Lab format is proprietary with undocumented binary structure".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        read_misc_strict_raw_plane(
+            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
+            self.layout.ok_or(BioFormatsError::NotInitialized)?,
+            plane_index,
+        )
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Sedat Lab format is proprietary with undocumented binary structure".to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Sedat Lab", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Sedat Lab format is proprietary with undocumented binary structure".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
 
@@ -1659,14 +2303,14 @@ impl FormatReader for SmCameraReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if s == 0 && self.meta.is_some() {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
 
@@ -1845,14 +2489,14 @@ impl FormatReader for TextReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if s == 0 && self.meta.is_some() {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
 

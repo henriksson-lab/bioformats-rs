@@ -492,7 +492,12 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
     }
 
     let channels: Vec<i32> = active_channels.into_iter().collect();
-    let size_c = channels.len().max(1) as u32;
+    if channels.is_empty() {
+        return Err(BioFormatsError::Format(
+            "PrairieView XML does not declare any file channels".into(),
+        ));
+    }
+    let size_c = channels.len() as u32;
 
     // NB: Both stage positions and time points are rasterized into the list of
     // Sequences. So sequenceCount = sizeT * seriesCount (Java
@@ -504,10 +509,15 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
 
     // Derive pixel type / dimensions from the first available TIFF.
     let mut pixel_type = match bits {
+        0 => PixelType::Uint16,
         8 => PixelType::Uint8,
         16 => PixelType::Uint16,
         32 => PixelType::Float32,
-        _ => PixelType::Uint16,
+        _ => {
+            return Err(BioFormatsError::Format(format!(
+                "Prairie: unsupported bitDepth {bits}"
+            )))
+        }
     };
     let mut is_little_endian = true;
     let first_file = sequences
@@ -518,27 +528,70 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
         .next();
     if let Some(ff) = first_file {
         let mut r = TiffReader::new();
-        if r.set_id(&ff).is_ok() {
+        r.set_id(&ff).map_err(|e| {
+            BioFormatsError::Format(format!(
+                "Prairie: companion TIFF {} could not be read before metadata was initialized: {e}",
+                ff.display()
+            ))
+        })?;
+        let tm = r.metadata();
+        pixel_type = tm.pixel_type;
+        is_little_endian = tm.is_little_endian;
+        if width == 0 {
+            width = tm.size_x;
+        }
+        if height == 0 {
+            height = tm.size_y;
+        }
+        if bits == 0 {
+            bits = tm.bits_per_pixel as u32;
+        }
+        let _ = r.close();
+    }
+
+    let mut checked_tiffs: HashMap<PathBuf, u32> = HashMap::new();
+    for pf in sequences
+        .iter()
+        .flat_map(|s| s.frames.iter())
+        .flat_map(|f| f.files.iter())
+    {
+        let pages = if let Some(pages) = checked_tiffs.get(&pf.filename) {
+            *pages
+        } else {
+            let mut r = TiffReader::new();
+            r.set_id(&pf.filename).map_err(|e| {
+                BioFormatsError::Format(format!(
+                    "Prairie: companion TIFF {} could not be read before metadata was initialized: {e}",
+                    pf.filename.display()
+                ))
+            })?;
             let tm = r.metadata();
-            pixel_type = tm.pixel_type;
-            is_little_endian = tm.is_little_endian;
-            if width == 0 {
-                width = tm.size_x;
+            if tm.size_x != width || tm.size_y != height {
+                return Err(BioFormatsError::Format(format!(
+                    "Prairie: companion TIFF {} has dimensions {}x{}, expected {width}x{height}",
+                    pf.filename.display(),
+                    tm.size_x,
+                    tm.size_y
+                )));
             }
-            if height == 0 {
-                height = tm.size_y;
-            }
-            if bits == 0 {
-                bits = tm.bits_per_pixel as u32;
-            }
+            let pages = tm.image_count.max(1);
             let _ = r.close();
+            checked_tiffs.insert(pf.filename.clone(), pages);
+            pages
+        };
+        if pf.page >= pages {
+            return Err(BioFormatsError::Format(format!(
+                "Prairie: TIFF page {} out of range for {} ({} pages)",
+                pf.page,
+                pf.filename.display(),
+                pages
+            )));
         }
     }
-    if width == 0 {
-        width = 512;
-    }
-    if height == 0 {
-        height = 512;
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "Prairie: invalid image dimensions {width}x{height}"
+        )));
     }
     if bits == 0 {
         bits = 16;
@@ -723,6 +776,7 @@ impl FormatReader for PrairieReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let xml = find_prairie_xml(path)
             .ok_or_else(|| BioFormatsError::Format("Prairie XML file not found".into()))?;
 
@@ -762,9 +816,12 @@ impl FormatReader for PrairieReader {
     }
 
     fn series_count(&self) -> usize {
-        self.metas.len().max(1)
+        self.metas.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.metas.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s >= self.metas.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -897,8 +954,14 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         if line.contains("<DimensionDescription") {
             let len = extract_attr(line, "NumberOfElements")
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(1)
-                .max(1);
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Leica TCS: missing or invalid NumberOfElements".into())
+                })?;
+            if len == 0 {
+                return Err(BioFormatsError::Format(
+                    "Leica TCS: NumberOfElements must be non-zero".into(),
+                ));
+            }
             let id = extract_attr(line, "DimID")
                 .and_then(|v| v.parse::<i32>().ok())
                 .unwrap_or(0);
@@ -918,7 +981,11 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
                         1 => PixelType::Uint8,
                         2 => PixelType::Uint16,
                         4 => PixelType::Float32,
-                        _ => pixel_type,
+                        _ => {
+                            return Err(BioFormatsError::Format(format!(
+                                "Leica TCS: unsupported BytesInc {n_bytes}"
+                            )))
+                        }
                     };
                 }
                 2 => {
@@ -977,11 +1044,26 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         ));
     }
 
-    if width == 0 {
-        width = 512;
+    let mut probe = TiffReader::new();
+    if probe.set_id(&tiff_files[0]).is_ok() {
+        let tm = probe.metadata();
+        if width == 0 {
+            width = tm.size_x;
+        }
+        if height == 0 {
+            height = tm.size_y;
+        }
+        let _ = probe.close();
+    } else if width == 0 || height == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "Leica TCS: companion TIFF {} could not be read before metadata was initialized",
+            tiff_files[0].display()
+        )));
     }
-    if height == 0 {
-        height = 512;
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "Leica TCS: invalid image dimensions {width}x{height}"
+        )));
     }
     if num_channels == 0 {
         num_channels = 1;
@@ -1061,6 +1143,7 @@ impl FormatReader for LeicaTcsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let content_prefix = {
             let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
             let mut buf = vec![0u8; 256];
@@ -1087,10 +1170,10 @@ impl FormatReader for LeicaTcsReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -1282,9 +1365,7 @@ mod prairie_tests {
         )
         .unwrap();
 
-        let mut reader = PrairieReader::new();
-        reader.set_id(&xml).unwrap();
-        let err = reader.open_bytes(0).unwrap_err();
+        let err = PrairieReader::new().set_id(&xml).unwrap_err();
 
         assert!(
             matches!(err, BioFormatsError::Format(ref message) if message.contains("TIFF page 1 out of range")),

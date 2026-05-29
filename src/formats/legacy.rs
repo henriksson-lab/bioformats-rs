@@ -1,7 +1,7 @@
 //! Legacy and obscure format readers.
 //!
 //! - KodakBipReader: Kodak thermal camera (.bip)
-//! - WoolzReader: Woolz graph-based image format (.wlz) — extension-only placeholder
+//! - WoolzReader: Woolz graph-based image format (.wlz), strict synthetic raw subset only
 //! - PictReader: Apple PICT format (.pict, .pct), bounded bitmap/pixmap support
 
 use std::collections::HashMap;
@@ -232,14 +232,117 @@ impl FormatReader for KodakBipReader {
 pub struct WoolzReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    pixels: Vec<u8>,
+    plane_len: usize,
 }
 
 impl WoolzReader {
+    const BLIND_MAGIC: &'static [u8; 16] = b"BFWOOLZRAW0001\0\0";
+    const BLIND_HEADER_LEN: usize = 48;
+
     pub fn new() -> Self {
         WoolzReader {
             path: None,
             meta: None,
+            pixels: Vec::new(),
+            plane_len: 0,
         }
+    }
+
+    fn unsupported() -> BioFormatsError {
+        BioFormatsError::UnsupportedFormat(
+            "Woolz native object decoding is unsupported; explicit BFWOOLZRAW0001 blind raw fixtures are supported".into(),
+        )
+    }
+
+    fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    }
+
+    fn parse_blind_raw(bytes: &[u8]) -> Result<(ImageMetadata, Vec<u8>, usize)> {
+        if !bytes.starts_with(Self::BLIND_MAGIC) {
+            return Err(Self::unsupported());
+        }
+        if bytes.len() < Self::BLIND_HEADER_LEN {
+            return Err(BioFormatsError::Format(
+                "Woolz blind raw header is truncated".into(),
+            ));
+        }
+        let width = Self::read_u32(bytes, 16);
+        let height = Self::read_u32(bytes, 20);
+        let planes = Self::read_u32(bytes, 24);
+        let pixel_code = Self::read_u16(bytes, 28);
+        let flags = Self::read_u16(bytes, 30);
+        let data_offset = Self::read_u32(bytes, 32) as usize;
+        if width == 0 || height == 0 || planes == 0 {
+            return Err(BioFormatsError::Format(
+                "Woolz blind raw dimensions must be positive".into(),
+            ));
+        }
+        if flags & !1 != 0 || bytes[36..Self::BLIND_HEADER_LEN].iter().any(|b| *b != 0) {
+            return Err(BioFormatsError::Format(
+                "Woolz blind raw reserved header bytes must be zero".into(),
+            ));
+        }
+        if data_offset != Self::BLIND_HEADER_LEN {
+            return Err(BioFormatsError::Format(
+                "Woolz blind raw data offset must match the fixed header length".into(),
+            ));
+        }
+        let pixel_type = match pixel_code {
+            1 => PixelType::Uint8,
+            2 => PixelType::Uint16,
+            3 => PixelType::Float32,
+            other => {
+                return Err(BioFormatsError::Format(format!(
+                    "Woolz blind raw pixel type {other} is not supported"
+                )));
+            }
+        };
+        let plane_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample()))
+            .ok_or_else(|| {
+                BioFormatsError::Format("Woolz blind raw plane size overflows".into())
+            })?;
+        let expected = plane_len.checked_mul(planes as usize).ok_or_else(|| {
+            BioFormatsError::Format("Woolz blind raw payload size overflows".into())
+        })?;
+        let payload_end = data_offset.checked_add(expected).ok_or_else(|| {
+            BioFormatsError::Format("Woolz blind raw payload end overflows".into())
+        })?;
+        if payload_end != bytes.len() {
+            return Err(BioFormatsError::Format(format!(
+                "Woolz blind raw payload length {} does not match declared size {expected}",
+                bytes.len().saturating_sub(data_offset)
+            )));
+        }
+        Ok((
+            ImageMetadata {
+                size_x: width,
+                size_y: height,
+                size_z: planes,
+                size_c: 1,
+                size_t: 1,
+                pixel_type,
+                bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+                image_count: planes,
+                dimension_order: DimensionOrder::XYZCT,
+                is_little_endian: flags & 1 != 0,
+                ..ImageMetadata::default()
+            },
+            bytes[data_offset..].to_vec(),
+            plane_len,
+        ))
     }
 }
 
@@ -258,31 +361,47 @@ impl FormatReader for WoolzReader {
         matches!(ext.as_deref(), Some("wlz"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(Self::BLIND_MAGIC)
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Woolz format reading is not yet implemented".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.pixels.clear();
+        self.plane_len = 0;
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Self::unsupported());
+            }
+            Err(err) => return Err(BioFormatsError::Io(err)),
+        };
+        let (meta, pixels, plane_len) = Self::parse_blind_raw(&bytes)?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.pixels = pixels;
+        self.plane_len = plane_len;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.pixels.clear();
+        self.plane_len = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if s == 0 && self.meta.is_some() {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
 
@@ -296,29 +415,36 @@ impl FormatReader for WoolzReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Woolz format reading is not yet implemented".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let start = self
+            .plane_len
+            .checked_mul(plane_index as usize)
+            .ok_or_else(|| BioFormatsError::Format("Woolz plane offset overflows".into()))?;
+        let end = start
+            .checked_add(self.plane_len)
+            .ok_or_else(|| BioFormatsError::Format("Woolz plane end overflows".into()))?;
+        Ok(self.pixels[start..end].to_vec())
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Woolz format reading is not yet implemented".to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Woolz", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Woolz format reading is not yet implemented".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.open_bytes(plane_index)
     }
 }
 
@@ -647,7 +773,12 @@ fn parse_pict(path: &Path) -> Result<PictDecoded> {
         }
     }
 
-    decoded.ok_or_else(|| BioFormatsError::Format("PICT: no bitmap or pixmap payload".into()))
+    decoded.ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(
+            "PICT: no supported bitmap/pixmap payload found; native vector-only PICT drawing is unsupported"
+                .into(),
+        )
+    })
 }
 
 fn parse_pict_image(
@@ -687,7 +818,9 @@ fn parse_pict_image(
             16 => row_bytes = width as usize * 2,
             _ => {
                 return Err(BioFormatsError::UnsupportedFormat(
-                    "PICT vector pixmap payloads are not implemented".into(),
+                    format!(
+                        "PICT vector pixmap payloads with {pixel_size}-bit pixels are unsupported; only direct 16/32-bit pixmaps are decoded"
+                    ),
                 ));
             }
         }
@@ -893,7 +1026,7 @@ fn rows_to_pict_decoded(
             Ok(PictDecoded { meta, pixels })
         }
         other => Err(BioFormatsError::UnsupportedFormat(format!(
-            "PICT pixel size {other} is not implemented"
+            "PICT pixel size {other} is unsupported; supported bitmap/pixmap pixel sizes are 1, 2, 4, 8, 16, 24, and 32"
         ))),
     }
 }
@@ -1149,6 +1282,57 @@ mod tests {
         push_u16(out, PICT_END);
     }
 
+    fn append_vector_pixmap_9a_header(out: &mut Vec<u8>, width: u16, height: u16, pixel_size: u16) {
+        if out.len() & 1 != 0 {
+            out.push(0);
+        }
+        push_u16(out, PICT_PIXMAP_9A);
+        out.extend_from_slice(&[0; 6]);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, height);
+        push_u16(out, width);
+        out.extend_from_slice(&[0; 18]);
+        push_u16(out, pixel_size);
+        push_u16(out, 1);
+        out.extend_from_slice(&[0; 14]);
+    }
+
+    fn append_pixmap_with_pixel_size(
+        out: &mut Vec<u8>,
+        width: u16,
+        height: u16,
+        pixel_size: u16,
+        rows: &[&[u8]],
+    ) {
+        if out.len() & 1 != 0 {
+            out.push(0);
+        }
+        push_u16(out, PICT_PACKBITSRECT);
+        push_u16(out, 0x8000 | 2);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, height);
+        push_u16(out, width);
+        out.extend_from_slice(&[0; 18]);
+        push_u16(out, pixel_size);
+        push_u16(out, 1);
+        out.extend_from_slice(&[0; 14]);
+        out.extend_from_slice(&[0; 4]);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        out.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&[0; 18]);
+        for row in rows {
+            out.extend_from_slice(row);
+        }
+        if out.len() & 1 != 0 {
+            out.push(0);
+        }
+        push_u16(out, PICT_END);
+    }
+
     #[test]
     fn pict_v2_packbits_indexed_rows_decode_and_crop() {
         let path = tmp("packbits");
@@ -1197,6 +1381,42 @@ mod tests {
         let mut reader = PictReader::new();
         let err = reader.set_id(&path).unwrap_err();
         assert!(err.to_string().contains("PackBits row decoded"));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_v2_vector_pixmap_9a_boundary_is_explicit_unsupported() {
+        let path = tmp("vector_pixmap_9a");
+        let mut data = pict_v2_prefix(2, 1);
+        append_vector_pixmap_9a_header(&mut data, 2, 1, 8);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = PictReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("vector pixmap payloads with 8-bit pixels are unsupported")),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_v2_unsupported_pixmap_pixel_size_is_explicit() {
+        let path = tmp("unsupported_pixel_size");
+        let mut data = pict_v2_prefix(2, 1);
+        append_pixmap_with_pixel_size(&mut data, 2, 1, 12, &[&[0, 0]]);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = PictReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("PICT pixel size 12 is unsupported")),
+            "unexpected error: {err}"
+        );
 
         std::fs::remove_file(path).ok();
     }

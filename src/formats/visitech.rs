@@ -80,7 +80,7 @@ struct VisitechMeta {
     num_series: u32,
 }
 
-fn parse_html(html: &str) -> VisitechMeta {
+fn parse_html(html: &str) -> Result<VisitechMeta> {
     // Normalize <br> to newlines, like Java does.
     let normalized = html
         .replace("<br>", "\n")
@@ -94,6 +94,7 @@ fn parse_html(html: &str) -> VisitechMeta {
     let mut size_c = 0u32;
     let mut size_t = 0u32;
     let mut pixel_type = PixelType::Uint16;
+    let mut saw_bit_depth = false;
     let mut num_series = 0u32;
     // Java tracks an estimated series count / sizeC from "Document created".
     let mut estimated_series_count = 0u32;
@@ -122,6 +123,7 @@ fn parse_html(html: &str) -> VisitechMeta {
                 num_series += 1;
             } else if key == "Image bit depth" {
                 if let Ok(mut bits) = value.parse::<u32>() {
+                    saw_bit_depth = true;
                     while bits % 8 != 0 {
                         bits += 1;
                     }
@@ -130,7 +132,11 @@ fn parse_html(html: &str) -> VisitechMeta {
                         1 => PixelType::Uint8,
                         2 => PixelType::Uint16,
                         4 => PixelType::Float32,
-                        _ => PixelType::Uint16,
+                        _ => {
+                            return Err(BioFormatsError::Format(format!(
+                                "Visitech: unsupported image bit depth {value}"
+                            )));
+                        }
                     };
                 }
             } else if key == "Image dimensions" {
@@ -183,26 +189,23 @@ fn parse_html(html: &str) -> VisitechMeta {
         size_c = estimated_size_c;
     }
 
-    if size_c == 0 {
-        size_c = 1;
+    if size_x == 0 || size_y == 0 {
+        return Err(BioFormatsError::Format(
+            "Visitech: report is missing positive image dimensions".into(),
+        ));
     }
-    if size_z == 0 {
-        size_z = 1;
+    if size_z == 0 || size_c == 0 || size_t == 0 || num_series == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "Visitech: report is missing positive counts (Z={size_z}, C={size_c}, T={size_t}, series={num_series})"
+        )));
     }
-    if size_t == 0 {
-        size_t = 1;
-    }
-    if size_x == 0 {
-        size_x = 512;
-    }
-    if size_y == 0 {
-        size_y = 512;
-    }
-    if num_series == 0 {
-        num_series = 1;
+    if !saw_bit_depth {
+        return Err(BioFormatsError::Format(
+            "Visitech: report is missing image bit depth".into(),
+        ));
     }
 
-    VisitechMeta {
+    Ok(VisitechMeta {
         size_x,
         size_y,
         size_z,
@@ -210,7 +213,7 @@ fn parse_html(html: &str) -> VisitechMeta {
         size_t,
         pixel_type,
         num_series,
-    }
+    })
 }
 
 /// Locate the HTML report for a given `.xys` or `.html` entry path.
@@ -290,10 +293,19 @@ fn find_pixels_offset(
     if plane_count == 0 {
         return Ok(marker_pos);
     }
-    let skip = (len
-        .saturating_sub(marker_pos)
-        .saturating_sub(plane_count * plane_size))
-        / plane_count;
+    let payload_bytes = plane_count.checked_mul(plane_size).ok_or_else(|| {
+        BioFormatsError::Format("Visitech: declared payload size overflows".into())
+    })?;
+    if marker_pos
+        .checked_add(payload_bytes)
+        .map(|end| end > len)
+        .unwrap_or(true)
+    {
+        return Err(BioFormatsError::Format(format!(
+            "Visitech: .xys pixel payload is shorter than declared ({payload_bytes} bytes after marker, file length {len})"
+        )));
+    }
+    let skip = (len.saturating_sub(marker_pos).saturating_sub(payload_bytes)) / plane_count;
     let mut fp = marker_pos + skip;
     // PIXELS_MARKER last byte is 0x3f; nudge forward if present.
     if let Some(&b) = bytes.get(fp as usize) {
@@ -319,17 +331,18 @@ impl FormatReader for VisitechReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let html_path = find_html(path);
         let vmeta = match &html_path {
             Some(hp) => {
-                let html = std::fs::read_to_string(hp).unwrap_or_default();
-                parse_html(&html)
+                let html = std::fs::read_to_string(hp).map_err(BioFormatsError::Io)?;
+                parse_html(&html)?
             }
             None => {
                 // No report; fall back to scanning the entry for textual dims.
-                let raw = std::fs::read(path).unwrap_or_default();
+                let raw = std::fs::read(path).map_err(BioFormatsError::Io)?;
                 let text = String::from_utf8_lossy(&raw[..raw.len().min(4096)]).to_string();
-                parse_html(&text)
+                parse_html(&text)?
             }
         };
 
@@ -455,11 +468,13 @@ impl FormatReader for VisitechReader {
     }
 
     fn series_count(&self) -> usize {
-        self.series_meta.len().max(1)
+        self.series_meta.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.series_meta.len() {
+        if self.series_meta.is_empty() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s >= self.series_meta.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             self.series = s;
@@ -529,7 +544,10 @@ impl FormatReader for VisitechReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.series_meta.get(self.series).unwrap();
+        let meta = self
+            .series_meta
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         crate::formats::lei::crop_region(&full, meta, x, y, w, h)
     }
 

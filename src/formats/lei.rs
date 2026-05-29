@@ -207,12 +207,30 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
             c2.seek(images_ptr);
             temp_images = c2.read_i32();
         }
-        let temp_images = temp_images.max(0) as usize;
+        if temp_images <= 0 {
+            return Err(BioFormatsError::Format(
+                "LEI: image count must be positive".into(),
+            ));
+        }
+        let temp_images = temp_images as usize;
 
-        let mut size_x = c.read_i32().max(1) as u32;
-        let mut size_y = c.read_i32().max(1) as u32;
+        let raw_size_x = c.read_i32();
+        let raw_size_y = c.read_i32();
+        if raw_size_x <= 0 || raw_size_y <= 0 {
+            return Err(BioFormatsError::Format(format!(
+                "LEI: invalid image dimensions {raw_size_x}x{raw_size_y}"
+            )));
+        }
+        let mut size_x = raw_size_x as u32;
+        let mut size_y = raw_size_y as u32;
         c.skip(4);
-        let samples_per_pixel = c.read_i32().max(1) as u32;
+        let raw_samples_per_pixel = c.read_i32();
+        if raw_samples_per_pixel <= 0 {
+            return Err(BioFormatsError::Format(format!(
+                "LEI: invalid samples per pixel {raw_samples_per_pixel}"
+            )));
+        }
+        let samples_per_pixel = raw_samples_per_pixel as u32;
         let mut is_rgb = samples_per_pixel > 1;
         let mut size_c = samples_per_pixel;
 
@@ -271,18 +289,27 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
             if voxel == 20 {
                 is_rgb = true;
             }
-            let mut bpp = c.read_i32().max(1);
+            let mut bpp = c.read_i32();
+            if bpp <= 0 {
+                return Err(BioFormatsError::Format(format!(
+                    "LEI: invalid bytes per pixel {bpp}"
+                )));
+            }
             if bpp % 3 == 0 {
                 size_c = 3;
                 is_rgb = true;
                 bpp /= 3;
             }
-            bpp_bytes = bpp.max(1) as u32;
+            bpp_bytes = bpp as u32;
             pixel_type = match bpp_bytes {
                 1 => PixelType::Uint8,
                 2 => PixelType::Uint16,
                 4 => PixelType::Float32,
-                _ => PixelType::Uint8,
+                _ => {
+                    return Err(BioFormatsError::Format(format!(
+                        "LEI: unsupported bytes per pixel {bpp_bytes}"
+                    )))
+                }
             };
 
             let _resolution = c.read_i32(); // bits per pixel / real-world resolution
@@ -298,7 +325,13 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
             for j in 0..dim_count {
                 let dim_id = c.read_i32();
                 let dim_type = dimension_name(dim_id);
-                let size = c.read_i32().max(1) as u32;
+                let raw_size = c.read_i32();
+                if raw_size <= 0 {
+                    return Err(BioFormatsError::Format(format!(
+                        "LEI: invalid dimension size {raw_size}"
+                    )));
+                }
+                let size = raw_size as u32;
                 let distance = c.read_i32();
                 let strlen = c.read_i32().max(0) as usize * 2;
                 let size_data = c.read_string(strlen);
@@ -504,6 +537,7 @@ impl FormatReader for LeiReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let lei = find_lei_file(path)
             .ok_or_else(|| BioFormatsError::Format("LEI file not found".into()))?;
         self.series_list = parse_lei(&lei)?;
@@ -519,7 +553,7 @@ impl FormatReader for LeiReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        self.series_list.len().max(1)
+        self.series_list.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
         if s >= self.series_list.len() {

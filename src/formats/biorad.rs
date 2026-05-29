@@ -24,6 +24,15 @@ fn r_f32(b: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+fn positive_i16_dim(value: i16, label: &str) -> Result<u32> {
+    if value <= 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Bio-Rad PIC {label} is non-positive ({value})"
+        )));
+    }
+    Ok(value as u32)
+}
+
 pub struct BioRadReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -221,6 +230,7 @@ impl FormatReader for BioRadReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut hdr = [0u8; HEADER_SIZE as usize];
         f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
@@ -229,9 +239,9 @@ impl FormatReader for BioRadReader {
             return Err(BioFormatsError::Format("Not a Bio-Rad PIC file".into()));
         }
 
-        let nx = r_i16(&hdr, 0).max(1) as u32;
-        let ny = r_i16(&hdr, 2).max(1) as u32;
-        let npic = r_i16(&hdr, 4).max(1) as u32;
+        let nx = positive_i16_dim(r_i16(&hdr, 0), "width")?;
+        let ny = positive_i16_dim(r_i16(&hdr, 2), "height")?;
+        let npic = positive_i16_dim(r_i16(&hdr, 4), "image count")?;
         // Java: pixelType = (byteFormat == 0) ? UINT16 : UINT8. Any nonzero
         // byteFormat means 8-bit data.
         let byte_format = r_i16(&hdr, 14); // 0=uint16 (2 bytes), nonzero=uint8 (1 byte)
@@ -241,6 +251,24 @@ impl FormatReader for BioRadReader {
         } else {
             PixelType::Uint16
         };
+        let plane_bytes = (nx as u64)
+            .checked_mul(ny as u64)
+            .and_then(|v| v.checked_mul(bpp as u64))
+            .ok_or_else(|| {
+                BioFormatsError::Format("Bio-Rad PIC plane byte count overflows".into())
+            })?;
+        let pixel_bytes = plane_bytes.checked_mul(npic as u64).ok_or_else(|| {
+            BioFormatsError::Format("Bio-Rad PIC pixel byte count overflows".into())
+        })?;
+        let required_len = HEADER_SIZE.checked_add(pixel_bytes).ok_or_else(|| {
+            BioFormatsError::Format("Bio-Rad PIC payload offset overflows".into())
+        })?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if file_len < required_len {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Bio-Rad PIC pixel payload is shorter than declared: need {required_len} bytes, found {file_len}"
+            )));
+        }
         let name_bytes = &hdr[18..50];
         let name = String::from_utf8_lossy(name_bytes)
             .trim_end_matches('\0')
@@ -374,9 +402,12 @@ impl FormatReader for BioRadReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {

@@ -329,6 +329,11 @@ impl OifReader {
         }
 
         let mut image_count = filenames.len();
+        if image_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "OIF/OIB does not reference any PTY image planes".into(),
+            ));
+        }
 
         // ---- Build dimension order + tiff list by reading each .pty ----
         let mut dimension_order = String::from("XY");
@@ -360,12 +365,9 @@ impl OifReader {
             let pty_bytes = match self.source.read_bytes(&file) {
                 Ok(b) => b,
                 Err(_) => {
-                    // Java: if .pty is missing, guess the TIFF directly.
-                    let tiff = replace_extension(&file, "pty", "tif");
-                    tiffs.push(tiff);
-                    planes.push(PlaneData::default());
-                    produced += 1;
-                    continue;
+                    return Err(BioFormatsError::Format(format!(
+                        "OIF/OIB: referenced PTY file {file} could not be read"
+                    )));
                 }
             };
             let pty = IniList::parse(&decode_text(&pty_bytes));
@@ -432,7 +434,15 @@ impl OifReader {
         }
 
         if tiffs.len() != image_count {
-            image_count = tiffs.len();
+            return Err(BioFormatsError::Format(format!(
+                "OIF/OIB: referenced {image_count} PTY plane(s) but resolved {} TIFF plane(s)",
+                tiffs.len()
+            )));
+        }
+        if tiffs.is_empty() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "OIF/OIB does not reference any TIFF image planes".into(),
+            ));
         }
 
         // ---- Compute axis sizes from the OIF axis codes ----
@@ -524,7 +534,11 @@ impl OifReader {
             1 => PixelType::Uint8,
             2 => PixelType::Uint16,
             4 => PixelType::Float32,
-            _ => PixelType::Uint16,
+            _ => {
+                return Err(BioFormatsError::Format(format!(
+                    "OIF/OIB: unsupported ImageDepth {image_depth}"
+                )))
+            }
         };
         let mut bits = if valid_bits > 0 {
             valid_bits as u8
@@ -561,6 +575,39 @@ impl OifReader {
                         }
                     }
                 }
+            }
+        }
+        if size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::Format(format!(
+                "OIF/OIB: invalid image dimensions {size_x}x{size_y}"
+            )));
+        }
+        let images_per_file = if tiffs.is_empty() {
+            0
+        } else if image_count % tiffs.len() == 0 {
+            image_count / tiffs.len()
+        } else {
+            return Err(BioFormatsError::Format(format!(
+                "OIF/OIB: image count {image_count} is not divisible by {} TIFF file(s)",
+                tiffs.len()
+            )));
+        };
+        for tiff in &tiffs {
+            let bytes = self.source.read_bytes(tiff)?;
+            let tm = probe_tiff_metadata(&bytes).ok_or_else(|| {
+                BioFormatsError::Format(format!("OIF/OIB: companion TIFF {tiff} could not be read"))
+            })?;
+            if tm.size_x != size_x || tm.size_y != size_y {
+                return Err(BioFormatsError::Format(format!(
+                    "OIF/OIB: companion TIFF {tiff} has dimensions {}x{}, expected {size_x}x{size_y}",
+                    tm.size_x, tm.size_y
+                )));
+            }
+            if tm.image_count.max(1) < images_per_file as u32 {
+                return Err(BioFormatsError::Format(format!(
+                    "OIF/OIB: companion TIFF {tiff} has {} page(s), expected at least {images_per_file}",
+                    tm.image_count.max(1)
+                )));
             }
         }
 
@@ -790,6 +837,16 @@ fn probe_tiff_dims(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8, u32, u32)
     res
 }
 
+fn probe_tiff_metadata(bytes: &[u8]) -> Option<ImageMetadata> {
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("bioformats_oib_meta_{}.tif", rand_suffix(bytes)));
+    std::fs::write(&tmp, bytes).ok()?;
+    let mut r = TiffReader::new();
+    let res = r.set_id(&tmp).ok().map(|_| r.metadata().clone());
+    let _ = std::fs::remove_file(&tmp);
+    res
+}
+
 fn rand_suffix(bytes: &[u8]) -> u64 {
     // cheap, deterministic-ish unique suffix
     let pid = std::process::id() as u64;
@@ -821,6 +878,7 @@ impl FormatReader for OifReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let is_oib = path
             .extension()
             .and_then(|e| e.to_str())
@@ -843,10 +901,12 @@ impl FormatReader for OifReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -1005,13 +1065,10 @@ mod tests {
         .unwrap();
 
         let mut reader = OifReader::new();
-        reader.set_id(&root).unwrap();
-        assert_eq!(reader.metadata().image_count, 4);
-        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
-
-        let err = reader.open_bytes(1).unwrap_err();
+        let err = reader.set_id(&root).unwrap_err();
         assert!(
-            err.to_string().contains("maps to TIFF page 1"),
+            err.to_string().contains("companion TIFF")
+                && err.to_string().contains("expected at least 4"),
             "unexpected error: {err}"
         );
 

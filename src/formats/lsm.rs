@@ -99,9 +99,11 @@ fn read_f64_lsm(buf: &[u8], off: usize, le: bool) -> f64 {
     }
 }
 
-fn parse_lsm_info(bytes: &[u8], le: bool) -> Option<LsmInfo> {
+fn parse_lsm_info(bytes: &[u8], le: bool) -> Result<LsmInfo> {
     if bytes.len() < 64 {
-        return None;
+        return Err(BioFormatsError::Format(
+            "LSM: CZ_LSMInfo block is shorter than 64 bytes".into(),
+        ));
     }
     // ZeissLSMReader.java never rejects based on the magic number; it only
     // records it. We mirror that: accept the documented magics (0x00300494 and
@@ -112,10 +114,19 @@ fn parse_lsm_info(bytes: &[u8], le: bool) -> Option<LsmInfo> {
         // Not a hard error: continue parsing dimensions like Java does.
     }
 
-    Some(LsmInfo {
-        dim_z: read_i32_lsm(bytes, 16, le).max(1) as u32,
-        dim_c: read_i32_lsm(bytes, 20, le).max(1) as u32,
-        dim_t: read_i32_lsm(bytes, 24, le).max(1) as u32,
+    let dim_z = read_i32_lsm(bytes, 16, le);
+    let dim_c = read_i32_lsm(bytes, 20, le);
+    let dim_t = read_i32_lsm(bytes, 24, le);
+    if dim_z <= 0 || dim_c <= 0 || dim_t <= 0 {
+        return Err(BioFormatsError::Format(format!(
+            "LSM: invalid non-positive dimensions Z={dim_z} C={dim_c} T={dim_t}"
+        )));
+    }
+
+    Ok(LsmInfo {
+        dim_z: dim_z as u32,
+        dim_c: dim_c as u32,
+        dim_t: dim_t as u32,
         data_type: read_i32_lsm(bytes, 28, le),
         voxel_x: if bytes.len() >= 48 {
             read_f64_lsm(bytes, 40, le)
@@ -135,22 +146,16 @@ fn parse_lsm_info(bytes: &[u8], le: bool) -> Option<LsmInfo> {
     })
 }
 
-fn lsm_pixel_type(data_type: i32, tiff_bps: u16) -> PixelType {
+fn lsm_pixel_type(data_type: i32, tiff_bps: u16) -> Result<PixelType> {
     // data_type follows ZeissLSMReader: 1=uint8, 2=12-bit stored as uint16,
     // 5=32-bit float.
     match data_type {
-        1 => PixelType::Uint8,
-        2 => PixelType::Uint16,
-        5 => PixelType::Float32,
-        _ => {
-            // Fall back to TIFF BPS
-            match tiff_bps {
-                8 => PixelType::Uint8,
-                16 => PixelType::Uint16,
-                32 => PixelType::Float32,
-                _ => PixelType::Uint8,
-            }
-        }
+        1 => Ok(PixelType::Uint8),
+        2 => Ok(PixelType::Uint16),
+        5 => Ok(PixelType::Float32),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "LSM: unsupported CZ_LSMInfo DataType {other} (TIFF bits/sample {tiff_bps})"
+        ))),
     }
 }
 
@@ -173,8 +178,7 @@ fn read_lsm_info_from_file(path: &Path) -> Result<(LsmInfo, bool)> {
         }
     };
 
-    let info = parse_lsm_info(&lsm_bytes, le)
-        .ok_or_else(|| BioFormatsError::Format("LSM: failed to parse CZ_LSMInfo block".into()))?;
+    let info = parse_lsm_info(&lsm_bytes, le)?;
     Ok((info, le))
 }
 
@@ -254,6 +258,7 @@ impl FormatReader for LsmReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // First, read the CZ_LSMInfo block to get true dimensions
         let (lsm_info, le) = read_lsm_info_from_file(path)?;
 
@@ -279,9 +284,9 @@ impl FormatReader for LsmReader {
         let tiff_meta = self.inner.metadata().clone();
 
         // Build corrected metadata using LSM dimensions
-        let dim_z = lsm_info.dim_z.max(1);
-        let dim_c = lsm_info.dim_c.max(1);
-        let dim_t = lsm_info.dim_t.max(1);
+        let dim_z = lsm_info.dim_z;
+        let dim_c = lsm_info.dim_c;
+        let dim_t = lsm_info.dim_t;
         let packed_channels =
             lsm_uses_packed_channels(dim_z, dim_c, dim_t, tiff_meta.size_c, full_res_ifd_count);
         let image_count = if packed_channels {
@@ -290,7 +295,7 @@ impl FormatReader for LsmReader {
             checked_plane_count(dim_z, dim_c, dim_t)?
         };
 
-        let pixel_type = lsm_pixel_type(lsm_info.data_type, tiff_meta.bits_per_pixel as u16);
+        let pixel_type = lsm_pixel_type(lsm_info.data_type, tiff_meta.bits_per_pixel as u16)?;
         let is_rgb = packed_channels && tiff_meta.is_rgb;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
@@ -342,11 +347,11 @@ impl FormatReader for LsmReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())

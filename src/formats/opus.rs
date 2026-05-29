@@ -1,15 +1,194 @@
 //! Bruker OPUS FTIR spectroscopy and ISS Vista FLIM format readers.
 
+use std::fs::File;
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
 
 const OPUS_UNSUPPORTED: &str =
-    "Bruker OPUS spectral image decoding is not implemented; refusing guessed header metadata";
+    "Bruker OPUS native spectral image decoding is unsupported; expected explicit strict blind raw data";
 const ISS_UNSUPPORTED: &str =
-    "ISS Vista FLIM decoding is not implemented; refusing guessed header metadata";
+    "ISS Vista FLIM native decoding is unsupported; expected explicit strict blind raw data";
+const BLIND_HEADER_LEN: usize = 32;
+const OPUS_BLIND_MAGIC: &[u8; 8] = b"BFOPUS1\0";
+const ISS_BLIND_MAGIC: &[u8; 8] = b"BFISSFL1";
+
+#[derive(Clone, Copy)]
+struct BlindLayout {
+    data_offset: u64,
+    plane_bytes: usize,
+}
+
+fn blind_unsupported(format_name: &str) -> BioFormatsError {
+    match format_name {
+        "Bruker OPUS" => BioFormatsError::UnsupportedFormat(OPUS_UNSUPPORTED.to_string()),
+        "ISS Vista FLIM" => BioFormatsError::UnsupportedFormat(ISS_UNSUPPORTED.to_string()),
+        _ => BioFormatsError::UnsupportedFormat(format!(
+            "{format_name} native decoding is unsupported"
+        )),
+    }
+}
+
+fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
+}
+
+fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
+}
+
+fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ])
+}
+
+fn blind_pixel_type(code: u16, format_name: &str) -> Result<PixelType> {
+    match code {
+        1 => Ok(PixelType::Uint8),
+        2 => Ok(PixelType::Uint16),
+        3 => Ok(PixelType::Float32),
+        _ => Err(BioFormatsError::Format(format!(
+            "{format_name} blind subset has unsupported pixel type code {code}"
+        ))),
+    }
+}
+
+fn parse_blind_raw_layout(
+    path: &Path,
+    magic: &[u8; 8],
+    format_name: &str,
+) -> Result<(ImageMetadata, BlindLayout)> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(blind_unsupported(format_name));
+        }
+        Err(err) => return Err(BioFormatsError::Io(err)),
+    };
+    let file_len = file.metadata().map_err(BioFormatsError::Io)?.len();
+    if file_len < magic.len() as u64 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} file is too short for blind subset magic"
+        )));
+    }
+
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix).map_err(BioFormatsError::Io)?;
+    if &prefix != magic {
+        return Err(blind_unsupported(format_name));
+    }
+    if file_len < BLIND_HEADER_LEN as u64 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} blind subset header is truncated"
+        )));
+    }
+
+    let mut header = [0u8; BLIND_HEADER_LEN];
+    header[..8].copy_from_slice(&prefix);
+    file.read_exact(&mut header[8..])
+        .map_err(BioFormatsError::Io)?;
+
+    let size_x = read_u32_le(&header, 8);
+    let size_y = read_u32_le(&header, 12);
+    let image_count = read_u32_le(&header, 16);
+    let pixel_type_code = read_u16_le(&header, 20);
+    let reserved = read_u16_le(&header, 22);
+    let data_offset = read_u64_le(&header, 24);
+    if size_x == 0 || size_y == 0 || image_count == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} blind subset dimensions must be non-zero"
+        )));
+    }
+    if reserved != 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} blind subset reserved header bytes must be zero"
+        )));
+    }
+    if data_offset < BLIND_HEADER_LEN as u64 {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} blind subset data offset points into header"
+        )));
+    }
+
+    let pixel_type = blind_pixel_type(pixel_type_code, format_name)?;
+    let plane_bytes = (size_x as usize)
+        .checked_mul(size_y as usize)
+        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample()))
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!("{format_name} blind subset plane size overflows"))
+        })?;
+    let payload_bytes = (plane_bytes as u64)
+        .checked_mul(image_count as u64)
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!("{format_name} blind subset payload size overflows"))
+        })?;
+    let required_len = data_offset.checked_add(payload_bytes).ok_or_else(|| {
+        BioFormatsError::Format(format!("{format_name} blind subset file size overflows"))
+    })?;
+    if file_len < required_len {
+        return Err(BioFormatsError::Format(format!(
+            "{format_name} blind subset payload is truncated: got {file_len} bytes, expected at least {required_len}"
+        )));
+    }
+
+    let meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z: 1,
+        size_c: 1,
+        size_t: image_count,
+        pixel_type,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        image_count,
+        dimension_order: DimensionOrder::XYCZT,
+        is_little_endian: true,
+        ..Default::default()
+    };
+    Ok((
+        meta,
+        BlindLayout {
+            data_offset,
+            plane_bytes,
+        },
+    ))
+}
+
+fn read_blind_plane(path: &Path, layout: BlindLayout, plane_index: u32) -> Result<Vec<u8>> {
+    let offset = layout
+        .data_offset
+        .checked_add(
+            (layout.plane_bytes as u64)
+                .checked_mul(plane_index as u64)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("blind subset plane offset overflows".into())
+                })?,
+        )
+        .ok_or_else(|| BioFormatsError::Format("blind subset plane offset overflows".into()))?;
+    let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(BioFormatsError::Io)?;
+    let mut plane = vec![0u8; layout.plane_bytes];
+    file.read_exact(&mut plane).map_err(BioFormatsError::Io)?;
+    Ok(plane)
+}
 
 // ─── Bruker OPUS ──────────────────────────────────────────────────────────────
 //
@@ -21,6 +200,7 @@ const ISS_UNSUPPORTED: &str =
 pub struct BrukerOpusReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<BlindLayout>,
 }
 
 impl BrukerOpusReader {
@@ -28,6 +208,7 @@ impl BrukerOpusReader {
         BrukerOpusReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -51,29 +232,38 @@ impl FormatReader for BrukerOpusReader {
         }
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(OPUS_BLIND_MAGIC)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.meta = None;
-        let _ = path;
         self.path = None;
-        Err(BioFormatsError::UnsupportedFormat(
-            OPUS_UNSUPPORTED.to_string(),
-        ))
+        self.layout = None;
+        let (meta, layout) = parse_blind_raw_layout(path, OPUS_BLIND_MAGIC, "Bruker OPUS")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
     fn series(&self) -> usize {
         0
@@ -85,20 +275,19 @@ impl FormatReader for BrukerOpusReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_blind_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let full = self.open_bytes(p)?;
-        let meta = self.meta.as_ref().unwrap();
-        let row = meta.size_x as usize * 4;
-        let out_row = w as usize * 4;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * 4..x as usize * 4 + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Bruker OPUS", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
@@ -117,6 +306,7 @@ impl FormatReader for BrukerOpusReader {
 pub struct IssFlimReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: Option<BlindLayout>,
 }
 
 impl IssFlimReader {
@@ -124,6 +314,7 @@ impl IssFlimReader {
         IssFlimReader {
             path: None,
             meta: None,
+            layout: None,
         }
     }
 }
@@ -140,29 +331,38 @@ impl FormatReader for IssFlimReader {
             .map(|e| e.eq_ignore_ascii_case("iss"))
             .unwrap_or(false)
     }
-    fn is_this_type_by_bytes(&self, _: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(ISS_BLIND_MAGIC)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.meta = None;
-        let _ = path;
         self.path = None;
-        Err(BioFormatsError::UnsupportedFormat(
-            ISS_UNSUPPORTED.to_string(),
-        ))
+        self.layout = None;
+        let (meta, layout) = parse_blind_raw_layout(path, ISS_BLIND_MAGIC, "ISS Vista FLIM")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.layout = Some(layout);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
     fn series(&self) -> usize {
         0
@@ -174,20 +374,19 @@ impl FormatReader for IssFlimReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
+        read_blind_plane(path, layout, plane_index)
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let full = self.open_bytes(p)?;
-        let meta = self.meta.as_ref().unwrap();
-        let row = meta.size_x as usize * 4;
-        let out_row = w as usize * 4;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * 4..x as usize * 4 + out_row]);
-        }
-        Ok(out)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("ISS Vista FLIM", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {

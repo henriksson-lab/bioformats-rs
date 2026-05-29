@@ -135,6 +135,26 @@ fn attr_int(e: &quick_xml::events::BytesStart, name: &str) -> Option<i64> {
     attr_val(e, name).and_then(|s| s.trim().parse::<i64>().ok())
 }
 
+fn attr_nonnegative_u32(e: &quick_xml::events::BytesStart, name: &str) -> Result<u32> {
+    let value = attr_int(e, name).unwrap_or(0);
+    if value < 0 {
+        return Err(BioFormatsError::Format(format!(
+            "InCell attribute {name} must be non-negative, got {value}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+fn attr_positive_u32(e: &quick_xml::events::BytesStart, name: &str) -> Result<u32> {
+    let value = attr_int(e, name).unwrap_or(0);
+    if value <= 0 {
+        return Err(BioFormatsError::Format(format!(
+            "InCell attribute {name} must be positive, got {value}"
+        )));
+    }
+    Ok(value as u32)
+}
+
 fn attr_f64(e: &quick_xml::events::BytesStart, name: &str) -> Option<f64> {
     attr_val(e, name).and_then(|s| s.trim().parse::<f64>().ok())
 }
@@ -183,8 +203,8 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                 let qname = qname.as_ref();
                 match qname {
                     b"Plate" => {
-                        m.well_rows = attr_int(e, "rows").unwrap_or(0) as usize;
-                        m.well_cols = attr_int(e, "columns").unwrap_or(0) as usize;
+                        m.well_rows = attr_positive_u32(e, "rows")? as usize;
+                        m.well_cols = attr_positive_u32(e, "columns")? as usize;
                         m.plate_map = vec![vec![false; m.well_cols]; m.well_rows];
                     }
                     b"Images" => {
@@ -192,6 +212,7 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                     }
                     b"Image" => {
                         m.total_images += 1;
+                        current_image_file = None;
                         if let Some(file) = attr_val(e, "filename") {
                             current_image_file =
                                 Some(confined_join(&dir, &file).ok_or_else(|| {
@@ -202,10 +223,10 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                     }
                     b"Identifier" => {
-                        let field = attr_int(e, "field_index").unwrap_or(0) as usize;
-                        let z = attr_int(e, "z_index").unwrap_or(0) as u32;
-                        let c = attr_int(e, "wave_index").unwrap_or(0) as u32;
-                        let t = attr_int(e, "time_index").unwrap_or(0) as usize;
+                        let field = attr_nonnegative_u32(e, "field_index")? as usize;
+                        let z = attr_nonnegative_u32(e, "z_index")?;
+                        let c = attr_nonnegative_u32(e, "wave_index")?;
+                        let t = attr_nonnegative_u32(e, "time_index")? as usize;
 
                         // channels per timepoint is read by Java but the plane
                         // index (with t=0) reduces to z + c*sizeZ regardless.
@@ -288,6 +309,11 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                     }
                     b"ZDimensionParameters" => {
                         if let Some(nz) = attr_int(e, "number_of_slices") {
+                            if nz <= 0 {
+                                return Err(BioFormatsError::Format(format!(
+                                    "InCell attribute number_of_slices must be positive, got {nz}"
+                                )));
+                            }
                             if m.do_z {
                                 m.size_z = nz as u32;
                             } else {
@@ -298,17 +324,33 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                     }
                     b"Row" => {
-                        well_row = (attr_int(e, "number").unwrap_or(1) - 1).max(0) as usize;
+                        let row = attr_positive_u32(e, "number")? as usize - 1;
+                        if !m.plate_map.is_empty() && row >= m.well_rows {
+                            return Err(BioFormatsError::Format(format!(
+                                "InCell row {} is outside declared plate rows {}",
+                                row + 1,
+                                m.well_rows
+                            )));
+                        }
+                        well_row = row;
                     }
                     b"Column" => {
-                        well_col = (attr_int(e, "number").unwrap_or(1) - 1).max(0) as usize;
+                        let col = attr_positive_u32(e, "number")? as usize - 1;
+                        if !m.plate_map.is_empty() && col >= m.well_cols {
+                            return Err(BioFormatsError::Format(format!(
+                                "InCell column {} is outside declared plate columns {}",
+                                col + 1,
+                                m.well_cols
+                            )));
+                        }
+                        well_col = col;
                         if well_row < m.plate_map.len() && well_col < m.well_cols {
                             m.plate_map[well_row][well_col] = true;
                         }
                     }
                     b"Size" => {
-                        m.image_width = attr_int(e, "width").unwrap_or(0) as u32;
-                        m.image_height = attr_int(e, "height").unwrap_or(0) as u32;
+                        m.image_width = attr_positive_u32(e, "width")?;
+                        m.image_height = attr_positive_u32(e, "height")?;
                     }
                     b"NamingRows" => {
                         if let Some(begin) = attr_val(e, "begin") {
@@ -348,6 +390,9 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
             Event::End(ref e) => {
                 let qname = e.name();
                 match qname.as_ref() {
+                    b"Image" => {
+                        current_image_file = None;
+                    }
                     b"PlateMap" => {
                         // End of the plate map: allocate the imageFiles array now,
                         // mirroring Java MinimalInCellHandler.endElement.
@@ -424,6 +469,92 @@ fn allocate_image_files(m: &mut InCellMeta, channels_per_timepoint: &[u32]) {
         .collect();
 }
 
+fn iter_image_planes(m: &InCellMeta) -> impl Iterator<Item = &ImagePlane> {
+    m.image_files
+        .iter()
+        .flat_map(|well| well.iter())
+        .flat_map(|field| field.iter())
+        .flat_map(|timepoint| timepoint.iter())
+        .filter_map(|plane| plane.as_ref())
+}
+
+fn validate_incell_companions(m: &InCellMeta) -> Result<()> {
+    let mut has_existing_companion = false;
+    let mut has_tiff_companion = false;
+    let mut has_im_companion = false;
+    for plane in iter_image_planes(m) {
+        if plane.filename.is_some() {
+            has_existing_companion = true;
+            has_tiff_companion |= plane.is_tiff;
+            has_im_companion |= !plane.is_tiff;
+        }
+    }
+    if !has_existing_companion {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "InCell XML/XDCE does not reference any existing companion image files".into(),
+        ));
+    }
+    if has_tiff_companion {
+        for plane in iter_image_planes(m) {
+            if !plane.is_tiff {
+                continue;
+            }
+            let Some(path) = &plane.filename else {
+                continue;
+            };
+            let mut tr = crate::tiff::TiffReader::new();
+            tr.set_id(path).map_err(|e| {
+                BioFormatsError::Format(format!(
+                    "InCell companion TIFF {} could not be initialized: {e}",
+                    path.display()
+                ))
+            })?;
+            let meta = tr.metadata();
+            if meta.size_x == 0 || meta.size_y == 0 || meta.image_count == 0 {
+                return Err(BioFormatsError::Format(format!(
+                    "InCell companion TIFF {} has invalid image metadata",
+                    path.display()
+                )));
+            }
+            let _ = tr.close();
+        }
+    }
+    if has_im_companion {
+        if m.image_width == 0 || m.image_height == 0 {
+            return Err(BioFormatsError::Format(
+                "InCell .im companion metadata is missing positive image dimensions".into(),
+            ));
+        }
+        let plane_bytes = (m.image_width as u64)
+            .checked_mul(m.image_height as u64)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| BioFormatsError::Format("InCell .im plane size overflows".into()))?;
+        let required_len = 128u64
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("InCell .im payload size overflows".into()))?;
+        for plane in iter_image_planes(m) {
+            if !plane.is_tiff {
+                let Some(path) = &plane.filename else {
+                    continue;
+                };
+                let len = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
+                if len < required_len {
+                    return Err(BioFormatsError::Format(format!(
+                        "InCell .im companion {} is shorter than declared payload: need {required_len} bytes, file length {len}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    if !has_tiff_companion && !has_im_companion {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "InCell XML/XDCE does not reference any supported companion image files".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl InCellReader {
     /// Build the series list and a flat per-series plane lookup from parsed metadata.
     fn build(&mut self, m: InCellMeta) -> Result<()> {
@@ -453,8 +584,8 @@ impl InCellReader {
         let series_count = plate_wells.len() * field_count;
 
         // Determine pixel parameters from the first available TIFF plane.
-        let mut size_x = m.image_width.max(1);
-        let mut size_y = m.image_height.max(1);
+        let mut size_x = m.image_width;
+        let mut size_y = m.image_height;
         let mut pixel_type = PixelType::Uint16;
         let mut bits = 16u8;
         let mut little_endian = true;
@@ -488,6 +619,11 @@ impl InCellReader {
             }
         }
         let _ = is_tiff_first;
+        if size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::Format(
+                "InCell metadata is missing positive image dimensions".into(),
+            ));
+        }
 
         // Build per-series metadata and the flat plane lookup.
         let mut series = Vec::with_capacity(series_count);
@@ -609,12 +745,14 @@ impl FormatReader for InCellReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let m = parse_incell_xml(path)?;
         if m.total_images == 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "InCell XML/XDCE does not reference any companion TIFF image files".into(),
             ));
         }
+        validate_incell_companions(&m)?;
         self.build(m)?;
         if self.series.is_empty() {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -641,11 +779,13 @@ impl FormatReader for InCellReader {
     }
 
     fn series_count(&self) -> usize {
-        self.series.len().max(1)
+        self.series.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.series_count() {
+        if self.series.is_empty() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s >= self.series.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             self.current_series = s;

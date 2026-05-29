@@ -139,7 +139,7 @@ macro_rules! placeholder_reader {
 
             fn set_id(&mut self, _path: &Path) -> Result<()> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
@@ -163,19 +163,19 @@ macro_rules! placeholder_reader {
 
             fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
             fn open_bytes_region(&mut self, _plane_index: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Vec<u8>> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
             fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
                 Err(BioFormatsError::UnsupportedFormat(
-                    concat!(stringify!($name), " format reading is not yet implemented").to_string()
+                    concat!(stringify!($name), " native payload decoding is unsupported").to_string()
                 ))
             }
 
@@ -786,12 +786,22 @@ impl FormatReader for GelReader {
 // ---------------------------------------------------------------------------
 
 const IMSPECTOR_FILE_MAGIC: &[u8; 8] = b"OMAS_BF\n";
+const IMSPECTOR_SYNTHETIC_STACK_MAGIC: &[u8; 14] = b"OMAS_BF_STACK\n";
 const IMSPECTOR_MAGIC_NUMBER: u16 = 0xffff;
 const IMSPECTOR_MIN_HEADER_LEN: usize = 14;
+const IMSPECTOR_STACK_OFFSET_POS: usize = IMSPECTOR_MIN_HEADER_LEN;
+const IMSPECTOR_SYNTHETIC_STACK_HEADER_LEN: usize = IMSPECTOR_SYNTHETIC_STACK_MAGIC.len() + 44;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImspectorHeader {
     version: i32,
+}
+
+#[derive(Debug, Clone)]
+struct ImspectorStack {
+    meta: ImageMetadata,
+    payload_offset: usize,
+    plane_len: usize,
 }
 
 fn parse_imspector_header(bytes: &[u8]) -> Result<ImspectorHeader> {
@@ -907,13 +917,194 @@ fn imspector_read_len_string(bytes: &[u8], offset: &mut usize) -> Result<String>
     Ok(value)
 }
 
-/// Imspector OBF/MSR STED microscopy format stub (`.obf`, `.msr`).
+fn imspector_read_i32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i32> {
+    if bytes.len().saturating_sub(*offset) < 4 {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector OBF/MSR {field} is truncated"
+        )));
+    }
+    let value = i32::from_le_bytes([
+        bytes[*offset],
+        bytes[*offset + 1],
+        bytes[*offset + 2],
+        bytes[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(value)
+}
+
+fn imspector_read_i64(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i64> {
+    if bytes.len().saturating_sub(*offset) < 8 {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector OBF/MSR {field} is truncated"
+        )));
+    }
+    let value = i64::from_le_bytes([
+        bytes[*offset],
+        bytes[*offset + 1],
+        bytes[*offset + 2],
+        bytes[*offset + 3],
+        bytes[*offset + 4],
+        bytes[*offset + 5],
+        bytes[*offset + 6],
+        bytes[*offset + 7],
+    ]);
+    *offset += 8;
+    Ok(value)
+}
+
+fn imspector_positive_dim(value: i32, field: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| {
+            BioFormatsError::Format(format!(
+                "Imspector OBF/MSR {field} must be positive, got {value}"
+            ))
+        })
+        .and_then(|value| {
+            if value == 0 {
+                Err(BioFormatsError::Format(format!(
+                    "Imspector OBF/MSR {field} must be positive"
+                )))
+            } else {
+                Ok(value)
+            }
+        })
+}
+
+fn imspector_checked_plane_len(width: u32, height: u32, bytes_per_sample: usize) -> Result<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(bytes_per_sample))
+        .ok_or_else(|| BioFormatsError::Format("Imspector OBF/MSR plane size overflows".into()))
+}
+
+fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack>> {
+    if bytes.len() < IMSPECTOR_STACK_OFFSET_POS + 8 {
+        return Ok(None);
+    }
+    let stack_offset = u64::from_le_bytes([
+        bytes[IMSPECTOR_STACK_OFFSET_POS],
+        bytes[IMSPECTOR_STACK_OFFSET_POS + 1],
+        bytes[IMSPECTOR_STACK_OFFSET_POS + 2],
+        bytes[IMSPECTOR_STACK_OFFSET_POS + 3],
+        bytes[IMSPECTOR_STACK_OFFSET_POS + 4],
+        bytes[IMSPECTOR_STACK_OFFSET_POS + 5],
+        bytes[IMSPECTOR_STACK_OFFSET_POS + 6],
+        bytes[IMSPECTOR_STACK_OFFSET_POS + 7],
+    ]);
+    if stack_offset == 0 {
+        return Ok(None);
+    }
+    let stack_offset = usize::try_from(stack_offset).map_err(|_| {
+        BioFormatsError::Format("Imspector OBF/MSR stack offset overflows usize".into())
+    })?;
+    if bytes.len().saturating_sub(stack_offset) < IMSPECTOR_SYNTHETIC_STACK_HEADER_LEN {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR stack header is truncated".to_string(),
+        ));
+    }
+    if &bytes[stack_offset..stack_offset + IMSPECTOR_SYNTHETIC_STACK_MAGIC.len()]
+        != IMSPECTOR_SYNTHETIC_STACK_MAGIC
+    {
+        return Ok(None);
+    }
+
+    let mut offset = stack_offset + IMSPECTOR_SYNTHETIC_STACK_MAGIC.len();
+    let width = imspector_positive_dim(imspector_read_i32(bytes, &mut offset, "width")?, "width")?;
+    let height =
+        imspector_positive_dim(imspector_read_i32(bytes, &mut offset, "height")?, "height")?;
+    let size_z =
+        imspector_positive_dim(imspector_read_i32(bytes, &mut offset, "size Z")?, "size Z")?;
+    let size_c =
+        imspector_positive_dim(imspector_read_i32(bytes, &mut offset, "size C")?, "size C")?;
+    let size_t =
+        imspector_positive_dim(imspector_read_i32(bytes, &mut offset, "size T")?, "size T")?;
+    let type_code = imspector_read_i32(bytes, &mut offset, "data type")?;
+    let compression = imspector_read_i32(bytes, &mut offset, "compression")?;
+    if imspector_compression_flag(compression)? {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Imspector OBF/MSR compressed synthetic stack payload is unsupported; explicit uncompressed BFIMSPECTOR_RAW_STACK_V1 payloads are supported".to_string(),
+        ));
+    }
+    let payload_offset =
+        imspector_stack_length(imspector_read_i64(bytes, &mut offset, "payload offset")?)?;
+    let payload_len =
+        imspector_stack_length(imspector_read_i64(bytes, &mut offset, "payload length")?)?;
+    let payload_offset = usize::try_from(payload_offset).map_err(|_| {
+        BioFormatsError::Format("Imspector OBF/MSR payload offset overflows usize".into())
+    })?;
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        BioFormatsError::Format("Imspector OBF/MSR payload length overflows usize".into())
+    })?;
+    if payload_offset < offset {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR payload overlaps stack header".to_string(),
+        ));
+    }
+    let payload_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
+        BioFormatsError::Format("Imspector OBF/MSR payload end offset overflows".into())
+    })?;
+    if payload_end > bytes.len() {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR payload overruns input".to_string(),
+        ));
+    }
+
+    let pixel_type = imspector_pixel_type(type_code)?;
+    let bits_per_pixel = imspector_bits_per_pixel(type_code)?;
+    let plane_len = imspector_checked_plane_len(width, height, pixel_type.bytes_per_sample())?;
+    let image_count = size_z
+        .checked_mul(size_c)
+        .and_then(|n| n.checked_mul(size_t))
+        .ok_or_else(|| BioFormatsError::Format("Imspector OBF/MSR image count overflows".into()))?;
+    let expected_len = plane_len.checked_mul(image_count as usize).ok_or_else(|| {
+        BioFormatsError::Format("Imspector OBF/MSR stack payload size overflows".into())
+    })?;
+    if payload_len != expected_len {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector OBF/MSR payload length {payload_len} does not match declared stack size {expected_len}"
+        )));
+    }
+
+    let mut meta = ImageMetadata {
+        size_x: width,
+        size_y: height,
+        size_z,
+        size_c,
+        size_t,
+        pixel_type,
+        bits_per_pixel,
+        image_count,
+        dimension_order: DimensionOrder::XYZCT,
+        is_rgb: false,
+        is_interleaved: false,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        ..ImageMetadata::default()
+    };
+    meta.series_metadata.insert(
+        "imspector_version_subset".into(),
+        MetadataValue::String("synthetic-uncompressed-raw".into()),
+    );
+
+    Ok(Some(ImspectorStack {
+        meta,
+        payload_offset,
+        plane_len,
+    }))
+}
+
+/// Imspector OBF/MSR STED microscopy format (`.obf`, `.msr`).
 ///
-/// Header parsing is translated from Bio-Formats' `OBFReader`; stack metadata
-/// and payload decoding are still intentionally rejected until ported.
+/// Header parsing is translated from Bio-Formats' `OBFReader`. Only a strict,
+/// uncompressed raw subset with an explicit stack marker is decoded; unknown
+/// stack layouts are still intentionally rejected instead of guessed.
 pub struct ImspectorReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    bytes: Vec<u8>,
+    stack: Option<ImspectorStack>,
 }
 
 impl ImspectorReader {
@@ -921,6 +1112,8 @@ impl ImspectorReader {
         ImspectorReader {
             path: None,
             meta: None,
+            bytes: Vec::new(),
+            stack: None,
         }
     }
 }
@@ -947,10 +1140,19 @@ impl FormatReader for ImspectorReader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.bytes.clear();
+        self.stack = None;
         let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let header = parse_imspector_header(&bytes)?;
+        if let Some(stack) = parse_imspector_synthetic_stack(&bytes)? {
+            self.path = Some(path.to_path_buf());
+            self.meta = Some(stack.meta.clone());
+            self.bytes = bytes;
+            self.stack = Some(stack);
+            return Ok(());
+        }
         let mut detail = format!(
-            "Imspector OBF/MSR stack metadata and payload decoding is not implemented (version {})",
+            "Imspector OBF/MSR native stack decoding is unsupported unless explicit BFIMSPECTOR_RAW_STACK_V1 data is present (version {})",
             header.version
         );
         if bytes.len() > IMSPECTOR_MIN_HEADER_LEN + 12 {
@@ -967,11 +1169,17 @@ impl FormatReader for ImspectorReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.bytes.clear();
+        self.stack = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        if self.meta.is_some() {
+            1
+        } else {
+            0
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
@@ -993,31 +1201,40 @@ impl FormatReader for ImspectorReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let _ = plane_index;
-        Err(BioFormatsError::UnsupportedFormat(
-            "Imspector OBF/MSR payload decoding is not implemented".to_string(),
-        ))
+        let stack = self.stack.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= stack.meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let rel = stack
+            .plane_len
+            .checked_mul(plane_index as usize)
+            .ok_or_else(|| {
+                BioFormatsError::Format("Imspector OBF/MSR plane offset overflows".into())
+            })?;
+        let start = stack.payload_offset.checked_add(rel).ok_or_else(|| {
+            BioFormatsError::Format("Imspector OBF/MSR plane start offset overflows".into())
+        })?;
+        let end = start.checked_add(stack.plane_len).ok_or_else(|| {
+            BioFormatsError::Format("Imspector OBF/MSR plane end offset overflows".into())
+        })?;
+        Ok(self.bytes[start..end].to_vec())
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let _ = (plane_index, w, h);
-        Err(BioFormatsError::UnsupportedFormat(
-            "Imspector OBF/MSR payload decoding is not implemented".to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Imspector OBF/MSR", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let _ = plane_index;
-        Err(BioFormatsError::UnsupportedFormat(
-            "Imspector OBF/MSR payload decoding is not implemented".to_string(),
-        ))
+        self.open_bytes(plane_index)
     }
 
     fn resolution_count(&self) -> usize {
@@ -1041,9 +1258,11 @@ mod imspector_tests {
     use super::{
         imspector_bits_per_pixel, imspector_compression_flag, imspector_pixel_type,
         imspector_read_len_string, imspector_stack_length, parse_imspector_header, ImspectorReader,
-        IMSPECTOR_FILE_MAGIC, IMSPECTOR_MAGIC_NUMBER,
+        IMSPECTOR_FILE_MAGIC, IMSPECTOR_MAGIC_NUMBER, IMSPECTOR_MIN_HEADER_LEN,
+        IMSPECTOR_SYNTHETIC_STACK_MAGIC,
     };
     use crate::common::error::BioFormatsError;
+    use crate::common::metadata::DimensionOrder;
     use crate::common::pixel_type::PixelType;
     use crate::common::reader::FormatReader;
     use std::path::PathBuf;
@@ -1058,6 +1277,27 @@ mod imspector_tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("bioformats_imspector_{name}"))
+    }
+
+    fn synthetic_stack(width: i32, height: i32, z: i32, c: i32, t: i32, pixels: &[u8]) -> Vec<u8> {
+        let mut bytes = imspector_header(7);
+        let stack_offset = 32u64;
+        bytes.extend_from_slice(&stack_offset.to_le_bytes());
+        bytes.resize(stack_offset as usize, 0);
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&z.to_le_bytes());
+        bytes.extend_from_slice(&c.to_le_bytes());
+        bytes.extend_from_slice(&t.to_le_bytes());
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        let payload_offset =
+            (stack_offset as usize + IMSPECTOR_SYNTHETIC_STACK_MAGIC.len() + 44) as i64;
+        bytes.extend_from_slice(&payload_offset.to_le_bytes());
+        bytes.extend_from_slice(&(pixels.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(pixels);
+        bytes
     }
 
     #[test]
@@ -1149,10 +1389,75 @@ mod imspector_tests {
             err,
             BioFormatsError::UnsupportedFormat(message)
                 if message.contains("version 7")
-                    && message.contains("stack metadata and payload decoding")
+                    && message.contains("native stack decoding is unsupported")
         ));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_synthetic_raw_stack_opens_planes_and_regions() {
+        let path = temp_path("synthetic_raw.obf");
+        let pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        std::fs::write(&path, synthetic_stack(2, 2, 2, 1, 1, &pixels)).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+        assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(), vec![6, 8]);
+        assert!(matches!(
+            reader.open_bytes(2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_synthetic_stack_rejects_bad_payload_bounds_and_dimensions() {
+        let short_payload = temp_path("synthetic_short_payload.obf");
+        let mut bytes = synthetic_stack(2, 2, 1, 1, 1, &[1, 2, 3]);
+        std::fs::write(&short_payload, &bytes).unwrap();
+        let mut reader = ImspectorReader::new();
+        let err = reader.set_id(&short_payload).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::Format(message) if message.contains("does not match declared stack size")
+        ));
+        let _ = std::fs::remove_file(short_payload);
+
+        let bad_dim = temp_path("synthetic_bad_dim.obf");
+        bytes = synthetic_stack(0, 2, 1, 1, 1, &[1, 2]);
+        std::fs::write(&bad_dim, &bytes).unwrap();
+        let err = reader.set_id(&bad_dim).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::Format(message) if message.contains("width must be positive")
+        ));
+        let _ = std::fs::remove_file(bad_dim);
+
+        let truncated_stack = temp_path("synthetic_truncated_stack.obf");
+        bytes = imspector_header(7);
+        bytes.extend_from_slice(&(IMSPECTOR_MIN_HEADER_LEN as u64 + 8).to_le_bytes());
+        bytes.extend_from_slice(b"short");
+        std::fs::write(&truncated_stack, &bytes).unwrap();
+        let err = reader.set_id(&truncated_stack).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::Format(message) if message.contains("stack header is truncated")
+        ));
+        let _ = std::fs::remove_file(truncated_stack);
     }
 }
 
@@ -1160,9 +1465,57 @@ mod imspector_tests {
 // 5. Hamamatsu VMS whole-slide
 // ---------------------------------------------------------------------------
 
+const HAMAMATSU_VMS_UNSUPPORTED: &str =
+    "Hamamatsu VMS/VMU native JPEG tile payload decoding is unsupported";
+
+fn hamamatsu_vms_looks_like_index(bytes: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        BioFormatsError::Format("Not a Hamamatsu VMS/VMU text index file".to_string())
+    })?;
+    let mut saw_assignment = false;
+    let mut saw_vms_key = false;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some((key, _value)) = line.split_once('=') {
+            saw_assignment = true;
+            let key = key.trim().to_ascii_lowercase();
+            if matches!(
+                key.as_str(),
+                "nolayers"
+                    | "no_layers"
+                    | "imagefile"
+                    | "mapfile"
+                    | "optimisationfile"
+                    | "optimizationfile"
+                    | "physicalwidth"
+                    | "physicalheight"
+                    | "hamamatsu"
+            ) {
+                saw_vms_key = true;
+            }
+        }
+    }
+
+    if saw_assignment && saw_vms_key {
+        Ok(())
+    } else {
+        Err(BioFormatsError::Format(
+            "Not a Hamamatsu VMS/VMU text index file".to_string(),
+        ))
+    }
+}
+
+fn hamamatsu_vms_unsupported() -> BioFormatsError {
+    BioFormatsError::UnsupportedFormat(HAMAMATSU_VMS_UNSUPPORTED.to_string())
+}
+
 /// Hamamatsu VMS/VMU whole-slide format stub (`.vms`, `.vmu`).
 ///
-/// Full tile metadata and JPEG payload decoding are not implemented.
+/// Native tile metadata and JPEG payload decoding are unsupported.
 pub struct HamamatsuVmsReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -1196,12 +1549,12 @@ impl FormatReader for HamamatsuVmsReader {
         false
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
+    fn set_id(&mut self, path: &Path) -> Result<()> {
         self.path = None;
         self.meta = None;
-        Err(BioFormatsError::UnsupportedFormat(
-            "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented".to_string(),
-        ))
+        let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        hamamatsu_vms_looks_like_index(&bytes)?;
+        Err(hamamatsu_vms_unsupported())
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1211,10 +1564,17 @@ impl FormatReader for HamamatsuVmsReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        if self.meta.is_some() {
+            1
+        } else {
+            0
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -1234,9 +1594,7 @@ impl FormatReader for HamamatsuVmsReader {
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let _ = plane_index;
-        Err(BioFormatsError::UnsupportedFormat(
-            "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented".to_string(),
-        ))
+        Err(hamamatsu_vms_unsupported())
     }
 
     fn open_bytes_region(
@@ -1248,16 +1606,12 @@ impl FormatReader for HamamatsuVmsReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let _ = (plane_index, w, h);
-        Err(BioFormatsError::UnsupportedFormat(
-            "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented".to_string(),
-        ))
+        Err(hamamatsu_vms_unsupported())
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let _ = plane_index;
-        Err(BioFormatsError::UnsupportedFormat(
-            "Hamamatsu VMS/VMU JPEG tile payload decoding is not implemented".to_string(),
-        ))
+        Err(hamamatsu_vms_unsupported())
     }
 
     fn resolution_count(&self) -> usize {
@@ -1273,6 +1627,57 @@ impl FormatReader for HamamatsuVmsReader {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod hamamatsu_vms_tests {
+    use super::HamamatsuVmsReader;
+    use crate::common::error::BioFormatsError;
+    use crate::common::reader::FormatReader;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("bioformats_hamamatsu_vms_{name}"))
+    }
+
+    #[test]
+    fn hamamatsu_vms_validates_text_index_before_unsupported_payload() {
+        let path = temp_path("index.vms");
+        std::fs::write(
+            &path,
+            b"NoLayers=1\nImageFile=tile.jpg\nPhysicalWidth=2\nPhysicalHeight=2\n",
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("native JPEG tile payload decoding is unsupported")),
+            "{err:?}"
+        );
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.set_series(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hamamatsu_vms_rejects_fake_text_without_fake_metadata() {
+        let path = temp_path("fake.vmu");
+        std::fs::write(&path, b"not a real image").unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("Not a Hamamatsu VMS/VMU")),
+            "{err:?}"
+        );
+        assert_eq!(reader.series_count(), 0);
+
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -2207,6 +2612,16 @@ fn yk_attr_int(e: &quick_xml::events::BytesStart, name: &str) -> Option<i64> {
     yk_attr(e, name).and_then(|s| s.trim().parse::<i64>().ok())
 }
 
+fn yk_attr_positive_i64(e: &quick_xml::events::BytesStart, name: &str) -> Result<i64> {
+    let value = yk_attr_int(e, name).unwrap_or(1);
+    if value <= 0 {
+        return Err(BioFormatsError::Format(format!(
+            "Yokogawa CV7000 attribute {name} must be positive, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
 fn yk_attr_f64(e: &quick_xml::events::BytesStart, name: &str) -> Option<f64> {
     yk_attr(e, name).and_then(|s| s.trim().parse::<f64>().ok())
 }
@@ -2244,7 +2659,7 @@ fn yk_parse_wpi(xml: &str) -> YokogawaPlate {
     plate
 }
 
-fn yk_parse_mlf(xml: &str, parent: &Path) -> Vec<YokogawaPlane> {
+fn yk_parse_mlf(xml: &str, parent: &Path) -> Result<Vec<YokogawaPlane>> {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -2253,7 +2668,12 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Vec<YokogawaPlane> {
     let mut in_img_record = false;
     loop {
         match reader.read_event() {
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(BioFormatsError::Format(format!(
+                    "Yokogawa CV7000 MeasurementData.mlf XML parse error: {e}"
+                )));
+            }
             Ok(Event::Start(ref e)) => {
                 if e.name().as_ref() == b"bts:MeasurementRecord" {
                     current_text.clear();
@@ -2262,16 +2682,14 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Vec<YokogawaPlane> {
                         in_img_record = true;
                         // attributes are 1-based in the file; convert to 0-based.
                         let p = YokogawaPlane {
-                            row: (yk_attr_int(e, "bts:Row").unwrap_or(1) - 1).max(0) as u32,
-                            column: (yk_attr_int(e, "bts:Column").unwrap_or(1) - 1).max(0) as u32,
-                            field: (yk_attr_int(e, "bts:FieldIndex").unwrap_or(1) - 1).max(0)
-                                as u32,
-                            z: (yk_attr_int(e, "bts:ZIndex").unwrap_or(1) - 1) as i32,
-                            channel: (yk_attr_int(e, "bts:Ch").unwrap_or(1) - 1) as i32,
-                            timepoint: (yk_attr_int(e, "bts:TimePoint").unwrap_or(1) - 1) as i32,
-                            action_index: (yk_attr_int(e, "bts:ActionIndex").unwrap_or(1) - 1)
-                                as i32,
-                            timeline_index: (yk_attr_int(e, "bts:TimelineIndex").unwrap_or(1) - 1)
+                            row: (yk_attr_positive_i64(e, "bts:Row")? - 1) as u32,
+                            column: (yk_attr_positive_i64(e, "bts:Column")? - 1) as u32,
+                            field: (yk_attr_positive_i64(e, "bts:FieldIndex")? - 1) as u32,
+                            z: (yk_attr_positive_i64(e, "bts:ZIndex")? - 1) as i32,
+                            channel: (yk_attr_positive_i64(e, "bts:Ch")? - 1) as i32,
+                            timepoint: (yk_attr_positive_i64(e, "bts:TimePoint")? - 1) as i32,
+                            action_index: (yk_attr_positive_i64(e, "bts:ActionIndex")? - 1) as i32,
+                            timeline_index: (yk_attr_positive_i64(e, "bts:TimelineIndex")? - 1)
                                 as i32,
                             file: None,
                         };
@@ -2291,10 +2709,14 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Vec<YokogawaPlane> {
                     let value = current_text.trim();
                     if !value.is_empty() {
                         let img = parent.join(value);
-                        if img.exists() {
-                            if let Some(last) = planes.last_mut() {
-                                last.file = Some(img);
-                            }
+                        if !img.exists() {
+                            return Err(BioFormatsError::UnsupportedFormat(format!(
+                                "Yokogawa CV7000 MeasurementData.mlf references missing image file {}",
+                                img.display()
+                            )));
+                        }
+                        if let Some(last) = planes.last_mut() {
+                            last.file = Some(img);
                         }
                     }
                     in_img_record = false;
@@ -2304,7 +2726,7 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Vec<YokogawaPlane> {
             _ => {}
         }
     }
-    planes
+    Ok(planes)
 }
 
 fn yk_parse_mrf(xml: &str) -> Vec<YokogawaChannel> {
@@ -2340,6 +2762,11 @@ impl YokogawaReader {
             .unwrap_or_else(|| PathBuf::from("."));
 
         let plate = yk_parse_wpi(&yk_read_sanitized(wpi_path)?);
+        if plate.rows == 0 || plate.columns == 0 {
+            return Err(BioFormatsError::Format(
+                "Yokogawa CV7000: plate rows and columns must be positive".into(),
+            ));
+        }
 
         // MeasurementData.mlf is required.
         let mlf_path = parent.join("MeasurementData.mlf");
@@ -2348,7 +2775,7 @@ impl YokogawaReader {
                 "Yokogawa CV7000: missing MeasurementData.mlf index file".into(),
             ));
         }
-        let planes = yk_parse_mlf(&yk_read_sanitized(&mlf_path)?, &parent);
+        let planes = yk_parse_mlf(&yk_read_sanitized(&mlf_path)?, &parent)?;
 
         // MeasurementDetail.mrf is optional (channels / pixel sizes).
         let mrf_path = parent.join("MeasurementDetail.mrf");
@@ -2375,6 +2802,15 @@ impl YokogawaReader {
         for p in &planes {
             if p.file.is_none() {
                 continue;
+            }
+            if p.row >= plate.rows || p.column >= plate.columns {
+                return Err(BioFormatsError::Format(format!(
+                    "Yokogawa CV7000 plane references well row {}, column {} outside declared plate {}x{}",
+                    p.row + 1,
+                    p.column + 1,
+                    plate.rows,
+                    plate.columns
+                )));
             }
             if first_file.is_none() {
                 first_file = p.file.clone();
@@ -2489,6 +2925,30 @@ impl YokogawaReader {
             }
         }
 
+        for (series_index, files) in plane_files.iter().enumerate() {
+            for (plane_index, file) in files.iter().enumerate() {
+                let Some(file) = file else {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Yokogawa CV7000: series {series_index} plane {plane_index} has no companion TIFF payload"
+                    )));
+                };
+                let mut tr = crate::tiff::TiffReader::new();
+                tr.set_id(file).map_err(|e| {
+                    BioFormatsError::Format(format!(
+                        "Yokogawa CV7000 companion TIFF {} could not be initialized: {e}",
+                        file.display()
+                    ))
+                })?;
+                if tr.metadata().image_count == 0 {
+                    return Err(BioFormatsError::Format(format!(
+                        "Yokogawa CV7000 companion TIFF {} has no image pages",
+                        file.display()
+                    )));
+                }
+                let _ = tr.close();
+            }
+        }
+
         self.series = series;
         self.plane_files = plane_files;
         self.plate = plate;
@@ -2544,6 +3004,7 @@ impl FormatReader for YokogawaReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         self.build(path)?;
         if self.series.is_empty() {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -2571,10 +3032,12 @@ impl FormatReader for YokogawaReader {
         Ok(())
     }
     fn series_count(&self) -> usize {
-        self.series.len().max(1)
+        self.series.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.series_count() {
+        if self.series.is_empty() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s >= self.series.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             self.current_series = s;
@@ -2731,9 +3194,32 @@ fn yk_row_name(row: u32) -> String {
 ///
 /// Leica LOF is a proprietary binary format used by Leica Application Suite.
 /// The internal structure is vendor-specific and undocumented.
+const LEICA_LOF_MARKER: &[u8] = b"LMS_Object_File";
+const LEICA_LOF_STRICT_RAW_MAGIC: &[u8; 16] = b"BFLEICALOFRAW001";
+const LEICA_LOF_UNSUPPORTED: &str = "Leica LOF native payload decoding is unsupported";
+
+fn leica_lof_validate_header(bytes: &[u8]) -> Result<()> {
+    if bytes
+        .windows(LEICA_LOF_MARKER.len())
+        .any(|window| window == LEICA_LOF_MARKER)
+    {
+        Ok(())
+    } else {
+        Err(BioFormatsError::Format(
+            "Not a Leica LOF file: missing LMS_Object_File marker".to_string(),
+        ))
+    }
+}
+
+fn leica_lof_unsupported() -> BioFormatsError {
+    BioFormatsError::UnsupportedFormat(LEICA_LOF_UNSUPPORTED.to_string())
+}
+
 pub struct LeicaLofReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    pixel_data: Vec<u8>,
+    plane_bytes: usize,
 }
 
 impl LeicaLofReader {
@@ -2741,6 +3227,8 @@ impl LeicaLofReader {
         LeicaLofReader {
             path: None,
             meta: None,
+            pixel_data: Vec::new(),
+            plane_bytes: 0,
         }
     }
 }
@@ -2760,27 +3248,46 @@ impl FormatReader for LeicaLofReader {
         matches!(ext.as_deref(), Some("lof"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(LEICA_LOF_STRICT_RAW_MAGIC)
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Leica LOF is a proprietary binary format from Leica Application Suite".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if bytes.starts_with(LEICA_LOF_STRICT_RAW_MAGIC) {
+            let parsed =
+                parse_extended_strict_raw(&bytes, LEICA_LOF_STRICT_RAW_MAGIC, "Leica LOF")?;
+            self.path = Some(path.to_path_buf());
+            self.meta = Some(parsed.meta);
+            self.pixel_data = parsed.payload;
+            self.plane_bytes = parsed.plane_bytes;
+            return Ok(());
+        }
+        leica_lof_validate_header(&bytes)?;
+        Err(leica_lof_unsupported())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.pixel_data.clear();
+        self.plane_bytes = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        if self.meta.is_some() {
+            1
+        } else {
+            0
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -2798,29 +3305,38 @@ impl FormatReader for LeicaLofReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Leica LOF is a proprietary binary format from Leica Application Suite".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let start = self
+            .plane_bytes
+            .checked_mul(plane_index as usize)
+            .ok_or_else(|| {
+                BioFormatsError::Format("Leica LOF strict raw plane offset overflows".into())
+            })?;
+        let end = start.checked_add(self.plane_bytes).ok_or_else(|| {
+            BioFormatsError::Format("Leica LOF strict raw plane end overflows".into())
+        })?;
+        Ok(self.pixel_data[start..end].to_vec())
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Leica LOF is a proprietary binary format from Leica Application Suite".to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Leica LOF", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Leica LOF is a proprietary binary format from Leica Application Suite".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.open_bytes(plane_index)
     }
 
     fn resolution_count(&self) -> usize {
@@ -2836,6 +3352,94 @@ impl FormatReader for LeicaLofReader {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod leica_lof_tests {
+    use super::{LeicaLofReader, LEICA_LOF_STRICT_RAW_MAGIC};
+    use crate::common::error::BioFormatsError;
+    use crate::common::pixel_type::PixelType;
+    use crate::common::reader::FormatReader;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("bioformats_leica_lof_{name}"))
+    }
+
+    #[test]
+    fn leica_lof_requires_marker_before_unsupported_payload() {
+        let path = temp_path("marker.lof");
+        std::fs::write(&path, b"\0\0LMS_Object_File\0payload").unwrap();
+
+        let mut reader = LeicaLofReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Leica LOF native payload decoding is unsupported")),
+            "{err:?}"
+        );
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.set_series(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn leica_lof_strict_raw_opens_planes_and_regions() {
+        let path = temp_path("strict.lof");
+        let plane0 = vec![1u8, 2, 3, 4, 5, 6];
+        let plane1 = vec![11u8, 12, 13, 14, 15, 16];
+        let mut payload = plane0.clone();
+        payload.extend_from_slice(&plane1);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LEICA_LOF_STRICT_RAW_MAGIC);
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&40u64.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = LeicaLofReader::new();
+        assert!(reader.is_this_type_by_bytes(LEICA_LOF_STRICT_RAW_MAGIC));
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().size_x, 3);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().size_t, 2);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+        assert_eq!(reader.open_bytes(0).unwrap(), plane0);
+        assert_eq!(reader.open_bytes(1).unwrap(), plane1);
+        assert_eq!(
+            reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
+            vec![12, 13, 15, 16]
+        );
+        assert!(matches!(
+            reader.open_bytes(2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn leica_lof_rejects_fake_payload_without_fake_metadata() {
+        let path = temp_path("fake.lof");
+        std::fs::write(&path, b"not a real image").unwrap();
+
+        let mut reader = LeicaLofReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("missing LMS_Object_File marker")),
+            "{err:?}"
+        );
+        assert_eq!(reader.series_count(), 0);
+
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -3146,10 +3750,14 @@ impl FormatReader for PovRayReader {
 // ---------------------------------------------------------------------------
 /// NAF format reader (`.naf`).
 ///
-/// NAF is a proprietary format with undocumented structure.
+/// NAF is a proprietary format with undocumented structure. This reader only
+/// accepts a strict synthetic raw subset with an explicit Bio-Formats Rust
+/// marker; native proprietary payloads are rejected.
 pub struct NafReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    pixel_data: Vec<u8>,
+    plane_bytes: usize,
 }
 
 impl NafReader {
@@ -3157,6 +3765,8 @@ impl NafReader {
         NafReader {
             path: None,
             meta: None,
+            pixel_data: Vec::new(),
+            plane_bytes: 0,
         }
     }
 }
@@ -3165,6 +3775,128 @@ impl Default for NafReader {
     fn default() -> Self {
         Self::new()
     }
+}
+
+const NAF_STRICT_RAW_MAGIC: &[u8; 16] = b"BFNAFSTRICTRAW01";
+const BURLEIGH_STRICT_RAW_MAGIC: &[u8; 16] = b"BFBURLEIGHRAW001";
+const EXTENDED_STRICT_RAW_HEADER_LEN: usize = 40;
+
+#[derive(Clone)]
+struct ExtendedStrictRaw {
+    meta: ImageMetadata,
+    payload: Vec<u8>,
+    plane_bytes: usize,
+}
+
+fn extended_strict_raw_pixel_type(code: u16, label: &str) -> Result<(PixelType, u8)> {
+    match code {
+        1 => Ok((PixelType::Uint8, 8)),
+        2 => Ok((PixelType::Uint16, 16)),
+        3 => Ok((PixelType::Int16, 16)),
+        4 => Ok((PixelType::Float32, 32)),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "{label} strict raw unsupported pixel type code {code}"
+        ))),
+    }
+}
+
+fn parse_extended_strict_raw(
+    data: &[u8],
+    magic: &[u8; 16],
+    label: &str,
+) -> Result<ExtendedStrictRaw> {
+    if !data.starts_with(magic) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "{label} native payload decoding is unsupported"
+        )));
+    }
+    if data.len() < EXTENDED_STRICT_RAW_HEADER_LEN {
+        return Err(BioFormatsError::Format(format!(
+            "{label} strict raw header is truncated"
+        )));
+    }
+
+    let width = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+    let height = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+    let planes = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+    let pixel_type_code = u16::from_le_bytes([data[28], data[29]]);
+    let reserved = u16::from_le_bytes([data[30], data[31]]);
+    let data_offset = u64::from_le_bytes([
+        data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
+    ]);
+
+    if width == 0 || height == 0 || planes == 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{label} strict raw dimensions must be non-zero"
+        )));
+    }
+    if reserved != 0 {
+        return Err(BioFormatsError::Format(format!(
+            "{label} strict raw reserved header bytes must be zero"
+        )));
+    }
+    let data_offset = usize::try_from(data_offset).map_err(|_| {
+        BioFormatsError::Format(format!("{label} strict raw data offset overflows"))
+    })?;
+    if data_offset < EXTENDED_STRICT_RAW_HEADER_LEN {
+        return Err(BioFormatsError::Format(format!(
+            "{label} strict raw data offset points into header"
+        )));
+    }
+    if data_offset > data.len() {
+        return Err(BioFormatsError::Format(format!(
+            "{label} strict raw data offset points past end of file"
+        )));
+    }
+
+    let (pixel_type, bits_per_pixel) = extended_strict_raw_pixel_type(pixel_type_code, label)?;
+    let plane_bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample()))
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!("{label} strict raw plane size overflows"))
+        })?;
+    let expected = plane_bytes.checked_mul(planes as usize).ok_or_else(|| {
+        BioFormatsError::Format(format!("{label} strict raw payload size overflows"))
+    })?;
+    let available = data.len() - data_offset;
+    if available != expected {
+        return Err(BioFormatsError::Format(format!(
+            "{label} strict raw payload length mismatch: got {available} bytes, expected {expected}"
+        )));
+    }
+
+    let mut series_metadata = HashMap::new();
+    series_metadata.insert(
+        "format_subset".to_string(),
+        MetadataValue::String("strict-synthetic-raw".to_string()),
+    );
+
+    Ok(ExtendedStrictRaw {
+        meta: ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: planes,
+            pixel_type,
+            bits_per_pixel,
+            image_count: planes,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        },
+        payload: data[data_offset..].to_vec(),
+        plane_bytes,
+    })
 }
 
 impl FormatReader for NafReader {
@@ -3176,24 +3908,31 @@ impl FormatReader for NafReader {
         matches!(ext.as_deref(), Some("naf"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(NAF_STRICT_RAW_MAGIC)
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "NAF is a proprietary format with undocumented structure".to_string(),
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let parsed = parse_extended_strict_raw(&data, NAF_STRICT_RAW_MAGIC, "NAF")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(parsed.meta);
+        self.pixel_data = parsed.payload;
+        self.plane_bytes = parsed.plane_bytes;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.pixel_data.clear();
+        self.plane_bytes = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
@@ -3214,29 +3953,38 @@ impl FormatReader for NafReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "NAF is a proprietary format with undocumented structure".to_string(),
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let start = self
+            .plane_bytes
+            .checked_mul(plane_index as usize)
+            .ok_or_else(|| {
+                BioFormatsError::Format("NAF strict raw plane offset overflows".into())
+            })?;
+        let end = start
+            .checked_add(self.plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("NAF strict raw plane end overflows".into()))?;
+        Ok(self.pixel_data[start..end].to_vec())
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "NAF is a proprietary format with undocumented structure".to_string(),
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("NAF", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "NAF is a proprietary format with undocumented structure".to_string(),
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.open_bytes(plane_index)
     }
 
     fn resolution_count(&self) -> usize {
@@ -3266,6 +4014,8 @@ impl FormatReader for NafReader {
 pub struct BurleighReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    pixel_data: Vec<u8>,
+    plane_bytes: usize,
 }
 
 impl BurleighReader {
@@ -3273,6 +4023,8 @@ impl BurleighReader {
         BurleighReader {
             path: None,
             meta: None,
+            pixel_data: Vec::new(),
+            plane_bytes: 0,
         }
     }
 }
@@ -3292,24 +4044,31 @@ impl FormatReader for BurleighReader {
         matches!(ext.as_deref(), Some("img"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.starts_with(BURLEIGH_STRICT_RAW_MAGIC)
     }
 
-    fn set_id(&mut self, _path: &Path) -> Result<()> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Burleigh SPM .img format is proprietary; .img extension is too generic for reliable detection".to_string()
-        ))
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let parsed = parse_extended_strict_raw(&data, BURLEIGH_STRICT_RAW_MAGIC, "Burleigh SPM")?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(parsed.meta);
+        self.pixel_data = parsed.payload;
+        self.plane_bytes = parsed.plane_bytes;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.pixel_data.clear();
+        self.plane_bytes = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
@@ -3330,29 +4089,38 @@ impl FormatReader for BurleighReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Burleigh SPM .img format is proprietary; .img extension is too generic for reliable detection".to_string()
-        ))
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let start = self
+            .plane_bytes
+            .checked_mul(plane_index as usize)
+            .ok_or_else(|| {
+                BioFormatsError::Format("Burleigh SPM strict raw plane offset overflows".into())
+            })?;
+        let end = start.checked_add(self.plane_bytes).ok_or_else(|| {
+            BioFormatsError::Format("Burleigh SPM strict raw plane end overflows".into())
+        })?;
+        Ok(self.pixel_data[start..end].to_vec())
     }
 
     fn open_bytes_region(
         &mut self,
-        _plane_index: u32,
-        _x: u32,
-        _y: u32,
-        _w: u32,
-        _h: u32,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
     ) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Burleigh SPM .img format is proprietary; .img extension is too generic for reliable detection".to_string()
-        ))
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Burleigh SPM", &full, meta, 1, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::UnsupportedFormat(
-            "Burleigh SPM .img format is proprietary; .img extension is too generic for reliable detection".to_string()
-        ))
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.open_bytes(plane_index)
     }
 
     fn resolution_count(&self) -> usize {

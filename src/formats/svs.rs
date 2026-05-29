@@ -119,6 +119,7 @@ impl FormatReader for WholeSlideTiffReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.close()?;
         self.inner.set_id(path)?;
         // Aperio SVS stores its pyramid as the main IFD chain (differently
         // sized IFDs). TiffReader splits these into separate series by default;

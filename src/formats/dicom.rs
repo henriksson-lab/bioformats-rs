@@ -844,9 +844,6 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
     if attrs.number_of_frames == 0 {
         attrs.number_of_frames = 1;
     }
-    if attrs.samples_per_pixel == 0 {
-        attrs.samples_per_pixel = 1;
-    }
     if attrs.samples_per_pixel == 1 {
         attrs.planar_configuration = 0;
     }
@@ -1115,6 +1112,22 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
             "DICOM: missing image dimensions".into(),
         ));
     }
+    if a.samples_per_pixel == 0 {
+        return Err(BioFormatsError::Format(
+            "DICOM: missing SamplesPerPixel".into(),
+        ));
+    }
+    if a.bits_allocated == 0 {
+        return Err(BioFormatsError::Format(
+            "DICOM: missing BitsAllocated".into(),
+        ));
+    }
+    if a.bits_stored > a.bits_allocated {
+        return Err(BioFormatsError::Format(format!(
+            "DICOM: BitsStored {} exceeds BitsAllocated {}",
+            a.bits_stored, a.bits_allocated
+        )));
+    }
     let has_palette =
         a.palette.red.is_some() && a.palette.green.is_some() && a.palette.blue.is_some();
     let palette_bits = a
@@ -1137,7 +1150,12 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
             (9..=16, 1) => PixelType::Int16,
             (32, 0) => PixelType::Uint32,
             (32, 1) => PixelType::Int32,
-            _ => PixelType::Uint16,
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "DICOM: unsupported BitsAllocated {} / PixelRepresentation {}",
+                    a.bits_allocated, a.pixel_representation
+                )));
+            }
         }
     };
     let source_bits = if a.bits_stored == 0 {
@@ -1799,6 +1817,7 @@ impl FormatReader for DicomReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // Parse the selected file first to derive its grouping key.
         let attrs = parse_dicom(path)?;
         let key = group_key_from_attrs(&attrs);
@@ -1823,9 +1842,14 @@ impl FormatReader for DicomReader {
             .unwrap_or(0);
 
         self.series_files = series_files;
-        self.load_series(selected)?;
-        // Match Java: series 0 is selected after initialisation.
-        self.set_series(0)?;
+        let result = self.load_series(selected).and_then(|_| {
+            // Match Java: series 0 is selected after initialisation.
+            self.set_series(0)
+        });
+        if let Err(err) = result {
+            self.close()?;
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -1838,19 +1862,12 @@ impl FormatReader for DicomReader {
     }
 
     fn series_count(&self) -> usize {
-        self.series_files.len().max(1)
+        self.series_files.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.series_files.len().max(1) {
+        if self.series_files.is_empty() || s >= self.series_files.len() {
             return Err(BioFormatsError::SeriesOutOfRange(s));
-        }
-        if self.series_files.is_empty() {
-            // Single-file fallback (no grouping performed).
-            if s != 0 {
-                return Err(BioFormatsError::SeriesOutOfRange(s));
-            }
-            return Ok(());
         }
         if s != self.current_series {
             self.load_series(s)?;

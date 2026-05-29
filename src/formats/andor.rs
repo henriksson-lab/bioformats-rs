@@ -56,6 +56,34 @@ fn checked_footer_offset(path: &Path, width: u32, height: u32, image_count: u32)
         })
 }
 
+fn checked_inline_payload(
+    path: &Path,
+    data_offset: u64,
+    width: u32,
+    height: u32,
+    image_count: u32,
+    declared_byte_count: Option<u64>,
+) -> Result<()> {
+    let pixel_bytes = width as u64 * height as u64 * image_count as u64 * 4;
+    if let Some(byte_count) = declared_byte_count {
+        if byte_count < pixel_bytes {
+            return Err(BioFormatsError::Format(format!(
+                "Andor SIF: declared data block has {byte_count} bytes, expected {pixel_bytes}"
+            )));
+        }
+    }
+    let file_len = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
+    if data_offset
+        .checked_add(pixel_bytes)
+        .is_none_or(|end| end > file_len)
+    {
+        return Err(BioFormatsError::Format(
+            "Andor SIF: file is shorter than declared pixel payload".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Parse the SIF text header using Java Bio-Formats' Pixel number layout when
 /// present, with the legacy "32 " acquisition-line parser retained as fallback.
 fn parse_sif_header(path: &Path) -> Result<SifHeader> {
@@ -120,11 +148,20 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
             let width = u32::try_from(computed_width)
                 .ok()
                 .filter(|&v| v > 0)
-                .unwrap_or(declared_x);
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Andor SIF: invalid computed width".into())
+                })?;
             let height = u32::try_from(computed_height)
                 .ok()
                 .filter(|&v| v > 0)
-                .unwrap_or(declared_y);
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Andor SIF: invalid computed height".into())
+                })?;
+            if declared_x == 0 || declared_y == 0 || size_c == 0 || size_z == 0 || size_t == 0 {
+                return Err(BioFormatsError::Format(
+                    "Andor SIF: Pixel number contains non-positive dimensions".into(),
+                ));
+            }
             let data_offset = checked_footer_offset(path, width, height, image_count)?;
 
             // SIFReader.java allocates one timestamp per plane. Its index math
@@ -190,6 +227,14 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
                 if byte_count > 0 && width > 0 && height > 0 {
                     let data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
                     let image_count = num_frames.max(1);
+                    checked_inline_payload(
+                        path,
+                        data_offset,
+                        width,
+                        height,
+                        image_count,
+                        Some(byte_count),
+                    )?;
                     return Ok(SifHeader {
                         width,
                         height,
@@ -213,6 +258,7 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
     // Fallback data offset: end of file? Try 0 with a warning
     let data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
     let image_count = num_frames.max(1);
+    checked_inline_payload(path, data_offset, width, height, image_count, None)?;
     Ok(SifHeader {
         width,
         height,
@@ -262,6 +308,7 @@ impl FormatReader for AndorSifReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let header = parse_sif_header(path)?;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
@@ -302,16 +349,18 @@ impl FormatReader for AndorSifReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.data_offset = 0;
+        self.timestamps.clear();
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if s == 0 && self.meta.is_some() {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
     fn series(&self) -> usize {

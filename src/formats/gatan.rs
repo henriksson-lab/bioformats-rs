@@ -482,10 +482,14 @@ struct DmImage {
     name: String,
 }
 
-fn find_image_data(root: &DmValue) -> Option<DmImage> {
+fn find_image_data(root: &DmValue) -> Result<DmImage> {
     // Navigate: root → "ImageList" → entry 1 (or first if 1 is absent)
-    let image_list = root.get("ImageList")?;
-    let entries = image_list.as_group()?;
+    let image_list = root
+        .get("ImageList")
+        .ok_or_else(|| BioFormatsError::Format("DM3/DM4: ImageList missing".into()))?;
+    let entries = image_list
+        .as_group()
+        .ok_or_else(|| BioFormatsError::Format("DM3/DM4: ImageList is not a group".into()))?;
 
     // Try entry at index 1 first (index 0 is often a thumbnail/reference)
     // entries are in order, try index 1 (if present) then 0
@@ -497,41 +501,72 @@ fn find_image_data(root: &DmValue) -> Option<DmImage> {
 
     for &idx in &candidates {
         if let Some((_, image_entry)) = entries.get(idx) {
-            if let Some(result) = extract_image(image_entry) {
-                return Some(result);
+            match extract_image(image_entry)? {
+                Some(result) => return Ok(result),
+                None => {}
             }
         }
     }
-    None
+    Err(BioFormatsError::Format(
+        "DM3/DM4: could not find image data in tag tree".into(),
+    ))
 }
 
-fn extract_image(entry: &DmValue) -> Option<DmImage> {
-    let img_data = entry.get("ImageData")?;
+fn extract_image(entry: &DmValue) -> Result<Option<DmImage>> {
+    let img_data = match entry.get("ImageData") {
+        Some(value) => value,
+        None => return Ok(None),
+    };
 
     // Get dimensions
-    let dims = img_data.get("Dimensions")?;
-    let dim_entries = dims.as_group()?;
-    let width = dim_entries.get(0)?.1.as_u64()? as u32;
+    let dims = img_data.get("Dimensions").ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Gatan DM ImageData has no Dimensions".into())
+    })?;
+    let dim_entries = dims.as_group().ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Gatan DM Dimensions is not a group".into())
+    })?;
+    let width = dim_entries
+        .first()
+        .and_then(|(_, v)| v.as_u64())
+        .ok_or_else(|| BioFormatsError::UnsupportedFormat("Gatan DM width missing".into()))?;
     let height = dim_entries
         .get(1)
-        .map(|(_, v)| v.as_u64().unwrap_or(1) as u32)
-        .unwrap_or(1);
+        .and_then(|(_, v)| v.as_u64())
+        .ok_or_else(|| BioFormatsError::UnsupportedFormat("Gatan DM height missing".into()))?;
     let depth = dim_entries
         .get(2)
-        .map(|(_, v)| v.as_u64().unwrap_or(1) as u32)
+        .and_then(|(_, v)| v.as_u64())
         .unwrap_or(1);
+    if width == 0 || height == 0 || depth == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Gatan DM image has non-positive dimensions".into(),
+        ));
+    }
+    let width = u32::try_from(width)
+        .map_err(|_| BioFormatsError::Format("Gatan DM width overflows".into()))?;
+    let height = u32::try_from(height)
+        .map_err(|_| BioFormatsError::Format("Gatan DM height overflows".into()))?;
+    let depth = u32::try_from(depth)
+        .map_err(|_| BioFormatsError::Format("Gatan DM depth overflows".into()))?;
 
     // Get data type
-    let dm_data_type = img_data
-        .get("DataType")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(23) as i32; // default to uint8
+    let dm_data_type = i32::try_from(
+        img_data
+            .get("DataType")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat("Gatan DM ImageData has no DataType".into())
+            })?,
+    )
+    .map_err(|_| BioFormatsError::Format("Gatan DM data type overflows".into()))?;
 
     // Get pixel data
-    let data_tag = img_data.get("Data")?;
+    let data_tag = img_data.get("Data").ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Gatan DM ImageData has no Data".into())
+    })?;
     let pixel_data = match data_tag {
         DmValue::Bytes(b) => b.clone(),
-        _ => return None,
+        _ => return Ok(None),
     };
 
     // Get image name
@@ -546,14 +581,14 @@ fn extract_image(entry: &DmValue) -> Option<DmImage> {
         })
         .unwrap_or_default();
 
-    Some(DmImage {
+    Ok(Some(DmImage {
         width,
         height,
         depth,
         dm_data_type,
         pixel_data,
         name,
-    })
+    }))
 }
 
 // ── Reader ────────────────────────────────────────────────────────────────────
@@ -613,6 +648,7 @@ impl FormatReader for GatanReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let f = File::open(path).map_err(BioFormatsError::Io)?;
         let r = BufReader::new(f);
 
@@ -658,12 +694,21 @@ impl FormatReader for GatanReader {
 
         let root = dm.parse_tag_group(0).map_err(BioFormatsError::Io)?;
 
-        let img = find_image_data(&root).ok_or_else(|| {
-            BioFormatsError::Format("DM3/DM4: could not find image data in tag tree".into())
-        })?;
+        let img = find_image_data(&root)?;
 
         let (pixel_type, bytes_per_pixel) = dm_pixel_type_and_bytes(img.dm_data_type)?;
-        let image_count = img.depth.max(1);
+        let image_count = img.depth;
+        let expected_len = (img.width as usize)
+            .checked_mul(img.height as usize)
+            .and_then(|px| px.checked_mul(image_count as usize))
+            .and_then(|px| px.checked_mul(bytes_per_pixel))
+            .ok_or_else(|| BioFormatsError::Format("Gatan DM pixel payload overflows".into()))?;
+        if img.pixel_data.len() < expected_len {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Gatan DM pixel payload is shorter than declared ({} < {expected_len})",
+                img.pixel_data.len()
+            )));
+        }
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         if !img.name.is_empty() {
@@ -714,10 +759,13 @@ impl FormatReader for GatanReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
@@ -1152,6 +1200,7 @@ impl FormatReader for Dm2Reader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // Port of GatanDM2Reader.initFile (big-endian, ISO-8859-1 strings).
         let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if bytes.len() < 24 {
@@ -1241,14 +1290,17 @@ impl FormatReader for Dm2Reader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.data_offset = 32;
+        self.data_offset = DM2_HEADER_SIZE;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {

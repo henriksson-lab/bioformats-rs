@@ -135,6 +135,7 @@ impl FormatReader for GenericReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, pixels) = load_image(path, self.behavior)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
@@ -150,10 +151,10 @@ impl FormatReader for GenericReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -287,6 +288,7 @@ impl FormatReader for GifReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, frames) = load_gif_frames(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
@@ -302,10 +304,10 @@ impl FormatReader for GifReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())

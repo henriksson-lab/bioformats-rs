@@ -47,6 +47,7 @@ macro_rules! tiff_wrapper {
             fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
 
             fn set_id(&mut self, path: &Path) -> Result<()> {
+                self.inner.close()?;
                 self.inner.set_id(path)?;
                 for series in self.inner.series_list_mut() {
                     series.metadata.series_metadata.insert(
@@ -66,6 +67,9 @@ macro_rules! tiff_wrapper {
             }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
+                if self.inner.series_count() == 0 {
+                    return Err(BioFormatsError::NotInitialized);
+                }
                 self.inner.set_series(s)
             }
 
@@ -448,6 +452,125 @@ impl HcsAssembly {
         let meta = self.meta()?;
         crop_full_plane("BD Pathway", &full, meta, 1, x, y, w, h)
     }
+
+    fn validate(&self, format_name: &str) -> Result<()> {
+        if self.series.is_empty() {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "{format_name}: no series assembled"
+            )));
+        }
+        if self.planes.len() != self.series.len() {
+            return Err(BioFormatsError::Format(format!(
+                "{format_name}: series/plane table length mismatch"
+            )));
+        }
+
+        let mut saw_payload = false;
+        for (series_index, meta) in self.series.iter().enumerate() {
+            if meta.size_x == 0
+                || meta.size_y == 0
+                || meta.size_z == 0
+                || meta.size_c == 0
+                || meta.size_t == 0
+            {
+                return Err(BioFormatsError::Format(format!(
+                    "{format_name}: series {series_index} has non-positive dimensions"
+                )));
+            }
+            let expected = meta
+                .size_z
+                .checked_mul(meta.size_c)
+                .and_then(|v| v.checked_mul(meta.size_t))
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "{format_name}: series {series_index} plane count overflows"
+                    ))
+                })?;
+            if meta.image_count != expected {
+                return Err(BioFormatsError::Format(format!(
+                    "{format_name}: series {series_index} image_count {} does not match dimensions {expected}",
+                    meta.image_count
+                )));
+            }
+            let planes = self.planes.get(series_index).ok_or_else(|| {
+                BioFormatsError::Format(format!("{format_name}: missing plane table"))
+            })?;
+            if planes.len() < expected as usize {
+                return Err(BioFormatsError::Format(format!(
+                    "{format_name}: series {series_index} has {} plane slots for {expected} planes",
+                    planes.len()
+                )));
+            }
+            for (plane_index, plane) in planes.iter().take(expected as usize).enumerate() {
+                for tile in &plane.tiles {
+                    saw_payload = true;
+                    let mut tr = crate::tiff::TiffReader::new();
+                    tr.set_id(&tile.filename).map_err(|e| {
+                        BioFormatsError::Format(format!(
+                            "{format_name}: companion TIFF {} could not be initialized: {e}",
+                            tile.filename.display()
+                        ))
+                    })?;
+                    let tm = tr.metadata();
+                    if tm.size_x == 0 || tm.size_y == 0 || tm.image_count == 0 {
+                        return Err(BioFormatsError::Format(format!(
+                            "{format_name}: companion TIFF {} has invalid image metadata",
+                            tile.filename.display()
+                        )));
+                    }
+                    if tile.file_index >= tm.image_count {
+                        return Err(BioFormatsError::Format(format!(
+                            "{format_name}: plane {plane_index} references TIFF page {} in {} but only {} page(s) are available",
+                            tile.file_index,
+                            tile.filename.display(),
+                            tm.image_count
+                        )));
+                    }
+                    let src_w = if tile.src_w == 0 {
+                        tm.size_x
+                    } else {
+                        tile.src_w
+                    };
+                    let src_h = if tile.src_h == 0 {
+                        tm.size_y
+                    } else {
+                        tile.src_h
+                    };
+                    let src_end_x = tile.src_x.checked_add(src_w).ok_or_else(|| {
+                        BioFormatsError::Format(format!(
+                            "{format_name}: source tile X range overflows for {}",
+                            tile.filename.display()
+                        ))
+                    })?;
+                    let src_end_y = tile.src_y.checked_add(src_h).ok_or_else(|| {
+                        BioFormatsError::Format(format!(
+                            "{format_name}: source tile Y range overflows for {}",
+                            tile.filename.display()
+                        ))
+                    })?;
+                    if src_end_x > tm.size_x || src_end_y > tm.size_y {
+                        return Err(BioFormatsError::Format(format!(
+                            "{format_name}: source tile region {}x{} at {},{} exceeds companion TIFF {} dimensions {}x{}",
+                            src_w,
+                            src_h,
+                            tile.src_x,
+                            tile.src_y,
+                            tile.filename.display(),
+                            tm.size_x,
+                            tm.size_y
+                        )));
+                    }
+                    let _ = tr.close();
+                }
+            }
+        }
+        if !saw_payload {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "{format_name}: index does not reference any readable companion TIFF payload"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Build an `ImageMetadata` for an assembled HCS series.
@@ -537,7 +660,10 @@ macro_rules! impl_assembled_reader {
 
             fn set_id(&mut self, path: &Path) -> Result<()> {
                 let parse: fn(&Path) -> Result<HcsAssembly> = $parse;
-                self.asm = parse(path)?;
+                self.asm = HcsAssembly::new();
+                let asm = parse(path)?;
+                asm.validate(stringify!($name))?;
+                self.asm = asm;
                 Ok(())
             }
 
@@ -547,11 +673,13 @@ macro_rules! impl_assembled_reader {
             }
 
             fn series_count(&self) -> usize {
-                self.asm.series.len().max(1)
+                self.asm.series.len()
             }
 
             fn set_series(&mut self, s: usize) -> Result<()> {
-                if s >= self.asm.series.len() {
+                if self.asm.series.is_empty() {
+                    Err(BioFormatsError::NotInitialized)
+                } else if s >= self.asm.series.len() {
                     Err(BioFormatsError::SeriesOutOfRange(s))
                 } else {
                     self.asm.current_series = s;
@@ -862,6 +990,7 @@ impl FormatReader for InCell3000Reader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // `.xdce` is the InCell XML index, handled by incell::InCellReader. This
         // reader only decodes the binary `.frm` frame; for an `.xdce` it falls
         // through with the historical "no TIFF" rejection so the registry's
@@ -942,11 +1071,13 @@ impl FormatReader for InCell3000Reader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -1187,6 +1318,7 @@ impl FormatReader for TecanReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
         let mut rows: Vec<Vec<f32>> = Vec::new();
         for line in text.lines() {
@@ -1274,11 +1406,13 @@ impl FormatReader for TecanReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())

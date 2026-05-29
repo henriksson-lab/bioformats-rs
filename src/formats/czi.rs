@@ -21,21 +21,23 @@ use crate::common::region::crop_full_plane;
 
 // ---- pixel types (from DirectoryEntry) -------------------------------------
 
-fn czi_pixel_type(code: i32) -> (PixelType, u32) {
+fn czi_pixel_type(code: i32) -> std::io::Result<(PixelType, u32)> {
     // Returns (pixel_type, samples_per_pixel)
     match code {
-        0 => (PixelType::Uint8, 1),    // Gray8
-        1 => (PixelType::Uint16, 1),   // Gray16
-        2 => (PixelType::Float32, 1),  // GrayFloat
-        3 => (PixelType::Uint8, 3),    // Bgr24
-        4 => (PixelType::Uint16, 3),   // Bgr48
-        8 => (PixelType::Float32, 3),  // BgrFloat
-        9 => (PixelType::Uint8, 4),    // Bgra32
-        10 => (PixelType::Float32, 2), // Complex (re+im)
-        11 => (PixelType::Float32, 2), // ComplexFloat
-        12 => (PixelType::Uint32, 1),  // Gray32
-        13 => (PixelType::Float64, 1), // GrayDouble
-        _ => (PixelType::Uint8, 1),
+        0 => Ok((PixelType::Uint8, 1)),    // Gray8
+        1 => Ok((PixelType::Uint16, 1)),   // Gray16
+        2 => Ok((PixelType::Float32, 1)),  // GrayFloat
+        3 => Ok((PixelType::Uint8, 3)),    // Bgr24
+        4 => Ok((PixelType::Uint16, 3)),   // Bgr48
+        8 => Ok((PixelType::Float32, 3)),  // BgrFloat
+        9 => Ok((PixelType::Uint8, 4)),    // Bgra32
+        10 => Ok((PixelType::Float32, 2)), // Complex (re+im)
+        11 => Ok((PixelType::Float32, 2)), // ComplexFloat
+        12 => Ok((PixelType::Uint32, 1)),  // Gray32
+        13 => Ok((PixelType::Float64, 1)), // GrayDouble
+        other => Err(czi_invalid_data(format!(
+            "CZI unsupported pixel type code {other}"
+        ))),
     }
 }
 
@@ -403,7 +405,7 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
     }
 
     // Compute dimensions from entries.
-    let parsed = build_dimensions(meta_xml, entries);
+    let parsed = build_dimensions(meta_xml, entries)?;
     Ok(parsed)
 }
 
@@ -411,7 +413,10 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
 /// per-pixel-type core split machinery (the part of `initFile` from
 /// calculateDimensions through assignPlaneIndices and the mosaic tile min/max
 /// row-col logic).
-fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> CziParsed {
+fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result<CziParsed> {
+    if entries.is_empty() {
+        return Err(czi_invalid_data("CZI directory contains no subblocks"));
+    }
     // --- calculateDimensions: per-dimension extents (ZeissCZIReader:1942-2048) ---
     let mut max_z = 0i32;
     let mut max_c = 0i32;
@@ -585,7 +590,7 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> CziParsed {
     let mut c_count = (max_c + 1) as u32;
     let mut t_count = (max_t + 1) as u32;
 
-    let (pt, spp) = czi_pixel_type(first_pixel_type);
+    let (pt, spp) = czi_pixel_type(first_pixel_type)?;
 
     // --- modulo annotations (ZeissCZIReader:832-860) ---
     // rotations -> modulo Z, illuminations -> modulo C, phases -> modulo T.
@@ -889,7 +894,7 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> CziParsed {
         // Same-size pair => not PALM; leave the existing 2-channel series untouched.
     }
 
-    CziParsed {
+    Ok(CziParsed {
         meta_xml,
         entries,
         z_count: z_count.max(1),
@@ -912,7 +917,7 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> CziParsed {
         phases: c.phases,
         rotation_axis: c.rotation_axis,
         palm,
-    }
+    })
 }
 
 /// Port of ZeissCZIReader.checkPALM (ZeissCZIReader:2277-2335): the file is PALM
@@ -1578,6 +1583,7 @@ impl FormatReader for CziReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut reader = BufReader::new(f);
         let parsed = parse_czi_file(&mut reader).map_err(BioFormatsError::Io)?;
@@ -1660,7 +1666,11 @@ impl FormatReader for CziReader {
     }
 
     fn series_count(&self) -> usize {
-        self.series.len().max(1)
+        if self.meta.is_some() {
+            self.series.len().max(1)
+        } else {
+            0
+        }
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
         if s >= self.series_count() {

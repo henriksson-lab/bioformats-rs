@@ -90,6 +90,7 @@ impl FormatReader for ZipReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
         let mut archive = zip::ZipArchive::new(file)
             .map_err(|e| BioFormatsError::Format(format!("ZIP open error: {e}")))?;
@@ -152,11 +153,15 @@ impl FormatReader for ZipReader {
             extracted_files.push(out_path);
         }
 
-        let primary = primary_entry.or(first_entry).ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat(
-                "Zip file does not contain any valid files".to_string(),
-            )
-        })?;
+        let primary = match primary_entry.or(first_entry) {
+            Some(primary) => primary,
+            None => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Zip file does not contain any valid files".to_string(),
+                ));
+            }
+        };
         let mut candidates = Vec::with_capacity(extracted_files.len());
         candidates.push(primary.clone());
         for file in &extracted_files {
@@ -204,7 +209,7 @@ impl FormatReader for ZipReader {
     }
 
     fn series_count(&self) -> usize {
-        self.inner().map(|r| r.series_count()).unwrap_or(1)
+        self.inner().map(|r| r.series_count()).unwrap_or(0)
     }
 
     fn set_series(&mut self, series: usize) -> Result<()> {
