@@ -1145,7 +1145,10 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
     } else {
         match (a.bits_allocated, a.pixel_representation) {
             (1, _) => PixelType::Uint8,
-            (2..=8, _) => PixelType::Uint8,
+            // FormatTools.pixelTypeFromBytes(1, signed, false): INT8 when signed,
+            // UINT8 otherwise (DicomReader.java:909).
+            (2..=8, 0) => PixelType::Uint8,
+            (2..=8, 1) => PixelType::Int8,
             (9..=16, 0) => PixelType::Uint16,
             (9..=16, 1) => PixelType::Int16,
             (32, 0) => PixelType::Uint32,
@@ -1945,12 +1948,22 @@ impl FormatReader for DicomReader {
 
             match syntax {
                 EncapsulatedSyntax::Jpeg2000 => {
-                    let decoded = crate::common::codec::decompress_jpeg2000(&encoded)?;
+                    let mut decoded = crate::common::codec::decompress_jpeg2000(&encoded)?;
                     if decoded.len() != expected {
                         return Err(BioFormatsError::Codec(format!(
                             "DICOM JPEG 2000 decoded {} bytes, expected {expected}",
                             decoded.len()
                         )));
+                    }
+                    // Java DicomReader.openBytes inverts MONOCHROME1 after tile
+                    // decoding for every codec (DicomReader.java:409-430).
+                    if self.photometric_interpretation.trim() == "MONOCHROME1" {
+                        invert_monochrome1(
+                            &mut decoded,
+                            meta,
+                            self.max_pixel_range,
+                            self.center_pixel_value,
+                        );
                     }
                     return Ok(decoded);
                 }
@@ -1961,12 +1974,22 @@ impl FormatReader for DicomReader {
                     // Both baseline (process 1) and lossless (process 14) JPEG
                     // are handled by the shared JPEG decoder, which supports the
                     // lossless SOF3 path.
-                    let decoded = crate::common::codec::decompress_jpeg(&trimmed)?;
+                    let mut decoded = crate::common::codec::decompress_jpeg(&trimmed)?;
                     if decoded.len() != expected {
                         return Err(BioFormatsError::Codec(format!(
                             "DICOM JPEG decoded {} bytes, expected {expected}",
                             decoded.len()
                         )));
+                    }
+                    // Java DicomReader.openBytes inverts MONOCHROME1 after tile
+                    // decoding for every codec (DicomReader.java:409-430).
+                    if self.photometric_interpretation.trim() == "MONOCHROME1" {
+                        invert_monochrome1(
+                            &mut decoded,
+                            meta,
+                            self.max_pixel_range,
+                            self.center_pixel_value,
+                        );
                     }
                     return Ok(decoded);
                 }

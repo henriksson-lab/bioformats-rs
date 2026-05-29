@@ -102,6 +102,8 @@ struct InCellMeta {
     do_t: bool,
     // plateMap[row][col] = a well exists here
     plate_map: Vec<Vec<bool>>,
+    // exclude[row][col] = this well is explicitly excluded via <Exclude>
+    exclude: Vec<Vec<bool>>,
     // imageFiles[well][field][t][index]
     image_files: Vec<Vec<Vec<Vec<Option<ImagePlane>>>>>,
     total_images: usize,
@@ -206,6 +208,28 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         m.well_rows = attr_positive_u32(e, "rows")? as usize;
                         m.well_cols = attr_positive_u32(e, "columns")? as usize;
                         m.plate_map = vec![vec![false; m.well_cols]; m.well_rows];
+                        m.exclude = vec![vec![false; m.well_cols]; m.well_rows];
+                    }
+                    b"Exclude" => {
+                        // Java InCellReader.java:897-901: <Exclude row=… col=…>,
+                        // attributes are 1-indexed (subtract 1) and mark a well
+                        // to be dropped from the series list.
+                        if m.exclude.is_empty() {
+                            m.exclude = vec![vec![false; m.well_cols]; m.well_rows];
+                        }
+                        let row = attr_positive_u32(e, "row")? as usize - 1;
+                        let col = attr_positive_u32(e, "col")? as usize - 1;
+                        if row < m.well_rows && col < m.well_cols {
+                            m.exclude[row][col] = true;
+                        } else {
+                            return Err(BioFormatsError::Format(format!(
+                                "InCell Exclude well ({}, {}) is outside declared plate dimensions {}x{}",
+                                row + 1,
+                                col + 1,
+                                m.well_rows,
+                                m.well_cols
+                            )));
+                        }
                     }
                     b"Images" => {
                         // imagesNumber - not strictly needed for assembly
@@ -563,15 +587,26 @@ impl InCellReader {
         let size_t = m.size_t.max(1);
 
         // Determine the ordered list of populated wells (matches getWellFromSeries).
+        // Wells explicitly listed in <Exclude> are dropped, mirroring Java
+        // InCellReader.java:477-498 where excluded wells are skipped when
+        // computing seriesCount. We remove them from the well list entirely so
+        // both the series count and the well->series mapping stay consistent.
         let mut plate_wells: Vec<(usize, usize)> = Vec::new();
         for row in 0..m.well_rows {
             for col in 0..m.well_cols {
-                if m.plate_map
+                let populated = m
+                    .plate_map
                     .get(row)
                     .and_then(|r| r.get(col))
                     .copied()
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                let excluded = m
+                    .exclude
+                    .get(row)
+                    .and_then(|r| r.get(col))
+                    .copied()
+                    .unwrap_or(false);
+                if populated && !excluded {
                     plate_wells.push((row, col));
                 }
             }
@@ -1135,5 +1170,29 @@ mod tests {
 
         assert_eq!(plane.filename.as_ref(), Some(&image));
         assert!(plane.is_tiff);
+    }
+
+    #[test]
+    fn incell_exclude_drops_well_from_series() {
+        // 1x2 plate, both wells populated; well (row 1, col 2) is excluded.
+        // Exclude attributes are 1-indexed, matching Java InCellReader.
+        let xml = r#"<InCell>
+            <Plate rows="1" columns="2"/>
+            <Exclude row="1" col="2"/>
+            <Row number="1"><Column number="1"/></Row>
+            <Row number="1"><Column number="2"/></Row>
+        </InCell>"#;
+        let m = {
+            let dir = temp_dir("exclude");
+            let path = dir.join("plate.xdce");
+            std::fs::write(&path, xml).unwrap();
+            parse_incell_xml(&path).unwrap()
+        };
+        // Both wells are populated in the plate map.
+        assert!(m.plate_map[0][0]);
+        assert!(m.plate_map[0][1]);
+        // Only the second well (1-indexed row=1,col=2) is excluded.
+        assert!(!m.exclude[0][0]);
+        assert!(m.exclude[0][1]);
     }
 }

@@ -32,6 +32,44 @@ fn dm_pixel_type_and_bytes(dm_type: i32) -> Result<(PixelType, usize)> {
     }
 }
 
+/// Whether a DM DataType code denotes signed integer/float pixels.
+///
+/// The DM `DataType` codes encode signedness for the normal path: 1=Int16,
+/// 9=Int8, 7=Int32 and 2/12 (float/double) are signed; 6=UInt8, 10=UInt16,
+/// 11=UInt32 are unsigned. Java instead reads sign from the `LowLimit` tag
+/// (`signed = LowLimit < 0`, GatanReader.java:719-720); gatan.rs does not
+/// capture that tag, so we fall back to the DataType's own signedness. For
+/// the RGB-ish DataType 23 (Java's `getNumBytes(23)==0`) signedness is
+/// unknown, so we treat it as unsigned (matching the Uint8 default).
+fn dm_data_type_is_signed(dm_type: i32) -> bool {
+    matches!(dm_type, 1 | 2 | 7 | 9 | 12)
+}
+
+/// Map (bytes-per-pixel, signed) to a PixelType, mirroring
+/// `FormatTools.pixelTypeFromBytes(bytes, signed, /*fp=*/false)`
+/// (GatanReader.java:258). Used to reconcile the DataType-derived
+/// bytes-per-pixel with the bpp implied by the stored payload length.
+fn dm_pixel_type_from_bytes(bytes: usize, signed: bool) -> Result<PixelType> {
+    let pt = match (bytes, signed) {
+        (1, true) => PixelType::Int8,
+        (1, false) => PixelType::Uint8,
+        (2, true) => PixelType::Int16,
+        (2, false) => PixelType::Uint16,
+        (4, true) => PixelType::Int32,
+        (4, false) => PixelType::Uint32,
+        // 8 bytes: FormatTools maps to DOUBLE when fp, else to the widest
+        // available integer. With fp=false and our PixelType set lacking a
+        // 64-bit integer, fall back to Float64 to preserve the stride.
+        (8, _) => PixelType::Float64,
+        _ => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Gatan DM: cannot derive pixel type from {bytes} bytes/pixel (signed={signed})"
+            )))
+        }
+    };
+    Ok(pt)
+}
+
 // ── Tag value types (DM encoding) ─────────────────────────────────────────────
 // info[0] encodes the tag data type:
 const DM_TYPE_INT16: u32 = 2;
@@ -696,12 +734,38 @@ impl FormatReader for GatanReader {
 
         let img = find_image_data(&root)?;
 
-        let (pixel_type, bytes_per_pixel) = dm_pixel_type_and_bytes(img.dm_data_type)?;
+        let (mut pixel_type, mut bytes_per_pixel) =
+            dm_pixel_type_and_bytes(img.dm_data_type)?;
         let image_count = img.depth;
-        let expected_len = (img.width as usize)
+
+        // Reconcile the DataType-derived bytes-per-pixel with the bpp implied by
+        // the stored payload. Java: bytes = numPixelBytes / (sizeX*sizeY*imageCount)
+        // and, if that disagrees with FormatTools.getBytesPerPixel(pixelType),
+        // overrides via FormatTools.pixelTypeFromBytes(bytes, signed, false)
+        // (GatanReader.java:256-259). This rescues files whose payload implies a
+        // different bpp than the DataType (e.g. RGB DataType 23, where Java's
+        // getNumBytes(23)==0).
+        let pixel_count = (img.width as usize)
             .checked_mul(img.height as usize)
             .and_then(|px| px.checked_mul(image_count as usize))
-            .and_then(|px| px.checked_mul(bytes_per_pixel))
+            .ok_or_else(|| BioFormatsError::Format("Gatan DM pixel count overflows".into()))?;
+        if pixel_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Gatan DM image has zero pixels".into(),
+            ));
+        }
+        let derived_bytes = img.pixel_data.len() / pixel_count;
+        if derived_bytes != bytes_per_pixel {
+            // Java sources `signed` from the LowLimit tag; gatan.rs does not
+            // capture it, so fall back to the DataType's own signedness.
+            let signed = dm_data_type_is_signed(img.dm_data_type);
+            pixel_type = dm_pixel_type_from_bytes(derived_bytes, signed)?;
+            bytes_per_pixel = derived_bytes;
+        }
+
+        // Ensure the payload is large enough for the (possibly reconciled) stride.
+        let expected_len = pixel_count
+            .checked_mul(bytes_per_pixel)
             .ok_or_else(|| BioFormatsError::Format("Gatan DM pixel payload overflows".into()))?;
         if img.pixel_data.len() < expected_len {
             return Err(BioFormatsError::UnsupportedFormat(format!(

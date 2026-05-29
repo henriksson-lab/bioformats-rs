@@ -1698,12 +1698,16 @@ fn cellomics_legacy_payload_crops_real_pixels() {
 }
 
 #[test]
-fn perkinelmer_and_openlab_reject_short_payloads_instead_of_padding() {
-    // PerkinElmer .htm layout: an .htm header plus a numbered/TIFF pixel file
-    // whose stem matches the header stem. Here the TIFF pixel file is truncated
-    // so its declared dimensions require more bytes than the file actually
-    // contains; the reader must reject it rather than zero-pad.
-    let dir = isolated_tmp_dir("perkin_short_payload");
+fn perkinelmer_tolerates_truncated_trailing_tiff_metadata() {
+    // PerkinElmer .htm layout: an .htm header plus a matching TIFF pixel file.
+    // The TiffWriter lays out pixel strips first and IFD metadata last, so
+    // chopping the tail damages only an out-of-line metadata value, leaving the
+    // pixel strips intact. Java Bio-Formats parses such trailing-truncated TIFFs
+    // leniently (truncating the over-long value rather than erroring); after the
+    // Tier 2 robustness fix the Rust reader matches that — and the pixels must
+    // still read back exactly. (Genuine *pixel* shortfall is still rejected; see
+    // `openlab_rejects_short_payloads_instead_of_padding`.)
+    let dir = isolated_tmp_dir("perkin_trunc_meta");
     let htm = dir.join("scan.htm");
     let tif = dir.join("scan.tif");
     std::fs::write(&htm, b"<html><body></body></html>").unwrap();
@@ -1719,17 +1723,21 @@ fn perkinelmer_and_openlab_reject_short_payloads_instead_of_padding() {
     meta.is_little_endian = true;
     meta.resolution_count = 1;
     ImageWriter::save(&tif, &meta, &[vec![1u8, 2, 3, 4, 5, 6]]).unwrap();
-    // Truncate the pixel file so it no longer covers the declared image.
+    // Chop the trailing metadata bytes; the leading pixel strips are untouched.
     let full = std::fs::read(&tif).unwrap();
     std::fs::write(&tif, &full[..full.len() - 3]).unwrap();
     let mut pe = bioformats::formats::perkinelmer::PerkinElmerReader::new();
-    let err = pe.set_id(&htm).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::Format(ref message) if message.contains("exceeds file length")),
-        "{err:?}"
-    );
+    pe.set_id(&htm)
+        .expect("trailing-metadata truncation should be tolerated, not rejected");
+    assert_eq!(pe.open_bytes(0).unwrap(), vec![1u8, 2, 3, 4, 5, 6]);
     let _ = std::fs::remove_dir_all(dir);
+}
 
+#[test]
+fn openlab_rejects_short_payloads_instead_of_padding() {
+    // Openlab .raw declares its dimensions in a fixed header; when the actual
+    // payload is shorter than declared, the reader must reject it rather than
+    // zero-pad to the declared size.
     let raw = tmp("short_openlab.raw");
     let mut data = vec![0u8; 288];
     data[..4].copy_from_slice(b"LBLB");

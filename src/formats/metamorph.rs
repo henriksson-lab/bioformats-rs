@@ -23,6 +23,7 @@ use crate::tiff::ifd::IfdValue;
 use crate::tiff::parser::TiffParser;
 use crate::tiff::TiffReader;
 
+#[allow(dead_code)]
 const UIC1_TAG: u16 = 33628;
 #[allow(dead_code)]
 const UIC2_TAG: u16 = 33629;
@@ -31,23 +32,31 @@ const UIC3_TAG: u16 = 33630;
 #[allow(dead_code)]
 const UIC4_TAG: u16 = 33631;
 
-/// Read the plane count from UIC1Tag.
-/// UIC1Tag is stored as a RATIONAL (numerator/denominator) with:
-///   numerator = number of planes
-///   denominator = offset into extended UIC data block (we ignore this)
+/// Read the plane count (`mmPlanes`) from the UIC TIFF entries.
+///
+/// Java `MetamorphReader.java:1337-1342`: `mmPlanes = uic4tagEntry.getValueCount()`
+/// (the UIC4 TIFF entry's value *count*), falling back to `ifds.size()`. The
+/// previous implementation incorrectly used UIC1Tag's first rational numerator,
+/// but UIC1 is a list of (fieldID, value) pairs, so that numerator is a metadata
+/// field-ID, not a plane count.
+///
+/// Here we return the UIC4 entry's `count`, falling back to UIC2's `count`.
+/// The final `ifds.size()` fallback is applied by the caller.
 fn read_uic_plane_count(path: &Path) -> Result<Option<u32>> {
-    let f = File::open(path).map_err(BioFormatsError::Io)?;
-    let buf = BufReader::new(f);
-    let mut parser = TiffParser::new(buf)?;
-    let (ifd, _) = parser.read_ifd(parser.first_ifd_offset)?;
-
-    // UIC1Tag is stored as a Rational (pair of u32 values)
-    let count = match ifd.get(UIC1_TAG) {
-        Some(IfdValue::Rational(v)) if !v.is_empty() => Some(v[0].0),
-        Some(IfdValue::Long(v)) if !v.is_empty() => Some(v[0]),
-        _ => None,
-    };
-    Ok(count)
+    let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    // Prefer the UIC4 TIFF entry's value count (Java mmPlanes source).
+    if let Some((_, _, count)) = read_tag_value_offset(&data, UIC4_TAG) {
+        if count > 0 {
+            return Ok(Some(count));
+        }
+    }
+    // Fall back to the UIC2 entry's value count.
+    if let Some((_, _, count)) = read_tag_value_offset(&data, UIC2_TAG) {
+        if count > 0 {
+            return Ok(Some(count));
+        }
+    }
+    Ok(None)
 }
 
 /// Dimension info derived from the UIC tags, mirroring Java MetamorphReader.
@@ -365,6 +374,13 @@ pub struct MetamorphReader {
     series: usize,
     /// The companion `.nd` file path, if any (Java `ndFilename`).
     nd_filename: Option<PathBuf>,
+    /// Whether `set_id` may search for a sibling `.nd` file (Java
+    /// `canLookForND`). Constituent STK readers created for an `.nd` grid set
+    /// this to false to avoid re-resolving the `.nd` (Java setCanLookForND).
+    can_look_for_nd: bool,
+    /// Whether the `.nd` series is a "Both lasers"/DUAL bizarre multichannel
+    /// acquisition (Java `bizarreMultichannelAcquisition`).
+    bizarre_multichannel: bool,
 }
 
 impl MetamorphReader {
@@ -377,6 +393,8 @@ impl MetamorphReader {
             metas: Vec::new(),
             series: 0,
             nd_filename: None,
+            can_look_for_nd: true,
+            bizarre_multichannel: false,
         }
     }
 }
@@ -624,6 +642,14 @@ struct NdGrid {
     size_c: u32,
     size_t: u32,
     bizarre_multichannel: bool,
+    /// Number of stage positions (`NStagePositions`; Java `nstages`).
+    nstages: i32,
+    /// Stage count clamped to >= 1 (Java `stagesCount`).
+    stages_count: i32,
+    /// Z-step count (`NZSteps`; Java `zc`).
+    zc: i32,
+    /// Per-wavelength "do Z" flags (Java `hasZ`).
+    wave_do_z: Vec<bool>,
 }
 
 /// Build the `stks[series][file]` grid from a parsed `.nd` file, porting Java
@@ -771,6 +797,10 @@ fn build_nd_grid(nd_path: &Path, info: &NdInfo) -> NdGrid {
         size_c: cc.max(1) as u32,
         size_t: tc.max(1) as u32,
         bizarre_multichannel: info.bizarre_multichannel,
+        nstages,
+        stages_count,
+        zc,
+        wave_do_z: has_z.clone(),
     }
 }
 
@@ -872,9 +902,13 @@ impl FormatReader for MetamorphReader {
                 ))
             })?;
             (Some(path.to_path_buf()), stk)
-        } else {
-            // Given an STK: look for a sibling .nd file.
+        } else if self.can_look_for_nd {
+            // Given an STK: look for a sibling .nd file (Java initFile:430,
+            // gated on canLookForND).
             (find_nd_file(path), path.to_path_buf())
+        } else {
+            // Constituent STK reader: never re-resolve the .nd.
+            (None, path.to_path_buf())
         };
 
         // Build single-STK base metadata from the (first) STK file.
@@ -910,6 +944,7 @@ impl FormatReader for MetamorphReader {
         self.metas.clear();
         self.series = 0;
         self.nd_filename = None;
+        self.bizarre_multichannel = false;
         let _ = self.inner.close();
         Ok(())
     }
@@ -1082,7 +1117,10 @@ impl MetamorphReader {
         let size_c = grid.size_c;
         let size_t = grid.size_t;
         let rgb_mult = if probe_meta.is_rgb { 3 } else { 1 };
-        let image_count = size_z * (size_c * rgb_mult) * size_t;
+        // Java MetamorphReader.java:751-754 computes imageCount = sizeZ*sizeC*sizeT
+        // *before* `if (isRGB) sizeC *= 3` — RGB samples are interleaved within a
+        // single plane, so they must not be folded into the plane count.
+        let image_count = size_z * size_c * size_t;
 
         let series_count = grid.stks.len().max(1);
         let mut metas: Vec<ImageMetadata> = Vec::with_capacity(series_count);
@@ -1109,6 +1147,42 @@ impl MetamorphReader {
             });
         }
 
+        // Java MetamorphReader.java:776-789 — the differing-Z doubling case
+        // (`stks.length > nstages`) gives each series-pair its own sizeC/sizeZ
+        // derived from the actual file counts, then recomputes imageCount.
+        if series_count as i32 > grid.nstages && grid.stks.len() > 1 {
+            // hasZ.size() > 1 && hasZ.get(1) && base sizeZ == 1 ? zc : 1
+            let midx_size_z = if grid.wave_do_z.len() > 1
+                && grid.wave_do_z[1]
+                && grid.size_z == 1
+            {
+                grid.zc.max(1) as u32
+            } else {
+                1u32
+            };
+            for j in 0..grid.stages_count.max(1) as usize {
+                let pidx = j * 2;
+                let idx = j * 2 + 1;
+                if idx >= metas.len() {
+                    break;
+                }
+                let p_files = grid.stks[pidx].len() as u32;
+                let m_files = grid.stks[idx].len() as u32;
+                let p_size_t = metas[pidx].size_t.max(1);
+                let m_size_t = metas[idx].size_t.max(1);
+
+                let p_size_c = (p_files / p_size_t).max(1);
+                metas[pidx].size_c = p_size_c;
+                metas[pidx].image_count = p_size_c * p_size_t * metas[pidx].size_z.max(1);
+
+                let m_size_c = (m_files / m_size_t).max(1);
+                metas[idx].size_c = m_size_c;
+                metas[idx].size_z = midx_size_z;
+                metas[idx].image_count = m_size_c * m_size_t * midx_size_z;
+            }
+        }
+
+        self.bizarre_multichannel = grid.bizarre_multichannel;
         self.stks = Some(grid.stks);
         self.metas = metas;
         self.series = 0;
@@ -1255,16 +1329,33 @@ impl MetamorphReader {
             .get(series)
             .ok_or(BioFormatsError::NotInitialized)?;
         let size_z = meta.size_z.max(1);
+        let size_c = meta.size_c.max(1);
+        let bizarre = self.bizarre_multichannel;
         let row = stks.get(series).ok_or(BioFormatsError::NotInitialized)?;
         if row.is_empty() {
             return Ok(None);
         }
-        // ndx = no / sizeZ; plane within the file = no % sizeZ (Java).
-        let (ndx, plane) = if row.len() == 1 {
+        // ndx = no / sizeZ; plane within the file = no % sizeZ (Java openBytes).
+        // For XYZCT, no = z + sizeZ*(c + sizeC*t), so no/sizeZ = c + sizeC*t.
+        let (mut ndx, plane) = if row.len() == 1 {
             (0usize, plane_index)
         } else {
             ((plane_index / size_z) as usize, plane_index % size_z)
         };
+
+        // bizarreMultichannelAcquisition ("Both lasers" / DUAL): the two
+        // channels are stored side by side in a single file at channel 0.
+        // Java MetamorphReader.java:303-305 forces channel 0 in the file index
+        // (ndx = getIndex(z, 0, t) / sizeZ); :322-324 crops the correct half.
+        let mut channel = 0u32;
+        if bizarre && row.len() != 1 {
+            let rem = plane_index / size_z;
+            channel = rem % size_c;
+            let t = rem / size_c;
+            // getIndex(z, 0, t) = z + sizeZ*sizeC*t; / sizeZ = sizeC*t (z < sizeZ).
+            ndx = (size_c * t) as usize;
+        }
+
         let file = match row.get(ndx).and_then(|f| f.clone()) {
             Some(f) => f,
             // Missing file: return a blank plane (Java returns the buffer as-is).
@@ -1276,9 +1367,35 @@ impl MetamorphReader {
                 ]));
             }
         };
+        // Constituent STK reader: do not re-resolve the .nd (Java
+        // setCanLookForND(false), MetamorphReader.java:801,811).
         let mut reader = MetamorphReader::new();
+        reader.can_look_for_nd = false;
         reader.set_id(&file)?;
         let inner = reader.metadata().image_count.max(1);
+
+        if bizarre {
+            // The constituent file is 2*sizeX wide; channel 0 is the left half
+            // (x), channel 1 is the right half (x + sizeX). Read the full
+            // constituent plane and crop the appropriate sizeX-wide half.
+            let crop_w = meta.size_x;
+            let crop_h = meta.size_y;
+            let real_x = if channel == 0 { 0 } else { crop_w };
+            let full = reader.open_bytes(plane % inner)?;
+            let full_meta = reader.metadata();
+            let half = crop_full_plane(
+                "MetaMorph STK",
+                &full,
+                full_meta,
+                1,
+                real_x,
+                0,
+                crop_w,
+                crop_h,
+            )?;
+            return Ok(Some(half));
+        }
+
         Ok(Some(reader.open_bytes(plane % inner)?))
     }
 }

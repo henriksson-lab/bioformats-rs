@@ -97,16 +97,32 @@ impl<R: Read + Seek> TiffParser<R> {
         let mut ifds = Vec::new();
         let mut offset = self.first_ifd_offset;
         let mut visited_offsets = HashSet::new();
+        let file_len = self.file_len()?;
         while offset != 0 {
+            // A next-IFD pointer at/after EOF means the chain is truncated — this
+            // "can easily happen when writing multiple planes" (Java's words).
+            // getIFDOffsets stops and keeps the IFDs already read rather than
+            // failing, so do the same instead of erroring on a partial final IFD.
+            if offset >= file_len {
+                break;
+            }
             if !visited_offsets.insert(offset) {
                 return Err(BioFormatsError::Format(format!(
                     "TIFF IFD chain contains a cycle at offset {}",
                     offset
                 )));
             }
-            let (ifd, next) = self.read_ifd(offset)?;
-            ifds.push(ifd);
-            offset = next;
+            match self.read_ifd(offset) {
+                Ok((ifd, next)) => {
+                    ifds.push(ifd);
+                    offset = next;
+                }
+                // Tolerate a truncated/corrupt trailing IFD once at least one
+                // good IFD has been read (best-effort, matching Java); the first
+                // IFD must still parse cleanly.
+                Err(_) if !ifds.is_empty() => break,
+                Err(e) => return Err(e),
+            }
         }
         Ok(ifds)
     }
@@ -248,27 +264,35 @@ impl<R: Read + Seek> TiffParser<R> {
             4
         };
 
-        let data = if total_bytes <= inline_limit {
+        let (data, effective_count) = if total_bytes <= inline_limit {
             // Inline values are stored in the IFD entry's value/offset field
             // using the file byte order. Keep those raw bytes; converting the
             // field through an integer first corrupts big-endian SHORT/BYTE
             // values because TIFF stores them left-justified in the field.
-            inline_value_bytes[..total_bytes as usize].to_vec()
+            (inline_value_bytes[..total_bytes as usize].to_vec(), count)
         } else {
+            // An out-of-range value array is not fatal: Java's TiffParser
+            // truncates the element count to what actually fits in the file
+            // (count = (fileLen - offset) / bytesPerElement) rather than
+            // erroring. This tolerates slightly-truncated files that Java reads.
             let file_len = self.file_len()?;
-            Self::checked_range_end(value_or_offset, total_bytes, file_len, "TIFF IFD value")?;
-            let total_bytes = usize::try_from(total_bytes).map_err(|_| {
+            let available = file_len.saturating_sub(value_or_offset);
+            let usable_bytes = (total_bytes.min(available) / type_size) * type_size;
+            let usable_count = usable_bytes / type_size;
+            let usable_bytes = usize::try_from(usable_bytes).map_err(|_| {
                 BioFormatsError::Format("TIFF IFD value byte count does not fit in memory".into())
             })?;
-            let pos_after_entry = self.reader.stream_position()?;
-            self.reader.seek(SeekFrom::Start(value_or_offset))?;
-            let mut buf = vec![0u8; total_bytes];
-            self.reader.read_exact(&mut buf)?;
-            self.reader.seek(SeekFrom::Start(pos_after_entry))?;
-            buf
+            let mut buf = vec![0u8; usable_bytes];
+            if usable_bytes > 0 && value_or_offset < file_len {
+                let pos_after_entry = self.reader.stream_position()?;
+                self.reader.seek(SeekFrom::Start(value_or_offset))?;
+                self.reader.read_exact(&mut buf)?;
+                self.reader.seek(SeekFrom::Start(pos_after_entry))?;
+            }
+            (buf, usable_count)
         };
 
-        let count = usize::try_from(count)
+        let count = usize::try_from(effective_count)
             .map_err(|_| BioFormatsError::Format("TIFF IFD value count is too large".into()))?;
         self.decode_ifd_value(type_code, count, &data)
     }
@@ -573,19 +597,47 @@ mod tests {
     }
 
     #[test]
-    fn read_ifd_rejects_out_of_file_value_range() {
+    fn read_ifd_truncates_out_of_file_value_range() {
+        // Tag 270 (ASCII) declares 16 bytes at offset 26, but only 4 bytes
+        // ("abcd") actually exist before EOF. Java's TiffParser truncates the
+        // value to what fits rather than erroring, so we must read "abcd".
+        let mut bytes = classic_le_header(8);
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // entry count
+        offset_entry(&mut bytes, 270, 2, 16, 26); // value offset 26 = end of IFD
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+        assert_eq!(bytes.len(), 26);
+        bytes.extend_from_slice(b"abcd");
+
+        let mut parser = parse(bytes);
+        let ifds = parser
+            .read_ifds()
+            .expect("over-long value should be truncated, not rejected");
+        assert_eq!(ifds.len(), 1);
+        assert!(
+            matches!(ifds[0].get(270), Some(IfdValue::Ascii(v)) if v == "abcd"),
+            "expected truncated ASCII \"abcd\", got {:?}",
+            ifds[0].get(270)
+        );
+    }
+
+    #[test]
+    fn read_ifd_tolerates_value_offset_past_eof() {
+        // A value offset entirely past EOF yields an empty value (0 usable
+        // elements) rather than an error, matching Java's best-effort parsing.
         let mut bytes = classic_le_header(8);
         bytes.extend_from_slice(&1u16.to_le_bytes());
         offset_entry(&mut bytes, 270, 2, 16, 1_000);
         bytes.extend_from_slice(&0u32.to_le_bytes());
 
         let mut parser = parse(bytes);
-        let err = parser
+        let ifds = parser
             .read_ifds()
-            .expect_err("out-of-file value should fail");
+            .expect("out-of-file value should be tolerated");
+        assert_eq!(ifds.len(), 1);
         assert!(
-            err.to_string().contains("IFD value"),
-            "unexpected error: {err}"
+            matches!(ifds[0].get(270), Some(IfdValue::Ascii(v)) if v.is_empty()),
+            "expected empty ASCII value, got {:?}",
+            ifds[0].get(270)
         );
     }
 

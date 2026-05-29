@@ -1977,9 +1977,12 @@ fn validate_tiff_storage(
             .checked_mul(tiles_down)
             .and_then(|v| v.checked_mul(planes))
             .ok_or_else(|| BioFormatsError::Format("TIFF tile count overflows usize".into()))?;
-        if tile_offsets.len() != expected {
+        // Java (IFD.getTileOffsets/getTileByteCounts) errors only when there are
+        // *too few* entries; some writers pad with extra trailing offsets, which
+        // the tile read loop simply never indexes. Tolerate the extras.
+        if tile_offsets.len() < expected {
             return Err(BioFormatsError::Format(format!(
-                "TIFF TileOffsets/TileByteCounts count {} does not match expected tile count {}",
+                "TIFF TileOffsets/TileByteCounts count {} is fewer than expected tile count {}",
                 tile_offsets.len(),
                 expected
             )));
@@ -2010,9 +2013,12 @@ fn validate_tiff_storage(
         let expected = strips_per_plane
             .checked_mul(planes)
             .ok_or_else(|| BioFormatsError::Format("TIFF strip count overflows usize".into()))?;
-        if strip_offsets.len() != expected {
+        // Java (IFD.getStripOffsets/getStripByteCounts) errors only when there are
+        // *too few* entries; extra trailing strip offsets (writer padding) are
+        // skipped by the strip read loop's row-range bounds check. Tolerate them.
+        if strip_offsets.len() < expected {
             return Err(BioFormatsError::Format(format!(
-                "TIFF StripOffsets/StripByteCounts count {} does not match expected strip count {}",
+                "TIFF StripOffsets/StripByteCounts count {} is fewer than expected strip count {}",
                 strip_offsets.len(),
                 expected
             )));

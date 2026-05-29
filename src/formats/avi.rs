@@ -87,7 +87,17 @@ fn avi_frame_layout(width: u32, height: u32, channels: usize) -> Result<(usize, 
     let row_bytes = (width as usize).checked_mul(channels).ok_or_else(|| {
         BioFormatsError::InvalidData("AVI: decoded row byte count overflows".into())
     })?;
-    let stored_row = row_bytes.checked_add(3).map(|n| n & !3).ok_or_else(|| {
+    // Java AVIReader: npad = bmpWidth % 4; if (npad > 0) npad = 4 - npad;
+    // bmpScanLineSize = (bmpWidth + npad) * (bmpBitsPerPixel / 8)
+    // i.e. the *pixel width* is padded to a multiple of 4, then multiplied by
+    // bytes-per-pixel (here `channels`, since samples are 8-bit).
+    let padded_width = {
+        let npad = (4 - (width as usize) % 4) % 4;
+        (width as usize).checked_add(npad).ok_or_else(|| {
+            BioFormatsError::InvalidData("AVI: padded row width overflows".into())
+        })?
+    };
+    let stored_row = padded_width.checked_mul(channels).ok_or_else(|| {
         BioFormatsError::InvalidData("AVI: padded row byte count overflows".into())
     })?;
     let plane_bytes = row_bytes.checked_mul(height as usize).ok_or_else(|| {
@@ -343,6 +353,35 @@ const AVI_MS_VIDEO: u32 = 1296126531; // "MSVC"
 const AVI_JPEG: u32 = 1196444237; // "MJPG"
 const AVI_Y8: u32 = 538982489; // "Y800"
 const AVI_CINEPAK: u32 = 1684633187; // "cvid"
+
+/// Fixed Huffman table for Motion-JPEG ("AVI1") streams. MJPEG omits the DHT
+/// marker; Java AVIReader splices this table into the stream at offset 20.
+/// Byte-for-byte copy of `MJPEG_HUFFMAN_TABLE` in AVIReader.java.
+const MJPEG_HUFFMAN_TABLE: [u8; 420] = [
+    0xff, 0xc4, 1, 0xa2, 0, 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 1, 0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    10, 11, 0x10, 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D, 1, 2, 3, 0, 4, 0x11, 5, 0x12,
+    0x21, 0x31, 0x41, 6, 0x13, 0x51, 0x61, 7, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 8, 0x23,
+    0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 9, 10, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A,
+    0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a,
+    0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a,
+    0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+    0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+    0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5,
+    0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1,
+    0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0x11, 0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4,
+    0, 1, 2, 0x77, 0, 1, 2, 3, 0x11, 4, 5, 0x21, 0x31, 6, 0x12, 0x41, 0x51, 7, 0x61, 0x71, 0x13,
+    0x22, 0x32, 0x81, 8, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 9, 0x23, 0x33, 0x52, 0xf0, 0x15, 0x62,
+    0x72, 0xd1, 10, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26, 0x27, 0x28,
+    0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a,
+    0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a,
+    0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
+    0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe2, 0xe3,
+    0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
+];
 
 pub struct AviReader {
     path: Option<PathBuf>,
@@ -667,20 +706,60 @@ impl FormatReader for AviReader {
         if compression == AVI_JPEG {
             let mut raw = vec![0u8; stored_size as usize];
             f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
-            // Decode JPEG / Motion-JPEG. Most embedded streams decode directly.
-            let decoded = crate::common::codec::decompress_jpeg(&raw)?;
+
+            // Motion-JPEG ("AVI1") detection: Java AVIReader.uncompress() checks
+            // bytes 6..10 == "AVI1". MJPEG omits the DHT (Huffman table) marker,
+            // so we splice the fixed MJPEG_HUFFMAN_TABLE into the stream after
+            // the first 20 bytes before decoding.
+            // Java checks length >= 10 for detection, but the splice copies the
+            // first 20 bytes, so require >= 20 to avoid slicing past the buffer.
+            let motion_jpeg = raw.len() >= 20 && &raw[6..10] == b"AVI1";
+
+            let decoded = if motion_jpeg {
+                let mut fixed = Vec::with_capacity(raw.len() + MJPEG_HUFFMAN_TABLE.len());
+                fixed.extend_from_slice(&raw[..20]);
+                fixed.extend_from_slice(&MJPEG_HUFFMAN_TABLE);
+                fixed.extend_from_slice(&raw[20..]);
+                crate::common::codec::decompress_jpeg(&fixed)?
+            } else {
+                crate::common::codec::decompress_jpeg(&raw)?
+            };
+
+            if motion_jpeg {
+                // Decoded MJPEG output is YCbCr; convert to RGB.
+                // See AVIReader.uncompress() (and Wikipedia YCbCr JPEG conversion).
+                let mut buf = decoded;
+                let mut i = 0;
+                while i + 2 < buf.len() {
+                    let y = buf[i] as f64;
+                    let cb = buf[i + 1] as f64 - 128.0;
+                    let cr = buf[i + 2] as f64 - 128.0;
+
+                    let red = (y + 1.402 * cr) as i32;
+                    let green = (y - 0.34414 * cb - 0.71414 * cr) as i32;
+                    let blue = (y + 1.772 * cb) as i32;
+
+                    buf[i] = red.clamp(0, 255) as u8;
+                    buf[i + 1] = green.clamp(0, 255) as u8;
+                    buf[i + 2] = blue.clamp(0, 255) as u8;
+                    i += 3;
+                }
+                return Ok(buf);
+            }
+
             return Ok(decoded);
         }
 
         // --- uncompressed / Y8 ---
         let bytes_per_sample = pixel_type.bytes_per_sample();
-        let src_channels = if bit_count == 16 { 3 } else { channels };
         let row_bytes = width as usize * channels * bytes_per_sample;
-        let stored_row_samples = width as usize * src_channels;
-        // Stored rows are padded to a 4-byte boundary.
-        let stored_row_bytes_unpadded =
-            stored_row_samples * (if bit_count == 16 { 2 } else { bytes_per_sample });
-        let stored_row = (stored_row_bytes_unpadded + 3) & !3;
+        // Java AVIReader: npad = bmpWidth % 4; if (npad > 0) npad = 4 - npad;
+        // bmpScanLineSize = (bmpWidth + npad) * (bmpBitsPerPixel / 8).
+        // The pixel width (not the byte count) is padded to a multiple of 4,
+        // then multiplied by bytes-per-pixel (bit_count / 8).
+        let stored_bytes_per_pixel = (bit_count as usize) / 8;
+        let padded_width = width as usize + (4 - (width as usize) % 4) % 4;
+        let stored_row = padded_width * stored_bytes_per_pixel;
         let plane_bytes = row_bytes * height as usize;
 
         let required_size = stored_row * height as usize;

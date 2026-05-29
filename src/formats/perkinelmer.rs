@@ -476,7 +476,7 @@ impl FormatReader for PerkinElmerReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (m, files, ext_count, is_tiff) = parse_pe_dataset(path)?;
+        let (m, files, mut ext_count, is_tiff) = parse_pe_dataset(path)?;
 
         // Determine pixel type and (for raw files) sizeX/sizeY from the data.
         let mut size_z = if m.size_z == 0 { 1 } else { m.size_z };
@@ -514,8 +514,15 @@ impl FormatReader for PerkinElmerReader {
             };
         }
 
-        // imageCount: one per pixel file (Java increments per file).
-        let mut image_count = files.len() as u32;
+        // imageCount: one per pixel file, plus expansion for raw files that hold
+        // multiple concatenated planes (Java PerkinElmerReader.java:435-442).
+        let mut image_count = 0u32;
+        for f in &files {
+            image_count += 1;
+            if f.first_index < 0 && ext_count > 1 && files.len() > ext_count {
+                image_count += (((files.len() - 1) / (ext_count - 1)) - 1) as u32;
+            }
+        }
 
         // sizeT derivation (Java logic).
         let zc = (size_z * size_c).max(1);
@@ -532,6 +539,13 @@ impl FormatReader for PerkinElmerReader {
             image_count = size_z * size_c * size_t;
         }
         let _ = (&mut size_z, &mut size_c);
+
+        // For raw (non-TIFF) multi-wavelength data, correct extCount so the
+        // plane->file/offset mapping in lookup_file/file_index is right
+        // (Java PerkinElmerReader.java:595-597).
+        if !is_tiff && ext_count > size_t as usize {
+            ext_count = (size_t * size_c) as usize;
+        }
 
         let meta = ImageMetadata {
             size_x,
