@@ -299,52 +299,75 @@ fn undo_tiff_horizontal_differencing(
         return Ok(());
     }
 
-    match bits_per_sample {
-        8 => {
-            let row_stride = row_width * samples_per_pixel;
-            if row_stride == 0 {
-                return Ok(());
-            }
-            for row in data.chunks_mut(row_stride) {
-                let usable = row.len() / samples_per_pixel * samples_per_pixel;
-                for i in samples_per_pixel..usable {
-                    row[i] = row[i].wrapping_add(row[i - samples_per_pixel]);
-                }
-            }
-            Ok(())
+    // Horizontal differencing (predictor 2) operates on whole-byte samples.
+    // Mirrors Java TiffCompression.undifference: each sample is treated as an
+    // integer of `bytes_per_sample` bytes (respecting endianness); the previous
+    // same-channel sample (one pixel, i.e. `samples_per_pixel` samples, to the
+    // left) is added with wrapping overflow and repacked in place.
+    let bytes_per_sample = match bits_per_sample {
+        8 => 1usize,
+        16 => 2usize,
+        32 => 4usize,
+        64 => 8usize,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TIFF horizontal predictor for {other}-bit samples not supported"
+            )));
         }
-        16 => {
-            let row_stride = row_width * samples_per_pixel * 2;
-            if row_stride == 0 {
-                return Ok(());
-            }
-            for row in data.chunks_mut(row_stride) {
-                let sample_count = row.len() / 2;
-                let usable = sample_count / samples_per_pixel * samples_per_pixel;
-                for i in samples_per_pixel..usable {
-                    let cur = i * 2;
-                    let prev = (i - samples_per_pixel) * 2;
-                    let value = if little_endian {
-                        u16::from_le_bytes([row[cur], row[cur + 1]])
-                            .wrapping_add(u16::from_le_bytes([row[prev], row[prev + 1]]))
-                    } else {
-                        u16::from_be_bytes([row[cur], row[cur + 1]])
-                            .wrapping_add(u16::from_be_bytes([row[prev], row[prev + 1]]))
-                    };
-                    let bytes = if little_endian {
-                        value.to_le_bytes()
-                    } else {
-                        value.to_be_bytes()
-                    };
-                    row[cur..cur + 2].copy_from_slice(&bytes);
-                }
-            }
-            Ok(())
+    };
+
+    // Stride, in samples, between a sample and its left neighbour of the same
+    // channel. This is the per-channel horizontal differencing stride.
+    let channel_stride = samples_per_pixel;
+    let row_stride_bytes = row_width * samples_per_pixel * bytes_per_sample;
+    if row_stride_bytes == 0 {
+        return Ok(());
+    }
+
+    for row in data.chunks_mut(row_stride_bytes) {
+        let sample_count = row.len() / bytes_per_sample;
+        // Process only whole pixels so the channel stride never reads past the row.
+        let usable = sample_count / samples_per_pixel * samples_per_pixel;
+        for i in channel_stride..usable {
+            let cur = i * bytes_per_sample;
+            let prev = (i - channel_stride) * bytes_per_sample;
+            add_sample(row, cur, prev, bytes_per_sample, little_endian);
         }
-        _ => Err(BioFormatsError::UnsupportedFormat(format!(
-            "TIFF horizontal predictor for {}-bit samples not supported",
-            bits_per_sample
-        ))),
+    }
+    Ok(())
+}
+
+/// Reads the `bytes_per_sample`-wide integers at `cur` and `prev`, adds them
+/// with wrapping overflow, and writes the result back at `cur`. Endianness
+/// matches the byte order declared by the IFD.
+fn add_sample(
+    row: &mut [u8],
+    cur: usize,
+    prev: usize,
+    bytes_per_sample: usize,
+    little_endian: bool,
+) {
+    let read = |off: usize| -> u64 {
+        let mut buf = [0u8; 8];
+        if little_endian {
+            buf[..bytes_per_sample].copy_from_slice(&row[off..off + bytes_per_sample]);
+            u64::from_le_bytes(buf)
+        } else {
+            buf[8 - bytes_per_sample..].copy_from_slice(&row[off..off + bytes_per_sample]);
+            u64::from_be_bytes(buf)
+        }
+    };
+
+    let value = read(cur).wrapping_add(read(prev));
+    let bytes = if little_endian {
+        value.to_le_bytes()
+    } else {
+        value.to_be_bytes()
+    };
+    if little_endian {
+        row[cur..cur + bytes_per_sample].copy_from_slice(&bytes[..bytes_per_sample]);
+    } else {
+        row[cur..cur + bytes_per_sample].copy_from_slice(&bytes[8 - bytes_per_sample..]);
     }
 }
 

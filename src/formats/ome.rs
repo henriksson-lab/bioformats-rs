@@ -276,7 +276,7 @@ fn channel_samples_per_pixel(pixels_xml: &str, size_c: u32) -> Result<Vec<u32>> 
     Ok(samples)
 }
 
-fn parse_bindata_blocks(pixels_xml: &str) -> (Vec<Vec<u8>>, Option<String>) {
+fn parse_bindata_blocks(pixels_xml: &str) -> Result<(Vec<Vec<u8>>, Option<String>)> {
     let mut blocks = Vec::new();
     let mut first_big_endian = None;
     for pos in tag_positions(pixels_xml, "BinData") {
@@ -284,12 +284,40 @@ fn parse_bindata_blocks(pixels_xml: &str) -> (Vec<Vec<u8>>, Option<String>) {
         if first_big_endian.is_none() {
             first_big_endian = xml_attr(tag, "BigEndian").or_else(|| xml_attr(tag, "bigendian"));
         }
+        let compression = xml_attr(tag, "Compression")
+            .or_else(|| xml_attr(tag, "compression"))
+            .unwrap_or_else(|| "none".to_string());
         let content_start = pos + tag.len();
         let content_end = end_tag_start_after(pixels_xml, pos, "BinData").unwrap_or(content_start);
         let b64_text = pixels_xml.get(content_start..content_end).unwrap_or("");
-        blocks.push(base64_decode(b64_text));
+        let raw = base64_decode(b64_text);
+        blocks.push(decompress_bindata(raw, &compression)?);
     }
-    (blocks, first_big_endian)
+    Ok((blocks, first_big_endian))
+}
+
+/// Decompress an inline `<BinData>` payload according to its `Compression`
+/// attribute, mirroring `OMEXMLReader.openBytes`.
+///
+/// - `none` (or empty/absent) → raw bytes
+/// - `zlib` → Deflate/Zlib via `codec::decompress_deflate`
+/// - `J2K` → JPEG 2000 via `codec::decompress_jpeg2000`
+/// - `JPEG` → JPEG via `codec::decompress_jpeg`
+/// - `bzip2` → bzip2 via `codec::decompress_bzip2`
+fn decompress_bindata(data: Vec<u8>, compression: &str) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        return Ok(data);
+    }
+    match compression {
+        "none" | "" => Ok(data),
+        "zlib" => crate::common::codec::decompress_deflate(&data),
+        "J2K" => crate::common::codec::decompress_jpeg2000(&data),
+        "JPEG" => crate::common::codec::decompress_jpeg(&data),
+        "bzip2" => crate::common::codec::decompress_bzip2(&data),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "OME-XML BinData unknown compression: {other}"
+        ))),
+    }
 }
 
 // ─── External TiffData resolution (ported from OMETiffReader.java) ───────────
@@ -687,7 +715,7 @@ fn parse_ome_xml_series_with_base(
             .and_then(|v| v.checked_mul(size_t))
             .ok_or_else(|| BioFormatsError::Format("OME-XML plane count overflow".into()))?;
 
-        let (planes, first_bindata_big_endian) = parse_bindata_blocks(pixels_xml);
+        let (planes, first_bindata_big_endian) = parse_bindata_blocks(pixels_xml)?;
         if !planes.is_empty() {
             let samples_per_plane = if is_rgb { exposed_c as usize } else { 1 };
             let plane_bytes = (size_x as usize)

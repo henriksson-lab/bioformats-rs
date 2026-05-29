@@ -387,11 +387,30 @@ impl PyramidOmeTiffWriter {
                 let ifd_offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
                 level_offsets.push(ifd_offset);
 
+                // Build out-of-line (extra) data for this sub-IFD.
+                // When spp > 1, BitsPerSample (258) must be an spp-element SHORT
+                // array written out-of-line, mirroring the main IFD.
+                let mut extra: Vec<u8> = Vec::new();
+                if spp > 1 {
+                    for _ in 0..spp {
+                        extra.extend_from_slice(&bps.to_le_bytes());
+                    }
+                }
+
                 // Write a minimal IFD for this sub-resolution plane
                 let mut entries: Vec<Entry> = vec![
                     long_entry(256, sub_width),
                     long_entry(257, sub_height),
-                    short_entry(258, bps),
+                    if spp == 1 {
+                        short_entry(258, bps)
+                    } else {
+                        Entry {
+                            tag: 258,
+                            typ: short_type().0,
+                            count: spp as u32,
+                            value_or_offset: 0, // patched below
+                        }
+                    },
                     short_entry(259, comp_tag),
                     short_entry(262, photometric),
                     Entry {
@@ -418,20 +437,45 @@ impl PyramidOmeTiffWriter {
                 entries.sort_by_key(|e| e.tag);
 
                 let entry_count = entries.len() as u16;
-                w.write_all(&entry_count.to_le_bytes())
-                    .map_err(BioFormatsError::Io)?;
+                let ifd_data_len = 2 + entries.len() * 12 + 4; // count + entries + next-IFD
+
+                // Serialize the IFD into a buffer so out-of-line offsets can be patched.
+                let mut ifd_bytes: Vec<u8> = Vec::new();
+                ifd_bytes.extend_from_slice(&entry_count.to_le_bytes());
                 for e in &entries {
-                    w.write_all(&e.tag.to_le_bytes())
-                        .map_err(BioFormatsError::Io)?;
-                    w.write_all(&e.typ.to_le_bytes())
-                        .map_err(BioFormatsError::Io)?;
-                    w.write_all(&e.count.to_le_bytes())
-                        .map_err(BioFormatsError::Io)?;
-                    w.write_all(&e.value_or_offset.to_le_bytes())
-                        .map_err(BioFormatsError::Io)?;
+                    ifd_bytes.extend_from_slice(&e.tag.to_le_bytes());
+                    ifd_bytes.extend_from_slice(&e.typ.to_le_bytes());
+                    ifd_bytes.extend_from_slice(&e.count.to_le_bytes());
+                    ifd_bytes.extend_from_slice(&e.value_or_offset.to_le_bytes());
                 }
                 // Next IFD = 0 (sub-IFDs are not chained)
-                write_le_u32(&mut w, 0).map_err(BioFormatsError::Io)?;
+                ifd_bytes.extend_from_slice(&0u32.to_le_bytes());
+
+                // Extra (out-of-line) data is written immediately after the IFD.
+                let extra_file_off = ifd_offset + ifd_data_len as u64;
+
+                // Patch the BitsPerSample (258) entry to point at the out-of-line array.
+                let ec = u16::from_le_bytes([ifd_bytes[0], ifd_bytes[1]]) as usize;
+                for i in 0..ec {
+                    let off = 2 + i * 12;
+                    let tag = u16::from_le_bytes([ifd_bytes[off], ifd_bytes[off + 1]]);
+                    if tag == 258 {
+                        let count = u32::from_le_bytes([
+                            ifd_bytes[off + 4],
+                            ifd_bytes[off + 5],
+                            ifd_bytes[off + 6],
+                            ifd_bytes[off + 7],
+                        ]);
+                        if count > 1 {
+                            let abs_off = classic_tiff_u32(extra_file_off, "sub-IFD BPS offset")?;
+                            ifd_bytes[off + 8..off + 12]
+                                .copy_from_slice(&abs_off.to_le_bytes());
+                        }
+                    }
+                }
+
+                w.write_all(&ifd_bytes).map_err(BioFormatsError::Io)?;
+                w.write_all(&extra).map_err(BioFormatsError::Io)?;
             }
             sub_ifd_file_offsets.push(level_offsets);
         }

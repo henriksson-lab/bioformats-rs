@@ -19,6 +19,27 @@ pub fn decompress_deflate(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Decompress a bzip2 stream.
+///
+/// The input is a complete, standard bzip2 stream including the leading "BZh"
+/// magic. Note: Java's `OMEXMLReader` strips the first two bytes before feeding
+/// the data to Apache Ant's `CBZip2InputStream` (a quirk of that constructor);
+/// a standard decoder like this one must NOT strip them.
+///
+/// Uses the `bzip2` crate with its default pure-Rust `libbz2-rs-sys` backend,
+/// which correctly decodes multi-block streams (real pixel planes span many
+/// blocks). The pure-Rust `bzip2-rs` crate was tried first but only ever
+/// decodes the first block, failing with "huffman bitstream truncated" on
+/// anything larger than one block (~900 KB).
+pub fn decompress_bzip2(data: &[u8]) -> Result<Vec<u8>> {
+    use bzip2::read::BzDecoder;
+    use std::io::Read;
+    let mut decoder = BzDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).map_err(BioFormatsError::Io)?;
+    Ok(out)
+}
+
 /// Decompress raw Deflate (no zlib header).
 pub fn decompress_deflate_raw(data: &[u8]) -> Result<Vec<u8>> {
     use flate2::read::DeflateDecoder;
@@ -2290,6 +2311,23 @@ mod tests {
             out.push(byte << (8 - used));
         }
         out
+    }
+
+    #[test]
+    fn bzip2_decompresses_standard_stream() {
+        // `printf 'hello bzip2 world, hello bzip2 world!' | bzip2 -c`
+        // A complete standard stream starting with the "BZh" magic.
+        let data: &[u8] = &[
+            0x42, 0x5a, 0x68, 0x39, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0x73, 0x4d, 0xd1, 0x53,
+            0x00, 0x00, 0x08, 0x19, 0x80, 0x60, 0x04, 0x10, 0x00, 0x16, 0x64, 0xd0, 0x90, 0x20,
+            0x00, 0x20, 0xaa, 0xa6, 0x8d, 0x3d, 0x35, 0x32, 0x6d, 0x0a, 0x60, 0x00, 0x32, 0xf2,
+            0xe8, 0x69, 0xeb, 0x4c, 0xbb, 0x9a, 0x6d, 0xfa, 0x0a, 0x53, 0x69, 0x53, 0x82, 0xee,
+            0x48, 0xa7, 0x0a, 0x12, 0x0e, 0x69, 0xba, 0x2a, 0x60,
+        ];
+
+        let out = decompress_bzip2(data).expect("bzip2 decode");
+
+        assert_eq!(out, b"hello bzip2 world, hello bzip2 world!");
     }
 
     #[test]

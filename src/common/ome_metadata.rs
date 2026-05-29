@@ -941,9 +941,9 @@ impl OmeMetadata {
 
             let channels = pixels_xml.map(parse_channels).unwrap_or_default();
             let planes = pixels_xml.map(parse_planes).unwrap_or_default();
-            let modulo_z = pixels_xml.and_then(|px| parse_modulo(px, "Z"));
-            let modulo_c = pixels_xml.and_then(|px| parse_modulo(px, "C"));
-            let modulo_t = pixels_xml.and_then(|px| parse_modulo(px, "T"));
+            let modulo_z = parse_modulo(xml, img_xml, "Z");
+            let modulo_c = parse_modulo(xml, img_xml, "C");
+            let modulo_t = parse_modulo(xml, img_xml, "T");
 
             images.push(OmeImage {
                 name,
@@ -1078,12 +1078,30 @@ fn parse_channels(pixels_xml: &str) -> Vec<OmeChannel> {
         .collect()
 }
 
-fn parse_modulo(pixels_xml: &str, dim: &str) -> Option<crate::metadata::ModuloAnnotation> {
+/// Parse a single `<ModuloAlong{dim}>` element, given the slice of XML that
+/// directly contains it. Reads the Type/Start/Step/End/Unit attributes and any
+/// nested `<Label>` children, mirroring `OMEXMLServiceImpl.getModuloAlong`.
+///
+/// Note: the upstream `TypeDescription` attribute is parsed by Java but the
+/// crate's `ModuloAnnotation` struct has no matching field, so it is ignored.
+fn parse_modulo_element(scope_xml: &str, dim: &str) -> Option<crate::metadata::ModuloAnnotation> {
     let tag_name = format!("ModuloAlong{}", dim);
-    let pos = all_tag_positions(pixels_xml, &tag_name)
-        .into_iter()
-        .next()?;
-    let t = start_tag_at(pixels_xml, pos);
+    let pos = all_tag_positions(scope_xml, &tag_name).into_iter().next()?;
+    let t = start_tag_at(scope_xml, pos);
+
+    // Collect explicit <Label> children within this ModuloAlong* element.
+    let elem_start = pos + t.len();
+    let elem_end = find_end_tag(scope_xml, &tag_name, elem_start).unwrap_or(elem_start);
+    let elem_body = scope_xml.get(elem_start..elem_end).unwrap_or("");
+    let mut labels = Vec::new();
+    for lpos in all_tag_positions(elem_body, "Label") {
+        let ltag = start_tag_at(elem_body, lpos);
+        let lstart = lpos + ltag.len();
+        if let Some(lend) = find_end_tag(elem_body, "Label", lstart) {
+            labels.push(xml_unescape(elem_body[lstart..lend].trim()));
+        }
+    }
+
     Some(crate::metadata::ModuloAnnotation {
         parent_dimension: dim.to_string(),
         modulo_type: xml_attr(t, "Type").unwrap_or_default(),
@@ -1097,8 +1115,66 @@ fn parse_modulo(pixels_xml: &str, dim: &str) -> Option<crate::metadata::ModuloAn
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0),
         unit: xml_attr(t, "Unit").unwrap_or_default(),
-        labels: Vec::new(),
+        labels,
     })
+}
+
+/// Locate a `ModuloAlong{dim}` annotation for one OME `<Image>`.
+///
+/// In OME-XML the `ModuloAlongZ/C/T` blocks live in
+/// `<StructuredAnnotations><XMLAnnotation><Value><Modulo>…</Modulo></Value>`
+/// and are linked to the image via `<AnnotationRef ID="…"/>`, mirroring
+/// `OMEXMLServiceImpl.getModuloAlong`. This resolves those references against
+/// the full document. For backward compatibility (and inline/non-standard
+/// placements), it also falls back to searching the image's own XML.
+///
+/// `full_xml` is the complete OME-XML document; `image_xml` is the slice
+/// covering a single `<Image>…</Image>` element. `dim` is `"Z"`, `"C"`, or
+/// `"T"`.
+pub fn parse_modulo(
+    full_xml: &str,
+    image_xml: &str,
+    dim: &str,
+) -> Option<crate::metadata::ModuloAnnotation> {
+    // 1) Resolve via StructuredAnnotations linked by AnnotationRef.
+    let annotation_ids: Vec<String> = all_tag_positions(image_xml, "AnnotationRef")
+        .into_iter()
+        .filter_map(|p| xml_attr(start_tag_at(image_xml, p), "ID"))
+        .collect();
+
+    if !annotation_ids.is_empty() {
+        if let Some(sa_pos) = all_tag_positions(full_xml, "StructuredAnnotations")
+            .into_iter()
+            .next()
+        {
+            let sa_start = sa_pos + start_tag_at(full_xml, sa_pos).len();
+            let sa_end = find_end_tag(full_xml, "StructuredAnnotations", sa_start)
+                .unwrap_or(full_xml.len());
+            let sa_xml = &full_xml[sa_pos..sa_end.max(sa_pos)];
+
+            for ann_pos in all_tag_positions(sa_xml, "XMLAnnotation") {
+                let ann_tag = start_tag_at(sa_xml, ann_pos);
+                let ann_id = xml_attr(ann_tag, "ID");
+                if ann_id
+                    .as_deref()
+                    .map(|id| annotation_ids.iter().any(|r| r == id))
+                    != Some(true)
+                {
+                    continue;
+                }
+                let ann_body_start = ann_pos + ann_tag.len();
+                let ann_body_end =
+                    find_end_tag(sa_xml, "XMLAnnotation", ann_body_start).unwrap_or(sa_xml.len());
+                let ann_xml = &sa_xml[ann_pos..ann_body_end.max(ann_pos)];
+                if let Some(m) = parse_modulo_element(ann_xml, dim) {
+                    return Some(m);
+                }
+            }
+        }
+    }
+
+    // 2) Fallback: search the image's own XML (covers inline/legacy placement).
+    parse_modulo_element(image_xml, dim)
 }
 
 fn parse_planes(pixels_xml: &str) -> Vec<OmePlane> {

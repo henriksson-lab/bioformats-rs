@@ -43,6 +43,7 @@ bincode       = "1"
 jpegxr        = { version = "0.3", optional = true }
 openslide-pure-rs = { version = "0.1", path = "/home/mahogny/github/claude/openslide-rs", optional = true }
 mdbtools      = { package = "mdbtools-rs", version = "0.1", git = "https://github.com/henriksson-lab/mdbtools-rs" }
+bzip2 = "0.6"
 
 [features]
 jpegxr = ["dep:jpegxr"]
