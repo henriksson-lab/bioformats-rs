@@ -177,6 +177,13 @@ impl TiffReader {
         self.file.as_ref().and_then(|f| f.ifds.get(index))
     }
 
+    /// Mutable access to a parsed IFD. Used by vendor wrappers (e.g. NDPI) that
+    /// must rewrite strip/tile offset arrays after parsing — for instance to
+    /// apply NDPI's >4 GB high-word offset corrections before pixel reads.
+    pub fn ifd_mut(&mut self, index: usize) -> Option<&mut Ifd> {
+        self.file.as_mut().and_then(|f| f.ifds.get_mut(index))
+    }
+
     /// Get the embedded OME-XML string, if any.
     pub fn ome_xml_str(&self) -> Option<&str> {
         self.ome_xml.as_deref()

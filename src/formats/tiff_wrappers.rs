@@ -519,26 +519,28 @@ impl NdpiReader {
         }
     }
 
-    /// BUG 2 — analyze the >4 GB offset-reconstruction situation.
+    /// BUG 2 — reconstruct >4 GB offsets for NDPI.
     ///
     /// NDPI files larger than 4 GB keep using classic (32-bit) TIFF offsets that
     /// wrap; Java reconstructs the true 64-bit offsets from the per-IFD high-word
     /// trailer and from the `OFFSET_HIGH_BYTES` (65324) / `BYTE_COUNT_HIGH_BYTES`
-    /// (65325) arrays (`NDPIReader.java:439-521`), with a decreasing-offset
-    /// fallback for JPEG restart markers (`getMarkers:891-922`).
+    /// (65325) arrays (`NDPIReader.java:439-521`).
     ///
-    /// LIMITATION: applying those high words requires rewriting the strip/tile
-    /// `STRIP_OFFSETS`/`TILE_OFFSETS`/byte-count arrays *inside the core TIFF
-    /// IFDs* that `crate::tiff::TiffReader` reads pixels from. From this wrapper
-    /// we only have read-only `TiffReader::ifd()` access — there is no public
-    /// mutable IFD accessor and no public strip-offset setter — so the corrected
-    /// offsets cannot be injected into the pixel-read path without modifying the
-    /// core TIFF parser (`src/tiff/reader.rs` / `ifd.rs`). We therefore detect
-    /// the condition and record, per pyramid series, whether high-word
-    /// correction is *needed* and whether the high-word tags are *present*, so a
-    /// future core change (or caller) can act on it; we also flag the residual
-    /// limitation in `ndpi.offset64.limitation`. Pixel reads of data physically
-    /// located beyond 4 GB will be incorrect until the core supports this.
+    /// We implement the multi-strip/tile path (Java's `stripOffsets.length > 1`
+    /// branch): for each IFD that carries the high-word tags, add `high << 32` to
+    /// every strip/tile offset and byte count and rewrite the arrays in place as
+    /// 64-bit `Long8` values via `TiffReader::ifd_mut`, so the core pixel-read
+    /// path (which reads these arrays as u64 and seeks with a u64 offset) lands
+    /// on the correct >4 GB position. The high-word arrays and the base offset
+    /// arrays themselves are written near the start of the file (<4 GB), so the
+    /// already-parsed values are intact and only need the high words added.
+    ///
+    /// RESIDUAL LIMITATION: the single-strip case (Java's Mechanism A, where the
+    /// 4 high bytes for each IFD *entry* are appended after the IFD body) is not
+    /// handled — it would require re-reading the raw IFD bytes, and the IFD file
+    /// offsets are not exposed here. NDPI is JPEG-tiled (multi-tile) in practice,
+    /// so this affects only the rare single-strip >4 GB layout, flagged in
+    /// `ndpi.offset64.limitation` when it occurs.
     fn analyze_large_file_offsets(&mut self, file_len: u64) {
         use crate::common::metadata::MetadataValue;
         self.use_64bit = file_len >= (1u64 << 32);
@@ -546,26 +548,23 @@ impl NdpiReader {
             return;
         }
 
-        // Determine whether any IFD carries the high-word correction tags. If
-        // present, the data genuinely lives past 4 GB and we cannot honor it.
         let ifd_count = self.inner.ifd_count();
         let mut any_high_words = false;
-        let mut multi_strip_high = false;
+        let mut corrected_ifds = 0usize;
+        let mut single_strip_unhandled = false;
+
         for i in 0..ifd_count {
-            if let Some(ifd) = self.inner.ifd(i) {
-                if ifd.get(NDPI_OFFSET_HIGH_BYTES).is_some()
-                    || ifd.get(NDPI_BYTE_COUNT_HIGH_BYTES).is_some()
-                {
-                    any_high_words = true;
-                    // >1 strip/tile means the per-strip high-byte arrays matter.
-                    let strips = ifd
-                        .get(crate::tiff::ifd::tag::STRIP_OFFSETS)
-                        .or_else(|| ifd.get(crate::tiff::ifd::tag::TILE_OFFSETS))
-                        .map(|v| v.as_vec_u64().len())
-                        .unwrap_or(0);
-                    if strips > 1 {
-                        multi_strip_high = true;
+            if let Some(ifd) = self.inner.ifd_mut(i) {
+                match apply_ndpi_multistrip_offset_correction(ifd) {
+                    NdpiOffsetFix::Corrected => {
+                        any_high_words = true;
+                        corrected_ifds += 1;
                     }
+                    NdpiOffsetFix::SingleStripUnhandled => {
+                        any_high_words = true;
+                        single_strip_unhandled = true;
+                    }
+                    NdpiOffsetFix::NoHighWords => {}
                 }
             }
         }
@@ -578,22 +577,97 @@ impl NdpiReader {
                 MetadataValue::Bool(any_high_words),
             );
             m.insert(
-                "ndpi.offset64.multi_strip".into(),
-                MetadataValue::Bool(multi_strip_high),
+                "ndpi.offset64.corrected_ifds".into(),
+                MetadataValue::Int(corrected_ifds as i64),
             );
-            m.insert(
-                "ndpi.offset64.limitation".into(),
-                MetadataValue::String(
-                    "File >4GB: 32-bit TIFF offsets require high-word reconstruction \
-                     (tags 65324/65325 + per-IFD high words). The wrapper has only \
-                     read-only IFD access, so corrected offsets cannot be injected \
-                     into the core pixel-read path; pixels stored past 4GB will read \
-                     incorrectly until src/tiff supports NDPI 64-bit offsets."
-                        .into(),
-                ),
-            );
+            if single_strip_unhandled {
+                m.insert(
+                    "ndpi.offset64.limitation".into(),
+                    MetadataValue::String(
+                        "A single-strip IFD in a >4GB file uses NDPI's per-entry \
+                         high-word trailer (Mechanism A), which is not reconstructed; \
+                         such planes may read incorrectly. Multi-tile planes are \
+                         corrected."
+                            .into(),
+                    ),
+                );
+            }
         }
     }
+}
+
+/// Outcome of applying NDPI >4 GB offset correction to one IFD.
+enum NdpiOffsetFix {
+    /// No high-word tags present in this IFD — nothing to do.
+    NoHighWords,
+    /// Single-strip layout (Java Mechanism A) — not reconstructed here.
+    SingleStripUnhandled,
+    /// Multi-strip/tile offsets/byte-counts were rewritten with high words.
+    Corrected,
+}
+
+/// Apply NDPI's multi-strip/tile >4 GB offset reconstruction to one IFD in
+/// place (Java `NDPIReader.java:439-521`, the `stripOffsets.length > 1` branch).
+///
+/// `OFFSET_HIGH_BYTES` (65324) / `BYTE_COUNT_HIGH_BYTES` (65325) hold the high
+/// 32 bits for each strip/tile; the true offset is `low + (high << 32)`. The
+/// corrected arrays are written back as 64-bit `Long8` so the core reader, which
+/// reads them as u64 and seeks with a u64 offset, lands past 4 GB.
+fn apply_ndpi_multistrip_offset_correction(ifd: &mut crate::tiff::ifd::Ifd) -> NdpiOffsetFix {
+    use crate::tiff::ifd::{tag, IfdValue};
+
+    let offset_high = ifd.get(NDPI_OFFSET_HIGH_BYTES).map(|v| v.as_vec_u64());
+    let count_high = ifd.get(NDPI_BYTE_COUNT_HIGH_BYTES).map(|v| v.as_vec_u64());
+    if offset_high.is_none() && count_high.is_none() {
+        return NdpiOffsetFix::NoHighWords;
+    }
+
+    let (off_tag, offs) = ifd
+        .get(tag::STRIP_OFFSETS)
+        .map(|v| (tag::STRIP_OFFSETS, v.as_vec_u64()))
+        .or_else(|| {
+            ifd.get(tag::TILE_OFFSETS)
+                .map(|v| (tag::TILE_OFFSETS, v.as_vec_u64()))
+        })
+        .unwrap_or((0, Vec::new()));
+    let (cnt_tag, counts) = ifd
+        .get(tag::STRIP_BYTE_COUNTS)
+        .map(|v| (tag::STRIP_BYTE_COUNTS, v.as_vec_u64()))
+        .or_else(|| {
+            ifd.get(tag::TILE_BYTE_COUNTS)
+                .map(|v| (tag::TILE_BYTE_COUNTS, v.as_vec_u64()))
+        })
+        .unwrap_or((0, Vec::new()));
+
+    // Java applies the per-strip high-byte arrays only with >1 strip/tile.
+    if offs.len() <= 1 {
+        return NdpiOffsetFix::SingleStripUnhandled;
+    }
+
+    let mut new_offs = offs;
+    if let Some(hi) = &offset_high {
+        if hi.len() == new_offs.len() {
+            for (o, h) in new_offs.iter_mut().zip(hi) {
+                *o = o.wrapping_add(h << 32);
+            }
+        }
+    }
+    let mut new_counts = counts;
+    if let Some(hi) = &count_high {
+        if hi.len() == new_counts.len() {
+            for (c, h) in new_counts.iter_mut().zip(hi) {
+                *c = c.wrapping_add(h << 32);
+            }
+        }
+    }
+
+    if off_tag != 0 {
+        ifd.entries.insert(off_tag, IfdValue::Long8(new_offs));
+    }
+    if cnt_tag != 0 && !new_counts.is_empty() {
+        ifd.entries.insert(cnt_tag, IfdValue::Long8(new_counts));
+    }
+    NdpiOffsetFix::Corrected
 }
 
 impl Default for NdpiReader {
@@ -2742,5 +2816,71 @@ impl FormatReader for MolecularDevicesTiffReader {
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()
+    }
+}
+
+#[cfg(test)]
+mod ndpi_offset64_tests {
+    use super::*;
+    use crate::tiff::ifd::{tag, Ifd, IfdValue};
+    use std::collections::HashMap;
+
+    #[test]
+    fn ndpi_multistrip_offset_correction_applies_high_words() {
+        // Two tiles; tile 1's offset/bytecount live past 4 GB via high words.
+        let mut entries = HashMap::new();
+        entries.insert(tag::TILE_OFFSETS, IfdValue::Long(vec![100, 200]));
+        entries.insert(tag::TILE_BYTE_COUNTS, IfdValue::Long(vec![50, 60]));
+        entries.insert(NDPI_OFFSET_HIGH_BYTES, IfdValue::Long(vec![0, 1]));
+        entries.insert(NDPI_BYTE_COUNT_HIGH_BYTES, IfdValue::Long(vec![0, 2]));
+        let mut ifd = Ifd { entries };
+
+        assert!(matches!(
+            apply_ndpi_multistrip_offset_correction(&mut ifd),
+            NdpiOffsetFix::Corrected
+        ));
+        // Stored back as 64-bit Long8 with high words added.
+        assert!(matches!(
+            ifd.get(tag::TILE_OFFSETS),
+            Some(IfdValue::Long8(_))
+        ));
+        assert_eq!(
+            ifd.get(tag::TILE_OFFSETS).unwrap().as_vec_u64(),
+            vec![100, 200 + (1u64 << 32)]
+        );
+        assert_eq!(
+            ifd.get(tag::TILE_BYTE_COUNTS).unwrap().as_vec_u64(),
+            vec![50, 60 + (2u64 << 32)]
+        );
+    }
+
+    #[test]
+    fn ndpi_offset_correction_is_noop_without_high_word_tags() {
+        let mut entries = HashMap::new();
+        entries.insert(tag::TILE_OFFSETS, IfdValue::Long(vec![100, 200]));
+        let mut ifd = Ifd { entries };
+        assert!(matches!(
+            apply_ndpi_multistrip_offset_correction(&mut ifd),
+            NdpiOffsetFix::NoHighWords
+        ));
+        assert_eq!(
+            ifd.get(tag::TILE_OFFSETS).unwrap().as_vec_u64(),
+            vec![100, 200]
+        );
+    }
+
+    #[test]
+    fn ndpi_single_strip_high_word_is_flagged_unhandled() {
+        // Single strip uses Java's Mechanism A (per-entry trailer), not handled.
+        let mut entries = HashMap::new();
+        entries.insert(tag::STRIP_OFFSETS, IfdValue::Long(vec![100]));
+        entries.insert(NDPI_OFFSET_HIGH_BYTES, IfdValue::Long(vec![1]));
+        let mut ifd = Ifd { entries };
+        assert!(matches!(
+            apply_ndpi_multistrip_offset_correction(&mut ifd),
+            NdpiOffsetFix::SingleStripUnhandled
+        ));
+        // Offset left untouched (low 32 bits only).
+        assert_eq!(ifd.get(tag::STRIP_OFFSETS).unwrap().as_vec_u64(), vec![100]);
     }
 }
