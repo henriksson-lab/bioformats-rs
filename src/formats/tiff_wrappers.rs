@@ -198,81 +198,400 @@ fn xml_element_text(xml: &str, tag: &XmlTag) -> Option<String> {
 // ---------------------------------------------------------------------------
 /// Hamamatsu NDPI whole-slide image (TIFF-based, `.ndpi`).
 ///
-/// Enriches metadata with NDPI-specific vendor tags:
-/// - Tag 65421: magnification (float)
-/// - Tag 65422: x-offset (float)
-/// - Tag 65423: y-offset (float)
-/// - Tag 65441: z-offset (float)
-/// - Tag 65442: source lens (ASCII)
-/// - Tag 65449: NDPI JPEG quality (long)
+/// Ported from the Java `NDPIReader` (`initStandardMetadata`,
+/// `NDPIReader.java:419-607`). NDPI stores its image set as a flat chain of TIFF
+/// IFDs that must be regrouped into a logical structure:
+///
+/// - **sizeZ** is detected by counting trailing IFDs whose width/height match
+///   IFD 0 (a focal Z-stack of the full-resolution image).
+/// - **pyramid levels** are the differently sized IFDs that are *not* the macro
+///   (`SOURCE_LENS == -1`) or map/mask (`SOURCE_LENS == -2`) overview images.
+///   When `SOURCE_LENS` (tag 65421) is absent, every differing IFD except the
+///   last is assumed to be a pyramid level.
+/// - The full-resolution image plus its pyramid levels become **one
+///   multi-resolution series** (`resolution_count == pyramidHeight`); the
+///   trailing macro / map images become standalone trailing series.
+/// - Plane → IFD mapping follows Java `getIFDIndex`: for the pyramid series at
+///   resolution `s`, plane `z` lives at IFD `z * pyramidHeight + s`; extra
+///   (macro/map) series live after `sizeZ * pyramidHeight`.
+///
+/// Vendor tags are also surfaced into the first series' metadata
+/// (magnification, stage offsets, source lens, serial number, capture mode).
 pub struct NdpiReader {
     inner: crate::tiff::TiffReader,
+    /// Detected number of focal planes (Z) for the pyramid series.
+    size_z: u32,
+    /// Number of resolution levels in the pyramid series (>= 1).
+    pyramid_height: u32,
+    /// True when the file is larger than 4 GB and therefore uses 32-bit TIFF
+    /// offsets that wrap; see [`NdpiReader::analyze_large_file_offsets`].
+    use_64bit: bool,
 }
+
+// NDPI custom TIFF tags (mirrors the constants in NDPIReader.java:66-99).
+const NDPI_OFFSET_HIGH_BYTES: u16 = 65324;
+const NDPI_BYTE_COUNT_HIGH_BYTES: u16 = 65325;
+const NDPI_SOURCE_LENS: u16 = 65421;
+const NDPI_X_POSITION: u16 = 65422;
+const NDPI_Y_POSITION: u16 = 65423;
+const NDPI_Z_POSITION: u16 = 65424;
+const NDPI_CAPTURE_MODE: u16 = 65441;
+const NDPI_SERIAL_NUMBER: u16 = 65442;
+const NDPI_METADATA_TAG: u16 = 65449;
 
 impl NdpiReader {
     pub fn new() -> Self {
         NdpiReader {
             inner: crate::tiff::TiffReader::new(),
+            size_z: 1,
+            pyramid_height: 1,
+            use_64bit: false,
         }
     }
 
-    fn enrich_metadata(&mut self) {
-        // Read vendor tags from the first IFD
-        let vendor = {
-            let ifd = match self.inner.ifd(0) {
-                Some(ifd) => ifd,
-                None => return,
+    /// Detected number of focal (Z) planes in the pyramid series.
+    pub fn size_z(&self) -> u32 {
+        self.size_z
+    }
+
+    /// Number of resolution levels in the pyramid series (Java `pyramidHeight`).
+    pub fn pyramid_height(&self) -> u32 {
+        self.pyramid_height
+    }
+
+    /// True when the file is >4 GB and uses wrapping 32-bit TIFF offsets.
+    pub fn uses_64bit_offsets(&self) -> bool {
+        self.use_64bit
+    }
+
+    /// Read `SOURCE_LENS` (tag 65421) from an IFD as a float, if present.
+    /// Java stores this as a FLOAT; the special values -1 (macro) and -2
+    /// (map/mask) flag the overview images that must not become pyramid levels.
+    fn source_lens(&self, ifd_index: usize) -> Option<f32> {
+        let ifd = self.inner.ifd(ifd_index)?;
+        // Usually FLOAT, but tolerate other numeric encodings.
+        if let Some(v) = ifd.get(NDPI_SOURCE_LENS) {
+            if let Some(vals) = v.as_vec_f32() {
+                return vals.first().copied();
+            }
+            return v.as_f64().map(|f| f as f32);
+        }
+        None
+    }
+
+    /// Width/height of an IFD (0 if missing).
+    fn ifd_dims(&self, ifd_index: usize) -> (u32, u32) {
+        match self.inner.ifd(ifd_index) {
+            Some(ifd) => (
+                ifd.image_width().unwrap_or(0),
+                ifd.image_length().unwrap_or(0),
+            ),
+            None => (0, 0),
+        }
+    }
+
+    /// Detect `sizeZ` and `pyramidHeight` and regroup the flat IFD chain into a
+    /// pyramid series + trailing macro/map series. Mirrors
+    /// `NDPIReader.initStandardMetadata` (`NDPIReader.java:524-607`).
+    fn build_ndpi_series(&mut self) {
+        let ifd_count = self.inner.ifd_count();
+        if ifd_count == 0 {
+            return;
+        }
+        let little_endian = self.inner.is_little_endian();
+
+        let (w0, h0) = self.ifd_dims(0);
+
+        // --- detect sizeZ and pyramidHeight (Java 524-548) ---
+        let mut size_z: u32 = 1;
+        let mut pyramid_height: u32 = 1;
+        for i in 1..ifd_count {
+            let (w, h) = self.ifd_dims(i);
+            if w == w0 && h == h0 {
+                size_z += 1;
+            } else if size_z == 1 {
+                // Differing dimensions: pyramid level vs. macro/map overview.
+                let is_pyramid = match self.source_lens(i) {
+                    Some(lens) => lens != -1.0 && lens != -2.0,
+                    // No SOURCE_LENS: assume the last IFD is the macro image.
+                    None => i < ifd_count - 1,
+                };
+                if is_pyramid {
+                    pyramid_height += 1;
+                }
+            }
+        }
+        self.size_z = size_z;
+        self.pyramid_height = pyramid_height;
+
+        // seriesCount = pyramidHeight + (ifds - pyramidHeight*sizeZ)  (Java 552)
+        // The first `pyramidHeight` "series" collapse into one multi-resolution
+        // series; the remainder are trailing extras (macro/map).
+        let pyramid_planes = (pyramid_height as usize) * (size_z as usize);
+        let extra_count = ifd_count.saturating_sub(pyramid_planes);
+
+        // Java getIFDIndex: pyramid resolution `s`, plane `z` -> z*pyramidHeight+s
+        let pyramid_ifd = |s: usize, z: usize| z * (pyramid_height as usize) + s;
+        // Java getIFDIndex: extra series `e` (0-based among extras) -> base + e
+        let extra_ifd = |e: usize| pyramid_planes + e;
+
+        // Need a template TiffSeries to obtain instances (struct not re-exported).
+        let template = match self.inner.series_list().first() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+
+        let mut new_series = Vec::new();
+
+        // --- pyramid series (level 0 = full res, 1.. = sub-resolutions) ---
+        {
+            let base_ifd = pyramid_ifd(0, 0);
+            let mut meta = self.ndpi_plane_meta(base_ifd, little_endian, size_z);
+
+            // Sub-resolution levels: each level is a single plane per z.
+            let mut sub_resolutions: Vec<Vec<usize>> = Vec::new();
+            for s in 1..(pyramid_height as usize) {
+                let mut level: Vec<usize> = Vec::new();
+                for z in 0..(size_z as usize) {
+                    let idx = pyramid_ifd(s, z);
+                    if idx < ifd_count {
+                        level.push(idx);
+                    }
+                }
+                if !level.is_empty() {
+                    sub_resolutions.push(level);
+                }
+            }
+            meta.resolution_count = 1 + sub_resolutions.len() as u32;
+
+            // Full-resolution plane list: one IFD per z.
+            let mut main_ifds: Vec<usize> = Vec::new();
+            for z in 0..(size_z as usize) {
+                let idx = pyramid_ifd(0, z);
+                if idx < ifd_count {
+                    main_ifds.push(idx);
+                }
+            }
+            if main_ifds.is_empty() {
+                main_ifds.push(base_ifd.min(ifd_count - 1));
+            }
+
+            self.attach_vendor_metadata(0, &mut meta);
+
+            let mut s = template.clone();
+            s.ifd_indices = main_ifds;
+            s.plane_ifd_indices = Vec::new();
+            s.metadata = meta;
+            s.sub_resolutions = sub_resolutions;
+            new_series.push(s);
+        }
+
+        // --- trailing extra series (macro / map / mask), one IFD each ---
+        for e in 0..extra_count {
+            let idx = extra_ifd(e);
+            if idx >= ifd_count {
+                break;
+            }
+            let mut meta = self.ndpi_plane_meta(idx, little_endian, 1);
+            meta.resolution_count = 1;
+            // Java initMetadataStore names: series 1 = macro, 2 = macro mask.
+            let name = match e {
+                0 => "macro image",
+                1 => "macro mask image",
+                _ => "",
             };
-            let mut meta = std::collections::HashMap::new();
-            // Tag 65421 = magnification (stored as FLOAT)
-            if let Some(v) = ifd.get(65421) {
-                if let Some(vals) = v.as_vec_f32() {
-                    if let Some(&mag) = vals.first() {
-                        meta.insert(
-                            "ndpi.magnification".to_string(),
-                            crate::common::metadata::MetadataValue::Float(mag as f64),
-                        );
-                    }
-                }
+            if !name.is_empty() {
+                meta.series_metadata.insert(
+                    "ndpi.image_type".into(),
+                    crate::common::metadata::MetadataValue::String(name.to_string()),
+                );
             }
-            // Tag 65422 = x offset (FLOAT)
-            if let Some(v) = ifd.get(65422) {
-                if let Some(vals) = v.as_vec_f32() {
-                    if let Some(&x) = vals.first() {
-                        meta.insert(
-                            "ndpi.offset.x".to_string(),
-                            crate::common::metadata::MetadataValue::Float(x as f64),
-                        );
-                    }
-                }
+            let mut s = template.clone();
+            s.ifd_indices = vec![idx];
+            s.plane_ifd_indices = Vec::new();
+            s.metadata = meta;
+            s.sub_resolutions = Vec::new();
+            new_series.push(s);
+        }
+
+        if !new_series.is_empty() {
+            self.inner.replace_series(new_series);
+        }
+    }
+
+    /// Build per-series `ImageMetadata` from an IFD, mirroring Java's
+    /// per-CoreMetadata population (`NDPIReader.java:582-660`). `size_z` is the
+    /// focal-plane count for the pyramid series (1 for extras).
+    fn ndpi_plane_meta(
+        &self,
+        ifd_index: usize,
+        little_endian: bool,
+        size_z: u32,
+    ) -> ImageMetadata {
+        let mut meta = ImageMetadata::default();
+        if let Some(ifd) = self.inner.ifd(ifd_index) {
+            let spp = ifd.samples_per_pixel();
+            // Java clamps bits-per-sample up to 8 (NDPIReader.java:558-564).
+            let bps = ifd.bits_per_sample().first().copied().unwrap_or(8).max(8);
+            let photometric = ifd.photometric();
+            let is_rgb =
+                spp > 1 || matches!(photometric, crate::tiff::ifd::Photometric::Rgb);
+            meta.size_x = ifd.image_width().unwrap_or(0);
+            meta.size_y = ifd.image_length().unwrap_or(0);
+            meta.size_c = if is_rgb { spp as u32 } else { 1 };
+            meta.is_rgb = is_rgb;
+            meta.bits_per_pixel = bps as u8;
+            let sample_format = ifd
+                .get_u16(crate::tiff::ifd::tag::SAMPLE_FORMAT)
+                .unwrap_or(1);
+            meta.pixel_type = tiff_pixel_type(bps, sample_format);
+            meta.is_indexed =
+                matches!(photometric, crate::tiff::ifd::Photometric::Palette);
+        }
+        meta.size_z = size_z.max(1);
+        meta.size_t = 1;
+        meta.is_little_endian = little_endian;
+        // RGB planes pack channels into one plane; otherwise one per channel.
+        let c_planes = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+        meta.image_count = meta.size_z.max(1) * c_planes;
+        meta.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+        meta
+    }
+
+    /// Surface NDPI vendor tags from `ifd_index` into `meta.series_metadata`,
+    /// plus the `\n`-delimited `METADATA_TAG` (65449) key/value calibration
+    /// block (Java `NDPIReader.java:616-689`).
+    fn attach_vendor_metadata(&self, ifd_index: usize, meta: &mut ImageMetadata) {
+        use crate::common::metadata::MetadataValue;
+        let Some(ifd) = self.inner.ifd(ifd_index) else {
+            return;
+        };
+
+        if let Some(v) = ifd.get(NDPI_SOURCE_LENS) {
+            if let Some(mag) = v.as_vec_f32().and_then(|s| s.first().copied()) {
+                meta.series_metadata
+                    .insert("ndpi.magnification".into(), MetadataValue::Float(mag as f64));
             }
-            // Tag 65423 = y offset (FLOAT)
-            if let Some(v) = ifd.get(65423) {
-                if let Some(vals) = v.as_vec_f32() {
-                    if let Some(&y) = vals.first() {
-                        meta.insert(
-                            "ndpi.offset.y".to_string(),
-                            crate::common::metadata::MetadataValue::Float(y as f64),
-                        );
-                    }
-                }
+        }
+        if let Some(v) = ifd.get(NDPI_X_POSITION) {
+            if let Some(x) = v.as_vec_f32().and_then(|s| s.first().copied()) {
+                meta.series_metadata
+                    .insert("ndpi.offset.x".into(), MetadataValue::Float(x as f64));
             }
-            // Tag 65442 = source lens (ASCII)
-            if let Some(v) = ifd.get(65442) {
-                if let Some(s) = v.as_str() {
-                    meta.insert(
-                        "ndpi.source_lens".to_string(),
-                        crate::common::metadata::MetadataValue::String(s.to_string()),
+        }
+        if let Some(v) = ifd.get(NDPI_Y_POSITION) {
+            if let Some(y) = v.as_vec_f32().and_then(|s| s.first().copied()) {
+                meta.series_metadata
+                    .insert("ndpi.offset.y".into(), MetadataValue::Float(y as f64));
+            }
+        }
+        if let Some(v) = ifd.get(NDPI_Z_POSITION) {
+            if let Some(z) = v.as_f64() {
+                meta.series_metadata
+                    .insert("ndpi.offset.z".into(), MetadataValue::Float(z));
+            }
+        }
+        if let Some(s) = ifd.get(NDPI_SERIAL_NUMBER).and_then(|v| v.as_str()) {
+            meta.series_metadata.insert(
+                "ndpi.source_lens".into(),
+                MetadataValue::String(s.to_string()),
+            );
+        }
+        if let Some(cm) = ifd.get_u16(NDPI_CAPTURE_MODE) {
+            meta.series_metadata
+                .insert("ndpi.capture_mode".into(), MetadataValue::Int(cm as i64));
+        }
+        // METADATA_TAG: newline-separated "key=value" calibration entries.
+        if let Some(block) = ifd.get(NDPI_METADATA_TAG).and_then(|v| v.as_str()) {
+            for entry in block.split('\n') {
+                if let Some(eq) = entry.find('=') {
+                    let key = entry[..eq].trim();
+                    let value = entry[eq + 1..].trim();
+                    if key.is_empty() {
+                        continue;
+                    }
+                    meta.series_metadata.insert(
+                        format!("ndpi.{key}"),
+                        MetadataValue::String(value.to_string()),
                     );
                 }
             }
-            meta
-        };
+        }
+    }
+
+    /// BUG 2 — analyze the >4 GB offset-reconstruction situation.
+    ///
+    /// NDPI files larger than 4 GB keep using classic (32-bit) TIFF offsets that
+    /// wrap; Java reconstructs the true 64-bit offsets from the per-IFD high-word
+    /// trailer and from the `OFFSET_HIGH_BYTES` (65324) / `BYTE_COUNT_HIGH_BYTES`
+    /// (65325) arrays (`NDPIReader.java:439-521`), with a decreasing-offset
+    /// fallback for JPEG restart markers (`getMarkers:891-922`).
+    ///
+    /// LIMITATION: applying those high words requires rewriting the strip/tile
+    /// `STRIP_OFFSETS`/`TILE_OFFSETS`/byte-count arrays *inside the core TIFF
+    /// IFDs* that `crate::tiff::TiffReader` reads pixels from. From this wrapper
+    /// we only have read-only `TiffReader::ifd()` access — there is no public
+    /// mutable IFD accessor and no public strip-offset setter — so the corrected
+    /// offsets cannot be injected into the pixel-read path without modifying the
+    /// core TIFF parser (`src/tiff/reader.rs` / `ifd.rs`). We therefore detect
+    /// the condition and record, per pyramid series, whether high-word
+    /// correction is *needed* and whether the high-word tags are *present*, so a
+    /// future core change (or caller) can act on it; we also flag the residual
+    /// limitation in `ndpi.offset64.limitation`. Pixel reads of data physically
+    /// located beyond 4 GB will be incorrect until the core supports this.
+    fn analyze_large_file_offsets(&mut self, file_len: u64) {
+        use crate::common::metadata::MetadataValue;
+        self.use_64bit = file_len >= (1u64 << 32);
+        if !self.use_64bit {
+            return;
+        }
+
+        // Determine whether any IFD carries the high-word correction tags. If
+        // present, the data genuinely lives past 4 GB and we cannot honor it.
+        let ifd_count = self.inner.ifd_count();
+        let mut any_high_words = false;
+        let mut multi_strip_high = false;
+        for i in 0..ifd_count {
+            if let Some(ifd) = self.inner.ifd(i) {
+                if ifd.get(NDPI_OFFSET_HIGH_BYTES).is_some()
+                    || ifd.get(NDPI_BYTE_COUNT_HIGH_BYTES).is_some()
+                {
+                    any_high_words = true;
+                    // >1 strip/tile means the per-strip high-byte arrays matter.
+                    let strips = ifd
+                        .get(crate::tiff::ifd::tag::STRIP_OFFSETS)
+                        .or_else(|| ifd.get(crate::tiff::ifd::tag::TILE_OFFSETS))
+                        .map(|v| v.as_vec_u64().len())
+                        .unwrap_or(0);
+                    if strips > 1 {
+                        multi_strip_high = true;
+                    }
+                }
+            }
+        }
 
         if let Some(s) = self.inner.series_list_mut().first_mut() {
-            for (k, v) in vendor {
-                s.metadata.series_metadata.insert(k, v);
-            }
+            let m = &mut s.metadata.series_metadata;
+            m.insert("ndpi.use_64bit_offsets".into(), MetadataValue::Bool(true));
+            m.insert(
+                "ndpi.offset64.high_word_tags_present".into(),
+                MetadataValue::Bool(any_high_words),
+            );
+            m.insert(
+                "ndpi.offset64.multi_strip".into(),
+                MetadataValue::Bool(multi_strip_high),
+            );
+            m.insert(
+                "ndpi.offset64.limitation".into(),
+                MetadataValue::String(
+                    "File >4GB: 32-bit TIFF offsets require high-word reconstruction \
+                     (tags 65324/65325 + per-IFD high words). The wrapper has only \
+                     read-only IFD access, so corrected offsets cannot be injected \
+                     into the core pixel-read path; pixels stored past 4GB will read \
+                     incorrectly until src/tiff supports NDPI 64-bit offsets."
+                        .into(),
+                ),
+            );
         }
     }
 }
@@ -297,12 +616,21 @@ impl FormatReader for NdpiReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.close()?;
         self.inner.set_id(path)?;
-        self.enrich_metadata();
+        // Regroup the flat NDPI IFD chain into a pyramid series (+ macro/map
+        // series) and detect sizeZ, mirroring NDPIReader.initStandardMetadata.
+        self.build_ndpi_series();
+        // BUG 2: detect / flag the >4 GB offset-reconstruction situation.
+        let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        self.analyze_large_file_offsets(file_len);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        self.size_z = 1;
+        self.pyramid_height = 1;
+        self.use_64bit = false;
         self.inner.close()
     }
     fn series_count(&self) -> usize {

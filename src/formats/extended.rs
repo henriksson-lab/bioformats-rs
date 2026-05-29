@@ -3591,17 +3591,36 @@ impl FormatReader for PovRayReader {
             ));
         }
 
-        let plane_bytes = (size_x as usize)
+        let plane_voxels = (size_x as usize)
             .checked_mul(size_y as usize)
-            .ok_or_else(|| BioFormatsError::Format("DF3 plane byte count overflows".into()))?;
-        let expected_pixels = plane_bytes
+            .ok_or_else(|| BioFormatsError::Format("DF3 plane voxel count overflows".into()))?;
+        let total_voxels = plane_voxels
             .checked_mul(size_z as usize)
-            .ok_or_else(|| BioFormatsError::Format("DF3 voxel byte count overflows".into()))?;
-        if data.len() - 6 != expected_pixels {
+            .ok_or_else(|| BioFormatsError::Format("DF3 voxel count overflows".into()))?;
+
+        // Java ref (PovrayReader.java:92-95): nBytes = (fileLength - HEADER_SIZE) / (X*Y*Z),
+        // pixelType = pixelTypeFromBytes(nBytes, false, false) -> 1=Uint8, 2=Uint16, 4=Uint32.
+        let payload = data.len() - 6;
+        let n_bytes = payload / total_voxels;
+        let (pixel_type, bits_per_pixel) = match n_bytes {
+            1 => (PixelType::Uint8, 8),
+            2 => (PixelType::Uint16, 16),
+            4 => (PixelType::Uint32, 32),
+            other => {
+                return Err(BioFormatsError::Format(format!(
+                    "DF3 unsupported bytes-per-voxel: {} (expected 1, 2, or 4)",
+                    other
+                )));
+            }
+        };
+
+        let expected_bytes = total_voxels
+            .checked_mul(n_bytes)
+            .ok_or_else(|| BioFormatsError::Format("DF3 byte count overflows".into()))?;
+        if payload != expected_bytes {
             return Err(BioFormatsError::Format(format!(
                 "DF3 pixel payload has {} bytes, expected {}",
-                data.len() - 6,
-                expected_pixels
+                payload, expected_bytes
             )));
         }
 
@@ -3616,14 +3635,14 @@ impl FormatReader for PovRayReader {
             size_z,
             size_c: 1,
             size_t: 1,
-            pixel_type: PixelType::Uint8,
-            bits_per_pixel: 8,
+            pixel_type,
+            bits_per_pixel,
             image_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: true,
+            is_little_endian: false,
             resolution_count: 1,
             series_metadata: HashMap::new(),
             lookup_table: None,

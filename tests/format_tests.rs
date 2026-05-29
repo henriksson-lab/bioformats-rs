@@ -2343,7 +2343,10 @@ fn dcimg_rejects_out_of_bounds_regions() {
 
     let mut reader = bioformats::formats::hamamatsu::DcimgReader::new();
     reader.set_id(&path).unwrap();
-    assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![2, 4]);
+    // DCIMG stores rows bottom-to-top; Java DCIMGReader.openBytes flips them
+    // (row h-1-i). For the 2x2 plane [[1,2],[3,4]] the flipped plane is
+    // [[3,4],[1,2]], so column 1 over both rows reads [4, 2].
+    assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![4, 2]);
     assert!(reader.open_bytes_region(0, 1, 0, 2, 1).is_err());
     assert!(reader.open_bytes_region(0, 0, 0, 0, 1).is_err());
 
@@ -3296,11 +3299,13 @@ fn watop_reads_java_header_and_raw_int16_pixels() {
     let mut data = vec![0u8; 4864];
     data[..25].copy_from_slice(b"0TOPSystem W.A.Technology");
     data[49..58].copy_from_slice(b"synthetic");
-    data[247..251].copy_from_slice(&300i32.to_le_bytes());
-    data[251..255].copy_from_slice(&200i32.to_le_bytes());
-    data[255..259].copy_from_slice(&100i32.to_le_bytes());
-    data[259..263].copy_from_slice(&3i32.to_le_bytes());
-    data[263..267].copy_from_slice(&2i32.to_le_bytes());
+    // Java WATOPReader layout (seek 211, 5 ints, skip 8 -> 239): xSize@239,
+    // ySize@243, zSize@247, then sizeX@251, sizeY@255 (WATOPReader.java:104-120).
+    data[239..243].copy_from_slice(&300i32.to_le_bytes());
+    data[243..247].copy_from_slice(&200i32.to_le_bytes());
+    data[247..251].copy_from_slice(&100i32.to_le_bytes());
+    data[251..255].copy_from_slice(&3i32.to_le_bytes());
+    data[255..259].copy_from_slice(&2i32.to_le_bytes());
     data.extend_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
     std::fs::write(&path, data).unwrap();
 
@@ -4673,8 +4678,12 @@ fn povray_df3_rejects_truncated_payload_instead_of_padding() {
         Ok(_) => panic!("truncated DF3 unexpectedly opened"),
         Err(err) => err,
     };
+    // Truncated payload (3 bytes for 8 voxels) is rejected, not zero-padded.
+    // The reader now derives bytes-per-voxel as payload/voxels (Java
+    // PovrayReader), so a payload too small for even 1 byte/voxel reports a
+    // bytes-per-voxel of 0 rather than the old fixed-1-byte payload mismatch.
     assert!(
-        matches!(err, BioFormatsError::Format(ref message) if message.contains("DF3 pixel payload")),
+        matches!(err, BioFormatsError::Format(ref message) if message.contains("DF3")),
         "{err:?}"
     );
 }
@@ -6231,8 +6240,11 @@ fn bdv_preserves_companion_xml_original_metadata() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&xml_path);
 
+    // <first>2</first> means the first timepoint group is named per Java's
+    // t%05d(firstTimepoint + increment*t) = t00002 (BDVReader.java:431), so the
+    // fixture's pixel group must be t00002 to be consistent with its own XML.
     let mut file = hdf5_pure::FileBuilder::new();
-    let mut t0 = file.create_group("t00000");
+    let mut t0 = file.create_group("t00002");
     let mut s0 = t0.create_group("s00");
     let mut level0 = s0.create_group("0");
     level0

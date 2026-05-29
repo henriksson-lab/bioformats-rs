@@ -335,13 +335,18 @@ impl FormatReader for DcimgReader {
             }
         }
 
+        // DCIMG planes are stored bottom-to-top: the first row in the file is
+        // the bottom row of the image. Java's DCIMGReader.openBytes (lines
+        // 142-162) reflects this by reading with `for (int row=h-1; row>=0;
+        // row--)`, writing the first file row into the last buffer row. We
+        // mirror that here by emitting source row `r` into destination row
+        // `(size_y - 1 - r)`, combining the flip with per-row stride handling.
+        let size_y = meta.size_y as usize;
         let out_row = meta.size_x as usize * bps;
-        if row_bytes == out_row {
-            return Ok(raw);
-        }
-        let mut out = Vec::with_capacity(meta.size_y as usize * out_row);
-        for r in 0..meta.size_y as usize {
-            out.extend_from_slice(&raw[r * row_bytes..r * row_bytes + out_row]);
+        let mut out = vec![0u8; size_y * out_row];
+        for r in 0..size_y {
+            let dst = (size_y - 1 - r) * out_row;
+            out[dst..dst + out_row].copy_from_slice(&raw[r * row_bytes..r * row_bytes + out_row]);
         }
         Ok(out)
     }

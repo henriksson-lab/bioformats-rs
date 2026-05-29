@@ -518,6 +518,21 @@ fn decode_nd2_frame_payload(data: &[u8], expected: usize) -> Result<Vec<u8>> {
         return Ok(data.to_vec());
     }
 
+    // Each ImageDataSeq block is [8-byte frame timestamp/double][pixel data].
+    // Java always skips the leading 8 bytes before reading the plane
+    // (ND2Reader.java:1704 `offsets[...] = offset + p[0] + 8`, then :249 readPlane).
+    // Prefer interpreting the leading 8 bytes as the frame-timestamp prefix
+    // (yielding exactly `expected` pixel bytes) over truncating a trailer, which
+    // would otherwise keep the timestamp bytes as the first pixels and drop the
+    // last 8 real bytes. Skip this when the payload looks compressed so the
+    // zlib/JPEG2000 paths below remain unaffected.
+    if data.len() == expected + FRAME_PREFIX_LEN {
+        let payload = &data[FRAME_PREFIX_LEN..];
+        if !looks_like_zlib(payload) && !looks_like_jpeg2000(payload) {
+            return Ok(payload.to_vec());
+        }
+    }
+
     if data.len() > expected
         && expected >= 1024
         && data.len() - expected <= MAX_RAW_TRAILER_LEN

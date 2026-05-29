@@ -1289,8 +1289,8 @@ impl FormatReader for WatopReader {
             ));
         }
 
-        let width = Self::read_i32_le(&data, 259, "width")?;
-        let height = Self::read_i32_le(&data, 263, "height")?;
+        let width = Self::read_i32_le(&data, 251, "width")?;
+        let height = Self::read_i32_le(&data, 255, "height")?;
         if width <= 0 || height <= 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "WA Technology TOP header contains invalid image dimensions".into(),
@@ -1320,19 +1320,19 @@ impl FormatReader for WatopReader {
                 crate::common::metadata::MetadataValue::String(comment),
             );
         }
-        if let Ok(x_size) = Self::read_i32_le(&data, 247, "x size") {
+        if let Ok(x_size) = Self::read_i32_le(&data, 239, "x size") {
             series_metadata.insert(
                 "X size (in um)".to_string(),
                 crate::common::metadata::MetadataValue::Float(x_size as f64 / 100.0),
             );
         }
-        if let Ok(y_size) = Self::read_i32_le(&data, 251, "y size") {
+        if let Ok(y_size) = Self::read_i32_le(&data, 243, "y size") {
             series_metadata.insert(
                 "Y size (in um)".to_string(),
                 crate::common::metadata::MetadataValue::Float(y_size as f64 / 100.0),
             );
         }
-        if let Ok(z_size) = Self::read_i32_le(&data, 255, "z size") {
+        if let Ok(z_size) = Self::read_i32_le(&data, 247, "z size") {
             series_metadata.insert(
                 "Z size (in um)".to_string(),
                 crate::common::metadata::MetadataValue::Float(z_size as f64 / 100.0),

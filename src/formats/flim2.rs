@@ -322,22 +322,26 @@ const FLOWSIGHT_GREYSCALE_COMPRESSION: u16 = 30817;
 const FLOWSIGHT_BITMASK_COMPRESSION: u16 = 30818;
 
 fn flowsight_channel_count(ifd0: &Ifd) -> usize {
-    let declared = ifd0
+    // Match Java FlowSightReader (lines 150-200): start with the CHANNEL_COUNT_TAG
+    // default, override with the channel-names count if present, then override
+    // AGAIN with the XML ChannelInUseIndicators count if the XML provides it.
+    // The XML count is applied LAST so it wins when sources disagree.
+    let mut channel_count = ifd0
         .get_u32(FLOWSIGHT_CHANNEL_COUNT_TAG)
         .unwrap_or(1)
         .max(1) as usize;
     if let Some(names) = ifd0.get_str(FLOWSIGHT_CHANNEL_NAMES_TAG) {
         let count = split_flowsight_pipe_list(names).len();
         if count > 0 {
-            return count;
+            channel_count = count;
         }
     }
     if let Some(xml) = ifd0.get_str(FLOWSIGHT_METADATA_XML_TAG) {
         if let Some(count) = count_flowsight_channels_in_use(xml) {
-            return count.max(1);
+            channel_count = count.max(1);
         }
     }
-    declared
+    channel_count
 }
 
 fn split_flowsight_pipe_list(value: &str) -> Vec<String> {
@@ -586,7 +590,11 @@ impl<'a> FlowSightNibbleReader<'a> {
             shift += 3;
             if (nibble & 0x8) == 0 {
                 if (nibble & 0x4) != 0 {
-                    value |= -((1i16).wrapping_shl(shift));
+                    // Java FlowSightReader.java:409 evaluates `1 << shift` in 32-bit
+                    // int space then ORs it into the short. Doing the shift/negation
+                    // in i16 overflows (panics in debug) at shift==15 and yields wrong
+                    // bits at shift==18; compute in i32 and truncate to match Java.
+                    value |= (-(1i32 << shift)) as i16;
                 }
                 return Ok(value);
             }

@@ -47,6 +47,8 @@ struct LsmInfo {
     dim_c: u32,
     dim_t: u32,
     data_type: i32,
+    /// CZ-LSMINFO ScanType (short at offset 88); selects the dimension order.
+    scan_type: i16,
     voxel_x: f64,
     voxel_y: f64,
     voxel_z: f64,
@@ -90,6 +92,14 @@ fn read_i32_lsm(buf: &[u8], off: usize, le: bool) -> i32 {
         i32::from_be_bytes(b)
     }
 }
+fn read_i16_lsm(buf: &[u8], off: usize, le: bool) -> i16 {
+    let b = [buf[off], buf[off + 1]];
+    if le {
+        i16::from_le_bytes(b)
+    } else {
+        i16::from_be_bytes(b)
+    }
+}
 fn read_f64_lsm(buf: &[u8], off: usize, le: bool) -> f64 {
     let b: [u8; 8] = buf[off..off + 8].try_into().unwrap_or([0u8; 8]);
     if le {
@@ -128,6 +138,14 @@ fn parse_lsm_info(bytes: &[u8], le: bool) -> Result<LsmInfo> {
         dim_c: dim_c as u32,
         dim_t: dim_t as u32,
         data_type: read_i32_lsm(bytes, 28, le),
+        // ZeissLSMReader.java:822-824 seeks to offset 88 and reads a short for
+        // ScanType. Missing/short blocks fall back to 0 (-> XYZCT), matching the
+        // Java default case.
+        scan_type: if bytes.len() >= 90 {
+            read_i16_lsm(bytes, 88, le)
+        } else {
+            0
+        },
         voxel_x: if bytes.len() >= 48 {
             read_f64_lsm(bytes, 40, le)
         } else {
@@ -144,6 +162,48 @@ fn parse_lsm_info(bytes: &[u8], le: bool) -> Result<LsmInfo> {
             0.0
         },
     })
+}
+
+/// Maps the CZ-LSMINFO ScanType to a dimension order, mirroring
+/// ZeissLSMReader.java:824-885.
+///
+/// Base switch (java:825-873):
+///   3 / 5 / 9 -> XYTCZ   (time series x-y / Mean of ROIs / time series spline x-z)
+///   4 / 6     -> XYZTC   (time series x-z / time series x-y-z)
+///   7         -> XYCTZ   (spline scan)
+///   8         -> XYCZT   (spline scan x-z)
+///   0,1,2,10,default -> XYZCT
+///
+/// When the image is RGB (java:881-885), C is shuffled to the front: "C" is
+/// removed from the order then re-inserted right after "XY", i.e. the result is
+/// always "XYC" + the remaining two axes.
+fn lsm_dimension_order(scan_type: i16, is_rgb: bool) -> DimensionOrder {
+    let base = match scan_type {
+        3 | 5 | 9 => DimensionOrder::XYTCZ,
+        4 | 6 => DimensionOrder::XYZTC,
+        7 => DimensionOrder::XYCTZ,
+        8 => DimensionOrder::XYCZT,
+        // 0, 1, 2, 10 and any other value -> XYZCT
+        _ => DimensionOrder::XYZCT,
+    };
+    if !is_rgb {
+        return base;
+    }
+    // Shuffle C to the front (after XY), preserving the relative order of the
+    // remaining Z/T axes. base never already has C right after XY here.
+    match base {
+        // XYTCZ -> XYTZ -> XYCTZ
+        DimensionOrder::XYTCZ => DimensionOrder::XYCTZ,
+        // XYZTC -> XYZT -> XYCZT
+        DimensionOrder::XYZTC => DimensionOrder::XYCZT,
+        // XYCTZ -> XYTZ -> XYCTZ (unchanged)
+        DimensionOrder::XYCTZ => DimensionOrder::XYCTZ,
+        // XYCZT -> XYZT -> XYCZT (unchanged)
+        DimensionOrder::XYCZT => DimensionOrder::XYCZT,
+        // XYZCT -> XYZT -> XYCZT
+        DimensionOrder::XYZCT => DimensionOrder::XYCZT,
+        DimensionOrder::XYTZC => DimensionOrder::XYCTZ,
+    }
 }
 
 fn lsm_pixel_type(data_type: i32, tiff_bps: u16) -> Result<PixelType> {
@@ -321,7 +381,7 @@ impl FormatReader for LsmReader {
             pixel_type,
             bits_per_pixel: tiff_meta.bits_per_pixel,
             image_count,
-            dimension_order: DimensionOrder::XYZCT,
+            dimension_order: lsm_dimension_order(lsm_info.scan_type, is_rgb),
             is_rgb,
             is_interleaved: tiff_meta.is_interleaved,
             is_indexed: false,

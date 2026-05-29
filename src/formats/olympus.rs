@@ -287,6 +287,10 @@ impl OifReader {
 
         // ---- ProfileSaveInfo: collect .pty file names (IniFileNameN) ----
         let mut filenames: BTreeMap<usize, String> = BTreeMap::new();
+        // Mirrors Java FV1000Reader.previewNames.size(): number of preview
+        // ("-R") planes that resolve to a ".tif" name. Used in the image-count
+        // reconciliation branch below.
+        let mut preview_count: usize = 0;
         if let Some(save_info) = f.table("ProfileSaveInfo") {
             for (key, value) in save_info {
                 let value = sanitize_value(value);
@@ -297,6 +301,19 @@ impl OifReader {
                 {
                     if let Ok(idx) = key[11..].parse::<usize>() {
                         filenames.insert(idx, value);
+                    }
+                } else if key.starts_with("IniFileName")
+                    && !key.contains("Thumb")
+                    && is_preview_name(&value)
+                {
+                    // Java: isPreviewName(value) branch populates previewNames.
+                    // Java additionally requires the referenced file to exist and
+                    // its ".pty"->".tif" name to end in ".tif" (FV1000Reader:466-490,
+                    // 583-590). We approximate by counting preview entries here so
+                    // the diff==previewCount reconciliation branch below can fire.
+                    let tif = replace_extension(&value, "pty", "tif");
+                    if tif.ends_with(".tif") {
+                        preview_count += 1;
                     }
                 }
             }
@@ -500,16 +517,20 @@ impl OifReader {
         }
 
         if size_z * size_t * size_c != image_count as u32 {
-            let diff = (size_z * size_c * size_t) as i64 - image_count as i64;
-            if diff < 0 {
-                let d = (-diff) as u32 / size_c.max(1);
+            // Java FV1000Reader.java:874-882 — diff is a *signed* plane-count
+            // delta. When diff == previewNames.size() or diff < 0, divide by
+            // sizeC and SUBTRACT from the relevant dimension (so a negative diff
+            // GROWS the dimension); otherwise add diff to imageCount.
+            let mut diff = (size_z * size_c * size_t) as i64 - image_count as i64;
+            if diff == preview_count as i64 || diff < 0 {
+                diff /= size_c.max(1) as i64;
                 if size_t > 1 && size_z == 1 {
-                    size_t = size_t.saturating_sub(d);
+                    size_t = (size_t as i64 - diff) as u32;
                 } else if size_z > 1 && size_t == 1 {
-                    size_z = size_z.saturating_sub(d);
+                    size_z = (size_z as i64 - diff) as u32;
                 }
             } else {
-                image_count += diff as usize;
+                image_count = (image_count as i64 + diff) as usize;
             }
         }
 

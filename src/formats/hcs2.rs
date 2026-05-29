@@ -3112,8 +3112,12 @@ mod bd {
         }
 
         // Determine sizeT by counting per-channel images in a well.
+        // Mirror Java BDReader.java:668-680: a running imageCount starts at 0,
+        // so the first channel with any images sets sizeT = images/sizeZ, and
+        // later channels only update if they have more images than the running count.
         let mut size_t = 0u32;
         if let Some((_, tiffs)) = well_tiffs.iter().find(|(_, t)| !t.is_empty()) {
+            let mut image_count = 0u32;
             for cname in &channel_names {
                 let images = tiffs
                     .iter()
@@ -3124,9 +3128,9 @@ mod bd {
                             .unwrap_or(false)
                     })
                     .count() as u32;
-                let image_count_so_far = size_z * size_t.max(1) * n_channels as u32;
-                if images > image_count_so_far {
-                    size_t = images / size_z;
+                if images > image_count {
+                    size_t = images / size_z.max(1);
+                    image_count = size_z.max(1) * size_t * n_channels as u32;
                 }
             }
         }

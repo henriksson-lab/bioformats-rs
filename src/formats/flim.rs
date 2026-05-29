@@ -116,7 +116,12 @@ fn read_sdt_raw_plane(
     time_bin: usize,
     plane_bytes: usize,
 ) -> Result<Vec<u8>> {
-    let row_len = size_x
+    // SDTReader.java:176 — rows are stored at a width padded up to a multiple
+    // of 4 pixels. Each disk row holds `paddedWidth` pixels worth of decays,
+    // but the output plane only contains the unpadded `size_x` columns
+    // (SDTReader.java:185-190 drops the padding columns).
+    let padded_width = padded_width(size_x);
+    let row_len = padded_width
         .checked_mul(time_bins)
         .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| BioFormatsError::Format("SDT row size overflow".into()))?;
@@ -138,6 +143,12 @@ fn read_sdt_raw_plane(
     Ok(out)
 }
 
+/// Width padded up to a multiple of 4 pixels, per SDTReader.java:176:
+/// `paddedWidth = sizeX + ((4 - (sizeX % 4)) % 4)`.
+fn padded_width(size_x: usize) -> usize {
+    size_x + ((4 - (size_x % 4)) % 4)
+}
+
 fn read_sdt_zip_plane(
     f: &mut File,
     block: &SdtBlock,
@@ -152,11 +163,14 @@ fn read_sdt_zip_plane(
     let payload = zip_deflate_payload(&compressed)?;
     let mut decoder = flate2::read::DeflateDecoder::new(Cursor::new(payload));
 
+    // Output plane is unpadded (size_x columns); disk rows are padded_width
+    // wide (SDTReader.java:176,185-190).
+    let padded_width = padded_width(size_x);
     let plane_bytes = size_x
         .checked_mul(size_y)
         .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| BioFormatsError::Format("SDT plane size overflow".into()))?;
-    let row_len = size_x
+    let row_len = padded_width
         .checked_mul(time_bins)
         .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| BioFormatsError::Format("SDT row size overflow".into()))?;
@@ -727,8 +741,11 @@ impl FormatReader for SdtReader {
         f.seek(SeekFrom::Start(block.data_offset))
             .map_err(BioFormatsError::Io)?;
 
-        // planeSize for one channel = sizeX * sizeY * times * bpp.
-        let channel_plane_size = (size_x * size_y * times * 2) as u64;
+        // planeSize for one channel = paddedWidth * sizeY * times * bpp
+        // (SDTReader.java:181). Rows on disk are padded to a multiple of 4
+        // pixels in width, so the per-channel stride must use paddedWidth too.
+        let padded_width = padded_width(size_x);
+        let channel_plane_size = (padded_width * size_y * times * 2) as u64;
 
         if &signature == b"PK" {
             // For ZIP blocks we cannot random-seek; decode and skip channels by

@@ -26,6 +26,8 @@ pub struct BdvReader {
     current_resolution: usize,
     size_t: u32,
     size_c: u32,
+    first_timepoint: u32,
+    timepoint_increment: u32,
 }
 
 impl BdvReader {
@@ -37,6 +39,8 @@ impl BdvReader {
             current_resolution: 0,
             size_t: 1,
             size_c: 1,
+            first_timepoint: 0,
+            timepoint_increment: 1,
         }
     }
 }
@@ -68,7 +72,7 @@ fn xml_count(xml: &str, tag: &str) -> usize {
     count
 }
 
-fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
+fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32, u32, u32)> {
     let file = hdf5_pure::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
@@ -79,6 +83,10 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
     let mut size_z: u32 = 0;
     let mut size_t: u32 = 0;
     let mut size_c: u32 = 0;
+    // Timepoint group naming: Java defaults firstTimepoint=0, increment=1, then
+    // builds paths as t{firstTimepoint + increment*time}.
+    let mut first_timepoint: u32 = 0;
+    let mut timepoint_increment: u32 = 1;
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
     meta_map.insert(
         "format".into(),
@@ -130,11 +138,39 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
                     )));
                 }
                 size_t = last - first + 1;
+                first_timepoint = first;
                 meta_map.insert(
                     "bdv_timepoint_first".into(),
                     MetadataValue::Int(first as i64),
                 );
                 meta_map.insert("bdv_timepoint_last".into(), MetadataValue::Int(last as i64));
+            }
+            // Parse <integerpattern>first-last:increment</integerpattern>.
+            // Java parses parts[0] as firstTimepoint and the part after ':' as
+            // the timepoint increment (defaulting to 1 when absent).
+            if let Some(pat) = xml_find(&xml_str, "integerpattern") {
+                let dash: Vec<&str> = pat.splitn(2, '-').collect();
+                if let Ok(first) = dash[0].trim().parse::<u32>() {
+                    first_timepoint = first;
+                    meta_map.insert(
+                        "bdv_timepoint_first".into(),
+                        MetadataValue::Int(first as i64),
+                    );
+                }
+                if dash.len() > 1 {
+                    let colon: Vec<&str> = dash[1].splitn(2, ':').collect();
+                    if colon.len() > 1 {
+                        if let Ok(inc) = colon[1].trim().parse::<u32>() {
+                            if inc > 0 {
+                                timepoint_increment = inc;
+                                meta_map.insert(
+                                    "bdv_timepoint_increment".into(),
+                                    MetadataValue::Int(inc as i64),
+                                );
+                            }
+                        }
+                    }
+                }
             }
             // Count ViewSetup elements
             let vc = xml_count(&xml_str, "ViewSetup");
@@ -163,9 +199,15 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
         }
     }
 
+    // The first timepoint's HDF5 group is named for firstTimepoint (BDV uses
+    // t{firstTimepoint + increment*time}), so init probes must use it — not a
+    // literal t00000 — to stay consistent with the open_bytes read path.
+    let first_t_group = format!("t{first_timepoint:05}");
+    let first_cells_path = format!("{first_t_group}/s00/0/cells");
+
     if size_c == 0 {
-        // Count setup groups under t00000
-        if let Ok(t0) = file.group("t00000") {
+        // Count setup groups under the first timepoint group
+        if let Ok(t0) = file.group(&first_t_group) {
             if let Ok(members) = hdf5_group_members(&t0) {
                 size_c = members
                     .iter()
@@ -185,10 +227,10 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
     }
 
     if size_x == 0 || size_y == 0 || size_z == 0 {
-        // Infer from shape of t00000/s00/0/cells
-        let ds = file.dataset("t00000/s00/0/cells").map_err(|e| {
+        // Infer from shape of the first timepoint's cells dataset
+        let ds = file.dataset(&first_cells_path).map_err(|e| {
             BioFormatsError::UnsupportedFormat(format!(
-                "BDV: missing t00000/s00/0/cells for dimension inference: {e}"
+                "BDV: missing {first_cells_path} for dimension inference: {e}"
             ))
         })?;
         let shape = ds.shape().map_err(|e| {
@@ -206,7 +248,7 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
         size_x = u32::try_from(shape[2])
             .map_err(|_| BioFormatsError::Format("BDV X dimension overflows".into()))?;
     }
-    validate_bdv_cells_dataset(&file, "t00000/s00/0/cells", size_x, size_y, size_z)?;
+    validate_bdv_cells_dataset(&file, &first_cells_path, size_x, size_y, size_z)?;
 
     // ── Count resolution levels from s00/resolutions ────────────────────────
     let n_resolutions: usize = if let Ok(ds) = file.dataset("s00/resolutions") {
@@ -217,8 +259,8 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
             1
         }
     } else {
-        // Fall back: count integer-named children of t00000/s00
-        if let Ok(g) = file.group("t00000/s00") {
+        // Fall back: count integer-named children of <first timepoint>/s00
+        if let Ok(g) = file.group(&format!("{first_t_group}/s00")) {
             if let Ok(members) = hdf5_group_members(&g) {
                 let n = members
                     .iter()
@@ -251,7 +293,7 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
         pixel_type: PixelType::Uint16,
         bits_per_pixel: 16,
         image_count,
-        dimension_order: DimensionOrder::XYZCT,
+        dimension_order: DimensionOrder::XYZTC,
         is_rgb: false,
         is_interleaved: false,
         is_indexed: false,
@@ -264,7 +306,14 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32)> {
         modulo_t: None,
     };
 
-    Ok((meta, n_resolutions, size_t, size_c))
+    Ok((
+        meta,
+        n_resolutions,
+        size_t,
+        size_c,
+        first_timepoint,
+        timepoint_increment,
+    ))
 }
 
 fn hdf5_group_members(
@@ -353,13 +402,16 @@ impl FormatReader for BdvReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, n_res, size_t, size_c) = parse_bdv(path)?;
+        let (meta, n_res, size_t, size_c, first_timepoint, timepoint_increment) =
+            parse_bdv(path)?;
         self.meta = Some(meta);
         self.path = Some(path.to_path_buf());
         self.n_resolutions = n_res;
         self.current_resolution = 0;
         self.size_t = size_t;
         self.size_c = size_c;
+        self.first_timepoint = first_timepoint;
+        self.timepoint_increment = timepoint_increment;
         Ok(())
     }
 
@@ -368,6 +420,8 @@ impl FormatReader for BdvReader {
         self.meta = None;
         self.n_resolutions = 0;
         self.current_resolution = 0;
+        self.first_timepoint = 0;
+        self.timepoint_increment = 1;
         Ok(())
     }
 
@@ -420,14 +474,19 @@ impl FormatReader for BdvReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
+        // Dimension order is XYZTC: Z varies fastest, then T, then C.
         let sz = meta.size_z as usize;
-        let sc = meta.size_c as usize;
+        let st = meta.size_t as usize;
         let z = (plane_index as usize) % sz;
-        let c = (plane_index as usize / sz) % sc;
-        let t = (plane_index as usize) / (sz * sc);
+        let t = (plane_index as usize / sz) % st;
+        let c = (plane_index as usize) / (sz * st);
+
+        // Map the 0-based timepoint index onto the HDF5 group index using the
+        // companion XML's first/increment (Java: firstTimepoint + increment*time).
+        let group_t = self.first_timepoint as usize + self.timepoint_increment as usize * t;
 
         let res = self.current_resolution;
-        let ds_path = format!("t{t:05}/s{c:02}/{res}/cells");
+        let ds_path = format!("t{group_t:05}/s{c:02}/{res}/cells");
 
         let path = self
             .path
