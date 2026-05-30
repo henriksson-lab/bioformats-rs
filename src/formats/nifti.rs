@@ -366,7 +366,7 @@ impl FormatReader for NiftiReader {
             || path
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("hdr"))
+                .map(|e| e.eq_ignore_ascii_case("hdr") || e.eq_ignore_ascii_case("img"))
                 .unwrap_or(false)
     }
 
@@ -391,6 +391,20 @@ impl FormatReader for NiftiReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let path_str = path.to_string_lossy().to_ascii_lowercase();
+
+        // The paired dataset has two files; we want the one ending in '.hdr'.
+        // Java NiftiReader.initFile redirects a '.img' argument to its sibling
+        // '.hdr' and re-inits (erroring if the header is missing).
+        if path_str.ends_with(".img") {
+            let header = path.with_extension("hdr");
+            if header.exists() {
+                return self.set_id(&header);
+            }
+            return Err(BioFormatsError::Format(
+                "NIfTI/Analyze: header (.hdr) file not found for .img".into(),
+            ));
+        }
+
         let is_gz = path_str.ends_with(".nii.gz");
 
         // Read and parse header

@@ -949,9 +949,25 @@ impl FormatReader for Nd2Reader {
         let data = read_chunk_data(f, chunk).map_err(BioFormatsError::Io)?;
 
         let bps = meta.pixel_type.bytes_per_sample();
-        let expected = meta.size_x as usize * meta.size_y as usize * meta.size_c as usize * bps;
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        let size_c = meta.size_c as usize;
 
-        decode_nd2_frame_payload(&data, expected).map_err(|e| match e {
+        // Java ND2Reader.getScanlinePad() (~2650-2654): one padding sample per
+        // row total (not per channel) when BOTH sizeX and sizeC are odd. The
+        // stored plane is therefore (sizeX + scanlinePad) * sizeY * sizeC * bpp
+        // bytes (openBytes ~277,308), while the output buffer is unpadded.
+        let scanline_pad = if meta.size_x % 2 != 0 && meta.size_c % 2 != 0 {
+            1
+        } else {
+            0
+        };
+
+        // Stored row length in bytes: sizeX*sizeC samples plus one pad sample.
+        let stored_row = (size_x * size_c + scanline_pad) * bps;
+        let stored_expected = stored_row * size_y;
+
+        let decoded = decode_nd2_frame_payload(&data, stored_expected).map_err(|e| match e {
             BioFormatsError::Format(msg) => {
                 BioFormatsError::Format(format!("ND2: plane {plane_index}: {msg}"))
             }
@@ -962,7 +978,22 @@ impl FormatReader for Nd2Reader {
                 BioFormatsError::Codec(format!("ND2: plane {plane_index}: {msg}"))
             }
             other => other,
-        })
+        })?;
+
+        if scanline_pad == 0 {
+            return Ok(decoded);
+        }
+
+        // De-pad: strip the trailing pad sample from each row so the returned
+        // buffer is the unpadded sizeX*sizeY*sizeC*bpp plane (Java openBytes
+        // copies rowLength bytes then skips scanlinePad*bpp per row, ~280-289).
+        let out_row = size_x * size_c * bps;
+        let mut out = Vec::with_capacity(out_row * size_y);
+        for row in 0..size_y {
+            let start = row * stored_row;
+            out.extend_from_slice(&decoded[start..start + out_row]);
+        }
+        Ok(out)
     }
 
     fn open_bytes_region(

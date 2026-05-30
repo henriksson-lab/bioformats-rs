@@ -990,32 +990,51 @@ fn imagic_rejects_unknown_pixel_type_and_requires_initialization_for_series() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+// Build a binary TopoMetrix fixture matching the Java TopometrixReader layout:
+// "#R" magic in the 2-byte pad, version ASCII at [2..6), pixelOffset ASCII at
+// [8..12), an empty date line at offset 14 (so the comment region ends at 254),
+// then sizeX@406 / sizeY@410, with UINT16 LE pixels at the declared pixelOffset
+// (412 = the fixed header size used here).
+fn topometrix_fixture(version: &[u8; 4], size_x: i16, size_y: i16, pixels: &[u16]) -> Vec<u8> {
+    let mut data = vec![0u8; 412];
+    data[0..2].copy_from_slice(b"#R");
+    data[2..6].copy_from_slice(version);
+    data[8..12].copy_from_slice(b"412 ");
+    data[14] = b'\n';
+    data[406..408].copy_from_slice(&size_x.to_le_bytes());
+    data[410..412].copy_from_slice(&size_y.to_le_bytes());
+    for &p in pixels {
+        data.extend_from_slice(&p.to_le_bytes());
+    }
+    data
+}
+
 #[test]
 fn topometrix_requires_declared_dimensions() {
+    // A binary TopoMetrix header with a non-positive declared size cannot
+    // describe a real plane and is rejected.
     let path = tmp("missing_dims.tfr");
-    std::fs::write(&path, b"[Data]\n\x01\x02\x03\x04").unwrap();
+    std::fs::write(&path, topometrix_fixture(b"1.0 ", 0, 2, &[])).unwrap();
 
     let mut reader = bioformats::formats::afm::TopoMetrixReader::new();
     let err = reader.set_id(&path).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("XPoints")),
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("invalid dimensions")),
         "{err:?}"
     );
 }
 
 #[test]
-fn topometrix_rejects_unknown_data_type() {
-    let path = tmp("bad_datatype.tfr");
-    std::fs::write(
-        &path,
-        b"XPoints=1\nYPoints=1\nDataType=complex128\n[Data]\n\0\0",
-    )
-    .unwrap();
+fn topometrix_rejects_malformed_version_field() {
+    // The version is a 4-byte ASCII numeric field (Java parses it as a double);
+    // a non-numeric value is rejected.
+    let path = tmp("bad_version.tfr");
+    std::fs::write(&path, topometrix_fixture(b"abcd", 1, 1, &[])).unwrap();
 
     let mut reader = bioformats::formats::afm::TopoMetrixReader::new();
     let err = reader.set_id(&path).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("unsupported DataType complex128")),
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("invalid version field")),
         "{err:?}"
     );
 
@@ -1025,9 +1044,11 @@ fn topometrix_rejects_unknown_data_type() {
 #[test]
 fn topometrix_region_crops_real_pixels() {
     let path = tmp("real_crop.tfr");
-    let mut data = b"XPoints=3\nYPoints=2\nDataType=uint16\n[Data]\n".to_vec();
-    data.extend_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
-    std::fs::write(&path, data).unwrap();
+    std::fs::write(
+        &path,
+        topometrix_fixture(b"1.0 ", 3, 2, &[1, 2, 3, 4, 5, 6]),
+    )
+    .unwrap();
 
     let mut reader = ImageReader::open(&path).unwrap();
     let crop = reader.open_bytes_region(0, 1, 0, 2, 2).unwrap();
@@ -3854,6 +3875,67 @@ fn opus_iss_blind_subsets_reject_truncated_and_malformed_inputs_before_metadata(
     }
 }
 
+/// Write a PerkinElmer-densitometer PDS header (`.hdr`, magic " IDENTIFICATION",
+/// CRLF `KEY = value` lines) matching the reimplemented PdsReader. Returns the
+/// header path; no companion pixel file is written.
+fn write_pds_header(
+    stem: &str,
+    sign_x: char,
+    sign_y: char,
+    color: u32,
+    size_x: usize,
+    size_y: usize,
+    record_width: usize,
+) -> std::path::PathBuf {
+    let hdr_path = tmp(stem);
+    let mut hdr = Vec::new();
+    hdr.extend_from_slice(b" IDENTIFICATION\r\n");
+    hdr.extend_from_slice(format!("NXP = {size_x}\r\n").as_bytes());
+    hdr.extend_from_slice(format!("NYP = {size_y}\r\n").as_bytes());
+    hdr.extend_from_slice(format!("SIGNX = '{sign_x}'\r\n").as_bytes());
+    hdr.extend_from_slice(format!("SIGNY = '{sign_y}'\r\n").as_bytes());
+    hdr.extend_from_slice(format!("COLOR = {color}\r\n").as_bytes());
+    // The reader divides FILE REC LEN by 2 to get the record (row-pad) width.
+    hdr.extend_from_slice(format!("FILE REC LEN = {}\r\n", record_width * 2).as_bytes());
+    hdr.extend_from_slice(b"END\r\n");
+    std::fs::write(&hdr_path, hdr).unwrap();
+    hdr_path
+}
+
+/// Write a full PDS dataset: a `.hdr` plus its companion `.IMG` (UINT16 LE, each
+/// on-disk row padded to `record_width` with 0xFFFF sentinels). `pixels` is
+/// row-major across `size_c` planar planes of `size_x * size_y` samples.
+fn write_pds_fixture(
+    stem: &str,
+    sign_x: char,
+    sign_y: char,
+    color: u32,
+    size_x: usize,
+    size_y: usize,
+    record_width: usize,
+    pixels: &[u16],
+) -> std::path::PathBuf {
+    let hdr_path = write_pds_header(stem, sign_x, sign_y, color, size_x, size_y, record_width);
+    let img_path = hdr_path.with_extension("IMG");
+    let pad = record_width - (size_x % record_width);
+    let planes = pixels.len() / (size_x * size_y);
+    let mut img = Vec::new();
+    let mut idx = 0;
+    for _ in 0..planes {
+        for _ in 0..size_y {
+            for _ in 0..size_x {
+                img.extend_from_slice(&pixels[idx].to_le_bytes());
+                idx += 1;
+            }
+            for _ in 0..pad {
+                img.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(&img_path, img).unwrap();
+    hdr_path
+}
+
 #[test]
 fn misc4_raw_payload_readers_crop_real_pixels() {
     // A valid Axon Raw Format (ARF) file per the Java ARFReader: 2 endianness
@@ -3880,18 +3962,19 @@ fn misc4_raw_payload_readers_crop_real_pixels() {
         vec![5, 0, 6, 0, 8, 0, 9, 0]
     );
 
-    let pds_path = tmp("crop.pds");
-    let mut pds_data = b"LINES = 2\nLINE_SAMPLES = 3\nSAMPLE_BITS = 8\nEND\n".to_vec();
-    pds_data.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
-    std::fs::write(&pds_path, pds_data).unwrap();
+    // PDS (Perkin Elmer densitometer): a .hdr + companion .IMG. 3x2 UINT16
+    // grayscale, record width 4 (one pad sample per row).
+    let pds_path =
+        write_pds_fixture("pds_crop.hdr", '+', '+', 1, 3, 2, 4, &[10, 20, 30, 40, 50, 60]);
     let mut pds = bioformats::formats::misc4::PdsReader::new();
     pds.set_id(&pds_path).unwrap();
     assert_eq!(pds.series_count(), 1);
     pds.set_series(0).unwrap();
-    assert_eq!(
-        pds.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
-        vec![2, 3, 5, 6]
-    );
+    let pds_expected: Vec<u8> = [20u16, 30, 50, 60]
+        .iter()
+        .flat_map(|s| s.to_le_bytes())
+        .collect();
+    assert_eq!(pds.open_bytes_region(0, 1, 0, 2, 2).unwrap(), pds_expected);
 
     let his_path = tmp("crop.his");
     let mut his_data = Vec::new();
@@ -4165,38 +4248,36 @@ fn misc4_raw_payload_readers_reject_truncated_or_fake_dimensions() {
     );
     let _ = std::fs::remove_file(&arf_short_path);
 
-    let pds_path = tmp("truncated.pds");
-    let mut pds_data = b"LINES = 2\nLINE_SAMPLES = 3\nSAMPLE_BITS = 8\nEND\n".to_vec();
-    pds_data.extend_from_slice(&[1, 2, 3, 4, 5]);
-    std::fs::write(&pds_path, pds_data).unwrap();
+    // PDS: a companion shorter than the declared (padded) plane is rejected.
+    let pds_short_path = write_pds_header("pds_short.hdr", '+', '+', 1, 3, 2, 4);
+    std::fs::write(pds_short_path.with_extension("IMG"), [0u8; 4]).unwrap();
     let mut pds = bioformats::formats::misc4::PdsReader::new();
-    let err = pds.set_id(&pds_path).unwrap_err();
+    let err = pds.set_id(&pds_short_path).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("shorter than declared")),
         "{err:?}"
     );
 
-    let pds_missing_bits_path = tmp("missing_bits.pds");
-    let mut pds_data = b"LINES = 1\nLINE_SAMPLES = 1\nEND\n".to_vec();
-    pds_data.push(1);
-    std::fs::write(&pds_missing_bits_path, pds_data).unwrap();
+    // PDS: a missing companion pixel file is rejected at set_id.
+    let pds_no_companion = write_pds_header("pds_nocomp.hdr", '+', '+', 1, 3, 2, 4);
     let mut pds = bioformats::formats::misc4::PdsReader::new();
-    let err = pds.set_id(&pds_missing_bits_path).unwrap_err();
+    let err = pds.set_id(&pds_no_companion).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::Format(ref message) if message.contains("missing SAMPLE_BITS")),
+        matches!(err, BioFormatsError::Format(ref message) if message.contains("companion .IMG/.img pixel file not found")),
         "{err:?}"
     );
 
-    let pds_bad_lines_path = tmp("bad_lines.pds");
+    // PDS: a header missing the required NXP keyword is rejected.
+    let pds_no_nxp_path = tmp("pds_no_nxp.hdr");
     std::fs::write(
-        &pds_bad_lines_path,
-        b"LINES = nope\nLINE_SAMPLES = 1\nSAMPLE_BITS = 8\nEND\n1",
+        &pds_no_nxp_path,
+        b" IDENTIFICATION\r\nNYP = 2\r\nFILE REC LEN = 8\r\nEND\r\n".as_slice(),
     )
     .unwrap();
     let mut pds = bioformats::formats::misc4::PdsReader::new();
-    let err = pds.set_id(&pds_bad_lines_path).unwrap_err();
+    let err = pds.set_id(&pds_no_nxp_path).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::Format(ref message) if message.contains("LINES is not a valid integer")),
+        matches!(err, BioFormatsError::Format(ref message) if message.contains("missing NXP keyword")),
         "{err:?}"
     );
 
@@ -4212,9 +4293,9 @@ fn misc4_raw_payload_readers_reject_truncated_or_fake_dimensions() {
     );
 
     let _ = std::fs::remove_file(&arf_path);
-    let _ = std::fs::remove_file(&pds_path);
-    let _ = std::fs::remove_file(&pds_missing_bits_path);
-    let _ = std::fs::remove_file(&pds_bad_lines_path);
+    let _ = std::fs::remove_file(&pds_short_path);
+    let _ = std::fs::remove_file(&pds_no_companion);
+    let _ = std::fs::remove_file(&pds_no_nxp_path);
     let _ = std::fs::remove_file(&his_path);
 }
 
@@ -4245,16 +4326,10 @@ fn misc4_readers_clear_state_after_failed_reopen() {
         Err(BioFormatsError::NotInitialized)
     ));
 
-    let pds_valid = tmp("valid_then_bad.pds");
-    let mut pds_data = b"LINES = 1\nLINE_SAMPLES = 2\nSAMPLE_BITS = 8\nEND\n".to_vec();
-    pds_data.extend_from_slice(&[1, 2]);
-    std::fs::write(&pds_valid, pds_data).unwrap();
-    let pds_invalid = tmp("bad_reopen.pds");
-    std::fs::write(
-        &pds_invalid,
-        b"LINES = nope\nLINE_SAMPLES = 2\nSAMPLE_BITS = 8\nEND\n",
-    )
-    .unwrap();
+    // PDS: a valid .hdr+.IMG dataset, then a reopen on a header whose companion
+    // is missing must clear state.
+    let pds_valid = write_pds_fixture("pds_reopen_ok.hdr", '+', '+', 1, 1, 2, 2, &[10, 20]);
+    let pds_invalid = write_pds_header("pds_reopen_bad.hdr", '+', '+', 1, 1, 2, 2);
     let mut pds = bioformats::formats::misc4::PdsReader::new();
     pds.set_id(&pds_valid).unwrap();
     assert_eq!(pds.series_count(), 1);
@@ -6996,15 +7071,18 @@ fn nd2_chunk_map_finds_non_contiguous_image_chunks() {
     let attr_xml = b"<uiWidth>1</uiWidth><uiHeight>1</uiHeight><uiComp>1</uiComp><uiBpc>8</uiBpc>";
     let attr_pos = push_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
     bytes.extend_from_slice(b"junk-between");
-    let image0_pos = push_chunk(&mut bytes, "ImageDataSeq|0!", &[11]);
+    // 1x1 single-channel: sizeX and sizeC are both odd, so ND2 stores one
+    // scanline-pad sample per row (Java getScanlinePad). Each frame is therefore
+    // 2 bytes (pixel + pad); the reader strips the pad on read.
+    let image0_pos = push_chunk(&mut bytes, "ImageDataSeq|0!", &[11, 0]);
     bytes.extend_from_slice(b"more-junk");
-    let image1_pos = push_chunk(&mut bytes, "ImageDataSeq|1!", &[22]);
+    let image1_pos = push_chunk(&mut bytes, "ImageDataSeq|1!", &[22, 0]);
 
     let mut entries = Vec::new();
     for (name, position, data_len) in [
         ("ImageAttributesLV", attr_pos, attr_xml.len() as u64),
-        ("ImageDataSeq|0", image0_pos, 1u64),
-        ("ImageDataSeq|1", image1_pos, 1u64),
+        ("ImageDataSeq|0", image0_pos, 2u64),
+        ("ImageDataSeq|1", image1_pos, 2u64),
     ] {
         entries.extend_from_slice(name.as_bytes());
         entries.push(b'!');

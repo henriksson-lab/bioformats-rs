@@ -296,10 +296,12 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
         let dtype_size = ds.dtype().map(hdf5_dtype_size).map_err(|e| {
             BioFormatsError::Format(format!("CellH5: cannot read dtype for {ds_path}: {e}"))
         })?;
+        // Java CellH5Reader.java:445-455 maps element size to pixel type:
+        // 1 → UINT8, 2 → UINT16, 4 → INT32 (signed).
         let pixel_type = match dtype_size {
             1 => PixelType::Uint8,
             2 => PixelType::Uint16,
-            4 => PixelType::Uint32,
+            4 => PixelType::Int32,
             other => {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "CellH5: unsupported dtype size {other} for {ds_path}"
@@ -308,7 +310,7 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
         };
         let bytes_per_sample: usize = match pixel_type {
             PixelType::Uint8 => 1,
-            PixelType::Uint32 => 4,
+            PixelType::Int32 => 4,
             _ => 2,
         };
 

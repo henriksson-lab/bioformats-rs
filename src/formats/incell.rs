@@ -41,6 +41,11 @@ pub struct InCellReader {
     field_count: usize,
     // List of (row,col) wells that actually appear in the plate map, in order.
     plate_wells: Vec<(usize, usize)>,
+    // Channels acquired at each timepoint (mirrors Java channelsPerTimepoint).
+    channels_per_timepoint: Vec<u32>,
+    // True when timepoints differ in channel count: each timepoint becomes a
+    // separate series with its own channel count (Java oneTimepointPerSeries).
+    one_timepoint_per_series: bool,
     tiff_reader: crate::tiff::TiffReader,
     tiff_loaded: bool,
     // Captured HCS/OME metadata (built into OmeMetadata on demand).
@@ -75,6 +80,8 @@ impl InCellReader {
             image_files: Vec::new(),
             field_count: 1,
             plate_wells: Vec::new(),
+            channels_per_timepoint: Vec::new(),
+            one_timepoint_per_series: false,
             tiff_reader: crate::tiff::TiffReader::new(),
             tiff_loaded: false,
             hcs: HcsMeta::default(),
@@ -107,6 +114,9 @@ struct InCellMeta {
     // imageFiles[well][field][t][index]
     image_files: Vec<Vec<Vec<Vec<Option<ImagePlane>>>>>,
     total_images: usize,
+    // Channels acquired at each timepoint (mirrors Java channelsPerTimepoint).
+    // When timepoints differ in channel count, oneTimepointPerSeries kicks in.
+    channels_per_timepoint: Vec<u32>,
 
     // Metadata-store fields (mirrors the Java InCellHandler).
     row_name: String,
@@ -464,6 +474,10 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
     if m.field_count == 0 {
         m.field_count = 1;
     }
+    if channels_per_timepoint.is_empty() {
+        channels_per_timepoint.push(m.size_c.max(1));
+    }
+    m.channels_per_timepoint = channels_per_timepoint;
 
     Ok(m)
 }
@@ -616,7 +630,30 @@ impl InCellReader {
             plate_wells.push((0, 0));
         }
         let field_count = m.field_count.max(1);
-        let series_count = plate_wells.len() * field_count;
+
+        // Detect variable channels-per-timepoint (Java InCellReader.java:519-533).
+        // When timepoints differ in channel count, each timepoint becomes its
+        // own series with a per-series channel count.
+        let channels_per_timepoint: Vec<u32> = if m.channels_per_timepoint.is_empty() {
+            vec![size_c]
+        } else {
+            m.channels_per_timepoint.clone()
+        };
+        let one_timepoint_per_series =
+            channels_per_timepoint.windows(2).any(|w| w[0] != w[1]);
+
+        // Number of (well, field) combinations.
+        let well_field_count = plate_wells.len() * field_count;
+        // sizeT used for the channelsPerTimepoint index space. When timepoints
+        // differ, Java indexes by channelsPerTimepoint.size(); otherwise sizeT.
+        let cpt_len = channels_per_timepoint.len().max(1);
+        let series_count = if one_timepoint_per_series {
+            // Java: seriesCount = (totalImages / imageCount) * sizeT, where the
+            // (totalImages/imageCount) factor is the number of well/field combos.
+            well_field_count * size_t as usize
+        } else {
+            well_field_count
+        };
 
         // Determine pixel parameters from the first available TIFF plane.
         let mut size_x = m.image_width;
@@ -664,7 +701,27 @@ impl InCellReader {
         let mut series = Vec::with_capacity(series_count);
         let mut image_files = Vec::with_capacity(series_count);
         for s in 0..series_count {
-            let (well_idx, field) = series_to_well_field(s, &plate_wells, field_count, m.well_cols);
+            // Map the series index to (well, field, timepoint range) following
+            // Java getWellFromSeries / getFieldFromSeries / openBytes.
+            let (well_idx, field, series_size_c, series_size_t, t_base) = if one_timepoint_per_series
+            {
+                // Each timepoint is its own series: series order is well-major,
+                // then field, then timepoint (fastest). See Java lines 519-552,
+                // 807-829: getFieldFromSeries divides by channelsPerTimepoint.size().
+                let s2 = s / cpt_len;
+                let timepoint = s % cpt_len;
+                let (well, fld) =
+                    series_to_well_field(s2, &plate_wells, field_count, m.well_cols);
+                let c = channels_per_timepoint
+                    .get(timepoint)
+                    .copied()
+                    .unwrap_or(size_c);
+                (well, fld, c, 1u32, timepoint as u32)
+            } else {
+                let (well, fld) =
+                    series_to_well_field(s, &plate_wells, field_count, m.well_cols);
+                (well, fld, size_c, size_t, 0u32)
+            };
 
             let mut meta_map = HashMap::new();
             meta_map.insert(
@@ -675,11 +732,11 @@ impl InCellReader {
                 size_x,
                 size_y,
                 size_z,
-                size_c,
-                size_t,
+                size_c: series_size_c,
+                size_t: series_size_t,
                 pixel_type,
                 bits_per_pixel: bits,
-                image_count: size_z * size_c * size_t,
+                image_count: size_z * series_size_c * series_size_t,
                 dimension_order: DimensionOrder::XYZCT,
                 is_rgb: false,
                 is_interleaved: false,
@@ -695,15 +752,20 @@ impl InCellReader {
             series.push(meta);
 
             // Flatten imageFiles[well][field][t][z+c*sizeZ] into XYZCT plane order.
-            let mut planes = vec![ImagePlane::default(); (size_z * size_c * size_t) as usize];
+            // For oneTimepointPerSeries the series carries a single timepoint
+            // (t_base) and series_size_t == 1.
+            let mut planes =
+                vec![ImagePlane::default(); (size_z * series_size_c * series_size_t) as usize];
             if let Some(well) = m.image_files.get(well_idx) {
                 if let Some(field_planes) = well.get(field) {
-                    for t in 0..size_t {
-                        let tp = field_planes.get(t as usize);
-                        for c in 0..size_c {
+                    for t in 0..series_size_t {
+                        let src_t = (t_base + t) as usize;
+                        let tp = field_planes.get(src_t);
+                        for c in 0..series_size_c {
                             for z in 0..size_z {
                                 let src_index = (z + c * size_z) as usize;
-                                let dst = (z + c * size_z + t * size_z * size_c) as usize;
+                                let dst =
+                                    (z + c * size_z + t * size_z * series_size_c) as usize;
                                 if let Some(Some(p)) =
                                     tp.and_then(|tp| tp.get(src_index)).map(|p| p.as_ref())
                                 {
@@ -738,6 +800,8 @@ impl InCellReader {
         self.image_files = image_files;
         self.field_count = field_count;
         self.plate_wells = plate_wells;
+        self.channels_per_timepoint = channels_per_timepoint;
+        self.one_timepoint_per_series = one_timepoint_per_series;
         Ok(())
     }
 }
@@ -804,6 +868,10 @@ impl FormatReader for InCellReader {
         self.path = None;
         self.series.clear();
         self.image_files.clear();
+        self.plate_wells.clear();
+        self.channels_per_timepoint.clear();
+        self.one_timepoint_per_series = false;
+        self.field_count = 1;
         self.current_series = 0;
         self.hcs = HcsMeta::default();
         if self.tiff_loaded {
@@ -848,6 +916,7 @@ impl FormatReader for InCellReader {
         }
         let plane_bytes =
             meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample();
+        let size_z = meta.size_z.max(1);
 
         let plane = self
             .image_files
@@ -856,8 +925,28 @@ impl FormatReader for InCellReader {
             .cloned()
             .unwrap_or_default();
 
+        // Resolve the plane to read. When the requested plane is missing and it
+        // is a Z>0 section, duplicate the corresponding Z=0 plane (Java
+        // InCellReader.java:208-213, duplicatePlanes() defaults to true).
+        let plane = if plane.filename.is_none() {
+            let z = plane_index % size_z;
+            if z > 0 {
+                let z0_index = plane_index - z;
+                self.image_files
+                    .get(self.current_series)
+                    .and_then(|p| p.get(z0_index as usize))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                plane
+            }
+        } else {
+            plane
+        };
+
         let Some(tiff_path) = plane.filename else {
-            // Missing plane: return zero-filled (Java returns the unmodified buffer).
+            // Missing plane (and no Z=0 fallback): return zero-filled.
+            // Java returns the unmodified (zeroed) buffer.
             return Ok(vec![0u8; plane_bytes]);
         };
 
@@ -950,10 +1039,18 @@ impl FormatReader for InCellReader {
 
         // Per-series OmeImage (name, physical size, channels).
         let mut images: Vec<OmeImage> = Vec::with_capacity(series_count);
-        let size_c = self.series.first().map(|m| m.size_c).unwrap_or(1) as usize;
+        // Under oneTimepointPerSeries, the series index is divided by the number
+        // of timepoints before deriving the well/field (Java getWellFromSeries /
+        // getFieldFromSeries, lines 807-829).
+        let total_timepoints = if self.one_timepoint_per_series {
+            self.channels_per_timepoint.len().max(1)
+        } else {
+            1
+        };
         for s in 0..series_count {
-            let well_ordinal = s / field_count;
-            let field = s % field_count;
+            let well_field = s / total_timepoints;
+            let well_ordinal = well_field / field_count;
+            let field = well_field % field_count;
             let (well_row, well_col) = h_well_coords(self, well_ordinal);
 
             // Well label, mirroring the Java row/column naming logic.
@@ -961,6 +1058,8 @@ impl FormatReader for InCellReader {
             let col_label = format_well_label(&h.col_name, well_col);
             let name = format!("Well {}-{}, Field #{}", row_label, col_label, field + 1);
 
+            // Per-series channel count (varies under oneTimepointPerSeries).
+            let size_c = self.series.get(s).map(|m| m.size_c).unwrap_or(1) as usize;
             let mut channels = Vec::with_capacity(size_c);
             for q in 0..size_c {
                 channels.push(OmeChannel {
@@ -987,19 +1086,26 @@ impl FormatReader for InCellReader {
         // Wells are indexed by their ordinal in plate_wells (the populated wells).
         let mut wells: Vec<OmeWell> = Vec::with_capacity(self.plate_wells.len());
         for (well_ordinal, &(well_row, well_col)) in self.plate_wells.iter().enumerate() {
-            let mut well_samples = Vec::with_capacity(field_count);
+            let mut well_samples = Vec::with_capacity(field_count * total_timepoints);
+            // Each (field, timepoint) maps to one series under oneTimepointPerSeries;
+            // otherwise total_timepoints is 1 and this reduces to one per field.
+            let mut sample = 0usize;
             for field in 0..field_count {
-                let series = well_ordinal * field_count + field;
-                if series >= series_count {
-                    continue;
+                for tp in 0..total_timepoints {
+                    let series =
+                        (well_ordinal * field_count + field) * total_timepoints + tp;
+                    if series >= series_count {
+                        continue;
+                    }
+                    well_samples.push(OmeWellSample {
+                        id: Some(create_lsid("WellSample", &[0, well_ordinal, sample])),
+                        index: series as u32,
+                        image_ref: Some(series),
+                        position_x: h.pos_x.get(&field).copied(),
+                        position_y: h.pos_y.get(&field).copied(),
+                    });
+                    sample += 1;
                 }
-                well_samples.push(OmeWellSample {
-                    id: Some(create_lsid("WellSample", &[0, well_ordinal, field])),
-                    index: series as u32,
-                    image_ref: Some(series),
-                    position_x: h.pos_x.get(&field).copied(),
-                    position_y: h.pos_y.get(&field).copied(),
-                });
             }
             wells.push(OmeWell {
                 id: Some(create_lsid("Well", &[0, well_ordinal])),

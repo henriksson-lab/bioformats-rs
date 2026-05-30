@@ -420,7 +420,12 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
     // --- calculateDimensions: per-dimension extents (ZeissCZIReader:1942-2048) ---
     let mut max_z = 0i32;
     let mut max_c = 0i32;
-    let mut max_t = 0i32;
+    // Largest Z.size seen: a single subblock may encode the full Z range via its
+    // dimension.size rather than per-Z starts (ZeissCZIReader:1982-1983).
+    let mut max_z_size = 0i32;
+    // Distinct T index values across all subblocks: Java accumulates a uniqueT set
+    // over [start, start+size) and uses its cardinality (ZeissCZIReader:1986-1995).
+    let mut unique_t: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let mut first_pixel_type = 0i32;
 
     // Distinct pixel-type codes in first-seen order (ZeissCZIReader:969-977).
@@ -465,9 +470,13 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
         }
 
         // C/Z/T (logical max, ZeissCZIReader case 'C'/'Z'/'T').
-        if let Some(&(start, _)) = e.dims.get("Z") {
-            if start > max_z {
+        if let Some(&(start, size)) = e.dims.get("Z") {
+            // ZeissCZIReader:1978-1984. Prefer the per-Z start extent; otherwise a
+            // single subblock may encode the whole Z range via its dimension.size.
+            if start > 0 && start > max_z {
                 max_z = start;
+            } else if size > max_z_size {
+                max_z_size = size;
             }
         }
         if let Some(&(start, _)) = e.dims.get("C") {
@@ -475,9 +484,10 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
                 max_c = start;
             }
         }
-        if let Some(&(start, _)) = e.dims.get("T") {
-            if start > max_t {
-                max_t = start;
+        if let Some(&(start, size)) = e.dims.get("T") {
+            // ZeissCZIReader:1986-1995. Count distinct T values over [start,start+size).
+            for i in start..start + size.max(1) {
+                unique_t.insert(i);
             }
         }
         // Extra/modulo dimensions (ZeissCZIReader case 'S'/'I'/'B'/'M'/'H'/'V').
@@ -586,9 +596,13 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
         c.phases = (max_h - min_h).max(1);
     }
 
-    let mut z_count = (max_z + 1) as u32;
+    // sizeZ: max of the per-Z-start extent (max_z + 1) and any single subblock
+    // that spanned the whole Z range via dimension.size (ZeissCZIReader:1978-1984).
+    let mut z_count = ((max_z + 1) as u32).max(max_z_size.max(0) as u32);
     let mut c_count = (max_c + 1) as u32;
-    let mut t_count = (max_t + 1) as u32;
+    // sizeT = |uniqueT| (ZeissCZIReader:1986-1995), falling back to 1 when no
+    // subblock declared a T dimension.
+    let mut t_count = (unique_t.len() as u32).max(1);
 
     let (pt, spp) = czi_pixel_type(first_pixel_type)?;
 
@@ -1474,21 +1488,37 @@ impl CziReader {
         let mut seg_hdr = vec![0u8; SEG_HEADER];
         f.read_exact(&mut seg_hdr).map_err(BioFormatsError::Io)?;
 
-        // SubBlock body (matching ZeissCZIReader.SubBlock.fillInData):
-        //   body_start = file_position + HEADER_SIZE
+        // SubBlock body (matching ZeissCZIReader.SubBlock.fillInData:4175-4183):
+        //   body_start (fp) = file_position + HEADER_SIZE
         //   metadataSize (int), attachmentSize (int), dataSize (long) -> 16 bytes
-        //   DirectoryEntry, then skip so the fixed part of the body is 256 bytes
-        //   total (measured from body_start), then metadata of metadataSize bytes.
-        // Pixel data therefore starts at body_start + 256 + metadataSize.
+        //   DirectoryEntry, then skip max(256 - (filePointer - fp), 0) so the
+        //   fixed part of the body is *at least* 256 bytes (measured from fp),
+        //   then metadata of metadataSize bytes. Pixel data therefore starts at
+        //   fp + max(256, 16 + dirEntryLen) + metadataSize.
         let mut sb_hdr = vec![0u8; 16];
         f.read_exact(&mut sb_hdr).map_err(BioFormatsError::Io)?;
         let metadata_size = read_i32(&sb_hdr, 0) as u64;
         let data_size = read_u64(&sb_hdr, 8);
 
-        // We have already consumed the 16-byte size header out of the 256-byte
-        // fixed body, so skip the remaining (256 - 16) bytes plus the metadata.
-        f.seek(SeekFrom::Current((256 - 16) + metadata_size as i64))
-            .map_err(BioFormatsError::Io)?;
+        // Read the subblock's own DirectoryEntry header far enough to learn its
+        // dimensionCount, then compute its on-disk length. The DirectoryEntry is
+        // a 32-byte fixed header (dimensionCount at offset 28) followed by 20
+        // bytes per DimensionEntry (ZeissCZIReader.DirectoryEntry:4604-4630).
+        let mut de_hdr = vec![0u8; 32];
+        f.read_exact(&mut de_hdr).map_err(BioFormatsError::Io)?;
+        let dim_count = read_i32(&de_hdr, 28).max(0) as i64;
+        let dir_entry_len = 32 + 20 * dim_count;
+
+        // Java skips max(256 - (filePointer - fp), 0) once positioned just after
+        // the full DirectoryEntry, where (filePointer - fp) == 16 + dir_entry_len.
+        // We have so far consumed only 16 + 32 bytes (size header + DirectoryEntry
+        // fixed header), so to reach Java's post-DirectoryEntry position we must
+        // first skip the remaining DimensionEntry array (20*dim_count bytes), then
+        // apply Java's padding skip of max(256 - 16 - dir_entry_len, 0), then the
+        // metadata. When dim_count is large (dir_entry_len > 240) the padding skip
+        // is 0, so pixel data starts immediately after metadata (no fixed 256).
+        let skip = 20 * dim_count + (256 - 16 - dir_entry_len).max(0) + metadata_size as i64;
+        f.seek(SeekFrom::Current(skip)).map_err(BioFormatsError::Io)?;
 
         let mut compressed = vec![0u8; data_size as usize];
         f.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;

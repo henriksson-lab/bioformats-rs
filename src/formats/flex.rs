@@ -184,9 +184,16 @@ impl FlexReader {
     }
 
     /// Parse `<Array Name=.. Factor=..>` arrays and derive factors / widening.
-    /// Returns the factor vector (`None` when all factors are 1) and updates
-    /// `scaled_pixel_type` from the largest factor (Java semantics).
-    fn derive_factors(&mut self, total_planes: usize) -> Result<Option<Vec<f64>>> {
+    /// Returns the factor vector (`None` when all factors are 1). The scaled
+    /// pixel type is only widened from the first file's factors: Java derives
+    /// `core.get(0).pixelType` from file-0's max factor (FlexReader.java:909),
+    /// so a non-first file must not widen it. Pass `update_pixel_type = false`
+    /// for files other than the first.
+    fn derive_factors(
+        &mut self,
+        total_planes: usize,
+        update_pixel_type: bool,
+    ) -> Result<Option<Vec<f64>>> {
         if total_planes == 0 {
             return Err(BioFormatsError::Format(
                 "Flex: TIFF file has no image planes".into(),
@@ -234,11 +241,13 @@ impl FlexReader {
             }
         }
 
-        let max_factor = factor_values.get(max_idx).copied().unwrap_or(1.0);
-        if max_factor > 256.0 {
-            self.scaled_pixel_type = Some(PixelType::Uint32);
-        } else if max_factor > 1.0 {
-            self.scaled_pixel_type = Some(PixelType::Uint16);
+        if update_pixel_type {
+            let max_factor = factor_values.get(max_idx).copied().unwrap_or(1.0);
+            if max_factor > 256.0 {
+                self.scaled_pixel_type = Some(PixelType::Uint32);
+            } else if max_factor > 1.0 {
+                self.scaled_pixel_type = Some(PixelType::Uint16);
+            }
         }
 
         if one_factors {
@@ -635,7 +644,7 @@ impl FormatReader for FlexReader {
                 let total_planes: usize = (0..self.inner.series_count())
                     .map(|s| self.inner.series_list()[s].metadata.image_count as usize)
                     .sum();
-                let factors = self.derive_factors(total_planes)?;
+                let factors = self.derive_factors(total_planes, true)?;
 
                 if let Some(pt) = self.scaled_pixel_type {
                     let series = self.inner.series_list_mut();
@@ -749,8 +758,9 @@ impl FormatReader for FlexReader {
                 ));
             }
 
-            // Derive factors & widening from series-0 XML.
-            let factors = self.derive_factors(n_planes as usize)?;
+            // Derive factors & widening from series-0 XML. Only the first file
+            // sets the scaled pixel type (Java FlexReader.java:909).
+            let factors = self.derive_factors(n_planes as usize, true)?;
             flex_files[0].factors = factors;
 
             // populateCoreMetadata field logic (faithful to the common case):
@@ -799,7 +809,9 @@ impl FormatReader for FlexReader {
                         n_planes
                     )));
                 }
-                let f = self.derive_factors(np as usize)?;
+                // Non-first files contribute their own per-plane factors but must
+                // not widen the scaled pixel type (derived from file 0 only).
+                let f = self.derive_factors(np as usize, false)?;
                 flex_files[i].factors = f;
             }
 

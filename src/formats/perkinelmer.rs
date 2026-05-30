@@ -279,7 +279,7 @@ fn parse_pe_dataset(id: &Path) -> Result<(PeMeta, Vec<PixelsFile>, usize, bool)>
     let mut is_tiff = true;
     let mut prefix: Option<String> = None;
 
-    for name in &entries {
+    for (dir_index, name) in entries.iter().enumerate() {
         let dot = name.rfind('.');
         let stem = match dot {
             Some(d) => &name[..d],
@@ -329,7 +329,10 @@ fn parse_pe_dataset(id: &Path) -> Result<(PeMeta, Vec<PixelsFile>, usize, bool)>
                     name[dot_pos - 8..dot_pos - 4].parse::<i32>().unwrap_or(0),
                 )
             } else {
-                (temp_files.len() as i32, 0)
+                // Java PerkinElmerReader.java:386 uses `i`, the index into the
+                // full sorted directory listing (companions included), not the
+                // count of pixel files collected so far.
+                (dir_index as i32, 0)
             };
             temp_files.push(PixelsFile {
                 path,

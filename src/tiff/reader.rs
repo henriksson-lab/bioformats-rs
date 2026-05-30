@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
@@ -37,6 +37,11 @@ struct IfdInfo {
     tile_width: u32,
     tile_height: u32,
     rows_per_strip: u32,
+    /// Whether the RowsPerStrip tag was actually present in the IFD. When absent,
+    /// `rows_per_strip` is synthesized as `height`. Java's getStripByteCounts
+    /// (IFD.java:870-877) doubles LZW strip byte counts when the tag is absent, so
+    /// the raw presence must be tracked separately from the synthesized value.
+    rows_per_strip_present: bool,
     strip_offsets: Vec<u64>,
     strip_byte_counts: Vec<u64>,
     tile_offsets: Vec<u64>,
@@ -59,6 +64,9 @@ struct OmeTiffImage {
     size_t: u32,
     pixel_type: PixelType,
     bits_per_pixel: u8,
+    /// SamplesPerPixel from the first `<Channel>`, used by Java
+    /// OMETiffReader.initFile:1212 to compute `rgb`.
+    samples_per_pixel: u32,
     dimension_order: DimensionOrder,
     tiff_data: Vec<OmeTiffData>,
 }
@@ -276,10 +284,11 @@ impl TiffReader {
             (0, 0)
         };
 
+        let rows_per_strip_present = !is_tiled && ifd.get(tag::ROWS_PER_STRIP).is_some();
         let rows_per_strip = if is_tiled {
             0
         } else {
-            if ifd.get(tag::ROWS_PER_STRIP).is_some() {
+            if rows_per_strip_present {
                 ifd.get_u32(tag::ROWS_PER_STRIP).unwrap_or(0)
             } else {
                 height
@@ -355,6 +364,7 @@ impl TiffReader {
             tile_width,
             tile_height,
             rows_per_strip,
+            rows_per_strip_present,
             strip_offsets,
             strip_byte_counts,
             tile_offsets,
@@ -538,10 +548,13 @@ impl TiffReader {
 
             // Layout hints: from a resolved IFD if available, else inferred from
             // the OME-XML pixel type / channel layout.
+            // Java OMETiffReader.initFile:1212 sets `m.rgb = samples > 1 ||
+            // photo == RGB`, where `samples` is the OME-XML Channel SamplesPerPixel
+            // and `photo` is the first IFD's photometric interpretation. This is
+            // broader than the generic TIFF rule (spp >= 3 && photo in {RGB,YCbCr}).
             let (is_rgb, is_interleaved, is_indexed, lookup_table) = match &first_info {
                 Some(info) => (
-                    info.samples_per_pixel >= 3
-                        && matches!(info.photometric, Photometric::Rgb | Photometric::YCbCr),
+                    image.samples_per_pixel > 1 || info.photometric == Photometric::Rgb,
                     is_interleaved_rgb(info),
                     info.photometric == Photometric::Palette,
                     info.color_map.as_ref().map(|(r, g, b)| {
@@ -552,7 +565,12 @@ impl TiffReader {
                         }
                     }),
                 ),
-                None => (image.effective_c < image.size_c, false, false, None),
+                None => (
+                    image.samples_per_pixel > 1 || image.effective_c < image.size_c,
+                    false,
+                    false,
+                    None,
+                ),
             };
 
             let mut meta = crate::common::metadata::ImageMetadata {
@@ -1061,6 +1079,17 @@ impl TiffReader {
             info.rows_per_strip
         };
 
+        // Java IFD.getStripByteCounts (IFD.java:870-877) doubles the stored LZW
+        // strip byte counts when RowsPerStrip is absent OR imageLength is not an
+        // exact multiple of RowsPerStrip[0] (the clamped value). The doubled count
+        // is the number of compressed bytes read per strip; decompression still
+        // stops at `expected` output bytes. Gated strictly on LZW so the common
+        // path is untouched.
+        let lzw_double_byte_counts = info.compression == Compression::Lzw
+            && (!info.rows_per_strip_present
+                || rows_per_strip == 0
+                || info.height % rows_per_strip != 0);
+
         // We assemble the full plane row-by-row, then crop to [x, y, w, h].
         let requested_rows_bytes = checked_mul_usize(h as usize, row_bytes, "TIFF crop row bytes")?;
         let mut plane_rows: Vec<u8> =
@@ -1088,7 +1117,23 @@ impl TiffReader {
             }
 
             let offset = info.strip_offsets[strip_idx];
-            let byte_count = info.strip_byte_counts[strip_idx] as usize;
+            let mut byte_count = info.strip_byte_counts[strip_idx] as usize;
+            if lzw_double_byte_counts {
+                // Read up to double the stored count (Java IFD.java:870-877), but
+                // never past the end of the file. The LZW decoder stops at the EOI
+                // marker, so trailing bytes from the next strip / file tail are
+                // harmless; this only guards the read length so read_exact (which
+                // requires exactly N bytes) does not fail near EOF.
+                let doubled = byte_count.saturating_mul(2);
+                let remaining = file
+                    .parser
+                    .reader
+                    .seek(SeekFrom::End(0))
+                    .ok()
+                    .map(|end| end.saturating_sub(offset) as usize)
+                    .unwrap_or(doubled);
+                byte_count = doubled.min(remaining);
+            }
 
             let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
             apply_fill_order(&mut compressed, info.fill_order, info.compression);
@@ -1325,6 +1370,13 @@ impl TiffReader {
             info.rows_per_strip
         };
         let strips_per_channel = div_ceil_u32(info.height, rows_per_strip);
+        // Mirror the LZW StripByteCount doubling in the chunky path / Java
+        // IFD.getStripByteCounts (IFD.java:870-877): gated strictly on LZW with
+        // RowsPerStrip absent or not evenly dividing the image height.
+        let lzw_double_byte_counts = info.compression == Compression::Lzw
+            && (!info.rows_per_strip_present
+                || rows_per_strip == 0
+                || info.height % rows_per_strip != 0);
         let x_start = checked_row_bytes(x, 1, bytes_per_sample)?;
         let x_len = checked_row_bytes(w, 1, bytes_per_sample)?;
         let out_len =
@@ -1365,7 +1417,18 @@ impl TiffReader {
                     continue;
                 }
                 let offset = info.strip_offsets[strip_idx];
-                let byte_count = info.strip_byte_counts[strip_idx] as usize;
+                let mut byte_count = info.strip_byte_counts[strip_idx] as usize;
+                if lzw_double_byte_counts {
+                    let doubled = byte_count.saturating_mul(2);
+                    let remaining = file
+                        .parser
+                        .reader
+                        .seek(SeekFrom::End(0))
+                        .ok()
+                        .map(|end| end.saturating_sub(offset) as usize)
+                        .unwrap_or(doubled);
+                    byte_count = doubled.min(remaining);
+                }
                 let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
                 apply_fill_order(&mut compressed, info.fill_order, info.compression);
                 let strip_rows = strip_end_row - strip_start_row;
@@ -2078,10 +2141,17 @@ fn parse_ome_tiff_images(xml: &str) -> Vec<OmeTiffImage> {
             .as_deref()
             .map(parse_dimension_order)
             .unwrap_or_default();
-        let (pixel_type, bits_per_pixel) = xml_attr(pixels_tag, "Type")
+        let (pixel_type, type_bits) = xml_attr(pixels_tag, "Type")
             .as_deref()
             .map(parse_ome_pixel_type)
             .unwrap_or((PixelType::Uint8, 8));
+        // Java OMETiffReader.initFile:1250-1252 overrides m.bitsPerPixel with the
+        // Pixels SignificantBits attribute when present, falling back to the
+        // pixel-type default otherwise.
+        let bits_per_pixel = parse_u32_attr(pixels_tag, "SignificantBits")
+            .filter(|&b| b > 0 && b <= u8::MAX as u32)
+            .map(|b| b as u8)
+            .unwrap_or(type_bits);
 
         let pixels_end =
             matching_end_tag_start(image_xml, pixels_rel, "Pixels").unwrap_or(image_xml.len());
@@ -2139,6 +2209,7 @@ fn parse_ome_tiff_images(xml: &str) -> Vec<OmeTiffImage> {
             size_t,
             pixel_type,
             bits_per_pixel,
+            samples_per_pixel,
             dimension_order,
             tiff_data,
         });
@@ -3429,6 +3500,7 @@ mod tests {
             size_t: 1,
             pixel_type: PixelType::Uint8,
             bits_per_pixel: 8,
+            samples_per_pixel: 1,
             dimension_order: DimensionOrder::XYZCT,
             tiff_data: vec![
                 OmeTiffData {

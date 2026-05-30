@@ -248,7 +248,8 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32, u32, u32)> 
         size_x = u32::try_from(shape[2])
             .map_err(|_| BioFormatsError::Format("BDV X dimension overflows".into()))?;
     }
-    validate_bdv_cells_dataset(&file, &first_cells_path, size_x, size_y, size_z)?;
+    let (pixel_type, bytes_per_sample) =
+        validate_bdv_cells_dataset(&file, &first_cells_path, size_x, size_y, size_z)?;
 
     // ── Count resolution levels from s00/resolutions ────────────────────────
     let n_resolutions: usize = if let Ok(ds) = file.dataset("s00/resolutions") {
@@ -290,8 +291,8 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32, u32, u32)> 
         size_z,
         size_c,
         size_t,
-        pixel_type: PixelType::Uint16,
-        bits_per_pixel: 16,
+        pixel_type,
+        bits_per_pixel: (bytes_per_sample * 8) as u8,
         image_count,
         dimension_order: DimensionOrder::XYZTC,
         is_rgb: false,
@@ -354,13 +355,16 @@ fn hdf5_dtype_size(dtype: hdf5_pure::DType) -> usize {
     }
 }
 
+/// Validates the cells dataset shape and derives the pixel type from its HDF5
+/// dtype size. Java BDVReader.java:571-579 maps element size to pixel type:
+/// 1 → UINT8, 2 → UINT16, 4 → INT32 (signed). Returns (pixel_type, bytes_per_sample).
 fn validate_bdv_cells_dataset(
     file: &hdf5_pure::File,
     path: &str,
     size_x: u32,
     size_y: u32,
     size_z: u32,
-) -> Result<()> {
+) -> Result<(PixelType, usize)> {
     let ds = file
         .dataset(path)
         .map_err(|e| BioFormatsError::UnsupportedFormat(format!("BDV: missing {path}: {e}")))?;
@@ -368,11 +372,16 @@ fn validate_bdv_cells_dataset(
         .dtype()
         .map(hdf5_dtype_size)
         .map_err(|e| BioFormatsError::Format(format!("BDV: cannot read dtype for {path}: {e}")))?;
-    if dtype_size != 2 {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "BDV: unsupported cells dtype size {dtype_size} for {path}"
-        )));
-    }
+    let (pixel_type, bytes_per_sample) = match dtype_size {
+        1 => (PixelType::Uint8, 1usize),
+        2 => (PixelType::Uint16, 2usize),
+        4 => (PixelType::Int32, 4usize),
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "BDV: unsupported cells dtype size {other} for {path}"
+            )));
+        }
+    };
     let shape = ds
         .shape()
         .map_err(|e| BioFormatsError::Format(format!("BDV: cannot read shape for {path}: {e}")))?;
@@ -382,7 +391,7 @@ fn validate_bdv_cells_dataset(
             "BDV: {path} shape {shape:?} does not match declared {declared:?}"
         )));
     }
-    Ok(())
+    Ok((pixel_type, bytes_per_sample))
 }
 
 impl FormatReader for BdvReader {
@@ -499,13 +508,35 @@ impl FormatReader for BdvReader {
             .dataset(&ds_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
 
+        // Read width-aware: the cells dtype may be 1/2/4 bytes (Uint8/Uint16/
+        // Int32), so dispatch on the resolved pixel type rather than assuming
+        // uint16. Each branch yields the raw little-endian sample bytes.
+        let bps = meta.pixel_type.bytes_per_sample() as usize;
         let plane_pixels = meta.size_x as usize * meta.size_y as usize;
-        let plane_bytes = plane_pixels * 2; // uint16
+        let plane_bytes = plane_pixels * bps;
 
-        let words: Vec<u16> = ds
-            .read_u16()
-            .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-        let raw: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let raw: Vec<u8> = match bps {
+            1 => ds
+                .read_u8()
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
+            2 => {
+                let words: Vec<u16> = ds
+                    .read_u16()
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                words.iter().flat_map(|w| w.to_le_bytes()).collect()
+            }
+            4 => {
+                let words: Vec<u32> = ds
+                    .read_u32()
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                words.iter().flat_map(|w| w.to_le_bytes()).collect()
+            }
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "BDV unsupported bytes-per-sample {other}"
+                )))
+            }
+        };
 
         let offset = z * plane_bytes;
         if offset + plane_bytes <= raw.len() {

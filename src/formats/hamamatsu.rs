@@ -51,6 +51,15 @@ pub struct DcimgReader {
     bytes_per_row: usize,
     bytes_per_image: u64,
     frame_footer_size: u64,
+    /// Whether the per-frame footer carries a four-pixel correction (Java
+    /// `fourPixelCorrectionInFooter`).
+    four_pixel_correction_in_footer: bool,
+    /// Output row whose first four pixels must be restored (Java
+    /// `fourPixelCorrectionLine`).
+    four_pixel_correction_line: usize,
+    /// Absolute file offset of the four original pixels (Java
+    /// `fourPixelCorrectionOffset`).
+    four_pixel_correction_offset: u64,
 }
 
 impl DcimgReader {
@@ -62,6 +71,9 @@ impl DcimgReader {
             bytes_per_row: 0,
             bytes_per_image: 0,
             frame_footer_size: 0,
+            four_pixel_correction_in_footer: false,
+            four_pixel_correction_line: 0,
+            four_pixel_correction_offset: 0,
         }
     }
 }
@@ -135,6 +147,54 @@ impl FormatReader for DcimgReader {
                 bytes_per_image,
                 frame_footer_size,
             )
+        } else if version == 0x7 {
+            // DCIMG_VERSION_0. Mirrors Java parseDCAMVersion0Header (301-320):
+            // headerSize comes from offset 40 (initFile 196-197), then the
+            // version-0 fields live at headerSize + {32, 36, ...}.
+            //
+            //   seek(headerSize); skip 32
+            //   sizeT   = readInt()        @ headerSize + 32
+            //   pixelType = readInt()      @ headerSize + 36
+            //   skip 4
+            //   sizeX   = readInt()        @ headerSize + 44 (num columns)
+            //   bytesPerRow = readUInt()   @ headerSize + 48
+            //   sizeY   = readInt()        @ headerSize + 52 (num rows)
+            //   bytesPerImage = readUInt() @ headerSize + 56
+            //   skip 8
+            //   dataOffset = readInt()     @ headerSize + 68
+            //   offsetToFooter = readLong()@ headerSize + 72
+            //
+            // NOTE: the version-0 footer parsing (parseDCAMVersion0Footer,
+            // 344-388) that populates offsetToFourPixels / fourPixelOffsetInFrame
+            // is NOT implemented here; the version-0 four-pixel correction is
+            // therefore disabled (see four_pixel_correction setup below). This is
+            // an intentional, flagged simplification.
+            let header_size = r_u32_le(&hdr, 40) as u64;
+            let mut v0 = [0u8; 80];
+            f.seek(SeekFrom::Start(header_size))
+                .map_err(BioFormatsError::Io)?;
+            f.read_exact(&mut v0).map_err(|_| {
+                BioFormatsError::Format("DCIMG version 0 header is truncated".into())
+            })?;
+            // n_frames is sizeT for version 0 (single-file => size_t = frames).
+            let n_frames = positive_u32_dim(r_u32_le(&v0, 32), "frame count")?;
+            let pixel_type_code = r_u32_le(&v0, 36);
+            let width = positive_u32_dim(r_u32_le(&v0, 44), "width")?;
+            let bytes_per_row = r_u32_le(&v0, 48) as usize;
+            let height = positive_u32_dim(r_u32_le(&v0, 52), "height")?;
+            let bytes_per_image = r_u32_le(&v0, 56) as u64;
+            let data_offset = header_size + r_u32_le(&v0, 68) as u64;
+            (
+                header_size,
+                n_frames,
+                width,
+                height,
+                pixel_type_code,
+                bytes_per_row,
+                data_offset,
+                bytes_per_image,
+                0,
+            )
         } else {
             let header_size = r_u32_le(&hdr, 16) as u64;
             let n_frames = positive_u32_dim(r_u32_le(&hdr, 20), "frame count")?;
@@ -155,7 +215,8 @@ impl FormatReader for DcimgReader {
             )
         };
 
-        let (pixel_type, bpp): (PixelType, u8) = if version >= 0x0100_0000 {
+        let (pixel_type, bpp): (PixelType, u8) = if version >= 0x0100_0000 || version == 0x7 {
+            // Java initFile (228-234): MONO8 = 1, MONO16 = 2 for both versions.
             match pixel_type_code {
                 1 => (PixelType::Uint8, 8),
                 2 => (PixelType::Uint16, 16),
@@ -229,12 +290,16 @@ impl FormatReader for DcimgReader {
         meta_map.insert("bit_depth".into(), MetadataValue::Int(bpp as i64));
         meta_map.insert("header_size".into(), MetadataValue::Int(header_size as i64));
 
+        // Java (252-253): sizeT = frame count, sizeZ = number of grouped files.
+        // For a single file the group has one member, so size_z = 1 and
+        // size_t = n_frames. image_count stays n_frames (Z*C*T) and plane_index
+        // continues to address frames directly under XYZCT (Z=C=1).
         self.meta = Some(ImageMetadata {
             size_x: width,
             size_y: height,
-            size_z: n_frames,
+            size_z: 1,
             size_c: 1,
-            size_t: 1,
+            size_t: n_frames,
             pixel_type,
             bits_per_pixel: bpp,
             image_count: n_frames,
@@ -255,6 +320,31 @@ impl FormatReader for DcimgReader {
         self.bytes_per_row = bpr;
         self.bytes_per_image = bytes_per_image;
         self.frame_footer_size = frame_footer_size;
+
+        // Four-pixel correction setup (Java getFourPixelCorrectionLine 391-415,
+        // getFourPixelCorrectionOffset 417-423). Only the version-1 branch is
+        // implemented; version-0 requires footer parsing that we do not perform,
+        // so its correction stays disabled.
+        if version >= 0x0100_0000 {
+            // Gate: frameFooterSize >= 512 || frameFooterSize == 32 (401-403).
+            self.four_pixel_correction_in_footer =
+                frame_footer_size >= 512 || frame_footer_size == 32;
+            // Line: sizeY/2 (even) or sizeY/2 + 1 (odd) (408-412).
+            let size_y = height as usize;
+            self.four_pixel_correction_line = if size_y % 2 == 0 {
+                size_y / 2
+            } else {
+                size_y / 2 + 1
+            };
+            // Offset (422): headerSize + dataOffset + bytesPerImage + 12.
+            // data_offset already includes header_size, so omit the extra add.
+            self.four_pixel_correction_offset = data_offset + bytes_per_image + 12;
+        } else {
+            self.four_pixel_correction_in_footer = false;
+            self.four_pixel_correction_line = 0;
+            self.four_pixel_correction_offset = 0;
+        }
+
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -266,6 +356,9 @@ impl FormatReader for DcimgReader {
         self.bytes_per_row = 0;
         self.bytes_per_image = 0;
         self.frame_footer_size = 0;
+        self.four_pixel_correction_in_footer = false;
+        self.four_pixel_correction_line = 0;
+        self.four_pixel_correction_offset = 0;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -312,29 +405,6 @@ impl FormatReader for DcimgReader {
         let mut raw = vec![0u8; plane_bytes];
         f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
 
-        // Four-corner footer correction.
-        //
-        // DCIMG overwrites the first four pixels of every frame with internal
-        // bookkeeping data; the original values of those four pixels are
-        // preserved in the per-frame footer. When a footer is present we read it
-        // and restore the first four pixels of the frame in row-major order.
-        //
-        // The footer is laid out as: <reserved> followed by the four original
-        // corner pixels stored as native-width samples at the tail of the
-        // footer. We take the last `4 * bps` bytes of the footer as those
-        // samples (little-endian), matching the DCIMG on-disk ordering.
-        if self.frame_footer_size as usize >= 4 * bps {
-            let footer_off = offset + self.bytes_per_image;
-            if f.seek(SeekFrom::Start(footer_off)).is_ok() {
-                let mut footer = vec![0u8; self.frame_footer_size as usize];
-                if f.read_exact(&mut footer).is_ok() {
-                    let corner = &footer[footer.len() - 4 * bps..];
-                    let n = (4 * bps).min(raw.len());
-                    raw[..n].copy_from_slice(&corner[..n]);
-                }
-            }
-        }
-
         // DCIMG planes are stored bottom-to-top: the first row in the file is
         // the bottom row of the image. Java's DCIMGReader.openBytes (lines
         // 142-162) reflects this by reading with `for (int row=h-1; row>=0;
@@ -348,6 +418,33 @@ impl FormatReader for DcimgReader {
             let dst = (size_y - 1 - r) * out_row;
             out[dst..dst + out_row].copy_from_slice(&raw[r * row_bytes..r * row_bytes + out_row]);
         }
+
+        // Four-pixel correction (Java openBytes 143-156). DCIMG stashes the
+        // original first four pixels of one interior line elsewhere in the file;
+        // the in-frame copy of those pixels holds bookkeeping data and must be
+        // overwritten. The correction targets output row
+        // `four_pixel_correction_line` and replaces its first four pixels with
+        // four samples read little-endian from `four_pixel_correction_offset`.
+        //
+        // Java compares the *output* row index (its `row` counter runs h-1..0,
+        // i.e. the flipped image), so we apply the patch to `out` after the
+        // vertical flip — landing on the correct displayed row.
+        if self.four_pixel_correction_in_footer {
+            let line = self.four_pixel_correction_line;
+            let n = (4 * bps).min(out_row);
+            if line < size_y && n > 0 {
+                let mut corner = vec![0u8; n];
+                if f
+                    .seek(SeekFrom::Start(self.four_pixel_correction_offset))
+                    .is_ok()
+                    && f.read_exact(&mut corner).is_ok()
+                {
+                    let dst = line * out_row;
+                    out[dst..dst + n].copy_from_slice(&corner);
+                }
+            }
+        }
+
         Ok(out)
     }
 

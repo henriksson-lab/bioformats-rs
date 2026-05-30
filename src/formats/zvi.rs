@@ -549,15 +549,24 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
         1
     };
 
-    // Sort planes by (tile, t, c, z) so each tile's planes form a contiguous,
-    // canonically ordered block.
-    planes.sort_by_key(|p| (p.tile, p.t, p.c, p.z));
-
     let dimension_order = if is_rgb {
         DimensionOrder::XYCZT
     } else {
         DimensionOrder::XYZCT
     };
+
+    // Sort planes so each tile's planes form a contiguous, canonically ordered
+    // block matching the declared dimension order (BaseZeissReader:236-255: RGB
+    // files prepend 'C', giving XYCZT, so C varies fastest; non-RGB is XYZCT, so
+    // Z varies fastest). The sort key lists axes outermost-first, i.e. the
+    // fastest-varying axis comes last.
+    if is_rgb {
+        // XYCZT: C fastest, then Z, then T.
+        planes.sort_by_key(|p| (p.tile, p.t, p.z, p.c));
+    } else {
+        // XYZCT: Z fastest, then C, then T.
+        planes.sort_by_key(|p| (p.tile, p.t, p.c, p.z));
+    }
 
     let meta = ImageMetadata {
         size_x,

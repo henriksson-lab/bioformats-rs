@@ -113,7 +113,10 @@ fn pixel_type_from_str(s: &str) -> Result<PixelType> {
     match s.to_uppercase().as_str() {
         "GRAY8" | "RGB8" => Ok(PixelType::Uint8),
         "GRAY16" | "RGB16" => Ok(PixelType::Uint16),
-        "GRAY32" | "RGB32" => Ok(PixelType::Float32),
+        // Micro-Manager GRAY32 is 32-bit unsigned int, not float. The actual
+        // pixel type is overridden from the first TIFF IFD; this matches the
+        // declared 32-bit unsigned-integer mapping.
+        "GRAY32" | "RGB32" => Ok(PixelType::Uint32),
         other => Err(BioFormatsError::UnsupportedFormat(format!(
             "MicroManager: unsupported PixelType {other}"
         ))),
@@ -177,11 +180,13 @@ impl Position {
         if let Some(p) = self.file_name_map.get(&key) {
             return Some(p.clone());
         }
+        // Java Position.getFile (~1260): only fall back to the raster list when
+        // the FrameKey map is EMPTY; if the map is populated but lacks this
+        // coordinate, return null (None here) rather than a raster fallback.
         if self.file_name_map.is_empty() {
             return self.tiffs.get(no as usize).cloned();
         }
-        // Map exists but no entry for this coordinate: fall back to raster list.
-        self.tiffs.get(no as usize).cloned()
+        None
     }
 }
 

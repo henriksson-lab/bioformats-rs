@@ -13,7 +13,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::tiff::ifd::IfdValue;
+use crate::tiff::ifd::{tag, Compression, IfdValue};
 use crate::tiff::parser::TiffParser;
 use crate::tiff::TiffReader;
 
@@ -125,6 +125,10 @@ fn parse_lsm_info(bytes: &[u8], le: bool) -> Result<LsmInfo> {
     }
 
     let dim_z = read_i32_lsm(bytes, 16, le);
+    // ZeissLSMReader.java:773-777 reads sizeZ (offset 16), SKIPS the channel
+    // field (offset 20), then reads sizeT (offset 24). sizeC is taken from the
+    // TIFF, not from this struct, so the offset-20 channel count is read here
+    // only for the validity check (Java does not use it for sizeC).
     let dim_c = read_i32_lsm(bytes, 20, le);
     let dim_t = read_i32_lsm(bytes, 24, le);
     if dim_z <= 0 || dim_c <= 0 || dim_t <= 0 {
@@ -325,6 +329,22 @@ impl FormatReader for LsmReader {
         // Open with inner TIFF reader to get pixel dimensions and read pixel data
         self.inner.set_id(path)?;
 
+        // ZeissLSMReader.java:544-548 — many .lsm files carry a stray
+        // PREDICTOR=2 tag on IFDs whose compression is NOT LZW; the predictor
+        // must only be honoured for LZW data. Force PREDICTOR=1 on every IFD
+        // that is not LZW-compressed, after the inner reader has parsed the
+        // IFDs and before any pixel read (read_plane_bytes re-derives the
+        // predictor from the live IFD, so this mutation takes effect).
+        let ifd_count = self.inner.ifd_count();
+        for i in 0..ifd_count {
+            if let Some(ifd) = self.inner.ifd_mut(i) {
+                if ifd.compression() != Compression::Lzw {
+                    ifd.entries
+                        .insert(tag::PREDICTOR, IfdValue::Short(vec![1]));
+                }
+            }
+        }
+
         // The TIFF reader may have multiple series (full-res + thumbnails).
         // Select the series with the largest images.
         let n_series = self.inner.series_count();
@@ -343,7 +363,17 @@ impl FormatReader for LsmReader {
         let full_res_ifd_count = self.configure_full_resolution_series(best_series);
         let tiff_meta = self.inner.metadata().clone();
 
-        // Build corrected metadata using LSM dimensions
+        // Build corrected metadata using LSM dimensions.
+        //
+        // NOTE: Java ZeissLSMReader takes sizeC from the TIFF SamplesPerPixel and
+        // later reconciles separate-IFD channel planes back into C via its
+        // imageCount-vs-ifds.size() block (java:894-911). We do NOT port that
+        // reconciliation, so taking sizeC from the TIFF samples alone would
+        // collapse separate-IFD multichannel LSMs to sizeC=1 and under-count
+        // planes. The CZ-LSMINFO channel field (offset 20) already gives the
+        // correct channel count for those files, so we keep using it; the
+        // `lsm_uses_packed_channels` heuristic still handles interleaved/packed
+        // RGB. (See the reverted "sizeC from TIFF" attempt.)
         let dim_z = lsm_info.dim_z;
         let dim_c = lsm_info.dim_c;
         let dim_t = lsm_info.dim_t;

@@ -1585,16 +1585,27 @@ impl FormatReader for MincReader {
             .dtype()
             .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 dtype: {e}")))?;
 
+        // Java MINCReader.initFile (lines 157-171): the data is unsigned by
+        // default; for MINC-2 it is marked SIGNED only when an "_Unsigned"
+        // attribute is present and does NOT start with "true". The HDF5 storage
+        // signedness is ignored entirely.
         let unsigned_attr: Option<bool> = if is_minc2 {
             ds.attrs().ok().and_then(|attrs| {
                 attrs.get("_Unsigned").map(|v| {
-                    // Java: signed unless the attribute starts with "true".
-                    format!("{v:?}").to_ascii_lowercase().contains("true")
+                    // true => unsigned; anything else (the attribute is present
+                    // but not "true...") => signed.
+                    format!("{v:?}")
+                        .trim_start_matches(['"', '\''])
+                        .to_ascii_lowercase()
+                        .starts_with("true")
                 })
             })
         } else {
             None
         };
+        // unsigned_attr == Some(true) => unsigned; Some(false) => signed;
+        // None (no attribute / not MINC-2) => unsigned default.
+        let signed = unsigned_attr.map_or(false, |u| !u);
 
         // Read the raw values via the matching typed reader and re-emit them as
         // little-endian bytes (MINCReader uses isLittleEndian()==isMINC2 for the
@@ -1602,7 +1613,6 @@ impl FormatReader for MincReader {
         // metadata accordingly).
         let (pixel_type, bits, pixels): (PixelType, u8, Vec<u8>) = match &dtype {
             DType::U8 | DType::I8 => {
-                let signed = matches!(dtype, DType::I8) && unsigned_attr != Some(false);
                 let raw = ds
                     .read_u8()
                     .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
@@ -1614,7 +1624,6 @@ impl FormatReader for MincReader {
                 (pt, 8, raw)
             }
             DType::U16 | DType::I16 => {
-                let signed = matches!(dtype, DType::I16) && unsigned_attr != Some(false);
                 let raw = ds
                     .read_i16()
                     .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
@@ -1630,7 +1639,6 @@ impl FormatReader for MincReader {
                 (pt, 16, bytes)
             }
             DType::U32 | DType::I32 => {
-                let signed = matches!(dtype, DType::I32) && unsigned_attr != Some(false);
                 let raw = ds
                     .read_i32()
                     .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
@@ -2028,11 +2036,15 @@ impl FormatReader for Jpeg2000Reader {
     }
 
     fn series_count(&self) -> usize {
-        0
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.meta.is_some() && s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {

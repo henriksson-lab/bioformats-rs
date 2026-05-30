@@ -61,14 +61,29 @@ fn parse_meta_sizes(value: &str) -> Result<Vec<u32>> {
         .collect()
 }
 
+/// How the pixel data is stored across files (MetaIO `ElementDataFile`).
+#[derive(Clone)]
+enum DataLayout {
+    /// `LOCAL`: data follows the header in the same file.
+    Local,
+    /// A single detached file (one path, all planes packed sequentially).
+    Single(String),
+    /// `LIST` or a printf pattern: one file per slice.
+    PerSlice(Vec<String>),
+}
+
 struct MhdHeader {
     ndims: usize,
     sizes: Vec<u32>,
     pixel_type: PixelType,
     little_endian: bool,
     compressed: bool,
-    data_file: Option<String>, // "LOCAL" or path
+    layout: Option<DataLayout>,
     data_offset: u64,
+    /// MetaIO `HeaderSize`: bytes to skip in the detached data file before the
+    /// pixels. `None` if unspecified, `Some(-1)` for auto (skip = fileLen -
+    /// dataLen), `Some(n>=0)` for an explicit byte count.
+    header_size: Option<i64>,
     extra: HashMap<String, String>,
 }
 
@@ -81,8 +96,9 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
     let mut pixel_type = PixelType::Uint8;
     let mut little_endian = true;
     let mut compressed = false;
-    let mut data_file: Option<String> = None;
+    let mut layout: Option<DataLayout> = None;
     let mut data_offset = 0u64;
+    let mut header_size: Option<i64> = None;
     let mut extra: HashMap<String, String> = HashMap::new();
 
     loop {
@@ -115,10 +131,50 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
                 "BINARYDATA" if val.eq_ignore_ascii_case("false") => {}
                 "BINARYDATABYTEORDERMSB" => little_endian = !val.eq_ignore_ascii_case("true"),
                 "COMPRESSEDDATA" => compressed = val.eq_ignore_ascii_case("true"),
+                "HEADERSIZE" => {
+                    header_size = Some(parse_meta_scalar::<i64>(val, "HeaderSize")?);
+                }
                 "ELEMENTDATAFILE" => {
-                    data_file = Some(val.to_string());
-                    if val.eq_ignore_ascii_case("LOCAL") {
+                    // MetaIO ElementDataFile may be:
+                    //   LOCAL            data follows the header in this file
+                    //   <path>           a single detached data file
+                    //   LIST [n]         one filename per following line
+                    //   <printf-pattern> <start> <stop> <step>  generated names
+                    let upper = val.to_ascii_uppercase();
+                    if upper == "LOCAL" {
                         data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
+                        layout = Some(DataLayout::Local);
+                    } else if upper == "LIST" || upper.starts_with("LIST ") {
+                        // Remaining non-empty lines each name one slice file.
+                        let mut files = Vec::new();
+                        loop {
+                            let mut l = String::new();
+                            let m = reader.read_line(&mut l).map_err(BioFormatsError::Io)?;
+                            if m == 0 {
+                                break;
+                            }
+                            let t = l.trim();
+                            if !t.is_empty() {
+                                files.push(t.to_string());
+                            }
+                        }
+                        layout = Some(DataLayout::PerSlice(files));
+                    } else if val.contains('%') {
+                        // printf pattern, optionally followed by start stop step.
+                        let parts: Vec<&str> = val.split_ascii_whitespace().collect();
+                        let pattern = parts[0];
+                        let (start, stop, step) = match parts.len() {
+                            n if n >= 4 => (
+                                parse_meta_scalar::<i64>(parts[1], "DataFile start")?,
+                                parse_meta_scalar::<i64>(parts[2], "DataFile stop")?,
+                                parse_meta_scalar::<i64>(parts[3], "DataFile step")?,
+                            ),
+                            _ => (1, 1, 1),
+                        };
+                        let files = expand_printf_pattern(pattern, start, stop, step)?;
+                        layout = Some(DataLayout::PerSlice(files));
+                    } else {
+                        layout = Some(DataLayout::Single(val.to_string()));
                     }
                 }
                 _ => {
@@ -151,10 +207,49 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
         pixel_type,
         little_endian,
         compressed,
-        data_file,
+        layout,
         data_offset,
+        header_size,
         extra,
     })
+}
+
+/// Expand a MetaIO printf-style `ElementDataFile` pattern (e.g. `slice%03d.raw`)
+/// into one filename per slice for the inclusive range `start..=stop` stepping
+/// by `step`. Only the integer `%[0][width]d` conversion is supported.
+fn expand_printf_pattern(pattern: &str, start: i64, stop: i64, step: i64) -> Result<Vec<String>> {
+    if step == 0 {
+        return Err(BioFormatsError::Format(
+            "MetaImage: ElementDataFile printf step must be non-zero".into(),
+        ));
+    }
+    // Locate the single %d-style conversion.
+    let pct = pattern.find('%').ok_or_else(|| {
+        BioFormatsError::Format("MetaImage: ElementDataFile pattern has no '%' conversion".into())
+    })?;
+    let d = pattern[pct..].find('d').ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "MetaImage: unsupported ElementDataFile conversion in {pattern:?} (only %d)"
+        ))
+    })?;
+    let spec = &pattern[pct + 1..pct + d]; // e.g. "03" or ""
+    let zero_pad = spec.starts_with('0');
+    let width: usize = spec.trim_start_matches('0').parse().unwrap_or(0);
+    let prefix = &pattern[..pct];
+    let suffix = &pattern[pct + d + 1..];
+
+    let mut files = Vec::new();
+    let mut i = start;
+    while (step > 0 && i <= stop) || (step < 0 && i >= stop) {
+        let num = if zero_pad {
+            format!("{i:0width$}")
+        } else {
+            format!("{i:width$}")
+        };
+        files.push(format!("{prefix}{num}{suffix}"));
+        i += step;
+    }
+    Ok(files)
 }
 
 // ---- reader -----------------------------------------------------------------
@@ -188,32 +283,67 @@ impl MetaImageReader {
             .and_then(|v| v.checked_mul(meta.size_c as usize))
             .and_then(|v| v.checked_mul(bps))
             .ok_or_else(|| BioFormatsError::InvalidData("MetaImage: plane size overflow".into()))?;
-        let plane_offset = (plane_index as u64)
+        let parent = mhd_path.parent().unwrap_or(Path::new("."));
+        let resolve = |s: &str| -> Result<PathBuf> {
+            confined_join(parent, s).ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "MetaImage: ElementDataFile escapes image directory: {s}"
+                ))
+            })
+        };
+
+        // Resolve the data file for this plane, how many planes that file holds,
+        // and the index of the requested plane within that file. For a single
+        // packed file all planes share one file; for per-slice layouts each
+        // file holds exactly one plane.
+        let (data_path, base_offset, planes_in_file, plane_in_file) = match &hdr.layout {
+            Some(DataLayout::Local) => {
+                (mhd_path.clone(), hdr.data_offset, meta.image_count, plane_index)
+            }
+            Some(DataLayout::Single(s)) => (resolve(s)?, 0, meta.image_count, plane_index),
+            None => {
+                // Default: sibling .raw file, all planes packed.
+                (mhd_path.with_extension("raw"), 0, meta.image_count, plane_index)
+            }
+            Some(DataLayout::PerSlice(files)) => {
+                let f = files.get(plane_index as usize).ok_or_else(|| {
+                    BioFormatsError::InvalidData(format!(
+                        "MetaImage: ElementDataFile list has no entry for plane {plane_index}"
+                    ))
+                })?;
+                (resolve(f)?, 0, 1u32, 0u32)
+            }
+        };
+
+        // HeaderSize: bytes to skip in the data file before the pixels. -1 means
+        // auto (skip = fileLen - dataLen for the bytes this file should hold).
+        let header_skip: u64 = match hdr.header_size {
+            None | Some(0) => 0,
+            Some(n) if n > 0 => n as u64,
+            Some(_) => {
+                // Auto: file length minus the data this file is meant to contain.
+                let file_len = std::fs::metadata(&data_path)
+                    .map_err(BioFormatsError::Io)?
+                    .len();
+                let data_len = (planes_in_file as u64)
+                    .checked_mul(plane_bytes as u64)
+                    .ok_or_else(|| {
+                        BioFormatsError::InvalidData("MetaImage: data size overflow".into())
+                    })?;
+                file_len.saturating_sub(data_len)
+            }
+        };
+
+        let plane_offset = (plane_in_file as u64)
             .checked_mul(plane_bytes as u64)
             .ok_or_else(|| {
                 BioFormatsError::InvalidData("MetaImage: plane offset overflow".into())
             })?;
 
-        let data_path = match &hdr.data_file {
-            Some(s) if s.eq_ignore_ascii_case("LOCAL") => mhd_path.clone(),
-            Some(s) => {
-                let parent = mhd_path.parent().unwrap_or(Path::new("."));
-                confined_join(parent, s).ok_or_else(|| {
-                    BioFormatsError::Format(format!(
-                        "MetaImage: ElementDataFile escapes image directory: {s}"
-                    ))
-                })?
-            }
-            None => {
-                // Try replacing .mhd extension with .raw
-                mhd_path.with_extension("raw")
-            }
-        };
-
         let mut f = File::open(&data_path).map_err(BioFormatsError::Io)?;
 
         let buf = if hdr.compressed {
-            f.seek(SeekFrom::Start(hdr.data_offset))
+            f.seek(SeekFrom::Start(base_offset + header_skip))
                 .map_err(BioFormatsError::Io)?;
             let mut dec = flate2::read::ZlibDecoder::new(f);
             let mut all = Vec::new();
@@ -231,9 +361,12 @@ impl MetaImageReader {
             }
             all[start..end].to_vec()
         } else {
-            let offset = hdr.data_offset.checked_add(plane_offset).ok_or_else(|| {
-                BioFormatsError::InvalidData("MetaImage: plane offset overflow".into())
-            })?;
+            let offset = base_offset
+                .checked_add(header_skip)
+                .and_then(|o| o.checked_add(plane_offset))
+                .ok_or_else(|| {
+                    BioFormatsError::InvalidData("MetaImage: plane offset overflow".into())
+                })?;
             f.seek(SeekFrom::Start(offset))
                 .map_err(BioFormatsError::Io)?;
             let mut buf = vec![0u8; plane_bytes];

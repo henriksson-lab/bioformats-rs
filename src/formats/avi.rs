@@ -383,6 +383,55 @@ const MJPEG_HUFFMAN_TABLE: [u8; 420] = [
     0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
 ];
 
+/// Decode one JPEG/Motion-JPEG frame's raw chunk bytes.
+///
+/// Mirrors `AVIReader.uncompress()` for the JPEG case: detects the
+/// Motion-JPEG ("AVI1") variant (bytes 6..10), splices in the fixed Huffman
+/// table that MJPEG omits, decodes, then converts the YCbCr output back to RGB.
+fn decode_jpeg_frame(raw: &[u8]) -> Result<Vec<u8>> {
+    // Motion-JPEG ("AVI1") detection: Java AVIReader.uncompress() checks
+    // bytes 6..10 == "AVI1". MJPEG omits the DHT (Huffman table) marker,
+    // so we splice the fixed MJPEG_HUFFMAN_TABLE into the stream after
+    // the first 20 bytes before decoding.
+    // Java checks length >= 10 for detection, but the splice copies the
+    // first 20 bytes, so require >= 20 to avoid slicing past the buffer.
+    let motion_jpeg = raw.len() >= 20 && &raw[6..10] == b"AVI1";
+
+    let decoded = if motion_jpeg {
+        let mut fixed = Vec::with_capacity(raw.len() + MJPEG_HUFFMAN_TABLE.len());
+        fixed.extend_from_slice(&raw[..20]);
+        fixed.extend_from_slice(&MJPEG_HUFFMAN_TABLE);
+        fixed.extend_from_slice(&raw[20..]);
+        crate::common::codec::decompress_jpeg(&fixed)?
+    } else {
+        crate::common::codec::decompress_jpeg(raw)?
+    };
+
+    if motion_jpeg {
+        // Decoded MJPEG output is YCbCr; convert to RGB.
+        // See AVIReader.uncompress() (and Wikipedia YCbCr JPEG conversion).
+        let mut buf = decoded;
+        let mut i = 0;
+        while i + 2 < buf.len() {
+            let y = buf[i] as f64;
+            let cb = buf[i + 1] as f64 - 128.0;
+            let cr = buf[i + 2] as f64 - 128.0;
+
+            let red = (y + 1.402 * cr) as i32;
+            let green = (y - 0.34414 * cb - 0.71414 * cr) as i32;
+            let blue = (y + 1.772 * cb) as i32;
+
+            buf[i] = red.clamp(0, 255) as u8;
+            buf[i + 1] = green.clamp(0, 255) as u8;
+            buf[i + 2] = blue.clamp(0, 255) as u8;
+            i += 3;
+        }
+        return Ok(buf);
+    }
+
+    Ok(decoded)
+}
+
 pub struct AviReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -469,7 +518,8 @@ impl FormatReader for AviReader {
             ));
         }
         // For uncompressed data only the listed bit depths are supported.
-        if compression == 0 && !matches!(bit_count, 8 | 16 | 24 | 32) {
+        // Java AVIReader supports 4/8/16/24/32 (see AVIReader.java:717-719).
+        if compression == 0 && !matches!(bit_count, 4 | 8 | 16 | 24 | 32) {
             return Err(BioFormatsError::UnsupportedFormat(format!(
                 "AVI uncompressed bit depth {bit_count} is not supported"
             )));
@@ -495,6 +545,11 @@ impl FormatReader for AviReader {
         // Y8 decodes to single-channel 8-bit. 16-bit is UINT16 RGB (BGR swap).
         let palette = parsed.palette.clone();
         let (size_c, pixel_type, out_is_rgb, is_indexed) = if compression == AVI_JPEG {
+            // Motion-JPEG. We deliberately do NOT decode frame 0 here to derive
+            // sizeC (Java does, but that makes set_id fail on corrupt pixel data
+            // and pay a JPEG decode at init). The reader is lazy: metadata is
+            // accepted as 3-channel RGB and any decode error surfaces at
+            // open_bytes. (Trade-off: grayscale MJPEG is reported as 3-channel.)
             (3u32, PixelType::Uint8, true, false)
         } else if compression == AVI_CINEPAK {
             // Cinepak decodes to 8-bit grayscale or 24-bit RGB.
@@ -520,14 +575,17 @@ impl FormatReader for AviReader {
                 24 => (3u32, PixelType::Uint8, true, false),
                 32 => (4u32, PixelType::Uint8, true, false),
                 16 => (3u32, PixelType::Uint16, true, false),
-                8 if palette.is_some() => (1u32, PixelType::Uint8, false, true),
+                // <= 8-bit indexed (4-bit and 8-bit) decode to a single-channel
+                // UINT8 index plane when a palette is present.
+                4 | 8 if palette.is_some() => (1u32, PixelType::Uint8, false, true),
                 _ => (1u32, PixelType::Uint8, false, false),
             }
         };
 
         // Only validate stored frame sizes for raw uncompressed data, where we
-        // know the exact expected layout.
-        if compression == 0 && bit_count != 16 {
+        // know the exact expected layout. Sub-byte (4-bit) packing has its own
+        // layout, validated in the open_bytes 4-bit path.
+        if compression == 0 && bit_count != 16 && bit_count >= 8 {
             let channels = size_c as usize;
             let (_row_bytes, _stored_row, expected_stored) =
                 avi_frame_layout(width, height, channels)?;
@@ -562,8 +620,12 @@ impl FormatReader for AviReader {
             size_c,
             size_t: 1,
             pixel_type,
+            // Java AVIReader sets bitsPerPixel = bmpBitsPerPixel for <= 8-bit
+            // (so 4-bit reports 4); 16/24/32-bit map to 16/8 here.
             bits_per_pixel: if pixel_type == PixelType::Uint16 {
                 16
+            } else if compression == 0 && bit_count == 4 {
+                4
             } else {
                 8
             },
@@ -706,48 +768,44 @@ impl FormatReader for AviReader {
         if compression == AVI_JPEG {
             let mut raw = vec![0u8; stored_size as usize];
             f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
+            return decode_jpeg_frame(&raw);
+        }
 
-            // Motion-JPEG ("AVI1") detection: Java AVIReader.uncompress() checks
-            // bytes 6..10 == "AVI1". MJPEG omits the DHT (Huffman table) marker,
-            // so we splice the fixed MJPEG_HUFFMAN_TABLE into the stream after
-            // the first 20 bytes before decoding.
-            // Java checks length >= 10 for detection, but the splice copies the
-            // first 20 bytes, so require >= 20 to avoid slicing past the buffer.
-            let motion_jpeg = raw.len() >= 20 && &raw[6..10] == b"AVI1";
-
-            let decoded = if motion_jpeg {
-                let mut fixed = Vec::with_capacity(raw.len() + MJPEG_HUFFMAN_TABLE.len());
-                fixed.extend_from_slice(&raw[..20]);
-                fixed.extend_from_slice(&MJPEG_HUFFMAN_TABLE);
-                fixed.extend_from_slice(&raw[20..]);
-                crate::common::codec::decompress_jpeg(&fixed)?
-            } else {
-                crate::common::codec::decompress_jpeg(&raw)?
-            };
-
-            if motion_jpeg {
-                // Decoded MJPEG output is YCbCr; convert to RGB.
-                // See AVIReader.uncompress() (and Wikipedia YCbCr JPEG conversion).
-                let mut buf = decoded;
-                let mut i = 0;
-                while i + 2 < buf.len() {
-                    let y = buf[i] as f64;
-                    let cb = buf[i + 1] as f64 - 128.0;
-                    let cr = buf[i + 2] as f64 - 128.0;
-
-                    let red = (y + 1.402 * cr) as i32;
-                    let green = (y - 0.34414 * cb - 0.71414 * cr) as i32;
-                    let blue = (y + 1.772 * cb) as i32;
-
-                    buf[i] = red.clamp(0, 255) as u8;
-                    buf[i + 1] = green.clamp(0, 255) as u8;
-                    buf[i + 2] = blue.clamp(0, 255) as u8;
-                    i += 3;
-                }
-                return Ok(buf);
+        // --- 4-bit uncompressed (sub-byte packed indices) ---
+        // Mirrors AVIReader.java:214-231: nibbles are read MSB-first, two per
+        // byte, into a single-channel UINT8 index plane. There is no 4-byte row
+        // padding here (Java's effectiveWidth == sizeX and bmpScanLineSize == 0
+        // for 4-bit), and DIB rows are stored bottom-up.
+        if compression == 0 && bit_count == 4 {
+            // len = bytes per stored row = sizeX / 2 (Java truncates for odd X).
+            let len = width as usize / 2;
+            let raw_size = len * height as usize;
+            if (stored_size as usize) < raw_size {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "AVI: 4-bit frame chunk is too short: got {stored_size}, expected at least {raw_size}"
+                )));
             }
+            let mut raw = vec![0u8; raw_size];
+            f.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
 
-            return Ok(decoded);
+            // Output is a single-channel index plane (size_x * size_y), top-down.
+            // For odd widths only `len*2` pixels per row are decoded (matching
+            // Java's truncation); the trailing pixel stays 0.
+            let out_width = width as usize;
+            let decoded_per_row = len * 2;
+            let mut out = vec![0u8; out_width * height as usize];
+            for stored_row in 0..height as usize {
+                // DIB rows are bottom-up: stored row 0 is the bottom image row.
+                let dst_row = height as usize - 1 - stored_row;
+                let src = &raw[stored_row * len..stored_row * len + len];
+                let dst = &mut out[dst_row * out_width..dst_row * out_width + decoded_per_row];
+                for (i, &byte) in src.iter().enumerate() {
+                    // High nibble first (MSB-first readBits), then low nibble.
+                    dst[i * 2] = byte >> 4;
+                    dst[i * 2 + 1] = byte & 0x0f;
+                }
+            }
+            return Ok(out);
         }
 
         // --- uncompressed / Y8 ---

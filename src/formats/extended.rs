@@ -234,8 +234,14 @@ struct DngCfa {
     /// (`WHITE_BALANCE_RGB_COEFFS`). `None` means white balance is absent and
     /// `adjust_for_white_balance` is a no-op, matching Java.
     white_balance: Option<[f64; 3]>,
-    /// Cached demosaiced interleaved RGB plane.
+    /// Cached demosaiced (or expanded) interleaved RGB plane.
     full_image: Option<Vec<u8>>,
+    /// When `true`, take Java's non-demosaic "expand" path
+    /// (`DNGReader.openBytes` lines 128-148): expand the raw 8-bit samples to
+    /// UINT16 with per-channel white balance and NO Bayer interpolation. This is
+    /// selected when `totalStripBytes == planeSize || bitsPerSample.length > 1`,
+    /// even for `PhotometricInterpretation == CFA_ARRAY`.
+    expand: bool,
 }
 
 /// Port of `DNGReader.adjustForWhiteBalance`: scales sample `val` (already
@@ -303,6 +309,52 @@ impl DngReader {
 
         let mut full = vec![0u8; size_x * size_y * 3 * 2];
         cfahelp::interpolate(&pix, &mut full, &cfa.color_map, size_x, size_y, little);
+        Ok(full)
+    }
+
+    /// Port of the non-demosaic "expand" branch of `DNGReader.openBytes`
+    /// (lines 128-148): the TIFF stores UINT8 samples, but the output pixel type
+    /// is UINT16. Read the raw samples (Java's `tiffParser.getSamples`), then for
+    /// each sample expand `b[i] & 0xff` to a 16-bit value scaled by the
+    /// per-channel white balance (`adjustForWhiteBalance`) and pack it
+    /// little/big-endian. No Bayer interpolation is performed.
+    fn decode_expand(&mut self) -> Result<Vec<u8>> {
+        let (size_x, size_y, little, interleaved, wb) = {
+            let c = self.cfa.as_ref().unwrap();
+            (
+                c.meta.size_x as usize,
+                c.meta.size_y as usize,
+                c.meta.is_little_endian,
+                c.meta.is_interleaved,
+                c.white_balance,
+            )
+        };
+
+        // Java reads the raw decompressed samples for the plane via
+        // tiffParser.getSamples on IFD 0. The inner TiffReader decodes the CFA
+        // IFD as a plain UINT8 image, so open_bytes(0) yields the same raw bytes.
+        let raw = self.inner.open_bytes(0)?;
+
+        // Java: b has length buf.length / 2 == sizeX * sizeY * 3 (the UINT16 RGB
+        // plane has twice as many bytes). Only that many samples are expanded.
+        let n = (size_x * size_y * 3).min(raw.len());
+        let per_channel = (raw.len() / 3).max(1);
+        let mut full = vec![0u8; size_x * size_y * 3 * 2];
+
+        for i in 0..n {
+            // c = isInterleaved() ? i % 3 : i / (b.length / 3)
+            let c = if interleaved { i % 3 } else { i / per_channel };
+            let v = (raw[i] & 0xff) as i16;
+            let v = adjust_for_white_balance(v, c, &wb) as u16;
+            let out = i * 2;
+            if little {
+                full[out] = (v & 0xff) as u8;
+                full[out + 1] = (v >> 8) as u8;
+            } else {
+                full[out] = (v >> 8) as u8;
+                full[out + 1] = (v & 0xff) as u8;
+            }
+        }
         Ok(full)
     }
 }
@@ -373,6 +425,7 @@ impl FormatReader for DngReader {
             if photo == PHOTO_CFA_ARRAY {
                 let bps = ifd.bits_per_sample();
                 let data_size = *bps.first().unwrap_or(&16) as u32;
+                let bps_len = bps.len();
 
                 // Java default color map {1,0,2,1}; overridden by COLOR_MAP tag
                 // (320) when all four entries are valid channel indices 0..=2.
@@ -404,6 +457,15 @@ impl FormatReader for DngReader {
                         "DNG CFA: missing dimensions or strip layout".into(),
                     ));
                 }
+
+                // Java DNGReader.openBytes:128 — take the non-demosaic "expand"
+                // path when the stored data already covers a full UINT16 RGB
+                // plane (`totalStripBytes == getPlaneSize()`) or there is more
+                // than one sample per pixel (`bps.length > 1`). getPlaneSize()
+                // here = sizeX * sizeY * sizeC(=3) * bytesPerPixel(UINT16=2).
+                let total_strip_bytes: u64 = counts.iter().copied().sum();
+                let plane_size = (size_x as u64) * (size_y as u64) * 3 * 2;
+                let expand = total_strip_bytes == plane_size || bps_len > 1;
 
                 // Java: UINT16, RGB, interleaved, sizeC=3, sizeZ=sizeT=1.
                 let base = self.inner.metadata();
@@ -441,6 +503,7 @@ impl FormatReader for DngReader {
                     strips,
                     white_balance,
                     full_image: None,
+                    expand,
                 });
                 return Ok(());
             }
@@ -491,14 +554,19 @@ impl FormatReader for DngReader {
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        if let Some(c) = &mut self.cfa {
+        if self.cfa.is_some() {
             if p != 0 {
                 return Err(BioFormatsError::PlaneOutOfRange(p));
             }
-            if c.full_image.is_none() {
-                c.full_image = Some(Self::decode_cfa(c)?);
+            if self.cfa.as_ref().unwrap().full_image.is_none() {
+                let img = if self.cfa.as_ref().unwrap().expand {
+                    self.decode_expand()?
+                } else {
+                    Self::decode_cfa(self.cfa.as_ref().unwrap())?
+                };
+                self.cfa.as_mut().unwrap().full_image = Some(img);
             }
-            return Ok(c.full_image.clone().unwrap());
+            return Ok(self.cfa.as_ref().unwrap().full_image.clone().unwrap());
         }
         self.inner.open_bytes(p)
     }

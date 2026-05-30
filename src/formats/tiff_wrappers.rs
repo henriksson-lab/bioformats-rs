@@ -493,7 +493,7 @@ impl NdpiReader {
         }
         if let Some(s) = ifd.get(NDPI_SERIAL_NUMBER).and_then(|v| v.as_str()) {
             meta.series_metadata.insert(
-                "ndpi.source_lens".into(),
+                "ndpi.serial_number".into(),
                 MetadataValue::String(s.to_string()),
             );
         }
@@ -1620,9 +1620,34 @@ impl VentanaReader {
         }
     }
 
-    /// Reassemble the full-resolution stitched image for a requested region by
-    /// copying overlapping tile data. Bytes-per-pixel layout follows the inner
-    /// TiffReader (chunky/planar handled by the underlying region reads).
+    /// Scale factor between the full-resolution image and the resolution that is
+    /// currently selected on the inner reader. Mirrors Java `getScale`
+    /// (`VentanaReader.java:740-743`): `round(fullX / resX)`.
+    fn get_scale(&self) -> i64 {
+        let res_x = self.inner.metadata().size_x as i64;
+        if res_x <= 0 {
+            return 1;
+        }
+        let scale = (self.full_x as f64 / res_x as f64).round() as i64;
+        scale.max(1)
+    }
+
+    /// Scale a full-resolution coordinate to the current resolution. Mirrors
+    /// Java `scaleCoordinate` (`VentanaReader.java:750-752`): `ceil(v / scale)`.
+    fn scale_coordinate(&self, v: i64, scale: i64) -> i64 {
+        if scale <= 1 {
+            return v;
+        }
+        ((v as f64) / (scale as f64)).ceil() as i64
+    }
+
+    /// Reassemble a stitched region for the *currently selected resolution* by
+    /// copying overlapping tile data. The requested region `(x,y,w,h)` is in the
+    /// pixel space of the current resolution. Each tile is first clipped to the
+    /// bounding box of the AOI it belongs to (Java `VentanaReader.java:250-262`),
+    /// then its placement and dimensions are scaled to the current resolution and
+    /// intersected with the requested region (Java `VentanaReader.java:314-340`).
+    /// Bytes-per-pixel layout follows the inner TiffReader.
     fn assemble_region(&mut self, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let bpp_pixel = {
             let m = self.inner.metadata();
@@ -1630,8 +1655,15 @@ impl VentanaReader {
             let spp = if m.is_rgb { m.size_c as usize } else { 1 };
             bytes * spp
         };
-        let tw = self.tile_width;
-        let th = self.tile_height;
+        // Full-resolution tile geometry (Java tileWidth/tileHeight).
+        let tw = self.tile_width as i64;
+        let th = self.tile_height as i64;
+
+        let scale = self.get_scale();
+        // Tile dimensions in the current resolution (Java thisTileWidth/Height).
+        let this_tw = self.scale_coordinate(tw, scale);
+        let this_th = self.scale_coordinate(th, scale);
+
         let out_row = w as usize * bpp_pixel;
         let mut out = vec![0u8; out_row * h as usize];
         let req_x0 = x as i64;
@@ -1639,34 +1671,72 @@ impl VentanaReader {
         let req_x1 = req_x0 + w as i64;
         let req_y1 = req_y0 + h as i64;
 
-        // Collect tile snapshot to avoid borrow conflicts during inner reads.
+        // Snapshot of tiles + areas to avoid borrow conflicts during inner reads.
         let tiles = self.tiles.clone();
+        let areas = self.areas.clone();
         for tile in &tiles {
             if tile.real_x < 0 || tile.real_y < 0 {
                 continue;
             }
-            let tx0 = tile.real_x;
-            let ty0 = tile.real_y;
-            let tx1 = tx0 + tw as i64;
-            let ty1 = ty0 + th as i64;
-            // Intersection of tile with requested region in stitched space.
-            let ix0 = tx0.max(req_x0);
-            let iy0 = ty0.max(req_y0);
-            let ix1 = tx1.min(req_x1);
-            let iy1 = ty1.min(req_y1);
+            // Tile placement rect in full-resolution stitched space.
+            let mut box_x = tile.real_x;
+            let mut box_y = tile.real_y;
+            let mut box_w = tw;
+            let mut box_h = th;
+
+            // Clip to the bounding box of the first AOI the tile intersects
+            // (Java 253-258).
+            for area in &areas {
+                let (ax, ay, aw, ah) = (area.bb_x, area.bb_y, area.bb_w, area.bb_h);
+                if box_x < ax + aw && ax < box_x + box_w && box_y < ay + ah && ay < box_y + box_h {
+                    let nx = box_x.max(ax);
+                    let ny = box_y.max(ay);
+                    let nx1 = (box_x + box_w).min(ax + aw);
+                    let ny1 = (box_y + box_h).min(ay + ah);
+                    box_x = nx;
+                    box_y = ny;
+                    box_w = nx1 - nx;
+                    box_h = ny1 - ny;
+                    break;
+                }
+            }
+
+            // Scale the (clipped) tile box to the current resolution (Java 259-262).
+            box_x = self.scale_coordinate(box_x, scale);
+            box_y = self.scale_coordinate(box_y, scale);
+            box_w = self.scale_coordinate(box_w, scale);
+            box_h = self.scale_coordinate(box_h, scale);
+
+            // Intersection of the scaled tile box with the requested region
+            // (Java 264, 314).
+            let ix0 = box_x.max(req_x0);
+            let iy0 = box_y.max(req_y0);
+            let ix1 = (box_x + box_w).min(req_x1);
+            let iy1 = (box_y + box_h).min(req_y1);
             if ix0 >= ix1 || iy0 >= iy1 {
                 continue;
             }
-            // Read the source tile from the base TIFF layout.
-            let src =
-                self.inner
-                    .open_bytes_region(0, tile.base_x as u32, tile.base_y as u32, tw, th)?;
-            let src_row = tw as usize * bpp_pixel;
+
+            // Read the source tile from the current resolution's TIFF layout. The
+            // base tile origin is scaled into the current resolution so the inner
+            // reader pulls the matching sub-resolution pixels (Java getSamples,
+            // scale==1 vs sub-resolution branches collapse to one region read).
+            let src_x = self.scale_coordinate(tile.base_x, scale);
+            let src_y = self.scale_coordinate(tile.base_y, scale);
+            let src = self.inner.open_bytes_region(
+                0,
+                src_x as u32,
+                src_y as u32,
+                this_tw as u32,
+                this_th as u32,
+            )?;
+            let src_row = this_tw as usize * bpp_pixel;
             for row in iy0..iy1 {
-                let src_y = (row - ty0) as usize;
-                let src_x = (ix0 - tx0) as usize;
+                // Source coordinates within the scaled tile (Java realRow / x-x).
+                let sy = (row - box_y) as usize;
+                let sx = (ix0 - box_x) as usize;
                 let copy_len = (ix1 - ix0) as usize * bpp_pixel;
-                let s_off = src_y * src_row + src_x * bpp_pixel;
+                let s_off = sy * src_row + sx * bpp_pixel;
                 let dst_y = (row - req_y0) as usize;
                 let dst_x = (ix0 - req_x0) as usize;
                 let d_off = dst_y * out_row + dst_x * bpp_pixel;
@@ -1723,22 +1793,30 @@ impl FormatReader for VentanaReader {
         self.inner.metadata()
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        // Reassemble only the full-resolution image (series 0, resolution 0).
-        if self.reassemble && self.inner.series() == 0 && self.inner.resolution() == 0 {
+        // Reassemble the stitched image at the current resolution (Java stitches
+        // every resolution by scaling AOI/tile coords; VentanaReader.java:240-312).
+        if self.reassemble && self.inner.series() == 0 {
             if p != 0 {
                 return Err(BioFormatsError::PlaneOutOfRange(p));
             }
-            let (fx, fy) = (self.full_x, self.full_y);
-            return self.assemble_region(0, 0, fx, fy);
+            let (rx, ry) = {
+                let m = self.inner.metadata();
+                (m.size_x, m.size_y)
+            };
+            return self.assemble_region(0, 0, rx, ry);
         }
         self.inner.open_bytes(p)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        if self.reassemble && self.inner.series() == 0 && self.inner.resolution() == 0 {
+        if self.reassemble && self.inner.series() == 0 {
             if p != 0 {
                 return Err(BioFormatsError::PlaneOutOfRange(p));
             }
-            validate_region("Ventana", self.full_x, self.full_y, x, y, w, h)?;
+            let (rx, ry) = {
+                let m = self.inner.metadata();
+                (m.size_x, m.size_y)
+            };
+            validate_region("Ventana", rx, ry, x, y, w, h)?;
             return self.assemble_region(x, y, w, h);
         }
         self.inner.open_bytes_region(p, x, y, w, h)

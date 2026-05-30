@@ -247,7 +247,24 @@ impl FormatReader for FitsReader {
                     "FITS primary HDU contains no image".into(),
                 ));
             }
-            series.push(fits_series_from_hdu(hdu));
+            let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+            let mut s = fits_series_from_hdu(hdu);
+            // Correct for truncated files: Java FitsReader clamps sizeZ to
+            // (fileLen - pixelOffset) / planeSize when the declared stack would
+            // run past the end of the file.
+            let meta = &mut s.metadata;
+            let raw_bps = (s.raw_bitpix.unsigned_abs() as u64 / 8).max(1);
+            let plane_size = (meta.size_x as u64) * (meta.size_y as u64) * raw_bps;
+            if plane_size > 0 {
+                let avail = file_len.saturating_sub(s.data_offset);
+                let declared = plane_size.saturating_mul(meta.size_z as u64);
+                if declared > avail {
+                    let clamped = (avail / plane_size) as u32;
+                    meta.size_z = clamped;
+                    meta.image_count = clamped;
+                }
+            }
+            series.push(s);
         }
 
         if series.is_empty() {

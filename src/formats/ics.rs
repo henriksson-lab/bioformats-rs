@@ -165,7 +165,9 @@ fn pixel_type_from_ics(significant_bits: u8, format: &str, sign: &str) -> PixelT
         (32, "real", _) => PixelType::Float32,
         (32, _, "signed") => PixelType::Int32,
         (32, _, _) => PixelType::Uint32,
-        (64, "real", _) => PixelType::Float64,
+        // Java pixelTypeFromBytes(8, ...) returns DOUBLE for any 8-byte type,
+        // so a 64-bit integer maps to Float64 (there is no Int64 pixel type).
+        (64, _, _) => PixelType::Float64,
         _ => PixelType::Uint8,
     }
 }

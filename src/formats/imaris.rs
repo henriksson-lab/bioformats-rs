@@ -168,17 +168,25 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
         BioFormatsError::UnsupportedFormat(format!("Imaris: missing {data_path}: {e}"))
     })?;
     let (pixel_type, bytes_per_sample) = {
-        match ds.dtype().map(hdf5_dtype_size).map_err(|e| {
+        let dtype = ds.dtype().map_err(|e| {
             BioFormatsError::Format(format!("Imaris: cannot read dtype for {data_path}: {e}"))
-        })? {
-            1 => (PixelType::Uint8, 1usize),
-            2 => (PixelType::Uint16, 2usize),
-            4 => (PixelType::Uint32, 4usize),
-            other => {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "Imaris: unsupported dtype size {other} for {data_path}"
-                )));
-            }
+        })?;
+        // Java ImarisHDFReader.java:336-337 maps the sample array type to the
+        // pixel type, including FLOAT and DOUBLE. Distinguish float/double from
+        // the integer types of the same element size by inspecting the dtype.
+        match dtype {
+            hdf5_pure::DType::F32 => (PixelType::Float32, 4usize),
+            hdf5_pure::DType::F64 => (PixelType::Float64, 8usize),
+            other => match hdf5_dtype_size(other) {
+                1 => (PixelType::Uint8, 1usize),
+                2 => (PixelType::Uint16, 2usize),
+                4 => (PixelType::Uint32, 4usize),
+                size => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Imaris: unsupported dtype size {size} for {data_path}"
+                    )));
+                }
+            },
         }
     };
     validate_ims_data_dataset(&file, data_path, size_x, size_y, size_z, bytes_per_sample)?;

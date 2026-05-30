@@ -1115,25 +1115,89 @@ impl FormatReader for PciReader {
 }
 
 // ---------------------------------------------------------------------------
-// 7. PDS planetary format — text header parsing
+// 7. PDS — Perkin Elmer Densitometer format
 // ---------------------------------------------------------------------------
-/// PDS (Planetary Data System) format reader (`.pds`).
+/// PDS (Perkin Elmer Densitometer) format reader.
 ///
-/// PDS has a text header with keyword=value pairs (LINES, LINE_SAMPLES,
-/// SAMPLE_BITS, etc.) followed by raw binary pixel data.
+/// Faithful port of Bio-Formats `loci.formats.in.PDSReader`. PDS is NOT the
+/// NASA Planetary-Data-System format: it is a Perkin Elmer densitometer dataset
+/// consisting of a text header (`.hdr`/`.pds`, magic ` IDENTIFICATION`) holding
+/// `KEY = value / comment` lines, plus a companion binary pixel file
+/// (`.IMG`/`.img`). Pixels are always UINT16 little-endian. Each on-disk row is
+/// `recordWidth`-aligned: there are `pad = recordWidth - (sizeX % recordWidth)`
+/// extra samples of padding after each row of `sizeX` samples. `SIGNX`/`SIGNY`
+/// values of `-` request horizontal/vertical mirroring of the plane.
+///
+/// Relevant Java fields (PDSReader.java):
+///   - magic `" IDENTIFICATION"` (15 bytes), `isThisType` (lines 76-92).
+///   - `NXP`→sizeX, `NYP`→sizeY (lines 214-219).
+///   - `SIGNX`/`SIGNY` (`-` ⇒ reverseX/reverseY, lines 230-235).
+///   - `COLOR`: 4 ⇒ RGB sizeC=3; else sizeC=1, lutIndex=color-1 (lines 242-254).
+///   - `FILE REC LEN` ⇒ recordWidth = value / 2 (lines 255-257).
+///   - pixelType UINT16, littleEndian, dimensionOrder XYCZT (lines 262-267).
+///   - companion `base + ".IMG"` then `base + ".img"` (lines 269-273).
+///   - `openBytes` pad = recordWidth - (sizeX % recordWidth), realX/realY for
+///     reverse, readPlane, then byte-swap mirroring (lines 120-162).
 pub struct PdsReader {
-    path: Option<PathBuf>,
+    /// Path passed to `set_id` (the header file once resolved).
+    header_path: Option<PathBuf>,
+    /// Companion pixel file (`.IMG`/`.img`).
+    pixels_file: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    data_offset: u64,
+    record_width: u32,
+    reverse_x: bool,
+    reverse_y: bool,
 }
 
 impl PdsReader {
     pub fn new() -> Self {
         PdsReader {
-            path: None,
+            header_path: None,
+            pixels_file: None,
             meta: None,
-            data_offset: 0,
+            record_width: 0,
+            reverse_x: false,
+            reverse_y: false,
         }
+    }
+
+    /// True if `data` begins with the PDS magic `" IDENTIFICATION"`.
+    fn header_has_magic(data: &[u8]) -> bool {
+        const MAGIC: &[u8] = b" IDENTIFICATION";
+        data.len() >= MAGIC.len() && &data[..MAGIC.len()] == MAGIC
+    }
+
+    /// Replace the extension of `path` with `ext` (case as given). Mirrors the
+    /// Java `name.substring(0, name.lastIndexOf(".")) + ext` logic.
+    fn with_extension(path: &Path, ext: &str) -> Option<PathBuf> {
+        let s = path.to_str()?;
+        let dot = s.rfind('.')?;
+        Some(PathBuf::from(format!("{}.{}", &s[..dot], ext)))
+    }
+
+    /// Resolve `path` to its header file (the `.hdr`/`.HDR` sibling when `path`
+    /// is a `.img`/companion) and read its raw bytes.
+    fn resolve_header(path: &Path) -> Result<(PathBuf, Vec<u8>)> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        // Java initFile: if the id is not a .hdr, look for sibling .hdr then .HDR.
+        if ext.as_deref() != Some("hdr") && ext.as_deref() != Some("pds") {
+            for hdr_ext in ["hdr", "HDR"] {
+                if let Some(hdr) = Self::with_extension(path, hdr_ext) {
+                    if hdr.exists() {
+                        let data = std::fs::read(&hdr).map_err(BioFormatsError::Io)?;
+                        return Ok((hdr, data));
+                    }
+                }
+            }
+            return Err(BioFormatsError::Format(
+                "Could not find matching .hdr file.".to_string(),
+            ));
+        }
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        Ok((path.to_path_buf(), data))
     }
 }
 
@@ -1149,159 +1213,195 @@ impl FormatReader for PdsReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("pds"))
+        match ext.as_deref() {
+            // Java accepts "hdr" (and we also accept "pds") directly when the
+            // file content matches; isThisType(name, open=true) defers to the
+            // byte check, which we approximate by reading the header here.
+            Some("hdr") | Some("pds") => std::fs::read(path)
+                .map(|d| Self::header_has_magic(&d))
+                .unwrap_or(false),
+            // Java: for ".img", look up the sibling ".hdr" and check its magic.
+            Some("img") => {
+                if let Some(hdr) = Self::with_extension(path, "hdr") {
+                    if hdr.exists() {
+                        return std::fs::read(&hdr)
+                            .map(|d| Self::header_has_magic(&d))
+                            .unwrap_or(false);
+                    }
+                }
+                if let Some(hdr) = Self::with_extension(path, "HDR") {
+                    if hdr.exists() {
+                        return std::fs::read(&hdr)
+                            .map(|d| Self::header_has_magic(&d))
+                            .unwrap_or(false);
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Java isThisType(stream): the first 15 bytes equal " IDENTIFICATION".
+        Self::header_has_magic(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = None;
+        self.header_path = None;
+        self.pixels_file = None;
         self.meta = None;
-        self.data_offset = 0;
+        self.record_width = 0;
+        self.reverse_x = false;
+        self.reverse_y = false;
 
-        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let text_end = data.len().min(8192);
-        let header_text = String::from_utf8_lossy(&data[..text_end]);
+        let (header_path, header_data) = Self::resolve_header(path)?;
 
-        let mut lines = None;
-        let mut line_samples = None;
-        let mut sample_bits = None;
-        let mut record_bytes = None;
-        let mut label_records = None;
-        let mut found_end = false;
+        // Java splits on "\r\n"; if that yields one element, it re-splits on
+        // "\r". We normalize all line endings and iterate lines.
+        let header_text = String::from_utf8_lossy(&header_data);
 
-        for line in header_text.lines() {
-            let line = line.trim();
-            if line == "END" {
-                found_end = true;
-                break;
+        let mut size_x: Option<u32> = None;
+        let mut size_y: Option<u32> = None;
+        let mut size_c: u32 = 1;
+        let mut is_rgb = false;
+        let mut is_indexed = false;
+        let mut record_width: u32 = 0;
+        let mut reverse_x = false;
+        let mut reverse_y = false;
+
+        for raw_line in header_text.split(['\n', '\r']) {
+            let line = raw_line;
+            // Java: int eq = line.indexOf('='); if (eq < 0) continue;
+            let Some(eq) = line.find('=') else { continue };
+            // Java: int end = line.indexOf('/'); if (end < 0) end = line.length();
+            let value_end = line.find('/').unwrap_or(line.len());
+            if value_end < eq + 1 {
+                // A '/' before '=' would make the slice invalid; skip such lines.
+                continue;
             }
-            if let Some((key, val)) = line.split_once('=') {
-                let key = key.trim();
-                let val = val.trim();
-                match key {
-                    "LINES" => {
-                        lines = Some(val.parse::<u32>().map_err(|_| {
-                            BioFormatsError::Format("PDS LINES is not a valid integer".to_string())
-                        })?);
-                    }
-                    "LINE_SAMPLES" => {
-                        line_samples = Some(val.parse::<u32>().map_err(|_| {
-                            BioFormatsError::Format(
-                                "PDS LINE_SAMPLES is not a valid integer".to_string(),
-                            )
-                        })?);
-                    }
-                    "SAMPLE_BITS" => {
-                        sample_bits = Some(val.parse::<u32>().map_err(|_| {
-                            BioFormatsError::Format(
-                                "PDS SAMPLE_BITS is not a valid integer".to_string(),
-                            )
-                        })?);
-                    }
-                    "RECORD_BYTES" => {
-                        record_bytes = Some(val.parse::<u64>().map_err(|_| {
-                            BioFormatsError::Format(
-                                "PDS RECORD_BYTES is not a valid integer".to_string(),
-                            )
-                        })?);
-                    }
-                    "LABEL_RECORDS" | "^IMAGE" => {
-                        // ^IMAGE can be a record number
-                        label_records = Some(val.parse::<u64>().map_err(|_| {
-                            BioFormatsError::Format(
-                                "PDS image record offset is not a valid integer".to_string(),
-                            )
-                        })?);
-                    }
-                    _ => {}
+            let key = line[..eq].trim();
+            let value = line[eq + 1..value_end].trim();
+
+            match key {
+                "NXP" => {
+                    size_x = Some(value.parse::<u32>().map_err(|_| {
+                        BioFormatsError::Format("PDS NXP is not a valid integer".to_string())
+                    })?);
                 }
+                "NYP" => {
+                    size_y = Some(value.parse::<u32>().map_err(|_| {
+                        BioFormatsError::Format("PDS NYP is not a valid integer".to_string())
+                    })?);
+                }
+                "SIGNX" => {
+                    reverse_x = value.replace('\'', "").trim() == "-";
+                }
+                "SIGNY" => {
+                    reverse_y = value.replace('\'', "").trim() == "-";
+                }
+                "COLOR" => {
+                    let color = value.parse::<i32>().map_err(|_| {
+                        BioFormatsError::Format("PDS COLOR is not a valid integer".to_string())
+                    })?;
+                    if color == 4 {
+                        size_c = 3;
+                        is_rgb = true;
+                    } else {
+                        size_c = 1;
+                        is_rgb = false;
+                        let lut_index = color - 1;
+                        is_indexed = lut_index >= 0;
+                    }
+                }
+                "FILE REC LEN" => {
+                    record_width = value
+                        .parse::<u32>()
+                        .map_err(|_| {
+                            BioFormatsError::Format(
+                                "PDS FILE REC LEN is not a valid integer".to_string(),
+                            )
+                        })?
+                        / 2;
+                }
+                _ => {}
             }
         }
 
-        let lines = lines.unwrap_or(0);
-        let line_samples = line_samples.unwrap_or(0);
-        if lines == 0 || line_samples == 0 {
-            return Err(BioFormatsError::Format(
-                "PDS header missing LINES or LINE_SAMPLES keywords".to_string(),
-            ));
-        }
-        let sample_bits = sample_bits.ok_or_else(|| {
-            BioFormatsError::Format("PDS header missing SAMPLE_BITS keyword".to_string())
+        let size_x = size_x.ok_or_else(|| {
+            BioFormatsError::Format("PDS header missing NXP keyword".to_string())
         })?;
-
-        let (pixel_type, bpp) = match sample_bits {
-            8 => (PixelType::Uint8, 8u8),
-            16 => (PixelType::Uint16, 16u8),
-            32 => (PixelType::Uint32, 32u8),
-            _ => {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "PDS SAMPLE_BITS={sample_bits} is not supported"
-                )));
-            }
-        };
-
-        // Calculate data offset
-        let offset =
-            if let (Some(record_bytes), Some(label_records)) = (record_bytes, label_records) {
-                if record_bytes == 0 || label_records == 0 {
-                    return Err(BioFormatsError::Format(
-                        "PDS record offset must be non-zero".to_string(),
-                    ));
-                }
-                record_bytes * (label_records - 1) // PDS records are 1-based
-            } else {
-                // Find END keyword position and skip past it
-                if !found_end {
-                    return Err(BioFormatsError::Format(
-                        "PDS header missing END marker".to_string(),
-                    ));
-                } else if let Some(end_pos) = header_text.find("\nEND\r") {
-                    (end_pos + 5) as u64
-                } else if let Some(end_pos) = header_text.find("\nEND\n") {
-                    (end_pos + 5) as u64
-                } else if let Some(end_pos) = header_text.find("\nEND") {
-                    (end_pos + 4) as u64
-                } else {
-                    return Err(BioFormatsError::Format(
-                        "PDS header END marker offset is invalid".to_string(),
-                    ));
-                }
-            };
-
-        let bytes_per_pixel = (bpp / 8) as u64;
-        let expected = (line_samples as u64)
-            .checked_mul(lines as u64)
-            .and_then(|px| px.checked_mul(bytes_per_pixel))
-            .ok_or_else(|| BioFormatsError::Format("PDS image plane is too large".to_string()))?;
-        let available = data.len() as u64;
-        if offset
-            .checked_add(expected)
-            .is_none_or(|end| end > available)
-        {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "PDS payload is shorter than declared image dimensions".to_string(),
+        let size_y = size_y.ok_or_else(|| {
+            BioFormatsError::Format("PDS header missing NYP keyword".to_string())
+        })?;
+        if size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::Format(
+                "PDS NXP/NYP must be non-zero".to_string(),
+            ));
+        }
+        // pad = recordWidth - (sizeX % recordWidth) requires recordWidth > 0.
+        if record_width == 0 {
+            return Err(BioFormatsError::Format(
+                "PDS header missing FILE REC LEN keyword".to_string(),
             ));
         }
 
-        self.data_offset = offset;
-        self.path = Some(path.to_path_buf());
+        // Resolve companion pixel file: base + ".IMG" then base + ".img".
+        let base = Self::with_extension(&header_path, "IMG").ok_or_else(|| {
+            BioFormatsError::Format("PDS header path has no extension".to_string())
+        })?;
+        let pixels_file = if base.exists() {
+            base
+        } else {
+            Self::with_extension(&header_path, "img").ok_or_else(|| {
+                BioFormatsError::Format("PDS header path has no extension".to_string())
+            })?
+        };
+        if !pixels_file.exists() {
+            return Err(BioFormatsError::Format(
+                "PDS companion .IMG/.img pixel file not found".to_string(),
+            ));
+        }
+
+        // Validate the companion file is large enough for the declared plane,
+        // so truncated datasets fail in set_id like the reference would on read.
+        let pad = record_width - (size_x % record_width);
+        let scanline = (size_x as u64) + (pad as u64);
+        let required = scanline
+            .checked_mul(size_y as u64)
+            .and_then(|rows| rows.checked_mul(size_c as u64))
+            .and_then(|samples| samples.checked_mul(2)) // UINT16
+            .ok_or_else(|| BioFormatsError::Format("PDS plane is too large".to_string()))?;
+        let available = std::fs::metadata(&pixels_file)
+            .map_err(BioFormatsError::Io)?
+            .len();
+        if available < required {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PDS companion file is shorter than declared image dimensions".to_string(),
+            ));
+        }
+
+        self.record_width = record_width;
+        self.reverse_x = reverse_x;
+        self.reverse_y = reverse_y;
+        self.header_path = Some(header_path);
+        self.pixels_file = Some(pixels_file);
         self.meta = Some(ImageMetadata {
-            size_x: line_samples,
-            size_y: lines,
+            size_x,
+            size_y,
             size_z: 1,
-            size_c: 1,
+            size_c,
             size_t: 1,
-            pixel_type,
-            bits_per_pixel: bpp,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
             image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
+            // Java: dimensionOrder = "XYCZT".
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb,
+            // Java leaves interleaved at its default (false) -> planar RGB.
             is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: false, // PDS is typically big-endian
+            is_indexed,
+            is_little_endian: true,
             resolution_count: 1,
             series_metadata: HashMap::new(),
             lookup_table: None,
@@ -1313,8 +1413,12 @@ impl FormatReader for PdsReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
+        self.header_path = None;
+        self.pixels_file = None;
         self.meta = None;
+        self.record_width = 0;
+        self.reverse_x = false;
+        self.reverse_y = false;
         Ok(())
     }
 
@@ -1347,14 +1451,8 @@ impl FormatReader for PdsReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let n_bytes = checked_plane_len(meta)?;
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        let (size_x, size_y) = (meta.size_x, meta.size_y);
+        self.open_bytes_region(plane_index, 0, 0, size_x, size_y)
     }
 
     fn open_bytes_region(
@@ -1369,9 +1467,106 @@ impl FormatReader for PdsReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let meta = meta.clone();
-        let plane = self.open_bytes(plane_index)?;
-        crop_plane(&plane, &meta, x, y, w, h)
+        let size_x = meta.size_x;
+        let size_y = meta.size_y;
+        let size_c = meta.size_c;
+        if x.checked_add(w).is_none_or(|end| end > size_x)
+            || y.checked_add(h).is_none_or(|end| end > size_y)
+        {
+            return Err(BioFormatsError::Format(
+                "requested region is outside the image bounds".to_string(),
+            ));
+        }
+
+        let pixels_file = self
+            .pixels_file
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let data = std::fs::read(pixels_file).map_err(BioFormatsError::Io)?;
+
+        let bpp = 2usize; // UINT16
+        // Java: pad = recordWidth - (sizeX % recordWidth)
+        let pad = self.record_width - (size_x % self.record_width);
+        let scanline = (size_x + pad) as usize; // samples per on-disk row
+        // On-disk size (in samples) of one full padded channel plane.
+        let channel_plane = scanline
+            .checked_mul(size_y as usize)
+            .ok_or_else(|| BioFormatsError::Format("PDS plane is too large".to_string()))?;
+
+        // Java: realX/realY flip the read origin when mirroring is requested.
+        let real_x = if self.reverse_x {
+            size_x - w - x
+        } else {
+            x
+        };
+        let real_y = if self.reverse_y {
+            size_y - h - y
+        } else {
+            y
+        };
+
+        // Output buffer: planar, tightly packed (w*h per channel), w*bpp stride.
+        let out_channel_bytes = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(bpp))
+            .ok_or_else(|| BioFormatsError::Format("PDS region is too large".to_string()))?;
+        let total = out_channel_bytes
+            .checked_mul(size_c as usize)
+            .ok_or_else(|| BioFormatsError::Format("PDS region is too large".to_string()))?;
+        let mut buf = vec![0u8; total];
+
+        // readPlane (non-interleaved): for each channel, for each row, copy a
+        // contiguous run of w samples starting at realX within that on-disk row.
+        for channel in 0..size_c as usize {
+            let channel_base_samples = channel * channel_plane;
+            for row in 0..h as usize {
+                let src_sample =
+                    channel_base_samples + (real_y as usize + row) * scanline + real_x as usize;
+                let src_byte = src_sample * bpp;
+                let run = w as usize * bpp;
+                let src_end = src_byte + run;
+                if src_end > data.len() {
+                    return Err(BioFormatsError::Format(
+                        "PDS companion file is shorter than expected".to_string(),
+                    ));
+                }
+                let dst = channel * out_channel_bytes + row * (w as usize) * bpp;
+                buf[dst..dst + run].copy_from_slice(&data[src_byte..src_end]);
+            }
+        }
+
+        // Java reverseX: swap UINT16 samples within each row (per channel).
+        if self.reverse_x {
+            for channel in 0..size_c as usize {
+                let cbase = channel * out_channel_bytes;
+                for row in 0..h as usize {
+                    let rbase = cbase + row * (w as usize) * bpp;
+                    for col in 0..(w as usize) / 2 {
+                        let begin = rbase + 2 * col;
+                        let end = rbase + 2 * (w as usize - col - 1);
+                        buf.swap(begin, end);
+                        buf.swap(begin + 1, end + 1);
+                    }
+                }
+            }
+        }
+
+        // Java reverseY: swap whole rows top-to-bottom (per channel).
+        if self.reverse_y {
+            let row_bytes = (w as usize) * bpp;
+            for channel in 0..size_c as usize {
+                let cbase = channel * out_channel_bytes;
+                for row in 0..(h as usize) / 2 {
+                    let start = cbase + row * row_bytes;
+                    let end = cbase + (h as usize - row - 1) * row_bytes;
+                    for k in 0..row_bytes {
+                        buf.swap(start + k, end + k);
+                    }
+                }
+            }
+        }
+
+        Ok(buf)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1476,10 +1671,18 @@ impl FormatReader for HisReader {
             ));
         }
 
-        let mut metas = Vec::with_capacity(series_count);
-        let mut pixel_offsets = Vec::with_capacity(series_count);
-        let mut packed_12_bit = Vec::with_capacity(series_count);
+        let mut metas: Vec<ImageMetadata> = Vec::with_capacity(series_count);
+        let mut pixel_offsets: Vec<u64> = Vec::with_capacity(series_count);
+        let mut packed_12_bit: Vec<bool> = Vec::with_capacity(series_count);
         let mut offset = 0usize;
+        // Java HISReader.initFile (lines 129, 138-148): a series after the first
+        // that does not start with the "IM" magic indicates that the previous
+        // 12-bit plane was actually stored padded to 16 bits. When that happens
+        // we retroactively promote the previous series to 16-bit, recompute its
+        // (padded) plane size so the current series begins at the correct
+        // offset, and latch `adjusted_bit_depth` so the 12-bit data types (6 and
+        // 14) are treated as 16-bit for the remainder of the file.
+        let mut adjusted_bit_depth = false;
         for series in 0..series_count {
             if offset.checked_add(64).is_none_or(|end| end > data.len()) {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
@@ -1487,9 +1690,44 @@ impl FormatReader for HisReader {
                 )));
             }
             if &data[offset..offset + 2] != b"IM" {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "HIS series {series} missing IM magic"
-                )));
+                // Mirror Java: only the previous series being 12-bit allows us to
+                // recover; otherwise the magic really is missing/corrupt.
+                if series > 0 && metas[series - 1].bits_per_pixel == 12 {
+                    let prev = &mut metas[series - 1];
+                    prev.bits_per_pixel = 16;
+                    // prevSkip = sizeX*sizeY*sizeC*12/8 (already-consumed packed
+                    // plane); totalBytes = sizeX*sizeY*sizeC*2 (16-bit padded).
+                    let prev_samples = (prev.size_x as u64)
+                        .checked_mul(prev.size_y as u64)
+                        .and_then(|px| px.checked_mul(prev.size_c as u64))
+                        .ok_or_else(|| {
+                            BioFormatsError::Format("HIS image plane is too large".to_string())
+                        })?;
+                    let prev_pixel_offset = pixel_offsets[series - 1];
+                    let total_bytes = prev_samples.checked_mul(2).ok_or_else(|| {
+                        BioFormatsError::Format("HIS image plane is too large".to_string())
+                    })?;
+                    // The previous (12-bit packed) plane is no longer valid; this
+                    // series really starts after the 16-bit padded plane.
+                    packed_12_bit[series - 1] = false;
+                    offset = (prev_pixel_offset + total_bytes) as usize;
+                    adjusted_bit_depth = true;
+
+                    if offset.checked_add(64).is_none_or(|end| end > data.len()) {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "HIS series {series} header is truncated"
+                        )));
+                    }
+                    if &data[offset..offset + 2] != b"IM" {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "HIS series {series} missing IM magic"
+                        )));
+                    }
+                } else {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "HIS series {series} missing IM magic"
+                    )));
+                }
             }
 
             let comment_bytes = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
@@ -1502,13 +1740,18 @@ impl FormatReader for HisReader {
                 ));
             }
 
+            // Java: data types 6 and 14 are nominally 12-bit, but once a prior
+            // series has been promoted (`adjusted_bit_depth`) they are stored as
+            // unpacked 16-bit samples.
             let (pixel_type, bits_per_pixel, size_c, bytes_per_sample, is_packed_12) =
                 match data_type {
                     1 => (PixelType::Uint8, 8u8, 1u32, 1u64, false),
                     2 => (PixelType::Uint16, 16u8, 1u32, 2u64, false),
+                    6 if adjusted_bit_depth => (PixelType::Uint16, 16u8, 1u32, 2u64, false),
                     6 => (PixelType::Uint16, 12u8, 1u32, 2u64, true),
                     11 => (PixelType::Uint8, 8u8, 3u32, 1u64, false),
                     12 => (PixelType::Uint16, 16u8, 3u32, 2u64, false),
+                    14 if adjusted_bit_depth => (PixelType::Uint16, 16u8, 3u32, 2u64, false),
                     14 => (PixelType::Uint16, 12u8, 3u32, 2u64, true),
                     other => {
                         return Err(BioFormatsError::UnsupportedFormat(format!(
@@ -2391,5 +2634,208 @@ impl FormatReader for ObfReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+
+#[cfg(test)]
+mod pds_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Build a unique base path (no intermediate dots) in the temp directory.
+    fn unique_base(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("bioformats_pds_{tag}_{nanos}_{n}"))
+    }
+
+    /// Encode `samples` as little-endian UINT16 bytes.
+    fn le_u16(samples: &[u16]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(samples.len() * 2);
+        for s in samples {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v
+    }
+
+    /// Write a minimal grayscale PDS fixture: `.hdr` + companion `.IMG`.
+    ///
+    /// Header carries the ` IDENTIFICATION` magic, `NXP`/`NYP`, `COLOR = 1`
+    /// (grayscale, lutIndex 0), `FILE REC LEN` (= 2 * record_width), and the
+    /// requested SIGNX/SIGNY. The companion holds `(size_x + pad)` UINT16
+    /// samples per row, where `pad = record_width - (size_x % record_width)`.
+    /// `pixels` must be a row-major `size_x * size_y` grid of sample values.
+    fn write_gray_fixture(
+        tag: &str,
+        size_x: u32,
+        size_y: u32,
+        record_width: u32,
+        signx: &str,
+        signy: &str,
+        pixels: &[u16],
+    ) -> (PathBuf, PathBuf) {
+        assert_eq!(pixels.len(), (size_x * size_y) as usize);
+        let base = unique_base(tag);
+        let hdr = base.with_extension("hdr");
+        let img = base.with_extension("IMG");
+
+        let header = format!(
+            " IDENTIFICATION\r\n\
+             NXP = {size_x} / x samples\r\n\
+             NYP = {size_y} / y samples\r\n\
+             SIGNX = '{signx}' / x sign\r\n\
+             SIGNY = '{signy}' / y sign\r\n\
+             COLOR = 1 / grayscale\r\n\
+             FILE REC LEN = {rec_len} / record length in bytes\r\n\
+             END\r\n",
+            rec_len = record_width * 2,
+        );
+        std::fs::write(&hdr, header.as_bytes()).unwrap();
+
+        // Companion: one padded row at a time. Padding samples are sentinel
+        // 0xFFFF so a bug that reads padding instead of real data is visible.
+        let pad = record_width - (size_x % record_width);
+        let mut img_samples: Vec<u16> = Vec::new();
+        for row in 0..size_y as usize {
+            let start = row * size_x as usize;
+            img_samples.extend_from_slice(&pixels[start..start + size_x as usize]);
+            img_samples.extend(std::iter::repeat(0xFFFFu16).take(pad as usize));
+        }
+        std::fs::write(&img, le_u16(&img_samples)).unwrap();
+
+        (hdr, img)
+    }
+
+    fn cleanup(paths: &[&PathBuf]) {
+        for p in paths {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn pds_grayscale_full_and_region() {
+        // 3x2 image; record_width = 4 => pad = 4 - (3 % 4) = 1 sample per row.
+        let size_x = 3u32;
+        let size_y = 2u32;
+        let record_width = 4u32;
+        let pixels: Vec<u16> = vec![
+            10, 20, 30, // row 0
+            40, 50, 60, // row 1
+        ];
+        let (hdr, img) =
+            write_gray_fixture("gray", size_x, size_y, record_width, "+", "+", &pixels);
+
+        let mut r = PdsReader::new();
+        // Detection by name (header magic present).
+        assert!(r.is_this_type_by_name(&hdr));
+        // Detection of the companion via sibling header.
+        assert!(r.is_this_type_by_name(&img));
+        // Magic byte detection.
+        assert!(r.is_this_type_by_bytes(b" IDENTIFICATION extra"));
+        assert!(!r.is_this_type_by_bytes(b"NOT A PDS FILE."));
+
+        r.set_id(&hdr).unwrap();
+        let meta = r.metadata();
+        assert_eq!(meta.size_x, size_x);
+        assert_eq!(meta.size_y, size_y);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert!(meta.is_little_endian);
+        assert!(!meta.is_rgb);
+
+        // Full plane: padding must be stripped, row-major order preserved.
+        let full = r.open_bytes(0).unwrap();
+        assert_eq!(full, le_u16(&pixels));
+
+        // Region crop: 2x2 starting at (1,0) => columns 1,2 of both rows.
+        let region = r.open_bytes_region(0, 1, 0, 2, 2).unwrap();
+        assert_eq!(region, le_u16(&[20, 30, 50, 60]));
+
+        // Single-pixel crop bottom-right.
+        let one = r.open_bytes_region(0, 2, 1, 1, 1).unwrap();
+        assert_eq!(one, le_u16(&[60]));
+
+        // Out-of-bounds region rejected.
+        assert!(r.open_bytes_region(0, 2, 0, 2, 1).is_err());
+
+        cleanup(&[&hdr, &img]);
+    }
+
+    #[test]
+    fn pds_grayscale_reverse_xy() {
+        // SIGNX = '-' and SIGNY = '-' mirror horizontally and vertically.
+        let size_x = 3u32;
+        let size_y = 2u32;
+        let record_width = 4u32;
+        let pixels: Vec<u16> = vec![
+            10, 20, 30, // row 0
+            40, 50, 60, // row 1
+        ];
+        let (hdr, img) =
+            write_gray_fixture("rev", size_x, size_y, record_width, "-", "-", &pixels);
+
+        let mut r = PdsReader::new();
+        r.set_id(&hdr).unwrap();
+        assert!(r.reverse_x);
+        assert!(r.reverse_y);
+
+        // Full plane mirrored in both axes:
+        // Original rows: [10,20,30],[40,50,60]
+        // reverseX per row: [30,20,10],[60,50,40]
+        // reverseY swaps rows: [60,50,40],[30,20,10]
+        let full = r.open_bytes(0).unwrap();
+        assert_eq!(full, le_u16(&[60, 50, 40, 30, 20, 10]));
+
+        cleanup(&[&hdr, &img]);
+    }
+
+    #[test]
+    fn pds_reject_missing_companion() {
+        // Header present and valid, but no .IMG/.img companion exists.
+        let base = unique_base("nocomp");
+        let hdr = base.with_extension("hdr");
+        let header = " IDENTIFICATION\r\n\
+             NXP = 4 / x\r\n\
+             NYP = 4 / y\r\n\
+             COLOR = 1 /\r\n\
+             FILE REC LEN = 8 /\r\n\
+             END\r\n";
+        std::fs::write(&hdr, header).unwrap();
+
+        let mut r = PdsReader::new();
+        assert!(r.set_id(&hdr).is_err());
+        // State stays uninitialized after the failure.
+        assert_eq!(r.series_count(), 0);
+
+        cleanup(&[&hdr]);
+    }
+
+    #[test]
+    fn pds_reject_truncated_companion() {
+        // Companion exists but is shorter than the declared (padded) plane.
+        let base = unique_base("trunc");
+        let hdr = base.with_extension("hdr");
+        let img = base.with_extension("IMG");
+        let header = " IDENTIFICATION\r\n\
+             NXP = 8 / x\r\n\
+             NYP = 8 / y\r\n\
+             COLOR = 1 /\r\n\
+             FILE REC LEN = 16 /\r\n\
+             END\r\n";
+        std::fs::write(&hdr, header).unwrap();
+        // Only a handful of bytes, far short of 8 rows of (8 + pad) UINT16.
+        std::fs::write(&img, [0u8; 16]).unwrap();
+
+        let mut r = PdsReader::new();
+        assert!(r.set_id(&hdr).is_err());
+
+        cleanup(&[&hdr, &img]);
     }
 }

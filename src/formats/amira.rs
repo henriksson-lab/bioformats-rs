@@ -13,6 +13,18 @@ use crate::common::region::{crop_full_plane, validate_region};
 
 // ─── Amira Mesh ───────────────────────────────────────────────────────────────
 
+/// Per-stream compression of an AmiraMesh lattice (port of AmiraReader's
+/// `compression` token from the `@N(...)` stream descriptor).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AmiraCompression {
+    /// No compression — raw binary stream.
+    None,
+    /// `HxZip,<size>`: a single zlib/deflate stream for the whole stack.
+    HxZip,
+    /// `HxByteRLE,<size>`: byte run-length encoding for the whole stack.
+    HxByteRLE,
+}
+
 /// Parsed Amira Mesh header.
 struct AmiraHeader {
     nx: u32,
@@ -23,6 +35,8 @@ struct AmiraHeader {
     little_endian: bool,
     /// True when the data stream is stored as ASCII numbers, not raw binary.
     ascii: bool,
+    /// Per-stream compression of the `@N` data stream.
+    compression: AmiraCompression,
 }
 
 /// Parse the Amira Mesh ASCII header (port of AmiraParameters.java).
@@ -42,6 +56,7 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
     let mut little_endian = false;
     let mut ascii = false;
     let mut data_section: u32 = 1; // default @1
+    let mut compression = AmiraCompression::None;
 
     let mut line = String::new();
     loop {
@@ -127,10 +142,31 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
                     "Amira Mesh: unsupported lattice data type in {t:?}"
                 )));
             };
-            // Extract @N section number
+            // Extract @N section number and optional compression token. The
+            // stream descriptor looks like "... @1" or "... @1(HxByteRLE,12345)"
+            // (the parenthesised string is the AmiraReader `compression` token).
             if let Some(at_pos) = t.rfind('@') {
-                if let Ok(n) = t[at_pos + 1..].trim().parse::<u32>() {
+                let rest = t[at_pos + 1..].trim();
+                // Split off any "(...)" compression descriptor.
+                let (num_part, comp_part) = match rest.find('(') {
+                    Some(p) => (rest[..p].trim(), Some(&rest[p + 1..])),
+                    None => (rest, None),
+                };
+                if let Ok(n) = num_part.parse::<u32>() {
                     data_section = n;
+                }
+                if let Some(comp) = comp_part {
+                    // Strip the trailing ')' if present.
+                    let comp = comp.trim_end_matches(')').trim();
+                    if comp.starts_with("HxZip,") {
+                        compression = AmiraCompression::HxZip;
+                    } else if comp.starts_with("HxByteRLE,") {
+                        compression = AmiraCompression::HxByteRLE;
+                    } else if !comp.is_empty() {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "Amira Mesh: unsupported stream compression {comp:?}"
+                        )));
+                    }
                 }
             }
         }
@@ -147,6 +183,7 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
                 data_offset,
                 little_endian,
                 ascii,
+                compression,
             });
         }
     }
@@ -201,6 +238,10 @@ pub struct AmiraReader {
     meta: Option<ImageMetadata>,
     data_offset: u64,
     ascii: bool,
+    compression: AmiraCompression,
+    /// Lazily decoded full stack for compressed streams (HxZip/HxByteRLE).
+    /// The whole stack is one compressed stream, so we decode once and slice.
+    decoded_stack: Option<Vec<u8>>,
 }
 
 impl AmiraReader {
@@ -210,7 +251,84 @@ impl AmiraReader {
             meta: None,
             data_offset: 0,
             ascii: false,
+            compression: AmiraCompression::None,
+            decoded_stack: None,
         }
+    }
+
+    /// Decode an HxByteRLE stream. Port of `AmiraReader.HxRLE.read`.
+    ///
+    /// A control byte `insn` is read: when its high bit is set (negative as a
+    /// signed byte), `insn & 0x7f` literal bytes follow and are copied verbatim;
+    /// otherwise `insn` is a run length and the single following byte is
+    /// repeated that many times. Decoding stops once `expected` bytes have been
+    /// produced (the whole stack is one stream).
+    fn decode_byte_rle(data: &[u8], expected: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(expected);
+        let mut i = 0;
+        while out.len() < expected && i < data.len() {
+            let insn = data[i] as i8;
+            i += 1;
+            if insn < 0 {
+                // Literal run of (insn & 0x7f) bytes.
+                let count = (insn as u8 & 0x7f) as usize;
+                if i + count > data.len() {
+                    return Err(BioFormatsError::InvalidData(
+                        "Amira HxByteRLE: literal run overruns input".into(),
+                    ));
+                }
+                out.extend_from_slice(&data[i..i + count]);
+                i += count;
+            } else {
+                // Fill run of `insn` copies of the next byte.
+                let count = insn as usize;
+                if i >= data.len() {
+                    return Err(BioFormatsError::InvalidData(
+                        "Amira HxByteRLE: fill run missing byte".into(),
+                    ));
+                }
+                let byte = data[i];
+                i += 1;
+                out.resize(out.len() + count, byte);
+            }
+        }
+        if out.len() < expected {
+            return Err(BioFormatsError::InvalidData(format!(
+                "Amira HxByteRLE: decoded {} bytes, expected {expected}",
+                out.len()
+            )));
+        }
+        out.truncate(expected);
+        Ok(out)
+    }
+
+    /// Decode the whole compressed stack into raw little/big-endian bytes.
+    fn decode_stack(&self) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let expected = (checked_plane_bytes("Amira Mesh", meta)?
+            .checked_mul(meta.image_count as u64)
+            .ok_or_else(|| BioFormatsError::Format("Amira Mesh: payload size overflows".into()))?)
+            as usize;
+
+        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.data_offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut compressed = Vec::new();
+        f.read_to_end(&mut compressed).map_err(BioFormatsError::Io)?;
+
+        let decoded = match self.compression {
+            AmiraCompression::HxZip => crate::common::codec::decompress_deflate(&compressed)?,
+            AmiraCompression::HxByteRLE => Self::decode_byte_rle(&compressed, expected)?,
+            AmiraCompression::None => compressed,
+        };
+        if decoded.len() < expected {
+            return Err(BioFormatsError::InvalidData(format!(
+                "Amira Mesh: decompressed stack is shorter than declared ({} < {expected})",
+                decoded.len()
+            )));
+        }
+        Ok(decoded)
     }
 
     /// Read one plane's worth of ASCII-encoded numbers and pack into bytes
@@ -330,6 +448,8 @@ impl FormatReader for AmiraReader {
         self.meta = None;
         self.data_offset = 0;
         self.ascii = false;
+        self.compression = AmiraCompression::None;
+        self.decoded_stack = None;
         let hdr = parse_amira_header(path)?;
         let image_count = hdr.nz;
         // ASCII-decoded planes are emitted as little-endian byte buffers.
@@ -355,12 +475,16 @@ impl FormatReader for AmiraReader {
             modulo_c: None,
             modulo_t: None,
         };
-        if !hdr.ascii {
+        // For raw binary streams we can validate the on-disk payload length.
+        // Compressed (HxZip/HxByteRLE) streams are shorter than the decoded
+        // payload, so length validation happens after decompression instead.
+        if !hdr.ascii && hdr.compression == AmiraCompression::None {
             validate_payload_len("Amira Mesh", path, hdr.data_offset, &meta)?;
         }
         self.meta = Some(meta);
         self.data_offset = hdr.data_offset;
         self.ascii = hdr.ascii;
+        self.compression = hdr.compression;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -368,6 +492,7 @@ impl FormatReader for AmiraReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.decoded_stack = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -398,6 +523,22 @@ impl FormatReader for AmiraReader {
             return self.read_ascii_plane(plane_index);
         }
         let plane_bytes = checked_plane_bytes("Amira Mesh", meta)? as usize;
+
+        if self.compression != AmiraCompression::None {
+            // The whole stack is one compressed stream: decode once, then slice
+            // out the requested plane.
+            if self.decoded_stack.is_none() {
+                self.decoded_stack = Some(self.decode_stack()?);
+            }
+            let stack = self.decoded_stack.as_ref().unwrap();
+            let start = plane_index as usize * plane_bytes;
+            let end = start + plane_bytes;
+            if end > stack.len() {
+                return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            }
+            return Ok(stack[start..end].to_vec());
+        }
+
         let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;

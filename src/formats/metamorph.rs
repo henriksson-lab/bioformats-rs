@@ -655,7 +655,7 @@ struct NdGrid {
 /// Build the `stks[series][file]` grid from a parsed `.nd` file, porting Java
 /// `initFile`'s series/file enumeration.
 #[allow(clippy::too_many_lines)]
-fn build_nd_grid(nd_path: &Path, info: &NdInfo) -> NdGrid {
+fn build_nd_grid(nd_path: &Path, info: &NdInfo, base: (u32, u32, u32)) -> NdGrid {
     let dir = nd_path.parent().unwrap_or_else(|| Path::new("."));
     let prefix = nd_path
         .file_stem()
@@ -663,12 +663,17 @@ fn build_nd_grid(nd_path: &Path, info: &NdInfo) -> NdGrid {
         .unwrap_or("")
         .to_string();
 
-    let zc = info.z_steps.unwrap_or(1).max(1);
-    let mut cc = info.n_wavelengths.unwrap_or(1);
+    // Java MetamorphReader.java:500 seeds zc/cc/tc from the base single-STK
+    // getSizeZ()/getSizeC()/getSizeT(), then (587-592) overrides each only when
+    // the .nd declares NZSteps/NWavelengths/NTimePoints (with the doTimelapse
+    // special case for tc).
+    let (base_z, base_c, base_t) = base;
+    let zc = info.z_steps.unwrap_or(base_z as i32).max(1);
+    let mut cc = info.n_wavelengths.unwrap_or(base_c as i32);
     let mut tc = match info.n_time_points {
         Some(t) => t,
         None if !info.do_timelapse => 1,
-        None => 1,
+        None => base_t as i32,
     };
 
     if cc == 0 {
@@ -918,7 +923,11 @@ impl FormatReader for MetamorphReader {
         if let Some(nd) = nd_file {
             if let Ok(text) = read_nd_text(&nd) {
                 let info = parse_nd(&text);
-                let grid = build_nd_grid(&nd, &info);
+                let grid = build_nd_grid(
+                    &nd,
+                    &info,
+                    (base_meta.size_z, base_meta.size_c, base_meta.size_t),
+                );
                 if grid.stks.iter().any(|s| s.iter().any(|f| f.is_some())) {
                     self.build_series_from_grid(nd, base_meta, grid)?;
                     self.path = Some(stk_path);
@@ -1558,7 +1567,7 @@ mod tests {
             wave_do_z: vec![],
             ..Default::default()
         };
-        let grid = build_nd_grid(&nd_path, &info);
+        let grid = build_nd_grid(&nd_path, &info, (1, 1, 1));
 
         // One series per stage position.
         assert_eq!(grid.stks.len(), 2);
@@ -1617,7 +1626,7 @@ mod tests {
             n_stage_positions: 0,
             ..Default::default()
         };
-        let grid = build_nd_grid(&nd_path, &info);
+        let grid = build_nd_grid(&nd_path, &info, (1, 1, 1));
         assert_eq!(grid.stks.len(), 1);
         assert_eq!(grid.stks[0].len(), 1);
         assert_eq!(

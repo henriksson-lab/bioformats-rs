@@ -99,14 +99,6 @@ macro_rules! tiff_wrapper {
 // Real binary reader 1 — INR format
 // ===========================================================================
 
-/// Pixel type classification used during INR header parsing.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum InrType {
-    Uint,
-    Int,
-    Float,
-}
-
 /// INRIMAGE-4 volumetric format (`.inr`).
 ///
 /// Header is 256 ASCII bytes with `#INRIMAGE-4#{` magic, followed by raw
@@ -160,9 +152,10 @@ impl FormatReader for InrReader {
         let mut size_x: Option<u32> = None;
         let mut size_y: Option<u32> = None;
         let mut size_z: u32 = 1;
-        let mut size_c: u32 = 1;
+        let mut size_t: u32 = 1;
         let mut bpp: Option<u32> = None;
-        let mut inr_type: Option<InrType> = None;
+        // Java: isSigned = TYPE.toLowerCase().startsWith("signed")
+        let mut is_signed = false;
         let mut little_endian = true;
 
         for line in header_text.split('\n') {
@@ -187,8 +180,9 @@ impl FormatReader for InrReader {
                         }
                     }
                     "VDIM" => {
+                        // Java INRReader.java:124-126 maps VDIM -> sizeT
                         if let Ok(n) = val.parse::<u32>() {
-                            size_c = n;
+                            size_t = n;
                         }
                     }
                     "PIXSIZE" => {
@@ -200,26 +194,9 @@ impl FormatReader for InrReader {
                         }
                     }
                     "TYPE" => {
-                        let mut parsed_type = if val.contains("unsigned")
-                            || val.contains("fixed") && !val.contains("signed")
-                        {
-                            InrType::Uint
-                        } else if val.contains("signed") {
-                            InrType::Int
-                        } else if val.contains("float") {
-                            InrType::Float
-                        } else {
-                            InrType::Uint
-                        };
-                        // More precise: check exact values
-                        if val == "unsigned fixed" {
-                            parsed_type = InrType::Uint;
-                        } else if val == "signed fixed" {
-                            parsed_type = InrType::Int;
-                        } else if val == "float" {
-                            parsed_type = InrType::Float;
-                        }
-                        inr_type = Some(parsed_type);
+                        // Java INRReader.java:127-129:
+                        //   isSigned = value.toLowerCase().startsWith("signed")
+                        is_signed = val.to_ascii_lowercase().starts_with("signed");
                     }
                     "CPU" => {
                         little_endian = matches!(val, "decm" | "pc");
@@ -241,31 +218,37 @@ impl FormatReader for InrReader {
         let bpp = bpp.ok_or_else(|| {
             BioFormatsError::UnsupportedFormat("INR header missing PIXSIZE".into())
         })?;
-        let inr_type = inr_type
-            .ok_or_else(|| BioFormatsError::UnsupportedFormat("INR header missing TYPE".into()))?;
-        let pixel_type = match (bpp, inr_type) {
-            (8, InrType::Uint) => PixelType::Uint8,
-            (8, InrType::Int) => PixelType::Uint8,
-            (16, InrType::Uint) => PixelType::Uint16,
-            (16, InrType::Int) => PixelType::Int16,
-            (32, InrType::Uint) => PixelType::Uint32,
-            (32, InrType::Int) => PixelType::Int32,
-            (32, InrType::Float) => PixelType::Float32,
-            (64, InrType::Float) => PixelType::Float64,
+        // Java INRReader.java:158-159:
+        //   pixelType = FormatTools.pixelTypeFromBytes(nBits / 8, isSigned, false)
+        // Map purely by byte width; signed-ness chosen by `is_signed`. There is
+        // no floating-point branch in Java for INR (fp is always false), so an
+        // 8-byte sample maps to DOUBLE (Float64).
+        let bytes = bpp / 8;
+        let pixel_type = match bytes {
+            1 if is_signed => PixelType::Int8,
+            1 => PixelType::Uint8,
+            2 if is_signed => PixelType::Int16,
+            2 => PixelType::Uint16,
+            4 if is_signed => PixelType::Int32,
+            4 => PixelType::Uint32,
+            8 => PixelType::Float64,
             _ => {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "INR unsupported pixel size/type combination: {bpp} bits"
+                    "INR unsupported pixel size: {bpp} bits"
                 )));
             }
         };
 
-        if size_z == 0 || size_c == 0 {
+        // Java forces sizeC = 1 and imageCount = sizeZ * sizeT * sizeC.
+        let size_c: u32 = 1;
+        if size_z == 0 || size_t == 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "INR header dimensions must be positive".into(),
             ));
         }
         let image_count = size_z
-            .checked_mul(size_c)
+            .checked_mul(size_t)
+            .and_then(|v| v.checked_mul(size_c))
             .ok_or_else(|| BioFormatsError::Format("INR image count overflows".into()))?;
         let bps = (bpp / 8) as u64;
         let expected = 256u64
@@ -289,11 +272,11 @@ impl FormatReader for InrReader {
             size_y,
             size_z,
             size_c,
-            size_t: 1,
+            size_t,
             pixel_type,
             bits_per_pixel: bpp as u8,
             image_count,
-            dimension_order: DimensionOrder::XYZCT,
+            dimension_order: DimensionOrder::XYZTC,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
@@ -1853,6 +1836,77 @@ impl FormatReader for ImrodReader {
             )))
         } else {
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod inr_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build a minimal 256-byte INRIMAGE-4 header followed by raw pixels.
+    fn write_inr(dir: &std::path::Path, name: &str, header_body: &str, payload: &[u8]) -> PathBuf {
+        let mut header = String::from("#INRIMAGE-4#{\n");
+        header.push_str(header_body);
+        header.push_str("##}\n");
+        let mut bytes = header.into_bytes();
+        assert!(bytes.len() <= 256, "test header exceeds 256 bytes");
+        bytes.resize(256, b'\n');
+        bytes.extend_from_slice(payload);
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&bytes).unwrap();
+        path
+    }
+
+    /// VDIM must map to size_t (Java INRReader.java:124-126), size_c forced to 1,
+    /// dimension order XYZTC (Java line 160), image_count = z*t*c (line 157).
+    #[test]
+    fn vdim_maps_to_size_t() {
+        let tmp = std::env::temp_dir();
+        // 2x2 plane, ZDIM=3, VDIM=4 -> z=3,t=4,c=1,count=12, 8-bit unsigned
+        let body = "XDIM=2\nYDIM=2\nZDIM=3\nVDIM=4\nPIXSIZE=8 bits\nTYPE=unsigned fixed\n";
+        let payload = vec![0u8; 2 * 2 * 3 * 4];
+        let path = write_inr(&tmp, "inr_vdim_test.inr", body, &payload);
+
+        let mut r = InrReader::new();
+        r.set_id(&path).unwrap();
+        let m = r.metadata();
+        assert_eq!(m.size_z, 3);
+        assert_eq!(m.size_t, 4, "VDIM should populate size_t");
+        assert_eq!(m.size_c, 1, "size_c must be forced to 1");
+        assert_eq!(m.image_count, 12, "image_count = z*t*c");
+        assert_eq!(m.dimension_order, DimensionOrder::XYZTC);
+        assert_eq!(m.pixel_type, PixelType::Uint8);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Pixel type derives from byte width + signed flag (Java line 158-159);
+    /// 8 bytes maps to Float64/DOUBLE, never a 32-bit Float branch.
+    #[test]
+    fn pixel_type_by_byte_width() {
+        let tmp = std::env::temp_dir();
+        let cases: &[(&str, u32, PixelType)] = &[
+            ("signed fixed", 8, PixelType::Int8),
+            ("unsigned fixed", 8, PixelType::Uint8),
+            ("signed fixed", 16, PixelType::Int16),
+            ("unsigned fixed", 16, PixelType::Uint16),
+            ("signed fixed", 32, PixelType::Int32),
+            ("unsigned fixed", 32, PixelType::Uint32),
+            ("float", 64, PixelType::Float64),
+            // 32-bit float has no Java-specific branch; width 4 unsigned -> Uint32
+            ("float", 32, PixelType::Uint32),
+        ];
+        for (i, (ty, bits, expected)) in cases.iter().enumerate() {
+            let body = format!("XDIM=1\nYDIM=1\nPIXSIZE={} bits\nTYPE={}\n", bits, ty);
+            let payload = vec![0u8; (bits / 8) as usize];
+            let name = format!("inr_pt_{}.inr", i);
+            let path = write_inr(&tmp, &name, &body, &payload);
+            let mut r = InrReader::new();
+            r.set_id(&path).unwrap();
+            assert_eq!(r.metadata().pixel_type, *expected, "case {}: {} {}", i, ty, bits);
+            let _ = std::fs::remove_file(&path);
         }
     }
 }

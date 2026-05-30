@@ -1580,7 +1580,9 @@ fn well_name(row: i32, col: i32) -> String {
             break;
         }
     }
-    format!("{}{}", letters, col + 1)
+    // Java FormatTools.getWellName zero-pads the 1-based column to a minimum
+    // of 2 digits (FormatTools.java:1372-1376): "A1" -> "A01".
+    format!("{}{:02}", letters, col + 1)
 }
 
 // ===========================================================================
@@ -2158,7 +2160,9 @@ mod columbus {
                 .then(a.z.cmp(&b.z))
         });
 
-        let cols_for_sample = plate_cols.max(1);
+        // Java ColumbusReader uses the raw getPlateColumns() for the sample
+        // index (ColumbusReader.java:316,375), with no minimum-of-1 clamp.
+        let cols_for_sample = plate_cols;
         let mut unique_samples: Vec<i32> = Vec::new();
         let mut unique_rows: Vec<i32> = Vec::new();
         let mut unique_cols: Vec<i32> = Vec::new();
@@ -3115,8 +3119,11 @@ mod bd {
         // Mirror Java BDReader.java:668-680: a running imageCount starts at 0,
         // so the first channel with any images sets sizeT = images/sizeZ, and
         // later channels only update if they have more images than the running count.
+        // Java counts the SECOND well directory (wellList.get(1),
+        // BDReader.java:671), not the first non-empty one; we guard the length
+        // (Java would otherwise throw IndexOutOfBounds with a single well).
         let mut size_t = 0u32;
-        if let Some((_, tiffs)) = well_tiffs.iter().find(|(_, t)| !t.is_empty()) {
+        if let Some((_, tiffs)) = well_tiffs.get(1) {
             let mut image_count = 0u32;
             for cname in &channel_names {
                 let images = tiffs
@@ -3395,8 +3402,37 @@ mod cellvoyager {
                 "CellVoyager: no enabled channels in MeasurementResult.xml".to_string(),
             ));
         }
-        let pixel_width = (unmag_px_w / magnification).max(1e-9);
-        let pixel_height = (unmag_px_h / magnification).max(1e-9);
+        // Java CellVoyagerReader reads PhysicalSizeX/Y from the companion
+        // MeasurementResult.ome.xml (Image/Pixels attributes) and divides by
+        // magnification (CellVoyagerReader.java:533-534, 589-590). Tile
+        // placement (xpixels = round((x-xmin)/pixelWidth)) depends on this, so
+        // we read it from the OME XML; we only fall back to the camera
+        // cell-size / magnification when the OME XML is absent or unparsable.
+        let ome_file = measurement_folder.join("MeasurementResult.ome.xml");
+        let ome_phys = std::fs::read_to_string(&ome_file).ok().and_then(|s| {
+            let ome_dom = dom::parse(&s);
+            let pixels = ome_dom.root().child(&["Image", "Pixels"])?;
+            let px = pixels
+                .attr("PhysicalSizeX")
+                .and_then(|v| v.trim().parse::<f64>().ok());
+            let py = pixels
+                .attr("PhysicalSizeY")
+                .and_then(|v| v.trim().parse::<f64>().ok());
+            match (px, py) {
+                (Some(px), Some(py)) => Some((px, py)),
+                _ => None,
+            }
+        });
+        let (pixel_width, pixel_height) = match ome_phys {
+            Some((px, py)) => (
+                (px / magnification).max(1e-9),
+                (py / magnification).max(1e-9),
+            ),
+            None => (
+                (unmag_px_w / magnification).max(1e-9),
+                (unmag_px_h / magnification).max(1e-9),
+            ),
+        };
 
         // Areas may be shared per-well or defined per-well.
         let same_area_per_well = root
@@ -3645,6 +3681,7 @@ mod cellvoyager {
         pub struct Node {
             pub name: String,
             pub text: String,
+            pub attrs: Vec<(String, String)>,
             pub children: Vec<Node>,
         }
 
@@ -3677,6 +3714,27 @@ mod cellvoyager {
             pub fn children(&self, name: &str) -> Vec<&Node> {
                 self.children.iter().filter(|c| c.name == name).collect()
             }
+
+            /// Attribute value by (local) name.
+            pub fn attr(&self, name: &str) -> Option<&str> {
+                self.attrs
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+            }
+        }
+
+        fn collect_attrs(e: &quick_xml::events::BytesStart) -> Vec<(String, String)> {
+            let mut out = Vec::new();
+            for a in e.attributes().flatten() {
+                let k = local(a.key.as_ref());
+                let v = a
+                    .unescape_value()
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
+                out.push((k, v));
+            }
+            out
         }
 
         fn local(name: &[u8]) -> String {
@@ -3699,12 +3757,14 @@ mod cellvoyager {
                     Ok(Event::Start(ref e)) => {
                         stack.push(Node {
                             name: local(e.name().as_ref()),
+                            attrs: collect_attrs(e),
                             ..Default::default()
                         });
                     }
                     Ok(Event::Empty(ref e)) => {
                         let n = Node {
                             name: local(e.name().as_ref()),
+                            attrs: collect_attrs(e),
                             ..Default::default()
                         };
                         if let Some(parent) = stack.last_mut() {

@@ -290,9 +290,9 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
             }
             let ty = extract_attr(line, "type").unwrap_or("");
             cur_seq = Some(Sequence {
-                // Java: isTimeSeries() == ("TSeries Timed Element".equals(type)).
-                is_time_series: ty == "TSeries Timed Element"
-                    || ty.to_ascii_lowercase().contains("tseries"),
+                // Java PrairieMetadata.java:623-624: isTimeSeries() ==
+                // "TSeries Timed Element".equals(type) — an exact match.
+                is_time_series: ty == "TSeries Timed Element",
                 frames: Vec::new(),
             });
             next_frame_index = 0;

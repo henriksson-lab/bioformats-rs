@@ -61,6 +61,37 @@ fn spe_pixel_type(datatype: i16) -> (PixelType, u8) {
     }
 }
 
+/// Replicate Java SPEReader.SpeHeader.getStackSize (904-919): used as a
+/// fallback to derive the frame count when NUM_FRAMES < 1.
+///
+/// Offsets (all little-endian, matching SpeHeaderEntry):
+///   HEIGHT     = 656 (short, Y dim of raw data / "stripe")
+///   NOSCAN     =  34 (short, old num scans; usually -1, i.e. 65535 unsigned)
+///   LNOSCAN    = 664 (int, number of scans for early WinX)
+///   NUM_FRAMES =1446 (int)
+///
+/// Note: Java's getShort reads an UNSIGNED 16-bit value (no sign extension),
+/// so the `noscan == 65535` check is performed against the unsigned reading
+/// (r_u16_le), matching Java exactly.
+fn spe_stack_size(hdr: &[u8]) -> i32 {
+    let stripe = r_u16_le(hdr, 656) as i32; // HEIGHT
+    let noscan = r_u16_le(hdr, 34) as i32; // NOSCAN
+    let num_frames = r_i32_le(hdr, 1446); // NUM_FRAMES
+    if stripe == 0 || noscan == 0 {
+        return num_frames;
+    }
+    if noscan == 65535 {
+        let lnoscan = r_i32_le(hdr, 664); // LNOSCAN
+        if lnoscan == -1 || lnoscan == 0 {
+            num_frames
+        } else {
+            lnoscan / stripe
+        }
+    } else {
+        noscan / stripe
+    }
+}
+
 /// Read the SPE 3.0 trailing XML footer starting at `offset` to EOF.
 fn read_xml_footer(f: &mut File, offset: u64) -> Result<String> {
     let len = f.metadata().map_err(BioFormatsError::Io)?.len();
@@ -127,7 +158,21 @@ impl FormatReader for SpeReader {
         let datatype = r_i16_le(&hdr, 108);
         let xdim = positive_u16_dim(r_u16_le(&hdr, 42), "width")?;
         let ydim = positive_u16_dim(r_u16_le(&hdr, 656), "height")?;
-        let numframes = positive_i32_dim(r_i32_le(&hdr, 1446), "frame count")?;
+        // NUM_FRAMES (offset 1446, int). When < 1, Java SPEReader.java:152-155
+        // falls back to header.getStackSize() before erroring.
+        let raw_numframes = r_i32_le(&hdr, 1446);
+        let numframes = if raw_numframes < 1 {
+            let stack_size = spe_stack_size(&hdr);
+            if stack_size >= 1 {
+                stack_size as u32
+            } else {
+                // Still non-positive after the fallback: reject as Java would
+                // produce an invalid (<1) frame count.
+                positive_i32_dim(raw_numframes, "frame count")?
+            }
+        } else {
+            positive_i32_dim(raw_numframes, "frame count")?
+        };
         let exposure = r_i32_le(&hdr, 10);
         let header_ver = r_i32_le(&hdr, 1992);
         let xml_offset = r_i64_le(&hdr, 678);

@@ -148,20 +148,55 @@ impl<R: Read + Seek> DmReader<R> {
         self.r.read_exact(&mut b)?;
         Ok(b[0])
     }
+    #[allow(dead_code)]
     fn read_be_u16(&mut self) -> std::io::Result<u16> {
         let mut b = [0u8; 2];
         self.r.read_exact(&mut b)?;
         Ok(u16::from_be_bytes(b))
     }
+    #[allow(dead_code)]
     fn read_be_u32(&mut self) -> std::io::Result<u32> {
         let mut b = [0u8; 4];
         self.r.read_exact(&mut b)?;
         Ok(u32::from_be_bytes(b))
     }
+    #[allow(dead_code)]
     fn read_be_u64(&mut self) -> std::io::Result<u64> {
         let mut b = [0u8; 8];
         self.r.read_exact(&mut b)?;
         Ok(u64::from_be_bytes(b))
+    }
+    // Structural integers (tag length/type, n_info, data_type, array/struct
+    // counts) are read in the file's declared byte order. Java sets
+    // in.order(isLittleEndian()) before parseTags and reads these with
+    // readShort/readInt/readLong. Standard DM3/DM4 are big-endian (le=false),
+    // so these match read_be_*; for LE-declared files they read little-endian.
+    fn read_struct_u16(&mut self) -> std::io::Result<u16> {
+        let mut b = [0u8; 2];
+        self.r.read_exact(&mut b)?;
+        Ok(if self.le {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        })
+    }
+    fn read_struct_u32(&mut self) -> std::io::Result<u32> {
+        let mut b = [0u8; 4];
+        self.r.read_exact(&mut b)?;
+        Ok(if self.le {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })
+    }
+    fn read_struct_u64(&mut self) -> std::io::Result<u64> {
+        let mut b = [0u8; 8];
+        self.r.read_exact(&mut b)?;
+        Ok(if self.le {
+            u64::from_le_bytes(b)
+        } else {
+            u64::from_be_bytes(b)
+        })
     }
     fn skip_dm4_padding(&mut self) -> std::io::Result<()> {
         if self.dm4 {
@@ -359,26 +394,26 @@ impl<R: Read + Seek> DmReader<R> {
         self.r.read_exact(&mut delim)?;
 
         self.skip_dm4_padding()?;
-        let n_info = self.read_be_u32()?;
+        let n_info = self.read_struct_u32()?;
         self.skip_dm4_padding()?;
-        let data_type = self.read_be_u32()?;
+        let data_type = self.read_struct_u32()?;
 
         match n_info {
             0 => Ok(DmValue::Int(0)),
             1 => self.read_scalar(data_type),
             2 => {
-                let len = self.read_be_u32()? as usize;
+                let len = self.read_struct_u32()? as usize;
                 let mut bytes = vec![0u8; len];
                 self.r.read_exact(&mut bytes)?;
                 Ok(DmValue::Str(String::from_utf8_lossy(&bytes).to_string()))
             }
             3 if data_type == DM_TYPE_ARRAY => {
                 self.skip_dm4_padding()?;
-                let elem_type = self.read_be_u32()?;
+                let elem_type = self.read_struct_u32()?;
                 let elem_count = if self.dm4 {
-                    self.read_be_u64()?
+                    self.read_struct_u64()?
                 } else {
-                    self.read_be_u32()? as u64
+                    self.read_struct_u32()? as u64
                 };
                 let total_bytes = elem_count
                     .checked_mul(Self::type_size(elem_type) as u64)
@@ -410,7 +445,7 @@ impl<R: Read + Seek> DmReader<R> {
                 self.skip_bytes(4)?;
                 self.skip_dm4_padding()?;
                 self.skip_dm4_padding()?;
-                let n_fields = self.read_be_u32()? as usize;
+                let n_fields = self.read_struct_u32()? as usize;
                 let start_fp = self.r.stream_position()?;
                 self.skip_bytes(4)?;
                 self.skip_dm4_padding()?;
@@ -422,7 +457,7 @@ impl<R: Read + Seek> DmReader<R> {
                 let mut field_types = Vec::with_capacity(n_fields);
                 for i in 0..n_fields {
                     self.r.seek(SeekFrom::Start(base_fp + i as u64 * width))?;
-                    field_types.push(self.read_be_u32()?);
+                    field_types.push(self.read_struct_u32()?);
                 }
                 self.r
                     .seek(SeekFrom::Start(start_fp + n_fields as u64 * width))?;
@@ -435,12 +470,12 @@ impl<R: Read + Seek> DmReader<R> {
             }
             _ if data_type == DM_TYPE_ARRAY => {
                 self.skip_dm4_padding()?;
-                let nested_type = self.read_be_u32()?;
+                let nested_type = self.read_struct_u32()?;
                 if nested_type == DM_TYPE_STRUCT {
                     self.skip_bytes(4)?;
                     self.skip_dm4_padding()?;
                     self.skip_dm4_padding()?;
-                    let n_fields = self.read_be_u32()? as usize;
+                    let n_fields = self.read_struct_u32()? as usize;
                     let mut field_types = Vec::with_capacity(n_fields);
                     let mut base_fp = self.r.stream_position()? + 12;
                     if self.dm4 {
@@ -451,10 +486,10 @@ impl<R: Read + Seek> DmReader<R> {
                         if self.dm4 {
                             self.r.seek(SeekFrom::Start(base_fp + i as u64 * 16))?;
                         }
-                        field_types.push(self.read_be_u32()?);
+                        field_types.push(self.read_struct_u32()?);
                     }
                     self.skip_dm4_padding()?;
-                    let len = self.read_be_u32()? as usize;
+                    let len = self.read_struct_u32()? as usize;
                     for _ in 0..len {
                         for &type_code in &field_types {
                             let _ = self.read_scalar(type_code)?;
@@ -479,7 +514,7 @@ impl<R: Read + Seek> DmReader<R> {
             self.skip_dm4_padding()?;
             self.skip_dm4_padding()?;
         }
-        let n_tags = self.read_be_u32()? as u64;
+        let n_tags = self.read_struct_u32()? as u64;
 
         // Java: if numTags > in.length() the declared byte order is wrong, so
         // flip m.littleEndian and disable adjust_endianness.
@@ -491,10 +526,27 @@ impl<R: Read + Seek> DmReader<R> {
             }
         }
 
+        let stream_len = self.stream_len()?;
         let mut entries = Vec::new();
-        for _ in 0..n_tags {
+        // Java uses a `for (int i; i<numTags; i++)` loop where type-23 tags do
+        // `i--` to re-read the index; mirror that with an explicit counter.
+        let mut i: u64 = 0;
+        while i < n_tags {
+            // Java: if (in.getFilePointer() + 3 >= in.length()) break;
+            if self.r.stream_position()? + 3 >= stream_len {
+                break;
+            }
+
             let tag_type = self.read_u8()?;
-            let name_len = self.read_be_u16()? as usize;
+
+            // Java GatanReader.java:637-640: type 23 tags consume only 5 bytes
+            // and re-read the same index (i--), instead of carrying a name.
+            if tag_type == 23 {
+                self.skip_bytes(5)?;
+                continue;
+            }
+
+            let name_len = self.read_struct_u16()? as usize;
             let mut name_bytes = vec![0u8; name_len];
             self.r.read_exact(&mut name_bytes)?;
             let name = String::from_utf8_lossy(&name_bytes).to_string();
@@ -505,6 +557,7 @@ impl<R: Read + Seek> DmReader<R> {
                 _ => DmValue::Int(0),
             };
             entries.push((name, val));
+            i += 1;
         }
         Ok(DmValue::Group(entries))
     }

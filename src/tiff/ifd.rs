@@ -314,10 +314,34 @@ impl Ifd {
     }
 
     pub fn photometric(&self) -> Photometric {
-        Photometric::from(self.get_u16(tag::PHOTOMETRIC_INTERPRETATION).unwrap_or(1))
+        // Java IFD.getPhotometricInterpretation (IFD.java:743-750): when the
+        // PhotometricInterpretation tag is absent and the compression is OLD_JPEG,
+        // the photometric is RGB. Otherwise fall back to the default (BlackIsZero).
+        match self.get_u16(tag::PHOTOMETRIC_INTERPRETATION) {
+            Some(pi) => Photometric::from(pi),
+            None if self.is_old_jpeg() => Photometric::Rgb,
+            None => Photometric::from(1),
+        }
+    }
+
+    /// Raw Compression tag code (TIFF tag 259), before mapping to `Compression`.
+    /// OLD_JPEG (code 6) and ALT_JPEG (code 33007) both map to `Compression::Jpeg`,
+    /// but Java only special-cases OLD_JPEG, so the raw code is needed to match it.
+    fn compression_code(&self) -> u16 {
+        self.get_u16(tag::COMPRESSION).unwrap_or(1)
+    }
+
+    /// True for old-style JPEG (TIFF compression code 6, Java `TiffCompression.OLD_JPEG`).
+    fn is_old_jpeg(&self) -> bool {
+        self.compression_code() == 6
     }
 
     pub fn samples_per_pixel(&self) -> u16 {
+        // Java IFD.getSamplesPerPixel (IFD.java:693-698) always returns 3 for
+        // OLD_JPEG ("always RGB"), regardless of the SamplesPerPixel tag.
+        if self.is_old_jpeg() {
+            return 3;
+        }
         self.get_u16(tag::SAMPLES_PER_PIXEL).unwrap_or(1)
     }
 
