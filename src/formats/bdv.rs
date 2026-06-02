@@ -19,6 +19,8 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
+use hdf5_pure_rust::{HyperslabDim, Selection};
+
 pub struct BdvReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -73,7 +75,7 @@ fn xml_count(xml: &str, tag: &str) -> usize {
 }
 
 fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32, u32, u32)> {
-    let file = hdf5_pure::File::open(path)
+    let file = hdf5_pure_rust::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
     // ── Try companion XML for authoritative dimensions ───────────────────────
@@ -318,48 +320,33 @@ fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32, u32, u32)> 
 }
 
 fn hdf5_group_members(
-    group: &hdf5_pure::Group<'_>,
-) -> std::result::Result<Vec<String>, hdf5_pure::Error> {
-    let mut members = group.groups()?;
-    members.extend(group.datasets()?);
-    Ok(members)
+    group: &hdf5_pure_rust::Group,
+) -> std::result::Result<Vec<String>, hdf5_pure_rust::Error> {
+    group.member_names()
 }
 
 fn hdf5_members(
-    file: &hdf5_pure::File,
+    file: &hdf5_pure_rust::File,
     path: &str,
-) -> std::result::Result<Vec<String>, hdf5_pure::Error> {
+) -> std::result::Result<Vec<String>, hdf5_pure_rust::Error> {
     if path == "/" {
-        hdf5_group_members(&file.root())
+        file.member_names()
     } else {
         hdf5_group_members(&file.group(path)?)
     }
 }
 
-fn hdf5_dtype_size(dtype: hdf5_pure::DType) -> usize {
-    match dtype {
-        hdf5_pure::DType::I16 | hdf5_pure::DType::U16 => 2,
-        hdf5_pure::DType::I8 | hdf5_pure::DType::U8 => 1,
-        hdf5_pure::DType::F32
-        | hdf5_pure::DType::I32
-        | hdf5_pure::DType::U32
-        | hdf5_pure::DType::Enum(_) => 4,
-        hdf5_pure::DType::F64
-        | hdf5_pure::DType::I64
-        | hdf5_pure::DType::U64
-        | hdf5_pure::DType::ObjectReference => 8,
-        hdf5_pure::DType::Array(base, dims) => {
-            hdf5_dtype_size(*base) * dims.iter().copied().product::<u32>() as usize
-        }
-        _ => 0,
-    }
+fn hdf5_dtype_size(dtype: &hdf5_pure_rust::Datatype) -> usize {
+    // The new crate exposes the element size directly, so this collapses to a
+    // single call (covering fixed/floating/array element sizes alike).
+    dtype.size()
 }
 
 /// Validates the cells dataset shape and derives the pixel type from its HDF5
 /// dtype size. Java BDVReader.java:571-579 maps element size to pixel type:
 /// 1 → UINT8, 2 → UINT16, 4 → INT32 (signed). Returns (pixel_type, bytes_per_sample).
 fn validate_bdv_cells_dataset(
-    file: &hdf5_pure::File,
+    file: &hdf5_pure_rust::File,
     path: &str,
     size_x: u32,
     size_y: u32,
@@ -370,7 +357,7 @@ fn validate_bdv_cells_dataset(
         .map_err(|e| BioFormatsError::UnsupportedFormat(format!("BDV: missing {path}: {e}")))?;
     let dtype_size = ds
         .dtype()
-        .map(hdf5_dtype_size)
+        .map(|dt| hdf5_dtype_size(&dt))
         .map_err(|e| BioFormatsError::Format(format!("BDV: cannot read dtype for {path}: {e}")))?;
     let (pixel_type, bytes_per_sample) = match dtype_size {
         1 => (PixelType::Uint8, 1usize),
@@ -502,7 +489,7 @@ impl FormatReader for BdvReader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        let file = hdf5_pure::File::open(&path)
+        let file = hdf5_pure_rust::File::open(&path)
             .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
         let ds = file
             .dataset(&ds_path)
@@ -513,21 +500,29 @@ impl FormatReader for BdvReader {
         // uint16. Each branch yields the raw little-endian sample bytes.
         let bps = meta.pixel_type.bytes_per_sample() as usize;
         let plane_pixels = meta.size_x as usize * meta.size_y as usize;
-        let plane_bytes = plane_pixels * bps;
+
+        // True partial I/O: select only plane z of the 3-D [Z, Y, X] cells
+        // dataset instead of reading the whole volume and byte-slicing. After
+        // read_slice the returned vec IS the plane, so it is indexed from 0.
+        let sel = Selection::Hyperslab(vec![
+            HyperslabDim::new(z as u64, 1, 1, 1),
+            HyperslabDim::new(0, 1, meta.size_y as u64, 1),
+            HyperslabDim::new(0, 1, meta.size_x as u64, 1),
+        ]);
 
         let raw: Vec<u8> = match bps {
             1 => ds
-                .read_u8()
+                .read_slice::<u8, _>(sel)
                 .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
             2 => {
                 let words: Vec<u16> = ds
-                    .read_u16()
+                    .read_slice::<u16, _>(sel)
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 words.iter().flat_map(|w| w.to_le_bytes()).collect()
             }
             4 => {
                 let words: Vec<u32> = ds
-                    .read_u32()
+                    .read_slice::<u32, _>(sel)
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 words.iter().flat_map(|w| w.to_le_bytes()).collect()
             }
@@ -538,14 +533,15 @@ impl FormatReader for BdvReader {
             }
         };
 
-        let offset = z * plane_bytes;
-        if offset + plane_bytes <= raw.len() {
-            Ok(raw[offset..offset + plane_bytes].to_vec())
+        let plane_bytes = plane_pixels * bps;
+        // read_slice already returns exactly the selected plane (indexed from
+        // 0), so no per-plane byte offset is needed; just validate the length.
+        if raw.len() == plane_bytes {
+            Ok(raw)
         } else {
             Err(BioFormatsError::UnsupportedFormat(format!(
                 "BDV dataset {ds_path} is shorter than declared plane {plane_index} \
-                 (need {} bytes, have {})",
-                offset + plane_bytes,
+                 (need {plane_bytes} bytes, have {})",
                 raw.len()
             )))
         }

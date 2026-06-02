@@ -1520,7 +1520,7 @@ impl FormatReader for MincReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        use hdf5_pure::DType;
+        use hdf5_pure_rust::format::messages::datatype::DatatypeClass;
 
         // Dispatch on the file's magic bytes: NetCDF-3 classic (MINC-1) is read
         // by the local parser; everything else is treated as HDF5 (MINC-2).
@@ -1534,7 +1534,7 @@ impl FormatReader for MincReader {
             return self.set_id_netcdf3(path);
         }
 
-        let file = hdf5_pure::File::open(path)
+        let file = hdf5_pure_rust::File::open(path)
             .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5: {e}")))?;
 
         // Mirror MINCReader.initFile: only the HDF5-backed MINC-2.0 path is
@@ -1590,15 +1590,19 @@ impl FormatReader for MincReader {
         // attribute is present and does NOT start with "true". The HDF5 storage
         // signedness is ignored entirely.
         let unsigned_attr: Option<bool> = if is_minc2 {
-            ds.attrs().ok().and_then(|attrs| {
-                attrs.get("_Unsigned").map(|v| {
-                    // true => unsigned; anything else (the attribute is present
-                    // but not "true...") => signed.
-                    format!("{v:?}")
-                        .trim_start_matches(['"', '\''])
-                        .to_ascii_lowercase()
-                        .starts_with("true")
-                })
+            ds.attr_names().ok().and_then(|names| {
+                if names.iter().any(|n| n == "_Unsigned") {
+                    ds.attr("_Unsigned").ok().map(|attr| {
+                        // true => unsigned; anything else (the attribute is
+                        // present but not "true...") => signed.
+                        attr.read_string()
+                            .trim_start_matches(['"', '\''])
+                            .to_ascii_lowercase()
+                            .starts_with("true")
+                    })
+                } else {
+                    None
+                }
             })
         } else {
             None
@@ -1611,74 +1615,79 @@ impl FormatReader for MincReader {
         // little-endian bytes (MINCReader uses isLittleEndian()==isMINC2 for the
         // byte conversion; we always materialise little-endian and flag the
         // metadata accordingly).
-        let (pixel_type, bits, pixels): (PixelType, u8, Vec<u8>) = match &dtype {
-            DType::U8 | DType::I8 => {
-                let raw = ds
-                    .read_u8()
-                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
-                let pt = if signed {
-                    PixelType::Int8
-                } else {
-                    PixelType::Uint8
-                };
-                (pt, 8, raw)
-            }
-            DType::U16 | DType::I16 => {
-                let raw = ds
-                    .read_i16()
-                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
-                let mut bytes = Vec::with_capacity(raw.len() * 2);
-                for v in &raw {
-                    bytes.extend_from_slice(&v.to_le_bytes());
+        // TODO: per-plane read_slice. The MincReader caches the whole volume in
+        // self.pixel_data during set_id and serves planes by byte offset in
+        // open_bytes; the plane index is not available here, so we read the
+        // entire volume up front (preserving the original behaviour).
+        let (pixel_type, bits, pixels): (PixelType, u8, Vec<u8>) =
+            match (dtype.class(), dtype.size()) {
+                (DatatypeClass::FixedPoint, 1) => {
+                    let raw = ds
+                        .read::<u8>()
+                        .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                    let pt = if signed {
+                        PixelType::Int8
+                    } else {
+                        PixelType::Uint8
+                    };
+                    (pt, 8, raw)
                 }
-                let pt = if signed {
-                    PixelType::Int16
-                } else {
-                    PixelType::Uint16
-                };
-                (pt, 16, bytes)
-            }
-            DType::U32 | DType::I32 => {
-                let raw = ds
-                    .read_i32()
-                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
-                let mut bytes = Vec::with_capacity(raw.len() * 4);
-                for v in &raw {
-                    bytes.extend_from_slice(&v.to_le_bytes());
+                (DatatypeClass::FixedPoint, 2) => {
+                    let raw = ds
+                        .read::<i16>()
+                        .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                    let mut bytes = Vec::with_capacity(raw.len() * 2);
+                    for v in &raw {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let pt = if signed {
+                        PixelType::Int16
+                    } else {
+                        PixelType::Uint16
+                    };
+                    (pt, 16, bytes)
                 }
-                let pt = if signed {
-                    PixelType::Int32
-                } else {
-                    PixelType::Uint32
-                };
-                (pt, 32, bytes)
-            }
-            DType::F32 => {
-                let raw = ds
-                    .read_f32()
-                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
-                let mut bytes = Vec::with_capacity(raw.len() * 4);
-                for v in &raw {
-                    bytes.extend_from_slice(&v.to_le_bytes());
+                (DatatypeClass::FixedPoint, 4) => {
+                    let raw = ds
+                        .read::<i32>()
+                        .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                    let mut bytes = Vec::with_capacity(raw.len() * 4);
+                    for v in &raw {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let pt = if signed {
+                        PixelType::Int32
+                    } else {
+                        PixelType::Uint32
+                    };
+                    (pt, 32, bytes)
                 }
-                (PixelType::Float32, 32, bytes)
-            }
-            DType::F64 => {
-                let raw = ds
-                    .read_f64()
-                    .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
-                let mut bytes = Vec::with_capacity(raw.len() * 8);
-                for v in &raw {
-                    bytes.extend_from_slice(&v.to_le_bytes());
+                (DatatypeClass::FloatingPoint, 4) => {
+                    let raw = ds
+                        .read::<f32>()
+                        .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                    let mut bytes = Vec::with_capacity(raw.len() * 4);
+                    for v in &raw {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    (PixelType::Float32, 32, bytes)
                 }
-                (PixelType::Float64, 64, bytes)
-            }
-            other => {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "MINC/HDF5: unsupported image datatype {other}"
-                )));
-            }
-        };
+                (DatatypeClass::FloatingPoint, 8) => {
+                    let raw = ds
+                        .read::<f64>()
+                        .map_err(|e| BioFormatsError::Format(format!("MINC/HDF5 read: {e}")))?;
+                    let mut bytes = Vec::with_capacity(raw.len() * 8);
+                    for v in &raw {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    (PixelType::Float64, 64, bytes)
+                }
+                (class, size) => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "MINC/HDF5: unsupported image datatype {class:?} ({size} bytes)"
+                    )));
+                }
+            };
 
         // Java: imageCount = sizeZ * sizeT * sizeC (sizeC == 1).
         let image_count = size_z.max(1) * size_t.max(1);

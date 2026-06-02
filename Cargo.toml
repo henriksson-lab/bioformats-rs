@@ -26,12 +26,12 @@ exclude = ["bench"]
 [dependencies]
 thiserror    = "1"
 log          = "0.4"
-hdf5-pure    = "0.5"
-zip          = "2"
+hdf5-pure-rust = "0.3"
+zip          = { version = "2", default-features = false, features = ["deflate", "deflate64", "lzma", "aes-crypto", "time"] }
 flate2       = "1"
 weezl        = "0.1"
 jpeg-decoder = "0.3"
-zstd         = "0.13"
+zstd-pure-rs = "0.1"
 quick-xml    = "0.37"
 encoding_rs  = "0.8"
 cfb          = "0.10"
@@ -41,8 +41,8 @@ jpeg2k       = { version = "0.10", default-features = false, features = ["openjp
 serde         = { version = "1", features = ["derive"] }
 bincode       = "1"
 jpegxr        = { version = "0.3", optional = true }
-openslide-pure-rs = { version = "0.1", path = "/home/mahogny/github/claude/openslide-rs", optional = true }
-mdbtools      = { package = "mdbtools-rs", version = "0.1", git = "https://github.com/henriksson-lab/mdbtools-rs" }
+openslide-pure-rs = { version = "0.1", optional = true }
+mdbtools      = { package = "mdbtools-pure-rs", version = "0.1" }
 bzip2 = "0.6"
 
 [features]

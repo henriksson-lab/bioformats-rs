@@ -1127,7 +1127,7 @@ fn decompress_subblock(
         }
         5 => {
             // Zstd
-            zstd::decode_all(data).map_err(BioFormatsError::Io)
+            crate::common::codec::zstd_decode_all(data)
         }
         6 => decompress_zstd_1(data),
         104 => {
@@ -1296,7 +1296,7 @@ fn decompress_zstd_1(data: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
-    let decoded = zstd::decode_all(&data[header_end..]).map_err(BioFormatsError::Io)?;
+    let decoded = crate::common::codec::zstd_decode_all(&data[header_end..])?;
     if !high_low_unpacking {
         return Ok(decoded);
     }
@@ -2206,7 +2206,7 @@ mod tests {
 
     #[test]
     fn czi_zstd_1_plain_payload() {
-        let payload = zstd::encode_all(&b"\x11\x22\x33\x44"[..], 0).unwrap();
+        let payload = crate::common::codec::zstd_encode_all(b"\x11\x22\x33\x44", 0).unwrap();
         let mut wrapped = vec![3, 1, 0];
         wrapped.extend_from_slice(&payload);
         assert_eq!(
@@ -2217,7 +2217,7 @@ mod tests {
 
     #[test]
     fn czi_zstd_1_high_low_unpacking() {
-        let payload = zstd::encode_all(&b"\x11\x33\x22\x44"[..], 0).unwrap();
+        let payload = crate::common::codec::zstd_encode_all(b"\x11\x33\x22\x44", 0).unwrap();
         let mut wrapped = vec![3, 1, 1];
         wrapped.extend_from_slice(&payload);
         assert_eq!(

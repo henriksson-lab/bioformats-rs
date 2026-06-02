@@ -1,6 +1,6 @@
 # bioformats-rs
 
-A pure-Rust reimplementation of [Bio-Formats](https://www.openmicroscopy.org/bio-formats/) 
+A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-formats/) 
 — a library for reading (and writing) scientific image formats used in microscopy, medical imaging, and astronomy.
 
 **This package has limited real data testing, not all features are yet included**

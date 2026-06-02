@@ -308,6 +308,20 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
     let header = peek_header(path, 512)?;
     let mut best_error = None;
 
+    // `.ims` is shared by two unrelated formats: the HDF5-based Imaris
+    // (`imaris::ImarisReader`) and the older Bitplane Imaris 3 TIFF variant
+    // (`flim2::ImarisTiffReader`). The TIFF wrapper accepts `.ims` purely by
+    // extension, so for a genuine HDF5 `.ims` file the HDF5 reader must win.
+    // Dispatch on the actual header here: if the file carries the HDF5 magic,
+    // route straight to the HDF5 Imaris reader before any TIFF-based handling.
+    if has_ims_extension(path) && is_hdf5_header(&header) {
+        let mut r = boxed_reader(crate::formats::imaris::ImarisReader::new());
+        match r.set_id(path) {
+            Ok(()) => return Ok(r),
+            Err(err) => remember_set_id_error(&mut best_error, err),
+        }
+    }
+
     // TIFF-based vendor wrappers often have no magic beyond TIFF itself.
     // Give non-generic TIFF extensions a chance before the broad TiffReader
     // byte signature accepts the file.
@@ -412,6 +426,18 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
     Err(BioFormatsError::UnsupportedFormat(
         path.display().to_string(),
     ))
+}
+
+fn has_ims_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("ims"))
+        .unwrap_or(false)
+}
+
+fn is_hdf5_header(header: &[u8]) -> bool {
+    // HDF5 signature: bytes 0-7 = \x89 H D F \r \n \x1a \n
+    header.len() >= 8 && header[0..8] == [0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a]
 }
 
 fn is_tiff_header(header: &[u8]) -> bool {
@@ -1214,7 +1240,11 @@ mod tests {
             ),
         ] {
             let path = temp_path(name);
-            hdf5_pure::FileBuilder::new().write(&path).unwrap();
+            // Create an empty-but-valid HDF5 file (no image datasets) so the
+            // CellH5/MINC readers exercise their "not found" rejection paths.
+            let mut wf = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+            wf.flush().unwrap();
+            drop(wf);
 
             let err = match ImageReader::open(&path) {
                 Ok(_) => panic!("HDF5 placeholder reader opened fake data"),

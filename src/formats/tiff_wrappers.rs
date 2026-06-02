@@ -541,30 +541,52 @@ impl NdpiReader {
     /// offsets are not exposed here. NDPI is JPEG-tiled (multi-tile) in practice,
     /// so this affects only the rare single-strip >4 GB layout, flagged in
     /// `ndpi.offset64.limitation` when it occurs.
-    fn analyze_large_file_offsets(&mut self, file_len: u64) {
+    fn analyze_large_file_offsets(&mut self, path: &Path, file_len: u64) {
         use crate::common::metadata::MetadataValue;
         self.use_64bit = file_len >= (1u64 << 32);
         if !self.use_64bit {
             return;
         }
 
+        let le = self.inner.is_little_endian();
+        // Chain offsets for the raw IFD trailers used by Mechanism A.
+        let ifd_offsets = ndpi_ifd_offsets(path, le).unwrap_or_default();
+
         let ifd_count = self.inner.ifd_count();
         let mut any_high_words = false;
-        let mut corrected_ifds = 0usize;
-        let mut single_strip_unhandled = false;
+        let mut multistrip_corrected = 0usize;
+        let mut single_strip_corrected = 0usize;
+        let mut out_of_line_unhandled = false;
 
         for i in 0..ifd_count {
+            // Mechanism A (NDPIReader.java:444-490): single-strip/tile files store
+            // the offset inline; its true 64-bit value comes from the per-entry
+            // high-word trailer appended after the IFD body. Needs the raw IFD.
+            if let Some(&off) = ifd_offsets.get(i) {
+                if let Some(ifd) = self.inner.ifd_mut(i) {
+                    match apply_ndpi_single_strip_correction(path, off, le, ifd) {
+                        Ok(NdpiTrailerFix::Corrected) => {
+                            single_strip_corrected += 1;
+                            any_high_words = true;
+                        }
+                        Ok(NdpiTrailerFix::OutOfLineUnhandled) => {
+                            out_of_line_unhandled = true;
+                            any_high_words = true;
+                        }
+                        Ok(NdpiTrailerFix::None) | Err(_) => {}
+                    }
+                }
+            }
+            // Mechanism B: multi-strip/tile per-element high-word arrays
+            // (OFFSET_HIGH_BYTES / BYTE_COUNT_HIGH_BYTES).
             if let Some(ifd) = self.inner.ifd_mut(i) {
                 match apply_ndpi_multistrip_offset_correction(ifd) {
                     NdpiOffsetFix::Corrected => {
                         any_high_words = true;
-                        corrected_ifds += 1;
+                        multistrip_corrected += 1;
                     }
-                    NdpiOffsetFix::SingleStripUnhandled => {
-                        any_high_words = true;
-                        single_strip_unhandled = true;
-                    }
-                    NdpiOffsetFix::NoHighWords => {}
+                    // Single-strip is now handled by Mechanism A above.
+                    NdpiOffsetFix::SingleStripUnhandled | NdpiOffsetFix::NoHighWords => {}
                 }
             }
         }
@@ -577,23 +599,164 @@ impl NdpiReader {
                 MetadataValue::Bool(any_high_words),
             );
             m.insert(
-                "ndpi.offset64.corrected_ifds".into(),
-                MetadataValue::Int(corrected_ifds as i64),
+                "ndpi.offset64.multistrip_corrected_ifds".into(),
+                MetadataValue::Int(multistrip_corrected as i64),
             );
-            if single_strip_unhandled {
+            m.insert(
+                "ndpi.offset64.single_strip_corrected_ifds".into(),
+                MetadataValue::Int(single_strip_corrected as i64),
+            );
+            if out_of_line_unhandled {
                 m.insert(
                     "ndpi.offset64.limitation".into(),
                     MetadataValue::String(
-                        "A single-strip IFD in a >4GB file uses NDPI's per-entry \
-                         high-word trailer (Mechanism A), which is not reconstructed; \
-                         such planes may read incorrectly. Multi-tile planes are \
-                         corrected."
+                        "An IFD stores its strip/tile offset array out-of-line past \
+                         4GB (the array storage itself wraps); re-reading it from the \
+                         corrected location is not implemented, so such planes may \
+                         read incorrectly. Inline single-strip and in-range multi-tile \
+                         offsets are corrected."
                             .into(),
                     ),
                 );
             }
         }
     }
+}
+
+/// TIFF IFD-type → bytes-per-element (subset needed for offset/bytecount tags).
+fn tiff_type_size(type_code: u16) -> u64 {
+    match type_code {
+        1 | 2 | 6 | 7 => 1, // BYTE, ASCII, SBYTE, UNDEFINED
+        3 | 8 => 2,         // SHORT, SSHORT
+        4 | 9 | 11 | 13 => 4, // LONG, SLONG, FLOAT, IFD
+        5 | 10 | 12 => 8,   // RATIONAL, SRATIONAL, DOUBLE
+        16 | 17 | 18 => 8,  // LONG8, SLONG8, IFD8
+        _ => 0,
+    }
+}
+
+/// Walk the classic little-endian TIFF IFD chain and return each IFD's file
+/// offset in chain order. NDPI is always classic `II`/42 TIFF, and its IFDs (and
+/// the next-IFD pointers) live below 4 GB, so a 32-bit-offset walk is safe even
+/// for >4 GB files. The per-IFD high-word trailer is extra data after the body
+/// and is ignored by this walk (the next-IFD pointer sits right after the entry
+/// table, as in standard TIFF).
+fn ndpi_ifd_offsets(path: &Path, le: bool) -> std::io::Result<Vec<u64>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let rd16 = |b: [u8; 2]| if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) };
+    let rd32 = |b: [u8; 4]| if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) };
+
+    let mut f = std::fs::File::open(path)?;
+    let mut hdr = [0u8; 8];
+    f.read_exact(&mut hdr)?;
+    let mut offset = rd32([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
+
+    let mut offsets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while offset != 0 && seen.insert(offset) {
+        offsets.push(offset);
+        f.seek(SeekFrom::Start(offset))?;
+        let mut cb = [0u8; 2];
+        f.read_exact(&mut cb)?;
+        let count = rd16(cb) as u64;
+        f.seek(SeekFrom::Start(offset + 2 + count * 12))?;
+        let mut nb = [0u8; 4];
+        f.read_exact(&mut nb)?;
+        offset = rd32(nb) as u64;
+        if offsets.len() > 100_000 {
+            break; // runaway guard
+        }
+    }
+    Ok(offsets)
+}
+
+/// Outcome of NDPI Mechanism A (per-IFD high-word trailer) for one IFD.
+enum NdpiTrailerFix {
+    /// No high-order word applied to a strip/tile offset/bytecount tag.
+    None,
+    /// An inline single-strip/tile offset/bytecount was corrected.
+    Corrected,
+    /// A strip/tile offset/bytecount array is stored out-of-line past 4 GB
+    /// (its storage offset wraps); re-reading it is not implemented.
+    OutOfLineUnhandled,
+}
+
+/// NDPI Mechanism A (`NDPIReader.java:444-490`): for >4 GB files each IFD carries
+/// a trailer of per-entry high-order 32-bit words after the entry table (+ an
+/// 8-byte gap). For single-strip/tile files the STRIP/TILE offset (and byte
+/// count) is stored inline, and its true 64-bit value is `inline + (high << 32)`.
+/// Re-read the raw IFD trailer and correct those inline values in place, writing
+/// them back as 64-bit `Long8` so the core reader seeks past 4 GB correctly.
+fn apply_ndpi_single_strip_correction(
+    path: &Path,
+    ifd_offset: u64,
+    le: bool,
+    ifd: &mut crate::tiff::ifd::Ifd,
+) -> std::io::Result<NdpiTrailerFix> {
+    use crate::tiff::ifd::{tag, IfdValue};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let rd16 = |b: [u8; 2]| if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) };
+    let rd32 = |b: [u8; 4]| if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) };
+
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(ifd_offset))?;
+    let mut b2 = [0u8; 2];
+    let mut b4 = [0u8; 4];
+    f.read_exact(&mut b2)?;
+    let count = rd16(b2) as usize;
+
+    // (tag, is_out_of_line_offset, inline_value)
+    let mut entries: Vec<(u16, bool, u32)> = Vec::with_capacity(count);
+    for _ in 0..count {
+        f.read_exact(&mut b2)?;
+        let tag_id = rd16(b2);
+        f.read_exact(&mut b2)?;
+        let typ = rd16(b2);
+        f.read_exact(&mut b4)?;
+        let vcount = rd32(b4) as u64;
+        f.read_exact(&mut b4)?;
+        let val = rd32(b4);
+        let n_value_bytes = vcount.saturating_mul(tiff_type_size(typ));
+        entries.push((tag_id, n_value_bytes > 4, val));
+    }
+
+    // Skip the 8-byte gap (next-IFD pointer + padding), then read one high-order
+    // 32-bit word per entry, in tag order.
+    f.seek(SeekFrom::Current(8))?;
+    let mut highs = Vec::with_capacity(count);
+    for _ in 0..count {
+        f.read_exact(&mut b4)?;
+        highs.push(rd32(b4));
+    }
+
+    let mut result = NdpiTrailerFix::None;
+    for (idx, &(tag_id, is_offset, val)) in entries.iter().enumerate() {
+        let high = highs[idx];
+        if high == 0 {
+            continue;
+        }
+        let is_strip_tag = matches!(
+            tag_id,
+            tag::STRIP_OFFSETS | tag::TILE_OFFSETS | tag::STRIP_BYTE_COUNTS | tag::TILE_BYTE_COUNTS
+        );
+        if !is_strip_tag {
+            continue;
+        }
+        if is_offset {
+            // The offset/bytecount ARRAY is stored out-of-line past 4 GB; the
+            // core parser already read it from the wrapped (low) location, so we
+            // can't fix it by a simple value rewrite. Flag rather than mis-handle.
+            result = NdpiTrailerFix::OutOfLineUnhandled;
+            continue;
+        }
+        let corrected = (val as u64).wrapping_add((high as u64) << 32);
+        ifd.entries.insert(tag_id, IfdValue::Long8(vec![corrected]));
+        if !matches!(result, NdpiTrailerFix::OutOfLineUnhandled) {
+            result = NdpiTrailerFix::Corrected;
+        }
+    }
+    Ok(result)
 }
 
 /// Outcome of applying NDPI >4 GB offset correction to one IFD.
@@ -697,7 +860,7 @@ impl FormatReader for NdpiReader {
         self.build_ndpi_series();
         // BUG 2: detect / flag the >4 GB offset-reconstruction situation.
         let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        self.analyze_large_file_offsets(file_len);
+        self.analyze_large_file_offsets(path, file_len);
         Ok(())
     }
 
@@ -2960,5 +3123,81 @@ mod ndpi_offset64_tests {
         ));
         // Offset left untouched (low 32 bits only).
         assert_eq!(ifd.get(tag::STRIP_OFFSETS).unwrap().as_vec_u64(), vec![100]);
+    }
+
+    // ── Mechanism A (single-strip per-IFD high-word trailer) ────────────────
+    fn push_u16(v: &mut Vec<u8>, x: u16) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn push_u32(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+
+    /// Build a minimal classic little-endian TIFF whose single IFD (at offset 8)
+    /// has one inline LONG `STRIP_OFFSETS` entry, followed by NDPI's per-entry
+    /// high-word trailer (8-byte gap + one high word).
+    fn write_single_strip_ndpi_fixture(
+        stem: &str,
+        inline_offset: u32,
+        high_word: u32,
+    ) -> std::path::PathBuf {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"II"); // little-endian
+        push_u16(&mut b, 42); // classic TIFF magic
+        push_u32(&mut b, 8); // first IFD at offset 8
+        assert_eq!(b.len(), 8);
+        push_u16(&mut b, 1); // entry count
+        push_u16(&mut b, tag::STRIP_OFFSETS); // tag 273
+        push_u16(&mut b, 4); // type LONG
+        push_u32(&mut b, 1); // value count
+        push_u32(&mut b, inline_offset); // inline value (low 32 bits)
+        // 8-byte gap (next-IFD pointer = 0 + 4 padding), then the high word.
+        push_u32(&mut b, 0);
+        push_u32(&mut b, 0);
+        push_u32(&mut b, high_word);
+
+        let path = std::env::temp_dir().join(stem);
+        std::fs::write(&path, b).unwrap();
+        path
+    }
+
+    #[test]
+    fn ndpi_walks_classic_ifd_chain_offsets() {
+        let path = write_single_strip_ndpi_fixture("ndpi_chain.tif", 1000, 0);
+        let offsets = ndpi_ifd_offsets(&path, true).unwrap();
+        assert_eq!(offsets, vec![8]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ndpi_single_strip_inline_offset_is_corrected_from_trailer() {
+        // Inline strip offset 1000 with high word 2 -> 1000 + (2 << 32).
+        let path = write_single_strip_ndpi_fixture("ndpi_mech_a.tif", 1000, 2);
+        let mut ifd = Ifd {
+            entries: {
+                let mut m = HashMap::new();
+                m.insert(tag::STRIP_OFFSETS, IfdValue::Long(vec![1000]));
+                m
+            },
+        };
+        let fix = apply_ndpi_single_strip_correction(&path, 8, true, &mut ifd).unwrap();
+        assert!(matches!(fix, NdpiTrailerFix::Corrected));
+        assert!(matches!(ifd.get(tag::STRIP_OFFSETS), Some(IfdValue::Long8(_))));
+        assert_eq!(
+            ifd.get(tag::STRIP_OFFSETS).unwrap().as_vec_u64(),
+            vec![1000 + (2u64 << 32)]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ndpi_single_strip_zero_high_word_is_noop() {
+        let path = write_single_strip_ndpi_fixture("ndpi_mech_a_zero.tif", 1000, 0);
+        let mut ifd = Ifd {
+            entries: HashMap::new(),
+        };
+        let fix = apply_ndpi_single_strip_correction(&path, 8, true, &mut ifd).unwrap();
+        assert!(matches!(fix, NdpiTrailerFix::None));
+        let _ = std::fs::remove_file(path);
     }
 }

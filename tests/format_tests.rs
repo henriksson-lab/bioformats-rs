@@ -6126,8 +6126,10 @@ fn dicom_series_requires_successful_initialization() {
 
 #[test]
 fn dicom_rejects_missing_required_pixel_attributes() {
+    // Note: missing SamplesPerPixel (0028,0002) is NOT rejected — it defaults to
+    // 1 per the DICOM standard (old ACR-NEMA / implicit-VR files omit it). Only
+    // genuinely-required-and-invalid attributes (bits) are rejected here.
     for (name, omit_samples, omit_bits) in [
-        ("samples", true, false),
         ("bits_allocated", false, true),
         ("bits_stored_too_large", false, false),
     ] {
@@ -6308,6 +6310,30 @@ fn dicom_metadata_uses_dictionary_names_and_decodes_value_representations() {
     assert_eq!(image.physical_size_z, Some(750.0));
 }
 
+/// Build a CellH5 file whose canonical experiment layout
+/// `/sample/0/plate/Plate0/experiment/A01/position/1/image/channel` ends in an
+/// `image/channel` dataset configured by `build_channel`. The builder must
+/// consume the `DatasetBuilder` (call `.write::<T>(..)`).
+fn build_cellh5_channel<F>(path: &Path, build_channel: F)
+where
+    F: for<'b> FnOnce(hdf5_pure_rust::DatasetBuilder<'b>),
+{
+    let mut file = hdf5_pure_rust::WritableFile::create(path).unwrap();
+    {
+        let mut sample = file.create_group("sample").unwrap();
+        let mut zero = sample.create_group("0").unwrap();
+        let mut plate = zero.create_group("plate").unwrap();
+        let mut plate0 = plate.create_group("Plate0").unwrap();
+        let mut experiment = plate0.create_group("experiment").unwrap();
+        let mut well = experiment.create_group("A01").unwrap();
+        let mut positions = well.create_group("position").unwrap();
+        let mut site = positions.create_group("1").unwrap();
+        let mut image = site.create_group("image").unwrap();
+        build_channel(image.new_dataset_builder("channel"));
+    }
+    file.flush().unwrap();
+}
+
 #[test]
 fn bdv_preserves_companion_xml_original_metadata() {
     let path = tmp("metadata_parity_bdv.h5");
@@ -6318,25 +6344,26 @@ fn bdv_preserves_companion_xml_original_metadata() {
     // <first>2</first> means the first timepoint group is named per Java's
     // t%05d(firstTimepoint + increment*t) = t00002 (BDVReader.java:431), so the
     // fixture's pixel group must be t00002 to be consistent with its own XML.
-    let mut file = hdf5_pure::FileBuilder::new();
-    let mut t0 = file.create_group("t00002");
-    let mut s0 = t0.create_group("s00");
-    let mut level0 = s0.create_group("0");
-    level0
-        .create_dataset("cells")
-        .with_u16_data(&[1u16, 2, 3, 4, 5, 6])
-        .with_shape(&[1, 2, 3]);
-    s0.add_group(level0.finish());
-    t0.add_group(s0.finish());
-    file.add_group(t0.finish());
-
-    let mut setup0 = file.create_group("s00");
-    setup0
-        .create_dataset("resolutions")
-        .with_f64_data(&[1.0f64, 1.0, 1.0])
-        .with_shape(&[1, 3]);
-    file.add_group(setup0.finish());
-    file.write(&path).unwrap();
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut t0 = file.create_group("t00002").unwrap();
+        let mut s0 = t0.create_group("s00").unwrap();
+        let mut level0 = s0.create_group("0").unwrap();
+        level0
+            .new_dataset_builder("cells")
+            .shape(&[1, 2, 3])
+            .write::<u16>(&[1u16, 2, 3, 4, 5, 6])
+            .unwrap();
+    }
+    {
+        let mut setup0 = file.create_group("s00").unwrap();
+        setup0
+            .new_dataset_builder("resolutions")
+            .shape(&[1, 3])
+            .write::<f64>(&[1.0f64, 1.0, 1.0])
+            .unwrap();
+    }
+    file.flush().unwrap();
 
     let xml = r#"<SpimData>
   <SequenceDescription>
@@ -6392,25 +6419,26 @@ fn bdv_rejects_short_dataset_instead_of_zero_filling_plane() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&xml_path);
 
-    let mut file = hdf5_pure::FileBuilder::new();
-    let mut t0 = file.create_group("t00000");
-    let mut s0 = t0.create_group("s00");
-    let mut level0 = s0.create_group("0");
-    level0
-        .create_dataset("cells")
-        .with_u16_data(&[7u16])
-        .with_shape(&[1, 1, 1]);
-    s0.add_group(level0.finish());
-    t0.add_group(s0.finish());
-    file.add_group(t0.finish());
-
-    let mut setup0 = file.create_group("s00");
-    setup0
-        .create_dataset("resolutions")
-        .with_f64_data(&[1.0f64, 1.0, 1.0])
-        .with_shape(&[1, 3]);
-    file.add_group(setup0.finish());
-    file.write(&path).unwrap();
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut t0 = file.create_group("t00000").unwrap();
+        let mut s0 = t0.create_group("s00").unwrap();
+        let mut level0 = s0.create_group("0").unwrap();
+        level0
+            .new_dataset_builder("cells")
+            .shape(&[1, 1, 1])
+            .write::<u16>(&[7u16])
+            .unwrap();
+    }
+    {
+        let mut setup0 = file.create_group("s00").unwrap();
+        setup0
+            .new_dataset_builder("resolutions")
+            .shape(&[1, 3])
+            .write::<f64>(&[1.0f64, 1.0, 1.0])
+            .unwrap();
+    }
+    file.flush().unwrap();
 
     std::fs::write(
         &xml_path,
@@ -6447,7 +6475,9 @@ fn bdv_requires_real_dimensions_and_initialized_series() {
         Err(BioFormatsError::NotInitialized)
     ));
 
-    hdf5_pure::FileBuilder::new().write(&path).unwrap();
+    let mut wf = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    wf.flush().unwrap();
+    drop(wf);
     let err = uninit.set_id(&path).unwrap_err();
     assert!(
         err.to_string().contains("no timepoint groups found"),
@@ -6471,44 +6501,45 @@ fn bdv_requires_real_dimensions_and_initialized_series() {
 }
 
 #[test]
-fn imaris_rejects_short_dataset_instead_of_zero_filling_plane() {
-    let path = tmp("short_ims.ims");
+fn imaris_derives_dimensions_from_dataset_shape_not_attributes() {
+    // Real Imaris files can carry bogus DataSetInfo/Image X/Y/Z attributes
+    // (e.g. 1/1/1, observed in public samples); the authoritative pixel
+    // dimensions are the Data dataset shape [z, y, x]. Here the attributes say
+    // 1x1x1 but the Data is 4x3, and the reader must use the shape.
+    let path = tmp("shape_dims_ims.ims");
     let _ = std::fs::remove_file(&path);
 
-    let mut file = hdf5_pure::FileBuilder::new();
-    let mut info = file.create_group("DataSetInfo");
-    let mut image = info.create_group("Image");
-    image.set_attr("X", hdf5_pure::AttrValue::String("2".to_string()));
-    image.set_attr("Y", hdf5_pure::AttrValue::String("1".to_string()));
-    image.set_attr("Z", hdf5_pure::AttrValue::String("1".to_string()));
-    info.add_group(image.finish());
-    file.add_group(info.finish());
-
-    let mut dataset = file.create_group("DataSet");
-    let mut res = dataset.create_group("ResolutionLevel 0");
-    let mut time = res.create_group("TimePoint 0");
-    let mut channel = time.create_group("Channel 0");
-    channel
-        .create_dataset("Data")
-        .with_u8_data(&[5u8])
-        .with_shape(&[1, 1, 1]);
-    time.add_group(channel.finish());
-    res.add_group(time.finish());
-    dataset.add_group(res.finish());
-    file.add_group(dataset.finish());
-    file.write(&path).unwrap();
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut info = file.create_group("DataSetInfo").unwrap();
+        let mut image = info.create_group("Image").unwrap();
+        image.add_fixed_ascii_attr("X", "1", 1).unwrap();
+        image.add_fixed_ascii_attr("Y", "1", 1).unwrap();
+        image.add_fixed_ascii_attr("Z", "1", 1).unwrap();
+    }
+    {
+        let mut dataset = file.create_group("DataSet").unwrap();
+        let mut res = dataset.create_group("ResolutionLevel 0").unwrap();
+        let mut time = res.create_group("TimePoint 0").unwrap();
+        let mut channel = time.create_group("Channel 0").unwrap();
+        channel
+            .new_dataset_builder("Data")
+            .shape(&[1, 3, 4]) // z=1, y=3, x=4
+            .write::<u8>(&[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+            .unwrap();
+    }
+    file.flush().unwrap();
 
     let mut reader = bioformats::formats::imaris::ImarisReader::new();
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("does not match declared")),
-        "{err:?}"
-    );
+    reader.set_id(&path).unwrap();
+    let m = reader.metadata();
+    assert_eq!((m.size_x, m.size_y, m.size_z, m.size_c), (4, 3, 1, 1));
+    assert_eq!(reader.open_bytes(0).unwrap().len(), 12);
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
-fn imaris_requires_declared_metadata_and_initialized_series() {
+fn imaris_requires_pixel_dataset_and_initialized_series() {
     let path = tmp("weak_ims.ims");
     let _ = std::fs::remove_file(&path);
 
@@ -6520,19 +6551,22 @@ fn imaris_requires_declared_metadata_and_initialized_series() {
         Err(BioFormatsError::NotInitialized)
     ));
 
-    let mut file = hdf5_pure::FileBuilder::new();
-    let mut info = file.create_group("DataSetInfo");
-    let mut image = info.create_group("Image");
-    image.set_attr("X", hdf5_pure::AttrValue::String("2".to_string()));
-    image.set_attr("Y", hdf5_pure::AttrValue::String("0".to_string()));
-    image.set_attr("Z", hdf5_pure::AttrValue::String("1".to_string()));
-    info.add_group(image.finish());
-    file.add_group(info.finish());
-    file.write(&path).unwrap();
+    // DataSetInfo present but no DataSet/.../Data dataset. Since dimensions are
+    // derived from the Data shape, a file lacking it is rejected and the reader
+    // stays uninitialized.
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut info = file.create_group("DataSetInfo").unwrap();
+        let mut image = info.create_group("Image").unwrap();
+        image.add_fixed_ascii_attr("X", "2", 1).unwrap();
+        image.add_fixed_ascii_attr("Y", "1", 1).unwrap();
+        image.add_fixed_ascii_attr("Z", "1", 1).unwrap();
+    }
+    file.flush().unwrap();
 
     let err = reader.set_id(&path).unwrap_err();
     assert!(
-        err.to_string().contains("non-positive Image Y"),
+        err.to_string().contains("Data"),
         "unexpected Imaris error: {err}"
     );
     assert_eq!(reader.series_count(), 0);
@@ -6544,28 +6578,26 @@ fn imaris_rejects_out_of_bounds_region() {
     let path = tmp("region_bounds_ims.ims");
     let _ = std::fs::remove_file(&path);
 
-    let mut file = hdf5_pure::FileBuilder::new();
-    let mut info = file.create_group("DataSetInfo");
-    let mut image = info.create_group("Image");
-    image.set_attr("X", hdf5_pure::AttrValue::String("3".to_string()));
-    image.set_attr("Y", hdf5_pure::AttrValue::String("2".to_string()));
-    image.set_attr("Z", hdf5_pure::AttrValue::String("1".to_string()));
-    info.add_group(image.finish());
-    file.add_group(info.finish());
-
-    let mut dataset = file.create_group("DataSet");
-    let mut res = dataset.create_group("ResolutionLevel 0");
-    let mut time = res.create_group("TimePoint 0");
-    let mut channel = time.create_group("Channel 0");
-    channel
-        .create_dataset("Data")
-        .with_u8_data(&[1u8, 2, 3, 4, 5, 6])
-        .with_shape(&[1, 2, 3]);
-    time.add_group(channel.finish());
-    res.add_group(time.finish());
-    dataset.add_group(res.finish());
-    file.add_group(dataset.finish());
-    file.write(&path).unwrap();
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut info = file.create_group("DataSetInfo").unwrap();
+        let mut image = info.create_group("Image").unwrap();
+        image.add_fixed_ascii_attr("X", "3", 1).unwrap();
+        image.add_fixed_ascii_attr("Y", "2", 1).unwrap();
+        image.add_fixed_ascii_attr("Z", "1", 1).unwrap();
+    }
+    {
+        let mut dataset = file.create_group("DataSet").unwrap();
+        let mut res = dataset.create_group("ResolutionLevel 0").unwrap();
+        let mut time = res.create_group("TimePoint 0").unwrap();
+        let mut channel = time.create_group("Channel 0").unwrap();
+        channel
+            .new_dataset_builder("Data")
+            .shape(&[1, 2, 3])
+            .write::<u8>(&[1u8, 2, 3, 4, 5, 6])
+            .unwrap();
+    }
+    file.flush().unwrap();
 
     let mut reader = bioformats::formats::imaris::ImarisReader::new();
     reader.set_id(&path).unwrap();
@@ -6582,41 +6614,34 @@ fn cellh5_preserves_hdf5_attributes_and_dataset_metadata() {
     let path = tmp("metadata_parity_cellh5.ch5");
     let _ = std::fs::remove_file(&path);
 
-    let mut file = hdf5_pure::FileBuilder::new();
-    file.set_attr(
-        "experiment_name",
-        hdf5_pure::AttrValue::String("synthetic assay".to_string()),
-    );
     // CellH5Reader.java#parseStructure() walks the canonical experiment layout
     //   /sample/0/plate/{plate}/experiment/{well}/position/{site}/image/channel
     // (CellH5Constants: PREFIX_PATH "/sample/0/", PLATE "plate/", WELL
     // "/experiment/", SITE "/position/", IMAGE_PATH "image/channel/"). The
     // `image/channel` dataset is itself the 5D [channel, time, zslice, y, x]
     // image stack. Here c=1,t=2,z=1,y=2,x=3, keeping x=3, y=2, t=2.
-    let mut sample = file.create_group("sample");
-    let mut zero = sample.create_group("0");
-    let mut plate = zero.create_group("plate");
-    let mut plate0 = plate.create_group("Plate0");
-    let mut experiment = plate0.create_group("experiment");
-    let mut well = experiment.create_group("A01");
-    let mut positions = well.create_group("position");
-    let mut site = positions.create_group("1");
-    let mut image = site.create_group("image");
-    image
-        .create_dataset("channel")
-        .with_u16_data(&[1u16, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
-        .with_shape(&[1, 2, 1, 2, 3])
-        .set_attr("wavelength_nm", hdf5_pure::AttrValue::U32(488));
-    site.add_group(image.finish());
-    positions.add_group(site.finish());
-    well.add_group(positions.finish());
-    experiment.add_group(well.finish());
-    plate0.add_group(experiment.finish());
-    plate.add_group(plate0.finish());
-    zero.add_group(plate.finish());
-    sample.add_group(zero.finish());
-    file.add_group(sample.finish());
-    file.write(&path).unwrap();
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    file.add_fixed_ascii_attr("experiment_name", "synthetic assay", "synthetic assay".len())
+        .unwrap();
+    {
+        let mut sample = file.create_group("sample").unwrap();
+        let mut zero = sample.create_group("0").unwrap();
+        let mut plate = zero.create_group("plate").unwrap();
+        let mut plate0 = plate.create_group("Plate0").unwrap();
+        let mut experiment = plate0.create_group("experiment").unwrap();
+        let mut well = experiment.create_group("A01").unwrap();
+        let mut positions = well.create_group("position").unwrap();
+        let mut site = positions.create_group("1").unwrap();
+        let mut image = site.create_group("image").unwrap();
+        image
+            .new_dataset_builder("channel")
+            .shape(&[1, 2, 1, 2, 3])
+            .attr("wavelength_nm", 488u32)
+            .unwrap()
+            .write::<u16>(&[1u16, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+            .unwrap();
+    }
+    file.flush().unwrap();
 
     let mut reader = bioformats::formats::cellh5::CellH5Reader::new();
     reader.set_id(&path).unwrap();
@@ -6650,30 +6675,9 @@ fn cellh5_rejects_zero_dataset_axes() {
     let path = tmp("zero_axis_cellh5.ch5");
     let _ = std::fs::remove_file(&path);
 
-    let mut file = hdf5_pure::FileBuilder::new();
-    let mut sample = file.create_group("sample");
-    let mut zero = sample.create_group("0");
-    let mut plate = zero.create_group("plate");
-    let mut plate0 = plate.create_group("Plate0");
-    let mut experiment = plate0.create_group("experiment");
-    let mut well = experiment.create_group("A01");
-    let mut positions = well.create_group("position");
-    let mut site = positions.create_group("1");
-    let mut image = site.create_group("image");
-    image
-        .create_dataset("channel")
-        .with_u16_data(&[])
-        .with_shape(&[1, 1, 0, 1, 1]);
-    site.add_group(image.finish());
-    positions.add_group(site.finish());
-    well.add_group(positions.finish());
-    experiment.add_group(well.finish());
-    plate0.add_group(experiment.finish());
-    plate.add_group(plate0.finish());
-    zero.add_group(plate.finish());
-    sample.add_group(zero.finish());
-    file.add_group(sample.finish());
-    file.write(&path).unwrap();
+    build_cellh5_channel(&path, |b| {
+        b.shape(&[1, 1, 0, 1, 1]).write::<u16>(&[]).unwrap();
+    });
 
     let mut reader = bioformats::formats::cellh5::CellH5Reader::new();
     let err = reader.set_id(&path).unwrap_err();
@@ -6691,55 +6695,13 @@ fn cellh5_rejects_unsupported_dataset_dtype_and_clears_failed_reopen() {
     let _ = std::fs::remove_file(&good);
     let _ = std::fs::remove_file(&bad);
 
-    let mut file = hdf5_pure::FileBuilder::new();
-    let mut sample = file.create_group("sample");
-    let mut zero = sample.create_group("0");
-    let mut plate = zero.create_group("plate");
-    let mut plate0 = plate.create_group("Plate0");
-    let mut experiment = plate0.create_group("experiment");
-    let mut well = experiment.create_group("A01");
-    let mut positions = well.create_group("position");
-    let mut site = positions.create_group("1");
-    let mut image = site.create_group("image");
-    image
-        .create_dataset("channel")
-        .with_u16_data(&[1u16])
-        .with_shape(&[1, 1, 1, 1, 1]);
-    site.add_group(image.finish());
-    positions.add_group(site.finish());
-    well.add_group(positions.finish());
-    experiment.add_group(well.finish());
-    plate0.add_group(experiment.finish());
-    plate.add_group(plate0.finish());
-    zero.add_group(plate.finish());
-    sample.add_group(zero.finish());
-    file.add_group(sample.finish());
-    file.write(&good).unwrap();
+    build_cellh5_channel(&good, |b| {
+        b.shape(&[1, 1, 1, 1, 1]).write::<u16>(&[1u16]).unwrap();
+    });
 
-    let mut file = hdf5_pure::FileBuilder::new();
-    let mut sample = file.create_group("sample");
-    let mut zero = sample.create_group("0");
-    let mut plate = zero.create_group("plate");
-    let mut plate0 = plate.create_group("Plate0");
-    let mut experiment = plate0.create_group("experiment");
-    let mut well = experiment.create_group("A01");
-    let mut positions = well.create_group("position");
-    let mut site = positions.create_group("1");
-    let mut image = site.create_group("image");
-    image
-        .create_dataset("channel")
-        .with_f64_data(&[1.0f64])
-        .with_shape(&[1, 1, 1, 1, 1]);
-    site.add_group(image.finish());
-    positions.add_group(site.finish());
-    well.add_group(positions.finish());
-    experiment.add_group(well.finish());
-    plate0.add_group(experiment.finish());
-    plate.add_group(plate0.finish());
-    zero.add_group(plate.finish());
-    sample.add_group(zero.finish());
-    file.add_group(sample.finish());
-    file.write(&bad).unwrap();
+    build_cellh5_channel(&bad, |b| {
+        b.shape(&[1, 1, 1, 1, 1]).write::<f64>(&[1.0f64]).unwrap();
+    });
 
     let mut reader = bioformats::formats::cellh5::CellH5Reader::new();
     reader.set_id(&good).unwrap();

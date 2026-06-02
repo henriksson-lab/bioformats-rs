@@ -96,7 +96,50 @@ pub fn decompress_jpeg(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Decompress Zstd data.
 pub fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
-    zstd::decode_all(data).map_err(BioFormatsError::Io)
+    zstd_decode_all(data)
+}
+
+/// Decompress a Zstd frame using the pure-Rust `zstd-pure-rs` backend.
+///
+/// Mirrors `zstd::decode_all` for the single-frame payloads produced by the
+/// formats we support (TIFF Zstd tiles, CZI Zstd/Zstd_1).
+pub(crate) fn zstd_decode_all(data: &[u8]) -> Result<Vec<u8>> {
+    use zstd_pure_rs::prelude::*;
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bound = ZSTD_decompressBound(data);
+    if bound == ZSTD_CONTENTSIZE_ERROR || bound == ZSTD_CONTENTSIZE_UNKNOWN {
+        return Err(BioFormatsError::Codec(
+            "zstd: unable to determine decompressed size".into(),
+        ));
+    }
+    let mut out = vec![0u8; bound as usize];
+    let n = ZSTD_decompress(&mut out, data);
+    if ERR_isError(n) {
+        return Err(BioFormatsError::Codec(format!(
+            "zstd decompress failed: {}",
+            ZSTD_getErrorName(n)
+        )));
+    }
+    out.truncate(n);
+    Ok(out)
+}
+
+/// Compress data with Zstd using the pure-Rust `zstd-pure-rs` backend.
+#[cfg(test)]
+pub(crate) fn zstd_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
+    use zstd_pure_rs::prelude::*;
+    let mut dst = vec![0u8; ZSTD_compressBound(data.len())];
+    let n = ZSTD_compress(&mut dst, data, level);
+    if ERR_isError(n) {
+        return Err(BioFormatsError::Codec(format!(
+            "zstd compress failed: {}",
+            ZSTD_getErrorName(n)
+        )));
+    }
+    dst.truncate(n);
+    Ok(dst)
 }
 
 /// Decode an in-memory PNG payload to interleaved raw pixel bytes.

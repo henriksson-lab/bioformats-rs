@@ -19,6 +19,9 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
+use hdf5_pure_rust::format::messages::datatype::DatatypeClass;
+use hdf5_pure_rust::{HyperslabDim, Selection};
+
 const CELLH5_METADATA_NODE_LIMIT: usize = 512;
 
 /// One CellH5 series: its image-data dataset path and parsed dimensions.
@@ -64,7 +67,7 @@ impl Default for CellH5Reader {
 /// `[channel, time, zslice, y, x]`, NOT a group of per-channel leaves.
 /// Returns image-data paths first (one series per position), then the
 /// segmentation paths, matching the Java two-pass ordering.
-fn find_image_datasets(file: &hdf5_pure::File) -> Vec<String> {
+fn find_image_datasets(file: &hdf5_pure_rust::File) -> Vec<String> {
     // Resolve the `/sample/0/plate` prefix; fall back to a looser scan so
     // synthetic fixtures that omit the fixed `0` level still work.
     let mut positions: Vec<String> = Vec::new();
@@ -116,65 +119,102 @@ fn find_image_datasets(file: &hdf5_pure::File) -> Vec<String> {
     paths
 }
 
-fn hdf5_attr_value(attr: &hdf5_pure::AttrValue) -> MetadataValue {
-    match attr {
-        hdf5_pure::AttrValue::F64(v) => MetadataValue::Float(*v),
-        hdf5_pure::AttrValue::F64Array(v) => MetadataValue::String(format!("{v:?}")),
-        hdf5_pure::AttrValue::I32(v) => MetadataValue::Int(*v as i64),
-        hdf5_pure::AttrValue::I64(v) => MetadataValue::Int(*v),
-        hdf5_pure::AttrValue::I64Array(v) => MetadataValue::String(format!("{v:?}")),
-        hdf5_pure::AttrValue::U32(v) => MetadataValue::Int(*v as i64),
-        hdf5_pure::AttrValue::U64(v) => MetadataValue::Int((*v).min(i64::MAX as u64) as i64),
-        hdf5_pure::AttrValue::String(s) | hdf5_pure::AttrValue::AsciiString(s) => {
-            MetadataValue::String(s.trim_matches('\0').trim().to_string())
+fn hdf5_attr_value(attr: &hdf5_pure_rust::Attribute) -> MetadataValue {
+    // New API: no AttrValue enum. Inspect the datatype class and read accordingly.
+    let dtype = attr.dtype();
+    // Number of elements (scalar attrs have empty/[1] shape).
+    let n_elems: u64 = attr.shape().iter().product::<u64>().max(1);
+    match dtype.class() {
+        DatatypeClass::FloatingPoint => {
+            if n_elems > 1 {
+                match attr.read::<f64>() {
+                    Ok(v) => MetadataValue::String(format!("{v:?}")),
+                    Err(_) => MetadataValue::String(String::new()),
+                }
+            } else if let Some(v) = attr.read_scalar_f64() {
+                MetadataValue::Float(v)
+            } else {
+                MetadataValue::String(attr.read_string())
+            }
         }
-        hdf5_pure::AttrValue::StringArray(v)
-        | hdf5_pure::AttrValue::AsciiStringArray(v)
-        | hdf5_pure::AttrValue::VarLenAsciiArray(v) => MetadataValue::String(v.join(",")),
+        DatatypeClass::FixedPoint => {
+            if n_elems > 1 {
+                match attr.read::<i64>() {
+                    Ok(v) => MetadataValue::String(format!("{v:?}")),
+                    Err(_) => MetadataValue::String(String::new()),
+                }
+            } else if let Some(v) = attr.read_scalar_i64() {
+                MetadataValue::Int(v)
+            } else {
+                MetadataValue::String(attr.read_string())
+            }
+        }
+        DatatypeClass::String | DatatypeClass::VarLen => {
+            if n_elems > 1 {
+                match attr.read_strings() {
+                    Ok(v) => MetadataValue::String(v.join(",")),
+                    Err(_) => MetadataValue::String(attr.read_string()),
+                }
+            } else {
+                let s = attr.read_string();
+                MetadataValue::String(s.trim_matches('\0').trim().to_string())
+            }
+        }
+        _ => MetadataValue::String(attr.read_string()),
     }
 }
 
 fn collect_group_attrs(
-    group: &hdf5_pure::Group<'_>,
+    group: &hdf5_pure_rust::Group,
     path: &str,
     meta_map: &mut HashMap<String, MetadataValue>,
 ) {
-    if let Ok(attrs) = group.attrs() {
-        for (name, attr) in attrs {
-            meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
+    if let Ok(names) = group.attr_names() {
+        for name in names {
+            if let Ok(attr) = group.attr(&name) {
+                meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
+            }
         }
     }
 }
 
 fn collect_dataset_metadata(
-    dataset: &hdf5_pure::Dataset<'_>,
+    dataset: &hdf5_pure_rust::Dataset,
     path: &str,
     meta_map: &mut HashMap<String, MetadataValue>,
 ) {
-    let dtype_size = dataset.dtype().map(hdf5_dtype_size).unwrap_or(0);
+    let dtype_size = dataset
+        .dtype()
+        .map(|dt| hdf5_dtype_size(&dt))
+        .unwrap_or(0);
     let shape = dataset.shape().unwrap_or_default();
     meta_map.insert(
         format!("cellh5_dataset:{path}"),
         MetadataValue::String(format!("shape={:?}; dtype_size={dtype_size}", shape)),
     );
 
-    if let Ok(attrs) = dataset.attrs() {
-        for (name, attr) in attrs {
-            meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
+    if let Ok(names) = dataset.attr_names() {
+        for name in names {
+            if let Ok(attr) = dataset.attr(&name) {
+                meta_map.insert(format!("cellh5_attr:{path}@{name}"), hdf5_attr_value(&attr));
+            }
         }
     }
 }
 
-fn collect_file_attrs(file: &hdf5_pure::File, meta_map: &mut HashMap<String, MetadataValue>) {
-    if let Ok(attrs) = file.root().attrs() {
-        for (name, attr) in attrs {
-            meta_map.insert(format!("cellh5_attr:/@{name}"), hdf5_attr_value(&attr));
+fn collect_file_attrs(file: &hdf5_pure_rust::File, meta_map: &mut HashMap<String, MetadataValue>) {
+    // New API: no file.root(); attributes live directly on the File.
+    if let Ok(names) = file.attr_names() {
+        for name in names {
+            if let Ok(attr) = file.attr(&name) {
+                meta_map.insert(format!("cellh5_attr:/@{name}"), hdf5_attr_value(&attr));
+            }
         }
     }
 }
 
 fn collect_hdf5_metadata(
-    file: &hdf5_pure::File,
+    file: &hdf5_pure_rust::File,
     path: &str,
     meta_map: &mut HashMap<String, MetadataValue>,
     visited: &mut usize,
@@ -262,7 +302,7 @@ fn dims_from_shape(shape: &[u64]) -> Result<(u32, u32, u32, u32, u32)> {
 }
 
 fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
-    let file = hdf5_pure::File::open(path)
+    let file = hdf5_pure_rust::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
     let dataset_paths = find_image_datasets(&file);
@@ -293,9 +333,12 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
                 other => other,
             })?;
 
-        let dtype_size = ds.dtype().map(hdf5_dtype_size).map_err(|e| {
-            BioFormatsError::Format(format!("CellH5: cannot read dtype for {ds_path}: {e}"))
-        })?;
+        let dtype_size = ds
+            .dtype()
+            .map(|dt| hdf5_dtype_size(&dt))
+            .map_err(|e| {
+                BioFormatsError::Format(format!("CellH5: cannot read dtype for {ds_path}: {e}"))
+            })?;
         // Java CellH5Reader.java:445-455 maps element size to pixel type:
         // 1 → UINT8, 2 → UINT16, 4 → INT32 (signed).
         let pixel_type = match dtype_size {
@@ -358,30 +401,14 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
 }
 
 fn hdf5_group_members(
-    group: &hdf5_pure::Group<'_>,
-) -> std::result::Result<Vec<String>, hdf5_pure::Error> {
-    let mut members = group.groups()?;
-    members.extend(group.datasets()?);
-    Ok(members)
+    group: &hdf5_pure_rust::Group,
+) -> std::result::Result<Vec<String>, hdf5_pure_rust::Error> {
+    // New API: member_names() returns all child links (groups + datasets).
+    group.member_names()
 }
 
-fn hdf5_dtype_size(dtype: hdf5_pure::DType) -> usize {
-    match dtype {
-        hdf5_pure::DType::F32
-        | hdf5_pure::DType::I32
-        | hdf5_pure::DType::U32
-        | hdf5_pure::DType::Enum(_) => 4,
-        hdf5_pure::DType::F64
-        | hdf5_pure::DType::I64
-        | hdf5_pure::DType::U64
-        | hdf5_pure::DType::ObjectReference => 8,
-        hdf5_pure::DType::I16 | hdf5_pure::DType::U16 => 2,
-        hdf5_pure::DType::I8 | hdf5_pure::DType::U8 => 1,
-        hdf5_pure::DType::Array(base, dims) => {
-            hdf5_dtype_size(*base) * dims.iter().copied().product::<u32>() as usize
-        }
-        _ => 0,
-    }
+fn hdf5_dtype_size(dtype: &hdf5_pure_rust::Datatype) -> usize {
+    dtype.size()
 }
 
 impl FormatReader for CellH5Reader {
@@ -480,37 +507,75 @@ impl FormatReader for CellH5Reader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        let file = hdf5_pure::File::open(&path)
+        let file = hdf5_pure_rust::File::open(&path)
             .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
         let ds = file
             .dataset(&ds_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
 
+        // Per-plane partial read via a hyperslab selection: fix the leading
+        // dims (c, t, z) to the requested indices and select all of y,x.
+        // Storage is `[c, t, z, y, x]` for 5D; lower-rank datasets drop the
+        // leading dims in the same order dims_from_shape() assumes.
+        let shape = ds.shape().unwrap_or_default();
+        let y = meta.size_y as u64;
+        let xw = meta.size_x as u64;
+        let dims: Vec<HyperslabDim> = match shape.len() {
+            5 => vec![
+                HyperslabDim::new(c as u64, 1, 1, 1),
+                HyperslabDim::new(t as u64, 1, 1, 1),
+                HyperslabDim::new(z as u64, 1, 1, 1),
+                HyperslabDim::new(0, 1, y, 1),
+                HyperslabDim::new(0, 1, xw, 1),
+            ],
+            4 => vec![
+                HyperslabDim::new(c as u64, 1, 1, 1),
+                HyperslabDim::new(t as u64, 1, 1, 1),
+                HyperslabDim::new(0, 1, y, 1),
+                HyperslabDim::new(0, 1, xw, 1),
+            ],
+            3 => vec![
+                HyperslabDim::new(t as u64, 1, 1, 1),
+                HyperslabDim::new(0, 1, y, 1),
+                HyperslabDim::new(0, 1, xw, 1),
+            ],
+            2 => vec![
+                HyperslabDim::new(0, 1, y, 1),
+                HyperslabDim::new(0, 1, xw, 1),
+            ],
+            other => {
+                return Err(BioFormatsError::Format(format!(
+                    "CellH5: dataset {ds_path} has unsupported rank {other}"
+                )));
+            }
+        };
+        let selection = Selection::Hyperslab(dims);
+
+        // After read_slice the returned vec IS this plane; index from 0.
         let raw: Vec<u8> = match bytes_per_sample {
             1 => ds
-                .read_u8()
+                .read_slice::<u8, _>(selection)
                 .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
             2 => {
                 let words: Vec<u16> = ds
-                    .read_u16()
+                    .read_slice::<u16, _>(selection)
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 words.iter().flat_map(|w| w.to_le_bytes()).collect()
             }
             4 => {
                 let dwords: Vec<u32> = ds
-                    .read_u32()
+                    .read_slice::<u32, _>(selection)
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
             }
             _ => ds
-                .read_u8()
+                .read_slice::<u8, _>(selection)
                 .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
         };
 
-        // Index into the 5D buffer [c, t, z, y, x]: linear plane index =
-        //   ((c * size_t + t) * size_z + z) * (size_x * size_y)
-        let plane_linear = ((c * st + t) * sz + z) as usize;
-        let offset = plane_linear * plane_bytes;
+        // The hyperslab read already isolates the requested plane, so the
+        // buffer should be exactly one plane long; index from offset 0.
+        let offset = 0usize;
 
         if offset + plane_bytes <= raw.len() {
             Ok(raw[offset..offset + plane_bytes].to_vec())

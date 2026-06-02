@@ -17,6 +17,8 @@ use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
+use hdf5_pure_rust::format::messages::datatype::DatatypeClass;
+use hdf5_pure_rust::{HyperslabDim, Selection};
 
 pub struct ImarisReader {
     path: Option<PathBuf>,
@@ -25,19 +27,20 @@ pub struct ImarisReader {
     current_resolution: usize,
     // pixel type for raw reads
     bytes_per_sample: usize,
-    // Cache of the most recently decoded [z, y, x] volume so that sequential
-    // plane reads within the same dataset do not re-decode the whole volume.
-    // Keyed by (resolution, t, c). Mirrors the per-Z-block buffer cache in
-    // ImarisHDFReader.java (the underlying hdf5-pure 0.5 reader has no
-    // hyperslab API, so we cache the whole-channel volume instead of a slab).
+    // Cache of the most recently decoded plane so that repeated reads of the
+    // same plane do not re-read from disk. Keyed by (resolution, t, c, z).
+    // Mirrors the per-Z-block buffer cache in ImarisHDFReader.java. The new
+    // hdf5-pure-rust crate supports hyperslab partial I/O, so we read only the
+    // requested z-plane via read_slice instead of the whole channel volume.
     cache: Option<VolumeCache>,
 }
 
-/// Cached decoded volume for one (resolution, timepoint, channel) dataset.
+/// Cached decoded plane for one (resolution, timepoint, channel, z) location.
 struct VolumeCache {
     res: usize,
     t: usize,
     c: usize,
+    z: usize,
     raw: Vec<u8>,
 }
 
@@ -60,28 +63,31 @@ impl Default for ImarisReader {
 }
 
 /// Read a string attribute from an HDF5 group (tries VarLenAscii then FixedAscii).
-fn read_str_attr(group: &hdf5_pure::Group<'_>, attr: &str) -> Option<String> {
-    let attrs = group.attrs().ok()?;
-    match attrs.get(attr)? {
-        hdf5_pure::AttrValue::String(s) | hdf5_pure::AttrValue::AsciiString(s) => {
-            Some(s.trim_matches('\0').trim().to_string())
+fn read_str_attr(group: &hdf5_pure_rust::Group, attr: &str) -> Option<String> {
+    let a = group.attr(attr).ok()?;
+    // String-typed attributes: read directly. read_strings() handles both
+    // scalar and array string attributes; fall back to the first element.
+    if let Ok(v) = a.read_strings() {
+        if let Some(s) = v.first() {
+            return Some(s.trim_matches('\0').trim().to_string());
         }
-        hdf5_pure::AttrValue::StringArray(v)
-        | hdf5_pure::AttrValue::AsciiStringArray(v)
-        | hdf5_pure::AttrValue::VarLenAsciiArray(v) => {
-            v.first().map(|s| s.trim_matches('\0').trim().to_string())
-        }
-        hdf5_pure::AttrValue::I32(v) => Some(v.to_string()),
-        hdf5_pure::AttrValue::I64(v) => Some(v.to_string()),
-        hdf5_pure::AttrValue::U32(v) => Some(v.to_string()),
-        hdf5_pure::AttrValue::U64(v) => Some(v.to_string()),
-        hdf5_pure::AttrValue::F64(v) => Some(v.to_string()),
-        _ => None,
     }
+    let s = a.read_string();
+    if !s.is_empty() {
+        return Some(s.trim_matches('\0').trim().to_string());
+    }
+    // Numeric attributes: format the scalar value as a string.
+    if let Some(i) = a.read_scalar_i64() {
+        return Some(i.to_string());
+    }
+    if let Some(f) = a.read_scalar_f64() {
+        return Some(f.to_string());
+    }
+    None
 }
 
 fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
-    let file = hdf5_pure::File::open(path)
+    let file = hdf5_pure_rust::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
     // ── Read dimensions from DataSetInfo/Image ──────────────────────────────
@@ -89,9 +95,12 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
         .group("DataSetInfo/Image")
         .map_err(|e| BioFormatsError::Format(format!("DataSetInfo/Image missing: {e}")))?;
 
-    let size_x = read_required_positive_attr(&img_group, "X")?;
-    let size_y = read_required_positive_attr(&img_group, "Y")?;
-    let size_z = read_required_positive_attr(&img_group, "Z")?;
+    // The DataSetInfo/Image X/Y/Z attributes are advisory and unreliable — some
+    // writers store 1/1/1 (observed in real .ims files). The authoritative pixel
+    // dimensions are the full-resolution Data dataset shape [z, y, x], so derive
+    // X/Y/Z from it instead of the attributes.
+    let _ = &img_group; // group kept for any future attribute reads
+    let (size_z, size_y, size_x) = ims_level_dims(&file, 0)?;
 
     // ── Count channels ──────────────────────────────────────────────────────
     // Count groups named "Channel N" under DataSetInfo
@@ -173,20 +182,40 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
         })?;
         // Java ImarisHDFReader.java:336-337 maps the sample array type to the
         // pixel type, including FLOAT and DOUBLE. Distinguish float/double from
-        // the integer types of the same element size by inspecting the dtype.
-        match dtype {
-            hdf5_pure::DType::F32 => (PixelType::Float32, 4usize),
-            hdf5_pure::DType::F64 => (PixelType::Float64, 8usize),
-            other => match hdf5_dtype_size(other) {
-                1 => (PixelType::Uint8, 1usize),
-                2 => (PixelType::Uint16, 2usize),
-                4 => (PixelType::Uint32, 4usize),
-                size => {
-                    return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "Imaris: unsupported dtype size {size} for {data_path}"
-                    )));
+        // the integer types of the same element size by inspecting the dtype
+        // class and element size.
+        let class = dtype.class();
+        let size = dtype.size();
+        let signed = dtype.is_signed().unwrap_or(false);
+        match (class, size) {
+            (DatatypeClass::FloatingPoint, 4) => (PixelType::Float32, 4usize),
+            (DatatypeClass::FloatingPoint, 8) => (PixelType::Float64, 8usize),
+            (DatatypeClass::FixedPoint, 1) => {
+                if signed {
+                    (PixelType::Int8, 1usize)
+                } else {
+                    (PixelType::Uint8, 1usize)
                 }
-            },
+            }
+            (DatatypeClass::FixedPoint, 2) => {
+                if signed {
+                    (PixelType::Int16, 2usize)
+                } else {
+                    (PixelType::Uint16, 2usize)
+                }
+            }
+            (DatatypeClass::FixedPoint, 4) => {
+                if signed {
+                    (PixelType::Int32, 4usize)
+                } else {
+                    (PixelType::Uint32, 4usize)
+                }
+            }
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Imaris: unsupported dtype (class {class:?}, size {size}) for {data_path}"
+                )));
+            }
         }
     };
     validate_ims_data_dataset(&file, data_path, size_x, size_y, size_z, bytes_per_sample)?;
@@ -238,33 +267,13 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
     for level in 1..n_resolutions {
         let group_path = format!("DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0");
         let mut lvl = base_meta.clone();
-        let g = file.group(&group_path).map_err(|e| {
-            BioFormatsError::UnsupportedFormat(format!("Imaris: missing {group_path}: {e}"))
-        })?;
-        if let Some(v) = read_int_attr(&g, "ImageSizeX") {
-            if v == 0 {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "Imaris: non-positive ImageSizeX for resolution {level}"
-                )));
-            }
-            lvl.size_x = v;
-        }
-        if let Some(v) = read_int_attr(&g, "ImageSizeY") {
-            if v == 0 {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "Imaris: non-positive ImageSizeY for resolution {level}"
-                )));
-            }
-            lvl.size_y = v;
-        }
-        if let Some(v) = read_int_attr(&g, "ImageSizeZ") {
-            if v == 0 {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "Imaris: non-positive ImageSizeZ for resolution {level}"
-                )));
-            }
-            lvl.size_z = v;
-        }
+        let _ = &group_path; // (kept for error context below)
+        // Derive this level's dimensions from its own Data dataset shape rather
+        // than the ImageSize* attributes (same rationale as level 0).
+        let (lz, ly, lx) = ims_level_dims(&file, level)?;
+        lvl.size_z = lz;
+        lvl.size_y = ly;
+        lvl.size_x = lx;
         validate_ims_data_dataset(
             &file,
             &format!("DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data"),
@@ -282,26 +291,6 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
 }
 
 /// Read an integer attribute (string- or numeric-encoded) from an HDF5 group.
-fn read_int_attr(group: &hdf5_pure::Group<'_>, attr: &str) -> Option<u32> {
-    read_str_attr(group, attr).and_then(|s| s.trim().parse::<u32>().ok())
-}
-
-fn read_required_positive_attr(group: &hdf5_pure::Group<'_>, attr: &str) -> Result<u32> {
-    let value = read_str_attr(group, attr).ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat(format!("Imaris: missing Image {attr} attribute"))
-    })?;
-    let parsed = value.trim().parse::<u32>().map_err(|_| {
-        BioFormatsError::UnsupportedFormat(format!(
-            "Imaris: invalid Image {attr} attribute {value:?}"
-        ))
-    })?;
-    if parsed == 0 {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "Imaris: non-positive Image {attr} attribute"
-        )));
-    }
-    Ok(parsed)
-}
 
 fn checked_image_count(size_z: u32, size_c: u32, size_t: u32, label: &str) -> Result<u32> {
     size_z
@@ -310,8 +299,30 @@ fn checked_image_count(size_z: u32, size_c: u32, size_t: u32, label: &str) -> Re
         .ok_or_else(|| BioFormatsError::Format(format!("Imaris {label} image count overflows")))
 }
 
+/// Read the (z, y, x) pixel dimensions of a resolution level from its
+/// full-resolution Channel-0 `Data` dataset shape (the authoritative source,
+/// vs. the unreliable DataSetInfo X/Y/Z and per-level ImageSize* attributes).
+fn ims_level_dims(file: &hdf5_pure_rust::File, level: usize) -> Result<(u32, u32, u32)> {
+    let path = format!("DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data");
+    let ds = file
+        .dataset(&path)
+        .map_err(|e| BioFormatsError::UnsupportedFormat(format!("Imaris: missing {path}: {e}")))?;
+    let shape = ds
+        .shape()
+        .map_err(|e| BioFormatsError::Format(format!("Imaris: cannot read shape for {path}: {e}")))?;
+    if shape.len() != 3 || shape.iter().any(|&d| d == 0) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Imaris: unsupported Data shape {shape:?} for {path}"
+        )));
+    }
+    let to_u32 = |d: u64| -> Result<u32> {
+        u32::try_from(d).map_err(|_| BioFormatsError::Format("Imaris dimension overflows u32".into()))
+    };
+    Ok((to_u32(shape[0])?, to_u32(shape[1])?, to_u32(shape[2])?))
+}
+
 fn validate_ims_data_dataset(
-    file: &hdf5_pure::File,
+    file: &hdf5_pure_rust::File,
     path: &str,
     size_x: u32,
     size_y: u32,
@@ -341,9 +352,12 @@ fn validate_ims_data_dataset(
             "Imaris: {path} shape {shape:?} does not match declared {declared:?}"
         )));
     }
-    let dtype_size = ds.dtype().map(hdf5_dtype_size).map_err(|e| {
-        BioFormatsError::Format(format!("Imaris: cannot read dtype for {path}: {e}"))
-    })?;
+    let dtype_size = ds
+        .dtype()
+        .map(|dt| hdf5_dtype_size(&dt))
+        .map_err(|e| {
+            BioFormatsError::Format(format!("Imaris: cannot read dtype for {path}: {e}"))
+        })?;
     if dtype_size != bytes_per_sample {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "Imaris: {path} dtype size {dtype_size} does not match declared {bytes_per_sample}"
@@ -353,30 +367,15 @@ fn validate_ims_data_dataset(
 }
 
 fn hdf5_group_members(
-    group: &hdf5_pure::Group<'_>,
-) -> std::result::Result<Vec<String>, hdf5_pure::Error> {
-    let mut members = group.groups()?;
-    members.extend(group.datasets()?);
-    Ok(members)
+    group: &hdf5_pure_rust::Group,
+) -> std::result::Result<Vec<String>, hdf5_pure_rust::Error> {
+    group.member_names()
 }
 
-fn hdf5_dtype_size(dtype: hdf5_pure::DType) -> usize {
-    match dtype {
-        hdf5_pure::DType::F32
-        | hdf5_pure::DType::I32
-        | hdf5_pure::DType::U32
-        | hdf5_pure::DType::Enum(_) => 4,
-        hdf5_pure::DType::F64
-        | hdf5_pure::DType::I64
-        | hdf5_pure::DType::U64
-        | hdf5_pure::DType::ObjectReference => 8,
-        hdf5_pure::DType::I16 | hdf5_pure::DType::U16 => 2,
-        hdf5_pure::DType::I8 | hdf5_pure::DType::U8 => 1,
-        hdf5_pure::DType::Array(base, dims) => {
-            hdf5_dtype_size(*base) * dims.iter().copied().product::<u32>() as usize
-        }
-        _ => 0,
-    }
+/// Element byte size of an HDF5 datatype (the `size()` already reported by the
+/// crate, which for Array types is the total array byte size).
+fn hdf5_dtype_size(dtype: &hdf5_pure_rust::Datatype) -> usize {
+    dtype.size()
 }
 
 impl FormatReader for ImarisReader {
@@ -472,9 +471,11 @@ impl FormatReader for ImarisReader {
         let bps = self.bytes_per_sample;
         let plane_bytes = size_x * size_y * bps;
 
-        // Reuse the cached volume if it is for the same (resolution, t, c).
+        // Reuse the cached plane if it is for the same (resolution, t, c, z).
         let need_load = match &self.cache {
-            Some(cache) => cache.res != res || cache.t != t || cache.c != c,
+            Some(cache) => {
+                cache.res != res || cache.t != t || cache.c != c || cache.z != z
+            }
             None => true,
         };
         if need_load {
@@ -484,48 +485,53 @@ impl FormatReader for ImarisReader {
                 .as_ref()
                 .ok_or(BioFormatsError::NotInitialized)?
                 .clone();
-            let file = hdf5_pure::File::open(&path)
+            let file = hdf5_pure_rust::File::open(&path)
                 .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
             let ds = file
                 .dataset(&data_path)
                 .map_err(|e| BioFormatsError::Format(format!("dataset {data_path}: {e}")))?;
 
-            // hdf5-pure 0.5 has no hyperslab API, so read the whole [z,y,x]
-            // channel volume once and cache it; subsequent z-planes are served
-            // from the cache without re-decoding.
+            // The dataset is shaped [z, y, x]; use a hyperslab selection to read
+            // ONLY the requested z-plane. The returned vec is exactly that plane
+            // (Y*X elements) indexed from 0, so it is cached and returned whole.
+            let sel = Selection::Hyperslab(vec![
+                HyperslabDim::new(z as u64, 1, 1, 1), // single z slice
+                HyperslabDim::new(0, 1, size_y as u64, 1), // all rows
+                HyperslabDim::new(0, 1, size_x as u64, 1), // all cols
+            ]);
+
             let raw: Vec<u8> = match bps {
                 1 => ds
-                    .read_u8()
+                    .read_slice::<u8, _>(sel)
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
                 2 => {
                     let words: Vec<u16> = ds
-                        .read_u16()
+                        .read_slice::<u16, _>(sel)
                         .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                     words.iter().flat_map(|w| w.to_le_bytes()).collect()
                 }
                 4 => {
                     let dwords: Vec<u32> = ds
-                        .read_u32()
+                        .read_slice::<u32, _>(sel)
                         .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                     dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
                 }
                 _ => ds
-                    .read_u8()
+                    .read_slice::<u8, _>(sel)
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
             };
-            self.cache = Some(VolumeCache { res, t, c, raw });
+            self.cache = Some(VolumeCache { res, t, c, z, raw });
         }
 
         let raw = &self.cache.as_ref().unwrap().raw;
-        // raw is stored [z, y, x]; extract plane z
-        let offset = z * plane_bytes;
-        if offset + plane_bytes <= raw.len() {
-            Ok(raw[offset..offset + plane_bytes].to_vec())
+        // raw is now exactly plane z, indexed from offset 0.
+        if plane_bytes <= raw.len() {
+            Ok(raw[..plane_bytes].to_vec())
         } else {
             Err(BioFormatsError::UnsupportedFormat(format!(
-                "Imaris ResolutionLevel {res}/TimePoint {t}/Channel {c} is shorter than \
-                 declared plane {plane_index} (need {} bytes, have {})",
-                offset + plane_bytes,
+                "Imaris ResolutionLevel {res}/TimePoint {t}/Channel {c} plane {plane_index} is \
+                 shorter than declared (need {} bytes, have {})",
+                plane_bytes,
                 raw.len()
             )))
         }
@@ -554,9 +560,9 @@ impl FormatReader for ImarisReader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        if let Ok(file) = hdf5_pure::File::open(&path) {
+        if let Ok(file) = hdf5_pure_rust::File::open(&path) {
             if let Ok(ds) = file.dataset("Thumbnail/Data") {
-                if let Ok(data) = ds.read_u8() {
+                if let Ok(data) = ds.read::<u8>() {
                     return Ok(data);
                 }
             }

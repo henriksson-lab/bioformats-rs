@@ -844,6 +844,12 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
     if attrs.number_of_frames == 0 {
         attrs.number_of_frames = 1;
     }
+    // SamplesPerPixel (0028,0002) is absent in old ACR-NEMA / implicit-VR files
+    // (e.g. monochrome MR); the DICOM default is 1. Apply it here so every
+    // consumer (metadata + pixel-length validation + reads) sees a valid value.
+    if attrs.samples_per_pixel == 0 {
+        attrs.samples_per_pixel = 1;
+    }
     if attrs.samples_per_pixel == 1 {
         attrs.planar_configuration = 0;
     }
@@ -1018,73 +1024,94 @@ fn build_dicom_file_list(
 
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
-    // Seed the original file at its instance position within its own series.
-    let instance_number = original.instance.unwrap_or(1).max(1) - 1;
-    let series_files = file_list.entry(original.series).or_default();
-    if instance_number == 0 {
-        series_files.push(Some(abs.clone()));
-    } else {
-        while (instance_number as usize) > series_files.len() {
-            series_files.push(None);
-        }
-        series_files.push(Some(abs.clone()));
-    }
-
-    if let Some(dir) = path.parent() {
-        if let Ok(entries) = std::fs::read_dir(dir) {
+    // Gather the candidate files first so we know an upper bound on how many
+    // planes a series can possibly hold. InstanceNumber (0020,0013) is used to
+    // position a file within its series, but some legacy/ACR-NEMA files store a
+    // bogus or date-derived value (e.g. "01160501010100" → ~1.16e12). A naive
+    // `while position > len { push(None) }` pre-fill would then push trillions
+    // of placeholders and hang. The real number of planes can never exceed the
+    // number of DICOM files in the directory, so we cap placeholder pre-fill at
+    // that count; out-of-range positions simply append (placeholders are
+    // flattened away at the end anyway).
+    let dir_files: Vec<PathBuf> = path
+        .parent()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|entries| {
             let mut files: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.is_file())
                 .collect();
             files.sort();
+            files
+        })
+        .unwrap_or_default();
+    // +1 so the originally-selected file always has room for its own slot even
+    // when it is the only file in its series.
+    let max_position = dir_files.len().saturating_add(1);
 
-            let reader = DicomReader::new();
-            for file in files {
-                let file_abs = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
-                if file_abs == abs {
-                    continue;
-                }
-                // Must look like DICOM.
-                let header = match read_dicom_probe_header(&file) {
-                    Some(h) => h,
-                    None => continue,
-                };
-                if !reader.is_this_type_by_bytes(&header) {
-                    continue;
-                }
-                let attrs = match parse_dicom(&file) {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                let candidate = group_key_from_attrs(&attrs);
-                let Some(series) = grouped_series(original, &candidate) else {
-                    continue;
-                };
+    // Seed the original file at its instance position within its own series.
+    let instance_number = (original.instance.unwrap_or(1).max(1) - 1) as usize;
+    let series_files = file_list.entry(original.series).or_default();
+    if instance_number == 0 {
+        series_files.push(Some(abs.clone()));
+    } else {
+        let target = instance_number.min(max_position);
+        while target > series_files.len() {
+            series_files.push(None);
+        }
+        series_files.push(Some(abs.clone()));
+    }
 
-                let position = (candidate.instance.unwrap_or(1).max(1) - 1).max(0) as usize;
-                let bucket = file_list.entry(series).or_default();
-                if position < bucket.len() {
-                    let mut pos = position;
-                    while pos < bucket.len() && bucket[pos].is_some() {
-                        pos += 1;
-                    }
-                    if pos < bucket.len() {
-                        bucket[pos] = Some(file_abs.clone());
-                    } else if !bucket
-                        .iter()
-                        .any(|f| f.as_deref() == Some(file_abs.as_path()))
-                    {
-                        bucket.push(Some(file_abs.clone()));
-                    }
+    {
+        let reader = DicomReader::new();
+        for file in dir_files {
+            let file_abs = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+            if file_abs == abs {
+                continue;
+            }
+            // Must look like DICOM.
+            let header = match read_dicom_probe_header(&file) {
+                Some(h) => h,
+                None => continue,
+            };
+            if !reader.is_this_type_by_bytes(&header) {
+                continue;
+            }
+            let attrs = match parse_dicom(&file) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let candidate = group_key_from_attrs(&attrs);
+            let Some(series) = grouped_series(original, &candidate) else {
+                continue;
+            };
+
+            // Clamp the target position: a bogus InstanceNumber must not drive
+            // an unbounded placeholder pre-fill (see `max_position` above).
+            let position = ((candidate.instance.unwrap_or(1).max(1) - 1).max(0) as usize)
+                .min(max_position);
+            let bucket = file_list.entry(series).or_default();
+            if position < bucket.len() {
+                let mut pos = position;
+                while pos < bucket.len() && bucket[pos].is_some() {
+                    pos += 1;
+                }
+                if pos < bucket.len() {
+                    bucket[pos] = Some(file_abs.clone());
                 } else if !bucket
                     .iter()
                     .any(|f| f.as_deref() == Some(file_abs.as_path()))
                 {
-                    while position > bucket.len() {
-                        bucket.push(None);
-                    }
                     bucket.push(Some(file_abs.clone()));
                 }
+            } else if !bucket
+                .iter()
+                .any(|f| f.as_deref() == Some(file_abs.as_path()))
+            {
+                while position > bucket.len() {
+                    bucket.push(None);
+                }
+                bucket.push(Some(file_abs.clone()));
             }
         }
     }
@@ -1112,11 +1139,9 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
             "DICOM: missing image dimensions".into(),
         ));
     }
-    if a.samples_per_pixel == 0 {
-        return Err(BioFormatsError::Format(
-            "DICOM: missing SamplesPerPixel".into(),
-        ));
-    }
+    // SamplesPerPixel (0028,0002) is absent in old ACR-NEMA / implicit-VR files
+    // (e.g. monochrome MR); the DICOM default is 1 (matches Java DicomReader).
+    let samples_per_pixel = a.samples_per_pixel.max(1);
     if a.bits_allocated == 0 {
         return Err(BioFormatsError::Format(
             "DICOM: missing BitsAllocated".into(),
@@ -1175,12 +1200,12 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
     let photometric = a.photometric_interpretation.trim();
     let is_rgb = matches!(photometric, "RGB" | "YBR_FULL" | "YBR_FULL_422")
         || has_palette
-        || (photometric.is_empty() && a.samples_per_pixel == 3);
+        || (photometric.is_empty() && samples_per_pixel == 3);
     let image_count = a.number_of_frames;
     let size_c = if has_palette {
         3
     } else {
-        a.samples_per_pixel as u32
+        samples_per_pixel as u32
     };
 
     let mut meta = ImageMetadata {
@@ -1221,7 +1246,7 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
             MetadataValue::String(a.photometric_interpretation.clone()),
         );
     }
-    if a.samples_per_pixel > 1 {
+    if samples_per_pixel > 1 {
         meta.series_metadata.insert(
             "PlanarConfiguration".into(),
             MetadataValue::String(a.planar_configuration.to_string()),
