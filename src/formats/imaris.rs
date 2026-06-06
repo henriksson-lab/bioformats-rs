@@ -27,6 +27,10 @@ pub struct ImarisReader {
     current_resolution: usize,
     // pixel type for raw reads
     bytes_per_sample: usize,
+    // Spatial extents from DataSetInfo/Image: [minX,minY,minZ,maxX,maxY,maxZ].
+    extents: Option<[f64; 6]>,
+    // Per-channel names from DataSetInfo/Channel N.
+    channel_names: Vec<Option<String>>,
     // Cache of the most recently decoded plane so that repeated reads of the
     // same plane do not re-read from disk. Keyed by (resolution, t, c, z).
     // Mirrors the per-Z-block buffer cache in ImarisHDFReader.java. The new
@@ -51,6 +55,8 @@ impl ImarisReader {
             resolutions: Vec::new(),
             current_resolution: 0,
             bytes_per_sample: 1,
+            extents: None,
+            channel_names: Vec::new(),
             cache: None,
         }
     }
@@ -65,11 +71,16 @@ impl Default for ImarisReader {
 /// Read a string attribute from an HDF5 group (tries VarLenAscii then FixedAscii).
 fn read_str_attr(group: &hdf5_pure_rust::Group, attr: &str) -> Option<String> {
     let a = group.attr(attr).ok()?;
-    // String-typed attributes: read directly. read_strings() handles both
-    // scalar and array string attributes; fall back to the first element.
+    // String-typed attributes: read directly. Imaris stores strings as arrays
+    // of single-character (|S1) elements, so read_strings() returns one entry
+    // per character — concatenate them all rather than taking just the first.
     if let Ok(v) = a.read_strings() {
-        if let Some(s) = v.first() {
-            return Some(s.trim_matches('\0').trim().to_string());
+        if !v.is_empty() {
+            let joined: String = v.concat();
+            let trimmed = joined.trim_matches('\0').trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
         }
     }
     let s = a.read_string();
@@ -86,7 +97,14 @@ fn read_str_attr(group: &hdf5_pure_rust::Group, attr: &str) -> Option<String> {
     None
 }
 
-fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
+struct ImsParse {
+    resolutions: Vec<ImageMetadata>,
+    bytes_per_sample: usize,
+    extents: Option<[f64; 6]>,
+    channel_names: Vec<Option<String>>,
+}
+
+fn parse_ims(path: &Path) -> Result<ImsParse> {
     let file = hdf5_pure_rust::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
@@ -95,11 +113,26 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
         .group("DataSetInfo/Image")
         .map_err(|e| BioFormatsError::Format(format!("DataSetInfo/Image missing: {e}")))?;
 
+    // Spatial extents (ExtMin0..2 / ExtMax0..2) for deriving physical sizes.
+    let ext_val = |attr: &str| -> Option<f64> {
+        read_str_attr(&img_group, attr).and_then(|s| s.trim().parse::<f64>().ok())
+    };
+    let extents = match (
+        ext_val("ExtMin0"),
+        ext_val("ExtMin1"),
+        ext_val("ExtMin2"),
+        ext_val("ExtMax0"),
+        ext_val("ExtMax1"),
+        ext_val("ExtMax2"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => Some([a, b, c, d, e, f]),
+        _ => None,
+    };
+
     // The DataSetInfo/Image X/Y/Z attributes are advisory and unreliable — some
     // writers store 1/1/1 (observed in real .ims files). The authoritative pixel
     // dimensions are the full-resolution Data dataset shape [z, y, x], so derive
     // X/Y/Z from it instead of the attributes.
-    let _ = &img_group; // group kept for any future attribute reads
     let (size_z, size_y, size_x) = ims_level_dims(&file, 0)?;
 
     // ── Count channels ──────────────────────────────────────────────────────
@@ -223,10 +256,12 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
     // ── Collect channel metadata ────────────────────────────────────────────
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
     meta_map.insert("format".into(), MetadataValue::String("Imaris IMS".into()));
+    let mut channel_names: Vec<Option<String>> = vec![None; size_c as usize];
     for c in 0..size_c {
         if let Ok(ch_group) = file.group(&format!("DataSetInfo/Channel {c}")) {
             if let Some(name) = read_str_attr(&ch_group, "Name") {
-                meta_map.insert(format!("channel_{c}_name"), MetadataValue::String(name));
+                meta_map.insert(format!("channel_{c}_name"), MetadataValue::String(name.clone()));
+                channel_names[c as usize] = Some(name);
             }
             if let Some(color) = read_str_attr(&ch_group, "Color") {
                 meta_map.insert(format!("channel_{c}_color"), MetadataValue::String(color));
@@ -287,7 +322,12 @@ fn parse_ims(path: &Path) -> Result<(Vec<ImageMetadata>, usize)> {
         resolutions.push(lvl);
     }
 
-    Ok((resolutions, bytes_per_sample))
+    Ok(ImsParse {
+        resolutions,
+        bytes_per_sample,
+        extents,
+        channel_names,
+    })
 }
 
 /// Read an integer attribute (string- or numeric-encoded) from an HDF5 group.
@@ -394,11 +434,13 @@ impl FormatReader for ImarisReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (resolutions, bps) = parse_ims(path)?;
-        self.resolutions = resolutions;
+        let parsed = parse_ims(path)?;
+        self.resolutions = parsed.resolutions;
         self.path = Some(path.to_path_buf());
         self.current_resolution = 0;
-        self.bytes_per_sample = bps;
+        self.bytes_per_sample = parsed.bytes_per_sample;
+        self.extents = parsed.extents;
+        self.channel_names = parsed.channel_names;
         Ok(())
     }
 
@@ -406,6 +448,8 @@ impl FormatReader for ImarisReader {
         self.path = None;
         self.resolutions.clear();
         self.current_resolution = 0;
+        self.extents = None;
+        self.channel_names.clear();
         self.cache = None;
         Ok(())
     }
@@ -577,5 +621,48 @@ impl FormatReader for ImarisReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(0, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.resolutions.get(self.current_resolution)?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let img = ome.images.get_mut(0)?;
+
+        // Image name = "<basename> Resolution Level <level+1>" (Java
+        // ImarisHDFReader sets the name per series/resolution-level).
+        if let Some(path) = self.path.as_ref() {
+            let base = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            img.name = Some(format!(
+                "{base} Resolution Level {}",
+                self.current_resolution + 1
+            ));
+        }
+
+        // Physical pixel size: Java uses RecordingEntry*Spacing when set,
+        // otherwise (ExtMax - ExtMin) / size. We only have the extents path.
+        if let Some(ext) = self.extents {
+            let span = |hi: f64, lo: f64, n: u32| {
+                if n > 0 {
+                    Some((hi - lo) / n as f64)
+                } else {
+                    None
+                }
+            };
+            img.physical_size_x = span(ext[3], ext[0], meta.size_x);
+            img.physical_size_y = span(ext[4], ext[1], meta.size_y);
+            img.physical_size_z = span(ext[5], ext[2], meta.size_z);
+        }
+
+        // Per-channel names.
+        for (ci, ch) in img.channels.iter_mut().enumerate() {
+            if let Some(Some(name)) = self.channel_names.get(ci) {
+                ch.name = Some(name.clone());
+            }
+        }
+
+        Some(ome)
     }
 }

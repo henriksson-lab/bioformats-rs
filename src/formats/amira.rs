@@ -37,6 +37,8 @@ struct AmiraHeader {
     ascii: bool,
     /// Per-stream compression of the `@N` data stream.
     compression: AmiraCompression,
+    /// Bounding box (x0 x1 y0 y1 z0 z1), used to derive physical pixel sizes.
+    bounding_box: Option<[f64; 6]>,
 }
 
 /// Parse the Amira Mesh ASCII header (port of AmiraParameters.java).
@@ -57,6 +59,7 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
     let mut ascii = false;
     let mut data_section: u32 = 1; // default @1
     let mut compression = AmiraCompression::None;
+    let mut bounding_box: Option<[f64; 6]> = None;
 
     let mut line = String::new();
     loop {
@@ -117,6 +120,18 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
                     ))
                 })?;
                 nz = 1;
+            }
+        }
+
+        // "BoundingBox x0 x1 y0 y1 z0 z1" gives the voxel-centre extents.
+        if t.starts_with("BoundingBox") {
+            let vals: Vec<f64> = t
+                .split_ascii_whitespace()
+                .skip(1)
+                .filter_map(|s| s.parse::<f64>().ok())
+                .collect();
+            if vals.len() >= 6 {
+                bounding_box = Some([vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]]);
             }
         }
 
@@ -184,6 +199,7 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
                 little_endian,
                 ascii,
                 compression,
+                bounding_box,
             });
         }
     }
@@ -239,6 +255,8 @@ pub struct AmiraReader {
     data_offset: u64,
     ascii: bool,
     compression: AmiraCompression,
+    /// Bounding box (x0 x1 y0 y1 z0 z1) for deriving physical pixel sizes.
+    bounding_box: Option<[f64; 6]>,
     /// Lazily decoded full stack for compressed streams (HxZip/HxByteRLE).
     /// The whole stack is one compressed stream, so we decode once and slice.
     decoded_stack: Option<Vec<u8>>,
@@ -252,6 +270,7 @@ impl AmiraReader {
             data_offset: 0,
             ascii: false,
             compression: AmiraCompression::None,
+            bounding_box: None,
             decoded_stack: None,
         }
     }
@@ -449,6 +468,7 @@ impl FormatReader for AmiraReader {
         self.data_offset = 0;
         self.ascii = false;
         self.compression = AmiraCompression::None;
+        self.bounding_box = None;
         self.decoded_stack = None;
         let hdr = parse_amira_header(path)?;
         let image_count = hdr.nz;
@@ -485,6 +505,7 @@ impl FormatReader for AmiraReader {
         self.data_offset = hdr.data_offset;
         self.ascii = hdr.ascii;
         self.compression = hdr.compression;
+        self.bounding_box = hdr.bounding_box;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -571,6 +592,35 @@ impl FormatReader for AmiraReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let img = ome.images.get_mut(0)?;
+
+        // AmiraReader does not call setImageName, so Java falls back to the
+        // current file's basename (with extension).
+        if let Some(path) = self.path.as_ref() {
+            img.name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        }
+
+        // Physical pixel size from the bounding box (voxel-centre extents):
+        //   pixelSize = (high - low) / (count - 1)   (Java AmiraReader).
+        if let Some(bb) = self.bounding_box {
+            let span = |hi: f64, lo: f64, n: u32| {
+                if n > 1 {
+                    Some((hi - lo) / (n as f64 - 1.0))
+                } else {
+                    None
+                }
+            };
+            img.physical_size_x = span(bb[1], bb[0], meta.size_x);
+            img.physical_size_y = span(bb[3], bb[2], meta.size_y);
+            img.physical_size_z = span(bb[5], bb[4], meta.size_z);
+        }
+
+        Some(ome)
     }
 }
 

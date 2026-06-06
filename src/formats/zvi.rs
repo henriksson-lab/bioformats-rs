@@ -30,6 +30,24 @@ pub struct ZviReader {
     /// `coordinates[i][3]` (the tile index) selects the series.
     tile_count: usize,
     current_series: usize,
+    /// OME enrichment harvested from the per-item Tags streams.
+    ome_info: ZviOmeInfo,
+}
+
+/// OME metadata harvested from ZVI tag streams, mirroring the subset of
+/// BaseZeissReader.parseMainTags that the parity harness checks: physical pixel
+/// sizes and per-channel name / emission / excitation, keyed by channel index.
+#[derive(Default, Clone)]
+struct ZviOmeInfo {
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
+    /// channel index -> name
+    channel_names: HashMap<u32, String>,
+    /// channel index -> emission wavelength (nm)
+    emission: HashMap<u32, f64>,
+    /// channel index -> excitation wavelength (nm)
+    excitation: HashMap<u32, f64>,
 }
 
 struct ZviPlane {
@@ -44,6 +62,66 @@ struct ZviPlane {
     data_offset: usize,
     is_zlib: bool,
     is_jpeg: bool,
+}
+
+/// The immediate parent directory component of a "…/<dir>/Contents" path.
+///
+/// Java derives `dirName` this way (the directory directly containing the
+/// CONTENTS stream) and dispatches on it, so the image-item test must look only
+/// at the parent dir, not the whole path — otherwise unrelated nested "Item(n)"
+/// directories (Layers, RootFolder Locations, …) would also match.
+fn parent_dir(p: &str) -> &str {
+    let trimmed = p.strip_suffix('/').unwrap_or(p);
+    let last_slash = match trimmed.rfind('/') {
+        Some(i) => i,
+        None => return "",
+    };
+    let dir_path = &trimmed[..last_slash];
+    match dir_path.rfind('/') {
+        Some(i) => &dir_path[i + 1..],
+        None => dir_path,
+    }
+}
+
+/// Port of `MetadataTools.makeSaneDimensionOrder`: keep only XYZCT characters,
+/// then append any missing axis in the fixed precedence X, Y, C, Z, T and drop
+/// duplicate occurrences. Maps the resulting 5-char string to a [`DimensionOrder`].
+fn make_sane_dimension_order(input: &str) -> DimensionOrder {
+    let mut order = String::new();
+    for ch in input.to_ascii_uppercase().chars() {
+        if matches!(ch, 'X' | 'Y' | 'Z' | 'C' | 'T') && !order.contains(ch) {
+            order.push(ch);
+        }
+    }
+    for axis in ['X', 'Y', 'C', 'Z', 'T'] {
+        if !order.contains(axis) {
+            order.push(axis);
+        }
+    }
+    match order.as_str() {
+        "XYCTZ" => DimensionOrder::XYCTZ,
+        "XYCZT" => DimensionOrder::XYCZT,
+        "XYTCZ" => DimensionOrder::XYTCZ,
+        "XYTZC" => DimensionOrder::XYTZC,
+        "XYZCT" => DimensionOrder::XYZCT,
+        "XYZTC" => DimensionOrder::XYZTC,
+        // makeSaneDimensionOrder can only yield the six XY-prefixed permutations
+        // above; anything else means a logic error, so fall back to XYCZT.
+        _ => DimensionOrder::XYCZT,
+    }
+}
+
+/// The Z/C/T axis characters of a [`DimensionOrder`], in order (X, Y omitted).
+fn dimension_order_axes(order: DimensionOrder) -> Vec<char> {
+    let s = match order {
+        DimensionOrder::XYCTZ => "CTZ",
+        DimensionOrder::XYCZT => "CZT",
+        DimensionOrder::XYTCZ => "TCZ",
+        DimensionOrder::XYTZC => "TZC",
+        DimensionOrder::XYZCT => "ZCT",
+        DimensionOrder::XYZTC => "ZTC",
+    };
+    s.chars().collect()
 }
 
 fn zvi_tag_name(tag_id: u32) -> &'static str {
@@ -65,6 +143,18 @@ fn zvi_tag_name(tag_id: u32) -> &'static str {
         1801 => "User Name",
         _ => "Unknown",
     }
+}
+
+/// Port of `DataTools.stripString`: drop NUL characters (ZVI strings are stored
+/// UTF-16LE, so bytes decode to interleaved NULs) and trim surrounding
+/// whitespace. This turns e.g. "C\0y\05" back into "Cy5".
+fn strip_string(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .chars()
+        .filter(|&c| c != '\0')
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn read_zvi_variant(data: &[u8], offset: &mut usize) -> Option<String> {
@@ -97,10 +187,7 @@ fn read_zvi_variant(data: &[u8], offset: &mut usize) -> Option<String> {
             *offset += 4;
             let raw = data.get(*offset..*offset + len)?;
             *offset += len;
-            String::from_utf8_lossy(raw)
-                .trim_end_matches('\0')
-                .trim()
-                .to_string()
+            strip_string(raw)
         }
         11 => {
             let v = u16::from_le_bytes(data.get(*offset..*offset + 2)?.try_into().ok()?) != 0;
@@ -122,14 +209,107 @@ fn read_zvi_variant(data: &[u8], offset: &mut usize) -> Option<String> {
             *offset += 2;
             let raw = data.get(*offset..*offset + len)?;
             *offset += len;
-            String::from_utf8_lossy(raw)
-                .trim_end_matches('\0')
-                .trim()
-                .to_string()
+            strip_string(raw)
         }
         _ => return None,
     };
     Some(value)
+}
+
+/// Harvest OME-relevant tags from one item's Tags stream, mirroring
+/// BaseZeissReader.parseMainTags. Reads each (value, tagID) record in stream
+/// order, tracking the current channel index (tag 2820 "Image Channel Index")
+/// so that channel name (1284), emission (16777489), and excitation (16777488)
+/// are attributed to the right channel. Physical sizes come from tags 769/772/775
+/// ("Scale Factor for X/Y/Z"); Java keeps the first value seen for each.
+///
+/// `c_index` is threaded across all item streams to match Java's stateful field.
+fn harvest_zvi_ome_tags(data: &[u8], info: &mut ZviOmeInfo, c_index: &mut i32) {
+    const TAG_SCALE_X: u32 = 769;
+    const TAG_SCALE_Y: u32 = 772;
+    const TAG_SCALE_Z: u32 = 775;
+    const TAG_CHANNEL_NAME: u32 = 1284;
+    const TAG_CHANNEL_INDEX: u32 = 2820;
+    const TAG_EXCITATION: u32 = 16_777_488;
+    const TAG_EMISSION: u32 = 16_777_489;
+
+    if data.len() < 12 {
+        return;
+    }
+    let count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    let mut offset = 12;
+    for _ in 0..count {
+        if offset + 2 >= data.len() {
+            break;
+        }
+        let Some(value) = read_zvi_variant(data, &mut offset) else {
+            break;
+        };
+        if offset + 12 > data.len() {
+            break;
+        }
+        offset += 2;
+        let tag_id = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        offset += 10;
+
+        match tag_id {
+            TAG_CHANNEL_INDEX => {
+                if let Ok(v) = value.trim().parse::<i32>() {
+                    *c_index = v;
+                }
+            }
+            TAG_SCALE_X => {
+                if info.physical_size_x.is_none() {
+                    if let Ok(v) = value.trim().parse::<f64>() {
+                        info.physical_size_x = Some(v);
+                    }
+                }
+            }
+            TAG_SCALE_Y => {
+                if info.physical_size_y.is_none() {
+                    if let Ok(v) = value.trim().parse::<f64>() {
+                        info.physical_size_y = Some(v);
+                    }
+                }
+            }
+            TAG_SCALE_Z => {
+                if info.physical_size_z.is_none() {
+                    if let Ok(v) = value.trim().parse::<f64>() {
+                        info.physical_size_z = Some(v);
+                    }
+                }
+            }
+            TAG_CHANNEL_NAME => {
+                if *c_index != -1 {
+                    info.channel_names.insert(*c_index as u32, value.trim().to_string());
+                }
+            }
+            TAG_EMISSION => {
+                if *c_index != -1 {
+                    if let Ok(v) = value.trim().parse::<f64>() {
+                        if v > 0.0 {
+                            info.emission.insert(*c_index as u32, v);
+                        }
+                    }
+                }
+            }
+            TAG_EXCITATION => {
+                if *c_index != -1 {
+                    if let Ok(v) = value.trim().parse::<f64>() {
+                        if v > 0.0 {
+                            info.excitation.insert(*c_index as u32, v);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_zvi_tag_stream(data: &[u8], image_num: usize) -> HashMap<String, MetadataValue> {
@@ -183,6 +363,7 @@ impl ZviReader {
             is_rgb: false,
             tile_count: 1,
             current_series: 0,
+            ome_info: ZviOmeInfo::default(),
         }
     }
 }
@@ -363,9 +544,9 @@ fn parse_zvi_item(data: &[u8]) -> Result<Option<ParsedItem>> {
             "ZVI: unsupported bytes-per-pixel value {bpp}"
         )));
     }
-    // ZeissZVIReader: a single skipBytes(4) sits between the bytes-per-pixel
-    // field and the `valid` flag. A second skip here over-counted by 4 bytes,
-    // shifting the pixel-data offset and truncating the raw plane.
+    // Java skips exactly one 4-byte field here (ZeissZVIReader.java:311) before
+    // reading `valid`. Our pixel-data offset = filePointer - 4 depends on this
+    // being a single skip; a second skip would push the offset 4 bytes too far.
     s.skip(4);
 
     let Some(valid) = s.read_i32() else {
@@ -385,16 +566,21 @@ fn parse_zvi_item(data: &[u8]) -> Result<Option<ParsedItem>> {
     }
 
     if !is_zlib && !is_jpeg {
+        // Validate the offset is in range, but tolerate a plane that is a few
+        // bytes short of the declared size: ZeissZVIReader.openBytes reads into
+        // a pre-zeroed buffer via readPlane, so a stream that ends a few bytes
+        // early (seen in real Zeiss exports) simply leaves the tail zero rather
+        // than failing. open_bytes mirrors this by zero-padding.
         let plane_bytes = (size_x as usize)
             .checked_mul(size_y as usize)
             .and_then(|px| px.checked_mul(bpp as usize))
             .ok_or_else(|| BioFormatsError::Format("ZVI plane size overflows".into()))?;
-        let available = data.len().saturating_sub(data_offset);
-        if available < plane_bytes {
-            return Err(BioFormatsError::InvalidData(format!(
-                "ZVI raw plane is shorter than declared: got {available}, expected {plane_bytes}"
-            )));
+        if data_offset > data.len() {
+            return Err(BioFormatsError::InvalidData(
+                "ZVI: pixel data offset is past end of stream".into(),
+            ));
         }
+        let _ = plane_bytes;
     }
 
     Ok(Some(ParsedItem {
@@ -411,31 +597,45 @@ fn parse_zvi_item(data: &[u8]) -> Result<Option<ParsedItem>> {
     }))
 }
 
-fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, usize)> {
+fn parse_zvi(
+    path: &Path,
+) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, usize, ZviOmeInfo)> {
     let mut comp =
         cfb::open(path).map_err(|e| BioFormatsError::Format(format!("ZVI CFB open error: {e}")))?;
 
     // ── Enumerate image item streams ─────────────────────────────────────────
-    // Faithful to ZeissZVIReader.fillMetadataPass1 / countImages: a pixel plane
-    // is any stream whose final path component upper-cases to "CONTENTS" and
-    // whose immediate parent directory is "Image" or contains "ITEM"
-    // (case-insensitive), excluding the "Scaling" metadata storage. Real files
-    // name the stream "Contents" (mixed case) and number items from 0, so the
-    // earlier strict "/Image/Item(N)/CONTENTS" match found nothing.
+    // ZeissZVIReader matches stream names case-insensitively: it uppercases the
+    // path and keeps those ending in "CONTENTS" that live under an "ITEM(n)"
+    // directory (ZeissZVIReader.java:393-404). The cfb container preserves the
+    // original on-disk casing (e.g. ".../Item(0)/Contents"), so we must match
+    // without regard to case.
     let item_num = |s: &str| -> u32 {
-        // Parse N from the ".../Item(N)/..." parent directory, case-insensitively.
-        let upper = s.to_ascii_uppercase();
-        if let Some(item_pos) = upper.rfind("ITEM(") {
-            let after = &s[item_pos + "ITEM(".len()..];
-            if let Some(close) = after.find(')') {
-                if let Ok(n) = after[..close].parse() {
-                    return n;
-                }
+        // Extract the index from the parent "Item(n)" directory, mirroring
+        // getImageNumber (case-insensitive "ITEM").
+        let dir = parent_dir(s);
+        let upper = dir.to_ascii_uppercase();
+        if upper.contains("ITEM") {
+            if let Some(open) = dir.find('(') {
+                let after = &dir[open + 1..];
+                return after
+                    .split(')')
+                    .next()
+                    .and_then(|n| n.trim().parse().ok())
+                    .unwrap_or(0);
             }
         }
         0
     };
-
+    let is_item_contents = |p: &str| -> bool {
+        // relPath must be exactly CONTENTS (case-insensitive) and the immediate
+        // parent dir must be "Image" or contain "ITEM" (ZeissZVIReader:240-266).
+        let upper = p.to_ascii_uppercase();
+        if !upper.ends_with("/CONTENTS") {
+            return false;
+        }
+        let dir = parent_dir(p).to_ascii_uppercase();
+        dir == "IMAGE" || dir.contains("ITEM")
+    };
     let mut item_paths: Vec<String> = comp
         .walk()
         .filter_map(|entry| {
@@ -443,22 +643,7 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
                 return None;
             }
             let p = entry.path().to_string_lossy().to_string();
-            // Final component must be "CONTENTS" (case-insensitive).
-            let last = p.rsplit('/').next().unwrap_or("");
-            if !last.eq_ignore_ascii_case("CONTENTS") {
-                return None;
-            }
-            // Immediate parent directory name.
-            let parent = p
-                .rsplitn(2, '/')
-                .nth(1)
-                .map(|d| d.rsplit('/').next().unwrap_or(d))
-                .unwrap_or("");
-            let parent_upper = parent.to_ascii_uppercase();
-            if parent_upper.contains("SCALING") {
-                return None;
-            }
-            if parent == "Image" || parent_upper.contains("ITEM") {
+            if is_item_contents(&p) {
                 Some(p)
             } else {
                 None
@@ -471,6 +656,8 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
 
     let mut planes: Vec<ZviPlane> = Vec::with_capacity(item_paths.len());
     let mut series_metadata = HashMap::new();
+    let mut ome_info = ZviOmeInfo::default();
+    let mut c_index: i32 = -1;
     let mut bpp: u32 = 0;
     let mut size_x: u32 = 0;
     let mut size_y: u32 = 0;
@@ -521,20 +708,34 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
 
     for plane in &planes {
         let image_num = item_num(&plane.stream_path) as usize;
-        // The per-item Tags stream sits next to the pixel stream, e.g.
-        // "/Image/Item(N)/Contents" -> "/Image/Item(N)/Tags/Contents". Derive it
-        // from the real (case-preserved) item path so it works regardless of the
-        // "Contents"/"CONTENTS" spelling the file uses.
-        let (parent, contents_name) = plane
-            .stream_path
-            .rsplit_once('/')
-            .unwrap_or(("/Image/Item(0)", "Contents"));
-        let tag_path = format!("{parent}/Tags/{contents_name}");
+        // Derive the sibling Tags stream from the item's own "…/Contents" path,
+        // preserving on-disk casing (e.g. ".../Item(0)/Tags/Contents").
+        let sp = &plane.stream_path;
+        let tag_path = match sp.rfind('/') {
+            Some(slash) => {
+                let (dir, contents) = sp.split_at(slash);
+                format!("{dir}/Tags{contents}")
+            }
+            None => continue,
+        };
         if let Ok(mut stream) = comp.open_stream(&tag_path) {
             let mut data = Vec::new();
             if stream.read_to_end(&mut data).is_ok() {
                 series_metadata.extend(parse_zvi_tag_stream(&data, image_num));
+                harvest_zvi_ome_tags(&data, &mut ome_info, &mut c_index);
             }
+        }
+    }
+
+    // Physical pixel sizes live in the top-level "/Image/Tags/Contents" stream
+    // (dirName "Tags"), not the per-item Tags. BaseZeissReader parses that stream
+    // too; harvest it for the Scale Factor tags. Use a throwaway channel index so
+    // any "Image Channel Index" tag here cannot disturb the per-channel mapping.
+    if let Ok(mut stream) = comp.open_stream("/Image/Tags/Contents") {
+        let mut data = Vec::new();
+        if stream.read_to_end(&mut data).is_ok() {
+            let mut scratch_index: i32 = -1;
+            harvest_zvi_ome_tags(&data, &mut ome_info, &mut scratch_index);
         }
     }
 
@@ -590,24 +791,53 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
         1
     };
 
-    let dimension_order = if is_rgb {
-        DimensionOrder::XYCZT
-    } else {
-        DimensionOrder::XYZCT
-    };
-
-    // Sort planes so each tile's planes form a contiguous, canonically ordered
-    // block matching the declared dimension order (BaseZeissReader:236-255: RGB
-    // files prepend 'C', giving XYCZT, so C varies fastest; non-RGB is XYZCT, so
-    // Z varies fastest). The sort key lists axes outermost-first, i.e. the
-    // fastest-varying axis comes last.
+    // ── Dimension order (BaseZeissReader.fillMetadataPass4:236-255) ───────────
+    // Java builds the order from the per-plane coordinate deltas, walked in the
+    // original (item-number) stream order: start with "XY", prepend 'C' for RGB,
+    // then append Z/C/T the first time consecutive planes increase along that
+    // axis, and finally run makeSaneDimensionOrder to fill any missing axes.
+    // `planes` is currently in item-number order, matching `coordinates`.
+    let mut order = String::from("XY");
     if is_rgb {
-        // XYCZT: C fastest, then Z, then T.
-        planes.sort_by_key(|p| (p.tile, p.t, p.z, p.c));
-    } else {
-        // XYZCT: Z fastest, then C, then T.
-        planes.sort_by_key(|p| (p.tile, p.t, p.c, p.z));
+        order.push('C');
     }
+    for w in planes.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if b.z > a.z && !order.contains('Z') {
+            order.push('Z');
+        }
+        if b.c > a.c && !order.contains('C') {
+            order.push('C');
+        }
+        if b.t > a.t && !order.contains('T') {
+            order.push('T');
+        }
+    }
+    let dimension_order = make_sane_dimension_order(&order);
+
+    // Sort planes so each tile's planes form a contiguous block ordered by the
+    // derived dimension order (fastest-varying axis last in the sort key), so
+    // `plane_index` maps to the same plane Java resolves via getZCTCoords.
+    let axis_key = |p: &ZviPlane, axis: char| -> u32 {
+        match axis {
+            'Z' => p.z,
+            'C' => p.c,
+            'T' => p.t,
+            _ => 0,
+        }
+    };
+    // Build the (outer..inner) axis list from the order string (skip X, Y).
+    let axes: Vec<char> = dimension_order_axes(dimension_order);
+    planes.sort_by(|a, b| {
+        let mut ord = a.tile.cmp(&b.tile);
+        // outer-most axis first; the last axis in `axes` varies fastest, so
+        // compare from outermost (axes.last) to innermost (axes.first) by
+        // iterating the reversed slice as major→minor.
+        for &axis in axes.iter().rev() {
+            ord = ord.then_with(|| axis_key(a, axis).cmp(&axis_key(b, axis)));
+        }
+        ord
+    });
 
     let meta = ImageMetadata {
         size_x,
@@ -631,7 +861,7 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
         modulo_t: None,
     };
 
-    Ok((meta, planes, bytes_per_pixel, is_rgb, tile_count))
+    Ok((meta, planes, bytes_per_pixel, is_rgb, tile_count, ome_info))
 }
 
 /// Decode pixel data from a ZVI plane stream starting at `data_offset`.
@@ -692,7 +922,7 @@ impl FormatReader for ZviReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, planes, bpp, is_rgb, tile_count) = parse_zvi(path)?;
+        let (meta, planes, bpp, is_rgb, tile_count, ome_info) = parse_zvi(path)?;
         self.meta = Some(meta);
         self.planes = planes;
         self.path = Some(path.to_path_buf());
@@ -700,6 +930,7 @@ impl FormatReader for ZviReader {
         self.is_rgb = is_rgb;
         self.tile_count = tile_count.max(1);
         self.current_series = 0;
+        self.ome_info = ome_info;
         Ok(())
     }
 
@@ -709,6 +940,7 @@ impl FormatReader for ZviReader {
         self.planes.clear();
         self.tile_count = 1;
         self.current_series = 0;
+        self.ome_info = ZviOmeInfo::default();
         Ok(())
     }
 
@@ -802,16 +1034,15 @@ impl FormatReader for ZviReader {
 
         let mut pixels = decode_plane_data(&data, &plane)?;
 
-        // Trim to a single plane's worth of bytes (Java reads exactly
-        // sizeX * sizeY * pixel bytes via readPlane).
+        // Normalise to exactly one plane's worth of bytes. Java reads
+        // sizeX * sizeY * pixel bytes into a pre-zeroed buffer via readPlane, so
+        // a stream that ends a few bytes early leaves the tail zero rather than
+        // failing; mirror that by zero-padding a short decode.
         let plane_bytes = meta.size_x as usize * meta.size_y as usize * self.bytes_per_pixel;
         if pixels.len() > plane_bytes {
             pixels.truncate(plane_bytes);
         } else if pixels.len() < plane_bytes {
-            return Err(BioFormatsError::InvalidData(format!(
-                "ZVI plane decoded to {} bytes, expected {plane_bytes}",
-                pixels.len()
-            )));
+            pixels.resize(plane_bytes, 0);
         }
 
         // BGR storage: reverse channel bytes in groups for RGB images (but not
@@ -862,6 +1093,49 @@ impl FormatReader for ZviReader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::OmeMetadata;
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        let info = &self.ome_info;
+        let img = ome.images.get_mut(0)?;
+
+        // Image name: BaseZeissReader only sets an explicit name ("Tile #N") for
+        // multi-series files; for a single series Java falls back to the file's
+        // base name (with extension), e.g. "fig3d_wt_sting_cd31.zvi".
+        if self.tile_count > 1 {
+            img.name = Some(format!("Tile #{}", self.current_series + 1));
+        } else if let Some(path) = &self.path {
+            img.name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string);
+        }
+
+        img.physical_size_x = info.physical_size_x;
+        img.physical_size_y = info.physical_size_y;
+        img.physical_size_z = info.physical_size_z;
+
+        // Per-channel name / emission / excitation. The raw channel-index values
+        // ("Image Channel Index" tags) need not be 0..N-1 (this file uses 0,2,3),
+        // so — like BaseZeissReader — OME channel i takes the i-th value when the
+        // recorded channel-name keys are sorted ascending (channelKeys[i]).
+        let mut channel_keys: Vec<u32> = info.channel_names.keys().copied().collect();
+        channel_keys.sort_unstable();
+        for (ci, ch) in img.channels.iter_mut().enumerate() {
+            let Some(&key) = channel_keys.get(ci) else {
+                break;
+            };
+            if let Some(name) = info.channel_names.get(&key) {
+                ch.name = Some(name.clone());
+            }
+            ch.emission_wavelength = info.emission.get(&key).copied();
+            ch.excitation_wavelength = info.excitation.get(&key).copied();
+        }
+
+        Some(ome)
+    }
 }
 
 #[cfg(test)]
@@ -907,7 +1181,7 @@ mod tests {
         item.extend_from_slice(&1i32.to_le_bytes()); // sizeY
         item.extend_from_slice(&[0u8; 4]); // skip(4)
         item.extend_from_slice(&1i32.to_le_bytes()); // bpp -> UINT8
-        item.extend_from_slice(&[0u8; 4]); // skip(4)
+        item.extend_from_slice(&[0u8; 4]); // skip(4) before valid
         item.extend_from_slice(&2i32.to_le_bytes()); // valid=2 -> uncompressed
         item.extend_from_slice(&[pixel, 0, 0, 0]); // check / first-pixel region
         item
@@ -976,7 +1250,11 @@ mod tests {
     }
 
     #[test]
-    fn zvi_rejects_short_decoded_plane_instead_of_padding() {
+    fn zvi_zero_pads_a_short_raw_plane() {
+        // ZeissZVIReader.openBytes reads into a pre-zeroed buffer, so a stream
+        // that ends a few bytes short of a full plane leaves the tail zero
+        // rather than failing. Here the single uncompressed pixel byte (99) is
+        // truncated away, so the decoded plane must be a single zero byte.
         let path = temp_path("short_plane");
         let mut item = build_item(0, 0, 0, 0, 99);
         item.truncate(item.len() - 4);
@@ -990,11 +1268,8 @@ mod tests {
         }
 
         let mut reader = ZviReader::new();
-        let err = reader.set_id(&path).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("shorter than declared")),
-            "{err:?}"
-        );
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0]);
 
         let _ = std::fs::remove_file(path);
     }

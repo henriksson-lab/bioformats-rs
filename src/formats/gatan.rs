@@ -116,6 +116,15 @@ impl DmValue {
         }
     }
 
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            DmValue::Float(v) => Some(*v),
+            DmValue::Int(v) => Some(*v as f64),
+            DmValue::Uint(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
     fn as_group(&self) -> Option<&[(String, DmValue)]> {
         match self {
             DmValue::Group(v) => Some(v),
@@ -139,6 +148,11 @@ struct DmReader<R: Read + Seek> {
     // Java: when adjust_endianness is true, 4/8-byte structural scalars and the
     // Dimensions ints are read with the opposite byte order (in.order(!le)).
     adjust_endianness: bool,
+    // Physical pixel sizes (and matching units), collected in tree order from
+    // "Scale"/"Units" leaves whose parent group is "Dimension" — mirroring
+    // GatanReader.parseTags. Used to derive OME PhysicalSize{X,Y,Z}.
+    pixel_sizes: Vec<f64>,
+    units: Vec<String>,
 }
 
 impl<R: Read + Seek> DmReader<R> {
@@ -502,8 +516,9 @@ impl<R: Read + Seek> DmReader<R> {
         }
     }
 
-    /// Parse a TagGroup (branch node).
-    fn parse_tag_group(&mut self, depth: usize) -> std::io::Result<DmValue> {
+    /// Parse a TagGroup (branch node). `parent` is the name of the enclosing
+    /// group (for Scale/Units physical-size detection), like Java's `parent`.
+    fn parse_tag_group(&mut self, depth: usize, parent: &str) -> std::io::Result<DmValue> {
         if depth > 20 {
             return Ok(DmValue::Group(vec![]));
         }
@@ -552,10 +567,36 @@ impl<R: Read + Seek> DmReader<R> {
             let name = String::from_utf8_lossy(&name_bytes).to_string();
 
             let val = match tag_type {
-                20 => self.parse_tag_group(depth + 1)?, // group/branch
-                21 => self.parse_tag_data(&name)?,      // leaf
+                // Java passes the group's label as the new parent, but keeps the
+                // current parent when the label is empty (GatanReader.java:633).
+                20 => {
+                    let child_parent = if name.is_empty() { parent } else { name.as_str() };
+                    self.parse_tag_group(depth + 1, child_parent)?
+                }
+                21 => self.parse_tag_data(&name)?, // leaf
                 _ => DmValue::Int(0),
             };
+
+            // Physical pixel sizes: GatanReader collects "Scale" leaves whose
+            // parent group is "Dimension" (validPhysicalSize), then "Units"
+            // leaves, keeping units no longer than the size list. The OME value
+            // is the raw scale, so no unit conversion is applied here.
+            let valid_physical_size = parent == "Dimension"
+                || ((self.pixel_sizes.len() == 4 || self.units.len() == 4) && parent == "2");
+            if valid_physical_size {
+                if name == "Scale" {
+                    if let Some(v) = val.as_f64() {
+                        self.pixel_sizes.push(v);
+                    }
+                } else if name == "Units" {
+                    if self.pixel_sizes.len() == self.units.len() + 1 {
+                        if let DmValue::Str(s) = &val {
+                            self.units.push(s.clone());
+                        }
+                    }
+                }
+            }
+
             entries.push((name, val));
             i += 1;
         }
@@ -682,6 +723,42 @@ fn extract_image(entry: &DmValue) -> Result<Option<DmImage>> {
     }))
 }
 
+/// Select the physical pixel sizes (X, Y, Z) from the collected `Scale` values,
+/// porting GatanReader.initFile's index heuristic (GatanReader.java:282-330).
+///
+/// The reported OME value is the raw scale (the Java unit conversion only
+/// changes the unit, not `Length.value()`), so this returns the chosen scalars.
+fn select_physical_sizes(
+    pixel_sizes: &[f64],
+    size_y: u32,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    const EPSILON: f64 = 1e-10; // loci.common.Constants.EPSILON
+    let n = pixel_sizes.len();
+    let mut index: usize = 0;
+    if n > 4 {
+        index = n - 3;
+    } else if n == 4 && (pixel_sizes[0] - 1.0).abs() < EPSILON {
+        index = n - 2;
+    }
+    if index + 2 < n && (pixel_sizes[index + 1] - pixel_sizes[index + 2]).abs() < EPSILON {
+        if (pixel_sizes[index] - pixel_sizes[index + 1]).abs() > EPSILON && size_y > 1 {
+            index += 1;
+        }
+    }
+
+    let mut psx = None;
+    let mut psy = None;
+    let mut psz = None;
+    if index + 1 < n {
+        psx = Some(pixel_sizes[index]);
+        psy = Some(pixel_sizes[index + 1]);
+        if index + 2 < n {
+            psz = Some(pixel_sizes[index + 2]);
+        }
+    }
+    (psx, psy, psz)
+}
+
 // ── Reader ────────────────────────────────────────────────────────────────────
 
 pub struct GatanReader {
@@ -689,6 +766,10 @@ pub struct GatanReader {
     meta: Option<ImageMetadata>,
     pixel_data: Option<Vec<u8>>,
     dm_data_type: i32,
+    /// OME PhysicalSize{X,Y,Z} derived from the "Scale" tags (micrometres value).
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
 }
 
 impl GatanReader {
@@ -698,6 +779,9 @@ impl GatanReader {
             meta: None,
             pixel_data: None,
             dm_data_type: 23,
+            physical_size_x: None,
+            physical_size_y: None,
+            physical_size_z: None,
         }
     }
 }
@@ -772,6 +856,8 @@ impl FormatReader for GatanReader {
             dm4,
             le,
             adjust_endianness: true,
+            pixel_sizes: Vec::new(),
+            units: Vec::new(),
         };
 
         // Seek past the file header to the root tag group
@@ -783,7 +869,9 @@ impl FormatReader for GatanReader {
         dm.r.seek(SeekFrom::Start(root_off))
             .map_err(BioFormatsError::Io)?;
 
-        let root = dm.parse_tag_group(0).map_err(BioFormatsError::Io)?;
+        let root = dm.parse_tag_group(0, "").map_err(BioFormatsError::Io)?;
+        let pixel_sizes = std::mem::take(&mut dm.pixel_sizes);
+        let units = std::mem::take(&mut dm.units);
 
         let img = find_image_data(&root)?;
 
@@ -846,7 +934,8 @@ impl FormatReader for GatanReader {
             pixel_type,
             bits_per_pixel: (bytes_per_pixel * 8) as u8,
             image_count,
-            dimension_order: DimensionOrder::XYZCT,
+            // GatanReader hard-codes dimensionOrder = "XYZTC" (GatanReader.java:253).
+            dimension_order: DimensionOrder::XYZTC,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
@@ -861,10 +950,16 @@ impl FormatReader for GatanReader {
             modulo_t: None,
         };
 
+        let (psx, psy, psz) = select_physical_sizes(&pixel_sizes, img.height);
+        let _ = units; // units only affect the OME unit, not the reported value
+
         self.meta = Some(meta);
         self.pixel_data = Some(img.pixel_data);
         self.dm_data_type = img.dm_data_type;
         self.path = Some(path.to_path_buf());
+        self.physical_size_x = psx;
+        self.physical_size_y = psy;
+        self.physical_size_z = psz;
         Ok(())
     }
 
@@ -872,6 +967,9 @@ impl FormatReader for GatanReader {
         self.path = None;
         self.meta = None;
         self.pixel_data = None;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
+        self.physical_size_z = None;
         Ok(())
     }
 
@@ -942,14 +1040,24 @@ impl FormatReader for GatanReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::metadata::MetadataValue;
         use crate::common::ome_metadata::OmeMetadata;
         let meta = self.meta.as_ref()?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
-        let img = &mut ome.images[0];
-        if let Some(MetadataValue::String(n)) = meta.series_metadata.get("name") {
-            img.name = Some(n.clone());
+        let img = ome.images.get_mut(0)?;
+
+        // Image name: GatanReader only sets an explicit name ("Tile #N") for
+        // multi-series montages; for a single image it falls back to the file's
+        // base name (with extension), e.g. "clem_fig3b.dm3".
+        if let Some(path) = &self.path {
+            img.name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string);
         }
+
+        img.physical_size_x = self.physical_size_x;
+        img.physical_size_y = self.physical_size_y;
+        img.physical_size_z = self.physical_size_z;
         Some(ome)
     }
 }

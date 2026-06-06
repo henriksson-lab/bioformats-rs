@@ -1044,6 +1044,146 @@ fn parse_modulo_labels(xml: &str, name: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Read the significant ("valid") bit depth Java exposes as `getBitsPerPixel`.
+///
+/// ZeissCZIReader (`translateInformation`) sets `core.bitsPerPixel` from the
+/// first `<ComponentBitCount>` value under the `<Image>` node (12 for a 16-bit
+/// camera storing 12 significant bits). When absent, callers fall back to the
+/// storage bit depth (8 * bytes-per-sample).
+fn parse_component_bit_count(xml: &str) -> Option<u8> {
+    if xml.is_empty() {
+        return None;
+    }
+    let open = "<ComponentBitCount>";
+    let close = "</ComponentBitCount>";
+    let start = xml.find(open)? + open.len();
+    let rel_end = xml[start..].find(close)?;
+    xml[start..start + rel_end].trim().parse::<u8>().ok()
+}
+
+/// Slice out the body of the first `<{tag}> ... </{tag}>` element (case
+/// sensitive, matching CZI's mixed-case element names). Returns the inner text
+/// between the open and close tags, or `None` if not found.
+fn first_element_body<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open_prefix = format!("<{}", tag);
+    let close = format!("</{}>", tag);
+    let open_at = xml.find(&open_prefix)?;
+    // Find the '>' that closes this start tag (skip self-closing handling — the
+    // CZI containers we read are never self-closing).
+    let after_open = open_at + xml[open_at..].find('>')? + 1;
+    let close_rel = xml[after_open..].find(&close)?;
+    Some(&xml[after_open..after_open + close_rel])
+}
+
+/// Value of a direct child element `<{child}>value</{child}>` within `block`.
+fn child_value(block: &str, child: &str) -> Option<String> {
+    let v = first_element_body(block, child)?.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// Iterate the `<Channel ...> ... </Channel>` elements directly contained in the
+/// first `<Channels>` block found inside `scope` (the CZI `Dimensions` or
+/// `DisplaySetting` subtree). Returns one block string per channel.
+fn channel_blocks(scope: &str) -> Vec<&str> {
+    let Some(channels) = first_element_body(scope, "Channels") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let close = "</Channel>";
+    while let Some(rel) = channels[pos..].find("<Channel") {
+        let start = pos + rel;
+        // Skip "<Channels" (the wrapper, though we already stripped it) and any
+        // longer element name; require the next char to be space or '>'.
+        let after = channels[start + "<Channel".len()..].chars().next();
+        if !matches!(after, Some(' ') | Some('>') | Some('\t') | Some('\r') | Some('\n')) {
+            pos = start + "<Channel".len();
+            continue;
+        }
+        let Some(end_rel) = channels[start..].find(close) else {
+            break;
+        };
+        let end = start + end_rel + close.len();
+        out.push(&channels[start..end]);
+        pos = end;
+    }
+    out
+}
+
+/// The `Name` attribute of a `<Channel ... Name="...">` start tag.
+fn channel_name_attr(block: &str) -> Option<String> {
+    let tag_end = block.find('>')?;
+    let tag = &block[..tag_end];
+    let needle = "Name=\"";
+    let at = tag.find(needle)? + needle.len();
+    let rel_end = tag[at..].find('"')?;
+    let v = tag[at..at + rel_end].trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// Build the per-channel OME metadata the way ZeissCZIReader does:
+///   1. `Information/Image/Dimensions/Channels` provides the channel count plus
+///      emission/excitation wavelengths.
+///   2. `DisplaySetting/Channels` provides the channel `Name` (overriding) and
+///      colour, indexed positionally.
+/// The unrelated `Experiment/.../Channels` setup blocks are *not* counted.
+fn build_czi_channels(xml: &str) -> Vec<crate::common::ome_metadata::OmeChannel> {
+    use crate::common::ome_metadata::OmeChannel;
+
+    // Pass 1: Dimensions/Channels — count + wavelengths.
+    let mut channels: Vec<OmeChannel> = Vec::new();
+    if let Some(dims) = first_element_body(xml, "Dimensions") {
+        for block in channel_blocks(dims) {
+            channels.push(OmeChannel {
+                name: channel_name_attr(block),
+                samples_per_pixel: 1,
+                color: child_value(block, "Color").and_then(|s| {
+                    let hex = s.trim().trim_start_matches('#');
+                    i64::from_str_radix(hex, 16).ok().map(|v| v as i32)
+                }),
+                emission_wavelength: child_value(block, "EmissionWavelength")
+                    .and_then(|s| s.parse().ok()),
+                excitation_wavelength: child_value(block, "ExcitationWavelength")
+                    .and_then(|s| s.parse().ok()),
+            });
+        }
+    }
+
+    // Pass 2: DisplaySetting/Channels — name + colour (positional, may extend).
+    if let Some(ds) = first_element_body(xml, "DisplaySetting") {
+        for (i, block) in channel_blocks(ds).into_iter().enumerate() {
+            while channels.len() <= i {
+                channels.push(OmeChannel {
+                    samples_per_pixel: 1,
+                    ..Default::default()
+                });
+            }
+            if let Some(name) = channel_name_attr(block) {
+                channels[i].name = Some(name);
+            }
+            let color = child_value(block, "Color")
+                .or_else(|| child_value(block, "OriginalColor"))
+                .and_then(|s| {
+                    let hex = s.trim().trim_start_matches('#');
+                    i64::from_str_radix(hex, 16).ok().map(|v| v as i32)
+                });
+            if color.is_some() {
+                channels[i].color = color;
+            }
+        }
+    }
+
+    channels
+}
+
 impl DimCounts {
     /// Whether mosaics should be exposed as separate series rather than stitched.
     /// Mirrors the assignPlaneIndices guard that only adds 'M' to the extra-dim
@@ -1656,7 +1796,10 @@ impl FormatReader for CziReader {
         let parsed = parse_czi_file(&mut reader).map_err(BioFormatsError::Io)?;
 
         let image_count = parsed.z_count * parsed.c_count * parsed.t_count;
-        let bps = (parsed.pixel_type.bytes_per_sample() * 8) as u8;
+        // Java reports the significant/valid bit depth (`<ComponentBitCount>`,
+        // e.g. 12 for a 16-bit camera), falling back to the storage bit depth.
+        let storage_bps = (parsed.pixel_type.bytes_per_sample() * 8) as u8;
+        let bps = parse_component_bit_count(&parsed.meta_xml).unwrap_or(storage_bps);
         let is_rgb = parsed.spp >= 3;
 
         let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
@@ -1874,9 +2017,28 @@ impl FormatReader for CziReader {
         if self.meta_xml.is_empty() {
             return None;
         }
-        Some(crate::common::ome_metadata::OmeMetadata::from_czi_xml(
-            &self.meta_xml,
-        ))
+        let mut ome =
+            crate::common::ome_metadata::OmeMetadata::from_czi_xml(&self.meta_xml);
+        // Override channel enumeration to match ZeissCZIReader: the channel
+        // count and wavelengths come from Information/Image/Dimensions/Channels,
+        // names from DisplaySetting/Channels (the generic XML scan over-counts
+        // by also picking up Experiment setup channels).
+        let channels = build_czi_channels(&self.meta_xml);
+        if let Some(image) = ome.images.first_mut() {
+            if !channels.is_empty() {
+                image.channels = channels;
+            }
+            // ZeissCZIReader names the single-series image "<filename> #1"
+            // (base name, then " #" + 1-based series index).
+            if image.name.is_none() {
+                if let Some(path) = &self.path {
+                    if let Some(file) = path.file_name().and_then(|f| f.to_str()) {
+                        image.name = Some(format!("{} #1", file));
+                    }
+                }
+            }
+        }
+        Some(ome)
     }
 }
 

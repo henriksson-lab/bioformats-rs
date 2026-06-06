@@ -522,12 +522,21 @@ impl FormatReader for NiftiReader {
                 None
             }
         };
-        // pixdim stored in mm → convert to µm (×1000)
-        img.physical_size_x = get_f("voxel_size_x_mm").map(|v| v * 1000.0);
-        img.physical_size_y = get_f("voxel_size_y_mm").map(|v| v * 1000.0);
-        img.physical_size_z = get_f("voxel_size_z_mm").map(|v| v * 1000.0);
+        // Java stores pixdim directly as an OME Length in the file's spatial unit
+        // (FormatTools.getPhysicalSizeX(value, spatialUnit)); the OME value keeps
+        // the raw pixdim number, so we must NOT rescale it.
+        img.physical_size_x = get_f("voxel_size_x_mm");
+        img.physical_size_y = get_f("voxel_size_y_mm");
+        img.physical_size_z = get_f("voxel_size_z_mm");
         if let Some(MetadataValue::String(d)) = meta.series_metadata.get("description") {
             img.description = Some(d.clone());
+        }
+        // Java leaves the default image name (the file name).
+        if let Some(p) = self.hdr_path.as_ref() {
+            img.name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
         }
         Some(ome)
     }

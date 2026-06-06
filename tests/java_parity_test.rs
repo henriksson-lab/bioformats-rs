@@ -57,7 +57,7 @@ const FILES: &[&str] = &[
     "oif/Source Data Figure S5c-d CTRL.oif",
     "zvi/fig3d_wt_sting_cd31.zvi",
     "avi/cryper2_newborn.avi",
-    "psd/fgf8_pcw5.psd",
+    "psd/sample_rgb.psd",
     "dm3/clem_fig3b.dm3",
     "imagic/12409.stpm.hed",
     "vsi/HN 485 HNSCC APOBEC3A-1.1000.vsi",

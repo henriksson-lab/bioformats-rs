@@ -113,6 +113,12 @@ fn avi_frame_layout(width: u32, height: u32, channels: usize) -> Result<(usize, 
 struct AviParse {
     width: u32,
     height: u32,
+    /// Frame width from the AVI main header (avih dwWidth). Java seeds sizeX
+    /// from this and only shrinks it to the strf scan-line width if smaller.
+    avih_width: Option<u32>,
+    /// Bitmap width from the strf BITMAPINFOHEADER (biWidth). This drives the
+    /// stored scan-line stride (DIB rows are padded to a 4-byte boundary).
+    bmp_width: u32,
     total_frames: u32,
     bit_count: u16,
     compression: [u8; 4],
@@ -198,6 +204,10 @@ fn parse_riff_chunks(
 fn parse_avih(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse) {
     if data_end.saturating_sub(payload) >= 40 {
         parsed.total_frames = r_u32_le(buf, payload + 16);
+        // Java AVIReader seeds sizeX/sizeY from the avih dwWidth/dwHeight, then
+        // reconciles sizeX against the strf scan-line width below. Keep the
+        // avih width separate so strf doesn't clobber it.
+        parsed.avih_width = Some(r_u32_le(buf, payload + 32));
         parsed.width = r_u32_le(buf, payload + 32);
         parsed.height = r_u32_le(buf, payload + 36);
     }
@@ -212,7 +222,8 @@ fn parse_strh(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse
 fn parse_strf(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse) {
     if data_end.saturating_sub(payload) >= 20 {
         let dib_height = r_i32_le(buf, payload + 8);
-        parsed.width = r_u32_le(buf, payload + 4);
+        parsed.bmp_width = r_u32_le(buf, payload + 4);
+        parsed.width = parsed.bmp_width;
         parsed.height = dib_height.unsigned_abs();
         parsed.top_down = dib_height < 0;
         parsed.bit_count = r_u16_le(buf, payload + 14);
@@ -437,6 +448,10 @@ pub struct AviReader {
     meta: Option<ImageMetadata>,
     frame_offsets: Vec<(u64, u32)>, // (offset, size) per frame
     bytes_per_pixel: usize,
+    /// Stored DIB scan-line stride in bytes (from the strf biWidth padded to a
+    /// 4-byte boundary), used to step over per-row padding when the display
+    /// width is narrower than the stored scan line.
+    stored_row: usize,
     top_down: bool,
     compression: u32,
     bit_count: u16,
@@ -451,6 +466,7 @@ impl AviReader {
             meta: None,
             frame_offsets: Vec::new(),
             bytes_per_pixel: 3,
+            stored_row: 0,
             top_down: false,
             compression: 0,
             bit_count: 24,
@@ -504,9 +520,33 @@ impl FormatReader for AviReader {
             )));
         }
 
-        let width = parsed.width;
         let height = parsed.height;
         let bit_count = parsed.bit_count;
+        // Reconcile the display width with Java AVIReader. sizeX is seeded from
+        // the avih dwWidth; the strf BITMAPINFOHEADER biWidth drives the stored
+        // DIB scan-line stride (rows are padded to a 4-byte boundary). Java then
+        // computes effectiveWidth = bmpScanLineSize / (bits/8) and shrinks sizeX
+        // to it only if smaller. When there is no avih, sizeX falls back to the
+        // bitmap width. The stored scan-line stride is always derived from
+        // biWidth so we read the right number of bytes per row.
+        let bmp_width = if parsed.bmp_width > 0 {
+            parsed.bmp_width
+        } else {
+            parsed.avih_width.unwrap_or(0)
+        };
+        let mut width = match parsed.avih_width {
+            Some(w) if w > 0 => w,
+            _ => bmp_width,
+        };
+        if bit_count != 0 && bmp_width != 0 {
+            // bmpScanLineSize = (bmpWidth + npad) * (bits/8); effective scan-line
+            // pixel width = bmpScanLineSize / (bits/8) = bmpWidth + npad.
+            let npad = (4 - (bmp_width as usize) % 4) % 4;
+            let effective_width = (bmp_width as usize + npad) as u32;
+            if effective_width != 0 && effective_width < width {
+                width = effective_width;
+            }
+        }
         if width == 0 || height == 0 {
             return Err(BioFormatsError::InvalidData(
                 "AVI: missing or invalid video dimensions".into(),
@@ -613,12 +653,14 @@ impl FormatReader for AviReader {
             MetadataValue::String(fourcc_to_string(parsed.compression)),
         );
 
+        // Java AVIReader places frames on the T axis (sizeT = imageCount,
+        // sizeZ = 1) with dimension order XYTCZ.
         self.meta = Some(ImageMetadata {
             size_x: width,
             size_y: height,
-            size_z: n_frames,
+            size_z: 1,
             size_c,
-            size_t: 1,
+            size_t: n_frames,
             pixel_type,
             // Java AVIReader sets bitsPerPixel = bmpBitsPerPixel for <= 8-bit
             // (so 4-bit reports 4); 16/24/32-bit map to 16/8 here.
@@ -630,7 +672,7 @@ impl FormatReader for AviReader {
                 8
             },
             image_count: n_frames,
-            dimension_order: DimensionOrder::XYZCT,
+            dimension_order: DimensionOrder::XYTCZ,
             is_rgb: out_is_rgb,
             // 16-bit is stored non-interleaved per Java (ms0.interleaved = bpp != 16).
             is_interleaved: out_is_rgb && pixel_type != PixelType::Uint16,
@@ -645,6 +687,15 @@ impl FormatReader for AviReader {
         });
         self.frame_offsets = frame_offsets;
         self.bytes_per_pixel = size_c as usize;
+        // Stored DIB scan-line stride: biWidth padded to a 4-byte boundary,
+        // times bytes-per-pixel (bit_count / 8). For sub-byte (4-bit) data this
+        // is unused (its own packed layout is handled separately).
+        self.stored_row = if bit_count >= 8 && bmp_width != 0 {
+            let npad = (4 - (bmp_width as usize) % 4) % 4;
+            (bmp_width as usize + npad) * (bit_count as usize / 8)
+        } else {
+            0
+        };
         self.top_down = parsed.top_down;
         self.compression = compression;
         self.bit_count = bit_count;
@@ -677,6 +728,21 @@ impl FormatReader for AviReader {
         self.meta
             .as_ref()
             .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        // Java AVIReader names the single image after the source file.
+        if let (Some(img), Some(path)) = (ome.images.first_mut(), self.path.as_ref()) {
+            if img.name.is_none() {
+                img.name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string);
+            }
+        }
+        Some(ome)
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -812,12 +878,18 @@ impl FormatReader for AviReader {
         let bytes_per_sample = pixel_type.bytes_per_sample();
         let row_bytes = width as usize * channels * bytes_per_sample;
         // Java AVIReader: npad = bmpWidth % 4; if (npad > 0) npad = 4 - npad;
-        // bmpScanLineSize = (bmpWidth + npad) * (bmpBitsPerPixel / 8).
-        // The pixel width (not the byte count) is padded to a multiple of 4,
-        // then multiplied by bytes-per-pixel (bit_count / 8).
+        // bmpScanLineSize = (bmpWidth + npad) * (bmpBitsPerPixel / 8). The stride
+        // is derived from the stored bitmap width (biWidth), which may exceed the
+        // display width (sizeX) — the extra columns are row padding we skip.
+        // `self.stored_row` carries this stride; fall back to the padded display
+        // width if it was not computed (e.g. synthetic single-strf files).
         let stored_bytes_per_pixel = (bit_count as usize) / 8;
-        let padded_width = width as usize + (4 - (width as usize) % 4) % 4;
-        let stored_row = padded_width * stored_bytes_per_pixel;
+        let stored_row = if self.stored_row > 0 {
+            self.stored_row
+        } else {
+            let padded_width = width as usize + (4 - (width as usize) % 4) % 4;
+            padded_width * stored_bytes_per_pixel
+        };
         let plane_bytes = row_bytes * height as usize;
 
         let required_size = stored_row * height as usize;

@@ -6304,10 +6304,15 @@ fn dicom_metadata_uses_dictionary_names_and_decodes_value_representations() {
 
     let ome = reader.ome_metadata().unwrap();
     let image = &ome.images[0];
-    assert_eq!(image.name.as_deref(), Some("Doe^Jane"));
-    assert_eq!(image.physical_size_x, Some(250.0));
-    assert_eq!(image.physical_size_y, Some(500.0));
-    assert_eq!(image.physical_size_z, Some(750.0));
+    // Java DicomReader derives the image name from (0008,0008) ImageType, falling
+    // back to the file name when ImageType is absent (it does NOT use PatientName).
+    assert_eq!(image.name.as_deref(), Some("bioformats_fmt_metadata_dictionary.dcm"));
+    // PixelSpacing/SliceThickness are stored as raw millimetre OME Length values
+    // to match Java (FormatTools.getPhysicalSizeX(value, UNITS.MILLIMETER)), not
+    // rescaled to micrometres. PixelSpacing is "row\col" so X=col=0.25, Y=row=0.5.
+    assert_eq!(image.physical_size_x, Some(0.25));
+    assert_eq!(image.physical_size_y, Some(0.5));
+    assert_eq!(image.physical_size_z, Some(0.75));
 }
 
 /// Build a CellH5 file whose canonical experiment layout
@@ -6943,7 +6948,7 @@ fn dicom_palette_color_pixels_are_expanded_to_rgb() {
 }
 
 #[test]
-fn dicom_one_bit_pixels_are_unpacked() {
+fn dicom_bit_packed_pixels_are_read_raw_like_java() {
     let path = tmp("packed_bit.dcm");
     let mut bytes = Vec::new();
 
@@ -6960,7 +6965,11 @@ fn dicom_one_bit_pixels_are_unpacked() {
 
     assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
     assert_eq!(reader.metadata().bits_per_pixel, 1);
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0, 1, 0, 1]);
+    // Java's DicomReader does NOT bit-unpack sub-byte BitsAllocated: it rounds up
+    // to a byte boundary (uint8 here) and reads the raw packed bytes straight in,
+    // zero-padding the tail. So 5 one-bit pixels packed in one byte (0b00010101)
+    // become [0x15, 0, 0, 0, 0], matching the Java reference byte-for-byte.
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0b0001_0101, 0, 0, 0, 0]);
 }
 
 #[test]

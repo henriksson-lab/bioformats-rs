@@ -112,8 +112,8 @@ f_amira() {           # Amira Mesh
   dl amira "${OME}/AmiraMesh/ignacio/test.am" "test.am" "~18 KB, AmiraMesh"
 }
 
-f_dv() {              # DeltaVision .dv
-  dl dv "${OME}/DV/will/P-TRE_12_R3D_D3D.dv" "P-TRE_12_R3D_D3D.dv" "~86.5 MB, DeltaVision (smallest in dir)"
+f_dv() {              # DeltaVision .dv (moved from DV/will/ to top-level DV/)
+  dl dv "${OME}/DV/P-TRE_12_R3D_D3D.dv" "P-TRE_12_R3D_D3D.dv" "~86.5 MB, DeltaVision (smallest in dir)"
 }
 
 f_metamorph() {       # Metamorph .nd + TIFF stack (no public .stk found; .nd dataset)

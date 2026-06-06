@@ -3,6 +3,39 @@ use super::nikon::{decompress_nikon as decompress_nikon_tiff, NikonCompressionOp
 use crate::common::codec::*;
 use crate::common::error::{BioFormatsError, Result};
 
+/// How a JPEG-compressed TIFF strip/tile's stored components map to output bytes.
+///
+/// Mirrors Java's `codecOptions.ycbcr` / `ImageIO` behaviour: an Aperio (and
+/// some Leica/Hamamatsu) TIFF that declares `PhotometricInterpretation == RGB`
+/// (2) but stores a baseline JPEG with component IDs 1/2/3 must NOT have the
+/// YCbCr→RGB transform applied — the stored components already ARE the channel
+/// values the file intends. libjpeg / `jpeg_decoder`'s default assumes YCbCr and
+/// converts, which corrupts the pixels relative to Java. `Rgb` forces the
+/// "components are RGB, emit as-is" path (`ColorTransform::RGB`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JpegColor {
+    /// Let the JPEG markers / default heuristics decide (YCbCr→RGB for typical
+    /// 3-component baseline JPEGs). Used for `PhotometricInterpretation == YCbCr`.
+    Default,
+    /// Treat the stored components as RGB and emit them without conversion. Used
+    /// for `PhotometricInterpretation == RGB` JPEG strips/tiles.
+    Rgb,
+}
+
+/// Decode a JPEG payload, honouring `color` for the YCbCr↔RGB transform.
+fn decompress_jpeg_color(data: &[u8], color: JpegColor) -> Result<Vec<u8>> {
+    match color {
+        JpegColor::Default => decompress_jpeg(data),
+        JpegColor::Rgb => {
+            let mut decoder = jpeg_decoder::Decoder::new(data);
+            decoder.set_color_transform(jpeg_decoder::ColorTransform::RGB);
+            decoder
+                .decode()
+                .map_err(|e| BioFormatsError::Codec(e.to_string()))
+        }
+    }
+}
+
 /// Decompress one strip or tile using the specified TIFF compression scheme.
 /// `jpeg_tables` may contain JFIF tables from tag 347 for old-style JPEG tiles.
 pub fn decompress(
@@ -17,6 +50,7 @@ pub fn decompress(
     little_endian: bool,
     jpeg_tables: Option<&[u8]>,
     nikon_options: Option<&NikonCompressionOptions>,
+    jpeg_color: JpegColor,
 ) -> Result<Vec<u8>> {
     let bits_per_pixel = samples_per_pixel as u32 * bits_per_sample as u32;
     let mut out = match compression {
@@ -31,9 +65,9 @@ pub fn decompress(
             // Java TiffParser.getTile: tile = jpegTable[..len-2] + scan[2..].
             if let Some(tables) = jpeg_tables {
                 let combined = merge_jpeg_tables(tables, data);
-                decompress_jpeg(&combined)?
+                decompress_jpeg_color(&combined, jpeg_color)?
             } else {
-                decompress_jpeg(data)?
+                decompress_jpeg_color(data, jpeg_color)?
             }
         }
         Compression::Zstd => decompress_zstd(data)?,
@@ -454,6 +488,7 @@ mod tests {
             true,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("predictor decode failed");
 
@@ -483,6 +518,7 @@ mod tests {
             false,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("predictor decode failed");
 
@@ -510,6 +546,7 @@ mod tests {
             true,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("LZW predictor decode failed");
 
@@ -530,6 +567,7 @@ mod tests {
             true,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("PackBits decode failed");
 
@@ -551,6 +589,7 @@ mod tests {
                 true,
                 None,
                 None,
+                JpegColor::Default,
             ),
             "literal run overruns input",
         );
@@ -567,6 +606,7 @@ mod tests {
                 true,
                 None,
                 None,
+                JpegColor::Default,
             ),
             "repeat run missing byte",
         );
@@ -594,6 +634,7 @@ mod tests {
             true,
             Some(&comment_table),
             None,
+            JpegColor::Default,
         )
         .expect("old-style JPEG tables decode failed");
 
@@ -614,6 +655,7 @@ mod tests {
             true,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("uncompressed decode failed");
 
@@ -641,6 +683,7 @@ mod tests {
             true,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("Group 3 fax decode failed");
 
@@ -668,6 +711,7 @@ mod tests {
             true,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("CCITT 1D decode failed");
 
@@ -696,6 +740,7 @@ mod tests {
             true,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("Group 4 fax decode failed");
 
@@ -717,6 +762,7 @@ mod tests {
                 true,
                 None,
                 None,
+                JpegColor::Default,
             ),
             "TIFF predictor 3 not supported",
         );
@@ -737,6 +783,7 @@ mod tests {
                 true,
                 None,
                 None,
+                JpegColor::Default,
             ),
             "CCITT 1D compression requires 1 bpp, got 24 bpp",
         );
@@ -753,6 +800,7 @@ mod tests {
                 true,
                 None,
                 None,
+                JpegColor::Default,
             ),
             "Nikon NEF compression 34713 requires Nikon maker-note IFD tag 150 metadata",
         );
@@ -769,6 +817,7 @@ mod tests {
                 true,
                 None,
                 None,
+                JpegColor::Default,
             ),
             "compressed strip byte count/maxBytes",
         );
@@ -785,6 +834,7 @@ mod tests {
                 true,
                 None,
                 None,
+                JpegColor::Default,
             ),
             "5 compressed bytes",
         );
@@ -804,6 +854,7 @@ mod tests {
             true,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("Thunderscan decode failed");
 
@@ -833,6 +884,7 @@ mod tests {
             true,
             None,
             None,
+            JpegColor::Default,
         )
         .expect("Thunderscan decode failed");
 
@@ -854,6 +906,7 @@ mod tests {
                 true,
                 None,
                 None,
+                JpegColor::Default,
             ),
             "requires one 4-bit sample per pixel",
         );
@@ -880,6 +933,7 @@ mod tests {
             true,
             None,
             Some(&options),
+            JpegColor::Default,
         )
         .expect("Nikon decoder should mirror Bio-Formats EOF bit padding");
         assert_eq!(out.len(), (17 * 23 * 12usize).div_ceil(8));
@@ -907,6 +961,7 @@ mod tests {
                 true,
                 None,
                 Some(&options),
+                JpegColor::Default,
             ),
             "only defined for 12-bit or 14-bit RAW samples",
         );

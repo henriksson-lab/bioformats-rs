@@ -226,6 +226,8 @@ pub struct NdpiReader {
     /// True when the file is larger than 4 GB and therefore uses 32-bit TIFF
     /// offsets that wrap; see [`NdpiReader::analyze_large_file_offsets`].
     use_64bit: bool,
+    /// Per-flattened-series OME image metadata (name + physical sizes).
+    ome_images: Vec<crate::common::ome_metadata::OmeImage>,
 }
 
 // NDPI custom TIFF tags (mirrors the constants in NDPIReader.java:66-99).
@@ -235,6 +237,7 @@ const NDPI_SOURCE_LENS: u16 = 65421;
 const NDPI_X_POSITION: u16 = 65422;
 const NDPI_Y_POSITION: u16 = 65423;
 const NDPI_Z_POSITION: u16 = 65424;
+const NDPI_MARKER_TAG: u16 = 65426;
 const NDPI_CAPTURE_MODE: u16 = 65441;
 const NDPI_SERIAL_NUMBER: u16 = 65442;
 const NDPI_METADATA_TAG: u16 = 65449;
@@ -246,6 +249,7 @@ impl NdpiReader {
             size_z: 1,
             pyramid_height: 1,
             use_64bit: false,
+            ome_images: Vec::new(),
         }
     }
 
@@ -417,6 +421,119 @@ impl NdpiReader {
         if !new_series.is_empty() {
             self.inner.replace_series(new_series);
         }
+    }
+
+    /// NDPI `MAX_SIZE` (NDPIReader.java:63): JPEG planes larger than this in
+    /// either dimension exceed libjpeg's limits and are decoded by the custom
+    /// chunky/interleaved NDPI service instead of the TiffParser.
+    const NDPI_MAX_SIZE: u32 = 2048;
+
+    /// Set each (flattened) series' `is_interleaved` flag per
+    /// `NDPIReader.useTiffParser`: interleaved only when the series' first IFD is
+    /// JPEG-compressed, carries the NDPI marker tag, and is larger than
+    /// `MAX_SIZE` in BOTH dimensions. All other series are channel-separated.
+    fn set_ndpi_interleaving(&mut self) {
+        let mut flags: Vec<bool> = Vec::new();
+        for s in self.inner.series_list() {
+            let interleaved = s
+                .ifd_indices
+                .first()
+                .and_then(|&idx| self.inner.ifd(idx))
+                .map(|ifd| {
+                    let w = ifd.image_width().unwrap_or(0);
+                    let h = ifd.image_length().unwrap_or(0);
+                    let jpeg = matches!(
+                        ifd.compression(),
+                        crate::tiff::ifd::Compression::Jpeg
+                            | crate::tiff::ifd::Compression::JpegNew
+                    );
+                    let has_marker = ifd.get(NDPI_MARKER_TAG).is_some();
+                    // useTiffParser == false  =>  interleaved == true
+                    w > Self::NDPI_MAX_SIZE && h > Self::NDPI_MAX_SIZE && jpeg && has_marker
+                })
+                .unwrap_or(false);
+            flags.push(interleaved);
+        }
+        for (s, &interleaved) in self.inner.series_list_mut().iter_mut().zip(&flags) {
+            s.metadata.is_interleaved = interleaved;
+        }
+    }
+
+    /// De-interleave a chunky RGB plane into channel-separated layout when the
+    /// current series is RGB and flagged non-interleaved (mirrors the SVS path).
+    fn separate_channels(&self, buf: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+        let m = self.inner.metadata();
+        if !m.is_rgb || m.is_interleaved {
+            return buf;
+        }
+        let channels = m.size_c as usize;
+        if channels < 2 {
+            return buf;
+        }
+        let bps = ((m.bits_per_pixel as usize + 7) / 8).max(1);
+        let pixels = w as usize * h as usize;
+        let expected = pixels * channels * bps;
+        if pixels == 0 || buf.len() != expected {
+            return buf;
+        }
+        let mut out = vec![0u8; expected];
+        let plane = pixels * bps;
+        for i in 0..pixels {
+            for c in 0..channels {
+                let src = (i * channels + c) * bps;
+                let dst = c * plane + i * bps;
+                out[dst..dst + bps].copy_from_slice(&buf[src..src + bps]);
+            }
+        }
+        out
+    }
+
+    /// Build OME image metadata for each flattened series: name "Series N" and
+    /// PhysicalSizeX/Y derived from the IFD resolution tags
+    /// (`10000 / XResolution` for ResolutionUnit == cm), mirroring the
+    /// FormatTools.getPhysicalSize path Java uses for NDPI.
+    fn build_ndpi_ome(&mut self) {
+        use crate::common::ome_metadata::{OmeChannel, OmeImage};
+        use crate::tiff::ifd::tag;
+        let mut images: Vec<OmeImage> = Vec::new();
+        let series: Vec<(usize, u32)> = self
+            .inner
+            .series_list()
+            .iter()
+            .map(|s| (s.ifd_indices.first().copied().unwrap_or(0), s.metadata.size_c.max(1)))
+            .collect();
+        for (i, (ifd_idx, channels)) in series.into_iter().enumerate() {
+            let (px, py) = self
+                .inner
+                .ifd(ifd_idx)
+                .map(|ifd| {
+                    let unit = ifd.get_u16(tag::RESOLUTION_UNIT).unwrap_or(2);
+                    let scale = match unit {
+                        3 => 10_000.0, // centimetre
+                        2 => 25_400.0, // inch
+                        _ => 0.0,
+                    };
+                    let conv = |t: u16| {
+                        ifd.get(t)
+                            .and_then(|v| v.as_vec_f64().first().copied())
+                            .filter(|&r| r > 0.0 && scale > 0.0)
+                            .map(|r| scale / r)
+                    };
+                    (conv(tag::X_RESOLUTION), conv(tag::Y_RESOLUTION))
+                })
+                .unwrap_or((None, None));
+            images.push(OmeImage {
+                name: Some(format!("Series {}", i + 1)),
+                physical_size_x: px,
+                physical_size_y: py,
+                channels: vec![OmeChannel {
+                    samples_per_pixel: channels,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+        self.ome_images = images;
     }
 
     /// Build per-series `ImageMetadata` from an IFD, mirroring Java's
@@ -858,6 +975,14 @@ impl FormatReader for NdpiReader {
         // Regroup the flat NDPI IFD chain into a pyramid series (+ macro/map
         // series) and detect sizeZ, mirroring NDPIReader.initStandardMetadata.
         self.build_ndpi_series();
+        // Java's default ImageReader flattens the pyramid: each resolution is its
+        // own top-level series. Mirror that so seriesCount matches the reference.
+        let _ = self.inner.flatten_resolutions_into_series();
+        // Per-series interleaving follows NDPIReader.useTiffParser: a JPEG IFD
+        // larger than MAX_SIZE in both dimensions is decoded chunky/interleaved
+        // by the custom NDPI service; everything else is read channel-separated.
+        self.set_ndpi_interleaving();
+        self.build_ndpi_ome();
         // BUG 2: detect / flag the >4 GB offset-reconstruction situation.
         let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         self.analyze_large_file_offsets(path, file_len);
@@ -883,10 +1008,16 @@ impl FormatReader for NdpiReader {
         self.inner.metadata()
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        let (w, h) = {
+            let m = self.inner.metadata();
+            (m.size_x, m.size_y)
+        };
+        let buf = self.inner.open_bytes(p)?;
+        Ok(self.separate_channels(buf, w, h))
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let buf = self.inner.open_bytes_region(p, x, y, w, h)?;
+        Ok(self.separate_channels(buf, w, h))
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(p)
@@ -899,6 +1030,16 @@ impl FormatReader for NdpiReader {
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if self.ome_images.is_empty() {
+            return None;
+        }
+        Some(crate::common::ome_metadata::OmeMetadata {
+            images: self.ome_images.clone(),
+            ..Default::default()
+        })
     }
 }
 
@@ -915,6 +1056,10 @@ impl FormatReader for NdpiReader {
 /// becomes its own series; the dimensions with r>0 become pyramid resolutions.
 pub struct LeicaScnReader {
     inner: crate::tiff::TiffReader,
+    /// Per-flattened-series OME image metadata (name + physical sizes), built
+    /// from the SCN XML before resolution flattening so each (image, resolution)
+    /// gets its own name/calibration mirroring Java's LeicaSCNReader.
+    ome_images: Vec<crate::common::ome_metadata::OmeImage>,
 }
 
 /// One `<dimension>` element: a plane for a given z/c/r mapped to a TIFF IFD.
@@ -957,6 +1102,7 @@ impl LeicaScnReader {
     pub fn new() -> Self {
         LeicaScnReader {
             inner: crate::tiff::TiffReader::new(),
+            ome_images: Vec::new(),
         }
     }
 
@@ -1255,6 +1401,78 @@ impl LeicaScnReader {
             new_series.push(s);
         }
 
+        // Java's LeicaSCNReader reports RGB planes channel-separated
+        // (isInterleaved == false) for every resolution.
+        for s in &mut new_series {
+            s.metadata.is_interleaved = false;
+        }
+
+        // Build per-(image, resolution) OME metadata BEFORE flattening, so each
+        // flattened series gets the right name ("image_NAME (Rk)") and physical
+        // size (Leica volume / resolution width), mirroring LeicaSCNReader.
+        use crate::common::ome_metadata::{OmeChannel, OmeImage};
+        let mut ome_images: Vec<OmeImage> = Vec::new();
+        for img in images {
+            if img.dims.is_empty() {
+                continue;
+            }
+            let channels = if img
+                .lookup(0, 0, 0)
+                .or_else(|| img.dims.first())
+                .map(|d| d.ifd)
+                .and_then(|idx| self.inner.ifd(idx))
+                .map(|ifd| ifd.samples_per_pixel() > 1)
+                .unwrap_or(true)
+            {
+                self.inner
+                    .ifd(img.lookup(0, 0, 0).map(|d| d.ifd).unwrap_or(0))
+                    .map(|ifd| ifd.samples_per_pixel() as u32)
+                    .unwrap_or(3)
+            } else {
+                img.size_c.max(1)
+            };
+            for r in 0..img.size_r.max(1) {
+                let dim = img.lookup(0, 0, r);
+                let width = dim
+                    .map(|d| d.size_x)
+                    .filter(|&w| w > 0)
+                    .or_else(|| {
+                        dim.and_then(|d| self.inner.ifd(d.ifd))
+                            .and_then(|ifd| ifd.image_width())
+                    })
+                    .unwrap_or(0);
+                let height = dim
+                    .map(|d| d.size_y)
+                    .filter(|&h| h > 0)
+                    .or_else(|| {
+                        dim.and_then(|d| self.inner.ifd(d.ifd))
+                            .and_then(|ifd| ifd.image_length())
+                    })
+                    .unwrap_or(0);
+                let px = if img.v_size_x > 0 && width > 0 {
+                    Some((img.v_size_x as f64 / 1000.0) / width as f64)
+                } else {
+                    None
+                };
+                let py = if img.v_size_y > 0 && height > 0 {
+                    Some((img.v_size_y as f64 / 1000.0) / height as f64)
+                } else {
+                    None
+                };
+                ome_images.push(OmeImage {
+                    name: Some(format!("{} (R{})", img.name, r)),
+                    physical_size_x: px,
+                    physical_size_y: py,
+                    channels: vec![OmeChannel {
+                        samples_per_pixel: channels,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            }
+        }
+        self.ome_images = ome_images;
+
         if !new_series.is_empty() {
             self.inner.replace_series(new_series);
         }
@@ -1267,6 +1485,41 @@ impl LeicaScnReader {
             return;
         }
         self.build_scn_series(&images);
+        // Java flattens each image's resolution pyramid into top-level series.
+        let _ = self.inner.flatten_resolutions_into_series();
+        // Flattening copies the parent metadata; re-assert channel-separated.
+        for s in self.inner.series_list_mut() {
+            s.metadata.is_interleaved = false;
+        }
+    }
+
+    /// De-interleave a chunky RGB plane into channel-separated layout when the
+    /// current series is RGB and flagged non-interleaved (mirrors the SVS path).
+    fn separate_channels(&self, buf: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+        let m = self.inner.metadata();
+        if !m.is_rgb || m.is_interleaved {
+            return buf;
+        }
+        let channels = m.size_c as usize;
+        if channels < 2 {
+            return buf;
+        }
+        let bps = ((m.bits_per_pixel as usize + 7) / 8).max(1);
+        let pixels = w as usize * h as usize;
+        let expected = pixels * channels * bps;
+        if pixels == 0 || buf.len() != expected {
+            return buf;
+        }
+        let mut out = vec![0u8; expected];
+        let plane = pixels * bps;
+        for i in 0..pixels {
+            for c in 0..channels {
+                let src = (i * channels + c) * bps;
+                let dst = c * plane + i * bps;
+                out[dst..dst + bps].copy_from_slice(&buf[src..src + bps]);
+            }
+        }
+        out
     }
 }
 
@@ -1311,10 +1564,16 @@ impl FormatReader for LeicaScnReader {
         self.inner.metadata()
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        let (w, h) = {
+            let m = self.inner.metadata();
+            (m.size_x, m.size_y)
+        };
+        let buf = self.inner.open_bytes(p)?;
+        Ok(self.separate_channels(buf, w, h))
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let buf = self.inner.open_bytes_region(p, x, y, w, h)?;
+        Ok(self.separate_channels(buf, w, h))
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(p)
@@ -1327,6 +1586,16 @@ impl FormatReader for LeicaScnReader {
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if self.ome_images.is_empty() {
+            return None;
+        }
+        Some(crate::common::ome_metadata::OmeMetadata {
+            images: self.ome_images.clone(),
+            ..Default::default()
+        })
     }
 }
 

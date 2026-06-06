@@ -33,6 +33,20 @@ struct IcsHeader {
     gzip_compressed: bool,
     /// Byte offset of pixel data in the data file
     data_offset: u64,
+    /// SVI Huygens files are stored Y-inverted (history software contains "SVI").
+    invert_y: bool,
+    /// Image name (from the `filename` header token, basename only).
+    image_name: Option<String>,
+    /// Per-axis physical scales (from `parameter scale`), aligned with `scale_axes`.
+    scales: Vec<f64>,
+    /// Axis labels (from `parameter labels`), aligned with `scales`.
+    scale_axes: Vec<String>,
+    /// Per-axis units (from `parameter units`), aligned with `scales`.
+    scale_units: Vec<String>,
+    /// Emission wavelengths (from `sensor s_params LambdaEm`).
+    em_waves: Vec<f64>,
+    /// Excitation wavelengths (from `sensor s_params LambdaEx`).
+    ex_waves: Vec<f64>,
     extra: HashMap<String, String>,
 }
 
@@ -68,7 +82,58 @@ impl IcsHeader {
                     hdr.version = parse_ics_scalar(tokens[1], "ics_version")?;
                 }
                 "filename" if tokens.len() >= 2 => {
-                    hdr.filename = Some(PathBuf::from(tokens[1..].join(" ")));
+                    let joined = tokens[1..].join(" ");
+                    // Image name is the basename (Java strips path separators).
+                    let base = joined
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(&joined)
+                        .to_string();
+                    hdr.image_name = Some(base);
+                    hdr.filename = Some(PathBuf::from(joined));
+                }
+                "parameter" if tokens.len() >= 2 => {
+                    match tokens[1].to_ascii_lowercase().as_str() {
+                        "scale" => {
+                            hdr.scales = tokens[2..]
+                                .iter()
+                                .map(|s| s.parse::<f64>().unwrap_or(f64::NAN))
+                                .collect();
+                        }
+                        "labels" => {
+                            hdr.scale_axes =
+                                tokens[2..].iter().map(|s| s.to_ascii_lowercase()).collect();
+                        }
+                        "units" => {
+                            hdr.scale_units =
+                                tokens[2..].iter().map(|s| s.to_ascii_lowercase()).collect();
+                        }
+                        _ => {}
+                    }
+                }
+                "sensor" if tokens.len() >= 4 && tokens[1].eq_ignore_ascii_case("s_params") => {
+                    match tokens[2] {
+                        "LambdaEm" => {
+                            hdr.em_waves = tokens[3..]
+                                .iter()
+                                .filter_map(|s| s.parse::<f64>().ok())
+                                .collect();
+                        }
+                        "LambdaEx" => {
+                            hdr.ex_waves = tokens[3..]
+                                .iter()
+                                .filter_map(|s| s.parse::<f64>().ok())
+                                .collect();
+                        }
+                        _ => {}
+                    }
+                }
+                "history"
+                    if tokens.len() >= 3 && tokens[1].eq_ignore_ascii_case("software") =>
+                {
+                    if tokens[2..].join(" ").contains("SVI") {
+                        hdr.invert_y = true;
+                    }
                 }
                 "layout" if tokens.len() >= 3 => match tokens[1].to_ascii_lowercase().as_str() {
                     "order" => {
@@ -571,6 +636,19 @@ impl IcsReader {
                 }
             }
         }
+        // SVI Huygens files are inverted on the Y axis (Java ICSReader.openBytes
+        // flips full rows top-to-bottom when invertY is set).
+        if hdr.invert_y && meta.size_y > 1 {
+            let row_len = meta.size_x as usize * samples_per_pixel * bytes_per_sample;
+            let h = meta.size_y as usize;
+            for r in 0..h / 2 {
+                let top = r * row_len;
+                let bottom = (h - r - 1) * row_len;
+                for i in 0..row_len {
+                    out.swap(top + i, bottom + i);
+                }
+            }
+        }
         self.normalize_endianness(out)
     }
 }
@@ -658,6 +736,60 @@ impl FormatReader for IcsReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let hdr = self.header.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let img = ome.images.get_mut(0)?;
+
+        img.name = hdr.image_name.clone();
+
+        // Physical sizes from `parameter scale`, gated on micrometre units, with
+        // axis labels taken from `layout order` (Java ICSReader uses `axes`).
+        let is_micron = |u: Option<&String>| {
+            u.map(|s| {
+                let s = s.as_str();
+                s == "um"
+                    || s == "microns"
+                    || s == "micron"
+                    || s == "micrometer"
+                    || s == "micrometers"
+                    || s == "micrometre"
+                    || s == "micrometres"
+            })
+            .unwrap_or(false)
+        };
+        for (i, &scale) in hdr.scales.iter().enumerate() {
+            if scale.is_nan() {
+                continue;
+            }
+            let axis = hdr.order.get(i).map(String::as_str).unwrap_or("");
+            let unit = hdr.scale_units.get(i);
+            match axis {
+                "x" if is_micron(unit) => img.physical_size_x = Some(scale),
+                "y" if is_micron(unit) => img.physical_size_y = Some(scale),
+                "z" | "depth" if is_micron(unit) => img.physical_size_z = Some(scale),
+                _ => {}
+            }
+        }
+
+        // Per-channel emission/excitation wavelengths.
+        for (ci, ch) in img.channels.iter_mut().enumerate() {
+            if let Some(&w) = hdr.em_waves.get(ci) {
+                if w > 0.0 {
+                    ch.emission_wavelength = Some(w);
+                }
+            }
+            if let Some(&w) = hdr.ex_waves.get(ci) {
+                if w > 0.0 {
+                    ch.excitation_wavelength = Some(w);
+                }
+            }
+        }
+
+        Some(ome)
     }
 }
 

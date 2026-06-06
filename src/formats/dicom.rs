@@ -1353,6 +1353,25 @@ fn normalize_native_pixels(
     } else {
         (1u16 << stored_bits) - 1
     };
+    // Bit-packed source (BitsAllocated not a whole number of bytes, e.g. 12-bit
+    // MR data packed two pixels per three bytes). Java's DicomReader does NOT
+    // bit-unpack these: it rounds BitsAllocated up to the next byte boundary,
+    // sizes the output buffer at bytes-per-sample, and reads the raw packed
+    // bytes straight into it via readPlane — leaving any trailing bytes zero.
+    // We must reproduce that byte-for-byte (the unpacked interpretation would
+    // diverge from the Java reference CRC). Palette data never uses a
+    // non-byte-aligned BitsAllocated, so this short-circuits before LUT mapping.
+    if (bits_allocated < 8 || bits_allocated % 8 != 0)
+        && palette.red.is_none()
+        && palette.green.is_none()
+        && palette.blue.is_none()
+    {
+        let out_len = sample_count * meta.pixel_type.bytes_per_sample();
+        let mut out = vec![0u8; out_len];
+        let copy = src.len().min(out_len);
+        out[..copy].copy_from_slice(&src[..copy]);
+        return out;
+    }
     let values: Vec<u16> = if bits_allocated < 8 || bits_allocated % 8 != 0 {
         unpack_bit_samples(src, sample_count, bits_allocated.max(1))
     } else if bits_allocated <= 8 {
@@ -2113,25 +2132,37 @@ impl FormatReader for DicomReader {
         let meta = self.meta.as_ref()?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
         let img = &mut ome.images[0];
-        // DICOM tag (0028,0030) PixelSpacing: "row_spacing\col_spacing" in mm
+        // DICOM tag (0028,0030) PixelSpacing: "row_spacing\col_spacing".
+        // Java stores these via FormatTools.getPhysicalSizeX(value, UNITS.MILLIMETER),
+        // i.e. the OME Length keeps the raw millimetre value (no µm conversion).
         if let Some(MetadataValue::String(s)) = meta.series_metadata.get("(0028,0030)") {
             let parts: Vec<&str> = s.splitn(2, |c| c == '\\' || c == '/').collect();
             if let (Some(row), Some(col)) = (
                 parts.first().and_then(|v| v.trim().parse::<f64>().ok()),
                 parts.get(1).and_then(|v| v.trim().parse::<f64>().ok()),
             ) {
-                // PixelSpacing is in mm → convert to µm
-                img.physical_size_x = Some(col * 1000.0);
-                img.physical_size_y = Some(row * 1000.0);
+                img.physical_size_x = Some(col);
+                img.physical_size_y = Some(row);
             }
         }
-        // DICOM tag (0018,0050) SliceThickness in mm
+        // DICOM tag (0018,0050) SliceThickness, also reported in millimetres.
         if let Some(MetadataValue::String(s)) = meta.series_metadata.get("(0018,0050)") {
-            img.physical_size_z = s.trim().parse::<f64>().ok().map(|v| v * 1000.0);
+            img.physical_size_z = s.trim().parse::<f64>().ok();
         }
-        // PatientName / StudyDescription as image name
-        if let Some(MetadataValue::String(s)) = meta.series_metadata.get("(0010,0010)") {
-            img.name = Some(s.clone());
+        // Image name: Java uses the (0008,0008) ImageType value split on '\',
+        // taking token index 2 (or the last token if fewer than three). When
+        // ImageType is absent it leaves the default name (the file name).
+        if let Some(MetadataValue::String(s)) = meta.series_metadata.get("(0008,0008)") {
+            let tokens: Vec<&str> = s.split('\\').collect();
+            let idx = if tokens.len() > 2 { 2 } else { tokens.len().saturating_sub(1) };
+            if let Some(tok) = tokens.get(idx) {
+                img.name = Some(tok.trim().to_string());
+            }
+        } else if let Some(p) = self.path.as_ref() {
+            img.name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
         }
         Some(ome)
     }

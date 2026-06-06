@@ -3400,8 +3400,11 @@ impl CellSensReader {
             rd(off, 8).map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         };
 
-        // Volume header (offset 0): "SIS" magic, then ints/longs.
-        let magic = String::from_utf8_lossy(rd(0, 4)?).trim().to_string();
+        // Volume header (offset 0): "SIS\0" magic, then ints/longs. The 4-byte
+        // tag is NUL-padded ("SIS\0"); strip trailing NULs as well as whitespace.
+        let magic = String::from_utf8_lossy(rd(0, 4)?)
+            .trim_matches(|c: char| c.is_whitespace() || c == '\0')
+            .to_string();
         if magic != "SIS" {
             return Err(BioFormatsError::Format(format!(
                 "ETS file {:?}: unexpected magic {:?}",
@@ -3434,9 +3437,9 @@ impl CellSensReader {
             )));
         }
 
-        // Additional header (additionalHeaderOffset): "ETS" magic.
+        // Additional header (additionalHeaderOffset): "ETS\0" magic (NUL-padded).
         let more_magic = String::from_utf8_lossy(rd(additional_header_offset, 4)?)
-            .trim()
+            .trim_matches(|c: char| c.is_whitespace() || c == '\0')
             .to_string();
         if more_magic != "ETS" {
             return Err(BioFormatsError::Format(format!(
@@ -3585,9 +3588,8 @@ impl CellSensReader {
         let ets_files = Self::find_ets_files(vsi_path);
         let mut volumes = Vec::new();
         for f in &ets_files {
-            match Self::parse_ets(f) {
-                Ok(v) => volumes.push(v),
-                Err(_) => {}
+            if let Ok(v) = Self::parse_ets(f) {
+                volumes.push(v);
             }
         }
         self.tiff_series = self.inner.series_count();
@@ -3607,8 +3609,18 @@ impl CellSensReader {
         // width/height range, dropping any ETS that finds no match
         // (CellSensReader.java:782, 1329-1364).
         let pyramids = Self::parse_vsi_pyramids(vsi_path);
-        let has_orphan_ets = pyramids.len() < volumes.len();
-        if has_orphan_ets {
+        // If the VSI tag-tree yielded no `Pyramid` blocks at all, there is nothing
+        // to match against and nothing to crop to: keep every ETS volume and
+        // derive geometry purely from the tile grid (compute_levels falls back to
+        // the stored tile extent when pyramid_width/height are absent). Without
+        // this, a `.vsi` whose tag-tree we can't fully parse would expose only the
+        // tiny embedded TIFF overview images and never the real ETS pixels.
+        let has_orphan_ets = !pyramids.is_empty() && pyramids.len() < volumes.len();
+        if pyramids.is_empty() {
+            for vol in volumes.iter_mut() {
+                vol.compute_levels();
+            }
+        } else if has_orphan_ets {
             // Track which pyramids have already been claimed by an ETS volume
             // (Java's `Pyramid.HasAssociatedEtsFile`).
             let mut claimed = vec![false; pyramids.len()];

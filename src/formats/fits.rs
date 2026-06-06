@@ -358,6 +358,19 @@ impl FormatReader for FitsReader {
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.series.get(self.current_series).map(|s| &s.metadata)?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        // FitsReader does not call setImageName, so Java falls back to the
+        // current file's basename (with extension).
+        if let (Some(path), Some(img)) = (self.path.as_ref(), ome.images.get_mut(0)) {
+            img.name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
+        }
+        Some(ome)
+    }
 }
 
 // ---- writer -----------------------------------------------------------------

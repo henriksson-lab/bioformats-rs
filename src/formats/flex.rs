@@ -80,6 +80,15 @@ pub struct FlexReader {
     plate_barcode: Option<String>,
     /// True when running in single-file fallback mode.
     single_file: bool,
+    /// When true (single-file mode with multiple fields stored inside the one
+    /// `.flex` file), the file's IFDs are split across `field_count` series.
+    /// FLEX (series s, plane p) maps to inner IFD `s * image_count + p`.
+    fields_in_file: bool,
+    /// Channel names parsed from the FLEX `<Array Name=...>` elements (one per
+    /// IFD/plane in document order). Used for OME channel naming.
+    channel_names: Vec<String>,
+    /// Physical pixel size (x, y) in microns, from `<ImageResolutionX/Y>` * 1e6.
+    physical_size: Option<(f64, f64)>,
 }
 
 impl FlexReader {
@@ -103,6 +112,9 @@ impl FlexReader {
             plate_name: None,
             plate_barcode: None,
             single_file: true,
+            fields_in_file: false,
+            channel_names: Vec::new(),
+            physical_size: None,
         }
     }
 
@@ -143,7 +155,7 @@ impl FlexReader {
     /// {fieldCount, wellCount, plateCount}, raster-to-position, then look up by
     /// (row, col, field).
     fn file_index_for_series(&self, series: usize) -> usize {
-        if self.flex_files.len() == 1 {
+        if self.fields_in_file || self.flex_files.len() == 1 {
             return 0;
         }
         let field_count = self.field_count.max(1);
@@ -295,6 +307,20 @@ impl FlexReader {
         out
     }
 
+    /// Map a FLEX (current series, plane) to the inner TIFF plane index.
+    ///
+    /// When fields are stored within a single file (`fields_in_file`), the IFDs
+    /// of the one file are split across series: inner IFD = series*imageCount + p
+    /// (Java `imageNumber = getImageCount() * pos[0] + no`, pos[0] == series).
+    /// Otherwise each series binds its own file and the plane maps directly.
+    fn inner_plane(&self, plane: u32) -> u32 {
+        if self.fields_in_file {
+            self.series as u32 * self.image_count + plane
+        } else {
+            plane
+        }
+    }
+
     fn series_factor(&self, file_index: usize, plane: u32) -> f64 {
         self.flex_files
             .get(file_index)
@@ -376,6 +402,165 @@ fn parse_flex_arrays(xml: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     (names, factors)
+}
+
+/// Spreadsheet-style well row name (0 -> "A", 25 -> "Z", 26 -> "AA"), mirroring
+/// `FormatTools.getWellRowName`.
+fn well_row_name(row: u32) -> String {
+    let last = char::from(b'A' + (row % 26) as u8);
+    if row >= 26 {
+        let first = char::from(b'A' + ((row / 26) - 1) as u8);
+        format!("{first}{last}")
+    } else {
+        last.to_string()
+    }
+}
+
+/// Result of the Java `populateCoreMetadata` dimension computation.
+struct FlexCore {
+    size_c: u32,
+    size_z: u32,
+    size_t: u32,
+    image_count: u32,
+    field_count: u32,
+}
+
+/// Port of `FlexReader.populateCoreMetadata` dimension logic.
+///
+/// `image_names` are the per-plane `<Array Name>` values, `initial_field_count`
+/// is the count seeded by the `<Field No>` handler (single-file mode) or 0,
+/// `n_planes` is the IFD count of the first file, `n_files` the file count.
+fn compute_core_metadata(
+    image_names: &[String],
+    initial_field_count: u32,
+    n_planes: u32,
+    n_files: u32,
+) -> FlexCore {
+    let n_names = image_names.len();
+    let mut field_count = initial_field_count;
+    let mut size_c;
+    let mut size_z;
+    let mut size_t;
+
+    // sizeC == 0 && sizeT == 0 branch (always true at populate time).
+    if field_count == 0 || (n_names != 0 && n_names % field_count as usize != 0) {
+        field_count = 1;
+    }
+    let mut unique_channels: Vec<&str> = Vec::new();
+    for name in image_names {
+        let by_underscore: Vec<&str> = name.split('_').collect();
+        let tokens = if by_underscore.len() > 1 {
+            // fields are indexed from 1
+            if let Ok(field_index) = by_underscore[0].parse::<u32>() {
+                if field_index > field_count {
+                    field_count = field_index;
+                }
+            }
+            by_underscore
+        } else {
+            name.split(':').collect()
+        };
+        let channel = *tokens.last().unwrap_or(&name.as_str());
+        if !unique_channels.contains(&channel) {
+            unique_channels.push(channel);
+        }
+    }
+    if field_count == 0 {
+        field_count = 1;
+    }
+    size_c = (unique_channels.len() as u32).max(1);
+    size_z = 1;
+    size_t = (n_names as u32 / (field_count * size_c * size_z)).max(1);
+
+    if field_count == 0 {
+        field_count = 1;
+    }
+
+    let mut image_count = size_z * size_c * size_t;
+
+    if image_count as usize == n_names {
+        field_count = 1;
+    }
+
+    // If the calculated image count differs from the number of planes in the
+    // file, assume fields are stored within the file.
+    if image_count * field_count != n_planes
+        && ((image_count != n_planes && n_files > 1) || n_files == 1)
+    {
+        let per_field = (n_planes / field_count.max(1)).max(1);
+        image_count = per_field;
+        size_z = 1;
+        size_t = per_field;
+        if size_t % size_c == 0 {
+            size_t /= size_c;
+        } else {
+            size_c = 1;
+        }
+    }
+
+    if field_count == 1 {
+        field_count *= n_files.max(1);
+    }
+
+    FlexCore {
+        size_c: size_c.max(1),
+        size_z: size_z.max(1),
+        size_t: size_t.max(1),
+        image_count: image_count.max(1),
+        field_count: field_count.max(1),
+    }
+}
+
+/// Count `<Field No="...">` elements, mirroring the Java FlexHandler's field
+/// counter for the single-file case (`thisField < 0`). Each `<Field No>` whose
+/// number exceeds the running count and stays below the plane count bumps the
+/// field count by one. Returns the resulting field count.
+fn count_fields(xml: &str, plane_count: usize) -> u32 {
+    let mut field_count = 0u32;
+    let mut i = 0;
+    while let Some(rel) = xml[i..].find("<Field") {
+        let start = i + rel;
+        let end = match xml[start..].find('>') {
+            Some(e) => start + e,
+            None => break,
+        };
+        let tag = &xml[start..end];
+        // Only a true <Field ...> start tag (next char after "Field" is space or >).
+        let after = tag.as_bytes().get(6).copied();
+        let is_field = matches!(after, Some(b) if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r')
+            || tag.len() == 6;
+        if is_field {
+            if let Some(no) = xml_attr(tag, "No").and_then(|s| s.trim().parse::<u32>().ok()) {
+                // thisField < 0 branch: fieldNo > fieldCount && fieldCount < planeCount.
+                if no > field_count && (field_count as usize) < plane_count {
+                    field_count += 1;
+                }
+            }
+        }
+        i = end + 1;
+    }
+    field_count
+}
+
+/// Parse the first `<ImageResolutionX>`/`<ImageResolutionY>` decimal values
+/// (in metres) and convert to microns (× 1e6), mirroring the Java handler's
+/// `xSizes`/`ySizes` (value * 1000000).
+fn parse_physical_size(xml: &str) -> Option<(f64, f64)> {
+    let parse_one = |tag: &str| -> Option<f64> {
+        let idx = xml.find(tag)?;
+        let gt = xml[idx..].find('>').map(|e| idx + e + 1)?;
+        let lt = xml[gt..].find('<').map(|e| gt + e)?;
+        let v: f64 = xml[gt..lt].trim().parse().ok()?;
+        Some(v * 1_000_000.0)
+    };
+    let x = parse_one("<ImageResolutionX");
+    let y = parse_one("<ImageResolutionY");
+    match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (Some(x), None) => Some((x, x)),
+        (None, Some(y)) => Some((y, y)),
+        (None, None) => None,
+    }
 }
 
 /// Extract an XML attribute value (`attr="value"`) from a single start tag.
@@ -702,7 +887,6 @@ impl FormatReader for FlexReader {
             // Build the flex_files list in well order, fields sorted within a well.
             let mut flex_files: Vec<FlexFile> = Vec::new();
             let mut well_number: Vec<(u32, u32)> = Vec::new();
-            let mut n_files_per_well = 1usize;
             let mut expected_files_per_well: Option<usize> = None;
             for (&(row, col), files) in &wells {
                 well_number.push((row, col));
@@ -718,7 +902,6 @@ impl FormatReader for FlexReader {
                 } else {
                     expected_files_per_well = Some(sorted.len());
                 }
-                n_files_per_well = sorted.len();
                 // Java assigns the field index by sorted position within the well
                 // (FlexFile.field = field loop variable), but the filename's field
                 // digits (chars 6..9) are the authoritative field number. Use the
@@ -758,19 +941,53 @@ impl FormatReader for FlexReader {
                 ));
             }
 
+            // Read the first file's FLEX XML for channel names, in-file field
+            // count and physical size (mirrors FlexHandler / populateCoreMetadata).
+            let first_xml = self.flex_xml().map(|mut xml| {
+                let t = xml.trim();
+                xml = if t.ends_with(">>") || t.ends_with('%') {
+                    t[..t.len() - 1].to_string()
+                } else {
+                    t.to_string()
+                };
+                xml
+            });
+            let (image_names, _xml_factors) = first_xml
+                .as_deref()
+                .map(parse_flex_arrays)
+                .unwrap_or_default();
+            self.channel_names = image_names.clone();
+            self.physical_size = first_xml.as_deref().and_then(parse_physical_size);
+
+            let n_files = flex_files.len();
+            // For a single file, the field count comes from the in-file
+            // `<Field No>` elements (Java passes thisField = -1). For a true
+            // multi-file dataset it starts at 0 and is later multiplied by nFiles.
+            let initial_field_count = if n_files == 1 {
+                first_xml
+                    .as_deref()
+                    .map(|x| count_fields(x, n_planes as usize))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
             // Derive factors & widening from series-0 XML. Only the first file
             // sets the scaled pixel type (Java FlexReader.java:909).
             let factors = self.derive_factors(n_planes as usize, true)?;
             flex_files[0].factors = factors;
 
-            // populateCoreMetadata field logic (faithful to the common case):
-            // each file holds exactly imageCount planes => one field per file, so
-            // fieldCount = number of files per well (Java: `fieldCount *= nFiles`
-            // when fieldCount == 1). Fields-stored-within-a-file is rare and not
-            // reconstructed here.
-            let field_count = (n_files_per_well as u32).max(1);
+            // populateCoreMetadata: compute sizeC/sizeZ/sizeT/imageCount/fieldCount.
+            let core = compute_core_metadata(
+                &image_names,
+                initial_field_count,
+                n_planes,
+                n_files as u32,
+            );
+            let field_count = core.field_count.max(1);
             self.field_count = field_count;
-            self.image_count = n_planes;
+            self.image_count = core.image_count.max(1);
+            self.fields_in_file = n_files == 1 && field_count > 1;
 
             self.plate_count = 1;
 
@@ -778,13 +995,20 @@ impl FormatReader for FlexReader {
             let series_count =
                 (self.plate_count * self.well_count * self.field_count).max(1) as usize;
 
-            // Apply factor widening to the (single) base metadata.
+            // Build base metadata from the inner TIFF, overriding the dimension
+            // split + dimensionOrder per Java's populateCoreMetadata.
             let mut base_meta = self
                 .inner
                 .series_list()
                 .first()
                 .map(|s| s.metadata.clone())
                 .ok_or_else(|| BioFormatsError::Format("Flex: no IFDs in first file".into()))?;
+            base_meta.size_c = core.size_c.max(1);
+            base_meta.size_z = core.size_z.max(1);
+            base_meta.size_t = core.size_t.max(1);
+            base_meta.image_count = core.image_count.max(1);
+            base_meta.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+            base_meta.is_rgb = false;
             if let Some(pt) = self.scaled_pixel_type {
                 base_meta.pixel_type = pt;
                 base_meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
@@ -854,6 +1078,9 @@ impl FormatReader for FlexReader {
         self.plate_barcode = None;
         self.series = 0;
         self.single_file = true;
+        self.fields_in_file = false;
+        self.channel_names.clear();
+        self.physical_size = None;
         self.inner.close()
     }
 
@@ -899,25 +1126,28 @@ impl FormatReader for FlexReader {
         if !self.single_file {
             self.bind_series(self.series)?;
         }
+        let ip = self.inner_plane(p);
         let le = self.inner.is_little_endian();
-        let raw = self.inner.open_bytes(p)?;
-        Ok(self.apply_factor(raw, p, le))
+        let raw = self.inner.open_bytes(ip)?;
+        Ok(self.apply_factor(raw, ip, le))
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         if !self.single_file {
             self.bind_series(self.series)?;
         }
+        let ip = self.inner_plane(p);
         let le = self.inner.is_little_endian();
-        let raw = self.inner.open_bytes_region(p, x, y, w, h)?;
-        Ok(self.apply_factor(raw, p, le))
+        let raw = self.inner.open_bytes_region(ip, x, y, w, h)?;
+        Ok(self.apply_factor(raw, ip, le))
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         if !self.single_file {
             self.bind_series(self.series)?;
         }
-        self.inner.open_thumb_bytes(p)
+        let ip = self.inner_plane(p);
+        self.inner.open_thumb_bytes(ip)
     }
 
     fn resolution_count(&self) -> usize {
@@ -944,14 +1174,57 @@ impl FormatReader for FlexReader {
 
         // Build one Image per series; one Plate with Wells/WellSamples.
         let series_count = self.series_meta.len();
-        ome.images = (0..series_count)
-            .map(|_| crate::common::ome_metadata::OmeImage::default())
-            .collect();
-
         let field_count = self.field_count.max(1) as usize;
         let well_count = self.well_count.max(1) as usize;
         let plate_count = self.plate_count.max(1) as usize;
         let lengths = [field_count, well_count, plate_count];
+
+        // Per-series Image: name "Well <row>-<col>; Field #<n>", physical size,
+        // and channels named from the FLEX <Array Name> values (Java
+        // populateMetadataStore). channelIndex = series*effSizeC + c when the
+        // name list has one entry per (series, channel).
+        let eff_size_c = self
+            .series_meta
+            .first()
+            .map(|m| m.size_c.max(1) as usize)
+            .unwrap_or(1);
+        ome.images = (0..series_count)
+            .map(|i| {
+                let pos = raster_to_position(&lengths, i);
+                let (row, col) = self.well_number.get(pos[1]).copied().unwrap_or((0, 0));
+                let mut img = crate::common::ome_metadata::OmeImage {
+                    name: Some(format!(
+                        "Well {}-{}; Field #{}",
+                        well_row_name(row),
+                        col + 1,
+                        pos[0] + 1
+                    )),
+                    ..Default::default()
+                };
+                if let Some((px, py)) = self.physical_size {
+                    img.physical_size_x = Some(px);
+                    img.physical_size_y = Some(py);
+                }
+                img.channels = (0..eff_size_c)
+                    .map(|c| {
+                        // Mirror Java's channelIndex selection.
+                        let mut idx = i * self.image_count.max(1) as usize + c;
+                        if self.channel_names.len() == eff_size_c * series_count {
+                            idx = i * eff_size_c + c;
+                        }
+                        if idx >= self.channel_names.len() {
+                            idx = c;
+                        }
+                        crate::common::ome_metadata::OmeChannel {
+                            name: self.channel_names.get(idx).cloned(),
+                            samples_per_pixel: 1,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+                img
+            })
+            .collect();
 
         let mut plate = OmePlate {
             id: Some(create_lsid("Plate", &[0])),
@@ -1051,6 +1324,47 @@ mod tests {
         // lengths {field=2, well=3, plate=1}; series 4 -> field 0, well 2.
         let p = raster_to_position(&[2, 3, 1], 4);
         assert_eq!(p, vec![0, 2, 0]);
+    }
+
+    #[test]
+    fn fields_within_one_file_yield_one_series_per_field() {
+        // 6 IFDs, 2 channels (Exp1Cam1/Exp1Cam2) repeated per field, 3 <Field No>.
+        let names: Vec<String> = ["Exp1Cam1", "Exp1Cam2"]
+            .iter()
+            .cycle()
+            .take(6)
+            .map(|s| s.to_string())
+            .collect();
+        let core = compute_core_metadata(&names, 3, 6, 1);
+        assert_eq!(core.size_c, 2);
+        assert_eq!(core.size_z, 1);
+        assert_eq!(core.size_t, 1);
+        assert_eq!(core.image_count, 2);
+        assert_eq!(core.field_count, 3);
+    }
+
+    #[test]
+    fn count_fields_counts_field_no_elements() {
+        let xml = r#"<a><Field No="1"></Field><Field No="2"/><Field No="3"/></a>"#;
+        assert_eq!(count_fields(xml, 6), 3);
+        // capped by plane count
+        assert_eq!(count_fields(xml, 2), 2);
+    }
+
+    #[test]
+    fn physical_size_from_image_resolution() {
+        let xml = r#"<ImageResolutionX Unit="m">1.076e-007</ImageResolutionX>
+                     <ImageResolutionY Unit="m">1.076e-007</ImageResolutionY>"#;
+        let (x, y) = parse_physical_size(xml).unwrap();
+        assert!((x - 0.1076).abs() < 1e-9, "x={x}");
+        assert!((y - 0.1076).abs() < 1e-9, "y={y}");
+    }
+
+    #[test]
+    fn well_row_name_letters() {
+        assert_eq!(well_row_name(0), "A");
+        assert_eq!(well_row_name(25), "Z");
+        assert_eq!(well_row_name(26), "AA");
     }
 
     #[test]

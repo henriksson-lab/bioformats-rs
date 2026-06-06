@@ -10,7 +10,7 @@ use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader as _;
 
-use super::compression::decompress;
+use super::compression::{decompress, JpegColor};
 use super::ifd::{tag, Compression, Ifd, Photometric};
 use super::nikon::NikonCompressionOptions;
 use super::parser::TiffParser;
@@ -165,6 +165,62 @@ impl TiffReader {
         self.current_series = 0;
         self.current_resolution = 0;
         self.current_resolution_metadata = None;
+    }
+
+    /// Flatten each series' resolution pyramid into independent top-level series,
+    /// mirroring Java's default `ImageReader` behaviour (flattenedResolutions =
+    /// true): every (series, resolution) pair becomes its own series with
+    /// `resolutionCount == 1`. The per-resolution `sizeX`/`sizeY`/`imageCount`
+    /// are taken from each level's first IFD. Whole-slide vendor wrappers (SVS,
+    /// SCN, NDPI) call this so their flattened series count and per-series
+    /// dimensions match Java's reference output.
+    pub fn flatten_resolutions_into_series(&mut self) -> Result<()> {
+        let little_endian = self.is_little_endian();
+        let old = std::mem::take(&mut self.series);
+        let mut flat: Vec<TiffSeries> = Vec::with_capacity(old.len());
+        for s in old {
+            // Level 0 (main resolution): keep ifd_indices / plane map / externals.
+            let mut base = TiffSeries {
+                ifd_indices: s.ifd_indices.clone(),
+                plane_ifd_indices: s.plane_ifd_indices.clone(),
+                metadata: s.metadata.clone(),
+                sub_resolutions: Vec::new(),
+                external_planes: s.external_planes.clone(),
+            };
+            base.metadata.resolution_count = 1;
+            flat.push(base);
+
+            // Each sub-resolution level becomes its own series.
+            for level in &s.sub_resolutions {
+                let mut meta = s.metadata.clone();
+                meta.resolution_count = 1;
+                if let Some(&first_idx) = level.first() {
+                    if let Some(file) = self.file.as_ref() {
+                        if let Some(ifd) = file.ifds.get(first_idx) {
+                            if let Ok(info) = Self::ifd_info(ifd, little_endian) {
+                                meta.size_x = info.width;
+                                meta.size_y = info.height;
+                            }
+                        }
+                    }
+                }
+                // One plane per Z (sub-resolutions carry no separate C/T split).
+                meta.image_count = level.len() as u32;
+                meta.size_z = level.len() as u32;
+                flat.push(TiffSeries {
+                    ifd_indices: level.clone(),
+                    plane_ifd_indices: Vec::new(),
+                    metadata: meta,
+                    sub_resolutions: Vec::new(),
+                    external_planes: Vec::new(),
+                });
+            }
+        }
+        self.series = flat;
+        self.current_series = 0;
+        self.current_resolution = 0;
+        self.current_resolution_metadata = None;
+        Ok(())
     }
 
     /// Number of parsed IFDs in the open file.
@@ -805,6 +861,22 @@ impl TiffReader {
             return Ok(());
         }
 
+        // Drop a "thumbnail" smallest resolution: SVSReader.removeThumbnail()
+        // (SVSReader.java:612-630) removes the last pyramid level when it is
+        // stored with strips (StripByteCounts present) rather than tiles, per
+        // https://github.com/ome/bioformats/issues/3757. Only applies when more
+        // than one resolution remains.
+        if kept_levels.len() > 1 {
+            if let Some(&last_idx) = kept_levels.last() {
+                let last_ifd = &file.ifds[last_idx];
+                let stripped = last_ifd.get(tag::STRIP_BYTE_COUNTS).is_some()
+                    && last_ifd.get(tag::TILE_BYTE_COUNTS).is_none();
+                if stripped {
+                    kept_levels.pop();
+                }
+            }
+        }
+
         // Build the single pyramid series: level 0 is the main resolution,
         // remaining levels are sub-resolutions.
         let mut pyramid = Self::single_ifd_series(kept_levels[0], &full_info, little_endian);
@@ -836,6 +908,13 @@ impl TiffReader {
                 crate::common::metadata::MetadataValue::String(name.to_string()),
             );
             new_series.push(s);
+        }
+
+        // Java SVSReader reports RGB whole-slide planes as channel-separated
+        // (interleaved=false) with dimension order XYCZT (SVSReader.java:516-538).
+        for s in &mut new_series {
+            s.metadata.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+            s.metadata.is_interleaved = false;
         }
 
         self.replace_series(new_series);
@@ -962,23 +1041,30 @@ impl TiffReader {
             .get_mut(&plane.path)
             .expect("companion reader just inserted");
 
-        // Locate (series, plane-within-series) for the requested global IFD.
-        let mut target: Option<(usize, usize)> = None;
-        for (si, s) in reader.series_list().iter().enumerate() {
-            if let Some(pos) = s.ifd_indices.iter().position(|&idx| idx == plane.ifd) {
-                target = Some((si, pos));
-                break;
-            }
-        }
-        let (series_idx, plane_idx) = target.unwrap_or((0, plane.ifd));
-        reader.set_series(series_idx)?;
-        if x == 0 && y == 0 {
-            let m = reader.metadata();
-            if w == m.size_x && h == m.size_y {
-                return reader.open_bytes(plane_idx as u32);
-            }
-        }
-        reader.open_bytes_region(plane_idx as u32, x, y, w, h)
+        // The OME-XML `<TiffData IFD=N>` references a PHYSICAL IFD in the
+        // companion file, not a logical plane. Read that IFD directly. Going
+        // through the companion's own series/logical-plane mapping is wrong when
+        // the companion is itself a multi-file OME-TIFF: e.g. for the tubhiswt
+        // pair, C1's own OME-XML maps its logical plane 0 back to C0 (external),
+        // so `open_bytes(0)` on C1 would return C0's pixels. The physical IFD 0
+        // of C1 is the C1 data we want. (Java's OMETiffReader likewise indexes
+        // the companion by IFD.)
+        reader.read_physical_ifd_region(plane.ifd, x, y, w, h)
+    }
+
+    /// Read a region from a PHYSICAL IFD index, bypassing all series / logical-
+    /// plane / OME companion mapping. `(x, y, w, h)` clamp to the IFD's bounds;
+    /// passing the full IFD size reads the whole plane. Used for companion-file
+    /// reads where the OME-XML references a raw IFD number.
+    pub fn read_physical_ifd_region(
+        &mut self,
+        ifd_index: usize,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        self.read_plane_bytes(ifd_index, x, y, w, h)
     }
 
     fn resolution_metadata(&self, level: usize) -> Result<Option<ImageMetadata>> {
@@ -1160,6 +1246,7 @@ impl TiffReader {
                 file.parser.little_endian,
                 info.jpeg_tables.as_deref(),
                 info.nikon_compression_options.as_ref(),
+                jpeg_color_for(info),
             )?;
             if info.compression != Compression::Nikon {
                 require_decompressed_len("strip", strip_idx, strip_data.len(), expected)?;
@@ -1453,6 +1540,7 @@ impl TiffReader {
                     file.parser.little_endian,
                     info.jpeg_tables.as_deref(),
                     info.nikon_compression_options.as_ref(),
+                    jpeg_color_for(info),
                 )?;
                 if info.compression != Compression::Nikon {
                     require_decompressed_len("strip", strip_idx, strip_data.len(), expected)?;
@@ -1597,6 +1685,7 @@ impl TiffReader {
                     file.parser.little_endian,
                     info.jpeg_tables.as_deref(),
                     info.nikon_compression_options.as_ref(),
+                    jpeg_color_for(info),
                 )?;
                 require_decompressed_len("tile", tile_idx, tile_data.len(), tile_data_bytes)?;
                 tile_data.truncate(tile_data_bytes);
@@ -1701,6 +1790,7 @@ impl TiffReader {
                     file.parser.little_endian,
                     info.jpeg_tables.as_deref(),
                     info.nikon_compression_options.as_ref(),
+                    jpeg_color_for(info),
                 )?;
                 require_decompressed_len("tile", tile_idx, tile_data.len(), tile_data_bytes)?;
                 tile_data.truncate(tile_data_bytes);
@@ -1809,6 +1899,7 @@ impl TiffReader {
                         file.parser.little_endian,
                         info.jpeg_tables.as_deref(),
                         info.nikon_compression_options.as_ref(),
+                        jpeg_color_for(info),
                     )?;
                     require_decompressed_len("tile", tile_idx, tile_data.len(), tile_data_bytes)?;
                     tile_data.truncate(tile_data_bytes);
@@ -3042,6 +3133,22 @@ fn apply_photometric(
 fn ycbcr_decoded_by_jpeg(info: &IfdInfo) -> bool {
     info.photometric == Photometric::YCbCr
         && matches!(info.compression, Compression::Jpeg | Compression::JpegNew)
+}
+
+/// Decide how a JPEG-compressed strip/tile's components map to output channels.
+///
+/// Java reads Aperio/Leica TIFF JPEG tiles whose `PhotometricInterpretation` is
+/// RGB (2) WITHOUT applying the YCbCr→RGB transform (ImageIO emits the stored
+/// components as-is); libjpeg/`jpeg_decoder` would otherwise assume YCbCr and
+/// corrupt the pixels. YCbCr-photometric JPEGs keep the default conversion.
+fn jpeg_color_for(info: &IfdInfo) -> JpegColor {
+    if matches!(info.compression, Compression::Jpeg | Compression::JpegNew)
+        && info.photometric == Photometric::Rgb
+    {
+        JpegColor::Rgb
+    } else {
+        JpegColor::Default
+    }
 }
 
 fn is_unsupported_ycbcr(info: &IfdInfo) -> bool {

@@ -245,6 +245,144 @@ fn read_chunk_data(f: &mut BufReader<File>, chunk: &Nd2Chunk) -> std::io::Result
     Ok(buf)
 }
 
+/// Values harvested from the Nikon LV (LIM) binary metadata tree.
+///
+/// Mirrors `ND2Reader.iterateIn` in Java Bio-Formats: a recursive, length-typed
+/// key/value structure. We only collect the handful of attributes needed for
+/// OME parity (physical pixel size, channel names, emission wavelengths).
+#[derive(Default)]
+struct Nd2LvValues {
+    calibration: Option<f64>,
+    z_step: Option<f64>,
+    channel_names: Vec<String>,
+    emission_wavelengths: Vec<f64>,
+}
+
+/// Parse the Nikon LV binary metadata tree starting at the root of a chunk.
+///
+/// Entry layout: `[type:u8][nameLen:u8][name: nameLen × UTF-16LE]` followed by a
+/// type-specific value. Type 11 is a nested level: `[count:i32][absOffset:i64]`,
+/// where children live until `absOffset` (relative to the chunk start) and a
+/// trailing `count × 8` byte index table is skipped afterwards.
+fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
+    fn read_u16(d: &[u8], p: usize) -> Option<u16> {
+        d.get(p..p + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn read_i32(d: &[u8], p: usize) -> Option<i32> {
+        d.get(p..p + 4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn read_i64(d: &[u8], p: usize) -> Option<i64> {
+        d.get(p..p + 8)
+            .map(|b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+    fn read_f64(d: &[u8], p: usize) -> Option<f64> {
+        read_i64(d, p).map(|v| f64::from_bits(v as u64))
+    }
+
+    // Recursive walk. `end` is an exclusive byte bound for the current level.
+    fn walk(data: &[u8], mut p: usize, end: usize, depth: u32, out: &mut Nd2LvValues) -> usize {
+        if depth > 64 {
+            return end;
+        }
+        while p + 2 <= end {
+            let entry_start = p;
+            let ty = data[p];
+            let name_len = data[p + 1] as usize;
+            let name_start = p + 2;
+            let name_end = name_start + name_len * 2;
+            if name_end > end {
+                break;
+            }
+            let name_units: Vec<u16> = (0..name_len)
+                .filter_map(|i| read_u16(data, name_start + i * 2))
+                .collect();
+            let name = String::from_utf16_lossy(&name_units)
+                .trim_end_matches('\0')
+                .to_string();
+            p = name_end;
+
+            match ty {
+                1 => p += 1,         // bool
+                2 | 3 => p += 4,     // int32 / uint32
+                4 | 5 | 7 => p += 8, // int64 / uint64 / void*
+                6 => {
+                    // double
+                    if let Some(v) = read_f64(data, p) {
+                        match name.as_str() {
+                            "dCalibration" => {
+                                if v > 0.0 && out.calibration.is_none() {
+                                    out.calibration = Some(v);
+                                }
+                            }
+                            "dZStep" => {
+                                if v > 0.0 && out.z_step.is_none() {
+                                    out.z_step = Some(v);
+                                }
+                            }
+                            "EmWavelength" => out.emission_wavelengths.push(v),
+                            _ => {}
+                        }
+                    }
+                    p += 8;
+                }
+                8 => {
+                    // Null-terminated UTF-16LE string.
+                    let mut units = Vec::new();
+                    let mut q = p;
+                    while q + 2 <= end {
+                        let u = read_u16(data, q).unwrap_or(0);
+                        q += 2;
+                        if u == 0 {
+                            break;
+                        }
+                        units.push(u);
+                    }
+                    let s = String::from_utf16_lossy(&units);
+                    if name == "sDescription" && !s.is_empty() {
+                        out.channel_names.push(s);
+                    }
+                    p = q;
+                }
+                9 => {
+                    // ByteArray: i64 length then nested LV when length > 2.
+                    let Some(len) = read_i64(data, p) else { break };
+                    p += 8;
+                    let len = len.max(0) as usize;
+                    if len > 2 {
+                        let child_end = (p + len).min(end);
+                        walk(data, p, child_end, depth + 1, out);
+                    }
+                    p = (p + len).min(end);
+                }
+                11 => {
+                    // Level: count (i32), then an end offset (i64) measured from
+                    // this entry's own start (Java: endOffset = off + startOffset).
+                    // Children occupy [p, child_end); a count*8 index table follows.
+                    let Some(count) = read_i32(data, p) else { break };
+                    let Some(off) = read_i64(data, p + 4) else {
+                        break;
+                    };
+                    p += 12;
+                    let child_end = entry_start
+                        .saturating_add(off.max(0) as usize)
+                        .clamp(p, data.len());
+                    if child_end > p {
+                        walk(data, p, child_end.min(end), depth + 1, out);
+                    }
+                    // Skip children plus the trailing count*8 index table.
+                    let after = child_end.saturating_add((count.max(0) as usize) * 8);
+                    p = after.min(end);
+                }
+                _ => break, // Unknown type: bail out of this level.
+            }
+        }
+        p
+    }
+
+    walk(data, 0, data.len(), 0, out);
+}
+
 /// Very lightweight XML value extractor — just grab the first occurrence of a tag.
 fn xml_value(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}", tag);
@@ -584,6 +722,11 @@ pub struct Nd2Reader {
     current_series: usize,
     image_chunks: Vec<usize>, // indices into chunks[] for ImageDataSeq chunks
     old_jp2_planes: Vec<Vec<OldJp2Plane>>,
+    // OME-parity metadata harvested from the LV binary metadata tree.
+    physical_size: Option<f64>,
+    physical_size_z: Option<f64>,
+    channel_names: Vec<String>,
+    emission_wavelengths: Vec<f64>,
 }
 
 impl Nd2Reader {
@@ -594,6 +737,10 @@ impl Nd2Reader {
             chunks: Vec::new(),
             meta: Vec::new(),
             current_series: 0,
+            physical_size: None,
+            physical_size_z: None,
+            channel_names: Vec::new(),
+            emission_wavelengths: Vec::new(),
             image_chunks: Vec::new(),
             old_jp2_planes: Vec::new(),
         }
@@ -837,6 +984,33 @@ impl FormatReader for Nd2Reader {
             _ => PixelType::Uint16,
         };
 
+        // Parse the Nikon LV binary metadata tree (ImageMetadataSeqLV /
+        // ImageCalibrationLV) for OME attributes: physical pixel size, channel
+        // names, emission wavelengths. Matches ND2Reader.iterateIn in Java.
+        let mut lv = Nd2LvValues::default();
+        for mc in chunks.iter().filter(|c| {
+            c.name.starts_with("ImageMetadataSeq")
+                || c.name.starts_with("ImageMetadata")
+                || c.name.starts_with("ImageCalibration")
+        }) {
+            if let Ok(data) = read_chunk_data(&mut reader, mc) {
+                parse_nd2_lv(&data, &mut lv);
+            }
+        }
+        self.physical_size = lv.calibration;
+        self.physical_size_z = lv.z_step;
+        self.channel_names = lv.channel_names;
+        self.emission_wavelengths = lv.emission_wavelengths;
+
+        // Dimension order: Java ND2Reader builds "XY" + order, then appends any
+        // of Z/C/T not already present. With no acquisition-loop order and a
+        // single channel this yields XYZCT (see ND2Reader ~1530, ~2014).
+        let dimension_order = if size_c > 1 {
+            DimensionOrder::XYCZT
+        } else {
+            DimensionOrder::XYZCT
+        };
+
         let image_count = image_chunks.len() as u32;
         let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
         series_metadata.insert("nd2_chunks".into(), MetadataValue::Int(chunks.len() as i64));
@@ -850,7 +1024,7 @@ impl FormatReader for Nd2Reader {
             pixel_type,
             bits_per_pixel: bpp,
             image_count: image_count.max(1),
-            dimension_order: DimensionOrder::XYCZT,
+            dimension_order,
             is_rgb: size_c == 3,
             is_interleaved: true,
             is_indexed: false,
@@ -879,6 +1053,10 @@ impl FormatReader for Nd2Reader {
         self.chunks.clear();
         self.image_chunks.clear();
         self.old_jp2_planes.clear();
+        self.physical_size = None;
+        self.physical_size_z = None;
+        self.channel_names.clear();
+        self.emission_wavelengths.clear();
         Ok(())
     }
 
@@ -1022,5 +1200,40 @@ impl FormatReader for Nd2Reader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::OmeMetadata;
+        let meta = self.meta.get(self.current_series)?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        let img = ome.images.get_mut(0)?;
+
+        // Image name: "<filename> (series <n>)" per ND2Reader (~2263).
+        if let Some(path) = &self.path {
+            if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                img.name = Some(format!("{} (series {})", fname, self.current_series + 1));
+            }
+        }
+
+        // Physical pixel size: dCalibration applies to X and Y (µm/px).
+        if let Some(cal) = self.physical_size.filter(|v| *v > 0.0) {
+            img.physical_size_x = Some(cal);
+            img.physical_size_y = Some(cal);
+        }
+        if let Some(z) = self.physical_size_z.filter(|v| *v > 0.0) {
+            img.physical_size_z = Some(z);
+        }
+
+        // Channel names and emission wavelengths.
+        for (c, channel) in img.channels.iter_mut().enumerate() {
+            if let Some(name) = self.channel_names.get(c) {
+                channel.name = Some(name.clone());
+            }
+            if let Some(em) = self.emission_wavelengths.get(c).filter(|v| **v > 0.0) {
+                channel.emission_wavelength = Some(*em);
+            }
+        }
+
+        Some(ome)
     }
 }

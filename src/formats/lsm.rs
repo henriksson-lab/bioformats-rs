@@ -52,6 +52,14 @@ struct LsmInfo {
     voxel_x: f64,
     voxel_y: f64,
     voxel_z: f64,
+    /// CZ-LSMINFO OffsetChannelColors (int at offset 108): absolute file offset
+    /// of the channel-colours/-names sub-block, or 0 when absent.
+    channel_colors_offset: u32,
+    /// CZ-LSMINFO TimeInterval (double at offset 112); seconds between frames.
+    time_interval: f64,
+    /// Per-channel names parsed from the channel-colours sub-block (Java
+    /// ZeissLSMReader.java:1162-1181).
+    channel_names: Vec<String>,
 }
 
 fn checked_plane_count(size_z: u32, size_c: u32, size_t: u32) -> Result<u32> {
@@ -59,18 +67,6 @@ fn checked_plane_count(size_z: u32, size_c: u32, size_t: u32) -> Result<u32> {
         .checked_mul(size_c)
         .and_then(|v| v.checked_mul(size_t))
         .ok_or_else(|| BioFormatsError::Format("LSM: plane count overflow".into()))
-}
-
-fn lsm_uses_packed_channels(
-    dim_z: u32,
-    dim_c: u32,
-    dim_t: u32,
-    tiff_size_c: u32,
-    full_res_ifd_count: u32,
-) -> bool {
-    dim_c > 1
-        && tiff_size_c == dim_c
-        && checked_plane_count(dim_z, 1, dim_t).ok() == Some(full_res_ifd_count)
 }
 
 fn resolve_lsm_plane_index(
@@ -165,7 +161,67 @@ fn parse_lsm_info(bytes: &[u8], le: bool) -> Result<LsmInfo> {
         } else {
             0.0
         },
+        // ZeissLSMReader.java:952 reads OffsetChannelColors and java:954 reads
+        // TimeInterval. After seek(88) the field order is: scanType(2),
+        // spectralScan(2), type(4), overlay[0..2](12) -> offset 108 holds
+        // channelColorsOffset, offset 112 holds TimeInterval(double).
+        channel_colors_offset: if bytes.len() >= 112 {
+            read_i32_lsm(bytes, 108, le) as u32
+        } else {
+            0
+        },
+        time_interval: if bytes.len() >= 120 {
+            read_f64_lsm(bytes, 112, le)
+        } else {
+            0.0
+        },
+        channel_names: Vec::new(),
     })
+}
+
+/// Parses the per-channel names from the channel-colours sub-block, mirroring
+/// ZeissLSMReader.java:1112-1182. `colors_offset`/`names_offset` are relative to
+/// `channel_colors_offset`; the name table is a sequence of (int length, bytes)
+/// records with trailing NULs stripped.
+fn parse_channel_names(
+    file_bytes: &[u8],
+    channel_colors_offset: u32,
+    size_c: u32,
+    le: bool,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    if channel_colors_offset == 0 {
+        return names;
+    }
+    let base = channel_colors_offset as usize;
+    // Need at least the two offset ints at base+12 and base+16.
+    if base + 20 > file_bytes.len() {
+        return names;
+    }
+    let names_offset = read_i32_lsm(file_bytes, base + 16, le);
+    if names_offset <= 0 {
+        return names;
+    }
+    let mut p = base + names_offset as usize;
+    for _ in 0..size_c {
+        if p + 4 > file_bytes.len() {
+            break;
+        }
+        let length = read_i32_lsm(file_bytes, p, le);
+        p += 4;
+        if length < 0 {
+            break;
+        }
+        let length = length as usize;
+        if p + length > file_bytes.len() {
+            break;
+        }
+        let raw = &file_bytes[p..p + length];
+        p += length;
+        let trimmed = raw.split(|&b| b == 0).next().unwrap_or(&[]);
+        names.push(String::from_utf8_lossy(trimmed).into_owned());
+    }
+    names
 }
 
 /// Maps the CZ-LSMINFO ScanType to a dimension order, mirroring
@@ -242,7 +298,18 @@ fn read_lsm_info_from_file(path: &Path) -> Result<(LsmInfo, bool)> {
         }
     };
 
-    let info = parse_lsm_info(&lsm_bytes, le)?;
+    let mut info = parse_lsm_info(&lsm_bytes, le)?;
+
+    // Channel names live in the channel-colours sub-block, addressed by an
+    // absolute file offset stored in the CZ-LSMINFO struct. Read the whole file
+    // once to resolve it (these files are small) and parse the name table.
+    if info.channel_colors_offset != 0 {
+        if let Ok(file_bytes) = std::fs::read(path) {
+            info.channel_names =
+                parse_channel_names(&file_bytes, info.channel_colors_offset, info.dim_c, le);
+        }
+    }
+
     Ok((info, le))
 }
 
@@ -253,6 +320,14 @@ pub struct LsmReader {
     meta: Option<ImageMetadata>,
     /// Inner TIFF reader handles pixel I/O; we select the correct series.
     inner: TiffReader,
+    /// When true, one physical IFD packs all `size_c` channels in planar order
+    /// and a logical plane maps to (ifd = plane / sizeC, channel = plane % sizeC),
+    /// with the channel sliced out (Java splitPlanes path).
+    split_planes: bool,
+    /// Per-channel names parsed from the CZ-LSMINFO channel-colours sub-block.
+    channel_names: Vec<String>,
+    /// OME image name (file stem), mirroring Java's getLSMFileFromSeries name.
+    image_name: Option<String>,
 }
 
 impl LsmReader {
@@ -261,6 +336,9 @@ impl LsmReader {
             path: None,
             meta: None,
             inner: TiffReader::new(),
+            split_planes: false,
+            channel_names: Vec::new(),
+            image_name: None,
         }
     }
 
@@ -360,33 +438,61 @@ impl FormatReader for LsmReader {
             }
         }
         let _ = self.inner.set_series(best_series);
+        // Capture the first full-resolution IFD index *before* the series is
+        // reconfigured, so we can inspect its SamplesPerPixel.
+        let first_full_res_ifd = self
+            .collect_full_resolution_ifds(best_series)
+            .first()
+            .copied();
         let full_res_ifd_count = self.configure_full_resolution_series(best_series);
         let tiff_meta = self.inner.metadata().clone();
 
+        // ZeissLSMReader.java:720,725 — sizeC/rgb derive from the full-res IFD's
+        // SamplesPerPixel. When a single IFD carries more than one sample (planar
+        // multi-channel, e.g. SamplesPerPixel=2, PlanarConfiguration=2), every
+        // physical IFD holds *all* channels and Java splits them into separate
+        // planes (splitPlanes path, java:410-428, 988-992). Otherwise the file
+        // stores one channel per IFD.
+        let samples_per_ifd = first_full_res_ifd
+            .and_then(|i| self.inner.ifd(i))
+            .map(|ifd| ifd.samples_per_pixel())
+            .unwrap_or(1);
+
         // Build corrected metadata using LSM dimensions.
         //
-        // NOTE: Java ZeissLSMReader takes sizeC from the TIFF SamplesPerPixel and
-        // later reconciles separate-IFD channel planes back into C via its
-        // imageCount-vs-ifds.size() block (java:894-911). We do NOT port that
-        // reconciliation, so taking sizeC from the TIFF samples alone would
-        // collapse separate-IFD multichannel LSMs to sizeC=1 and under-count
-        // planes. The CZ-LSMINFO channel field (offset 20) already gives the
-        // correct channel count for those files, so we keep using it; the
-        // `lsm_uses_packed_channels` heuristic still handles interleaved/packed
-        // RGB. (See the reverted "sizeC from TIFF" attempt.)
+        // sizeC comes from the CZ-LSMINFO channel field (offset 20). There are
+        // two physical layouts (see `samples_per_ifd` above):
+        //
+        //   * packed (samples_per_ifd > 1): one IFD per Z/T plane carries all C
+        //     channels in planar order. full_res_ifd_count == Z*T. Java splits
+        //     these into C logical planes (splitPlanes), so imageCount = Z*C*T.
+        //     We slice the requested channel out of the planar IFD in
+        //     open_bytes_region.
+        //   * separate (samples_per_ifd == 1): one IFD per channel. We expose
+        //     each IFD as a logical plane directly. imageCount = ifd count.
         let dim_z = lsm_info.dim_z;
         let dim_c = lsm_info.dim_c;
         let dim_t = lsm_info.dim_t;
-        let packed_channels =
-            lsm_uses_packed_channels(dim_z, dim_c, dim_t, tiff_meta.size_c, full_res_ifd_count);
-        let image_count = if packed_channels {
-            checked_plane_count(dim_z, 1, dim_t)?
-        } else {
+
+        // A planar/packed multichannel LSM: SamplesPerPixel>1 on the full-res
+        // IFD and exactly one IFD per Z/T plane (java:410 condition
+        // `ifds.size() == sizeZ * sizeT`).
+        let split_planes = samples_per_ifd > 1
+            && dim_c > 1
+            && checked_plane_count(dim_z, 1, dim_t).ok() == Some(full_res_ifd_count);
+
+        let image_count = if split_planes {
             checked_plane_count(dim_z, dim_c, dim_t)?
+        } else {
+            full_res_ifd_count
         };
 
         let pixel_type = lsm_pixel_type(lsm_info.data_type, tiff_meta.bits_per_pixel as u16)?;
-        let is_rgb = packed_channels && tiff_meta.is_rgb;
+        // ZeissLSMReader sets rgb=samples>1 to drive the dimension-order shuffle,
+        // but always flattens rgb back to false once channels are split / the
+        // image is indexed (java:877, 990). We never expose LSM as packed RGB.
+        let rgb_for_order = samples_per_ifd > 1;
+        let is_rgb = false;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert(
@@ -401,6 +507,25 @@ impl FormatReader for LsmReader {
             "voxel_size_z_um".into(),
             MetadataValue::Float(lsm_info.voxel_z * 1e6),
         );
+        // ZeissLSMReader.java:954 records TimeInterval; surfaced as the OME
+        // TimeIncrement (seconds).
+        if lsm_info.time_interval != 0.0 {
+            meta_map.insert(
+                "time_increment_s".into(),
+                MetadataValue::Float(lsm_info.time_interval),
+            );
+        }
+
+        // OME image name: Java uses the LSM file path; ImageReader/OME later
+        // reduce it to the file's base name. Use the file stem to match.
+        let image_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+
+        // Java sets indexed=true whenever a channel-colours sub-block (LUT) is
+        // present (java:1122). It carries one per channel here.
+        let is_indexed = lsm_info.channel_colors_offset != 0;
 
         let meta = ImageMetadata {
             size_x: tiff_meta.size_x,
@@ -411,10 +536,10 @@ impl FormatReader for LsmReader {
             pixel_type,
             bits_per_pixel: tiff_meta.bits_per_pixel,
             image_count,
-            dimension_order: lsm_dimension_order(lsm_info.scan_type, is_rgb),
+            dimension_order: lsm_dimension_order(lsm_info.scan_type, rgb_for_order),
             is_rgb,
             is_interleaved: tiff_meta.is_interleaved,
-            is_indexed: false,
+            is_indexed,
             is_little_endian: le,
             resolution_count: 1,
             series_metadata: meta_map,
@@ -424,6 +549,9 @@ impl FormatReader for LsmReader {
             modulo_t: None,
         };
 
+        self.split_planes = split_planes;
+        self.channel_names = lsm_info.channel_names;
+        self.image_name = image_name;
         self.meta = Some(meta);
         self.path = Some(path.to_path_buf());
         Ok(())
@@ -432,6 +560,9 @@ impl FormatReader for LsmReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.split_planes = false;
+        self.channel_names = Vec::new();
+        self.image_name = None;
         let _ = self.inner.close();
         Ok(())
     }
@@ -459,13 +590,9 @@ impl FormatReader for LsmReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let count = self.meta.as_ref().map(|m| m.image_count).unwrap_or(0);
-        if plane_index >= count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let inner_count = self.inner.metadata().image_count;
-        let inner_idx = resolve_lsm_plane_index(plane_index, count, inner_count)?;
-        self.inner.open_bytes(inner_idx)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let (w, h) = (meta.size_x, meta.size_y);
+        self.open_bytes_region(plane_index, 0, 0, w, h)
     }
 
     fn open_bytes_region(
@@ -481,6 +608,34 @@ impl FormatReader for LsmReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let inner_count = self.inner.metadata().image_count;
+
+        if self.split_planes {
+            // One physical IFD packs all channels in planar order. Map the
+            // logical plane to (ifd, channel) and slice the channel out, mirroring
+            // ZeissLSMReader.java:410-428 (getSamples + ImageTools.splitChannels,
+            // non-interleaved). dimensionOrder is XY C..., so C is the fastest
+            // axis: ifd = no / sizeC, channel = no % sizeC.
+            let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            let size_c = meta.size_c.max(1);
+            let bpp = meta.pixel_type.bytes_per_sample();
+            let physical = plane_index / size_c;
+            let channel = (plane_index % size_c) as usize;
+            if physical >= inner_count {
+                return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            }
+            let packed = self.inner.open_bytes_region(physical, x, y, w, h)?;
+            let chan_len = (w as usize) * (h as usize) * bpp;
+            let start = chan_len * channel;
+            let end = start + chan_len;
+            if end > packed.len() {
+                return Err(BioFormatsError::Format(format!(
+                    "LSM: split-channel slice {start}..{end} exceeds plane length {}",
+                    packed.len()
+                )));
+            }
+            return Ok(packed[start..end].to_vec());
+        }
+
         let inner_idx = resolve_lsm_plane_index(plane_index, count, inner_count)?;
         self.inner.open_bytes_region(inner_idx, x, y, w, h)
     }
@@ -509,6 +664,17 @@ impl FormatReader for LsmReader {
         img.physical_size_x = get_f("voxel_size_x_um");
         img.physical_size_y = get_f("voxel_size_y_um");
         img.physical_size_z = get_f("voxel_size_z_um");
+        img.time_increment = get_f("time_increment_s");
+        img.name = self.image_name.clone();
+        // Channel names from the CZ-LSMINFO channel-colours sub-block
+        // (ZeissLSMReader.java:1351 store.setChannelName).
+        for (ci, name) in self.channel_names.iter().enumerate() {
+            if let Some(ch) = img.channels.get_mut(ci) {
+                if !name.is_empty() {
+                    ch.name = Some(name.clone());
+                }
+            }
+        }
         Some(ome)
     }
 }
@@ -536,14 +702,38 @@ mod tests {
     }
 
     #[test]
-    fn lsm_channel_split_planes_are_not_treated_as_packed_rgb() {
-        assert!(!lsm_uses_packed_channels(1, 3, 1, 1, 3));
-        assert_eq!(checked_plane_count(1, 3, 1).unwrap(), 3);
+    fn lsm_split_plane_image_count_multiplies_by_channels() {
+        // Packed multichannel: one IFD per Z/T plane carries all channels, so
+        // the logical plane count is Z*C*T.
+        assert_eq!(checked_plane_count(33, 2, 1).unwrap(), 66);
+        assert_eq!(checked_plane_count(2, 3, 4).unwrap(), 24);
     }
 
     #[test]
-    fn lsm_packed_channels_use_one_physical_ifd_per_zt_plane() {
-        assert!(lsm_uses_packed_channels(2, 3, 4, 3, 8));
-        assert_eq!(checked_plane_count(2, 1, 4).unwrap(), 8);
+    fn lsm_dimension_order_shuffles_c_when_packed() {
+        // scanType 0 -> XYZCT, RGB-style shuffle moves C to front -> XYCZT.
+        assert_eq!(lsm_dimension_order(0, false), DimensionOrder::XYZCT);
+        assert_eq!(lsm_dimension_order(0, true), DimensionOrder::XYCZT);
+    }
+
+    #[test]
+    fn lsm_parse_channel_names_reads_length_prefixed_table() {
+        let le = true;
+        // channel-colours sub-block at file offset 4. Layout:
+        //   +12 colorsOffset (int), +16 namesOffset (int)
+        // names table at offset 4 + namesOffset.
+        let names_offset: i32 = 24;
+        let mut buf = vec![0u8; 4]; // 0..4 header padding (base = 4)
+        buf.resize(4 + names_offset as usize, 0); // fill up to the names table
+                                                   // +12 colorsOffset, +16 namesOffset relative to base=4
+        buf[4 + 12..4 + 16].copy_from_slice(&0i32.to_le_bytes());
+        buf[4 + 16..4 + 20].copy_from_slice(&names_offset.to_le_bytes());
+        // names table at base + names_offset = index 28
+        for name in ["Ch2-T1\0", "Ch1-T2\0"] {
+            buf.extend_from_slice(&(name.len() as i32).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+        }
+        let names = parse_channel_names(&buf, 4, 2, le);
+        assert_eq!(names, vec!["Ch2-T1".to_string(), "Ch1-T2".to_string()]);
     }
 }

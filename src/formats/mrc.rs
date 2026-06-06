@@ -603,10 +603,19 @@ impl FormatReader for MrcReader {
                 None
             }
         };
-        // Stored in Ångströms → convert to µm (÷10)
-        img.physical_size_x = get_f("PhysicalSizeXAngstrom").map(|v| v / 10.0);
-        img.physical_size_y = get_f("PhysicalSizeYAngstrom").map(|v| v / 10.0);
-        img.physical_size_z = get_f("PhysicalSizeZAngstrom").map(|v| v / 10.0);
+        // Java stores xlen/mx directly as an OME Length with unit ANGSTROM
+        // (FormatTools.getPhysicalSizeX(xSize, UNITS.ANGSTROM)); the stored value
+        // keeps the raw Ångström number, so we must NOT rescale to µm.
+        img.physical_size_x = get_f("PhysicalSizeXAngstrom");
+        img.physical_size_y = get_f("PhysicalSizeYAngstrom");
+        img.physical_size_z = get_f("PhysicalSizeZAngstrom");
+        // Java leaves the default image name (the file name).
+        if let Some(p) = self.path.as_ref() {
+            img.name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+        }
         Some(ome)
     }
 }
