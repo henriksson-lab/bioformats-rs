@@ -363,7 +363,9 @@ fn parse_zvi_item(data: &[u8]) -> Result<Option<ParsedItem>> {
             "ZVI: unsupported bytes-per-pixel value {bpp}"
         )));
     }
-    s.skip(4);
+    // ZeissZVIReader: a single skipBytes(4) sits between the bytes-per-pixel
+    // field and the `valid` flag. A second skip here over-counted by 4 bytes,
+    // shifting the pixel-data offset and truncating the raw plane.
     s.skip(4);
 
     let Some(valid) = s.read_i32() else {
@@ -414,11 +416,49 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
         cfb::open(path).map_err(|e| BioFormatsError::Format(format!("ZVI CFB open error: {e}")))?;
 
     // ── Enumerate image item streams ─────────────────────────────────────────
+    // Faithful to ZeissZVIReader.fillMetadataPass1 / countImages: a pixel plane
+    // is any stream whose final path component upper-cases to "CONTENTS" and
+    // whose immediate parent directory is "Image" or contains "ITEM"
+    // (case-insensitive), excluding the "Scaling" metadata storage. Real files
+    // name the stream "Contents" (mixed case) and number items from 0, so the
+    // earlier strict "/Image/Item(N)/CONTENTS" match found nothing.
+    let item_num = |s: &str| -> u32 {
+        // Parse N from the ".../Item(N)/..." parent directory, case-insensitively.
+        let upper = s.to_ascii_uppercase();
+        if let Some(item_pos) = upper.rfind("ITEM(") {
+            let after = &s[item_pos + "ITEM(".len()..];
+            if let Some(close) = after.find(')') {
+                if let Ok(n) = after[..close].parse() {
+                    return n;
+                }
+            }
+        }
+        0
+    };
+
     let mut item_paths: Vec<String> = comp
         .walk()
         .filter_map(|entry| {
+            if !entry.is_stream() {
+                return None;
+            }
             let p = entry.path().to_string_lossy().to_string();
-            if p.starts_with("/Image/Item(") && p.ends_with(")/CONTENTS") {
+            // Final component must be "CONTENTS" (case-insensitive).
+            let last = p.rsplit('/').next().unwrap_or("");
+            if !last.eq_ignore_ascii_case("CONTENTS") {
+                return None;
+            }
+            // Immediate parent directory name.
+            let parent = p
+                .rsplitn(2, '/')
+                .nth(1)
+                .map(|d| d.rsplit('/').next().unwrap_or(d))
+                .unwrap_or("");
+            let parent_upper = parent.to_ascii_uppercase();
+            if parent_upper.contains("SCALING") {
+                return None;
+            }
+            if parent == "Image" || parent_upper.contains("ITEM") {
                 Some(p)
             } else {
                 None
@@ -427,13 +467,6 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
         .collect();
 
     // Numeric sort by item index.
-    let item_num = |s: &str| -> u32 {
-        s.trim_start_matches("/Image/Item(")
-            .split(')')
-            .next()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0)
-    };
     item_paths.sort_by_key(|p| item_num(p));
 
     let mut planes: Vec<ZviPlane> = Vec::with_capacity(item_paths.len());
@@ -488,7 +521,15 @@ fn parse_zvi(path: &Path) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, 
 
     for plane in &planes {
         let image_num = item_num(&plane.stream_path) as usize;
-        let tag_path = format!("/Image/Item({image_num})/Tags/CONTENTS");
+        // The per-item Tags stream sits next to the pixel stream, e.g.
+        // "/Image/Item(N)/Contents" -> "/Image/Item(N)/Tags/Contents". Derive it
+        // from the real (case-preserved) item path so it works regardless of the
+        // "Contents"/"CONTENTS" spelling the file uses.
+        let (parent, contents_name) = plane
+            .stream_path
+            .rsplit_once('/')
+            .unwrap_or(("/Image/Item(0)", "Contents"));
+        let tag_path = format!("{parent}/Tags/{contents_name}");
         if let Ok(mut stream) = comp.open_stream(&tag_path) {
             let mut data = Vec::new();
             if stream.read_to_end(&mut data).is_ok() {
@@ -866,7 +907,7 @@ mod tests {
         item.extend_from_slice(&1i32.to_le_bytes()); // sizeY
         item.extend_from_slice(&[0u8; 4]); // skip(4)
         item.extend_from_slice(&1i32.to_le_bytes()); // bpp -> UINT8
-        item.extend_from_slice(&[0u8; 8]); // skip(4); skip(4)
+        item.extend_from_slice(&[0u8; 4]); // skip(4)
         item.extend_from_slice(&2i32.to_le_bytes()); // valid=2 -> uncompressed
         item.extend_from_slice(&[pixel, 0, 0, 0]); // check / first-pixel region
         item

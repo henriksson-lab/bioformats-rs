@@ -291,11 +291,24 @@ impl OifReader {
         // ("-R") planes that resolve to a ".tif" name. Used in the image-count
         // reconciliation branch below.
         let mut preview_count: usize = 0;
+        // FV1000 v2 datasets omit the per-plane `IniFileNameN` keys and instead
+        // give the first/last `.pty` name plus a `printf`-style pattern
+        // (`PtyFileNameS`/`PtyFileNameE`/`PtyFileNameT2`). Java's addPtyFiles()
+        // expands these into the full plane list when `filenames` is empty.
+        let mut pty_start: Option<String> = None;
+        let mut pty_end: Option<String> = None;
+        let mut pty_pattern: Option<String> = None;
         if let Some(save_info) = f.table("ProfileSaveInfo") {
             for (key, value) in save_info {
                 let value = sanitize_value(value);
                 let value = value.trim().to_string();
-                if key.starts_with("IniFileName")
+                if key == "PtyFileNameS" {
+                    pty_start = Some(value);
+                } else if key == "PtyFileNameE" {
+                    pty_end = Some(value);
+                } else if key == "PtyFileNameT2" {
+                    pty_pattern = Some(value);
+                } else if key.starts_with("IniFileName")
                     && !key.contains("Thumb")
                     && !is_preview_name(&value)
                 {
@@ -317,6 +330,17 @@ impl OifReader {
                     }
                 }
             }
+        }
+
+        // FV1000 v2: expand the `.pty` name pattern when no explicit
+        // `IniFileNameN` entries were present (Java FV1000Reader.addPtyFiles).
+        if filenames.is_empty() {
+            add_pty_files(
+                &mut filenames,
+                pty_start.as_deref(),
+                pty_end.as_deref(),
+                pty_pattern.as_deref(),
+            );
         }
 
         // ---- Axis N Parameters Common: AxisCode / MaxSize ----
@@ -371,6 +395,7 @@ impl OifReader {
             };
             ki += 1;
             file = sanitize_file(&file, &self.path_prefix);
+            file = self.resolve_pty_path(&file);
 
             // Establish tiff directory from the .pty location.
             if let Some(slash) = file.rfind('/') {
@@ -664,6 +689,38 @@ impl OifReader {
         Ok(())
     }
 
+    /// Resolve a `.pty`/`.tif` path on disk (OIF only).
+    ///
+    /// The `PtyFileNameS/E/T2` pattern embeds the directory under which the data
+    /// was originally acquired (e.g. `28hpf CTRL E1S4.oif.files/`), which need
+    /// not match the current on-disk companion directory. Mirroring Java
+    /// FV1000Reader's "Could not find .pty file" fallback, when the resolved
+    /// path does not exist we retry against the real companion directory using
+    /// just the file's basename. For OIB the path is a logical stream name, so
+    /// this is a no-op.
+    fn resolve_pty_path(&self, file: &str) -> String {
+        if !matches!(self.source, FileSource::Disk) {
+            return file.to_string();
+        }
+        if Path::new(file).exists() {
+            return file.to_string();
+        }
+        let base = file.rsplit('/').next().unwrap_or(file);
+        let prefix = &self.path_prefix;
+        let candidate = if prefix.is_empty() {
+            base.to_string()
+        } else if prefix.ends_with('/') {
+            format!("{prefix}{base}")
+        } else {
+            format!("{prefix}/{base}")
+        };
+        if Path::new(&candidate).exists() {
+            candidate
+        } else {
+            file.to_string()
+        }
+    }
+
     /// Read a plane's bytes from its resolved TIFF (disk or OLE2 stream).
     fn read_plane(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
@@ -789,6 +846,160 @@ fn sanitize_file(file: &str, path: &str) -> String {
     }
 }
 
+/// Expand the FV1000 v2 `.pty` file-name pattern into an explicit plane list.
+///
+/// Mirrors Java FV1000Reader.addPtyFiles: given the first (`start`) and last
+/// (`end`) `.pty` names and a `printf`-style `pattern` (typically
+/// `s_C%03dT%03d.pty`), enumerate every block-index combination in raster order
+/// and store the resulting names keyed by 0-based plane index.
+fn add_pty_files(
+    filenames: &mut BTreeMap<usize, String>,
+    start: Option<&str>,
+    end: Option<&str>,
+    pattern: Option<&str>,
+) {
+    let (Some(start), Some(end)) = (start, end) else {
+        return;
+    };
+
+    // Java defaults a missing pattern to "<dir>/s_C%03dT%03d.pty".
+    let pattern_owned;
+    let pattern = match pattern {
+        Some(p) => p,
+        None => {
+            let dir = match start.find('/') {
+                Some(i) => &start[..=i],
+                None => "",
+            };
+            pattern_owned = format!("{dir}s_C%03dT%03d.pty");
+            &pattern_owned
+        }
+    };
+
+    let prefixes: Vec<&str> = pattern.split("%03d").collect();
+    if prefixes.len() < 2 {
+        return;
+    }
+
+    let first = match scan_format(pattern, start) {
+        Some(v) => v,
+        None => return,
+    };
+    let last = match scan_format(pattern, end) {
+        Some(v) => v,
+        None => return,
+    };
+    if first.len() != last.len() || first.is_empty() {
+        return;
+    }
+
+    let mut lengths = Vec::with_capacity(first.len());
+    let mut total_files: usize = 1;
+    for i in 0..first.len() {
+        if last[i] < first[i] {
+            return;
+        }
+        let len = (last[i] - first[i] + 1) as usize;
+        lengths.push(len);
+        total_files = total_files.saturating_mul(len);
+    }
+
+    for file in 0..total_files {
+        let pos = raster_to_position(&lengths, file);
+        let mut pty = String::new();
+        for (block, prefix) in prefixes.iter().enumerate() {
+            pty.push_str(prefix);
+            if block < pos.len() {
+                // Java emits `first[block] + pos[block]`, zero-padded to 3.
+                let num = first[block] as usize + pos[block];
+                pty.push_str(&format!("{num:03}"));
+            }
+        }
+        filenames.insert(file, pty);
+    }
+}
+
+/// Extract the integer blocks of `string` that fill the `%03d` slots of
+/// `pattern`. Mirrors Java FV1000Reader.scanFormat; returns `None` if the
+/// string does not conform to the pattern.
+fn scan_format(pattern: &str, string: &str) -> Option<Vec<i64>> {
+    let pat: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = string.chars().collect();
+
+    // Offsets of each "%0" marker in the pattern.
+    let mut percent_offsets = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < pat.len() {
+        if pat[i] == '%' && pat[i + 1] == '0' {
+            percent_offsets.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut result = Vec::with_capacity(percent_offsets.len());
+    let mut pattern_offset = 0usize;
+    let mut offset = 0usize;
+    for &percent in &percent_offsets {
+        let lit = percent - pattern_offset;
+        // The literal text between the previous field and this one must match.
+        if offset + lit > s.len() || s[offset..offset + lit] != pat[pattern_offset..percent] {
+            return None;
+        }
+        offset += lit;
+        pattern_offset = percent;
+
+        let mut end_offset = offset;
+        while end_offset < s.len() && s[end_offset].is_ascii_digit() {
+            end_offset += 1;
+        }
+        if end_offset == offset {
+            return None;
+        }
+        let num: i64 = s[offset..end_offset]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()?;
+        result.push(num);
+        offset = end_offset;
+
+        // Skip the format specifier in the pattern (advance past the 'd').
+        pattern_offset += 1;
+        while pattern_offset < pat.len() && pat[pattern_offset - 1] != 'd' {
+            pattern_offset += 1;
+        }
+    }
+
+    // Trailing literal text must match exactly.
+    let remaining = pat.len() - pattern_offset;
+    if s.len() - offset != remaining || s[offset..] != pat[pattern_offset..] {
+        return None;
+    }
+    Some(result)
+}
+
+/// Column-major (raster) decomposition of a linear index into per-block
+/// coordinates. Mirrors Java FormatTools.rasterToPosition.
+fn raster_to_position(lengths: &[usize], raster: usize) -> Vec<usize> {
+    let mut pos = vec![0usize; lengths.len()];
+    let mut offset = 1usize;
+    let mut raster = raster;
+    for i in 0..lengths.len() {
+        let offset1 = offset * lengths[i];
+        let q = if i < lengths.len() - 1 {
+            raster % offset1
+        } else {
+            raster
+        };
+        pos[i] = q / offset;
+        raster -= q;
+        offset = offset1;
+    }
+    pos
+}
+
 fn parse_dimension_order(s: &str) -> DimensionOrder {
     // s starts with "XY".
     let rest: Vec<char> = s.chars().skip(2).collect();
@@ -803,10 +1014,21 @@ fn parse_dimension_order(s: &str) -> DimensionOrder {
     }
 }
 
-/// Find the companion `.files/` (or stem) directory for an `.oif`.
+/// Find the companion `.files/` directory for an `.oif`.
+///
+/// Real Olympus datasets name the companion directory `<full .oif file
+/// name>.files` (e.g. `scan.oif.files`), so the primary candidate keeps the
+/// `.oif` suffix. The `<stem>.files` and `<stem>` forms are kept as fallbacks
+/// for synthetic/legacy layouts.
 fn find_companion_dir(oif_path: &Path) -> Option<PathBuf> {
-    let stem = oif_path.file_stem()?;
     let parent = oif_path.parent()?;
+    if let Some(name) = oif_path.file_name() {
+        let d0 = parent.join(format!("{}.files", name.to_string_lossy()));
+        if d0.is_dir() {
+            return Some(d0);
+        }
+    }
+    let stem = oif_path.file_stem()?;
     let d1 = parent.join(format!("{}.files", stem.to_string_lossy()));
     if d1.is_dir() {
         return Some(d1);

@@ -24,10 +24,13 @@ pub fn decompress(
         Compression::Lzw => decompress_lzw(data)?,
         Compression::Deflate | Compression::DeflateOld => decompress_deflate(data)?,
         Compression::PackBits => decompress_packbits(data)?,
-        Compression::JpegNew => decompress_jpeg(data)?,
-        Compression::Jpeg => {
+        Compression::Jpeg | Compression::JpegNew => {
+            // New-style (technote, code 7) and old-style (code 6) JPEG both store
+            // the abbreviated quantization/Huffman tables in the JPEGTables tag
+            // (347), spliced ahead of each tile/strip's entropy-coded scan. Mirror
+            // Java TiffParser.getTile: tile = jpegTable[..len-2] + scan[2..].
             if let Some(tables) = jpeg_tables {
-                let combined = merge_old_style_jpeg_tables(tables, data);
+                let combined = merge_jpeg_tables(tables, data);
                 decompress_jpeg(&combined)?
             } else {
                 decompress_jpeg(data)?
@@ -101,7 +104,7 @@ pub fn decompress(
     Ok(out)
 }
 
-fn merge_old_style_jpeg_tables(tables: &[u8], data: &[u8]) -> Vec<u8> {
+fn merge_jpeg_tables(tables: &[u8], data: &[u8]) -> Vec<u8> {
     if !starts_with_soi(tables) {
         return data.to_vec();
     }

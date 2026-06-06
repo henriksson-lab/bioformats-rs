@@ -86,6 +86,19 @@ real_data_test!(real_sdt, "sdt/FocalCheck.sdt");
 real_data_test!(real_bdv, "bdv/HisYFP-SPIM.h5");
 real_data_test!(real_ndpi_small, "ndpi/CMU-1.ndpi");
 
+// Formats fetched by scripts/download_biostudies_data.sh (EMBL-EBI BioImage
+// Archive / EMPIAR). Skipped until downloaded; a failure here is a genuine
+// reader finding (some of these readers may still be stubs).
+real_data_test!(real_oib, "oib/cry11_colocalization.oib");
+real_data_test!(real_oir, "oir/atg8_fig3a_mip.oir");
+real_data_test!(real_zvi, "zvi/fig3d_wt_sting_cd31.zvi");
+real_data_test!(real_avi, "avi/cryper2_newborn.avi");
+real_data_test!(real_psd, "psd/fgf8_pcw5.psd");
+real_data_test!(real_dm3, "dm3/clem_fig3b.dm3");
+real_data_test!(real_imagic, "imagic/12409.stpm.hed");
+real_data_test!(real_vsi, "vsi/HN 485 HNSCC APOBEC3A-1.1000.vsi");
+real_data_test!(real_oif, "oif/Source Data Figure S5c-d CTRL.oif");
+
 /// The >4 GB Hamamatsu NDPI: exercises the 64-bit offset reconstruction
 /// (Mechanism A/B). A region near the bottom-right of full resolution is read;
 /// those JPEG tiles are stored past 4 GB in the file, so a successful decode

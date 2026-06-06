@@ -13,6 +13,7 @@ time of writing. Sizes come from the source directory listings.
 |---|---|
 | `download_ndpi.sh` | **Hamamatsu NDPI focus**, including the >4 GB 64-bit-offset test. |
 | `download_test_data.sh` | One section per format, with a `--format <name>` selector. |
+| `download_biostudies_data.sh` | Formats **not** covered above, sourced from the EMBL-EBI [BioImage Archive](https://www.ebi.ac.uk/bioimage-archive/) (+ EMPIAR): `oib oir zvi avi psd dm3 imagic vsi oif`. `--list` also documents which supported formats are **absent** from the archive. |
 
 ### Usage
 
@@ -27,7 +28,16 @@ scripts/download_test_data.sh --list
 scripts/download_test_data.sh --format czi --format lif
 DEST=/data/samples scripts/download_test_data.sh --format dicom
 scripts/download_test_data.sh                  # download everything (large!)
+
+# BioImage Archive formats not in download_test_data.sh
+scripts/download_biostudies_data.sh --list
+scripts/download_biostudies_data.sh --format oib --format zvi
+scripts/download_biostudies_data.sh --format psd    # smallest (~1 MB)
 ```
+
+All three scripts share the `./testdata/<fmt>/` layout that
+`tests/real_data_test.rs` expects, so downloaded files are picked up by the
+real-data integration tests automatically.
 
 Both scripts use resumable downloads (`curl -L -C -`); re-run to continue an
 interrupted transfer.

@@ -339,20 +339,39 @@ impl IcsReader {
 
     fn data_path(ics_path: &Path, hdr: &IcsHeader) -> Result<PathBuf> {
         if hdr.version < 2.0 {
-            // ICS1: companion data file, named explicitly when available.
+            // ICS1: the companion .ids lives next to the .ics on disk with the
+            // same stem (Bio-Formats derives it from the actual file path, not
+            // from the `filename` recorded inside the header — that internal
+            // name may differ from the on-disk name). Match the .ics extension
+            // case so .ICS -> .IDS, .ics -> .ids.
+            let derived = match ics_path
+                .extension()
+                .and_then(|e| e.to_str())
+            {
+                Some(ext) if ext.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
+                    ics_path.with_extension("IDS")
+                }
+                _ => ics_path.with_extension("ids"),
+            };
+            if derived.exists() {
+                return Ok(derived);
+            }
+            // The sibling .ids is not present on disk; fall back to the
+            // header-recorded companion name when available (it may differ from
+            // the on-disk stem). Reject names that escape the image directory.
             if let Some(filename) = &hdr.filename {
                 let name = filename.to_string_lossy();
-                confined_join(ics_path.parent().unwrap_or_else(|| Path::new("")), &name).ok_or_else(
-                    || {
-                        BioFormatsError::Format(format!(
-                            "ICS companion filename escapes image directory: {name}"
-                        ))
-                    },
+                return confined_join(
+                    ics_path.parent().unwrap_or_else(|| Path::new("")),
+                    &name,
                 )
-            } else {
-                let stem = ics_path.file_stem().unwrap_or_default();
-                Ok(ics_path.with_file_name(format!("{}.ids", stem.to_string_lossy())))
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "ICS companion filename escapes image directory: {name}"
+                    ))
+                });
             }
+            Ok(derived)
         } else {
             Ok(ics_path.to_path_buf())
         }

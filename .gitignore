@@ -16,3 +16,5 @@ __pycache__/
 /test/
 /convo.txt
 testdata/
+parity/target/
+.claude/

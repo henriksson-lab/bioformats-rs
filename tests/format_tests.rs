@@ -7448,8 +7448,9 @@ fn zvi_preserves_tag_stream_ids_names_and_values() {
         item.extend_from_slice(&[0u8; 4]);
         // bpp (1 => UINT8, grayscale)
         item.extend_from_slice(&1i32.to_le_bytes());
-        // skipBytes(4); skipBytes(4)
-        item.extend_from_slice(&[0u8; 8]);
+        // skipBytes(4) — single skip between bpp and `valid`, per
+        // ZeissZVIReader.fillMetadataPass1.
+        item.extend_from_slice(&[0u8; 4]);
         // valid (use 2 so the data is treated as uncompressed)
         item.extend_from_slice(&2i32.to_le_bytes());
         // check / first pixel bytes: pixel data offset = filePointer - 4, i.e.

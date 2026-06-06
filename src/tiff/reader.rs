@@ -1054,7 +1054,11 @@ impl TiffReader {
         }
 
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
-        if info.photometric == Photometric::YCbCr && is_unsupported_ycbcr(info) {
+        // JPEG-compressed YCbCr decodes to RGB inside the JPEG codec, so it takes
+        // the generic chunky path below (ycbcr = false). Only the manual TIFF
+        // YCbCr conversion path has the 8-bit/chunky restriction.
+        let jpeg_ycbcr = ycbcr_decoded_by_jpeg(info);
+        if info.photometric == Photometric::YCbCr && !jpeg_ycbcr && is_unsupported_ycbcr(info) {
             return Err(BioFormatsError::UnsupportedFormat(
                 "Only 8-bit chunky non-JPEG TIFF YCbCr is supported".into(),
             ));
@@ -1064,7 +1068,7 @@ impl TiffReader {
         let effective_spp = info.samples_per_pixel as u32;
         let packed_row_layout = info.bits_per_sample % 8 != 0;
         let subbyte_samples = info.bits_per_sample < 8;
-        let ycbcr = info.photometric == Photometric::YCbCr;
+        let ycbcr = info.photometric == Photometric::YCbCr && !jpeg_ycbcr;
         let row_bytes = if ycbcr {
             checked_ycbcr_strip_bytes(info.width, 1, info.ycbcr_subsampling)?
         } else if packed_row_layout {
@@ -1536,7 +1540,10 @@ impl TiffReader {
             return self.read_planar_tiled_plane(info, x, y, w, h);
         }
 
-        if info.photometric == Photometric::YCbCr {
+        // JPEG-compressed YCbCr tiles decode to chunky RGB inside the JPEG codec;
+        // fall through to the generic chunky-RGB tile path. Only non-JPEG YCbCr
+        // uses the manual TIFF YCbCr (tag 529/532) conversion.
+        if info.photometric == Photometric::YCbCr && !ycbcr_decoded_by_jpeg(info) {
             if is_unsupported_ycbcr(info) {
                 return Err(BioFormatsError::UnsupportedFormat(
                     "Only 8-bit chunky non-JPEG TIFF YCbCr is supported".into(),
@@ -3027,14 +3034,21 @@ fn apply_photometric(
     }
 }
 
+/// True when a YCbCr IFD is JPEG-compressed (old- or new-style). The JPEG
+/// decoder performs the YCbCr->RGB conversion internally and emits chunky RGB,
+/// so these IFDs are decoded through the generic RGB path rather than the manual
+/// TIFF YCbCr (tag 529/532) conversion. Mirrors Java, where the JPEG codec
+/// returns RGB and TiffParser does not re-apply YCbCr math to JPEG output.
+fn ycbcr_decoded_by_jpeg(info: &IfdInfo) -> bool {
+    info.photometric == Photometric::YCbCr
+        && matches!(info.compression, Compression::Jpeg | Compression::JpegNew)
+}
+
 fn is_unsupported_ycbcr(info: &IfdInfo) -> bool {
     info.bits_per_sample != 8
         || info.planar_config != 1
         || info.samples_per_pixel < 3
-        || matches!(
-            info.compression,
-            Compression::Jpeg | Compression::JpegNew | Compression::JpegXR
-        )
+        || matches!(info.compression, Compression::JpegXR)
 }
 
 fn ycbcr_strip_bytes(width: u32, rows: u32, subsampling: (u16, u16)) -> usize {
