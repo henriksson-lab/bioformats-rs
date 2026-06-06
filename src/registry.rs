@@ -37,6 +37,12 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::czi::CziReader::new()),
         Box::new(crate::formats::nd2::Nd2Reader::new()),
         Box::new(crate::formats::lif::LifReader::new()),
+        // DeltaVision must precede MRC: both readers' byte signatures accept a
+        // file with plausible NX/NY/NZ in the first 12 bytes, and a .dv file
+        // qualifies. Java's readers.txt lists DeltavisionReader before MRCReader
+        // for exactly this reason, so the PRIISM magic (offset 96 == -16224)
+        // wins over MRC's looser heuristic.
+        Box::new(crate::formats::deltavision::DeltavisionReader::new()),
         Box::new(crate::formats::mrc::MrcReader::new()),
         Box::new(crate::formats::fits::FitsReader::new()),
         Box::new(crate::formats::nrrd::NrrdReader::new()),
@@ -55,7 +61,6 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::raster::farbfeld_reader()),
         // Additional scientific formats
         Box::new(crate::formats::biorad::BioRadReader::new()),
-        Box::new(crate::formats::deltavision::DeltavisionReader::new()),
         Box::new(crate::formats::spe::SpeReader::new()),
         Box::new(crate::formats::andor::AndorSifReader::new()),
         Box::new(crate::formats::amira::AmiraReader::new()),

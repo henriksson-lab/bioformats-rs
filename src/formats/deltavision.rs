@@ -636,10 +636,13 @@ impl FormatReader for DeltavisionReader {
         let num_z = positive_i32_dim(r_i32(&hdr, 8, le), "section count")?;
         let mode = r_i32(&hdr, 12, le);
         let ext_hdr_size = r_i32(&hdr, 92, le).max(0) as u64;
-        // pixel spacings
-        let dx = r_f32(&hdr, 28, le);
-        let dy = r_f32(&hdr, 32, le);
-        let dz = r_f32(&hdr, 36, le);
+        // Pixel spacings (µm). Java DeltavisionReader seeks to offset 16 and
+        // reads 6 ints (subImageStart X/Y/Z at 16/20/24, pixelSampling X/Y/Z at
+        // 28/32/36) before the three pixel-size floats, so pixX/pixY/pixZ live at
+        // offsets 40/44/48 — not 28/32/36, which hold integer sampling counts.
+        let dx = r_f32(&hdr, 40, le);
+        let dy = r_f32(&hdr, 44, le);
+        let dz = r_f32(&hdr, 48, le);
         let file_type = r_i16(&hdr, 160, le);
 
         // NumWaves at offset 196, NumTimes at offset 180 (Bio-Formats offsets)
@@ -959,6 +962,14 @@ impl FormatReader for DeltavisionReader {
         let meta = self.series.get(self.current_series)?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
         let img = &mut ome.images[0];
+        if img.name.is_none() {
+            img.name = self
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+        }
         let get_f = |k: &str| -> Option<f64> {
             if let Some(MetadataValue::Float(v)) = meta.series_metadata.get(k) {
                 Some(*v)

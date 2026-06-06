@@ -20,6 +20,7 @@ use quick_xml::events::Event;
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::ImageMetadata;
+use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
@@ -41,6 +42,9 @@ struct SeriesInfo {
     tile_count: u32,
     /// Bytes-per-tile increment from the tile dimension (DimID 10).
     tile_bytes_inc: u64,
+    /// OME-level metadata (image name, physical sizes, channel names) derived
+    /// from the LIF XML, mirroring Java `LIFReader`.
+    ome: OmeImage,
 }
 
 pub struct LifReader {
@@ -425,6 +429,16 @@ impl FormatReader for LifReader {
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.open_bytes(plane_index)
     }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        if self.series.is_empty() {
+            return None;
+        }
+        Some(OmeMetadata {
+            images: self.series.iter().map(|s| s.ome.clone()).collect(),
+            ..OmeMetadata::default()
+        })
+    }
 }
 
 impl LifReader {
@@ -623,7 +637,8 @@ fn parse_xml(xml: &str) -> Result<(Vec<SeriesInfo>, Vec<String>)> {
             .next()
             .and_then(|m| dom.nodes[m].attrs.get("MemoryBlockID").cloned());
 
-        let info = translate_image(&dom, img)?;
+        let mut info = translate_image(&dom, img)?;
+        info.ome.name = Some(image_name(&dom, img));
         let tiles = info.tile_count.max(1);
         for _ in 0..tiles {
             series.push(info.clone());
@@ -632,6 +647,40 @@ fn parse_xml(xml: &str) -> Result<(Vec<SeriesInfo>, Vec<String>)> {
     }
 
     Ok((series, ordered_ids))
+}
+
+/// Mirror of Java `translateImageNames`: walk the ancestor chain of an
+/// `<Image>` element, collecting the `Name` attribute of every enclosing
+/// `<Element>` (innermost first) until the `LEICA` root (or top) is reached,
+/// then concatenate them — dropping the outermost (experiment) name — joined by
+/// `/`. For a top-level image this yields just the image element's own name.
+fn image_name(dom: &Dom, img: usize) -> String {
+    let mut names: Vec<String> = Vec::new();
+    let mut cur = dom.nodes[img].parent;
+    while let Some(idx) = cur {
+        let node = &dom.nodes[idx];
+        if node.name == "LEICA" {
+            break;
+        }
+        if node.name == "Element" {
+            names.push(node.attrs.get("Name").cloned().unwrap_or_default());
+        }
+        cur = node.parent;
+    }
+    // Java: name = ""; for (k = names.size()-2; k >= 0; k--) { name += names[k]; if (k>0) name += "/"; }
+    if names.len() < 2 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut k = names.len() as isize - 2;
+    while k >= 0 {
+        out.push_str(&names[k as usize]);
+        if k > 0 {
+            out.push('/');
+        }
+        k -= 1;
+    }
+    out
 }
 
 /// Mirror of Java `translateImageNodes`: derive dimensions/pixel type from the
@@ -683,6 +732,12 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
     let mut is_rgb = false;
     let mut pixel_type = PixelType::Uint8;
 
+    // Physical pixel sizes (µm), mirroring Java `translateImageNodes`:
+    // length / (numElements - 1), unit-normalised to µm (Unit="m" → ×1e6).
+    let mut physical_size_x: Option<f64> = None;
+    let mut physical_size_y: Option<f64> = None;
+    let mut physical_size_z: Option<f64> = None;
+
     for &d in &dim_nodes {
         let attrs = &dom.nodes[d].attrs;
         let id: i32 = attrs
@@ -698,9 +753,13 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
 
+        // Calibration: length / (numElements - 1), normalised to µm.
+        let phys = physical_size_um(attrs, len);
+
         match id {
             1 => {
                 size_x = len;
+                physical_size_x = phys;
                 is_rgb = n_bytes > 0 && n_bytes % 3 == 0;
                 if is_rgb {
                     n_bytes /= 3;
@@ -711,6 +770,7 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
                 if size_y != 0 {
                     if size_z <= 1 {
                         size_z = len;
+                        physical_size_z = phys.map(f64::abs);
                         bytes_per_axis.insert(n_bytes, 'Z');
                     } else if size_t <= 1 {
                         size_t = len;
@@ -718,6 +778,7 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
                     }
                 } else {
                     size_y = len;
+                    physical_size_y = phys;
                 }
             }
             3 => {
@@ -725,9 +786,11 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
                     // XZ scan: swap Y and Z
                     size_y = len;
                     size_z = 1;
+                    physical_size_y = phys;
                     bytes_per_axis.insert(n_bytes, 'Y');
                 } else {
                     size_z = len;
+                    physical_size_z = phys.map(f64::abs);
                     bytes_per_axis.insert(n_bytes, 'Z');
                 }
             }
@@ -736,6 +799,7 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
                     // XT scan: swap Y and T
                     size_y = len;
                     size_t = 1;
+                    physical_size_y = phys;
                     bytes_per_axis.insert(n_bytes, 'Y');
                 } else {
                     size_t = len;
@@ -783,11 +847,94 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
     let rgb_channel_count = if is_rgb { m.size_c } else { 1 };
     m.image_count = size_z * size_t * (m.size_c / rgb_channel_count.max(1));
 
+    // Effective channel count (OME channels): one per ChannelDescription for
+    // non-RGB, or the RGB group count otherwise.
+    let effective_c = (m.size_c / rgb_channel_count.max(1)).max(1) as usize;
+    let ch_names = channel_names(dom, img, effective_c);
+    let channels: Vec<OmeChannel> = ch_names
+        .into_iter()
+        .map(|name| OmeChannel {
+            name,
+            samples_per_pixel: rgb_channel_count.max(1),
+            ..OmeChannel::default()
+        })
+        .collect();
+
+    let ome = OmeImage {
+        physical_size_x: physical_size_x.filter(|v| *v > 0.0),
+        physical_size_y: physical_size_y.filter(|v| *v > 0.0),
+        physical_size_z: physical_size_z.filter(|v| *v > 0.0),
+        channels,
+        ..OmeImage::default()
+    };
+
     Ok(SeriesInfo {
         meta: m,
         tile_count,
         tile_bytes_inc,
+        ome,
     })
+}
+
+/// Compute the physical pixel size in micrometres for one
+/// `<DimensionDescription>`, mirroring Java `translateImageNodes` with the
+/// default (non-legacy) calculation: `length / (numElements - 1)`, then
+/// unit-normalised (`Unit="m"` → ×1e6, `Unit="Ks"` → ÷1000). Returns `None`
+/// when there is no calibration (≤1 element or blank length).
+fn physical_size_um(attrs: &BTreeMap<String, String>, num_elements: u32) -> Option<f64> {
+    if num_elements <= 1 {
+        return None;
+    }
+    let raw = attrs.get("Length").map(|s| s.trim()).unwrap_or("");
+    if raw.is_empty() {
+        return None;
+    }
+    let length: f64 = raw.parse().ok()?;
+    let mut value = length / (num_elements as f64 - 1.0);
+    match attrs.get("Unit").map(String::as_str) {
+        Some("Ks") => value /= 1000.0,
+        Some("m") => value *= 1_000_000.0,
+        _ => {}
+    }
+    if value.is_finite() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Derive per-channel names, mirroring the subset of Java
+/// `LIFReader.translateDetectors` that populates `channelNames`. LIF stores dye
+/// names on `<MultiBand>` elements; Java collects the distinct dye names (an
+/// empty `DyeName` is kept as `""`) and assigns them to the *trailing*
+/// channels: channel `c` receives `dyeNames[c + dyeNames.len() - effectiveC]`
+/// when that index is valid, leaving leading channels unnamed (`None`).
+fn channel_names(dom: &Dom, img: usize, effective_c: usize) -> Vec<Option<String>> {
+    // Distinct dye names across all <MultiBand> descendants (dedup, keep "").
+    let mut multibands: Vec<usize> = Vec::new();
+    dom.descendants(img, "MultiBand", &mut multibands);
+    let mut dye_names: Vec<String> = Vec::new();
+    for &mb in &multibands {
+        let dye = dom.nodes[mb]
+            .attrs
+            .get("DyeName")
+            .cloned()
+            .unwrap_or_default();
+        if !dye_names.contains(&dye) {
+            dye_names.push(dye);
+        }
+    }
+
+    let mut names = vec![None; effective_c];
+    if !dye_names.is_empty() {
+        for (c, slot) in names.iter_mut().enumerate() {
+            let idx = c as isize + dye_names.len() as isize - effective_c as isize;
+            if idx >= 0 && (idx as usize) < dye_names.len() {
+                *slot = Some(dye_names[idx as usize].clone());
+            }
+        }
+    }
+    names
 }
 
 /// Java `FormatTools.pixelTypeFromBytes(nBytes, signed=false, fp=true)`:

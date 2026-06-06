@@ -81,8 +81,13 @@ public class BfParityOracle {
                     byte[] buf = reader.openBytes(p, 0, 0, w, h);
                     CRC32 crc = new CRC32();
                     crc.update(buf);
+                    // Also emit the raw region bytes (base64) so the Rust harness
+                    // can do a per-sample tolerance compare when the exact CRC
+                    // differs (e.g. JPEG IDCT rounding vs libjpeg).
+                    String b64 = java.util.Base64.getEncoder().encodeToString(buf);
                     entry = "{\"plane\":" + p + ",\"w\":" + w + ",\"h\":" + h
-                            + ",\"len\":" + buf.length + ",\"crc\":" + crc.getValue() + "}";
+                            + ",\"len\":" + buf.length + ",\"crc\":" + crc.getValue()
+                            + ",\"b64\":\"" + b64 + "\"}";
                 } catch (Throwable t) {
                     entry = "{\"plane\":" + p + ",\"error\":" + jstr(t.toString()) + "}";
                 }

@@ -4,45 +4,62 @@
 //! microscopy data.  Multi-setup, multi-timepoint, multi-resolution volumes.
 //!
 //! HDF5 group layout:
-//!   t{T:05}/s{C:02}/{level}/cells  — uint16 [z, y, x]
-//!   s{C:02}/resolutions            — float64 [n_levels, 3]
-//!   s{C:02}/subdivisions           — int32   [n_levels, 3]
+//!   t{T:05}/s{S:02}/{level}/cells  — uint16 [z, y, x]
+//!   s{S:02}/resolutions            — float64 [n_levels, 3]
+//!   s{S:02}/subdivisions           — int32   [n_levels, 3]
 //!
-//! Optional companion XML carries size and timepoint-range metadata.
+//! Companion XML (SpimData) carries the ViewSetups (sizes + voxel sizes) and
+//! the Timepoints range.
+//!
+//! ## Series model (Java parity)
+//!
+//! Java Bio-Formats' BDVReader flattens every `(ViewSetup × Timepoint ×
+//! resolution-level)` combination into a *separate series*. Each such series is
+//! a single-channel single-timepoint 3-D volume read from
+//! `t{timepoint}/s{setup}/{level}/cells`, with `sizeC = sizeT = 1`,
+//! `sizeZ = depth`, `imageCount = sizeZ`. The series iteration order is
+//! setup-outer, timepoint-middle, level-inner. Image names follow the pattern
+//! `P_t{timepoint:05}, W_s{setup:02}_{level}`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
 use hdf5_pure_rust::{HyperslabDim, Selection};
 
+/// One BDV series: a single resolution level of one setup at one timepoint.
+#[derive(Clone)]
+struct SeriesInfo {
+    /// Setup index (the `sNN` group number).
+    setup: u32,
+    /// Timepoint value (the `tNNNNN` group number, e.g. 18).
+    timepoint: u32,
+    /// Resolution level (the `{level}` group number).
+    level: u32,
+    /// Core metadata for this series.
+    meta: ImageMetadata,
+    /// Physical pixel sizes (micrometres) from the setup's voxelSize.
+    voxel_size: Option<(f64, f64, f64)>,
+}
+
 pub struct BdvReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    n_resolutions: usize,
-    current_resolution: usize,
-    size_t: u32,
-    size_c: u32,
-    first_timepoint: u32,
-    timepoint_increment: u32,
+    series: Vec<SeriesInfo>,
+    current_series: usize,
 }
 
 impl BdvReader {
     pub fn new() -> Self {
         BdvReader {
             path: None,
-            meta: None,
-            n_resolutions: 0,
-            current_resolution: 0,
-            size_t: 1,
-            size_c: 1,
-            first_timepoint: 0,
-            timepoint_increment: 1,
+            series: Vec::new(),
+            current_series: 0,
         }
     }
 }
@@ -53,270 +70,268 @@ impl Default for BdvReader {
     }
 }
 
-/// Minimal tag-search helper — no full XML parse needed.
-fn xml_find(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
+/// One parsed ViewSetup from the companion XML.
+struct ViewSetupXml {
+    id: u32,
+    voxel_size: Option<(f64, f64, f64)>,
+}
+
+/// Parse the `<ViewSetup>` blocks from the SpimData XML, extracting each
+/// setup id and (optionally) its voxel size.
+fn parse_view_setups(xml: &str) -> Vec<ViewSetupXml> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(open) = xml[pos..].find("<ViewSetup>") {
+        let start = pos + open + "<ViewSetup>".len();
+        let end_rel = xml[start..].find("</ViewSetup>").unwrap_or(xml.len() - start);
+        let block = &xml[start..start + end_rel];
+        pos = start + end_rel;
+
+        // <id>N</id>
+        let id = inner_text(block, "id").and_then(|s| s.trim().parse::<u32>().ok());
+        // <voxelSize><size>X Y Z</size></voxelSize>
+        let voxel_size = inner_text(block, "voxelSize").and_then(|vs| {
+            inner_text(&vs, "size").and_then(|s| {
+                let parts: Vec<f64> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+                if parts.len() >= 3 {
+                    Some((parts[0], parts[1], parts[2]))
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(id) = id {
+            out.push(ViewSetupXml { id, voxel_size });
+        }
+    }
+    out
+}
+
+/// Find the inner text of the first `<tag>...</tag>` in `xml`.
+fn inner_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)?;
-    Some(xml[start..start + end].trim().to_string())
+    Some(xml[start..start + end].to_string())
 }
 
-/// Count occurrences of an opening tag in the XML string.
-fn xml_count(xml: &str, tag: &str) -> usize {
-    let open = format!("<{}>", tag);
-    let mut count = 0;
-    let mut pos = 0;
-    while let Some(idx) = xml[pos..].find(&open) {
-        count += 1;
-        pos += idx + open.len();
+/// Parse the timepoint list from the SpimData `<Timepoints>` block.
+///
+/// Supports `type="pattern"` with `<integerpattern>` of the forms:
+///   * `N`            — a single timepoint
+///   * `first-last`   — an inclusive range
+///   * `first-last:increment`
+/// and `type="range"` with `<first>`/`<last>`. Falls back to `[0]`.
+fn parse_timepoints(xml: &str) -> Vec<u32> {
+    if let Some(pat) = inner_text(xml, "integerpattern") {
+        let pat = pat.trim();
+        // first-last:increment
+        let (range_part, inc) = match pat.split_once(':') {
+            Some((r, i)) => (r, i.trim().parse::<u32>().ok().filter(|&v| v > 0).unwrap_or(1)),
+            None => (pat, 1),
+        };
+        if let Some((first, last)) = range_part.split_once('-') {
+            if let (Ok(first), Ok(last)) =
+                (first.trim().parse::<u32>(), last.trim().parse::<u32>())
+            {
+                if last >= first {
+                    return (first..=last).step_by(inc as usize).collect();
+                }
+            }
+        } else if let Ok(single) = range_part.parse::<u32>() {
+            return vec![single];
+        }
     }
-    count
+    if let (Some(first), Some(last)) = (inner_text(xml, "first"), inner_text(xml, "last")) {
+        if let (Ok(first), Ok(last)) = (first.trim().parse::<u32>(), last.trim().parse::<u32>()) {
+            if last >= first {
+                return (first..=last).collect();
+            }
+        }
+    }
+    vec![0]
 }
 
-fn parse_bdv(path: &Path) -> Result<(ImageMetadata, usize, u32, u32, u32, u32)> {
+/// Map an HDF5 cells dtype element size to a Bio-Formats pixel type.
+/// Java BDVReader maps 1 → UINT8, 2 → UINT16, 4 → INT32 (signed).
+fn pixel_type_for_size(size: usize) -> Result<(PixelType, usize)> {
+    match size {
+        1 => Ok((PixelType::Uint8, 1)),
+        2 => Ok((PixelType::Uint16, 2)),
+        4 => Ok((PixelType::Int32, 4)),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "BDV: unsupported cells dtype size {other}"
+        ))),
+    }
+}
+
+fn parse_bdv(path: &Path) -> Result<Vec<SeriesInfo>> {
     let file = hdf5_pure_rust::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
-    // ── Try companion XML for authoritative dimensions ───────────────────────
+    // ── Enumerate setups and timepoints (companion XML preferred) ────────────
     let xml_path = path.with_extension("xml");
-    let mut size_x: u32 = 0;
-    let mut size_y: u32 = 0;
-    let mut size_z: u32 = 0;
-    let mut size_t: u32 = 0;
-    let mut size_c: u32 = 0;
-    // Timepoint group naming: Java defaults firstTimepoint=0, increment=1, then
-    // builds paths as t{firstTimepoint + increment*time}.
-    let mut first_timepoint: u32 = 0;
-    let mut timepoint_increment: u32 = 1;
-    let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
-    meta_map.insert(
-        "format".into(),
-        MetadataValue::String("BigDataViewer HDF5".into()),
-    );
+    let xml_str = if xml_path.exists() {
+        std::fs::read_to_string(&xml_path).ok()
+    } else {
+        None
+    };
 
-    if xml_path.exists() {
-        if let Ok(xml_str) = std::fs::read_to_string(&xml_path) {
-            meta_map.insert(
-                "bdv_xml_path".into(),
-                MetadataValue::String(xml_path.display().to_string()),
-            );
-            meta_map.insert("bdv_xml".into(), MetadataValue::String(xml_str.clone()));
-            // Parse <size>X Y Z</size>
-            if let Some(size_str) = xml_find(&xml_str, "size") {
-                let parts: Vec<u32> = size_str
-                    .split_whitespace()
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
-                if parts.len() >= 3 {
-                    if parts[0] == 0 || parts[1] == 0 || parts[2] == 0 {
-                        return Err(BioFormatsError::UnsupportedFormat(
-                            "BDV XML has non-positive size axis".into(),
-                        ));
-                    }
-                    size_x = parts[0];
-                    size_y = parts[1];
-                    size_z = parts[2];
-                    meta_map.insert("bdv_size".into(), MetadataValue::String(size_str));
-                }
-            }
-            // Parse timepoint range: <first>N</first> ... <last>M</last>
-            if let (Some(first_str), Some(last_str)) =
-                (xml_find(&xml_str, "first"), xml_find(&xml_str, "last"))
-            {
-                let first: u32 = first_str.parse().map_err(|_| {
-                    BioFormatsError::UnsupportedFormat(format!(
-                        "BDV XML has invalid first timepoint {first_str:?}"
-                    ))
-                })?;
-                let last: u32 = last_str.parse().map_err(|_| {
-                    BioFormatsError::UnsupportedFormat(format!(
-                        "BDV XML has invalid last timepoint {last_str:?}"
-                    ))
-                })?;
-                if last < first {
-                    return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "BDV XML last timepoint {last} precedes first {first}"
-                    )));
-                }
-                size_t = last - first + 1;
-                first_timepoint = first;
-                meta_map.insert(
-                    "bdv_timepoint_first".into(),
-                    MetadataValue::Int(first as i64),
-                );
-                meta_map.insert("bdv_timepoint_last".into(), MetadataValue::Int(last as i64));
-            }
-            // Parse <integerpattern>first-last:increment</integerpattern>.
-            // Java parses parts[0] as firstTimepoint and the part after ':' as
-            // the timepoint increment (defaulting to 1 when absent).
-            if let Some(pat) = xml_find(&xml_str, "integerpattern") {
-                let dash: Vec<&str> = pat.splitn(2, '-').collect();
-                if let Ok(first) = dash[0].trim().parse::<u32>() {
-                    first_timepoint = first;
-                    meta_map.insert(
-                        "bdv_timepoint_first".into(),
-                        MetadataValue::Int(first as i64),
-                    );
-                }
-                if dash.len() > 1 {
-                    let colon: Vec<&str> = dash[1].splitn(2, ':').collect();
-                    if colon.len() > 1 {
-                        if let Ok(inc) = colon[1].trim().parse::<u32>() {
-                            if inc > 0 {
-                                timepoint_increment = inc;
-                                meta_map.insert(
-                                    "bdv_timepoint_increment".into(),
-                                    MetadataValue::Int(inc as i64),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            // Count ViewSetup elements
-            let vc = xml_count(&xml_str, "ViewSetup");
-            if vc > 0 {
-                size_c = vc as u32;
-                meta_map.insert("bdv_view_setup_count".into(), MetadataValue::Int(vc as i64));
-            }
-        }
-    }
-
-    // ── Fall back to HDF5 introspection if XML didn't provide everything ─────
-    if size_t == 0 {
-        // Count top-level groups matching t\d{5}
-        if let Ok(root_members) = hdf5_members(&file, "/") {
-            size_t = root_members
+    // Setups: (id, voxelSize). Prefer the XML's ViewSetups; otherwise count the
+    // sNN groups at the HDF5 root.
+    let setups: Vec<ViewSetupXml> = match xml_str.as_deref().map(parse_view_setups) {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            let mut members = hdf5_members(&file, "/").unwrap_or_default();
+            members.sort();
+            members
                 .iter()
                 .filter(|n| {
-                    n.len() == 6 && n.starts_with('t') && n[1..].chars().all(|c| c.is_ascii_digit())
+                    n.len() == 3
+                        && n.starts_with('s')
+                        && n[1..].chars().all(|c| c.is_ascii_digit())
                 })
-                .count() as u32;
-        }
-        if size_t == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "BDV: no timepoint groups found".into(),
-            ));
-        }
-    }
-
-    // The first timepoint's HDF5 group is named for firstTimepoint (BDV uses
-    // t{firstTimepoint + increment*time}), so init probes must use it — not a
-    // literal t00000 — to stay consistent with the open_bytes read path.
-    let first_t_group = format!("t{first_timepoint:05}");
-    let first_cells_path = format!("{first_t_group}/s00/0/cells");
-
-    if size_c == 0 {
-        // Count setup groups under the first timepoint group
-        if let Ok(t0) = file.group(&first_t_group) {
-            if let Ok(members) = hdf5_group_members(&t0) {
-                size_c = members
-                    .iter()
-                    .filter(|n| {
-                        n.len() == 3
-                            && n.starts_with('s')
-                            && n[1..].chars().all(|c| c.is_ascii_digit())
-                    })
-                    .count() as u32;
-            }
-        }
-        if size_c == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "BDV: no setup groups found under t00000".into(),
-            ));
-        }
-    }
-
-    if size_x == 0 || size_y == 0 || size_z == 0 {
-        // Infer from shape of the first timepoint's cells dataset
-        let ds = file.dataset(&first_cells_path).map_err(|e| {
-            BioFormatsError::UnsupportedFormat(format!(
-                "BDV: missing {first_cells_path} for dimension inference: {e}"
-            ))
-        })?;
-        let shape = ds.shape().map_err(|e| {
-            BioFormatsError::Format(format!("BDV: cannot read cells dataset shape: {e}"))
-        })?;
-        if shape.len() != 3 || shape[0] == 0 || shape[1] == 0 || shape[2] == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "BDV: unsupported cells shape {shape:?}"
-            )));
-        }
-        size_z = u32::try_from(shape[0])
-            .map_err(|_| BioFormatsError::Format("BDV Z dimension overflows".into()))?;
-        size_y = u32::try_from(shape[1])
-            .map_err(|_| BioFormatsError::Format("BDV Y dimension overflows".into()))?;
-        size_x = u32::try_from(shape[2])
-            .map_err(|_| BioFormatsError::Format("BDV X dimension overflows".into()))?;
-    }
-    let (pixel_type, bytes_per_sample) =
-        validate_bdv_cells_dataset(&file, &first_cells_path, size_x, size_y, size_z)?;
-
-    // ── Count resolution levels from s00/resolutions ────────────────────────
-    let n_resolutions: usize = if let Ok(ds) = file.dataset("s00/resolutions") {
-        let shape = ds.shape().unwrap_or_default();
-        if !shape.is_empty() && shape[0] > 0 {
-            shape[0] as usize
-        } else {
-            1
-        }
-    } else {
-        // Fall back: count integer-named children of <first timepoint>/s00
-        if let Ok(g) = file.group(&format!("{first_t_group}/s00")) {
-            if let Ok(members) = hdf5_group_members(&g) {
-                let n = members
-                    .iter()
-                    .filter(|n| n.parse::<usize>().is_ok())
-                    .count();
-                n
-            } else {
-                0
-            }
-        } else {
-            0
+                .filter_map(|n| n[1..].parse::<u32>().ok())
+                .map(|id| ViewSetupXml {
+                    id,
+                    voxel_size: None,
+                })
+                .collect()
         }
     };
-    if n_resolutions == 0 {
+    if setups.is_empty() {
         return Err(BioFormatsError::UnsupportedFormat(
-            "BDV: no resolution levels found".into(),
+            "BDV: no ViewSetups / setup groups found".into(),
         ));
     }
 
-    let image_count = size_z
-        .checked_mul(size_c)
-        .and_then(|v| v.checked_mul(size_t))
-        .ok_or_else(|| BioFormatsError::Format("BDV image count overflows".into()))?;
-    let meta = ImageMetadata {
-        size_x,
-        size_y,
-        size_z,
-        size_c,
-        size_t,
-        pixel_type,
-        bits_per_pixel: (bytes_per_sample * 8) as u8,
-        image_count,
-        dimension_order: DimensionOrder::XYZTC,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: true,
-        resolution_count: n_resolutions as u32,
-        series_metadata: meta_map,
-        lookup_table: None,
-        modulo_z: None,
-        modulo_c: None,
-        modulo_t: None,
+    // Timepoints from the XML, else infer from the tNNNNN root groups.
+    let timepoints: Vec<u32> = match xml_str.as_deref().map(parse_timepoints) {
+        Some(v) if !v.is_empty() && v != vec![0] => v,
+        _ => {
+            let mut tps: Vec<u32> = hdf5_members(&file, "/")
+                .unwrap_or_default()
+                .iter()
+                .filter(|n| {
+                    n.len() == 6
+                        && n.starts_with('t')
+                        && n[1..].chars().all(|c| c.is_ascii_digit())
+                })
+                .filter_map(|n| n[1..].parse::<u32>().ok())
+                .collect();
+            tps.sort_unstable();
+            if tps.is_empty() {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "BDV: no timepoint groups found".into(),
+                ));
+            }
+            tps
+        }
     };
 
-    Ok((
-        meta,
-        n_resolutions,
-        size_t,
-        size_c,
-        first_timepoint,
-        timepoint_increment,
-    ))
+    // ── Build the flattened series list: setup × timepoint × level ───────────
+    let mut series: Vec<SeriesInfo> = Vec::new();
+    for setup in &setups {
+        for &tp in &timepoints {
+            // Number of resolution levels: count integer-named children of the
+            // setup group under this timepoint.
+            let setup_group = format!("t{tp:05}/s{:02}", setup.id);
+            let mut levels: Vec<u32> = match file
+                .group(&setup_group)
+                .ok()
+                .and_then(|g| hdf5_group_members(&g).ok())
+            {
+                Some(members) => members
+                    .iter()
+                    .filter_map(|n| n.parse::<u32>().ok())
+                    .collect(),
+                None => continue, // missing view — skip
+            };
+            levels.sort_unstable();
+            if levels.is_empty() {
+                continue;
+            }
+
+            for &level in &levels {
+                let cells_path = format!("{setup_group}/{level}/cells");
+                let ds = match file.dataset(&cells_path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let shape = ds.shape().map_err(|e| {
+                    BioFormatsError::Format(format!("BDV: cannot read shape {cells_path}: {e}"))
+                })?;
+                if shape.len() != 3 || shape.iter().any(|&d| d == 0) {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "BDV: unsupported cells shape {shape:?} for {cells_path}"
+                    )));
+                }
+                let size_z = u32::try_from(shape[0])
+                    .map_err(|_| BioFormatsError::Format("BDV Z overflows".into()))?;
+                let size_y = u32::try_from(shape[1])
+                    .map_err(|_| BioFormatsError::Format("BDV Y overflows".into()))?;
+                let size_x = u32::try_from(shape[2])
+                    .map_err(|_| BioFormatsError::Format("BDV X overflows".into()))?;
+
+                let dtype_size = ds
+                    .dtype()
+                    .map(|dt| dt.size())
+                    .map_err(|e| BioFormatsError::Format(format!("BDV: dtype {cells_path}: {e}")))?;
+                let (pixel_type, bytes_per_sample) = pixel_type_for_size(dtype_size)?;
+
+                let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
+                meta_map.insert(
+                    "format".into(),
+                    MetadataValue::String("BigDataViewer HDF5".into()),
+                );
+                if let Some(p) = xml_path.to_str() {
+                    meta_map.insert("bdv_xml_path".into(), MetadataValue::String(p.into()));
+                }
+                meta_map.insert("bdv_setup".into(), MetadataValue::Int(setup.id as i64));
+                meta_map.insert("bdv_timepoint".into(), MetadataValue::Int(tp as i64));
+                meta_map.insert("bdv_level".into(), MetadataValue::Int(level as i64));
+
+                let meta = ImageMetadata {
+                    size_x,
+                    size_y,
+                    size_z,
+                    size_c: 1,
+                    size_t: 1,
+                    pixel_type,
+                    bits_per_pixel: (bytes_per_sample * 8) as u8,
+                    image_count: size_z,
+                    dimension_order: DimensionOrder::XYZTC,
+                    is_rgb: false,
+                    is_interleaved: false,
+                    is_indexed: false,
+                    is_little_endian: true,
+                    resolution_count: 1,
+                    series_metadata: meta_map,
+                    lookup_table: None,
+                    modulo_z: None,
+                    modulo_c: None,
+                    modulo_t: None,
+                };
+
+                series.push(SeriesInfo {
+                    setup: setup.id,
+                    timepoint: tp,
+                    level,
+                    meta,
+                    voxel_size: setup.voxel_size,
+                });
+            }
+        }
+    }
+
+    if series.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "BDV: no readable cells datasets found".into(),
+        ));
+    }
+
+    Ok(series)
 }
 
 fn hdf5_group_members(
@@ -336,51 +351,6 @@ fn hdf5_members(
     }
 }
 
-fn hdf5_dtype_size(dtype: &hdf5_pure_rust::Datatype) -> usize {
-    // The new crate exposes the element size directly, so this collapses to a
-    // single call (covering fixed/floating/array element sizes alike).
-    dtype.size()
-}
-
-/// Validates the cells dataset shape and derives the pixel type from its HDF5
-/// dtype size. Java BDVReader.java:571-579 maps element size to pixel type:
-/// 1 → UINT8, 2 → UINT16, 4 → INT32 (signed). Returns (pixel_type, bytes_per_sample).
-fn validate_bdv_cells_dataset(
-    file: &hdf5_pure_rust::File,
-    path: &str,
-    size_x: u32,
-    size_y: u32,
-    size_z: u32,
-) -> Result<(PixelType, usize)> {
-    let ds = file
-        .dataset(path)
-        .map_err(|e| BioFormatsError::UnsupportedFormat(format!("BDV: missing {path}: {e}")))?;
-    let dtype_size = ds
-        .dtype()
-        .map(|dt| hdf5_dtype_size(&dt))
-        .map_err(|e| BioFormatsError::Format(format!("BDV: cannot read dtype for {path}: {e}")))?;
-    let (pixel_type, bytes_per_sample) = match dtype_size {
-        1 => (PixelType::Uint8, 1usize),
-        2 => (PixelType::Uint16, 2usize),
-        4 => (PixelType::Int32, 4usize),
-        other => {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "BDV: unsupported cells dtype size {other} for {path}"
-            )));
-        }
-    };
-    let shape = ds
-        .shape()
-        .map_err(|e| BioFormatsError::Format(format!("BDV: cannot read shape for {path}: {e}")))?;
-    let declared = [size_z as u64, size_y as u64, size_x as u64];
-    if shape != declared {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "BDV: {path} shape {shape:?} does not match declared {declared:?}"
-        )));
-    }
-    Ok((pixel_type, bytes_per_sample))
-}
-
 impl FormatReader for BdvReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -398,91 +368,85 @@ impl FormatReader for BdvReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, n_res, size_t, size_c, first_timepoint, timepoint_increment) =
-            parse_bdv(path)?;
-        self.meta = Some(meta);
+        self.series = parse_bdv(path)?;
         self.path = Some(path.to_path_buf());
-        self.n_resolutions = n_res;
-        self.current_resolution = 0;
-        self.size_t = size_t;
-        self.size_c = size_c;
-        self.first_timepoint = first_timepoint;
-        self.timepoint_increment = timepoint_increment;
+        self.current_series = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.n_resolutions = 0;
-        self.current_resolution = 0;
-        self.first_timepoint = 0;
-        self.timepoint_increment = 1;
+        self.series.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.series.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
+        if self.series.is_empty() {
             return Err(BioFormatsError::NotInitialized);
         }
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
+        if s >= self.series.len() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
         }
+        self.current_series = s;
+        Ok(())
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
-            .unwrap_or(crate::common::reader::uninitialized_metadata())
+        self.series
+            .get(self.current_series)
+            .map(|s| &s.meta)
+            .unwrap_or_else(|| crate::common::reader::uninitialized_metadata())
     }
 
     fn resolution_count(&self) -> usize {
-        self.n_resolutions
+        // Each resolution level is exposed as its own series (Java parity), so
+        // every series is a single-resolution image. Returns 0 before set_id.
+        if self.series.is_empty() {
+            0
+        } else {
+            1
+        }
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if self.meta.is_none() {
+        if self.series.is_empty() {
             return Err(BioFormatsError::NotInitialized);
         }
-        if level >= self.n_resolutions {
+        if level != 0 {
             return Err(BioFormatsError::Format(format!(
-                "resolution {level} out of range (max {})",
-                self.n_resolutions - 1
+                "resolution {level} out of range (max 0)"
             )));
         }
-        self.current_resolution = level;
         Ok(())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let si = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &si.meta;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
-        // Dimension order is XYZTC: Z varies fastest, then T, then C.
-        let sz = meta.size_z as usize;
-        let st = meta.size_t as usize;
-        let z = (plane_index as usize) % sz;
-        let t = (plane_index as usize / sz) % st;
-        let c = (plane_index as usize) / (sz * st);
-
-        // Map the 0-based timepoint index onto the HDF5 group index using the
-        // companion XML's first/increment (Java: firstTimepoint + increment*time).
-        let group_t = self.first_timepoint as usize + self.timepoint_increment as usize * t;
-
-        let res = self.current_resolution;
-        let ds_path = format!("t{group_t:05}/s{c:02}/{res}/cells");
+        // sizeC = sizeT = 1, so the plane index is the Z slice directly.
+        let z = plane_index as usize;
+        let ds_path = format!(
+            "t{:05}/s{:02}/{}/cells",
+            si.timepoint, si.setup, si.level
+        );
+        let bps = meta.pixel_type.bytes_per_sample() as usize;
+        let plane_pixels = meta.size_x as usize * meta.size_y as usize;
 
         let path = self
             .path
@@ -495,15 +459,7 @@ impl FormatReader for BdvReader {
             .dataset(&ds_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
 
-        // Read width-aware: the cells dtype may be 1/2/4 bytes (Uint8/Uint16/
-        // Int32), so dispatch on the resolved pixel type rather than assuming
-        // uint16. Each branch yields the raw little-endian sample bytes.
-        let bps = meta.pixel_type.bytes_per_sample() as usize;
-        let plane_pixels = meta.size_x as usize * meta.size_y as usize;
-
-        // True partial I/O: select only plane z of the 3-D [Z, Y, X] cells
-        // dataset instead of reading the whole volume and byte-slicing. After
-        // read_slice the returned vec IS the plane, so it is indexed from 0.
+        // Select only plane z of the [Z, Y, X] cells dataset.
         let sel = Selection::Hyperslab(vec![
             HyperslabDim::new(z as u64, 1, 1, 1),
             HyperslabDim::new(0, 1, meta.size_y as u64, 1),
@@ -534,8 +490,6 @@ impl FormatReader for BdvReader {
         };
 
         let plane_bytes = plane_pixels * bps;
-        // read_slice already returns exactly the selected plane (indexed from
-        // 0), so no per-plane byte offset is needed; just validate the length.
         if raw.len() == plane_bytes {
             Ok(raw)
         } else {
@@ -556,16 +510,52 @@ impl FormatReader for BdvReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("BDV", &full, meta, 1, x, y, w, h)
+        let si = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("BDV", &full, &si.meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
+        let si = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let (sx, sy) = (si.meta.size_x, si.meta.size_y);
+        let tw = sx.min(256);
+        let th = sy.min(256);
+        let tx = (sx - tw) / 2;
+        let ty = (sy - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        if self.series.is_empty() {
+            return None;
+        }
+        let mut ome = OmeMetadata::default();
+        for si in &self.series {
+            let (psx, psy, psz) = match si.voxel_size {
+                Some((x, y, z)) => (Some(x), Some(y), Some(z)),
+                None => (None, None, None),
+            };
+            ome.images.push(OmeImage {
+                // Java: "P_t{timepoint:05}, W_s{setup:02}_{level}".
+                name: Some(format!(
+                    "P_t{:05}, W_s{:02}_{}",
+                    si.timepoint, si.setup, si.level
+                )),
+                physical_size_x: psx,
+                physical_size_y: psy,
+                physical_size_z: psz,
+                channels: vec![OmeChannel {
+                    samples_per_pixel: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+        Some(ome)
     }
 }

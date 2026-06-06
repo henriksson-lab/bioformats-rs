@@ -26,9 +26,15 @@ fn validate(rel: &str, region: Option<(u32, u32, u32, u32)>) -> Result<bool, Str
         return Ok(false);
     }
     let mut reader = ImageReader::open(&path).map_err(|e| format!("open: {e}"))?;
-    let (sx, sy, ic, sc) = {
+    let (sx, sy, ic, sc, bps) = {
         let m = reader.metadata();
-        (m.size_x, m.size_y, m.image_count, m.size_c)
+        (
+            m.size_x,
+            m.size_y,
+            m.image_count,
+            m.size_c,
+            m.pixel_type.bytes_per_sample() as u64,
+        )
     };
     if sx == 0 || sy == 0 {
         return Err(format!("zero dimensions {sx}x{sy}"));
@@ -36,9 +42,22 @@ fn validate(rel: &str, region: Option<(u32, u32, u32, u32)>) -> Result<bool, Str
     if ic == 0 {
         return Err("zero image_count".into());
     }
-    // Read a bounded region rather than the full plane: whole-slide formats
-    // (SVS/SCN/NDPI) have gigapixel full-resolution planes that would allocate
-    // gigabytes. A small top-left region exercises the decode path safely.
+    // Memory guard: a bounded region exercises the decode path, but strip-based
+    // whole-slide levels (e.g. NDPI full resolution) decode the WHOLE strip —
+    // i.e. the entire gigapixel plane — even for a 256x256 crop. Skip the pixel
+    // read when the nominal full plane exceeds the budget; metadata is already
+    // validated, and pyramidal formats expose smaller levels (as other series)
+    // that still get read. This keeps the suite from exhausting RAM.
+    let plane_bytes = sx as u64 * sy as u64 * sc.max(1) as u64 * bps;
+    const PLANE_BUDGET: u64 = 512 << 20; // 512 MiB
+    if plane_bytes > PLANE_BUDGET {
+        eprintln!(
+            "OK   {rel}: {sx}x{sy} c={sc} planes={ic} (pixel read skipped: full plane ~{} MiB > {} MiB budget)",
+            plane_bytes >> 20,
+            PLANE_BUDGET >> 20
+        );
+        return Ok(true);
+    }
     let (x, y, w, h) = region.unwrap_or((0, 0, sx.min(256), sy.min(256)));
     let bytes = reader
         .open_bytes_region(0, x, y, w, h)

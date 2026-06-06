@@ -46,44 +46,66 @@ struct SdtBlock {
     next_block_offset: u64,
 }
 
-/// Parse setup text block for image dimensions.
-/// Returns (n_x, n_y, adc_re, channels) extracted from the SPC setup keys.
-fn parse_sdt_setup(text: &str) -> (u32, u32, u32, u32) {
-    let mut nx: u32 = 0;
-    let mut ny: u32 = 0;
-    let mut adc_re: u32 = 256;
-    let mut channels: u32 = 1;
+/// Dimensions extracted from the SPC ASCII setup block (SDTInfo.java:534-565).
+#[derive(Clone, Copy, Debug)]
+struct SdtSetup {
+    /// SP_SCAN_X — scanning width.
+    scan_x: u32,
+    /// SP_SCAN_Y — scanning height.
+    scan_y: u32,
+    /// SP_ADC_RE — number of time (lifetime) bins.
+    adc_re: u32,
+    /// SP_SCAN_RX — number of routing/spectral channels.
+    scan_rx: u32,
+    /// SP_IMG_X — image width (used for measMode 13).
+    img_x: u32,
+    /// SP_IMG_Y — image height (used for measMode 13).
+    img_y: u32,
+}
+
+/// Parse setup text block for image dimensions, mirroring SDTInfo.java's
+/// exact key matching (`#SP [SP_SCAN_X,I,...]` etc.).
+fn parse_sdt_setup(text: &str) -> SdtSetup {
+    let mut s = SdtSetup {
+        scan_x: 0,
+        scan_y: 0,
+        adc_re: 0,
+        scan_rx: 0,
+        img_x: 0,
+        img_y: 0,
+    };
     for line in text.lines() {
         let t = line.trim();
-        // Format: "  #SP [SP_FLIM_X,I,128]" or "sp_img_x:128" or "IMG_X 128"
         let low = t.to_ascii_lowercase();
-        if low.contains("sp_img_x") || low.contains("img_x") || low.contains("flim_x") {
+        // Match the most specific keys first; the order matters because some
+        // keys are substrings of others would-be but the SDT keys are distinct.
+        if low.contains("sp_scan_rx") {
             if let Some(v) = extract_int(t) {
-                if v > 0 {
-                    nx = v;
-                }
+                s.scan_rx = v;
             }
-        } else if low.contains("sp_img_y") || low.contains("img_y") || low.contains("flim_y") {
+        } else if low.contains("sp_scan_x") {
             if let Some(v) = extract_int(t) {
-                if v > 0 {
-                    ny = v;
-                }
+                s.scan_x = v;
+            }
+        } else if low.contains("sp_scan_y") {
+            if let Some(v) = extract_int(t) {
+                s.scan_y = v;
             }
         } else if low.contains("sp_adc_re") || low.contains("adc_re") {
             if let Some(v) = extract_int(t) {
-                if v > 0 {
-                    adc_re = v;
-                }
+                s.adc_re = v;
             }
-        } else if low.contains("sp_scan_rx") || low.contains("sp_img_rx") {
+        } else if low.contains("sp_img_x") {
             if let Some(v) = extract_int(t) {
-                if v > 0 {
-                    channels = channels.max(v);
-                }
+                s.img_x = v;
+            }
+        } else if low.contains("sp_img_y") {
+            if let Some(v) = extract_int(t) {
+                s.img_y = v;
             }
         }
     }
-    (nx.max(1), ny.max(1), adc_re.max(1), channels.max(1))
+    s
 }
 
 fn extract_int(s: &str) -> Option<u32> {
@@ -149,6 +171,7 @@ fn padded_width(size_x: usize) -> usize {
     size_x + ((4 - (size_x % 4)) % 4)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_sdt_zip_plane(
     f: &mut File,
     block: &SdtBlock,
@@ -156,6 +179,7 @@ fn read_sdt_zip_plane(
     size_y: usize,
     time_bins: usize,
     time_bin: usize,
+    channel: usize,
 ) -> Result<Vec<u8>> {
     let compressed_len = compressed_block_len(f, block)?;
     let mut compressed = vec![0u8; compressed_len];
@@ -177,6 +201,25 @@ fn read_sdt_zip_plane(
     let sample_offset = time_bin
         .checked_mul(2)
         .ok_or_else(|| BioFormatsError::Format("SDT time-bin offset overflow".into()))?;
+
+    // Skip preceding channels in the decompressed stream
+    // (SDTReader.java:221: codec.skip(channel * planeSize)).
+    let channel_plane_size = padded_width
+        .checked_mul(size_y)
+        .and_then(|v| v.checked_mul(time_bins))
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| BioFormatsError::Format("SDT channel plane size overflow".into()))?;
+    let mut to_skip = channel
+        .checked_mul(channel_plane_size)
+        .ok_or_else(|| BioFormatsError::Format("SDT channel skip overflow".into()))?;
+    let mut skip_buf = [0u8; 65536];
+    while to_skip > 0 {
+        let n = to_skip.min(skip_buf.len());
+        decoder
+            .read_exact(&mut skip_buf[..n])
+            .map_err(|e| BioFormatsError::Codec(format!("SDT ZIP channel skip failed: {e}")))?;
+        to_skip -= n;
+    }
 
     let mut row = vec![0u8; row_len];
     let mut out = vec![0u8; plane_bytes];
@@ -246,7 +289,7 @@ fn read_sdt_setup_block(
     setup_offs: u64,
     setup_length: usize,
     file_len: u64,
-) -> Result<Option<(u32, u32, u32, u32)>> {
+) -> Result<Option<SdtSetup>> {
     if setup_offs == 0 || setup_length == 0 {
         return Ok(None);
     }
@@ -257,7 +300,7 @@ fn read_sdt_setup_block(
     }
     f.seek(SeekFrom::Start(setup_offs))
         .map_err(BioFormatsError::Io)?;
-    let mut setup_buf = vec![0u8; setup_length.min(65536)];
+    let mut setup_buf = vec![0u8; setup_length.min(1 << 20)];
     let n = f.read(&mut setup_buf).map_err(BioFormatsError::Io)?;
     setup_buf.truncate(n);
     let text = String::from_utf8_lossy(&setup_buf).into_owned();
@@ -280,22 +323,34 @@ struct SdtInfo {
 }
 
 /// Read the SDT header and measurement-descriptor blocks (SDTInfo.java).
+///
+/// bhfileHeader layout (little-endian, SDTInfo.java:441-456):
+///   revision        i16 @0
+///   infoOffs        i32 @2
+///   infoLength      i16 @6
+///   setupOffs       i32 @8
+///   setupLength     u16 @12
+///   dataBlockOffs   i32 @14
+///   noOfDataBlocks  i16 @18
+///   dataBlockLength i32 @20
+///   measDescBlockOffs i32 @24
+///   noOfMeasDescBlocks i16 @28
+///   measDescBlockLength i16 @30
+///   headerValid     u16 @32
+///   reserved1       u32 @34
 fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
-    // bhfileHeader (little-endian).
     let mut hdr = [0u8; 42];
     f.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
     f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
 
-    let info_offs = r_u32_le(&hdr, 2) as u64;
     let setup_offs = r_u32_le(&hdr, 8) as u64;
     let setup_length = r_u16_le(&hdr, 12) as usize;
     let data_block_offs = r_u32_le(&hdr, 14) as u64;
     let no_of_data_blocks = r_i16_le(&hdr, 18);
-    let meas_desc_block_offs = r_u32_le(&hdr, 20) as u64;
-    let no_of_meas_desc_blocks = r_i16_le(&hdr, 24);
-    let meas_desc_block_length = r_i16_le(&hdr, 26).max(0) as usize;
+    let meas_desc_block_offs = r_u32_le(&hdr, 24) as u64;
+    let no_of_meas_desc_blocks = r_i16_le(&hdr, 28);
+    let meas_desc_block_length = r_i16_le(&hdr, 30).max(0) as usize;
     let reserved1 = r_u32_le(&hdr, 34) as usize;
-    let _ = info_offs;
 
     let block_count = if no_of_data_blocks == 0x7fff {
         reserved1
@@ -303,9 +358,20 @@ fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
         no_of_data_blocks.max(0) as usize
     };
 
-    // Setup text block: parse for X/Y/ADC_RE/SCAN_RX.
-    let (mut width, mut height, mut time_bins, mut channels) =
-        read_sdt_setup_block(f, setup_offs, setup_length, file_len)?.unwrap_or((1, 1, 256, 1));
+    // Setup text block: parse for SCAN_X/Y, ADC_RE, SCAN_RX, IMG_X/Y.
+    let setup =
+        read_sdt_setup_block(f, setup_offs, setup_length, file_len)?.unwrap_or(SdtSetup {
+            scan_x: 0,
+            scan_y: 0,
+            adc_re: 256,
+            scan_rx: 0,
+            img_x: 0,
+            img_y: 0,
+        });
+    let mut width: u32 = setup.scan_x.max(1);
+    let mut height: u32 = setup.scan_y.max(1);
+    let mut time_bins: u32 = setup.adc_re.max(1);
+    let mut channels: u32 = setup.scan_rx.max(1);
 
     let mut timepoints: u32 = 0;
     let mcsta_points: u32 = 0; // MCS-TA parsing is in the binary setup extension; left 0.
@@ -397,27 +463,35 @@ fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
             width = 1;
             height = 1;
         }
+        // measMode 13 (FLIM imaging): width/height come from SP_IMG_X/Y in the
+        // ASCII setup, and each measurement-descriptor block is a channel
+        // (SDTInfo.java:790-793).
         if meas_mode == 13 {
+            width = setup.img_x.max(1);
+            height = setup.img_y.max(1);
             channels = no_of_meas_desc_blocks.max(1) as u32;
         }
     }
 
     // Walk the data-block headers to collect offsets and lengths.
+    // BHFileBlockHeader is 22 bytes (SDTInfo.java:930-940):
+    //   blockNo(2), dataOffs(4), nextBlockOffs(4), blockType(2),
+    //   measDescBlockNo(2), lblockNo(4), blockLength(4).
+    // The pixel data for each block starts immediately after its 22-byte
+    // header; the next header is located via nextBlockOffs.
     let mut block_offsets = Vec::new();
     let mut block_lengths = Vec::new();
     let mut next = data_block_offs;
     for _ in 0..block_count {
-        if next == 0 || next + 20 > file_len {
+        if next == 0 || next + 22 > file_len {
             break;
         }
         f.seek(SeekFrom::Start(next)).map_err(BioFormatsError::Io)?;
-        let mut bh = [0u8; 20];
+        let mut bh = [0u8; 22];
         f.read_exact(&mut bh).map_err(BioFormatsError::Io)?;
-        // blockNo(2), dataOffs(4), nextBlockOffs(4), blockType(2),
-        // measDescBlockNo(2), lblockNo(4), blockLength(4)
         let next_block_offs = r_u32_le(&bh, 6) as u64;
-        let block_length = r_u32_le(&bh, 16) as u64;
-        let block_data_offset = next + 20; // file pointer after header
+        let block_length = r_u32_le(&bh, 18) as u64;
+        let block_data_offset = next + 22; // file pointer after header
         if block_data_offset >= file_len {
             break;
         }
@@ -559,9 +633,19 @@ impl FormatReader for SdtReader {
             let setup_offs = r_i16_le(&hdr, 22).max(0) as u64;
             let setup_length = r_i32_le(&hdr, 24).max(0) as usize;
             let data_offs = r_i16_le(&hdr, 28) as i32;
-            let (nx, ny, adc_re, channels) =
-                read_sdt_setup_block(&mut f, setup_offs, setup_length, file_len)?
-                    .unwrap_or((1, 1, 256, 1));
+            let setup = read_sdt_setup_block(&mut f, setup_offs, setup_length, file_len)?
+                .unwrap_or(SdtSetup {
+                    scan_x: 1,
+                    scan_y: 1,
+                    adc_re: 256,
+                    scan_rx: 1,
+                    img_x: 0,
+                    img_y: 0,
+                });
+            let nx = setup.scan_x.max(1);
+            let ny = setup.scan_y.max(1);
+            let adc_re = setup.adc_re.max(1);
+            let channels = setup.scan_rx.max(1);
             let data_offset = if data_offs > 0 {
                 data_offs as u64
             } else {
@@ -654,10 +738,13 @@ impl FormatReader for SdtReader {
                 modulo_t: None,
             };
 
+            // The compressed/raw payload for this block ends where the next
+            // block's 22-byte header begins (block_offsets[i+1] is the data
+            // offset, i.e. header start + 22).
             let next_block_offset = info
                 .block_offsets
                 .get(i + 1)
-                .map(|o| o.saturating_sub(20))
+                .map(|o| o.saturating_sub(22))
                 .unwrap_or(0);
 
             series.push(SdtSeries {
@@ -748,9 +835,9 @@ impl FormatReader for SdtReader {
         let channel_plane_size = (padded_width * size_y * times * 2) as u64;
 
         if &signature == b"PK" {
-            // For ZIP blocks we cannot random-seek; decode and skip channels by
-            // reading from the start of the decompressed stream.
-            read_sdt_zip_plane(&mut f, &block, size_x, size_y, times, time_bin)
+            // For ZIP blocks we cannot random-seek; decode and skip preceding
+            // channels by reading from the start of the decompressed stream.
+            read_sdt_zip_plane(&mut f, &block, size_x, size_y, times, time_bin, channel)
         } else {
             // Skip to the requested channel within the block.
             f.seek(SeekFrom::Current(
@@ -787,6 +874,41 @@ impl FormatReader for SdtReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
+        if self.series.is_empty() {
+            return None;
+        }
+        // Java names each SDT series "<filename> #<n>" (1-based) and exposes one
+        // OME channel per spectral/routing channel (SDTReader populates pixels
+        // with sizeC channels per image).
+        let file_name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+        let mut ome = OmeMetadata::default();
+        for (i, series) in self.series.iter().enumerate() {
+            let channels = (0..series.meta.size_c.max(1))
+                .map(|_| OmeChannel {
+                    samples_per_pixel: 1,
+                    ..Default::default()
+                })
+                .collect();
+            let name = file_name
+                .as_ref()
+                .map(|f| format!("{f} #{}", i + 1));
+            ome.images.push(OmeImage {
+                name,
+                channels,
+                modulo_t: series.meta.modulo_t.clone(),
+                ..Default::default()
+            });
+        }
+        Some(ome)
     }
 }
 

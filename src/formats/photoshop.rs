@@ -5,18 +5,22 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::ome_metadata::OmeMetadata;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
+use crate::common::region::validate_region;
 
 pub struct PsdReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    /// Decoded composite pixel data, stored **planar** (channel-separated):
+    /// all of channel 0's rows, then channel 1's, etc. — matching the on-disk
+    /// PSD layout and Java Bio-Formats' channel-separated `openBytes` output.
     pixels: Option<Vec<u8>>,
 }
 
@@ -34,24 +38,6 @@ impl Default for PsdReader {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn read_u16_be(r: &mut impl Read) -> std::io::Result<u16> {
-    let mut b = [0u8; 2];
-    r.read_exact(&mut b)?;
-    Ok(u16::from_be_bytes(b))
-}
-
-fn read_u32_be(r: &mut impl Read) -> std::io::Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(u32::from_be_bytes(b))
-}
-
-fn read_u64_be(r: &mut impl Read) -> std::io::Result<u64> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b)?;
-    Ok(u64::from_be_bytes(b))
 }
 
 /// Decode PackBits RLE-encoded data.
@@ -110,18 +96,87 @@ fn pixel_type_from_depth(depth: u16) -> Result<PixelType> {
     }
 }
 
+/// A minimal big-endian cursor over an in-memory buffer that mirrors the
+/// `RandomAccessInputStream` operations used by the Java `PSDReader`. Reads
+/// past end-of-buffer clamp the pointer rather than erroring, matching how the
+/// Java offset-finding heuristic tolerates short reads.
+struct Cur<'a> {
+    d: &'a [u8],
+    p: usize,
+}
+
+impl<'a> Cur<'a> {
+    fn new(d: &'a [u8]) -> Self {
+        Cur { d, p: 0 }
+    }
+    fn fp(&self) -> usize {
+        self.p
+    }
+    fn len(&self) -> usize {
+        self.d.len()
+    }
+    fn seek(&mut self, p: usize) {
+        self.p = p.min(self.d.len());
+    }
+    fn skip(&mut self, n: usize) {
+        self.p = self.p.saturating_add(n).min(self.d.len());
+    }
+    fn read_u8(&mut self) -> u8 {
+        let v = self.d.get(self.p).copied().unwrap_or(0);
+        if self.p < self.d.len() {
+            self.p += 1;
+        }
+        v
+    }
+    fn read_u16(&mut self) -> u16 {
+        let v = if self.p + 2 <= self.d.len() {
+            u16::from_be_bytes([self.d[self.p], self.d[self.p + 1]])
+        } else {
+            0
+        };
+        self.skip(2);
+        v
+    }
+    fn read_i16(&mut self) -> i16 {
+        self.read_u16() as i16
+    }
+    fn read_u32(&mut self) -> u32 {
+        let v = if self.p + 4 <= self.d.len() {
+            u32::from_be_bytes([
+                self.d[self.p],
+                self.d[self.p + 1],
+                self.d[self.p + 2],
+                self.d[self.p + 3],
+            ])
+        } else {
+            0
+        };
+        self.skip(4);
+        v
+    }
+    fn read_i32(&mut self) -> i32 {
+        self.read_u32() as i32
+    }
+    fn read_bytes(&mut self, n: usize) -> &'a [u8] {
+        let end = (self.p + n).min(self.d.len());
+        let s = &self.d[self.p..end];
+        self.p = end;
+        s
+    }
+}
+
 fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
-    let f = File::open(path).map_err(BioFormatsError::Io)?;
-    let mut r = BufReader::new(f);
+    let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
+    let mut r = Cur::new(&data);
 
     // Check magic
-    let mut magic = [0u8; 4];
-    r.read_exact(&mut magic).map_err(BioFormatsError::Io)?;
-    if &magic != b"8BPS" {
+    if r.read_bytes(4) != b"8BPS" {
         return Err(BioFormatsError::Format("Not a PSD file".into()));
     }
 
-    let version = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
+    let version = r.read_u16();
     if !matches!(version, 1 | 2) {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "PSD unsupported version {version}"
@@ -130,14 +185,13 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     let psb = version == 2;
 
     // Skip reserved 6 bytes
-    let mut reserved = [0u8; 6];
-    r.read_exact(&mut reserved).map_err(BioFormatsError::Io)?;
+    r.skip(6);
 
-    let channels = read_u16_be(&mut r).map_err(BioFormatsError::Io)? as u32;
-    let height = read_u32_be(&mut r).map_err(BioFormatsError::Io)?;
-    let width = read_u32_be(&mut r).map_err(BioFormatsError::Io)?;
-    let depth = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
-    let color_mode = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
+    let channels = r.read_u16() as u32;
+    let height = r.read_u32();
+    let width = r.read_u32();
+    let depth = r.read_u16();
+    let color_mode = r.read_u16();
     if channels == 0 {
         return Err(BioFormatsError::UnsupportedFormat(
             "PSD channel count is non-positive".into(),
@@ -155,51 +209,174 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     }
     let pixel_type = pixel_type_from_depth(depth)?;
 
+    let _ = psb; // Java's PSDReader uses 4-byte lengths regardless of version.
+
     // Color Mode Data section. For palette images (mode 2) this holds a
     // 768-byte (3 x 256) RGB lookup table, stored plane-by-plane.
-    let cm_len = read_u32_be(&mut r).map_err(BioFormatsError::Io)? as u64;
+    let mode_data_len = r.read_i32() as i64;
+    let fp = r.fp();
     let mut lookup_table = None;
-    if cm_len != 0 {
-        if color_mode == 2 && cm_len >= 768 {
-            let mut lut = [0u8; 768];
-            r.read_exact(&mut lut).map_err(BioFormatsError::Io)?;
-            let mut red = vec![0u16; 256];
-            let mut green = vec![0u16; 256];
-            let mut blue = vec![0u16; 256];
-            for i in 0..256 {
-                red[i] = lut[i] as u16;
-                green[i] = lut[256 + i] as u16;
-                blue[i] = lut[512 + i] as u16;
+    if mode_data_len != 0 {
+        if color_mode == 2 {
+            let lut = r.read_bytes(768);
+            if lut.len() == 768 {
+                let mut red = vec![0u16; 256];
+                let mut green = vec![0u16; 256];
+                let mut blue = vec![0u16; 256];
+                for i in 0..256 {
+                    red[i] = lut[i] as u16;
+                    green[i] = lut[256 + i] as u16;
+                    blue[i] = lut[512 + i] as u16;
+                }
+                lookup_table = Some(crate::common::metadata::LookupTable { red, green, blue });
             }
-            lookup_table = Some(crate::common::metadata::LookupTable { red, green, blue });
-            // Seek past any remaining color-mode data.
-            if cm_len > 768 {
-                r.seek(SeekFrom::Current((cm_len - 768) as i64))
-                    .map_err(BioFormatsError::Io)?;
-            }
-        } else {
-            r.seek(SeekFrom::Current(cm_len as i64))
-                .map_err(BioFormatsError::Io)?;
         }
+        r.seek((fp as i64 + mode_data_len).max(0) as usize);
     }
 
-    // Skip Image Resources section
-    let ir_len = read_u32_be(&mut r).map_err(BioFormatsError::Io)? as u64;
-    r.seek(SeekFrom::Current(ir_len as i64))
-        .map_err(BioFormatsError::Io)?;
+    // Image Resources section: Java skips the 4-byte length, then walks "8BIM"
+    // resource blocks one at a time.
+    r.skip(4);
+    while r.read_bytes(4) == b"8BIM" {
+        let _tag = r.read_i16();
+        let mut read = 1;
+        while r.read_u8() != 0 {
+            read += 1;
+        }
+        if read % 2 == 1 {
+            r.skip(1);
+        }
+        let mut size = r.read_i32();
+        if size % 2 == 1 {
+            size += 1;
+        }
+        r.skip(size.max(0) as usize);
+    }
+    r.seek(r.fp().saturating_sub(4));
 
-    // Skip Layer and Mask Info section
-    let lm_len: u64 = if psb {
-        read_u64_be(&mut r).map_err(BioFormatsError::Io)?
+    // Layer and Mask Info section. Java derives the image-data offset through a
+    // sequence of heuristics; we mirror them byte-for-byte so the resulting
+    // (sometimes slightly misaligned) offset matches the Java reference output.
+    let block_len = r.read_i32();
+    // Start of the layer+mask block (just past the 4-byte length). The simple
+    // fallback offset for the image-data section is `block_start + block_len`.
+    let block_start = r.fp();
+    let offset;
+    if block_len == 0 {
+        offset = r.fp();
     } else {
-        read_u32_be(&mut r).map_err(BioFormatsError::Io)? as u64
-    };
-    r.seek(SeekFrom::Current(lm_len as i64))
-        .map_err(BioFormatsError::Io)?;
+        let layer_len = r.read_i32();
+        let layer_count = r.read_i16();
+        if layer_count < 0 {
+            // Vector/large-document layer data: Java rejects this, but we still
+            // expose the flattened composite image. Skip the whole layer+mask
+            // block and read the image-data section that follows it.
+            r.seek(block_start.saturating_add(block_len.max(0) as usize));
+            offset = r.fp();
+            return finish_psd(
+                &data, &mut r, offset, channels, height, width, depth, color_mode,
+                pixel_type, lookup_table,
+            );
+        }
+        if layer_len == 0 && layer_count == 0 {
+            r.skip(2);
+            let check = r.read_i16();
+            r.seek(r.fp().saturating_sub(if check == 0 { 4 } else { 2 }));
+        }
 
-    // Image Data section
-    let compression = read_u16_be(&mut r).map_err(BioFormatsError::Io)?;
+        let lc = layer_count as usize;
+        let mut lw = vec![0i32; lc];
+        let mut lh = vec![0i32; lc];
+        let mut lcc = vec![0i32; lc];
+        for i in 0..lc {
+            let top = r.read_i32();
+            let left = r.read_i32();
+            let bottom = r.read_i32();
+            let right = r.read_i32();
+            lw[i] = right - left;
+            lh[i] = bottom - top;
+            lcc[i] = r.read_i16() as i32;
+            r.skip((lcc[i] * 6 + 12).max(0) as usize);
+            let mut len = r.read_i32();
+            if len % 2 == 1 {
+                len += 1;
+            }
+            r.skip(len.max(0) as usize);
+        }
+        // Skip over each layer's per-channel pixel data.
+        for i in 0..lc {
+            if lh[i] < 0 {
+                continue;
+            }
+            for _cc in 0..lcc[i] {
+                let compressed = r.read_i16() == 1;
+                if !compressed {
+                    r.skip((lw[i] as i64 * lh[i] as i64).max(0) as usize);
+                } else {
+                    let mut lens = vec![0usize; lh[i] as usize];
+                    for y in 0..lh[i] as usize {
+                        lens[y] = r.read_u16() as usize;
+                    }
+                    for y in 0..lh[i] as usize {
+                        r.skip(lens[y]);
+                    }
+                }
+            }
+        }
+        let start = r.fp();
+        while r.read_u8() != b'8' && r.fp() < r.len() {}
+        r.skip(7);
+        if r.fp() - start > 1024 {
+            r.seek(start);
+        }
+        let mut len = r.read_i32();
+        if len % 4 != 0 {
+            len += 4 - (len % 4);
+        }
+        if (len as i64) > (r.len() as i64 - r.fp() as i64) || (len & 0xff_0000) >> 16 == 1 {
+            r.seek(start);
+            len = 0;
+        }
+        r.skip(len.max(0) as usize);
 
+        let mut s = r.read_bytes(4).to_vec();
+        while s == b"8BIM" {
+            r.skip(4);
+            let mut len = r.read_i32();
+            if len % 4 != 0 {
+                len += 4 - (len % 4);
+            }
+            r.skip(len.max(0) as usize);
+            s = r.read_bytes(4).to_vec();
+        }
+        offset = r.fp().saturating_sub(4);
+    }
+
+    finish_psd(
+        &data, &mut r, offset, channels, height, width, depth, color_mode, pixel_type,
+        lookup_table,
+    )
+}
+
+/// Decode the PSD image-data section starting at `offset` and assemble metadata.
+/// `offset` points at the compression word (Java's pre-read position).
+#[allow(clippy::too_many_arguments)]
+fn finish_psd(
+    data: &[u8],
+    r: &mut Cur,
+    mut offset: usize,
+    channels: u32,
+    height: u32,
+    width: u32,
+    depth: u16,
+    color_mode: u16,
+    pixel_type: PixelType,
+    lookup_table: Option<crate::common::metadata::LookupTable>,
+) -> Result<(ImageMetadata, Vec<u8>)> {
+    // Image Data section. Java reads the compression word at `offset`, then sets
+    // `offset = filePointer` (just past the word).
+    r.seek(offset);
+    let compression = r.read_u16();
     let bytes_per_sample = pixel_type.bytes_per_sample();
     let row_bytes = (width as usize)
         .checked_mul(bytes_per_sample)
@@ -211,40 +388,45 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         .checked_mul(channels as usize)
         .ok_or_else(|| BioFormatsError::Format("PSD pixel byte count overflows".into()))?;
 
-    let pixel_data: Vec<u8> = if compression == 1 {
-        // RLE: byte count table followed by compressed data
-        let count_entries = (height * channels) as usize;
-        let mut row_counts = Vec::with_capacity(count_entries);
-        for _ in 0..count_entries {
-            if psb {
-                let c = {
-                    let mut b = [0u8; 4];
-                    r.read_exact(&mut b).map_err(BioFormatsError::Io)?;
-                    u32::from_be_bytes(b) as usize
-                };
-                row_counts.push(c);
-            } else {
-                row_counts.push(read_u16_be(&mut r).map_err(BioFormatsError::Io)? as usize);
-            }
+    let compressed = compression == 1;
+    // Java stores per-(channel,row) RLE byte counts read immediately after the
+    // compression word; `offset` then points at the first compressed byte.
+    let mut row_counts: Vec<usize> = Vec::new();
+    if compressed {
+        for _ in 0..(channels as usize * height as usize) {
+            row_counts.push(r.read_u16() as usize);
         }
-        let total_compressed: usize = row_counts.iter().sum();
-        let mut compressed = vec![0u8; total_compressed];
-        r.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;
+    }
+    offset = r.fp();
 
-        // Decode each row
+    let pixel_data: Vec<u8> = if compressed {
+        // RLE: decode each row from `offset` using its byte count. Java decodes
+        // exactly `lens[c][row]` bytes per row into a `sizeX*bpp` output row.
         let mut out = Vec::with_capacity(total_bytes);
-        let mut offset = 0;
+        let mut pos = offset;
         for &rc in &row_counts {
-            let decoded = decode_packbits(&compressed[offset..offset + rc], row_bytes)?;
+            let end = (pos + rc).min(data.len());
+            let src = &data[pos.min(data.len())..end];
+            let decoded = decode_packbits(src, row_bytes).unwrap_or_else(|_| {
+                let mut v = src.to_vec();
+                v.resize(row_bytes, 0);
+                v
+            });
             out.extend_from_slice(&decoded);
-            offset += rc;
+            pos += rc;
         }
         out
     } else if compression == 0 {
-        // Raw
-        let mut raw = vec![0u8; total_bytes];
-        r.read_exact(&mut raw).map_err(BioFormatsError::Io)?;
-        raw
+        // Raw planar data starting at `offset`. Like Java's readPlane, require
+        // the full plane to be present rather than zero-padding a truncated one.
+        let end = offset.checked_add(total_bytes).unwrap_or(usize::MAX);
+        if end > data.len() {
+            return Err(BioFormatsError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            )));
+        }
+        data[offset..end].to_vec()
     } else {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "PSD unsupported compression {compression}"
@@ -259,26 +441,12 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     let is_indexed = color_mode == 2 && lookup_table.is_some();
     let output_channels = channels as usize;
 
-    // Convert from planar to interleaved, preserving every channel so that
-    // alpha (RGBA), CMYK, and Lab data are not dropped.
-    let pixels = if output_channels > 1 {
-        let mut interleaved = Vec::with_capacity(
-            width as usize * height as usize * output_channels * bytes_per_sample,
-        );
-        for i in 0..(width as usize * height as usize) {
-            for c in 0..output_channels {
-                let src_off = c * plane_bytes + i * bytes_per_sample;
-                if src_off + bytes_per_sample <= pixel_data.len() {
-                    interleaved.extend_from_slice(&pixel_data[src_off..src_off + bytes_per_sample]);
-                } else {
-                    interleaved.extend(std::iter::repeat(0u8).take(bytes_per_sample));
-                }
-            }
-        }
-        interleaved
-    } else {
-        pixel_data[..plane_bytes.min(pixel_data.len())].to_vec()
-    };
+    // Keep the composite data **planar** (channel-separated): channel 0's plane,
+    // then channel 1's, etc. Java's PSDReader is interleaved=false and emits
+    // channels separately, so storing planar lets the region crop mirror Java's
+    // byte layout exactly. Normalize to the full expected size (pad/truncate).
+    let mut pixels = pixel_data;
+    pixels.resize(total_bytes, 0u8);
 
     // Java: imageCount = sizeC / (isRGB ? 3 : 1).
     let image_count = (output_channels as u32 / if is_rgb { 3 } else { 1 }).max(1);
@@ -294,7 +462,7 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,
-        is_interleaved: output_channels > 1,
+        is_interleaved: false,
         is_indexed,
         is_little_endian: false, // PSD is big-endian
         resolution_count: 1,
@@ -397,9 +565,38 @@ impl FormatReader for PsdReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("PSD", &full, meta, meta.size_c as usize, x, y, w, h)
+        let full = self.pixels.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        validate_region("PSD", meta.size_x, meta.size_y, x, y, w, h)?;
+
+        let bps = meta.pixel_type.bytes_per_sample();
+        let channels = meta.size_c as usize;
+        let row_bytes = (meta.size_x as usize)
+            .checked_mul(bps)
+            .ok_or_else(|| BioFormatsError::Format("PSD row size overflows".into()))?;
+        let plane_bytes = row_bytes
+            .checked_mul(meta.size_y as usize)
+            .ok_or_else(|| BioFormatsError::Format("PSD plane size overflows".into()))?;
+        let out_row = (w as usize)
+            .checked_mul(bps)
+            .ok_or_else(|| BioFormatsError::Format("PSD output row size overflows".into()))?;
+
+        // Channel-separated (planar) output, matching Java's openBytes layout:
+        // for each channel, copy its cropped region rows, then the next channel.
+        let mut out = Vec::with_capacity(channels * (h as usize) * out_row);
+        let start_x = (x as usize) * bps;
+        for c in 0..channels {
+            let chan_base = c * plane_bytes;
+            for row in 0..h as usize {
+                let src = chan_base + (y as usize + row) * row_bytes + start_x;
+                out.extend_from_slice(&full[src..src + out_row]);
+            }
+        }
+        Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -409,5 +606,17 @@ impl FormatReader for PsdReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        // Java sets the image name to the source file's basename.
+        if let (Some(path), Some(image)) = (self.path.as_ref(), ome.images.first_mut()) {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                image.name = Some(name.to_string());
+            }
+        }
+        Some(ome)
     }
 }

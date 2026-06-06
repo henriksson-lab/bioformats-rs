@@ -6383,32 +6383,31 @@ fn bdv_preserves_companion_xml_original_metadata() {
 
     let mut reader = bioformats::formats::bdv::BdvReader::new();
     reader.set_id(&path).unwrap();
-    let metadata = &reader.metadata().series_metadata;
 
+    // Java parity: each (setup × timepoint × level) becomes its own series.
+    // The XML declares 2 setups and timepoints 2..=4 (3 timepoints), but the
+    // HDF5 fixture only contains pixels for setup 0 at t00002 level 0, so only
+    // one series is actually readable. Each series is single-channel,
+    // single-timepoint, with dims taken from the cells dataset shape.
+    assert_eq!(reader.series_count(), 1);
+    let metadata = &reader.metadata().series_metadata;
     assert_eq!(reader.metadata().size_x, 3);
     assert_eq!(reader.metadata().size_y, 2);
     assert_eq!(reader.metadata().size_z, 1);
-    assert_eq!(reader.metadata().size_c, 2);
-    assert_eq!(reader.metadata().size_t, 3);
+    assert_eq!(reader.metadata().size_c, 1);
+    assert_eq!(reader.metadata().size_t, 1);
+    assert_eq!(reader.metadata().image_count, 1);
     assert!(matches!(
-        metadata.get("bdv_size"),
-        Some(MetadataValue::String(value)) if value == "3 2 1"
+        metadata.get("bdv_setup"),
+        Some(MetadataValue::Int(0))
     ));
     assert!(matches!(
-        metadata.get("bdv_timepoint_first"),
+        metadata.get("bdv_timepoint"),
         Some(MetadataValue::Int(2))
     ));
     assert!(matches!(
-        metadata.get("bdv_timepoint_last"),
-        Some(MetadataValue::Int(4))
-    ));
-    assert!(matches!(
-        metadata.get("bdv_view_setup_count"),
-        Some(MetadataValue::Int(2))
-    ));
-    assert!(matches!(
-        metadata.get("bdv_xml"),
-        Some(MetadataValue::String(value)) if value.contains("<SpimData>")
+        metadata.get("bdv_level"),
+        Some(MetadataValue::Int(0))
     ));
     let err = reader.open_bytes_region(0, 2, 0, 2, 1).unwrap_err();
     assert!(
@@ -6418,7 +6417,11 @@ fn bdv_preserves_companion_xml_original_metadata() {
 }
 
 #[test]
-fn bdv_rejects_short_dataset_instead_of_zero_filling_plane() {
+fn bdv_derives_dimensions_from_cells_dataset_shape() {
+    // Java parity: core dimensions come from the {level}/cells dataset shape
+    // [z, y, x], not from the companion XML <size>. Here the XML claims a
+    // 2x1x1 setup but the actual cells dataset is 1x1x1, and the reader must
+    // expose the dataset's real shape with a single readable plane.
     let path = tmp("short_bdv.h5");
     let xml_path = path.with_extension("xml");
     let _ = std::fs::remove_file(&path);
@@ -6447,16 +6450,22 @@ fn bdv_rejects_short_dataset_instead_of_zero_filling_plane() {
 
     std::fs::write(
         &xml_path,
-        r#"<SpimData><SequenceDescription><ViewSetups><ViewSetup><size>2 1 1</size></ViewSetup></ViewSetups></SequenceDescription></SpimData>"#,
+        r#"<SpimData><SequenceDescription><ViewSetups><ViewSetup><id>0</id><size>2 1 1</size></ViewSetup></ViewSetups></SequenceDescription></SpimData>"#,
     )
     .unwrap();
 
     let mut reader = bioformats::formats::bdv::BdvReader::new();
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("does not match declared")),
-        "{err:?}"
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(
+        (
+            reader.metadata().size_x,
+            reader.metadata().size_y,
+            reader.metadata().size_z
+        ),
+        (1, 1, 1)
     );
+    assert_eq!(reader.open_bytes(0).unwrap(), 7u16.to_le_bytes().to_vec());
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&xml_path);
 }
@@ -6483,21 +6492,24 @@ fn bdv_requires_real_dimensions_and_initialized_series() {
     let mut wf = hdf5_pure_rust::WritableFile::create(&path).unwrap();
     wf.flush().unwrap();
     drop(wf);
+    // No companion XML and no sNN groups in the HDF5 → no setups to enumerate.
     let err = uninit.set_id(&path).unwrap_err();
     assert!(
-        err.to_string().contains("no timepoint groups found"),
+        err.to_string().contains("no ViewSetups / setup groups found"),
         "unexpected BDV error: {err}"
     );
     assert_eq!(uninit.series_count(), 0);
 
+    // A ViewSetup without an <id> cannot be mapped to an sNN group, so it is
+    // ignored; with no usable setups, set_id still fails (no series).
     std::fs::write(
         &xml_path,
-        r#"<SpimData><ViewSetup><size>0 2 1</size></ViewSetup></SpimData>"#,
+        r#"<SpimData><SequenceDescription><ViewSetups><ViewSetup><size>0 2 1</size></ViewSetup></ViewSetups></SequenceDescription></SpimData>"#,
     )
     .unwrap();
     let err = uninit.set_id(&path).unwrap_err();
     assert!(
-        err.to_string().contains("non-positive size axis"),
+        err.to_string().contains("no ViewSetups / setup groups found"),
         "unexpected BDV error: {err}"
     );
 
