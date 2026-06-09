@@ -427,17 +427,14 @@ impl NrrdReader {
             let data_path = &hdr.data_files[plane_index as usize];
             // Detached LIST files are external data sources.
             let raw = self.read_nrrd_payload(data_path, 0, hdr, plane_bytes, true)?;
-            let mut buf = raw[..plane_bytes.min(raw.len())].to_vec();
+            let buf = raw[..plane_bytes.min(raw.len())].to_vec();
             if buf.len() != plane_bytes {
                 return Err(BioFormatsError::InvalidData(
                     "NRRD: detached LIST plane is shorter than expected".into(),
                 ));
             }
-            if !hdr.endian && bps > 1 {
-                for chunk in buf.chunks_exact_mut(bps) {
-                    chunk.reverse();
-                }
-            }
+            // Java's openBytes returns the raw on-disk bytes without swapping;
+            // the byte order is reported via is_little_endian instead.
             return Ok(buf);
         }
 
@@ -494,12 +491,8 @@ impl NrrdReader {
                     "NRRD: plane out of range".into(),
                 ));
             }
-            let mut buf = all[start..end].to_vec();
-            if !hdr.endian && bps > 1 {
-                for chunk in buf.chunks_exact_mut(bps) {
-                    chunk.reverse();
-                }
-            }
+            let buf = all[start..end].to_vec();
+            // Raw on-disk byte order is preserved; see is_little_endian.
             return Ok(buf);
         }
 
@@ -575,11 +568,7 @@ impl NrrdReader {
                 }
             }
         }
-        if !hdr.endian && bps > 1 {
-            for chunk in buf.chunks_exact_mut(bps) {
-                chunk.reverse();
-            }
-        }
+        // Raw on-disk byte order is preserved; see is_little_endian.
         Ok(buf)
     }
 
@@ -827,13 +816,19 @@ impl FormatReader for NrrdReader {
             pixel_type: hdr.pixel_type,
             bits_per_pixel: bps,
             image_count,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: axes.size_c == 3 || axes.size_c == 4,
+            // NRRDReader.java fixes dimensionOrder = "XYCZT" (initFile line 277).
+            dimension_order: DimensionOrder::XYCZT,
+            // NRRDReader.java: m.rgb = getSizeC() > 1 (initFile line 368). Any
+            // multi-component leading axis is an interleaved RGB-like channel.
+            is_rgb: axes.size_c > 1,
             is_interleaved: true,
             is_indexed: false,
-            // Multi-byte big-endian samples are normalized to little-endian in
-            // open_bytes, so expose the byte order callers actually receive.
-            is_little_endian: true,
+            // Honor the NRRD `endian:` header field exactly as Java does
+            // (m.littleEndian = v.equals("little")). We return the raw bytes in
+            // their on-disk order without swapping, so this flag is the byte
+            // order callers actually receive. Default is little-endian when the
+            // header omits `endian:` (single-byte types never declare it).
+            is_little_endian: hdr.endian,
             resolution_count: 1,
             series_metadata,
             lookup_table: None,
@@ -897,6 +892,25 @@ impl FormatReader for NrrdReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::OmeMetadata;
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        // Java's MetadataTools.populatePixels sets the OME Image name to the
+        // dataset file name (e.g. "dt-helix.nrrd").
+        if let Some(name) = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            if let Some(img) = ome.images.get_mut(0) {
+                img.name = Some(name.to_string());
+            }
+        }
+        Some(ome)
     }
 }
 

@@ -10,8 +10,9 @@ use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader as _;
 
-use super::compression::{decompress, JpegColor};
+use super::compression::{decompress, merge_jpeg_tables, JpegColor};
 use super::ifd::{tag, Compression, Ifd, Photometric};
+use super::jpeg_restart;
 use super::nikon::NikonCompressionOptions;
 use super::parser::TiffParser;
 
@@ -52,6 +53,13 @@ struct IfdInfo {
     ycbcr_subsampling: (u16, u16),
     ycbcr_coefficients: (f32, f32, f32),
     nikon_compression_options: Option<NikonCompressionOptions>,
+    /// Hamamatsu NDPI restart-marker offsets (relative to the strip start) for a
+    /// single-strip JPEG level. Built from tag 65426 (low 32 bits) + 65432 (high
+    /// 32 bits). When present, a giant single-strip JPEG (whole-slide level 0,
+    /// stored as one >4 GB strip) can be windowed without scanning the strip:
+    /// `markers[k]` is the byte offset just after the k-th `RSTn` marker, and
+    /// `markers[0]` is the scan start. See `jpeg_restart::decode_rows_ndpi`.
+    ndpi_restart_markers: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +139,10 @@ pub struct TiffReader {
     /// Cache of opened companion TIFF readers, keyed by absolute path, so that
     /// reading many external planes from the same companion reuses one reader.
     companion_readers: HashMap<PathBuf, TiffReader>,
+    /// When set, parse the IFD chain using the Hamamatsu NDPI 64-bit ("fake
+    /// BigTIFF") layout instead of standard 32-bit pointers. Enabled by
+    /// `NdpiReader` for files >4 GB before `set_id`.
+    ndpi_64bit: bool,
 }
 
 impl TiffReader {
@@ -144,7 +156,14 @@ impl TiffReader {
             ome_xml: None,
             path: None,
             companion_readers: HashMap::new(),
+            ndpi_64bit: false,
         }
+    }
+
+    /// Enable Hamamatsu NDPI 64-bit ("fake BigTIFF") IFD parsing. Must be called
+    /// before `set_id`. See [`TiffParser::read_ifds_ndpi64`].
+    pub fn set_ndpi_64bit(&mut self, on: bool) {
+        self.ndpi_64bit = on;
     }
 
     /// Access the series list for vendor-specific wrappers.
@@ -393,6 +412,34 @@ impl TiffReader {
         });
 
         let image_description = ifd.get_str(tag::IMAGE_DESCRIPTION).map(str::to_owned);
+
+        // Hamamatsu NDPI restart-marker offsets (tag 65426 low, 65432 high). Used
+        // to window a giant single-strip JPEG level without reading the whole
+        // strip. Mirrors NDPIReader.getMarkers (NDPIReader.java:891-921).
+        const NDPI_MARKER_TAG: u16 = 65426;
+        const NDPI_MARKER_HIGH_BYTES: u16 = 65432;
+        let ndpi_restart_markers = ifd.get(NDPI_MARKER_TAG).map(|v| {
+            let low = v.as_vec_u64();
+            match ifd.get(NDPI_MARKER_HIGH_BYTES).map(|h| h.as_vec_u64()) {
+                Some(high) => low
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &lo)| (lo & 0xffff_ffff) + (high.get(i).copied().unwrap_or(0) << 32))
+                    .collect::<Vec<u64>>(),
+                None => {
+                    // High words absent (can happen in sub-resolution IFDs): add
+                    // 4 GB whenever the offset sequence decreases (overflow).
+                    let mut out = low.clone();
+                    for i in 1..out.len() {
+                        if out[i] < out[i - 1] {
+                            out[i] += 1u64 << 32;
+                        }
+                    }
+                    out
+                }
+            }
+        });
+
         let subsampling = ifd.get_vec_u16(tag::YCBCR_SUBSAMPLING);
         let ycbcr_subsampling = (
             subsampling.first().copied().unwrap_or(2).max(1),
@@ -431,6 +478,7 @@ impl TiffReader {
             ycbcr_subsampling,
             ycbcr_coefficients: coefficients,
             nikon_compression_options: None,
+            ndpi_restart_markers,
         })
     }
 
@@ -1194,7 +1242,154 @@ impl TiffReader {
             .checked_add(h)
             .ok_or_else(|| BioFormatsError::Format("TIFF region y range overflows".into()))?;
 
-        for strip_idx in 0..info.strip_offsets.len() {
+        // Windowed single-strip JPEG fast path (NDPI / whole-slide). When a level
+        // is stored as ONE baseline JPEG strip covering the whole image, decode
+        // only the band of MCU rows overlapping [y, y_end) via restart markers
+        // instead of materialising the entire plane. Falls back to the generic
+        // strip loop below when the JPEG lacks restart markers / is unaligned.
+        let mut used_window = false;
+
+        // NDPI marker-driven windowing: a Hamamatsu level is one JPEG strip that
+        // can exceed 4 GB (full resolution). Its restart-marker offsets live in a
+        // dedicated TIFF tag, so we can window WITHOUT reading the whole strip —
+        // only the JPEG header and the requested band's intervals are read from
+        // disk. This is the only path that keeps the >4 GB level bounded.
+        if !used_window
+            && matches!(info.compression, Compression::Jpeg | Compression::JpegNew)
+            && !ycbcr
+            && info.strip_offsets.len() == 1
+            && info.strip_byte_counts.len() == 1
+            && info.rows_per_strip >= info.height
+        {
+            if let Some(markers) = info.ndpi_restart_markers.as_deref() {
+                let decoded = jpeg_restart::decode_rows_ndpi(
+                    &mut file.parser.reader,
+                    info.strip_offsets[0],
+                    info.strip_byte_counts[0],
+                    markers,
+                    info.jpeg_tables.as_deref(),
+                    info.width,
+                    info.height,
+                    x,
+                    y,
+                    w,
+                    h,
+                    jpeg_color_for(info),
+                );
+                if let Some(result) = decoded {
+                    let band = result?;
+                    // The band is a sub-rectangle [band_x0, band_x0+band_width) ×
+                    // [band_y0, band_y0+band_height) that fully contains the
+                    // requested [x,x+w) columns. Emit `h` FULL-WIDTH rows (with the
+                    // band's columns placed at `band_x0`, the rest left zero) so the
+                    // shared apply_photometric + column-crop below produce exactly
+                    // the same output as the generic path. Only the [x,x+w) columns
+                    // — which lie inside the band — survive the crop.
+                    let channels = band
+                        .pixels
+                        .len()
+                        .checked_div(band.band_width as usize * band.band_height.max(1) as usize)
+                        .filter(|&c| c > 0)
+                        .unwrap_or(effective_spp as usize);
+                    let band_stride = band.band_width as usize * channels;
+                    let dst_off = band.band_x0 as usize * channels;
+                    let copy_len = band_stride.min(row_bytes.saturating_sub(dst_off));
+                    for out_row in 0..h as usize {
+                        let img_row = y as usize + out_row;
+                        let band_row = img_row.saturating_sub(band.band_y0 as usize);
+                        let mut full = vec![0u8; row_bytes];
+                        let rs = checked_mul_usize(band_row, band_stride, "TIFF NDPI band row")?;
+                        if let Some(src) = band.pixels.get(rs..rs + copy_len) {
+                            full[dst_off..dst_off + copy_len].copy_from_slice(src);
+                        }
+                        plane_rows.extend_from_slice(&full);
+                    }
+                    used_window = true;
+                }
+            }
+        }
+        // Cap the compressed-strip read used for windowing/indexing. A real
+        // whole-slide JPEG level compresses to at most a few hundred MB; a strip
+        // byte-count of multiple GB means a garbage >4 GB-NDPI offset table (it
+        // clamps to "rest of file"). Don't read it — let the safety valve below
+        // refuse the level cleanly instead of allocating gigabytes here.
+        const MAX_STRIP_READ: u64 = 2 << 30; // 2 GiB
+        if matches!(info.compression, Compression::Jpeg | Compression::JpegNew)
+            && !ycbcr
+            && info.strip_offsets.len() == 1
+            && info.strip_byte_counts.len() == 1
+            && info.rows_per_strip >= info.height
+            && (info.strip_byte_counts[0] as u64) <= MAX_STRIP_READ
+        {
+            let offset = info.strip_offsets[0];
+            let byte_count = info.strip_byte_counts[0] as usize;
+            let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+            apply_fill_order(&mut compressed, info.fill_order, info.compression);
+            let merged = match info.jpeg_tables.as_deref() {
+                Some(tables) => merge_jpeg_tables(tables, &compressed),
+                None => compressed,
+            };
+            let indexed = jpeg_restart::index(&merged);
+            if std::env::var("BF_JR_DEBUG").is_ok() {
+                eprintln!(
+                    "[jpeg_restart] single-strip JPEG {}x{}: index={}",
+                    info.width,
+                    info.height,
+                    if indexed.is_some() { "Some(has restart markers)" } else { "None (no DRI/restart markers)" }
+                );
+            }
+            if let Some(idx) = indexed {
+                let decoded = idx.decode_rows(&merged, y, h, jpeg_color_for(info));
+                if decoded.is_none() && std::env::var("BF_JR_DEBUG").is_ok() {
+                    eprintln!("[jpeg_restart] decode_rows=None (restart intervals not row-aligned)");
+                }
+                if let Some(result) = decoded {
+                    let band = result?;
+                    // Crop [y, y_end) rows from the band, exactly like the generic
+                    // path crops within a strip (band_y0 plays strip_start_row).
+                    let row_start = y.saturating_sub(band.band_y0) as usize;
+                    let row_end = y_end
+                        .saturating_sub(band.band_y0)
+                        .min(band.band_height) as usize;
+                    for row in row_start..row_end {
+                        let rs = checked_mul_usize(row, row_bytes, "TIFF JPEG band row offset")?;
+                        let re = rs.checked_add(row_bytes).ok_or_else(|| {
+                            BioFormatsError::Format("TIFF JPEG band row range overflows".into())
+                        })?;
+                        let row_data = band.pixels.get(rs..re).ok_or_else(|| {
+                            BioFormatsError::InvalidData(
+                                "TIFF JPEG band row is outside decoded data".into(),
+                            )
+                        })?;
+                        plane_rows.extend_from_slice(row_data);
+                    }
+                    used_window = true;
+                }
+            }
+        }
+
+        // Memory safety valve: a single strip covering the whole plane that we
+        // could NOT window (no JPEG restart markers, unaligned intervals, or a
+        // garbage >4 GB-NDPI strip) would otherwise be decoded in full here,
+        // materialising the entire gigapixel plane (observed: 144 GiB on the
+        // 6.5 GB Hamamatsu slide). Refuse it instead of OOMing. Real small
+        // single-strip planes (< cap) and multi-strip/tiled reads are unaffected.
+        if !used_window && info.strip_offsets.len() == 1 && info.rows_per_strip >= info.height {
+            let bps = ((info.bits_per_sample as u64) + 7) / 8;
+            let plane_bytes = (info.width as u64)
+                .saturating_mul(info.height as u64)
+                .saturating_mul(info.samples_per_pixel as u64)
+                .saturating_mul(bps);
+            const HARD_CAP: u64 = 1 << 30; // 1 GiB
+            if plane_bytes > HARD_CAP {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "single-strip plane is ~{} MiB and could not be windowed (no JPEG restart markers / unaligned intervals); refusing full-plane decode to avoid exhausting memory",
+                    plane_bytes >> 20
+                )));
+            }
+        }
+
+        for strip_idx in (0..info.strip_offsets.len()).take_while(|_| !used_window) {
             let strip_start_row = checked_strip_start_row(strip_idx, rows_per_strip)?;
             let strip_end_row = strip_start_row
                 .checked_add(rows_per_strip)
@@ -3351,7 +3546,11 @@ impl crate::common::reader::FormatReader for TiffReader {
             parser,
             ifds: Vec::new(),
         };
-        tf.ifds = tf.parser.read_ifds()?;
+        tf.ifds = if self.ndpi_64bit {
+            tf.parser.read_ifds_ndpi64()?
+        } else {
+            tf.parser.read_ifds()?
+        };
         for ifd in &tf.ifds {
             Self::ifd_info(ifd, little_endian)?;
         }

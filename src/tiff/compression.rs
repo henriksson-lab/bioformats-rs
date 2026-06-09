@@ -23,7 +23,7 @@ pub enum JpegColor {
 }
 
 /// Decode a JPEG payload, honouring `color` for the YCbCr↔RGB transform.
-fn decompress_jpeg_color(data: &[u8], color: JpegColor) -> Result<Vec<u8>> {
+pub(crate) fn decompress_jpeg_color(data: &[u8], color: JpegColor) -> Result<Vec<u8>> {
     match color {
         JpegColor::Default => decompress_jpeg(data),
         JpegColor::Rgb => {
@@ -138,7 +138,7 @@ pub fn decompress(
     Ok(out)
 }
 
-fn merge_jpeg_tables(tables: &[u8], data: &[u8]) -> Vec<u8> {
+pub(crate) fn merge_jpeg_tables(tables: &[u8], data: &[u8]) -> Vec<u8> {
     if !starts_with_soi(tables) {
         return data.to_vec();
     }

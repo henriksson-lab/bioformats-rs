@@ -4,12 +4,21 @@
 ///   - core metadata (sizeX/Y/Z/C/T, pixelType, bitsPerPixel, imageCount,
 ///     dimensionOrder, rgb/interleaved/indexed/littleEndian, rgbChannelCount,
 ///     resolutionCount)
-///   - a bounded-region CRC32 of the first few planes (so gigapixel whole-slide
-///     images don't allocate gigabytes — same region the Rust side reads)
+///   - a bounded-region CRC32 of the top-left 256² of up to `maxPlanes` planes
+///     (so gigapixel whole-slide images don't allocate gigabytes — same region
+///     the Rust side reads). For SMALL planes (full plane <= FULL_PLANE_MAX) the
+///     same entry ALSO carries a CRC+base64 of the WHOLE plane, so divergences
+///     outside the top-left corner are caught.
+///   - one NON-ZERO-ORIGIN region (centered 256² crop) of plane 0, to catch
+///     tiling/stride/offset bugs the (0,0) crop misses.
 /// and the OME metadata (per image: name, physical sizes, time increment,
 /// per-channel name / samplesPerPixel / emission / excitation).
 ///
 /// The JSON is hand-built (no JSON lib) so it only needs bioformats_package.jar.
+///
+/// Memory: whole-plane reads are ONLY done for planes whose full size is
+/// <= FULL_PLANE_MAX (4 MiB), so peak RAM stays bounded even for deep stacks or
+/// gigapixel whole-slide levels (those only get the bounded 256² crops).
 ///
 /// Usage: java -cp bioformats_package.jar:<dir> BfParityOracle <path> [maxPlanes] [region]
 ///   maxPlanes default 8, region (square edge) default 256.
@@ -23,11 +32,20 @@ import loci.common.DebugTools;
 import java.util.zip.CRC32;
 
 public class BfParityOracle {
+    /// Max full-plane size (bytes) for which we ALSO emit a whole-plane CRC+b64.
+    /// Keeps peak RAM and JSON-line size bounded; larger planes get only the
+    /// bounded 256² crops.
+    static final long FULL_PLANE_MAX = 4L << 20; // 4 MiB
+
     public static void main(String[] args) {
         DebugTools.setRootLevel("ERROR");
         String path = args[0];
         int maxPlanes = args.length > 1 ? Integer.parseInt(args[1]) : 8;
         int region = args.length > 2 ? Integer.parseInt(args[2]) : 256;
+        // Whole-plane openBytes() reads can hard-crash the bundled libhdf5 on
+        // full-precision scaleoffset chunks (no output at all); the harness sets
+        // this to 0 for such files so the bounded crops still produce a result.
+        boolean doFull = args.length > 3 ? "1".equals(args[3]) : true;
 
         ImageReader reader = new ImageReader();
         IMetadata ome = null;
@@ -73,10 +91,18 @@ public class BfParityOracle {
             int w = Math.min(reader.getSizeX(), region);
             int h = Math.min(reader.getSizeY(), region);
             int planes = Math.min(reader.getImageCount(), maxPlanes);
+
+            // Is a whole-plane read cheap enough to also CRC? (bounded RAM)
+            long fullPlaneBytes = (long) reader.getSizeX() * reader.getSizeY()
+                    * reader.getRGBChannelCount()
+                    * FormatTools.getBytesPerPixel(reader.getPixelType());
+            boolean smallPlane = fullPlaneBytes <= FULL_PLANE_MAX;
+            sb.append(",\"fullPlaneBytes\":").append(fullPlaneBytes);
+
             sb.append(",\"planeCrc\":[");
             for (int p = 0; p < planes; p++) {
                 if (p > 0) sb.append(",");
-                String entry;
+                StringBuilder entry = new StringBuilder();
                 try {
                     byte[] buf = reader.openBytes(p, 0, 0, w, h);
                     CRC32 crc = new CRC32();
@@ -85,15 +111,57 @@ public class BfParityOracle {
                     // can do a per-sample tolerance compare when the exact CRC
                     // differs (e.g. JPEG IDCT rounding vs libjpeg).
                     String b64 = java.util.Base64.getEncoder().encodeToString(buf);
-                    entry = "{\"plane\":" + p + ",\"w\":" + w + ",\"h\":" + h
-                            + ",\"len\":" + buf.length + ",\"crc\":" + crc.getValue()
-                            + ",\"b64\":\"" + b64 + "\"}";
+                    entry.append("{\"plane\":").append(p).append(",\"w\":").append(w)
+                         .append(",\"h\":").append(h).append(",\"len\":").append(buf.length)
+                         .append(",\"crc\":").append(crc.getValue())
+                         .append(",\"b64\":\"").append(b64).append("\"");
+                    // For small planes, ALSO CRC the WHOLE plane (catches errors
+                    // outside the top-left 256² crop).
+                    if (smallPlane && doFull) {
+                        try {
+                            byte[] full = reader.openBytes(p);
+                            CRC32 fcrc = new CRC32();
+                            fcrc.update(full);
+                            String fb64 = java.util.Base64.getEncoder().encodeToString(full);
+                            entry.append(",\"fullLen\":").append(full.length)
+                                 .append(",\"fullCrc\":").append(fcrc.getValue())
+                                 .append(",\"fullB64\":\"").append(fb64).append("\"");
+                        } catch (Throwable t) {
+                            entry.append(",\"fullError\":").append(jstr(t.toString()));
+                        }
+                    }
+                    entry.append("}");
                 } catch (Throwable t) {
-                    entry = "{\"plane\":" + p + ",\"error\":" + jstr(t.toString()) + "}";
+                    entry.setLength(0);
+                    entry.append("{\"plane\":").append(p)
+                         .append(",\"error\":").append(jstr(t.toString())).append("}");
                 }
                 sb.append(entry);
             }
-            sb.append("]}");
+            sb.append("]");
+
+            // One NON-ZERO-ORIGIN region (centered 256² crop) of plane 0, to
+            // catch tiling/stride/offset bugs that the (0,0) crop cannot. Only
+            // emitted when the image is larger than the crop in some dimension
+            // (otherwise the offset is (0,0) and it duplicates the crop above).
+            int ox = (reader.getSizeX() - w) / 2;
+            int oy = (reader.getSizeY() - h) / 2;
+            if (planes > 0 && (ox > 0 || oy > 0)) {
+                try {
+                    byte[] buf = reader.openBytes(0, ox, oy, w, h);
+                    CRC32 crc = new CRC32();
+                    crc.update(buf);
+                    String b64 = java.util.Base64.getEncoder().encodeToString(buf);
+                    sb.append(",\"offset\":{\"plane\":0,\"ox\":").append(ox)
+                      .append(",\"oy\":").append(oy).append(",\"w\":").append(w)
+                      .append(",\"h\":").append(h).append(",\"len\":").append(buf.length)
+                      .append(",\"crc\":").append(crc.getValue())
+                      .append(",\"b64\":\"").append(b64).append("\"}");
+                } catch (Throwable t) {
+                    sb.append(",\"offset\":{\"error\":").append(jstr(t.toString())).append("}");
+                }
+            }
+            sb.append("}");
         }
         sb.append("],\"ome\":");
         sb.append(omeJson(ome));

@@ -120,6 +120,14 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
         // and then a six-coordinate line used to compute the stored plane size.
         if trimmed.starts_with("Pixel number") {
             let parts: Vec<&str> = trimmed.split_ascii_whitespace().collect();
+            // SIFReader.java only treats a "Pixel number" line as the dimension
+            // line when `tokens.length > 2`. Older Andor SOLIS files contain a
+            // decoy "Pixel number6" line (2 tokens) earlier in the header, plus
+            // a real "Pixel number65538 1 512 512 1 1 1 ..." line (no space after
+            // "number", so token[2] is SizeC). Skip the decoy and keep scanning.
+            if parts.len() <= 2 {
+                continue;
+            }
             let size_c = parse_u32_token(parts.get(2), "SizeC")?;
             let declared_x = parse_u32_token(parts.get(3), "SizeX")?;
             let declared_y = parse_u32_token(parts.get(4), "SizeY")?;
@@ -428,6 +436,15 @@ impl FormatReader for AndorSifReader {
         use crate::common::ome_metadata::{OmeMetadata, OmePlane};
         let meta = self.meta.as_ref()?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
+        // Java's MetadataTools.populatePixels names the image after the file.
+        if let Some(name) = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            ome.images[0].name = Some(name.to_string());
+        }
         // SIFReader.java calls store.setPlaneDeltaT(timestamp[i], 0, i) for each
         // plane (XYCZT order). Mirror that with the parsed (zero-filled) values.
         if !self.timestamps.is_empty() {

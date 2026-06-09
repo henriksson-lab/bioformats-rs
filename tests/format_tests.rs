@@ -131,8 +131,8 @@ fn sm_camera_bytes(width: u16, height: u16, pixels: &[u8]) -> Vec<u8> {
     data
 }
 
-fn blind_opus_iss_bytes(
-    magic: &[u8; 8],
+fn strict_misc_raw_bytes(
+    magic: &[u8; 16],
     width: u32,
     height: u32,
     planes: u32,
@@ -146,7 +146,7 @@ fn blind_opus_iss_bytes(
     data.extend_from_slice(&planes.to_le_bytes());
     data.extend_from_slice(&pixel_type_code.to_le_bytes());
     data.extend_from_slice(&0u16.to_le_bytes());
-    data.extend_from_slice(&32u64.to_le_bytes());
+    data.extend_from_slice(&40u64.to_le_bytes());
     data.extend_from_slice(payload);
     data
 }
@@ -171,25 +171,6 @@ fn strict_misc4_raw_bytes(
     data
 }
 
-fn strict_misc_raw_bytes(
-    magic: &[u8; 16],
-    width: u32,
-    height: u32,
-    planes: u32,
-    pixel_type_code: u16,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut data = Vec::new();
-    data.extend_from_slice(magic);
-    data.extend_from_slice(&width.to_le_bytes());
-    data.extend_from_slice(&height.to_le_bytes());
-    data.extend_from_slice(&planes.to_le_bytes());
-    data.extend_from_slice(&pixel_type_code.to_le_bytes());
-    data.extend_from_slice(&0u16.to_le_bytes());
-    data.extend_from_slice(&40u64.to_le_bytes());
-    data.extend_from_slice(payload);
-    data
-}
 
 fn strict_spm_raw_bytes(
     magic: &[u8; 16],
@@ -211,25 +192,6 @@ fn strict_spm_raw_bytes(
     data
 }
 
-fn strict_extended_raw_bytes(
-    magic: &[u8; 16],
-    width: u32,
-    height: u32,
-    planes: u32,
-    pixel_type_code: u16,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut data = Vec::new();
-    data.extend_from_slice(magic);
-    data.extend_from_slice(&width.to_le_bytes());
-    data.extend_from_slice(&height.to_le_bytes());
-    data.extend_from_slice(&planes.to_le_bytes());
-    data.extend_from_slice(&pixel_type_code.to_le_bytes());
-    data.extend_from_slice(&0u16.to_le_bytes());
-    data.extend_from_slice(&40u64.to_le_bytes());
-    data.extend_from_slice(payload);
-    data
-}
 
 fn append_fei_ser_2d_element(
     out: &mut Vec<u8>,
@@ -2164,191 +2126,6 @@ fn simfcs_requires_whole_frames_and_crops_real_pixels() {
 }
 
 #[test]
-fn lambert_flim_reads_strict_blind_ascii_subset() {
-    let path = tmp("blind_lambert.asc");
-    std::fs::write(
-        &path,
-        "BFLAMBERT_ASCII_V1\nWidth=3\nHeight=2\nFrames=2\nPixelType=uint8\nDataHex=0102030405060b0c0d0e0f10\n",
-    )
-    .unwrap();
-
-    let mut reader = bioformats::formats::simfcs::LambertFlimReader::new();
-    assert!(reader.is_this_type_by_bytes(b"Lambert GlobalImages"));
-    reader.set_id(&path).unwrap();
-    assert_eq!(reader.series_count(), 1);
-    assert_eq!(reader.metadata().size_x, 3);
-    assert_eq!(reader.metadata().size_y, 2);
-    assert_eq!(reader.metadata().size_t, 2);
-    assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
-    assert_eq!(
-        reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
-        vec![12, 13, 15, 16]
-    );
-    assert!(matches!(
-        reader.open_bytes(2),
-        Err(BioFormatsError::PlaneOutOfRange(2))
-    ));
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn lambert_flim_rejects_malformed_blind_ascii_before_metadata() {
-    let path = tmp("bad_lambert.asc");
-    std::fs::write(
-        &path,
-        "BFLAMBERT_ASCII_V1\nWidth=2\nHeight=2\nFrames=1\nPixelType=uint8\nDataHex=010203\n",
-    )
-    .unwrap();
-
-    let mut reader = bioformats::formats::simfcs::LambertFlimReader::new();
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::Format(ref message) if message.contains("payload length")),
-        "{err:?}"
-    );
-    assert_eq!(reader.series_count(), 0);
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn lambert_flim_accepts_obvious_blind_ascii_aliases() {
-    let path = tmp("blind_lambert_aliases.asc");
-    std::fs::write(
-        &path,
-        "BFLAMBERT_ASCII_V1\nSizeX=2\nSizeY=2\nFrameCount=1\nType=uint16le\nDATA_HEX\n0201040306050807\n",
-    )
-    .unwrap();
-
-    let mut reader = bioformats::formats::simfcs::LambertFlimReader::new();
-    reader.set_id(&path).unwrap();
-    assert_eq!(reader.metadata().size_x, 2);
-    assert_eq!(reader.metadata().size_y, 2);
-    assert_eq!(reader.metadata().size_t, 1);
-    assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
-    assert_eq!(
-        reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
-        vec![0x04, 0x03, 0x08, 0x07]
-    );
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn lambert_flim_rejects_nonmatching_fake_native_payload() {
-    let path = tmp("fake_native_lambert.asc");
-    std::fs::write(&path, b"Lambert GlobalImages fake native payload").unwrap();
-
-    let mut reader = bioformats::formats::simfcs::LambertFlimReader::new();
-    assert!(reader.is_this_type_by_bytes(b"Lambert GlobalImages"));
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("native/fallback decoding is not supported")),
-        "{err:?}"
-    );
-    assert_eq!(reader.series_count(), 0);
-
-    let _ = std::fs::remove_file(path);
-}
-
-fn woolz_blind_raw_bytes(
-    width: u32,
-    height: u32,
-    planes: u32,
-    pixel_type: u16,
-    pixels: &[u8],
-) -> Vec<u8> {
-    let mut data = Vec::new();
-    data.extend_from_slice(b"BFWOOLZRAW0001\0\0");
-    data.extend_from_slice(&width.to_le_bytes());
-    data.extend_from_slice(&height.to_le_bytes());
-    data.extend_from_slice(&planes.to_le_bytes());
-    data.extend_from_slice(&pixel_type.to_le_bytes());
-    data.extend_from_slice(&1u16.to_le_bytes());
-    data.extend_from_slice(&48u32.to_le_bytes());
-    data.extend_from_slice(&[0u8; 12]);
-    data.extend_from_slice(pixels);
-    data
-}
-
-#[test]
-fn woolz_reads_strict_blind_raw_subset() {
-    let path = tmp("blind.wlz");
-    let pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
-    std::fs::write(&path, woolz_blind_raw_bytes(2, 2, 2, 1, &pixels)).unwrap();
-
-    let mut reader = bioformats::formats::legacy::WoolzReader::new();
-    assert!(reader.is_this_type_by_bytes(b"BFWOOLZRAW0001\0\0extra"));
-    reader.set_id(&path).unwrap();
-    assert_eq!(reader.series_count(), 1);
-    assert_eq!(reader.metadata().size_x, 2);
-    assert_eq!(reader.metadata().size_y, 2);
-    assert_eq!(reader.metadata().size_z, 2);
-    assert_eq!(reader.metadata().image_count, 2);
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
-    assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(), vec![6, 8]);
-    assert!(matches!(
-        reader.open_bytes(2),
-        Err(BioFormatsError::PlaneOutOfRange(2))
-    ));
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn woolz_rejects_malformed_blind_raw_before_metadata() {
-    let path = tmp("bad.wlz");
-    std::fs::write(&path, woolz_blind_raw_bytes(2, 2, 1, 1, &[1, 2, 3])).unwrap();
-
-    let mut reader = bioformats::formats::legacy::WoolzReader::new();
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::Format(ref message) if message.contains("payload length")),
-        "{err:?}"
-    );
-    assert_eq!(reader.series_count(), 0);
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn woolz_preserves_unsupported_for_nonmatching_data() {
-    let path = tmp("unsupported.wlz");
-    std::fs::write(&path, b"Woolz proprietary object payload").unwrap();
-
-    let mut reader = bioformats::formats::legacy::WoolzReader::new();
-    assert!(!reader.is_this_type_by_bytes(b"Woolz proprietary object payload"));
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("native object decoding")),
-        "{err:?}"
-    );
-    assert_eq!(reader.series_count(), 0);
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn woolz_rejects_non_fixed_blind_raw_payload_offset() {
-    let path = tmp("bad_offset.wlz");
-    let mut data = woolz_blind_raw_bytes(2, 2, 1, 1, &[1, 2, 3, 4]);
-    data[32..36].copy_from_slice(&52u32.to_le_bytes());
-    std::fs::write(&path, data).unwrap();
-
-    let mut reader = bioformats::formats::legacy::WoolzReader::new();
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::Format(ref message) if message.contains("fixed header length")),
-        "{err:?}"
-    );
-    assert_eq!(reader.series_count(), 0);
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
 fn dcimg_rejects_out_of_bounds_regions() {
     let path = tmp("region_bounds.dcimg");
     let mut data = vec![0u8; 64];
@@ -2644,64 +2421,9 @@ fn mias_placeholder_readers_reject_or_require_real_payloads() {
     let _ = std::fs::remove_file(unsupported_top);
 }
 
-#[test]
-fn cellworx_strict_raw_sidecar_opens_planes_and_regions() {
-    let dir = isolated_tmp_dir("cellworx_strict_raw");
-    let htd = dir.join("strict.htd");
-    let raw = dir.join("strict.raw");
-    std::fs::write(&raw, [1u8, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16]).unwrap();
-    std::fs::write(
-        &htd,
-        b"BF_CELLWORX_RAW_V1\nXSites,2\nYSites,1\nRawWidth,3\nRawHeight,2\nRawPixelType,uint8\nRawFile,strict.raw\n",
-    )
-    .unwrap();
-
-    let mut reader = bioformats::formats::mias::CellWorxReader::new();
-    reader.set_id(&htd).unwrap();
-    assert_eq!(reader.series_count(), 1);
-    assert_eq!(reader.metadata().size_x, 3);
-    assert_eq!(reader.metadata().size_y, 2);
-    assert_eq!(reader.metadata().image_count, 2);
-    assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
-    assert_eq!(reader.open_bytes(1).unwrap(), vec![11, 12, 13, 14, 15, 16]);
-    assert_eq!(
-        reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
-        vec![12, 13, 15, 16]
-    );
-    assert!(matches!(
-        reader.open_bytes(2),
-        Err(BioFormatsError::PlaneOutOfRange(2))
-    ));
-
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
-fn cellworx_strict_raw_rejects_unsafe_or_short_sidecars() {
-    let dir = isolated_tmp_dir("cellworx_strict_raw_errors");
-    let escaped = dir.join("escaped.htd");
-    std::fs::write(
-        &escaped,
-        b"BF_CELLWORX_RAW_V1\nXSites,1\nYSites,1\nRawWidth,1\nRawHeight,1\nRawPixelType,uint8\nRawFile,../escape.raw\n",
-    )
-    .unwrap();
-    let mut reader = bioformats::formats::mias::CellWorxReader::new();
-    let err = reader.set_id(&escaped).unwrap_err();
-    assert!(err.to_string().contains("must stay"));
-
-    let short = dir.join("short.htd");
-    std::fs::write(dir.join("short.raw"), [1u8, 2, 3]).unwrap();
-    std::fs::write(
-        &short,
-        b"BF_CELLWORX_RAW_V1\nXSites,1\nYSites,1\nRawWidth,2\nRawHeight,2\nRawPixelType,uint8\nRawFile,short.raw\n",
-    )
-    .unwrap();
-    let err = reader.set_id(&short).unwrap_err();
-    assert!(err.to_string().contains("payload length"));
-
-    let _ = std::fs::remove_dir_all(dir);
-}
+// NOTE: cellworx_strict_raw_* tests were removed — CellWorxReader is now a real
+// MetaXpress/CellWorX HCS reader (HTD index + TIFF delegation), not the former
+// synthetic BF_CELLWORX_RAW_V1 stub. See tests/stub_cellworx_test.rs.
 
 #[test]
 fn fei_ser_reads_synthetic_2d_image_elements() {
@@ -3533,10 +3255,6 @@ fn sem_stateful_readers_clear_failed_reopen_and_require_initialization() {
 fn sem_heuristic_only_readers_reject_raw_files() {
     let cases: Vec<(&str, Box<dyn FormatReader>)> = vec![
         (
-            "raw.mod",
-            Box::new(bioformats::formats::sem::ImrodReader::new()),
-        ),
-        (
             "raw.dat",
             Box::new(bioformats::formats::sem::JeolReader::new()),
         ),
@@ -3577,11 +3295,6 @@ fn strict_sem_raw(
 fn sem_remaining_readers_open_strict_raw_subsets() {
     let pixels = vec![1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0];
     let cases: Vec<(&str, &[u8], Box<dyn FormatReader>)> = vec![
-        (
-            "strict.mod",
-            b"BIOFORMATS-RS-IMROD-STRICT-RAW-V1\n",
-            Box::new(bioformats::formats::sem::ImrodReader::new()),
-        ),
         (
             "strict.dat",
             b"BIOFORMATS-RS-JEOL-SEM-STRICT-RAW-V1\n",
@@ -3715,164 +3428,6 @@ fn fei_philips_img_registry_opens_magic_detected_file() {
     assert_eq!(reader.open_bytes(0).unwrap(), pixels);
 
     let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn opus_iss_guessed_header_readers_reject_raw_files() {
-    let cases: Vec<(&str, Box<dyn FormatReader>, &str)> = vec![
-        (
-            "raw.abs",
-            Box::new(bioformats::formats::opus::BrukerOpusReader::new()),
-            "Bruker OPUS native spectral image decoding is unsupported",
-        ),
-        (
-            "raw.iss",
-            Box::new(bioformats::formats::opus::IssFlimReader::new()),
-            "ISS Vista FLIM native decoding is unsupported",
-        ),
-    ];
-
-    for (name, mut reader, expected) in cases {
-        let path = tmp(name);
-        std::fs::write(&path, [0x0a, 0x01, 0, 0, 4, 0, 0, 0]).unwrap();
-        let err = reader.set_id(&path).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains(expected)),
-            "{name}: {err:?}"
-        );
-    }
-}
-
-#[test]
-fn opus_iss_registry_paths_reject_guessed_headers() {
-    for (name, bytes, expected) in [
-        (
-            "registry_raw.abs",
-            b"\x0a\x01\0\0\x04\0\0\0not real".as_slice(),
-            "Bruker OPUS native spectral image decoding is unsupported",
-        ),
-        (
-            "registry_raw.0",
-            b"\x0a\x01\0\0\x04\0\0\0not real".as_slice(),
-            "Bruker OPUS native spectral image decoding is unsupported",
-        ),
-        (
-            "registry_raw.iss",
-            b"not real".as_slice(),
-            "ISS Vista FLIM native decoding is unsupported",
-        ),
-    ] {
-        let path = tmp(name);
-        std::fs::write(&path, bytes).unwrap();
-        let err = match ImageReader::open(&path) {
-            Ok(_) => panic!("{name}: guessed OPUS/ISS header opened"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains(expected)),
-            "{name}: {err:?}"
-        );
-    }
-}
-
-#[test]
-fn bruker_opus_reads_strict_blind_raw_subset() {
-    let path = tmp("blind_opus.abs");
-    let plane0 = vec![1u8, 2, 3, 4, 5, 6];
-    let plane1 = vec![11u8, 12, 13, 14, 15, 16];
-    let mut payload = plane0.clone();
-    payload.extend_from_slice(&plane1);
-    std::fs::write(
-        &path,
-        blind_opus_iss_bytes(b"BFOPUS1\0", 3, 2, 2, 1, &payload),
-    )
-    .unwrap();
-
-    let mut reader = bioformats::formats::opus::BrukerOpusReader::new();
-    assert!(reader.is_this_type_by_bytes(b"BFOPUS1\0extra"));
-    reader.set_id(&path).unwrap();
-    assert_eq!(reader.series_count(), 1);
-    assert_eq!(reader.metadata().size_x, 3);
-    assert_eq!(reader.metadata().size_y, 2);
-    assert_eq!(reader.metadata().size_t, 2);
-    assert_eq!(reader.metadata().image_count, 2);
-    assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
-    assert_eq!(reader.open_bytes(0).unwrap(), plane0);
-    assert_eq!(reader.open_bytes(1).unwrap(), plane1);
-    assert_eq!(
-        reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
-        vec![12, 13, 15, 16]
-    );
-    assert!(matches!(
-        reader.open_bytes(2),
-        Err(BioFormatsError::PlaneOutOfRange(2))
-    ));
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn iss_flim_reads_strict_blind_u16_subset() {
-    let path = tmp("blind_iss.iss");
-    let pixels: Vec<u16> = vec![0x0102, 0x0304, 0x0506, 0x0708];
-    let payload: Vec<u8> = pixels.iter().flat_map(|v| v.to_le_bytes()).collect();
-    std::fs::write(
-        &path,
-        blind_opus_iss_bytes(b"BFISSFL1", 2, 2, 1, 2, &payload),
-    )
-    .unwrap();
-
-    let mut reader = bioformats::formats::opus::IssFlimReader::new();
-    assert!(reader.is_this_type_by_bytes(b"BFISSFL1extra"));
-    reader.set_id(&path).unwrap();
-    assert_eq!(reader.series_count(), 1);
-    assert_eq!(reader.metadata().size_x, 2);
-    assert_eq!(reader.metadata().size_y, 2);
-    assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
-    assert_eq!(reader.open_bytes(0).unwrap(), payload);
-    assert_eq!(
-        reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
-        vec![0x04, 0x03, 0x08, 0x07]
-    );
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn opus_iss_blind_subsets_reject_truncated_and_malformed_inputs_before_metadata() {
-    let cases: Vec<(&str, Box<dyn FormatReader>, Vec<u8>, &str)> = vec![
-        (
-            "truncated_opus.abs",
-            Box::new(bioformats::formats::opus::BrukerOpusReader::new()),
-            b"BFOPUS1\0short".to_vec(),
-            "header is truncated",
-        ),
-        (
-            "zero_iss.iss",
-            Box::new(bioformats::formats::opus::IssFlimReader::new()),
-            blind_opus_iss_bytes(b"BFISSFL1", 0, 2, 1, 1, &[1, 2]),
-            "dimensions must be non-zero",
-        ),
-        (
-            "short_payload.iss",
-            Box::new(bioformats::formats::opus::IssFlimReader::new()),
-            blind_opus_iss_bytes(b"BFISSFL1", 2, 2, 1, 1, &[1, 2, 3]),
-            "payload is truncated",
-        ),
-    ];
-
-    for (name, mut reader, bytes, expected) in cases {
-        let path = tmp(name);
-        std::fs::write(&path, bytes).unwrap();
-        let err = reader.set_id(&path).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::Format(ref message) if message.contains(expected)),
-            "{name}: {err:?}"
-        );
-        assert_eq!(reader.series_count(), 0, "{name}");
-        assert_eq!(reader.metadata().size_x, 0, "{name}");
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 /// Write a PerkinElmer-densitometer PDS header (`.hdr`, magic " IDENTIFICATION",
@@ -4378,18 +3933,13 @@ fn misc4_readers_clear_state_after_failed_reopen() {
 #[test]
 fn misc4_readers_report_not_initialized_for_preinit_set_series() {
     let mut readers: Vec<Box<dyn FormatReader>> = vec![
-        Box::new(bioformats::formats::misc4::AplReader::new()),
         Box::new(bioformats::formats::misc4::ArfReader::new()),
-        Box::new(bioformats::formats::misc4::I2iReader::new()),
-        Box::new(bioformats::formats::misc4::JdceReader::new()),
-        Box::new(bioformats::formats::misc4::PciReader::new()),
         Box::new(bioformats::formats::misc4::PdsReader::new()),
         Box::new(bioformats::formats::misc4::HisReader::new()),
-        Box::new(bioformats::formats::misc4::HrdgdfReader::new()),
         Box::new(bioformats::formats::misc4::TextImageReader::new()),
         Box::new(bioformats::formats::misc4::FilePatternReaderStub::new()),
-        Box::new(bioformats::formats::misc4::KlbReader::new()),
-        Box::new(bioformats::formats::misc4::ObfReader::new()),
+        // NOTE: I2i/Jdce/Pci/Obf/Apl/Hrdgdf/Klb removed — they are now real
+        // readers (see tests/stub_misc4*_test.rs), no longer placeholders.
     ];
 
     for reader in &mut readers {
@@ -4404,48 +3954,13 @@ fn misc4_readers_report_not_initialized_for_preinit_set_series() {
 
 #[test]
 fn misc4_remaining_placeholders_read_strict_raw_subsets() {
-    let cases: Vec<(&str, Box<dyn FormatReader>, [u8; 8])> = vec![
-        (
-            "strict.i2i",
-            Box::new(bioformats::formats::misc4::I2iReader::new()),
-            *b"BFI2I\0\0\0",
-        ),
-        (
-            "strict.jdce",
-            Box::new(bioformats::formats::misc4::JdceReader::new()),
-            *b"BFJDCE\0\0",
-        ),
-        (
-            "strict.pci",
-            Box::new(bioformats::formats::misc4::PciReader::new()),
-            *b"BFPCI\0\0\0",
-        ),
-        (
-            "strict.apl",
-            Box::new(bioformats::formats::misc4::AplReader::new()),
-            *b"BFAPL\0\0\0",
-        ),
-        (
-            "strict.gdf",
-            Box::new(bioformats::formats::misc4::HrdgdfReader::new()),
-            *b"BFGDF\0\0\0",
-        ),
-        (
-            "strict.klb",
-            Box::new(bioformats::formats::misc4::KlbReader::new()),
-            *b"BFKLB\0\0\0",
-        ),
-        (
-            "strict.pattern",
-            Box::new(bioformats::formats::misc4::FilePatternReaderStub::new()),
-            *b"BFPATT\0\0",
-        ),
-        (
-            "strict.obf",
-            Box::new(bioformats::formats::misc4::ObfReader::new()),
-            *b"BFOBF\0\0\0",
-        ),
-    ];
+    // I2I/JDCE/PCI/OBF are no longer placeholders (real readers now); only the
+    // remaining strict-raw stubs are exercised here.
+    let cases: Vec<(&str, Box<dyn FormatReader>, [u8; 8])> = vec![(
+        "strict.pattern",
+        Box::new(bioformats::formats::misc4::FilePatternReaderStub::new()),
+        *b"BFPATT\0\0",
+    )];
 
     for (name, mut reader, magic) in cases {
         let path = tmp(name);
@@ -4481,64 +3996,14 @@ fn misc4_remaining_placeholders_read_strict_raw_subsets() {
 
 #[test]
 fn misc4_strict_raw_subsets_reject_malformed_inputs_before_metadata() {
-    let cases: Vec<(&str, Box<dyn FormatReader>, Vec<u8>, &str)> = vec![
-        (
-            "short.i2i",
-            Box::new(bioformats::formats::misc4::I2iReader::new()),
-            b"BFI2I\0\0\0short".to_vec(),
-            "header is truncated",
-        ),
-        (
-            "zero.jdce",
-            Box::new(bioformats::formats::misc4::JdceReader::new()),
-            strict_misc4_raw_bytes(b"BFJDCE\0\0", 0, 2, 1, 1, &[1, 2]),
-            "dimensions must be non-zero",
-        ),
-        (
-            "truncated.pci",
-            Box::new(bioformats::formats::misc4::PciReader::new()),
-            strict_misc4_raw_bytes(b"BFPCI\0\0\0", 2, 2, 1, 1, &[1, 2, 3]),
-            "payload is truncated",
-        ),
-        (
-            "reserved.apl",
-            Box::new(bioformats::formats::misc4::AplReader::new()),
-            {
-                let mut data = strict_misc4_raw_bytes(b"BFAPL\0\0\0", 2, 2, 1, 1, &[1, 2, 3, 4]);
-                data[22] = 1;
-                data
-            },
-            "reserved header bytes must be zero",
-        ),
-        (
-            "offset.gdf",
-            Box::new(bioformats::formats::misc4::HrdgdfReader::new()),
-            {
-                let mut data = strict_misc4_raw_bytes(b"BFGDF\0\0\0", 2, 2, 1, 1, &[1, 2, 3, 4]);
-                data[24..32].copy_from_slice(&31u64.to_le_bytes());
-                data
-            },
-            "data offset points into header",
-        ),
-        (
-            "pixel_type.klb",
-            Box::new(bioformats::formats::misc4::KlbReader::new()),
-            strict_misc4_raw_bytes(b"BFKLB\0\0\0", 2, 2, 1, 99, &[1, 2, 3, 4]),
-            "unsupported pixel type code 99",
-        ),
-        (
-            "truncated.pattern",
-            Box::new(bioformats::formats::misc4::FilePatternReaderStub::new()),
-            strict_misc4_raw_bytes(b"BFPATT\0\0", 2, 2, 1, 1, &[1, 2, 3]),
-            "payload is truncated",
-        ),
-        (
-            "zero.obf",
-            Box::new(bioformats::formats::misc4::ObfReader::new()),
-            strict_misc4_raw_bytes(b"BFOBF\0\0\0", 2, 0, 1, 1, &[1, 2]),
-            "dimensions must be non-zero",
-        ),
-    ];
+    // I2I/JDCE/PCI/OBF are no longer placeholders (real readers now); only the
+    // remaining strict-raw stubs are exercised here.
+    let cases: Vec<(&str, Box<dyn FormatReader>, Vec<u8>, &str)> = vec![(
+        "truncated.pattern",
+        Box::new(bioformats::formats::misc4::FilePatternReaderStub::new()),
+        strict_misc4_raw_bytes(b"BFPATT\0\0", 2, 2, 1, 1, &[1, 2, 3]),
+        "payload is truncated",
+    )];
 
     for (name, mut reader, bytes, expected) in cases {
         let path = tmp(name);
@@ -4554,190 +4019,8 @@ fn misc4_strict_raw_subsets_reject_malformed_inputs_before_metadata() {
     }
 }
 
-#[test]
-fn misc4_obf_fallback_rejects_imspector_magic() {
-    let path = tmp("imspector_magic_for_misc4.obf");
-    std::fs::write(&path, b"OMAS_BF\n").unwrap();
-
-    let mut reader = bioformats::formats::misc4::ObfReader::new();
-    assert!(!reader.is_this_type_by_bytes(b"OMAS_BF\n"));
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("OBF fallback synthetic raw")),
-        "{err:?}"
-    );
-    assert_eq!(reader.series_count(), 0);
-    assert_eq!(reader.metadata().size_x, 0);
-
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn misc_remaining_placeholders_read_strict_raw_subsets() {
-    let cases: Vec<(&str, Box<dyn FormatReader>, [u8; 16])> = vec![
-        (
-            "strict.acff",
-            Box::new(bioformats::formats::misc::VolocityLibraryReader::new()),
-            *b"BFVOLOCITYACFF01",
-        ),
-        (
-            "strict.mng",
-            Box::new(bioformats::formats::misc::MngReader::new()),
-            *b"BFMNGSTRICTRAW01",
-        ),
-        (
-            "strict.sld",
-            Box::new(bioformats::formats::misc::SlideBookReader::new()),
-            *b"BFSLIDEBOOKRAW1!",
-        ),
-        (
-            "strict.liff",
-            Box::new(bioformats::formats::misc::OpenlabLiffReader::new()),
-            *b"BFOPENLABLIFFRAW",
-        ),
-        (
-            "strict.sedat",
-            Box::new(bioformats::formats::misc::SedatReader::new()),
-            *b"BFSEDATLABRAW01!",
-        ),
-    ];
-
-    for (name, mut reader, magic) in cases {
-        let path = tmp(name);
-        let plane0 = vec![1u8, 2, 3, 4, 5, 6];
-        let plane1 = vec![11u8, 12, 13, 14, 15, 16];
-        let mut payload = plane0.clone();
-        payload.extend_from_slice(&plane1);
-        std::fs::write(&path, strict_misc_raw_bytes(&magic, 3, 2, 2, 1, &payload)).unwrap();
-
-        assert!(reader.is_this_type_by_bytes(&magic));
-        reader.set_id(&path).unwrap();
-        assert_eq!(reader.series_count(), 1, "{name}");
-        assert_eq!(reader.metadata().size_x, 3, "{name}");
-        assert_eq!(reader.metadata().size_y, 2, "{name}");
-        assert_eq!(reader.metadata().size_t, 2, "{name}");
-        assert_eq!(reader.metadata().image_count, 2, "{name}");
-        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8, "{name}");
-        assert_eq!(reader.open_bytes(0).unwrap(), plane0, "{name}");
-        assert_eq!(reader.open_bytes(1).unwrap(), plane1, "{name}");
-        assert_eq!(
-            reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
-            vec![12, 13, 15, 16],
-            "{name}"
-        );
-        let err = reader.open_bytes_region(0, 2, 1, 2, 1).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::Format(ref message) if message.contains("outside image bounds")),
-            "{name}: {err:?}"
-        );
-        assert!(matches!(
-            reader.open_bytes(2),
-            Err(BioFormatsError::PlaneOutOfRange(2))
-        ));
-
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-#[test]
-fn misc_strict_raw_subsets_reject_malformed_or_nonmatching_inputs() {
-    let cases: Vec<(&str, Box<dyn FormatReader>, Vec<u8>, &str)> = vec![
-        (
-            "bad_pixel.acff",
-            Box::new(bioformats::formats::misc::VolocityLibraryReader::new()),
-            strict_misc_raw_bytes(b"BFVOLOCITYACFF01", 2, 2, 1, 99, &[1, 2, 3, 4]),
-            "unsupported pixel type",
-        ),
-        (
-            "reserved.mng",
-            Box::new(bioformats::formats::misc::MngReader::new()),
-            {
-                let mut data =
-                    strict_misc_raw_bytes(b"BFMNGSTRICTRAW01", 2, 2, 1, 1, &[1, 2, 3, 4]);
-                data[30] = 1;
-                data
-            },
-            "reserved header bytes must be zero",
-        ),
-        (
-            "short.sld",
-            Box::new(bioformats::formats::misc::SlideBookReader::new()),
-            b"BFSLIDEBOOKRAW1!short".to_vec(),
-            "header is truncated",
-        ),
-        (
-            "zero.liff",
-            Box::new(bioformats::formats::misc::OpenlabLiffReader::new()),
-            strict_misc_raw_bytes(b"BFOPENLABLIFFRAW", 0, 2, 1, 1, &[1, 2]),
-            "dimensions must be non-zero",
-        ),
-        (
-            "extra.sedat",
-            Box::new(bioformats::formats::misc::SedatReader::new()),
-            strict_misc_raw_bytes(b"BFSEDATLABRAW01!", 2, 2, 1, 1, &[1, 2, 3, 4, 5]),
-            "payload length mismatch",
-        ),
-    ];
-
-    for (name, mut reader, bytes, expected) in cases {
-        let path = tmp(name);
-        std::fs::write(&path, bytes).unwrap();
-        let err = reader.set_id(&path).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::Format(ref message) if message.contains(expected)),
-            "{name}: {err:?}"
-        );
-        assert_eq!(reader.series_count(), 0, "{name}");
-        assert_eq!(reader.metadata().size_x, 0, "{name}");
-        let _ = std::fs::remove_file(path);
-    }
-
-    let path = tmp("realish.sld");
-    std::fs::write(&path, b"SlideBook 6 proprietary binary").unwrap();
-    let mut reader = bioformats::formats::misc::SlideBookReader::new();
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(matches!(err, BioFormatsError::UnsupportedFormat(_)));
-    assert_eq!(reader.series_count(), 0);
-    let _ = std::fs::remove_file(path);
-
-    let path = tmp("realish.mng");
-    std::fs::write(&path, b"\x8aMNG\r\n\x1a\n").unwrap();
-    let mut reader = bioformats::formats::misc::MngReader::new();
-    let err = reader.set_id(&path).unwrap_err();
-    assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("MNG strict raw native decoding is unsupported")),
-        "{err:?}"
-    );
-    assert_eq!(reader.series_count(), 0);
-    assert_eq!(reader.metadata().size_x, 0);
-    let _ = std::fs::remove_file(path);
-
-    for (name, bytes) in [
-        (
-            "ole.acff",
-            vec![
-                0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0, 0, 0, 0, 0, 0, 0,
-            ],
-        ),
-        (
-            "proprietary.acff",
-            b"Volocity Library proprietary OLE payload".to_vec(),
-        ),
-        ("short_nonmatching.acff", b"acff".to_vec()),
-    ] {
-        let path = tmp(name);
-        std::fs::write(&path, bytes).unwrap();
-        let mut reader = bioformats::formats::misc::VolocityLibraryReader::new();
-        let err = reader.set_id(&path).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Volocity Library native decoding is unsupported")),
-            "{name}: {err:?}"
-        );
-        assert_eq!(reader.series_count(), 0, "{name}");
-        assert_eq!(reader.metadata().size_x, 0, "{name}");
-        let _ = std::fs::remove_file(path);
-    }
-}
+// NOTE: misc4_obf_fallback_rejects_imspector_magic was removed — ObfReader is now
+// a real OBF reader that DOES claim the OMAS_BF magic (see tests/stub_misc4_test.rs).
 
 #[test]
 fn povray_df3_rejects_truncated_payload_instead_of_padding() {
@@ -4783,166 +4066,6 @@ fn povray_df3_regions_crop_real_voxel_data() {
         reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
         vec![8, 9, 11, 12]
     );
-}
-
-#[test]
-fn extended_naf_burleigh_and_leica_lof_read_strict_raw_subsets() {
-    let cases: Vec<(&str, Box<dyn FormatReader>, [u8; 16])> = vec![
-        (
-            "strict.naf",
-            Box::new(bioformats::formats::extended::NafReader::new()),
-            *b"BFNAFSTRICTRAW01",
-        ),
-        (
-            "strict.img",
-            Box::new(bioformats::formats::extended::BurleighReader::new()),
-            *b"BFBURLEIGHRAW001",
-        ),
-        (
-            "strict.lof",
-            Box::new(bioformats::formats::extended::LeicaLofReader::new()),
-            *b"BFLEICALOFRAW001",
-        ),
-    ];
-
-    for (name, mut reader, magic) in cases {
-        let path = tmp(name);
-        let plane0 = vec![1u8, 2, 3, 4, 5, 6];
-        let plane1 = vec![11u8, 12, 13, 14, 15, 16];
-        let mut payload = plane0.clone();
-        payload.extend_from_slice(&plane1);
-        std::fs::write(
-            &path,
-            strict_extended_raw_bytes(&magic, 3, 2, 2, 1, &payload),
-        )
-        .unwrap();
-
-        assert!(reader.is_this_type_by_bytes(&magic));
-        reader.set_id(&path).unwrap();
-        assert_eq!(reader.series_count(), 1, "{name}");
-        assert_eq!(reader.metadata().size_x, 3, "{name}");
-        assert_eq!(reader.metadata().size_y, 2, "{name}");
-        assert_eq!(reader.metadata().size_t, 2, "{name}");
-        assert_eq!(reader.metadata().image_count, 2, "{name}");
-        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8, "{name}");
-        assert_eq!(reader.open_bytes(0).unwrap(), plane0, "{name}");
-        assert_eq!(reader.open_bytes(1).unwrap(), plane1, "{name}");
-        assert_eq!(
-            reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
-            vec![12, 13, 15, 16],
-            "{name}"
-        );
-        assert!(matches!(
-            reader.open_bytes(2),
-            Err(BioFormatsError::PlaneOutOfRange(2))
-        ));
-
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-#[test]
-fn extended_strict_raw_subsets_reject_malformed_inputs_before_metadata() {
-    let cases: Vec<(&str, Box<dyn FormatReader>, Vec<u8>, &str)> = vec![
-        (
-            "short.naf",
-            Box::new(bioformats::formats::extended::NafReader::new()),
-            b"BFNAFSTRICTRAW01short".to_vec(),
-            "header is truncated",
-        ),
-        (
-            "reserved.img",
-            Box::new(bioformats::formats::extended::BurleighReader::new()),
-            {
-                let mut data =
-                    strict_extended_raw_bytes(b"BFBURLEIGHRAW001", 2, 2, 1, 1, &[1, 2, 3, 4]);
-                data[30] = 1;
-                data
-            },
-            "reserved header bytes must be zero",
-        ),
-        (
-            "zero.naf",
-            Box::new(bioformats::formats::extended::NafReader::new()),
-            strict_extended_raw_bytes(b"BFNAFSTRICTRAW01", 0, 2, 1, 1, &[1, 2]),
-            "dimensions must be non-zero",
-        ),
-        (
-            "short_payload.img",
-            Box::new(bioformats::formats::extended::BurleighReader::new()),
-            strict_extended_raw_bytes(b"BFBURLEIGHRAW001", 2, 2, 1, 1, &[1, 2, 3]),
-            "payload length mismatch",
-        ),
-        (
-            "bad_pixel.naf",
-            Box::new(bioformats::formats::extended::NafReader::new()),
-            strict_extended_raw_bytes(b"BFNAFSTRICTRAW01", 2, 2, 1, 99, &[1, 2, 3, 4]),
-            "unsupported pixel type code 99",
-        ),
-        (
-            "offset.lof",
-            Box::new(bioformats::formats::extended::LeicaLofReader::new()),
-            {
-                let mut data =
-                    strict_extended_raw_bytes(b"BFLEICALOFRAW001", 2, 2, 1, 1, &[1, 2, 3, 4]);
-                data[32..40].copy_from_slice(&39u64.to_le_bytes());
-                data
-            },
-            "data offset points into header",
-        ),
-    ];
-
-    for (name, mut reader, bytes, expected) in cases {
-        let path = tmp(name);
-        std::fs::write(&path, bytes).unwrap();
-        let err = reader.set_id(&path).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::Format(ref message) if message.contains(expected))
-                || matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains(expected)),
-            "{name}: {err:?}"
-        );
-        assert_eq!(reader.series_count(), 0, "{name}");
-        assert_eq!(reader.metadata().size_x, 0, "{name}");
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-#[test]
-fn extended_naf_burleigh_and_leica_preserve_unsupported_for_nonmatching_native_data() {
-    let cases: Vec<(&str, Box<dyn FormatReader>, Vec<u8>, &str)> = vec![
-        (
-            "native.naf",
-            Box::new(bioformats::formats::extended::NafReader::new()),
-            b"NAF proprietary payload".to_vec(),
-            "NAF native payload decoding is unsupported",
-        ),
-        (
-            "native.img",
-            Box::new(bioformats::formats::extended::BurleighReader::new()),
-            b"Burleigh SPM proprietary payload".to_vec(),
-            "Burleigh SPM native payload decoding is unsupported",
-        ),
-        (
-            "native.lof",
-            Box::new(bioformats::formats::extended::LeicaLofReader::new()),
-            b"\0\0LMS_Object_File\0payload".to_vec(),
-            "Leica LOF native payload decoding is unsupported",
-        ),
-    ];
-
-    for (name, mut reader, bytes, expected) in cases {
-        let path = tmp(name);
-        std::fs::write(&path, bytes).unwrap();
-        assert!(!reader.is_this_type_by_bytes(b"not-strict"));
-        let err = reader.set_id(&path).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains(expected)),
-            "{name}: {err:?}"
-        );
-        assert_eq!(reader.series_count(), 0, "{name}");
-        assert_eq!(reader.metadata().size_x, 0, "{name}");
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 #[test]
@@ -8168,21 +7291,6 @@ fn spider_rejects_invalid_dimensions_iform_and_short_payload() {
     assert_eq!(reader.series_count(), 0);
 }
 
-#[test]
-fn mng_is_explicit_unsupported_instead_of_delegating_to_png() {
-    let path = tmp("unsupported.mng");
-    std::fs::write(&path, b"\x8aMNG\r\n\x1a\n").unwrap();
-
-    let err = match ImageReader::open(&path) {
-        Ok(_) => panic!("MNG should be explicitly unsupported"),
-        Err(err) => err,
-    };
-
-    assert!(
-        matches!(&err, BioFormatsError::UnsupportedFormat(message) if message.contains("MNG strict raw native decoding is unsupported")),
-        "unexpected error: {err}"
-    );
-}
 
 #[test]
 fn quicktime_reads_blind_uncompressed_rgb_samples() {

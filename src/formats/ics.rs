@@ -869,10 +869,14 @@ impl FormatWriter for IcsWriter {
             _ => ("integer", "unsigned"),
         };
 
-        writeln!(f, "ics_version\t2.0").map_err(BioFormatsError::Io)?;
-        writeln!(
+        // ICS headers use CRLF line endings. In particular Java's ICSReader v2
+        // probe does readString(17).trim() == "ics_version\t2.0", which only
+        // matches when this line is exactly "ics_version\t2.0\r\n" (17 bytes);
+        // a bare "\n" makes Java fall back to ICS v1 and demand a .ids file.
+        write!(f, "ics_version\t2.0\r\n").map_err(BioFormatsError::Io)?;
+        write!(
             f,
-            "filename\t{}",
+            "filename\t{}\r\n",
             path.file_stem().unwrap_or_default().to_string_lossy()
         )
         .map_err(BioFormatsError::Io)?;
@@ -895,15 +899,23 @@ impl FormatWriter for IcsWriter {
             size_parts.push(meta.size_c.to_string());
         }
 
-        writeln!(f, "layout\tparameters\t{}", order_parts.len()).map_err(BioFormatsError::Io)?;
-        writeln!(f, "layout\torder\t{}", order_parts.join(" ")).map_err(BioFormatsError::Io)?;
-        writeln!(f, "layout\tsizes\t{}", size_parts.join(" ")).map_err(BioFormatsError::Io)?;
-        writeln!(f, "layout\tsignificant_bits\t{}", bps).map_err(BioFormatsError::Io)?;
-        writeln!(f, "representation\tformat\t{}", format_str).map_err(BioFormatsError::Io)?;
-        writeln!(f, "representation\tsign\t{}", sign_str).map_err(BioFormatsError::Io)?;
-        writeln!(f, "representation\tbyte_order\t1 2 3 4").map_err(BioFormatsError::Io)?;
-        writeln!(f, "representation\tcompression\tuncompressed").map_err(BioFormatsError::Io)?;
-        writeln!(f, "end\r").map_err(BioFormatsError::Io)?;
+        write!(f, "layout\tparameters\t{}\r\n", order_parts.len()).map_err(BioFormatsError::Io)?;
+        write!(f, "layout\torder\t{}\r\n", order_parts.join(" ")).map_err(BioFormatsError::Io)?;
+        write!(f, "layout\tsizes\t{}\r\n", size_parts.join(" ")).map_err(BioFormatsError::Io)?;
+        write!(f, "layout\tsignificant_bits\t{}\r\n", bps).map_err(BioFormatsError::Io)?;
+        write!(f, "representation\tformat\t{}\r\n", format_str).map_err(BioFormatsError::Io)?;
+        write!(f, "representation\tsign\t{}\r\n", sign_str).map_err(BioFormatsError::Io)?;
+        write!(f, "representation\tbyte_order\t1 2 3 4\r\n").map_err(BioFormatsError::Io)?;
+        write!(f, "representation\tcompression\tuncompressed\r\n").map_err(BioFormatsError::Io)?;
+        // The terminator MUST end in a bare LF, not CRLF. Java's ICSReader locates
+        // the pixel-data offset for ICS v2 with `in.readString(NL)` (NL = "\r\n"),
+        // which stops at the FIRST terminator character and consumes only that one
+        // byte. With "end\r\n" it stops on the `\r`, leaving the trailing `\n`
+        // inside the pixel stream — every plane is then shifted one byte and reads
+        // garbage. Java's own ICSWriter emits "\nend\n" (LF) for exactly this
+        // reason. The leading `ics_version\t2.0\r\n` line stays CRLF because the v2
+        // probe reads a fixed 17 bytes and needs that line to be exactly 17 long.
+        write!(f, "end\n").map_err(BioFormatsError::Io)?;
 
         for plane in &self.planes {
             f.write_all(plane).map_err(BioFormatsError::Io)?;

@@ -13,186 +13,182 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
-const MISC_STRICT_RAW_HEADER_LEN: usize = 40;
-
-#[derive(Clone, Copy)]
-struct MiscStrictRawLayout {
-    data_offset: u64,
-    plane_bytes: usize,
+// ---------------------------------------------------------------------------
+// Shared byte cursor (mirrors loci.common.RandomAccessInputStream)
+// ---------------------------------------------------------------------------
+/// In-memory, endian-aware byte cursor used by the faithful ports of the
+/// Improvision Openlab LIFF, MNG and 3i SlideBook readers. It mirrors the
+/// subset of `RandomAccessInputStream` those Java readers rely on: seeking,
+/// signed/unsigned multi-byte reads, fixed-length and NUL-terminated strings,
+/// and an endianness flag that can be toggled mid-stream (`in.order(...)`).
+///
+/// Reads past the end of the buffer return zero-padded values and advance the
+/// position, matching the way the Java readers tolerate over-reads while their
+/// `while (fp < length)` loops terminate.
+struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+    little: bool,
 }
 
-fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([buf[offset], buf[offset + 1]])
-}
-
-fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        buf[offset],
-        buf[offset + 1],
-        buf[offset + 2],
-        buf[offset + 3],
-    ])
-}
-
-fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        buf[offset],
-        buf[offset + 1],
-        buf[offset + 2],
-        buf[offset + 3],
-        buf[offset + 4],
-        buf[offset + 5],
-        buf[offset + 6],
-        buf[offset + 7],
-    ])
-}
-
-fn strict_misc_raw_unsupported(format_name: &str) -> BioFormatsError {
-    BioFormatsError::UnsupportedFormat(format!(
-        "{format_name} native decoding is unsupported unless explicit strict raw data is present; refusing guessed proprietary metadata"
-    ))
-}
-
-fn strict_misc_raw_pixel_type(code: u16, format_name: &str) -> Result<PixelType> {
-    match code {
-        1 => Ok(PixelType::Uint8),
-        2 => Ok(PixelType::Uint16),
-        3 => Ok(PixelType::Float32),
-        _ => Err(BioFormatsError::Format(format!(
-            "{format_name} strict raw subset has unsupported pixel type code {code}"
-        ))),
-    }
-}
-
-fn parse_misc_strict_raw_subset(
-    path: &Path,
-    magic: &[u8; 16],
-    format_name: &str,
-) -> Result<(ImageMetadata, MiscStrictRawLayout)> {
-    let data = match std::fs::read(path) {
-        Ok(data) => data,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(strict_misc_raw_unsupported(format_name));
+impl<'a> Cursor<'a> {
+    fn new(data: &'a [u8], little: bool) -> Self {
+        Cursor {
+            data,
+            pos: 0,
+            little,
         }
-        Err(err) => return Err(BioFormatsError::Io(err)),
-    };
-
-    if data.len() < magic.len() {
-        return Err(BioFormatsError::Format(format!(
-            "{format_name} file is too short for strict raw subset magic"
-        )));
-    }
-    if &data[..magic.len()] != magic {
-        return Err(strict_misc_raw_unsupported(format_name));
-    }
-    if data.len() < MISC_STRICT_RAW_HEADER_LEN {
-        return Err(BioFormatsError::Format(format!(
-            "{format_name} strict raw subset header is truncated"
-        )));
     }
 
-    let size_x = read_u32_le(&data, 16);
-    let size_y = read_u32_le(&data, 20);
-    let image_count = read_u32_le(&data, 24);
-    let pixel_type_code = read_u16_le(&data, 28);
-    let reserved = read_u16_le(&data, 30);
-    let data_offset = read_u64_le(&data, 32);
-
-    if size_x == 0 || size_y == 0 || image_count == 0 {
-        return Err(BioFormatsError::Format(format!(
-            "{format_name} strict raw subset dimensions must be non-zero"
-        )));
-    }
-    if reserved != 0 {
-        return Err(BioFormatsError::Format(format!(
-            "{format_name} strict raw subset reserved header bytes must be zero"
-        )));
-    }
-    if data_offset != MISC_STRICT_RAW_HEADER_LEN as u64 {
-        return Err(BioFormatsError::Format(format!(
-            "{format_name} strict raw subset data offset must equal {MISC_STRICT_RAW_HEADER_LEN}"
-        )));
+    fn fp(&self) -> usize {
+        self.pos
     }
 
-    let pixel_type = strict_misc_raw_pixel_type(pixel_type_code, format_name)?;
-    let plane_bytes = (size_x as usize)
-        .checked_mul(size_y as usize)
-        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample()))
-        .ok_or_else(|| {
-            BioFormatsError::Format(format!(
-                "{format_name} strict raw subset plane size overflows"
-            ))
-        })?;
-    let payload_bytes = plane_bytes
-        .checked_mul(image_count as usize)
-        .ok_or_else(|| {
-            BioFormatsError::Format(format!(
-                "{format_name} strict raw subset payload size overflows"
-            ))
-        })?;
-    let expected_len = MISC_STRICT_RAW_HEADER_LEN
-        .checked_add(payload_bytes)
-        .ok_or_else(|| {
-            BioFormatsError::Format(format!(
-                "{format_name} strict raw subset file size overflows"
-            ))
-        })?;
-    if data.len() != expected_len {
-        return Err(BioFormatsError::Format(format!(
-            "{format_name} strict raw subset payload length mismatch: got {} bytes, expected {expected_len}",
-            data.len()
-        )));
+    fn seek(&mut self, p: usize) {
+        self.pos = p;
     }
 
-    let meta = ImageMetadata {
-        size_x,
-        size_y,
-        size_z: 1,
-        size_c: 1,
-        size_t: image_count,
-        pixel_type,
-        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
-        image_count,
-        dimension_order: DimensionOrder::XYCZT,
-        is_little_endian: true,
-        ..ImageMetadata::default()
-    };
-    Ok((
-        meta,
-        MiscStrictRawLayout {
-            data_offset,
-            plane_bytes,
-        },
-    ))
+    /// Set the byte order (`in.order(little)`).
+    fn order(&mut self, little: bool) {
+        self.little = little;
+    }
+
+    fn skip(&mut self, n: i64) {
+        if n >= 0 {
+            self.pos = self.pos.saturating_add(n as usize);
+        } else {
+            self.pos = self.pos.saturating_sub((-n) as usize);
+        }
+    }
+
+    fn read_bytes(&mut self, n: usize) -> Vec<u8> {
+        let start = self.pos.min(self.data.len());
+        let end = self.pos.saturating_add(n).min(self.data.len());
+        let mut out = vec![0u8; n];
+        let avail = end.saturating_sub(start);
+        out[..avail].copy_from_slice(&self.data[start..end]);
+        self.pos = self.pos.saturating_add(n);
+        out
+    }
+
+    /// Java `in.read()`: next byte 0-255, or -1 at end of stream.
+    fn read(&mut self) -> i32 {
+        if self.pos < self.data.len() {
+            let v = self.data[self.pos] as i32;
+            self.pos += 1;
+            v
+        } else {
+            self.pos += 1;
+            -1
+        }
+    }
+
+    fn read_u16(&mut self) -> u16 {
+        let b = self.read_bytes(2);
+        let a = [b[0], b[1]];
+        if self.little {
+            u16::from_le_bytes(a)
+        } else {
+            u16::from_be_bytes(a)
+        }
+    }
+
+    fn read_short(&mut self) -> i16 {
+        self.read_u16() as i16
+    }
+
+    fn read_u32(&mut self) -> u32 {
+        let b = self.read_bytes(4);
+        let a = [b[0], b[1], b[2], b[3]];
+        if self.little {
+            u32::from_le_bytes(a)
+        } else {
+            u32::from_be_bytes(a)
+        }
+    }
+
+    fn read_int(&mut self) -> i32 {
+        self.read_u32() as i32
+    }
+
+    fn read_u64(&mut self) -> u64 {
+        let b = self.read_bytes(8);
+        let a = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+        if self.little {
+            u64::from_le_bytes(a)
+        } else {
+            u64::from_be_bytes(a)
+        }
+    }
+
+    fn read_long(&mut self) -> i64 {
+        self.read_u64() as i64
+    }
+
+    fn read_float(&mut self) -> f32 {
+        f32::from_bits(self.read_u32())
+    }
+
+    /// Read exactly `n` bytes and interpret them as a (lossy UTF-8) string.
+    fn read_string(&mut self, n: usize) -> String {
+        let b = self.read_bytes(n);
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    /// Read up to a NUL terminator, consuming the terminator (Java
+    /// `findString(true, .., "\0")`). Stops at end of stream.
+    fn read_cstring(&mut self) -> String {
+        let start = self.pos.min(self.data.len());
+        let mut end = start;
+        while end < self.data.len() && self.data[end] != 0 {
+            end += 1;
+        }
+        let s = String::from_utf8_lossy(&self.data[start..end]).into_owned();
+        // Consume up to and including the terminator (or to EOF).
+        self.pos = if end < self.data.len() {
+            end + 1
+        } else {
+            self.data.len()
+        };
+        s
+    }
 }
 
-fn read_misc_strict_raw_plane(
-    path: &Path,
-    layout: MiscStrictRawLayout,
-    plane_index: u32,
+/// Crop a region out of a channel-separated (planar) plane buffer. Used by the
+/// MNG / Openlab ports, whose `ImageMetadata` advertises `is_interleaved =
+/// false` so each channel is stored as a contiguous sub-plane.
+fn crop_planar(
+    format_name: &str,
+    full: &[u8],
+    meta: &ImageMetadata,
+    channels: usize,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
 ) -> Result<Vec<u8>> {
-    let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-    let offset = (layout.data_offset as usize)
-        .checked_add(
-            layout
-                .plane_bytes
-                .checked_mul(plane_index as usize)
-                .ok_or_else(|| {
-                    BioFormatsError::Format("strict raw subset plane offset overflows".to_string())
-                })?,
-        )
-        .ok_or_else(|| {
-            BioFormatsError::Format("strict raw subset plane offset overflows".to_string())
-        })?;
-    let end = offset
-        .checked_add(layout.plane_bytes)
-        .ok_or_else(|| BioFormatsError::Format("strict raw subset plane end overflows".into()))?;
-    if end > data.len() {
-        return Err(BioFormatsError::InvalidData(
-            "strict raw subset payload is shorter than declared metadata".to_string(),
-        ));
+    use crate::common::region::validate_region;
+    validate_region(format_name, meta.size_x, meta.size_y, x, y, w, h)?;
+    let bps = meta.pixel_type.bytes_per_sample();
+    let row = (meta.size_x as usize) * bps;
+    let plane = row * (meta.size_y as usize);
+    let out_row = (w as usize) * bps;
+    if full.len() < plane * channels {
+        return Err(BioFormatsError::InvalidData(format!(
+            "{format_name} plane buffer is too short: got {}, expected {}",
+            full.len(),
+            plane * channels
+        )));
     }
-    Ok(data[offset..end].to_vec())
+    let mut out = Vec::with_capacity(out_row * (h as usize) * channels);
+    for c in 0..channels {
+        let base = c * plane;
+        for r in 0..h as usize {
+            let src = base + (y as usize + r) * row + (x as usize) * bps;
+            out.extend_from_slice(&full[src..src + out_row]);
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -658,23 +654,251 @@ fn parse_quicktime(data: &[u8]) -> Result<QuickTimeParsed> {
 // ---------------------------------------------------------------------------
 /// MNG (Multiple-image Network Graphics) reader (`.mng`).
 ///
-/// MNG is PNG-related, but it is a distinct animation/container format and
-/// cannot be decoded by treating the file as a PNG stream.
-pub struct MngReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    layout: Option<MiscStrictRawLayout>,
+/// Faithful port of the Java `MNGReader` (formats-bsd). MNG is a container of
+/// embedded PNG (and, for JNG, JPEG) datastreams. `set_id` walks the
+/// `[len][code][data][crc]` chunk chain (big-endian), recording the byte range
+/// of each embedded image between an `IHDR`/`JDAT` chunk and its terminating
+/// `IEND`, honouring `LOOP`/`ENDL` iteration markers. Frames are then grouped
+/// by `(width, height, bands, pixel type)` into series, exactly as the Java
+/// reader does by decoding each frame once to read its dimensions.
+///
+/// Each embedded PNG frame is reconstructed by prepending the 8-byte PNG
+/// signature to the recorded chunk bytes and decoded with the `image` crate.
+/// Pixel data is returned channel-separated (`is_interleaved = false`,
+/// big-endian, matching `MNGReader`'s `littleEndian = false`).
+const MNG_MAGIC: [u8; 8] = [0x8a, 0x4d, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+#[derive(Clone)]
+struct MngSeries {
+    offsets: Vec<usize>,
+    lengths: Vec<usize>,
+    meta: ImageMetadata,
 }
 
-const MNG_STRICT_RAW_MAGIC: [u8; 16] = *b"BFMNGSTRICTRAW01";
+pub struct MngReader {
+    path: Option<PathBuf>,
+    is_jng: bool,
+    series: Vec<MngSeries>,
+    current: usize,
+}
 
 impl MngReader {
     pub fn new() -> Self {
         MngReader {
             path: None,
-            meta: None,
-            layout: None,
+            is_jng: false,
+            series: Vec::new(),
+            current: 0,
         }
+    }
+
+    /// Decode the embedded image at `[offset, end)` into a `DynamicImage`.
+    fn decode_frame(
+        data: &[u8],
+        offset: usize,
+        end: usize,
+        is_jng: bool,
+    ) -> Result<image::DynamicImage> {
+        if end <= offset || end > data.len() {
+            return Err(BioFormatsError::InvalidData(
+                "MNG frame range is outside the file".into(),
+            ));
+        }
+        if is_jng {
+            // JNG embeds a JPEG datastream; Java does not fully support JNG, so
+            // this is a best-effort JPEG decode of the recorded bytes.
+            image::load_from_memory_with_format(&data[offset..end], image::ImageFormat::Jpeg)
+                .map_err(|e| BioFormatsError::Codec(format!("MNG/JNG decode: {e}")))
+        } else {
+            let mut png = Vec::with_capacity(8 + (end - offset));
+            png.extend_from_slice(&PNG_SIGNATURE);
+            png.extend_from_slice(&data[offset..end]);
+            image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                .map_err(|e| BioFormatsError::Codec(format!("MNG/PNG decode: {e}")))
+        }
+    }
+
+    /// Per-frame geometry: width, height, band count, pixel type.
+    fn frame_info(img: &image::DynamicImage) -> (u32, u32, u32, PixelType) {
+        use image::DynamicImage::*;
+        let (w, h) = (img.width(), img.height());
+        let (bands, pt) = match img {
+            ImageLuma8(_) => (1, PixelType::Uint8),
+            ImageLumaA8(_) => (2, PixelType::Uint8),
+            ImageRgb8(_) => (3, PixelType::Uint8),
+            ImageRgba8(_) => (4, PixelType::Uint8),
+            ImageLuma16(_) => (1, PixelType::Uint16),
+            ImageLumaA16(_) => (2, PixelType::Uint16),
+            ImageRgb16(_) => (3, PixelType::Uint16),
+            ImageRgba16(_) => (4, PixelType::Uint16),
+            ImageRgb32F(_) => (3, PixelType::Float32),
+            ImageRgba32F(_) => (4, PixelType::Float32),
+            _ => (3, PixelType::Uint8),
+        };
+        (w, h, bands, pt)
+    }
+
+    /// Convert a decoded frame into channel-separated (planar) bytes. Multi-byte
+    /// samples are emitted big-endian to match `littleEndian = false`.
+    fn frame_to_planar(img: &image::DynamicImage, bands: u32, pt: PixelType) -> Vec<u8> {
+        let w = img.width() as usize;
+        let h = img.height() as usize;
+        let pixels = w * h;
+        let bands = bands as usize;
+        match pt {
+            PixelType::Uint8 => {
+                let interleaved = img.to_rgba8();
+                let src = interleaved.as_raw();
+                // image always gives 4-band RGBA8 from to_rgba8; remap to the
+                // declared band count.
+                let mut out = vec![0u8; pixels * bands];
+                for p in 0..pixels {
+                    for b in 0..bands {
+                        out[b * pixels + p] = src[p * 4 + b.min(3)];
+                    }
+                }
+                out
+            }
+            PixelType::Uint16 => {
+                let interleaved = img.to_rgba16();
+                let src = interleaved.as_raw();
+                let mut out = vec![0u8; pixels * bands * 2];
+                for p in 0..pixels {
+                    for b in 0..bands {
+                        let v = src[p * 4 + b.min(3)];
+                        let be = v.to_be_bytes();
+                        let dst = (b * pixels + p) * 2;
+                        out[dst] = be[0];
+                        out[dst + 1] = be[1];
+                    }
+                }
+                out
+            }
+            _ => {
+                // Float / other: fall back to interleaved RGBA8.
+                img.to_rgba8().into_raw()
+            }
+        }
+    }
+
+    fn parse(path: &Path) -> Result<(bool, Vec<MngSeries>)> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let mut c = Cursor::new(&data, false); // MNG is big-endian
+
+        c.skip(12);
+        if c.read_string(4) != "MHDR" {
+            return Err(BioFormatsError::Format("Invalid MNG file.".into()));
+        }
+        c.skip(32);
+
+        let mut offsets: Vec<usize> = Vec::new();
+        let mut lengths: Vec<usize> = Vec::new();
+        let mut stack: Vec<i64> = Vec::new();
+        let mut max_iterations: i32 = 0;
+        let mut current_iteration: i32 = 0;
+        let mut is_jng = false;
+
+        // Read the sequence of [len, code, value] chunks.
+        while c.fp() + 8 <= data.len() {
+            let len = c.read_int() as i64;
+            let code = c.read_string(4);
+            let fp = c.fp() as i64;
+
+            match code.as_str() {
+                "IHDR" => offsets.push((fp - 8).max(0) as usize),
+                "JDAT" => {
+                    is_jng = true;
+                    offsets.push(fp as usize);
+                }
+                "IEND" => lengths.push((fp + len + 4).max(0) as usize),
+                "LOOP" => {
+                    stack.push(fp + len + 4);
+                    c.skip(1);
+                    max_iterations = c.read_int();
+                }
+                "ENDL" => {
+                    if let Some(&seek) = stack.last() {
+                        if current_iteration < max_iterations {
+                            c.seek(seek.max(0) as usize);
+                            current_iteration += 1;
+                        } else {
+                            stack.pop();
+                            max_iterations = 0;
+                            current_iteration = 0;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            // Skip to the start of the next chunk (data + 4-byte CRC).
+            let next = fp + len + 4;
+            if next < 0 {
+                break;
+            }
+            c.seek(next as usize);
+        }
+
+        // Group frames by (width-height-bands-pixeltype), preserving order.
+        let mut keys: Vec<(u32, u32, u32, PixelType)> = Vec::new();
+        let mut grouped_offsets: Vec<Vec<usize>> = Vec::new();
+        let mut grouped_lengths: Vec<Vec<usize>> = Vec::new();
+
+        for i in 0..offsets.len() {
+            let offset = offsets[i];
+            let end = match lengths.get(i) {
+                Some(&e) => e,
+                None => continue,
+            };
+            if end < offset {
+                continue;
+            }
+            let img = Self::decode_frame(&data, offset, end, is_jng)?;
+            let (w, h, bands, pt) = Self::frame_info(&img);
+            let key = (w, h, bands, pt);
+            let idx = match keys.iter().position(|k| *k == key) {
+                Some(idx) => idx,
+                None => {
+                    keys.push(key);
+                    grouped_offsets.push(Vec::new());
+                    grouped_lengths.push(Vec::new());
+                    keys.len() - 1
+                }
+            };
+            grouped_offsets[idx].push(offset);
+            grouped_lengths[idx].push(end);
+        }
+
+        if keys.is_empty() {
+            return Err(BioFormatsError::Format("Pixel data not found.".into()));
+        }
+
+        let mut series = Vec::with_capacity(keys.len());
+        for (i, &(w, h, bands, pt)) in keys.iter().enumerate() {
+            let count = grouped_offsets[i].len() as u32;
+            let meta = ImageMetadata {
+                size_x: w,
+                size_y: h,
+                size_z: 1,
+                size_c: bands,
+                size_t: count,
+                pixel_type: pt,
+                bits_per_pixel: (pt.bytes_per_sample() * 8) as u8,
+                image_count: count,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb: bands > 1,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: false,
+                ..ImageMetadata::default()
+            };
+            series.push(MngSeries {
+                offsets: grouped_offsets[i].clone(),
+                lengths: grouped_lengths[i].clone(),
+                meta,
+            });
+        }
+        Ok((is_jng, series))
     }
 }
 
@@ -694,72 +918,61 @@ impl FormatReader for MngReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= MNG_STRICT_RAW_MAGIC.len()
-            && header[..MNG_STRICT_RAW_MAGIC.len()] == MNG_STRICT_RAW_MAGIC
+        header.len() >= 8 && header[..8] == MNG_MAGIC
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.layout = None;
-
-        let data = match std::fs::read(path) {
-            Ok(data) => data,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(strict_misc_raw_unsupported("MNG strict raw"));
-            }
-            Err(err) => return Err(BioFormatsError::Io(err)),
-        };
-        if data.len() < MNG_STRICT_RAW_MAGIC.len()
-            || data[..MNG_STRICT_RAW_MAGIC.len()] != MNG_STRICT_RAW_MAGIC
-        {
-            return Err(strict_misc_raw_unsupported("MNG strict raw"));
-        }
-
-        let (meta, layout) =
-            parse_misc_strict_raw_subset(path, &MNG_STRICT_RAW_MAGIC, "MNG strict raw")?;
+        self.close()?;
+        let (is_jng, series) = Self::parse(path)?;
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.is_jng = is_jng;
+        self.series = series;
+        self.current = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.layout = None;
+        self.is_jng = false;
+        self.series.clear();
+        self.current = 0;
         Ok(())
     }
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.series.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
-            Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
+        if s < self.series.len() {
+            self.current = s;
             Ok(())
         } else {
             Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
     fn series(&self) -> usize {
-        0
+        self.current
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.series
+            .get(self.current)
+            .map(|s| &s.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
+        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
+        let s = self
+            .series
+            .get(self.current)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let no = plane_index as usize;
+        if no >= s.offsets.len() {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        read_misc_strict_raw_plane(
-            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
-            self.layout.ok_or(BioFormatsError::NotInitialized)?,
-            plane_index,
-        )
+        let (offset, end) = (s.offsets[no], s.lengths[no]);
+        let (bands, pt) = (s.meta.size_c, s.meta.pixel_type);
+        let data = std::fs::read(&path).map_err(BioFormatsError::Io)?;
+        let img = Self::decode_frame(&data, offset, end, self.is_jng)?;
+        Ok(Self::frame_to_planar(&img, bands, pt))
     }
     fn open_bytes_region(
         &mut self,
@@ -770,182 +983,465 @@ impl FormatReader for MngReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("MNG strict raw", &full, meta, 1, x, y, w, h)
+        let s = self
+            .series
+            .get(self.current)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        crop_planar("MNG", &full, &s.meta, s.meta.size_c as usize, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 3. Volocity Library
-// ---------------------------------------------------------------------------
-/// Volocity Library reader (`.acff`).
-///
-/// Volocity Library files use OLE2/Compound Document format; the remaining
-/// missing piece is the Volocity-specific stream schema.
-pub struct VolocityLibraryReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    layout: Option<MiscStrictRawLayout>,
-}
-
-const VOLOCITY_LIBRARY_STRICT_RAW_MAGIC: [u8; 16] = *b"BFVOLOCITYACFF01";
-
-impl VolocityLibraryReader {
-    pub fn new() -> Self {
-        VolocityLibraryReader {
-            path: None,
-            meta: None,
-            layout: None,
-        }
-    }
-}
-
-impl Default for VolocityLibraryReader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FormatReader for VolocityLibraryReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("acff"))
-    }
-
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= VOLOCITY_LIBRARY_STRICT_RAW_MAGIC.len()
-            && header[..VOLOCITY_LIBRARY_STRICT_RAW_MAGIC.len()]
-                == VOLOCITY_LIBRARY_STRICT_RAW_MAGIC
-    }
-
-    fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.layout = None;
-
-        let data = match std::fs::read(path) {
-            Ok(data) => data,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(strict_misc_raw_unsupported("Volocity Library"));
-            }
-            Err(err) => return Err(BioFormatsError::Io(err)),
+        let (sx, sy) = {
+            let m = self.metadata();
+            (m.size_x, m.size_y)
         };
-        if data.len() < VOLOCITY_LIBRARY_STRICT_RAW_MAGIC.len()
-            || data[..VOLOCITY_LIBRARY_STRICT_RAW_MAGIC.len()] != VOLOCITY_LIBRARY_STRICT_RAW_MAGIC
-        {
-            return Err(strict_misc_raw_unsupported("Volocity Library"));
-        }
-
-        let (meta, layout) = parse_misc_strict_raw_subset(
-            path,
-            &VOLOCITY_LIBRARY_STRICT_RAW_MAGIC,
-            "Volocity Library",
-        )?;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
-        Ok(())
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.layout = None;
-        Ok(())
-    }
-
-    fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
-    }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
-            Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
-            Ok(())
-        } else {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        }
-    }
-
-    fn series(&self) -> usize {
-        0
-    }
-
-    fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
-            .unwrap_or(crate::common::reader::uninitialized_metadata())
-    }
-
-    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        read_misc_strict_raw_plane(
-            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
-            self.layout.ok_or(BioFormatsError::NotInitialized)?,
-            plane_index,
-        )
-    }
-
-    fn open_bytes_region(
-        &mut self,
-        plane_index: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-    ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("Volocity Library", &full, meta, 1, x, y, w, h)
-    }
-
-    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
+        let tw = sx.min(256);
+        let th = sy.min(256);
+        let tx = (sx - tw) / 2;
+        let ty = (sy - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // 4. 3i SlideBook
 // ---------------------------------------------------------------------------
 /// 3i SlideBook reader (`.sld`).
 ///
-/// SlideBook uses a proprietary binary format from 3i (Intelligent Imaging
-/// Innovations). The internal structure is undocumented.
-pub struct SlideBookReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    layout: Option<MiscStrictRawLayout>,
+/// BEST-EFFORT port of the Java `SlidebookReader`. SlideBook files are a
+/// loosely documented sequence of variable-length pixel-data blocks and
+/// fixed/variable-length metadata blocks. This port faithfully reproduces:
+///
+/// - detection (`isThisType`): little/big-endian flag at offset 4, then the
+///   two magic shorts;
+/// - the block-offset scan (`initFile` lines 242-396) that records every
+///   metadata block and confirms each candidate pixel block by scanning forward
+///   for the `h`/`i`/`j`/`k`/`n` identifier that follows it;
+/// - reading the `'i'` and `'u'` metadata blocks to recover sizeX/sizeY (with
+///   the divisor fix-up), sizeC (`iCount`) and sizeZ (`uCount`).
+///
+/// Each surviving pixel block becomes one series of 16-bit planes. Planes are
+/// uncompressed and read directly by byte offset.
+///
+/// NOT PORTED (Java lines ~758-1207): the extensive heuristic dimension
+/// disambiguation, montage/spool handling, image-name based series flattening,
+/// and physical-size/channel-name metadata. When the recovered geometry cannot
+/// be factored cleanly into the available planes, this reader returns an honest
+/// `UnsupportedFormat`/`Format` error rather than fabricating a layout.
+struct SlideBookSeries {
+    meta: ImageMetadata,
+    plane_offsets: Vec<usize>,
+    plane_bytes: usize,
 }
 
-const SLIDEBOOK_STRICT_RAW_MAGIC: [u8; 16] = *b"BFSLIDEBOOKRAW1!";
+pub struct SlideBookReader {
+    path: Option<PathBuf>,
+    series: Vec<SlideBookSeries>,
+    current: usize,
+}
 
 impl SlideBookReader {
     pub fn new() -> Self {
         SlideBookReader {
             path: None,
-            meta: None,
-            layout: None,
+            series: Vec::new(),
+            current: 0,
         }
+    }
+
+    fn within_pixels(offset: usize, pixel_offsets: &[usize], pixel_lengths: &[usize]) -> bool {
+        for i in 0..pixel_offsets.len() {
+            let po = pixel_offsets[i];
+            let pl = pixel_lengths.get(i).copied().unwrap_or(0);
+            if offset >= po && offset < po + pl {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Scan the file for metadata and pixel block offsets (Java initFile
+    /// 228-396). Returns (little_endian, metadata_offsets, pixel_offsets,
+    /// pixel_lengths).
+    fn scan_offsets(data: &[u8]) -> Result<(bool, Vec<usize>, Vec<usize>, Vec<usize>)> {
+        let mut c = Cursor::new(data, true);
+        c.skip(4);
+        let little = c.read() == 0x49; // 'I'
+        c.order(little);
+
+        let mut metadata_offsets: Vec<usize> = Vec::new();
+        let mut pixel_offsets: Vec<usize> = Vec::new();
+        let mut pixel_lengths: Vec<usize> = Vec::new();
+
+        c.seek(0);
+        let total = data.len();
+        let is_marker = |b0: u8, b1: u8| (b0 == b'I' && b1 == b'I') || (b0 == b'M' && b1 == b'M');
+
+        while c.fp() + 8 < total {
+            c.skip(4);
+            let check_one = c.read();
+            let check_two = c.read();
+
+            if (check_one == b'I' as i32 && check_two == b'I' as i32)
+                || (check_one == b'M' as i32 && check_two == b'M' as i32)
+            {
+                metadata_offsets.push(c.fp() - 6);
+                let s = c.read_short() as i64;
+                c.skip(s - 8);
+            } else if (check_one == 0xff || check_one == -1)
+                && (check_two == 0xff || check_two == -1)
+            {
+                // Variable-length metadata block: find the next II/MM marker.
+                let mut m: Option<usize> = None;
+                let mut p = c.fp();
+                while p + 1 < total {
+                    if is_marker(data[p], data[p + 1]) {
+                        m = Some(p);
+                        break;
+                    }
+                    p += 1;
+                }
+                match m {
+                    Some(m) if m >= 2 => {
+                        c.seek(m - 2);
+                        metadata_offsets.push(m.saturating_sub(4));
+                        let s = c.read_short() as i64;
+                        c.skip(s - 5);
+                    }
+                    _ => break, // no further markers: stop scanning
+                }
+            } else {
+                // Candidate pixel block.
+                let mut fp = c.fp() as i64 - 6;
+                if fp < 0 {
+                    break;
+                }
+                c.seek(fp as usize);
+                let blen = c.read();
+                let s = if blen > 0 && blen <= 32 {
+                    Some(c.read_string(blen as usize))
+                } else {
+                    None
+                };
+
+                if let Some(s) = s.as_deref().filter(|s| s.contains("Annotation")) {
+                    match s {
+                        "CTimelapseAnnotation" => {
+                            c.skip(41);
+                            if c.read() == 0 {
+                                c.skip(10);
+                            } else {
+                                c.skip(-1);
+                            }
+                        }
+                        "CIntensityBarAnnotation" => {
+                            c.skip(56);
+                            let mut n = c.read();
+                            while n == 0 || n < 6 || n > 0x80 {
+                                if n == -1 {
+                                    break;
+                                }
+                                n = c.read();
+                            }
+                            c.skip(-1);
+                        }
+                        "CCubeAnnotation" => {
+                            c.skip(66);
+                            let n = c.read();
+                            if n != 0 {
+                                c.skip(-1);
+                            }
+                        }
+                        "CScaleBarAnnotation" => {
+                            c.skip(38);
+                            let extra = c.read();
+                            if extra <= 16 {
+                                c.skip(3 + extra as i64);
+                            } else {
+                                c.skip(2);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if s.as_deref().map(|s| s.contains("Decon")).unwrap_or(false) {
+                    c.seek(fp as usize);
+                    loop {
+                        let b = c.read();
+                        if b == b']' as i32 || b == -1 {
+                            break;
+                        }
+                    }
+                } else {
+                    if fp % 2 == 1 {
+                        fp -= 2;
+                    }
+                    c.seek(fp as usize);
+                    let check_string = c.read_string(64);
+                    let idx = check_string.find("II").or_else(|| check_string.find("MM"));
+                    if let Some(index) = idx {
+                        c.seek((fp + index as i64 - 4).max(0) as usize);
+                        continue;
+                    } else {
+                        c.seek(fp as usize);
+                    }
+
+                    pixel_offsets.push(fp as usize);
+
+                    // Confirm the block by scanning forward for the identifier
+                    // (h/i/j/k/n/on) followed by an II/MM marker.
+                    let start = fp as usize;
+                    let mut found = false;
+                    let mut a = start;
+                    while a + 6 <= total {
+                        let m4 = data[a + 4];
+                        let m5 = data[a + 5];
+                        if is_marker(m4, m5) {
+                            let b0 = data[a];
+                            let b1 = data[a + 1];
+                            if ((b0 == b'h' || b0 == b'i') && b1 == 0)
+                                || (b0 == 0 && (b1 == b'h' || b1 == b'i'))
+                            {
+                                found = true;
+                                if b0 == b'i' || b1 == b'i' {
+                                    pixel_offsets.pop();
+                                }
+                                c.seek(a.saturating_sub(20));
+                                break;
+                            } else if ((b0 == b'j' || b0 == b'k' || b0 == b'n') && b1 == 0)
+                                || (b0 == 0 && (b1 == b'j' || b1 == b'k' || b1 == b'n'))
+                                || (b0 == b'o' && b1 == b'n')
+                            {
+                                found = true;
+                                pixel_offsets.pop();
+                                c.seek(a.saturating_sub(20));
+                                break;
+                            }
+                        }
+                        a += 1;
+                    }
+                    if !found {
+                        c.seek(total);
+                    }
+
+                    // Compute and validate the pixel block length.
+                    if pixel_offsets.len() > pixel_lengths.len() {
+                        let mut length = c.fp() as i64 - fp;
+                        if (length / 2) % 2 == 1 {
+                            if let Some(last) = pixel_offsets.last_mut() {
+                                *last = (fp + 2) as usize;
+                            }
+                            length -= 2;
+                        }
+                        if length >= 1024 {
+                            pixel_lengths.push(length.max(0) as usize);
+                        } else {
+                            pixel_offsets.pop();
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((little, metadata_offsets, pixel_offsets, pixel_lengths))
+    }
+
+    fn parse(path: &Path) -> Result<Vec<SlideBookSeries>> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let (little, metadata_offsets, mut pixel_offsets, mut pixel_lengths) =
+            Self::scan_offsets(&data)?;
+
+        // Drop pixel blocks that run off the end of the file (padding = 7 for
+        // non-spool .sld files).
+        let mut i = 0;
+        while i < pixel_offsets.len() {
+            let length = pixel_lengths.get(i).copied().unwrap_or(0);
+            let offset = pixel_offsets[i];
+            if length + offset + 7 > data.len() {
+                pixel_offsets.remove(i);
+                if i < pixel_lengths.len() {
+                    pixel_lengths.remove(i);
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        let n_pix = pixel_offsets.len();
+        if n_pix == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "3i SlideBook: no pixel data blocks found".into(),
+            ));
+        }
+
+        // Recover per-block dimensions from 'i' and 'u' metadata blocks.
+        let mut size_x = vec![0i32; n_pix];
+        let mut size_y = vec![0i32; n_pix];
+        let mut size_z = vec![0i32; n_pix];
+        let mut size_c = vec![0i32; n_pix];
+        let mut div_values = vec![0i32; n_pix];
+
+        let mut c = Cursor::new(&data, little);
+        let mut i_count = 0i32;
+        let mut u_count = 0i32;
+        let mut prev_series = -1i32;
+        let mut prev_series_u = -1i32;
+        let total = data.len();
+
+        for mi in 0..metadata_offsets.len() {
+            let off = metadata_offsets[mi];
+            let next = if mi == metadata_offsets.len() - 1 {
+                total
+            } else {
+                metadata_offsets[mi + 1]
+            };
+            if next <= off {
+                continue;
+            }
+            let total_blocks = (next - off) / 128;
+            for q in 0..total_blocks {
+                let blk = off + q * 128;
+                if Self::within_pixels(blk, &pixel_offsets, &pixel_lengths) {
+                    continue;
+                }
+                c.seek(blk);
+                let mut n = c.read_short() as u16;
+                while n == 0 && c.fp() < off + (q + 1) * 128 {
+                    n = c.read_short() as u16;
+                }
+                if c.fp() >= total.saturating_sub(2) {
+                    break;
+                }
+                let n = n as u8 as char;
+                if n == 'i' {
+                    i_count += 1;
+                    c.skip(70);
+                    let _exp = c.read_int();
+                    c.skip(20);
+                    let _size = c.read_float();
+                    c.skip(-20);
+                    for j in 0..n_pix {
+                        let end = if j == n_pix - 1 {
+                            total
+                        } else {
+                            pixel_offsets[j + 1]
+                        };
+                        if c.fp() < end {
+                            if size_x[j] == 0 {
+                                let x = c.read_short() as i32;
+                                let y = c.read_short() as i32;
+                                if x != 0 && y != 0 {
+                                    size_x[j] = x;
+                                    size_y[j] = y;
+                                    let check_x = c.read_short() as i32;
+                                    let check_y = c.read_short() as i32;
+                                    let mut div = c.read_short() as i32;
+                                    if check_x == check_y {
+                                        div_values[j] = div;
+                                        size_x[j] /= if div == 0 { 1 } else { div };
+                                        div = c.read_short() as i32;
+                                        size_y[j] /= if div == 0 { 1 } else { div };
+                                    }
+                                } else {
+                                    c.skip(8);
+                                }
+                            }
+                            if prev_series != j as i32 {
+                                i_count = 1;
+                            }
+                            prev_series = j as i32;
+                            size_c[j] = i_count;
+                            break;
+                        }
+                    }
+                } else if n == 'u' {
+                    u_count += 1;
+                    for j in 0..n_pix {
+                        let end = if j == n_pix - 1 {
+                            total
+                        } else {
+                            pixel_offsets[j + 1]
+                        };
+                        if c.fp() < end {
+                            if prev_series_u != j as i32 {
+                                u_count = 1;
+                            }
+                            prev_series_u = j as i32;
+                            size_z[j] = u_count;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build one series per pixel block with a clean dimension factoring.
+        let mut series = Vec::with_capacity(n_pix);
+        for idx in 0..n_pix {
+            let sx = size_x[idx];
+            let sy = size_y[idx];
+            if sx <= 0 || sy <= 0 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "3i SlideBook: could not recover dimensions for series {idx}"
+                )));
+            }
+            let _ = div_values[idx];
+            let sx = sx as u32;
+            let sy = sy as u32;
+            let plane_bytes = (sx as usize) * (sy as usize) * 2;
+            if plane_bytes == 0 {
+                return Err(BioFormatsError::Format(
+                    "3i SlideBook: zero-sized plane".into(),
+                ));
+            }
+            let length = pixel_lengths.get(idx).copied().unwrap_or(0);
+            let plane_count = length / plane_bytes;
+            if plane_count == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "3i SlideBook: series {idx} pixel block holds no full planes"
+                )));
+            }
+
+            let mut sc = size_c[idx].max(1) as u32;
+            let mut sz = size_z[idx].max(1) as u32;
+            let product = (sc as usize) * (sz as usize);
+            if product == 0 || plane_count % product != 0 {
+                // Cannot factor cleanly into C*Z; fall back to a plain Z-stack.
+                sc = 1;
+                sz = 1;
+            }
+            let nplanes = (sc * sz).max(1);
+            let size_t = (plane_count as u32 / nplanes).max(1);
+            let image_count = (nplanes * size_t).min(plane_count as u32).max(1);
+
+            let start = pixel_offsets[idx];
+            let mut plane_offsets = Vec::with_capacity(image_count as usize);
+            for p in 0..image_count as usize {
+                plane_offsets.push(start + p * plane_bytes);
+            }
+
+            let meta = ImageMetadata {
+                size_x: sx,
+                size_y: sy,
+                size_z: sz,
+                size_c: sc,
+                size_t,
+                pixel_type: PixelType::Uint16,
+                bits_per_pixel: 16,
+                image_count,
+                dimension_order: DimensionOrder::XYZTC,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: little,
+                ..ImageMetadata::default()
+            };
+            series.push(SlideBookSeries {
+                meta,
+                plane_offsets,
+                plane_bytes,
+            });
+        }
+        Ok(series)
     }
 }
 
@@ -965,32 +1461,47 @@ impl FormatReader for SlideBookReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= SLIDEBOOK_STRICT_RAW_MAGIC.len()
-            && header[..SLIDEBOOK_STRICT_RAW_MAGIC.len()] == SLIDEBOOK_STRICT_RAW_MAGIC
+        if header.len() < 10 {
+            return false;
+        }
+        let little = &header[4..6] == b"II";
+        let rd = |o: usize| -> i32 {
+            let a = [header[o], header[o + 1]];
+            (if little {
+                u16::from_le_bytes(a)
+            } else {
+                u16::from_be_bytes(a)
+            }) as i32
+        };
+        let magic1 = rd(6);
+        let magic2 = rd(8);
+        ((magic2 & 0xff00) == 0x0100 || (magic2 & 0xff00) == 0x0200)
+            && (magic1 == 0x006c || magic1 == 0x01f5)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (meta, layout) =
-            parse_misc_strict_raw_subset(path, &SLIDEBOOK_STRICT_RAW_MAGIC, "3i SlideBook")?;
+        self.close()?;
+        let series = Self::parse(path)?;
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.series = series;
+        self.current = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.layout = None;
+        self.series.clear();
+        self.current = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.series.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s == 0 && self.meta.is_some() {
+        if s < self.series.len() {
+            self.current = s;
             Ok(())
         } else {
             Err(BioFormatsError::SeriesOutOfRange(s))
@@ -998,25 +1509,37 @@ impl FormatReader for SlideBookReader {
     }
 
     fn series(&self) -> usize {
-        0
+        self.current
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.series
+            .get(self.current)
+            .map(|s| &s.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
+        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
+        let s = self
+            .series
+            .get(self.current)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let no = plane_index as usize;
+        if no >= s.plane_offsets.len() {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        read_misc_strict_raw_plane(
-            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
-            self.layout.ok_or(BioFormatsError::NotInitialized)?,
-            plane_index,
-        )
+        let (offset, plane_bytes) = (s.plane_offsets[no], s.plane_bytes);
+        let data = std::fs::read(&path).map_err(BioFormatsError::Io)?;
+        let end = offset
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("3i SlideBook plane offset overflows".into()))?;
+        if end > data.len() {
+            return Err(BioFormatsError::InvalidData(
+                "3i SlideBook plane extends past end of file".into(),
+            ));
+        }
+        Ok(data[offset..end].to_vec())
     }
 
     fn open_bytes_region(
@@ -1028,16 +1551,19 @@ impl FormatReader for SlideBookReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("3i SlideBook", &full, meta, 1, x, y, w, h)
+        let meta = self.metadata().clone();
+        crop_full_plane("3i SlideBook", &full, &meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
+        let (sx, sy) = {
+            let m = self.metadata();
+            (m.size_x, m.size_y)
+        };
+        let tw = sx.min(256);
+        let th = sy.min(256);
+        let tx = (sx - tw) / 2;
+        let ty = (sy - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
@@ -1795,25 +2321,367 @@ impl FormatReader for MincReader {
 // ---------------------------------------------------------------------------
 // 6. PerkinElmer Openlab LIFF
 // ---------------------------------------------------------------------------
-/// PerkinElmer Openlab LIFF reader (`.liff`).
+/// Improvision Openlab LIFF reader (`.liff`).
 ///
-/// Openlab LIFF is a proprietary binary format from PerkinElmer/Improvision.
-/// The internal structure is undocumented and not publicly specified.
-pub struct OpenlabLiffReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    layout: Option<MiscStrictRawLayout>,
+/// Faithful port of the Java `OpenlabReader` block/layer parsing and the
+/// uncompressed / LZO pixel-read paths. The file is a big-endian sequence of
+/// tagged blocks (`readTagHeader`): each `IMAGE_TYPE_1`/`IMAGE_TYPE_2` tag
+/// carries a plane (volume type, name, dimensions and pixel offset). Planes are
+/// grouped into series by matching width/height/volume-type against previously
+/// seen "representative" planes, exactly as the Java reader does.
+///
+/// Pixel reads cover the documented non-PICT cases:
+/// - **version 2**: raw uncompressed planes;
+/// - **version 5**: LZO-compressed planes (8-bit greyscale and 24-bit colour),
+///   decoded with [`crate::common::codec::decompress_lzo`] and unpacked using
+///   the same stride logic as Java's `openBytes`.
+///
+/// MAC_256 greyscale/colour planes are bit-inverted as in Java.
+///
+/// NOT PORTED: embedded Apple PICT planes (`planeInfo.pict`) require a PICT
+/// decoder and return `UnsupportedFormat`; the `parseImageNames` Z/C/T axis and
+/// special-plate-name inference and the OME stage/detector metadata are omitted.
+const OPENLAB_LIFF_MAGIC: u64 = 0x0000_ffff_696d_7072;
+
+// Openlab image (volume) types.
+const OL_MAC_1_BIT: i32 = 1;
+const OL_MAC_4_GREYS: i32 = 2;
+const OL_MAC_16_GREYS: i32 = 3;
+const OL_MAC_16_COLORS: i32 = 4;
+const OL_MAC_256_GREYS: i32 = 5;
+const OL_MAC_256_COLORS: i32 = 6;
+const OL_MAC_16_BIT_COLOR: i32 = 7;
+const OL_MAC_24_BIT_COLOR: i32 = 8;
+const OL_DEEP_GREY_9: i32 = 9;
+const OL_DEEP_GREY_16: i32 = 16;
+
+// Tag types.
+const OL_IMAGE_TYPE_1: i32 = 67;
+const OL_IMAGE_TYPE_2: i32 = 68;
+const OL_CALIBRATION: i32 = 69;
+
+#[derive(Clone)]
+struct OpenlabPlane {
+    plane_offset: usize,
+    volume_type: i32,
+    pict: bool,
+    width: u32,
+    height: u32,
+    series: i32,
 }
 
-const OPENLAB_LIFF_STRICT_RAW_MAGIC: [u8; 16] = *b"BFOPENLABLIFFRAW";
+pub struct OpenlabLiffReader {
+    path: Option<PathBuf>,
+    version: i32,
+    planes: Vec<OpenlabPlane>,
+    /// Per-series list of indices into `planes`.
+    plane_offsets: Vec<Vec<usize>>,
+    metas: Vec<ImageMetadata>,
+    current: usize,
+}
 
 impl OpenlabLiffReader {
     pub fn new() -> Self {
         OpenlabLiffReader {
             path: None,
-            meta: None,
-            layout: None,
+            version: 0,
+            planes: Vec::new(),
+            plane_offsets: Vec::new(),
+            metas: Vec::new(),
+            current: 0,
         }
+    }
+
+    /// Read one tag header (Java `readTagHeader`). Returns
+    /// (tag, sub_tag, next_tag, fmt).
+    fn read_tag_header(c: &mut Cursor, version: i32) -> (i32, i32, i64, String) {
+        let tag = c.read_short() as i32;
+        let sub_tag = c.read_short() as i32;
+        let next_tag = if version == 2 {
+            c.read_int() as i64
+        } else {
+            c.read_long()
+        };
+        let fmt = c.read_string(4);
+        c.skip(if version == 2 { 4 } else { 8 });
+        (tag, sub_tag, next_tag, fmt)
+    }
+
+    fn parse(path: &Path) -> Result<OpenlabLiffReader> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let mut c = Cursor::new(&data, false); // big-endian
+
+        c.seek(4);
+        if c.read_string(4) != "impr" {
+            return Err(BioFormatsError::Format("Invalid LIFF file.".into()));
+        }
+        let version = c.read_int();
+        if version != 2 && version != 5 {
+            return Err(BioFormatsError::Format(format!(
+                "Invalid Openlab LIFF version : {version}"
+            )));
+        }
+        let _plane_count = c.read_short();
+        c.skip(2); // ID seed
+        let first_offset = c.read_int();
+        c.seek(first_offset.max(0) as usize);
+
+        let mut planes: Vec<OpenlabPlane> = Vec::new();
+        // Representative planes: (width, height, volume_type).
+        let mut reps: Vec<(u32, u32, i32)> = Vec::new();
+        let mut xcal = 0.0f32;
+        let mut ycal = 0.0f32;
+        let total = data.len();
+
+        while c.fp() + 8 < total {
+            let mut fp = c.fp() as i64;
+            let (mut tag, mut sub_tag, mut next_tag, mut fmt) =
+                Self::read_tag_header(&mut c, version);
+            // Resync: back up one byte at a time until the tag is in range.
+            while (tag < OL_IMAGE_TYPE_1 || tag > 76) && fp > 0 {
+                fp -= 1;
+                c.seek(fp as usize);
+                let h = Self::read_tag_header(&mut c, version);
+                tag = h.0;
+                sub_tag = h.1;
+                next_tag = h.2;
+                fmt = h.3;
+            }
+            if tag < OL_IMAGE_TYPE_1 || tag > 76 {
+                break; // could not resync
+            }
+            let _ = sub_tag;
+
+            if tag == OL_IMAGE_TYPE_1 || tag == OL_IMAGE_TYPE_2 {
+                let pict = fmt.to_lowercase() == "pict";
+                c.skip(24);
+                let volume_type = c.read_short() as i32;
+                c.skip(16);
+                let pointer = c.fp();
+                let name = c.read_cstring().trim().to_string();
+                c.skip(256 - c.fp() as i64 + pointer as i64);
+                let plane_offset = c.fp();
+
+                let (width, height) = if version == 2 {
+                    c.skip(2);
+                    let top = c.read_short() as i32;
+                    let left = c.read_short() as i32;
+                    let bottom = c.read_short() as i32;
+                    let right = c.read_short() as i32;
+                    ((right - left).max(0) as u32, (bottom - top).max(0) as u32)
+                } else {
+                    (c.read_int().max(0) as u32, c.read_int().max(0) as u32)
+                };
+
+                let mut series = -1i32;
+                for i in (0..reps.len()).rev() {
+                    let (rw, rh, rv) = reps[i];
+                    if width == rw
+                        && height == rh
+                        && (volume_type == rv
+                            || (volume_type >= OL_DEEP_GREY_9 && rv >= OL_DEEP_GREY_9))
+                    {
+                        series = i as i32;
+                        break;
+                    }
+                }
+                if series == -1 && name != "Original Image" {
+                    series = reps.len() as i32;
+                    reps.push((width, height, volume_type));
+                }
+
+                planes.push(OpenlabPlane {
+                    plane_offset,
+                    volume_type,
+                    pict,
+                    width,
+                    height,
+                    series,
+                });
+            } else if tag == OL_CALIBRATION {
+                c.skip(4);
+                let units = c.read_short() as i32;
+                let scaling = if units == 3 { 0.001f32 } else { 1.0f32 };
+                c.skip(12);
+                xcal = c.read_float() * scaling;
+                ycal = c.read_float() * scaling;
+            }
+
+            if next_tag <= fp || next_tag as usize > total {
+                // Avoid looping forever on a malformed / final block.
+                if next_tag <= 0 {
+                    break;
+                }
+            }
+            c.seek(next_tag.max(0) as usize);
+        }
+
+        let n_series = reps.len();
+        if n_series == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Openlab LIFF: no image planes found".into(),
+            ));
+        }
+
+        // Group plane indices by series.
+        let mut plane_offsets: Vec<Vec<usize>> = vec![Vec::new(); n_series];
+        for (q, p) in planes.iter().enumerate() {
+            if p.series >= 0 && (p.series as usize) < n_series {
+                plane_offsets[p.series as usize].push(q);
+            }
+        }
+
+        let mut metas = Vec::with_capacity(n_series);
+        for (i, list) in plane_offsets.iter().enumerate() {
+            if list.is_empty() {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Openlab LIFF: series {i} has no planes"
+                )));
+            }
+            let first = &planes[list[0]];
+            let mut meta = ImageMetadata::default();
+            meta.size_x = first.width;
+            meta.size_y = first.height;
+            meta.image_count = list.len() as u32;
+            meta.size_c = 1;
+            let mut bits = 8u8;
+            match first.volume_type {
+                v if v == OL_MAC_1_BIT || v == OL_MAC_4_GREYS || v == OL_MAC_256_GREYS => {
+                    meta.pixel_type = PixelType::Uint8;
+                    meta.is_indexed = first.pict;
+                }
+                v if v == OL_MAC_256_COLORS => {
+                    meta.pixel_type = PixelType::Uint8;
+                    meta.is_indexed = true;
+                }
+                v if v == OL_MAC_16_COLORS
+                    || v == OL_MAC_16_BIT_COLOR
+                    || v == OL_MAC_24_BIT_COLOR =>
+                {
+                    meta.pixel_type = PixelType::Uint8;
+                    meta.size_c = 3;
+                }
+                v if (OL_DEEP_GREY_9..OL_DEEP_GREY_16).contains(&v) => {
+                    bits = v as u8; // 9..15
+                    meta.pixel_type = PixelType::Uint16;
+                }
+                v if v == OL_MAC_16_GREYS || v == OL_DEEP_GREY_16 => {
+                    bits = 16;
+                    meta.pixel_type = PixelType::Uint16;
+                }
+                other => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Openlab LIFF: unsupported plane type {other}"
+                    )));
+                }
+            }
+            if bits > 8 {
+                meta.pixel_type = PixelType::Uint16;
+            }
+            meta.bits_per_pixel = if meta.pixel_type == PixelType::Uint16 {
+                bits.max(9)
+            } else {
+                8
+            };
+            meta.is_rgb = meta.size_c > 1;
+            meta.is_interleaved = meta.is_rgb && version == 5;
+            meta.size_t = 1;
+            meta.size_z = meta.image_count;
+            meta.dimension_order = DimensionOrder::XYCZT;
+            meta.is_little_endian = false;
+            if i == 0 {
+                use crate::common::metadata::MetadataValue;
+                if xcal != 0.0 {
+                    meta.series_metadata
+                        .insert("openlab.physical_size_x".into(), MetadataValue::Float(xcal as f64));
+                }
+                if ycal != 0.0 {
+                    meta.series_metadata
+                        .insert("openlab.physical_size_y".into(), MetadataValue::Float(ycal as f64));
+                }
+            }
+            metas.push(meta);
+        }
+
+        Ok(OpenlabLiffReader {
+            path: Some(path.to_path_buf()),
+            version,
+            planes,
+            plane_offsets,
+            metas,
+            current: 0,
+        })
+    }
+
+    /// Read and decode a non-PICT plane (full image).
+    fn read_plane(&self, data: &[u8], plane: &OpenlabPlane, meta: &ImageMetadata) -> Result<Vec<u8>> {
+        if plane.pict {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Openlab LIFF: embedded PICT planes are not supported".into(),
+            ));
+        }
+        let w = meta.size_x as usize;
+        let h = meta.size_y as usize;
+        let bpp = meta.pixel_type.bytes_per_sample();
+        let channels = if meta.is_rgb { meta.size_c as usize } else { 1 };
+        let plane_size = w * h * bpp * channels;
+        let first = plane.plane_offset;
+
+        let mut buf: Vec<u8> = if self.version == 2 {
+            let end = first
+                .checked_add(plane_size)
+                .ok_or_else(|| BioFormatsError::Format("Openlab plane offset overflows".into()))?;
+            if end > data.len() {
+                return Err(BioFormatsError::InvalidData(
+                    "Openlab LIFF plane extends past end of file".into(),
+                ));
+            }
+            data[first..end].to_vec()
+        } else {
+            // version 5: LZO-compressed.
+            let last = first + plane_size * 2;
+            let comp_start = (first + 16).min(data.len());
+            let comp_end = last.min(data.len());
+            let comp = &data[comp_start..comp_end.max(comp_start)];
+            let b = crate::common::codec::decompress_lzo(comp)
+                .map_err(|e| BioFormatsError::Codec(format!("Openlab LZO: {e}")))?;
+
+            if w * h * 4 <= b.len() {
+                // 32-bit ARGB-ish source with a (w + 4) stride; emit RGB.
+                let mut out = vec![0u8; w * h * 3];
+                for yy in 0..h {
+                    for xx in 0..w {
+                        let src = (yy * (w + 4) + xx) * 4 + 1;
+                        if src + 3 <= b.len() {
+                            let dst = (yy * w + xx) * 3;
+                            out[dst..dst + 3].copy_from_slice(&b[src..src + 3]);
+                        }
+                    }
+                }
+                out
+            } else {
+                let mut src = if h > 0 { b.len() / h } else { 0 };
+                if src as i64 - (w * bpp) as i64 != 16 {
+                    src = w * bpp;
+                }
+                let dest = w * bpp;
+                let mut out = vec![0u8; h * dest];
+                for row in 0..h {
+                    let s = row * src;
+                    if s + dest <= b.len() {
+                        out[row * dest..row * dest + dest].copy_from_slice(&b[s..s + dest]);
+                    }
+                }
+                out
+            }
+        };
+
+        if plane.volume_type == OL_MAC_256_GREYS || plane.volume_type == OL_MAC_256_COLORS {
+            for byte in buf.iter_mut() {
+                *byte = !*byte;
+            }
+        }
+        Ok(buf)
     }
 }
 
@@ -1833,35 +2701,33 @@ impl FormatReader for OpenlabLiffReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= OPENLAB_LIFF_STRICT_RAW_MAGIC.len()
-            && header[..OPENLAB_LIFF_STRICT_RAW_MAGIC.len()] == OPENLAB_LIFF_STRICT_RAW_MAGIC
+        header.len() >= 8
+            && u64::from_be_bytes(header[..8].try_into().unwrap()) == OPENLAB_LIFF_MAGIC
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (meta, layout) = parse_misc_strict_raw_subset(
-            path,
-            &OPENLAB_LIFF_STRICT_RAW_MAGIC,
-            "PerkinElmer Openlab LIFF",
-        )?;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.close()?;
+        *self = Self::parse(path)?;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.layout = None;
+        self.version = 0;
+        self.planes.clear();
+        self.plane_offsets.clear();
+        self.metas.clear();
+        self.current = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.metas.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s == 0 && self.meta.is_some() {
+        if s < self.metas.len() {
+            self.current = s;
             Ok(())
         } else {
             Err(BioFormatsError::SeriesOutOfRange(s))
@@ -1869,25 +2735,29 @@ impl FormatReader for OpenlabLiffReader {
     }
 
     fn series(&self) -> usize {
-        0
+        self.current
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.metas
+            .get(self.current)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
+        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
+        let no = plane_index as usize;
+        let list = self
+            .plane_offsets
+            .get(self.current)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if no >= list.len() {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        read_misc_strict_raw_plane(
-            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
-            self.layout.ok_or(BioFormatsError::NotInitialized)?,
-            plane_index,
-        )
+        let plane = self.planes[list[no]].clone();
+        let meta = self.metas[self.current].clone();
+        let data = std::fs::read(&path).map_err(BioFormatsError::Io)?;
+        self.read_plane(&data, &plane, &meta)
     }
 
     fn open_bytes_region(
@@ -1899,16 +2769,24 @@ impl FormatReader for OpenlabLiffReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("PerkinElmer Openlab LIFF", &full, meta, 1, x, y, w, h)
+        let meta = self.metadata().clone();
+        let channels = if meta.is_rgb { meta.size_c as usize } else { 1 };
+        if meta.is_interleaved {
+            crop_full_plane("Openlab LIFF", &full, &meta, channels, x, y, w, h)
+        } else {
+            crop_planar("Openlab LIFF", &full, &meta, channels, x, y, w, h)
+        }
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
+        let (sx, sy) = {
+            let m = self.metadata();
+            (m.size_x, m.size_y)
+        };
+        let tw = sx.min(256);
+        let th = sy.min(256);
+        let tx = (sx - tw) / 2;
+        let ty = (sy - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
@@ -2098,123 +2976,6 @@ impl FormatReader for Jpeg2000Reader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8. Sedat Lab format
-// ---------------------------------------------------------------------------
-/// Sedat Lab format reader (`.sedat`).
-///
-/// The Sedat format is a proprietary format from the Sedat Lab at UCSF.
-/// The binary structure is not publicly documented.
-pub struct SedatReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    layout: Option<MiscStrictRawLayout>,
-}
-
-const SEDAT_STRICT_RAW_MAGIC: [u8; 16] = *b"BFSEDATLABRAW01!";
-
-impl SedatReader {
-    pub fn new() -> Self {
-        SedatReader {
-            path: None,
-            meta: None,
-            layout: None,
-        }
-    }
-}
-
-impl Default for SedatReader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FormatReader for SedatReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("sedat"))
-    }
-
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= SEDAT_STRICT_RAW_MAGIC.len()
-            && header[..SEDAT_STRICT_RAW_MAGIC.len()] == SEDAT_STRICT_RAW_MAGIC
-    }
-
-    fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (meta, layout) =
-            parse_misc_strict_raw_subset(path, &SEDAT_STRICT_RAW_MAGIC, "Sedat Lab")?;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
-        Ok(())
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.layout = None;
-        Ok(())
-    }
-
-    fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
-    }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s == 0 && self.meta.is_some() {
-            Ok(())
-        } else {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        }
-    }
-
-    fn series(&self) -> usize {
-        0
-    }
-
-    fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
-            .unwrap_or(crate::common::reader::uninitialized_metadata())
-    }
-
-    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        read_misc_strict_raw_plane(
-            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
-            self.layout.ok_or(BioFormatsError::NotInitialized)?,
-            plane_index,
-        )
-    }
-
-    fn open_bytes_region(
-        &mut self,
-        plane_index: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-    ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("Sedat Lab", &full, meta, 1, x, y, w, h)
-    }
-
-    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 9. SM-Camera

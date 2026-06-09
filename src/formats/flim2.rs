@@ -13,35 +13,8 @@ use crate::common::metadata::ImageMetadata;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
-use crate::tiff::ifd::{tag, Ifd};
+use crate::tiff::ifd::{tag, Compression, Ifd, IfdValue};
 use crate::tiff::parser::TiffParser;
-
-const OLE2_CFB_MAGIC: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
-
-fn validate_ole2_cfb_header(path: &Path, format_name: &str) -> Result<()> {
-    let mut file = File::open(path).map_err(BioFormatsError::Io)?;
-    let mut header = [0u8; 8];
-    match file.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
-            return Err(BioFormatsError::Format(format!(
-                "{format_name} file is too short for OLE2 CFB header"
-            )));
-        }
-        Err(err) => return Err(BioFormatsError::Io(err)),
-    }
-    if header != OLE2_CFB_MAGIC {
-        let article = if format_name.starts_with("Olympus") {
-            "an"
-        } else {
-            "a"
-        };
-        return Err(BioFormatsError::Format(format!(
-            "Not {article} {format_name} OLE2 CFB file"
-        )));
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Macros
@@ -778,9 +751,6 @@ impl FormatReader for FlowSightReader {
 // ---------------------------------------------------------------------------
 const SYNTHETIC_IM3_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-IM3-RAW-V1\0";
 const SYNTHETIC_SLIDEBOOK7_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-SLIDEBOOK7-RAW-V1\0";
-const SYNTHETIC_OIR_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-OLYMPUS-OIR-RAW-V1\0";
-const SYNTHETIC_VOLOCITY_CLIPPING_MAGIC: &[u8] =
-    b"BIOFORMATS-RS-SYNTHETIC-VOLOCITY-CLIPPING-RAW-V1\0";
 const SYNTHETIC_IVISION_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-IVISION-IPM-RAW-V1\0";
 const SYNTHETIC_RAW_TRAILER_LEN: usize = 24;
 const SYNTHETIC_RAW_U8: u16 = 1;
@@ -957,16 +927,6 @@ fn parse_synthetic_raw(path: &Path, spec: SyntheticRawSpec) -> Result<SyntheticR
             plane_len,
         },
     })
-}
-
-fn has_synthetic_raw_magic(path: &Path, spec: SyntheticRawSpec) -> Result<bool> {
-    let mut file = File::open(path).map_err(BioFormatsError::Io)?;
-    let mut magic = vec![0u8; spec.magic.len()];
-    match file.read_exact(&mut magic) {
-        Ok(()) => Ok(magic == spec.magic),
-        Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(false),
-        Err(err) => Err(BioFormatsError::Io(err)),
-    }
 }
 
 fn synthetic_raw_open_bytes(
@@ -1930,31 +1890,63 @@ impl FormatReader for XlefReader {
 // ---------------------------------------------------------------------------
 // 9. Olympus OIR
 // ---------------------------------------------------------------------------
+//
+// Port of the Java `OIRReader`. Native `.oir` files begin with the 16-byte
+// identifier `OLYMPUSRAWFORMAT`; pixel data is stored as a sequence of raw
+// "pixel blocks", each preceded by a UID encoding the plane/block index
+// (e.g. `z001t001_<channel-id>_0`). Blocks of XML are interspersed and define
+// the acquisition parameters (dimensions, channels, LUTs). Large acquisitions
+// (>1 GB) spill into companion files named `<base>_00001`, `<base>_00002`, ...
+//
+// In addition to the native path, this reader includes a TIFF-delegate
+// fallback: some Olympus exports (e.g. maximum-intensity-projection snapshots)
+// are saved with a `.oir` extension but actually contain a plain (often
+// ImageJ-flavoured) TIFF. Java has no such fallback and simply fails on those
+// files; we delegate to the internal `TiffReader` so they still open with the
+// correct dimensions and pixels.
+
+/// 16-byte magic identifier for native Olympus OIR files.
+const OIR_IDENTIFIER: &[u8] = b"OLYMPUSRAWFORMAT";
+
+/// A single raw pixel block within an OIR (companion) file.
+#[derive(Clone)]
+struct OirPixelBlock {
+    /// File that physically contains the block (main or companion).
+    file: PathBuf,
+    /// Absolute offset of the raw pixel bytes (header already skipped).
+    data_offset: u64,
+    /// Number of raw pixel bytes in this block.
+    length: usize,
+    /// First image row (inclusive) covered by the block within its plane.
+    y_start: usize,
+    /// One past the last image row covered by the block.
+    y_end: usize,
+}
+
+/// Resolved native-OIR state produced by `parse_oir_native`.
+struct OirNative {
+    meta: ImageMetadata,
+    /// (c, z, t) -> blocks for that plane, indexed by block number.
+    czt_blocks: std::collections::HashMap<(i32, i32, i32), Vec<Option<OirPixelBlock>>>,
+}
+
+/// Internal state of an initialized [`OirReader`].
+enum OirState {
+    /// Native `OLYMPUSRAWFORMAT` container.
+    Native(Box<OirNative>),
+    /// `.oir`-named file that is actually a TIFF; delegated to `TiffReader`.
+    /// Carries an overridden metadata copy (e.g. ImageJ channel count).
+    Tiff(Box<crate::tiff::TiffReader>, ImageMetadata),
+}
+
 /// Olympus OIR format reader (`.oir`).
-///
-/// Olympus OIR uses an OLE2 container; the remaining missing piece is the
-/// proprietary Olympus FluoView stream schema.
 pub struct OirReader {
-    state: Option<SyntheticRawState>,
+    state: Option<OirState>,
 }
 
 impl OirReader {
     pub fn new() -> Self {
         OirReader { state: None }
-    }
-
-    fn spec() -> SyntheticRawSpec {
-        SyntheticRawSpec {
-            format_name: "Olympus OIR",
-            unsupported_message:
-                "Olympus OIR format requires proprietary Olympus FluoView stream parsing",
-            extension: "oir",
-            magic: SYNTHETIC_OIR_MAGIC,
-        }
-    }
-
-    fn unsupported() -> BioFormatsError {
-        synthetic_raw_unsupported(Self::spec())
     }
 }
 
@@ -1964,39 +1956,826 @@ impl Default for OirReader {
     }
 }
 
+/// Minimal forward cursor over an in-memory file buffer with little-endian
+/// readers, mirroring the subset of `RandomAccessInputStream` the Java reader
+/// uses. All reads are bounds-checked and return `None` past EOF (the Java code
+/// relies on `EOFException` to terminate some scan loops).
+struct OirCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> OirCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        OirCursor { data, pos: 0 }
+    }
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+    fn tell(&self) -> usize {
+        self.pos
+    }
+    fn seek(&mut self, p: usize) {
+        self.pos = p;
+    }
+    fn skip(&mut self, n: usize) {
+        self.pos = self.pos.saturating_add(n);
+    }
+    fn read_u32(&mut self) -> Option<u32> {
+        if self.pos + 4 > self.data.len() {
+            self.pos = self.data.len();
+            return None;
+        }
+        let v = u32::from_le_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Some(v)
+    }
+    /// Read `n` bytes as a UTF-8 (lossy) string, clamped to EOF.
+    fn read_string(&mut self, n: usize) -> String {
+        let end = (self.pos + n).min(self.data.len());
+        let s = String::from_utf8_lossy(&self.data[self.pos..end]).into_owned();
+        self.pos = end;
+        s
+    }
+    /// Seek forward to the next `<?xml` marker (ASCII), positioning just after
+    /// the matched bytes (mirrors `findString("<?xml")`).
+    fn find_xml(&mut self) -> bool {
+        let needle = b"<?xml";
+        if self.pos >= self.data.len() {
+            return false;
+        }
+        if let Some(rel) = self.data[self.pos..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+        {
+            self.pos += rel + needle.len();
+            true
+        } else {
+            self.pos = self.data.len();
+            false
+        }
+    }
+}
+
+/// Parse pixel blocks (and collect XML strings) from one OIR file buffer,
+/// porting `OIRReader.readPixelsFile` / `skipPixelBlock`.
+fn oir_scan_file(
+    file: &Path,
+    data: &[u8],
+    is_current: bool,
+    pixel_blocks: &mut Vec<(String, OirPixelBlock)>,
+    xml_blocks: &mut Vec<String>,
+    blocks_per_plane: &mut i32,
+) {
+    let mut s = OirCursor::new(data);
+    if data.len() < 20 {
+        return;
+    }
+    // Seek past the leading 16-byte identifier and the framing that follows,
+    // up to the 0xffffffff terminator.
+    s.seek(16);
+    loop {
+        match s.read_u32() {
+            Some(0xffff_ffff) => break,
+            Some(_) => {}
+            None => return,
+        }
+    }
+    s.skip(4);
+
+    let pixel_start = s.tell();
+    // Skip reference image blocks (not stored).
+    while oir_skip_pixel_block(file, &mut s, false, pixel_blocks, blocks_per_plane) {}
+
+    if s.tell() == pixel_start && !is_current {
+        loop {
+            match s.read_u32() {
+                Some(0xffff_ffff) => break,
+                Some(_) => {}
+                None => return,
+            }
+        }
+        s.skip(4);
+    }
+
+    oir_read_xml_block(&mut s, is_current, xml_blocks);
+
+    while oir_skip_pixel_block(file, &mut s, true, pixel_blocks, blocks_per_plane) {}
+
+    oir_read_xml_block(&mut s, is_current, xml_blocks);
+
+    while s.tell() + 16 < s.len() {
+        if !s.find_xml() {
+            break;
+        }
+        // back up to the 4-byte length that precedes "<?xml" (5 bytes) by 9
+        let mark = s.tell();
+        if mark < 9 {
+            break;
+        }
+        s.seek(mark - 9);
+        let length = match s.read_u32() {
+            Some(v) => v as i64,
+            None => break,
+        };
+        if length <= 0 || (length as usize) + s.tell() > s.len() {
+            break;
+        }
+        let fp = s.tell();
+        let xml = s.read_string(length as usize);
+        if !xml.starts_with("<?xml") {
+            // resync: step back two bytes and keep scanning
+            s.seek(fp.saturating_sub(2));
+            continue;
+        }
+        let xml = xml.trim().to_string();
+        let expect_pixel_block = xml.trim_end().ends_with(":frameProperties>");
+        if is_current {
+            xml_blocks.push(xml);
+        }
+        if expect_pixel_block {
+            while oir_skip_pixel_block(file, &mut s, true, pixel_blocks, blocks_per_plane) {}
+        }
+    }
+}
+
+/// Port of `OIRReader.skipPixelBlock`. Returns `true` if a block (real or
+/// reference) was consumed and scanning should continue.
+fn oir_skip_pixel_block(
+    file: &Path,
+    s: &mut OirCursor,
+    store: bool,
+    pixel_blocks: &mut Vec<(String, OirPixelBlock)>,
+    blocks_per_plane: &mut i32,
+) -> bool {
+    let offset = s.tell();
+    if offset + 8 >= s.len() {
+        return false;
+    }
+    let check_length = match s.read_u32() {
+        Some(v) => v,
+        None => return false,
+    };
+    let check = match s.read_u32() {
+        Some(v) => v,
+        None => return false,
+    };
+    if check != 3 {
+        s.seek(offset);
+        if check == 2 {
+            s.seek(offset + check_length as usize + 8);
+            return true;
+        }
+        return false;
+    }
+
+    s.skip(8);
+    let uid_length = match s.read_u32() {
+        Some(v) => v,
+        None => return false,
+    };
+    if check_length != uid_length.wrapping_add(12) {
+        s.seek(offset);
+        return false;
+    }
+    let uid = s.read_string(uid_length as usize);
+    if s.tell() + 4 >= s.len() {
+        return false;
+    }
+    let pixel_bytes = match s.read_u32() {
+        Some(v) => v,
+        None => return false,
+    };
+    s.skip(4);
+    let data_offset = s.tell() as u64;
+
+    if store && pixel_bytes > 0 {
+        if let Some(block_index) = uid
+            .rsplit('_')
+            .next()
+            .and_then(|t| t.parse::<i32>().ok())
+        {
+            if block_index >= *blocks_per_plane {
+                *blocks_per_plane = block_index + 1;
+            }
+        }
+        pixel_blocks.push((
+            uid,
+            OirPixelBlock {
+                file: file.to_path_buf(),
+                data_offset,
+                length: pixel_bytes as usize,
+                y_start: 0,
+                y_end: 0,
+            },
+        ));
+    } else if pixel_bytes == 0 {
+        return false;
+    }
+    s.skip(pixel_bytes as usize);
+    true
+}
+
+/// Port of `OIRReader.readXMLBlock`: a length-prefixed container holding one or
+/// more XML strings. Extracted XML is appended to `xml_blocks` when current.
+fn oir_read_xml_block(s: &mut OirCursor, is_current: bool, xml_blocks: &mut Vec<String>) {
+    let offset = s.tell();
+    if offset + 8 >= s.len() {
+        return;
+    }
+    let total_block_length = match s.read_u32() {
+        Some(v) => v as usize,
+        None => return,
+    };
+    if total_block_length < 4 {
+        s.seek(offset);
+        return;
+    }
+    let end = s.tell() + total_block_length - 4;
+    s.skip(4);
+
+    let default_skip = 36usize;
+    while s.tell() < end {
+        s.skip(default_skip);
+        let mut xml_length = match s.read_u32() {
+            Some(v) => v as i64,
+            None => return,
+        };
+        if xml_length <= 32 {
+            // small value: skip an embedded UID then read the real length
+            let n = match s.read_u32() {
+                Some(v) => v as usize,
+                None => return,
+            };
+            let _uid = s.read_string(n);
+            xml_length = match s.read_u32() {
+                Some(v) => v as i64,
+                None => return,
+            };
+        }
+        if xml_length <= 32 || s.tell() + xml_length as usize > end + 8 {
+            break;
+        }
+        let xml = s.read_string(xml_length as usize);
+        let xml = xml.trim().to_string();
+        if !xml.starts_with("<?xml") {
+            break;
+        }
+        if is_current || xml.contains("lut:LUT") {
+            xml_blocks.push(xml);
+        }
+    }
+}
+
+/// Extract the trimmed text content of the first element whose (possibly
+/// namespaced) name ends with `local`. Returns `None` if absent.
+fn oir_xml_text(xml: &str, local: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut capture = false;
+    let mut depth_match = 0usize;
+    let mut text = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                if local_name_matches(name.as_ref(), local) {
+                    capture = true;
+                    depth_match += 1;
+                    text.clear();
+                }
+            }
+            Ok(Event::Text(t)) if capture && depth_match > 0 => {
+                if let Ok(s) = t.unescape() {
+                    text.push_str(&s);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if local_name_matches(e.name().as_ref(), local) && capture {
+                    return Some(text.trim().to_string());
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn local_name_matches(qname: &[u8], local: &str) -> bool {
+    let after_colon = qname
+        .iter()
+        .rposition(|&b| b == b':')
+        .map(|i| &qname[i + 1..])
+        .unwrap_or(qname);
+    after_colon == local.as_bytes()
+}
+
+/// Parse a native `OLYMPUSRAWFORMAT` OIR file (and any companion files) into
+/// resolved [`OirNative`] state. This ports the metadata/dimension/pixel-block
+/// portions of `OIRReader.initFile`; per-channel laser/detector/objective
+/// enrichment present in Java is intentionally omitted.
+fn parse_oir_native(path: &Path) -> Result<OirNative> {
+    // Resolve companion files: <base>_00001, <base>_00002, ... in the same dir.
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let mut files: Vec<PathBuf> = vec![path.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(&parent) {
+        let mut companions: Vec<(u32, PathBuf)> = Vec::new();
+        let prefix = format!("{stem}_");
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name.strip_prefix(&prefix) {
+                if rest.len() == 5 {
+                    if let Ok(idx) = rest.parse::<u32>() {
+                        companions.push((idx, entry.path()));
+                    }
+                }
+            }
+        }
+        companions.sort_by_key(|(idx, _)| *idx);
+        files.extend(companions.into_iter().map(|(_, p)| p));
+    }
+
+    let mut meta = ImageMetadata {
+        size_z: 1,
+        size_c: 1,
+        size_t: 1,
+        is_little_endian: true,
+        ..ImageMetadata::default()
+    };
+
+    let mut pixel_blocks: Vec<(String, OirPixelBlock)> = Vec::new();
+    let mut xml_blocks: Vec<String> = Vec::new();
+    let mut blocks_per_plane: i32 = 0;
+    let mut channel_ids: Vec<String> = Vec::new();
+
+    for (i, file) in files.iter().enumerate() {
+        let data = std::fs::read(file).map_err(BioFormatsError::Io)?;
+        if i == 0 && !data.starts_with(OIR_IDENTIFIER) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Not an OLYMPUSRAWFORMAT Olympus OIR file".into(),
+            ));
+        }
+        oir_scan_file(
+            file,
+            &data,
+            i == 0,
+            &mut pixel_blocks,
+            &mut xml_blocks,
+            &mut blocks_per_plane,
+        );
+    }
+
+    // Parse XML metadata for dimensions and channels.
+    oir_apply_xml(&xml_blocks, &mut meta, &mut channel_ids);
+
+    if meta.size_x == 0 || meta.size_y == 0 {
+        return Err(BioFormatsError::Format(
+            "Olympus OIR XML metadata did not define image dimensions".into(),
+        ));
+    }
+    if channel_ids.is_empty() {
+        // Fall back to channel ids discovered in the pixel block UIDs.
+        channel_ids = oir_channel_ids_from_uids(&pixel_blocks);
+    }
+    let channel_count = channel_ids.len().max(1) as u32;
+
+    // sizeC starts at 1 (or LAMBDA size) and is multiplied by channel count,
+    // mirroring `m.sizeC *= channels.size()`.
+    meta.size_c = meta.size_c.max(1) * channel_count;
+
+    // Determine min/max Z and T across stored blocks when blocks are missing.
+    let mut min_z = i32::MAX;
+    let mut min_t = i32::MAX;
+    let image_count_full = meta.size_c * meta.size_z * meta.size_t;
+    if blocks_per_plane > 0
+        && (blocks_per_plane as usize) * (image_count_full as usize) != pixel_blocks.len()
+    {
+        let mut max_z = 0;
+        let mut max_t = 0;
+        for (uid, _) in &pixel_blocks {
+            if oir_get_block(uid) == blocks_per_plane - 1 {
+                let z = oir_get_z(uid);
+                let t = oir_get_t(uid);
+                max_z = max_z.max(z);
+                max_t = max_t.max(t);
+                min_z = min_z.min(z);
+                min_t = min_t.min(t);
+            }
+        }
+        if min_z != i32::MAX {
+            meta.size_z = ((max_z - min_z) + 1) as u32;
+            meta.size_t = ((max_t - min_t) + 1) as u32;
+        }
+    }
+    if min_z == i32::MAX {
+        min_z = 0;
+    }
+    if min_t == i32::MAX {
+        min_t = 0;
+    }
+    meta.image_count = meta.size_c * meta.size_z * meta.size_t;
+
+    // Dimension order: Java emits "XYC" + a Z/T ordering; our enum's closest
+    // match is XYCZT, which is correct whenever Z or T is singleton (the common
+    // case) and a reasonable default otherwise.
+    meta.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+
+    // Group blocks by (c,z,t) into per-plane block arrays.
+    let max_blocks = pixel_blocks
+        .iter()
+        .map(|(uid, _)| oir_get_block(uid) + 1)
+        .max()
+        .unwrap_or(1)
+        .max(1) as usize;
+
+    let mut czt_blocks: std::collections::HashMap<(i32, i32, i32), Vec<Option<OirPixelBlock>>> =
+        std::collections::HashMap::new();
+    for (uid, block) in &pixel_blocks {
+        let z = oir_get_z(uid) - min_z;
+        let t = oir_get_t(uid) - min_t;
+        let c = oir_get_c(uid, &channel_ids) + oir_get_l(uid);
+        let b = oir_get_block(uid) as usize;
+        let entry = czt_blocks
+            .entry((c, z, t))
+            .or_insert_with(|| vec![None; max_blocks]);
+        if b < entry.len() {
+            entry[b] = Some(block.clone());
+        }
+    }
+
+    // Compute per-block Y extents within each plane.
+    let bpp = meta.pixel_type.bytes_per_sample();
+    let bytes_per_line = (meta.size_x as usize).max(1) * bpp;
+    for blocks in czt_blocks.values_mut() {
+        let mut y_start = 0usize;
+        for block in blocks.iter_mut().flatten() {
+            block.y_start = y_start;
+            let n_lines = if bytes_per_line > 0 {
+                block.length / bytes_per_line
+            } else {
+                0
+            };
+            y_start += n_lines;
+            block.y_end = y_start;
+        }
+    }
+
+    Ok(OirNative { meta, czt_blocks })
+}
+
+/// Apply parsed OIR XML blocks to metadata (dimensions, pixel type, channels).
+fn oir_apply_xml(xml_blocks: &[String], meta: &mut ImageMetadata, channel_ids: &mut Vec<String>) {
+    for xml in xml_blocks {
+        // frame:frameProperties -> imageDefinition width/height/depth/bitCounts
+        if xml.contains("frameProperties") {
+            let rgb = oir_xml_text(xml, "colorType")
+                .map(|c| c.trim().eq_ignore_ascii_case("RGB"))
+                .unwrap_or(false);
+            if let Some(w) = oir_xml_text(xml, "width").and_then(|v| v.trim().parse::<u32>().ok()) {
+                if meta.size_x == 0 {
+                    meta.size_x = w;
+                }
+            }
+            if let Some(h) = oir_xml_text(xml, "height").and_then(|v| v.trim().parse::<u32>().ok()) {
+                if meta.size_y == 0 {
+                    meta.size_y = h;
+                }
+            }
+            if let Some(mut depth) = oir_xml_text(xml, "depth")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                if rgb {
+                    depth /= 3;
+                }
+                let (pt, bits) = oir_pixel_type_from_bytes(depth);
+                meta.pixel_type = pt;
+                if meta.bits_per_pixel == 0 || meta.bits_per_pixel == 8 {
+                    meta.bits_per_pixel = bits;
+                }
+            }
+            if let Some(mut bits) = oir_xml_text(xml, "bitCounts")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                if rgb {
+                    bits /= 3;
+                }
+                meta.bits_per_pixel = bits as u8;
+            }
+        }
+
+        // image:imageProperties -> imageInfo width/height, axes, channels
+        if xml.contains("imageProperties") || xml.contains("imageInfo") {
+            if meta.size_x == 0 {
+                if let Some(w) =
+                    oir_xml_text(xml, "width").and_then(|v| v.trim().parse::<u32>().ok())
+                {
+                    meta.size_x = w;
+                }
+            }
+            if meta.size_y == 0 {
+                if let Some(h) =
+                    oir_xml_text(xml, "height").and_then(|v| v.trim().parse::<u32>().ok())
+                {
+                    meta.size_y = h;
+                }
+            }
+            oir_apply_axes(xml, meta);
+            oir_apply_channels(xml, channel_ids);
+        }
+    }
+}
+
+/// Parse `commonparam:axis` / `commonimage:axis` entries (ZSTACK/TIMELAPSE/
+/// LAMBDA) and update Z/T/C sizes, mirroring `OIRReader.parseAxis`.
+fn oir_apply_axes(xml: &str, meta: &mut ImageMetadata) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    // Collect axis blocks as (axisName, maxSize) by scanning for <...:axis>
+    // wrappers that contain a nested <...:axis> name and <...:maxSize> value.
+    let mut cur_axis_name: Option<String> = None;
+    let mut cur_max_size: Option<u32> = None;
+    let mut in_axis_wrapper = 0i32;
+    let mut pending_text_for: Option<&'static str> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let local = local_of(name.as_ref());
+                if local == "axis" {
+                    // could be the wrapper (dimensionAxis) or the inner name node
+                    in_axis_wrapper += 1;
+                    pending_text_for = Some("axisname");
+                } else if local == "maxSize" {
+                    pending_text_for = Some("maxsize");
+                } else {
+                    pending_text_for = None;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if let Some(kind) = pending_text_for {
+                    if let Ok(s) = t.unescape() {
+                        let s = s.trim().to_string();
+                        if kind == "axisname" && !s.is_empty() {
+                            cur_axis_name = Some(s);
+                        } else if kind == "maxsize" {
+                            cur_max_size = s.parse::<u32>().ok();
+                        }
+                    }
+                }
+                pending_text_for = None;
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let local = local_of(name.as_ref());
+                if local == "axis" {
+                    in_axis_wrapper -= 1;
+                    if in_axis_wrapper <= 0 {
+                        if let (Some(name), Some(size)) = (cur_axis_name.take(), cur_max_size.take())
+                        {
+                            oir_apply_one_axis(&name, size, meta);
+                        }
+                        in_axis_wrapper = 0;
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+}
+
+fn oir_apply_one_axis(name: &str, size: u32, meta: &mut ImageMetadata) {
+    match name {
+        "ZSTACK" => {
+            if meta.size_z <= 1 {
+                meta.size_z = size.max(1);
+            }
+        }
+        "TIMELAPSE" => {
+            if meta.size_t <= 1 {
+                meta.size_t = size.max(1);
+            }
+        }
+        "LAMBDA" => {
+            meta.size_c = size.max(1);
+        }
+        _ => {}
+    }
+}
+
+fn local_of(qname: &[u8]) -> &str {
+    let after = qname
+        .iter()
+        .rposition(|&b| b == b':')
+        .map(|i| &qname[i + 1..])
+        .unwrap_or(qname);
+    std::str::from_utf8(after).unwrap_or("")
+}
+
+/// Collect channel ids from `commonphase:channel` / `commonphase:elementChannel`
+/// nodes (the `id` attribute), preserving document order.
+fn oir_apply_channels(xml: &str, channel_ids: &mut Vec<String>) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name = e.name();
+                let local = local_of(name.as_ref());
+                if local == "channel" || local == "elementChannel" {
+                    if let Some(id) = e.attributes().flatten().find_map(|a| {
+                        if a.key.as_ref() == b"id" {
+                            a.unescape_value().ok().map(|v| v.into_owned())
+                        } else {
+                            None
+                        }
+                    }) {
+                        if !id.is_empty() && !channel_ids.contains(&id) {
+                            channel_ids.push(id);
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+}
+
+/// Derive channel ids from the channel signature embedded in pixel block UIDs.
+fn oir_channel_ids_from_uids(pixel_blocks: &[(String, OirPixelBlock)]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for (uid, _) in pixel_blocks {
+        // uid = ...<channel-id>_<block>; channel signature is the token before
+        // the final '_'.
+        if let Some(idx) = uid.rfind('_') {
+            let before = &uid[..idx];
+            if let Some(cidx) = before.rfind('_') {
+                let sig = before[cidx + 1..].to_string();
+                if !sig.is_empty() && !ids.contains(&sig) {
+                    ids.push(sig);
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn oir_pixel_type_from_bytes(bytes: u32) -> (PixelType, u8) {
+    match bytes {
+        1 => (PixelType::Uint8, 8),
+        2 => (PixelType::Uint16, 16),
+        4 => (PixelType::Float32, 32),
+        _ => (PixelType::Uint16, 16),
+    }
+}
+
+fn oir_get_z(uid: &str) -> i32 {
+    if let Some(idx) = uid.find('z') {
+        uid.get(idx + 1..idx + 4)
+            .and_then(|s| s.parse::<i32>().ok())
+            .map(|v| v - 1)
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+fn oir_get_t(uid: &str) -> i32 {
+    if let Some(idx) = uid.find('t') {
+        let sub = &uid[idx + 1..];
+        if let Some(end) = sub.find('_') {
+            return sub[..end].parse::<i32>().map(|v| v - 1).unwrap_or(0);
+        }
+    }
+    0
+}
+
+fn oir_get_c(uid: &str, channel_ids: &[String]) -> i32 {
+    if let Some(idx) = uid.rfind('_') {
+        let before = &uid[..idx];
+        if let Some(cidx) = before.rfind('_') {
+            let sig = &before[cidx + 1..];
+            for (i, id) in channel_ids.iter().enumerate() {
+                if id == sig {
+                    return i as i32;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn oir_get_block(uid: &str) -> i32 {
+    if let Some(idx) = uid.rfind('_') {
+        uid[idx + 1..].parse::<i32>().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+fn oir_get_l(uid: &str) -> i32 {
+    if !uid.starts_with('l') {
+        return 0;
+    }
+    uid.get(1..4)
+        .and_then(|s| s.parse::<i32>().ok())
+        .map(|v| v - 1)
+        .unwrap_or(0)
+}
+
+/// Detect whether a `.oir`-named file is actually a TIFF (II*/MM* magic).
+fn oir_looks_like_tiff(header: &[u8]) -> bool {
+    header.len() >= 4
+        && ((header[0..2] == [0x49, 0x49] && header[2..4] == [42, 0])
+            || (header[0..2] == [0x4d, 0x4d] && header[2..4] == [0, 42]))
+}
+
+/// Build overridden metadata for a TIFF-delegated `.oir` file, applying ImageJ
+/// `channels=`/`images=` hints from the ImageDescription when present.
+fn oir_tiff_meta(reader: &crate::tiff::TiffReader) -> ImageMetadata {
+    let mut meta = reader.series_list()[0].metadata.clone();
+    // ImageJ stores hyperstack layout in the ImageDescription of IFD 0.
+    if let Some(desc) = reader.ifd(0).and_then(|ifd| {
+        ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION)
+            .map(str::to_owned)
+    }) {
+        if desc.contains("ImageJ=") {
+            let get = |key: &str| -> Option<u32> {
+                desc.lines()
+                    .find_map(|l| l.strip_prefix(key))
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+            };
+            let channels = get("channels=");
+            let slices = get("slices=");
+            let frames = get("frames=");
+            if let Some(c) = channels {
+                if c > 0 {
+                    meta.size_c = c;
+                    meta.size_z = slices.unwrap_or(1).max(1);
+                    meta.size_t = frames.unwrap_or(1).max(1);
+                    meta.is_rgb = false;
+                }
+            }
+        }
+    }
+    meta
+}
+
 impl FormatReader for OirReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        Self::spec().matches_name(path)
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("oir"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        Self::spec().matches_bytes(header)
+        // Only claim genuine native OIR files by magic; TIFF-flavoured `.oir`
+        // exports are handled by extension fallback so we do not hijack the
+        // generic TIFF magic in the reader registry.
+        header.len() >= OIR_IDENTIFIER.len() && header.starts_with(OIR_IDENTIFIER)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.state = None;
-        match has_synthetic_raw_magic(path, Self::spec()) {
-            Ok(true) => {
-                self.state = Some(parse_synthetic_raw(path, Self::spec())?);
-                return Ok(());
-            }
-            Ok(false) => {}
-            Err(BioFormatsError::Io(err)) if err.kind() == ErrorKind::NotFound => {
-                return Err(Self::unsupported());
-            }
-            Err(err) => return Err(err),
+        let header = crate::common::io::peek_header(path, 16)?;
+
+        if header.starts_with(OIR_IDENTIFIER) {
+            let native = parse_oir_native(path)?;
+            self.state = Some(OirState::Native(Box::new(native)));
+            return Ok(());
         }
 
-        match validate_ole2_cfb_header(path, "Olympus OIR") {
-            Ok(()) => Err(Self::unsupported()),
-            Err(BioFormatsError::Io(err)) if err.kind() == ErrorKind::NotFound => {
-                Err(Self::unsupported())
-            }
-            Err(err) => Err(err),
+        if oir_looks_like_tiff(&header) {
+            // Non-Java extension: Olympus MIP/snapshot exports saved as `.oir`
+            // are plain TIFFs. Delegate to the internal TIFF reader.
+            let mut tiff = crate::tiff::TiffReader::new();
+            tiff.set_id(path)?;
+            let meta = oir_tiff_meta(&tiff);
+            self.state = Some(OirState::Tiff(Box::new(tiff), meta));
+            return Ok(());
         }
+
+        Err(BioFormatsError::UnsupportedFormat(
+            "Olympus OIR file is neither OLYMPUSRAWFORMAT nor a TIFF export".into(),
+        ))
     }
 
     fn close(&mut self) -> Result<()> {
+        if let Some(OirState::Tiff(tiff, _)) = &mut self.state {
+            let _ = tiff.close();
+        }
         self.state = None;
         Ok(())
     }
@@ -2020,15 +2799,22 @@ impl FormatReader for OirReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.state
-            .as_ref()
-            .map(|state| &state.meta)
-            .unwrap_or(crate::common::reader::uninitialized_metadata())
+        match &self.state {
+            Some(OirState::Native(n)) => &n.meta,
+            Some(OirState::Tiff(_, meta)) => meta,
+            None => crate::common::reader::uninitialized_metadata(),
+        }
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes(state, Self::spec(), plane_index)
+        match &mut self.state {
+            Some(OirState::Native(n)) => oir_open_plane(n, plane_index),
+            Some(OirState::Tiff(tiff, _)) => {
+                tiff.set_series(0)?;
+                tiff.open_bytes(plane_index)
+            }
+            None => Err(BioFormatsError::NotInitialized),
+        }
     }
 
     fn open_bytes_region(
@@ -2039,18 +2825,96 @@ impl FormatReader for OirReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes_region(state, Self::spec(), plane_index, x, y, w, h)
+        match &mut self.state {
+            Some(OirState::Native(n)) => {
+                let full = oir_open_plane(n, plane_index)?;
+                crop_full_plane("Olympus OIR", &full, &n.meta, 1, x, y, w, h)
+            }
+            Some(OirState::Tiff(tiff, _)) => {
+                tiff.set_series(0)?;
+                tiff.open_bytes_region(plane_index, x, y, w, h)
+            }
+            None => Err(BioFormatsError::NotInitialized),
+        }
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.metadata();
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
+        let (sx, sy) = {
+            let meta = self.metadata();
+            (meta.size_x, meta.size_y)
+        };
+        if sx == 0 || sy == 0 {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        let tw = sx.min(256);
+        let th = sy.min(256);
+        let tx = (sx - tw) / 2;
+        let ty = (sy - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+}
+
+/// Assemble a full native-OIR plane by concatenating its pixel blocks in order,
+/// porting the full-plane case of `OIRReader.openBytes`.
+fn oir_open_plane(n: &OirNative, plane_index: u32) -> Result<Vec<u8>> {
+    if plane_index >= n.meta.image_count {
+        return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+    }
+    let bpp = n.meta.pixel_type.bytes_per_sample();
+    let bytes_per_line = (n.meta.size_x as usize) * bpp;
+    let plane_len = bytes_per_line * (n.meta.size_y as usize);
+    let mut out = vec![0u8; plane_len];
+
+    let (z, c, t) = oir_zct_coords(&n.meta, plane_index);
+    let key = (c as i32, z as i32, t as i32);
+    let blocks = match n.czt_blocks.get(&key) {
+        Some(b) => b,
+        None => return Ok(out), // missing plane: zero-filled (matches fill color)
+    };
+
+    let mut y_off_bytes = 0usize;
+    for block in blocks.iter().flatten() {
+        if y_off_bytes >= out.len() {
+            break;
+        }
+        let mut reader = BufReader::new(File::open(&block.file).map_err(BioFormatsError::Io)?);
+        let data = read_bytes_at(&mut reader, block.data_offset, block.length)?;
+        let end = (y_off_bytes + data.len()).min(out.len());
+        let take = end - y_off_bytes;
+        out[y_off_bytes..end].copy_from_slice(&data[..take]);
+        y_off_bytes = end;
+    }
+    Ok(out)
+}
+
+/// Convert a plane index to (z, c, t) using the metadata dimension order.
+fn oir_zct_coords(meta: &ImageMetadata, no: u32) -> (u32, u32, u32) {
+    use crate::common::metadata::DimensionOrder;
+    let z = meta.size_z.max(1);
+    let c = meta.size_c.max(1);
+    let t = meta.size_t.max(1);
+    let dims: &[(char, u32)] = match meta.dimension_order {
+        DimensionOrder::XYCTZ => &[('C', c), ('T', t), ('Z', z)],
+        DimensionOrder::XYCZT => &[('C', c), ('Z', z), ('T', t)],
+        DimensionOrder::XYTCZ => &[('T', t), ('C', c), ('Z', z)],
+        DimensionOrder::XYTZC => &[('T', t), ('Z', z), ('C', c)],
+        DimensionOrder::XYZCT => &[('Z', z), ('C', c), ('T', t)],
+        DimensionOrder::XYZTC => &[('Z', z), ('T', t), ('C', c)],
+    };
+    let mut remaining = no;
+    let (mut zz, mut cc, mut tt) = (0u32, 0u32, 0u32);
+    for (dim, len) in dims {
+        let len = (*len).max(1);
+        let value = remaining % len;
+        remaining /= len;
+        match dim {
+            'Z' => zz = value,
+            'C' => cc = value,
+            'T' => tt = value,
+            _ => {}
+        }
+    }
+    (zz, cc, tt)
 }
 
 // ---------------------------------------------------------------------------
@@ -2096,6 +2960,9 @@ pub struct CellSensReader {
     series_phys: Vec<Option<(f64, f64)>>,
     /// Currently selected logical series index into `series_map`.
     current: usize,
+    /// Path to the base `.vsi` file (needed to read embedded-TIFF JPEG strips
+    /// directly when the inner reader cannot merge the JPEGTables tag).
+    vsi_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3365,6 +4232,7 @@ impl CellSensReader {
             series_names: Vec::new(),
             series_phys: Vec::new(),
             current: 0,
+            vsi_path: None,
         }
     }
 
@@ -3936,6 +4804,137 @@ impl CellSensReader {
     fn resolve_series(&self, s: usize) -> Option<CellSensTarget> {
         self.series_map.get(s).copied()
     }
+
+    /// IFD index backing inner TIFF series `ts`, plane `plane`.
+    fn overview_ifd_index(&self, ts: usize, plane: u32) -> Option<usize> {
+        let series = self.inner.series_list().get(ts)?;
+        let p = plane as usize;
+        if !series.plane_ifd_indices.is_empty() {
+            series.plane_ifd_indices.get(p).copied().flatten()
+        } else {
+            series.ifd_indices.get(p).copied()
+        }
+    }
+
+    /// Decode the full, chunky-interleaved overview plane when its embedded-TIFF
+    /// IFD is a single-strip baseline JPEG whose quantization/Huffman tables live
+    /// in the JPEGTables tag (347). Mirrors Java `TiffParser.getTile`, which
+    /// splices `jpegTable[..len-2] + scan[2..]` before handing the stream to the
+    /// JPEG codec. Returns `None` for any other IFD (uncompressed/LZW/multi-strip),
+    /// so the caller delegates to the inner TIFF reader unchanged.
+    fn decode_overview_jpeg_full(&mut self, ts: usize, plane: u32) -> Result<Option<Vec<u8>>> {
+        let Some(idx) = self.overview_ifd_index(ts, plane) else {
+            return Ok(None);
+        };
+        let Some(ifd) = self.inner.ifd(idx) else {
+            return Ok(None);
+        };
+        if !matches!(ifd.compression(), Compression::Jpeg | Compression::JpegNew) {
+            return Ok(None);
+        }
+        let Some(tables) = ifd.get(tag::JPEG_TABLES).and_then(ifd_raw_bytes) else {
+            return Ok(None);
+        };
+        let offsets = ifd
+            .get(tag::STRIP_OFFSETS)
+            .map(IfdValue::as_vec_u64)
+            .unwrap_or_default();
+        let counts = ifd
+            .get(tag::STRIP_BYTE_COUNTS)
+            .map(IfdValue::as_vec_u64)
+            .unwrap_or_default();
+        // Only the single-strip case is handled here (the cellSens overview).
+        if offsets.len() != 1 || counts.len() != 1 {
+            return Ok(None);
+        }
+        let photometric = ifd
+            .get(tag::PHOTOMETRIC_INTERPRETATION)
+            .and_then(IfdValue::as_u16)
+            .unwrap_or(0);
+        let Some(path) = self.vsi_path.clone() else {
+            return Ok(None);
+        };
+        let mut file = BufReader::new(File::open(&path)?);
+        let scan = read_bytes_at(&mut file, offsets[0], counts[0] as usize)?;
+        let combined = merge_jpeg_tables(&tables, &scan);
+        let mut decoder = jpeg_decoder::Decoder::new(combined.as_slice());
+        // PhotometricInterpretation RGB (2): the stored components already ARE RGB,
+        // so suppress jpeg_decoder's default YCbCr->RGB transform (matches Java's
+        // ImageIO, which emits the components as-is). YCbCr keeps the default.
+        if photometric == 2 {
+            decoder.set_color_transform(jpeg_decoder::ColorTransform::RGB);
+        }
+        let pixels = decoder
+            .decode()
+            .map_err(|e| BioFormatsError::Codec(e.to_string()))?;
+        Ok(Some(pixels))
+    }
+}
+
+/// Raw byte payload of an UNDEFINED/BYTE IFD value (e.g. the JPEGTables tag).
+fn ifd_raw_bytes(v: &IfdValue) -> Option<Vec<u8>> {
+    match v {
+        IfdValue::Undefined(b) | IfdValue::Byte(b) => Some(b.clone()),
+        _ => None,
+    }
+}
+
+/// Splice abbreviated JPEGTables (tag 347) ahead of a strip's entropy-coded scan:
+/// `SOI + tables[without SOI/EOI] + scan[without SOI]`.
+fn merge_jpeg_tables(tables: &[u8], scan: &[u8]) -> Vec<u8> {
+    let starts_soi = |d: &[u8]| d.len() >= 2 && d[0] == 0xff && d[1] == 0xd8;
+    if !starts_soi(tables) {
+        return scan.to_vec();
+    }
+    let mut table_payload = &tables[2..];
+    if table_payload.len() >= 2
+        && table_payload[table_payload.len() - 2] == 0xff
+        && table_payload[table_payload.len() - 1] == 0xd9
+    {
+        table_payload = &table_payload[..table_payload.len() - 2];
+    }
+    let scan_payload = if starts_soi(scan) { &scan[2..] } else { scan };
+    let mut out = Vec::with_capacity(2 + table_payload.len() + scan_payload.len());
+    out.extend_from_slice(&[0xff, 0xd8]);
+    out.extend_from_slice(table_payload);
+    out.extend_from_slice(scan_payload);
+    out
+}
+
+/// Convert a chunky/interleaved plane (pixel-major) to planar (channel-major).
+fn deinterleave_to_planar(chunky: &[u8], plane: usize, spp: usize, sample: usize) -> Vec<u8> {
+    let pixel = spp * sample;
+    let mut out = vec![0u8; chunky.len()];
+    for px in 0..plane {
+        for ch in 0..spp {
+            let src = px * pixel + ch * sample;
+            let dst = (ch * plane + px) * sample;
+            out[dst..dst + sample].copy_from_slice(&chunky[src..src + sample]);
+        }
+    }
+    out
+}
+
+/// Crop a `w`×`h` chunky region at (`x`,`y`) out of a chunky full plane.
+fn crop_chunky(
+    full: &[u8],
+    full_width: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    pixel: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * pixel];
+    let row_len = w * pixel;
+    for row in 0..h {
+        let src = ((y + row) * full_width + x) * pixel;
+        let dst = row * row_len;
+        if src + row_len <= full.len() {
+            out[dst..dst + row_len].copy_from_slice(&full[src..src + row_len]);
+        }
+    }
+    out
 }
 
 impl Default for CellSensReader {
@@ -3965,6 +4964,7 @@ impl FormatReader for CellSensReader {
                     .to_string(),
             )
         })?;
+        self.vsi_path = Some(path.to_path_buf());
         self.enrich_metadata(path);
         // Default to logical series 0.
         if !self.series_map.is_empty() {
@@ -3982,6 +4982,7 @@ impl FormatReader for CellSensReader {
         self.series_names.clear();
         self.series_phys.clear();
         self.current = 0;
+        self.vsi_path = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -4035,7 +5036,31 @@ impl FormatReader for CellSensReader {
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         match self.target {
-            CellSensTarget::Tiff(_) => self.inner.open_bytes(p),
+            CellSensTarget::Tiff(ts) => {
+                // The inner TIFF reader returns the overview chunky/interleaved
+                // (or fails on a JPEGTables-abbreviated JPEG strip, which we decode
+                // ourselves). Java reports the overview as non-interleaved (planar),
+                // so the FULL plane must be de-interleaved to match — the inner
+                // reader does NOT do this, which is why a raw `open_bytes` diverged
+                // everywhere except the very first pixels.
+                let full = match self.decode_overview_jpeg_full(ts, p)? {
+                    Some(f) => f,
+                    None => self.inner.open_bytes(p)?,
+                };
+                let meta = self.metadata();
+                let spp = if meta.is_rgb {
+                    meta.size_c.max(1) as usize
+                } else {
+                    1
+                };
+                let sample = meta.pixel_type.bytes_per_sample();
+                let plane = (meta.size_x as usize) * (meta.size_y as usize);
+                if spp > 1 && sample > 0 && full.len() == plane * spp * sample {
+                    Ok(deinterleave_to_planar(&full, plane, spp, sample))
+                } else {
+                    Ok(full)
+                }
+            }
             CellSensTarget::Ets { volume, resolution } => {
                 let vol = &self.ets[volume];
                 let level = vol
@@ -4058,10 +5083,33 @@ impl FormatReader for CellSensReader {
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         match self.target {
-            CellSensTarget::Tiff(_) => {
-                let buf = self.inner.open_bytes_region(p, x, y, w, h)?;
-                // Java reports the overview as non-interleaved (planar). The inner
-                // TIFF reader returns interleaved RGB; de-interleave to match.
+            CellSensTarget::Tiff(ts) => {
+                // Source the requested chunky/interleaved region: either by cropping
+                // our manually decoded JPEG overview (the inner reader can't merge
+                // the JPEGTables tag), or via the inner reader for plain IFDs.
+                let buf = match self.decode_overview_jpeg_full(ts, p)? {
+                    Some(full) => {
+                        let meta = self.metadata();
+                        let spp = if meta.is_rgb {
+                            meta.size_c.max(1) as usize
+                        } else {
+                            1
+                        };
+                        let pixel = spp * meta.pixel_type.bytes_per_sample();
+                        crop_chunky(
+                            &full,
+                            meta.size_x as usize,
+                            x as usize,
+                            y as usize,
+                            w as usize,
+                            h as usize,
+                            pixel,
+                        )
+                    }
+                    None => self.inner.open_bytes_region(p, x, y, w, h)?,
+                };
+                // Java reports the overview as non-interleaved (planar). The region
+                // buffer is interleaved RGB; de-interleave to match.
                 let meta = self.metadata();
                 let spp = if meta.is_rgb {
                     meta.size_c.max(1) as usize
@@ -4158,31 +5206,35 @@ impl FormatReader for CellSensReader {
 // ---------------------------------------------------------------------------
 // 11. Volocity clipping ACFF
 // ---------------------------------------------------------------------------
-/// Volocity clipping format reader (`.acff`).
+/// Volocity Library Clipping format reader (`.acff`).
 ///
-/// Volocity clipping files use OLE2/Compound Document format; the remaining
-/// missing piece is the Volocity-specific stream schema.
+/// Port of the Java `VolocityClippingReader`. The header encodes endianness via
+/// its first byte (`'I'` = little-endian), then a `FFCA` magic string. After
+/// locating the geometry marker (`0x208`, or the big-endian `AISF` variant),
+/// width/height/Z are read; pixels follow at a fixed offset. Pixel data is
+/// either raw or LZO-compressed (auto-detected exactly as in Java). Single
+/// channel/timepoint; `pixelType` defaults to `UINT8` and is refined to match
+/// the decompressed plane size when the data is LZO-compressed.
 pub struct VolocityClippingReader {
-    state: Option<SyntheticRawState>,
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    /// Offset of the first pixel byte (after geometry header).
+    pixel_offset: u64,
+    little_endian: bool,
 }
+
+const VOLOCITY_CLIPPING_MAGIC: &str = "FFCA";
+/// `AISF` as produced by a big-endian `readInt` over the four ASCII bytes.
+const VOLOCITY_AISF: u32 = 0x4653_4941;
 
 impl VolocityClippingReader {
     pub fn new() -> Self {
-        VolocityClippingReader { state: None }
-    }
-
-    fn spec() -> SyntheticRawSpec {
-        SyntheticRawSpec {
-            format_name: "Volocity clipping",
-            unsupported_message:
-                "Volocity clipping format requires Volocity-specific OLE2 stream parsing",
-            extension: "acff",
-            magic: SYNTHETIC_VOLOCITY_CLIPPING_MAGIC,
+        VolocityClippingReader {
+            path: None,
+            meta: None,
+            pixel_offset: 0,
+            little_endian: true,
         }
-    }
-
-    fn unsupported() -> BioFormatsError {
-        synthetic_raw_unsupported(Self::spec())
     }
 }
 
@@ -4192,49 +5244,156 @@ impl Default for VolocityClippingReader {
     }
 }
 
+/// Read a 4-byte integer with the given endianness from `data` at `pos`.
+fn volocity_read_int(data: &[u8], pos: usize, little_endian: bool) -> Option<u32> {
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let b: [u8; 4] = data[pos..pos + 4].try_into().unwrap();
+    Some(if little_endian {
+        u32::from_le_bytes(b)
+    } else {
+        u32::from_be_bytes(b)
+    })
+}
+
 impl FormatReader for VolocityClippingReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        Self::spec().matches_name(path)
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("acff"))
     }
 
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        Self::spec().matches_bytes(header)
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // Mirrors Java `isThisType(RandomAccessInputStream)`, which returns false.
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.state = None;
-        match has_synthetic_raw_magic(path, Self::spec()) {
-            Ok(true) => {
-                self.state = Some(parse_synthetic_raw(path, Self::spec())?);
-                return Ok(());
-            }
-            Ok(false) => {}
-            Err(BioFormatsError::Io(err)) if err.kind() == ErrorKind::NotFound => {
-                return Err(Self::unsupported());
-            }
-            Err(err) => return Err(err),
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < 9 {
+            return Err(BioFormatsError::Format(
+                "Volocity clipping file is too short".into(),
+            ));
         }
 
-        match validate_ole2_cfb_header(path, "Volocity clipping") {
-            Ok(()) => Err(Self::unsupported()),
-            Err(BioFormatsError::Io(err)) if err.kind() == ErrorKind::NotFound => {
-                Err(Self::unsupported())
-            }
-            Err(err) => Err(err),
+        let mut little_endian = data[0] == b'I';
+        // skip first byte + 4 bytes, then read the 4-char magic string
+        let magic = String::from_utf8_lossy(&data[5..9]).into_owned();
+        if magic != VOLOCITY_CLIPPING_MAGIC {
+            return Err(BioFormatsError::Format(format!(
+                "Found invalid magic string: {magic}"
+            )));
         }
+
+        // Scan for the geometry marker (0x208) or big-endian AISF variant.
+        let mut fp = 9usize;
+        let mut check = volocity_read_int(&data, fp, little_endian)
+            .ok_or_else(|| BioFormatsError::Format("Volocity clipping header truncated".into()))?;
+        fp += 4;
+        while check != 0x208 && check != VOLOCITY_AISF {
+            // Java: in.seek(filePointer - 3); check = readInt();
+            fp = fp.checked_sub(3).ok_or_else(|| {
+                BioFormatsError::Format("Volocity clipping geometry marker not found".into())
+            })?;
+            check = match volocity_read_int(&data, fp, little_endian) {
+                Some(v) => v,
+                None => {
+                    return Err(BioFormatsError::Format(
+                        "Volocity clipping geometry marker not found".into(),
+                    ))
+                }
+            };
+            fp += 4;
+        }
+        if check == VOLOCITY_AISF {
+            little_endian = false;
+            fp += 28; // skipBytes(28)
+        }
+
+        let read_at = |fp: &mut usize| -> Result<u32> {
+            let v = volocity_read_int(&data, *fp, little_endian).ok_or_else(|| {
+                BioFormatsError::Format("Volocity clipping dimensions truncated".into())
+            })?;
+            *fp += 4;
+            Ok(v)
+        };
+        let size_x = read_at(&mut fp)?;
+        let size_y = read_at(&mut fp)?;
+        let size_z = read_at(&mut fp)?.max(1);
+
+        if size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::Format(
+                "Volocity clipping image has zero width or height".into(),
+            ));
+        }
+
+        // pixelOffset = filePointer + 65
+        let mut pixel_offset = (fp + 65) as u64;
+        let mut pixel_type = PixelType::Uint8;
+
+        // If the raw payload is implausibly small, the data is LZO-compressed;
+        // probe successive offsets and infer pixel type from the decompressed
+        // plane size (port of the Java auto-detection loop). We only adjust the
+        // pixel type here; actual decompression happens in open_bytes.
+        let plane_pixels = (size_x as usize) * (size_y as usize);
+        if plane_pixels.saturating_mul(100) >= data.len() {
+            let mut probe = pixel_offset as usize;
+            while probe < data.len() {
+                if let Ok(decoded) = crate::common::codec::decompress_lzo(&data[probe..]) {
+                    if !decoded.is_empty() && decoded.len() % plane_pixels == 0 {
+                        let bytes = decoded.len() / plane_pixels;
+                        pixel_type = match bytes {
+                            1 => PixelType::Uint8,
+                            2 => PixelType::Uint16,
+                            4 => PixelType::Float32,
+                            _ => PixelType::Uint8,
+                        };
+                        pixel_offset = probe as u64;
+                        break;
+                    }
+                }
+                probe += 1;
+            }
+        }
+
+        let meta = ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c: 1,
+            size_t: 1,
+            image_count: size_z,
+            pixel_type,
+            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
+            is_little_endian: little_endian,
+            ..ImageMetadata::default()
+        };
+
+        self.path = Some(path.to_path_buf());
+        self.little_endian = little_endian;
+        self.pixel_offset = pixel_offset;
+        self.meta = Some(meta);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.state = None;
+        self.path = None;
+        self.meta = None;
+        self.pixel_offset = 0;
+        self.little_endian = true;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.state.is_some())
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.state.is_none() {
+        if self.meta.is_none() {
             Err(BioFormatsError::NotInitialized)
         } else if s == 0 {
             Ok(())
@@ -4248,15 +5407,37 @@ impl FormatReader for VolocityClippingReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.state
+        self.meta
             .as_ref()
-            .map(|state| &state.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes(state, Self::spec(), plane_index)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let plane_size =
+            (meta.size_x as usize) * (meta.size_y as usize) * meta.pixel_type.bytes_per_sample();
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let start = self.pixel_offset as usize;
+
+        // Java: if planeSize * 2 + pixelOffset < fileLength -> data is raw.
+        let full = if plane_size * 2 + start < data.len() {
+            data.get(start..).map(<[u8]>::to_vec).unwrap_or_default()
+        } else {
+            crate::common::codec::decompress_lzo(data.get(start..).unwrap_or_default())?
+        };
+
+        let offset = (plane_index as usize) * plane_size;
+        let end = offset + plane_size;
+        if end > full.len() {
+            return Err(BioFormatsError::InvalidData(
+                "Volocity clipping plane extends beyond available pixel data".into(),
+            ));
+        }
+        Ok(full[offset..end].to_vec())
     }
 
     fn open_bytes_region(
@@ -4267,16 +5448,23 @@ impl FormatReader for VolocityClippingReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes_region(state, Self::spec(), plane_index, x, y, w, h)
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Volocity clipping", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.metadata();
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
+        let (sx, sy) = {
+            let meta = self.metadata();
+            (meta.size_x, meta.size_y)
+        };
+        if sx == 0 || sy == 0 {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        let tw = sx.min(256);
+        let th = sy.min(256);
+        let tx = (sx - tw) / 2;
+        let ty = (sy - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
@@ -5023,148 +6211,6 @@ mod tests {
         );
     }
 
-    fn assert_ole2_placeholder_header_validation<R: FormatReader>(
-        mut reader: R,
-        ext: &str,
-        expected_bad_magic: &str,
-        expected_short: &str,
-        expected_unsupported: &str,
-    ) {
-        let short = temp_flim2_path(&format!("short.{ext}"));
-        std::fs::write(&short, [0xd0, 0xcf, 0x11]).unwrap();
-        let err = reader.set_id(&short).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::Format(ref message) if message.contains(expected_short)),
-            "unexpected short-file error: {err:?}"
-        );
-        let _ = std::fs::remove_file(&short);
-
-        let bad = temp_flim2_path(&format!("bad.{ext}"));
-        std::fs::write(&bad, b"not-ole2").unwrap();
-        let err = reader.set_id(&bad).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::Format(ref message) if message.contains(expected_bad_magic)),
-            "unexpected bad-magic error: {err:?}"
-        );
-        let _ = std::fs::remove_file(&bad);
-
-        let cfb = temp_flim2_path(&format!("cfb.{ext}"));
-        std::fs::write(&cfb, OLE2_CFB_MAGIC).unwrap();
-        let err = reader.set_id(&cfb).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains(expected_unsupported)),
-            "unexpected CFB unsupported error: {err:?}"
-        );
-        assert_eq!(reader.series_count(), 0);
-        assert_eq!(reader.metadata().size_x, 0);
-        let _ = std::fs::remove_file(&cfb);
-    }
-
-    #[test]
-    fn oir_and_volocity_clipping_validate_ole2_headers_before_unsupported() {
-        assert_ole2_placeholder_header_validation(
-            OirReader::new(),
-            "oir",
-            "Not an Olympus OIR OLE2 CFB file",
-            "Olympus OIR file is too short for OLE2 CFB header",
-            "Olympus OIR format requires proprietary Olympus FluoView stream parsing",
-        );
-        assert_ole2_placeholder_header_validation(
-            VolocityClippingReader::new(),
-            "acff",
-            "Not a Volocity clipping OLE2 CFB file",
-            "Volocity clipping file is too short for OLE2 CFB header",
-            "Volocity clipping format requires Volocity-specific OLE2 stream parsing",
-        );
-    }
-
-    #[test]
-    fn oir_and_volocity_clipping_read_explicit_synthetic_raw_subsets() {
-        let payload = [0u16, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]
-            .into_iter()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-
-        let oir = temp_flim2_path("synthetic.oir");
-        write_synthetic_raw(
-            &oir,
-            SYNTHETIC_OIR_MAGIC,
-            (3, 2, 1, 2, 1),
-            SYNTHETIC_RAW_U16,
-            &payload,
-        );
-        assert!(OirReader::new().is_this_type_by_name(&oir));
-        assert!(OirReader::new().is_this_type_by_bytes(SYNTHETIC_OIR_MAGIC));
-        assert_synthetic_raw_reader(OirReader::new(), &oir, "Olympus OIR");
-        let _ = std::fs::remove_file(oir);
-
-        let acff = temp_flim2_path("synthetic.acff");
-        write_synthetic_raw(
-            &acff,
-            SYNTHETIC_VOLOCITY_CLIPPING_MAGIC,
-            (3, 2, 1, 2, 1),
-            SYNTHETIC_RAW_U16,
-            &payload,
-        );
-        assert!(VolocityClippingReader::new().is_this_type_by_name(&acff));
-        assert!(
-            VolocityClippingReader::new().is_this_type_by_bytes(SYNTHETIC_VOLOCITY_CLIPPING_MAGIC)
-        );
-        assert_synthetic_raw_reader(VolocityClippingReader::new(), &acff, "Volocity clipping");
-        let _ = std::fs::remove_file(acff);
-    }
-
-    #[test]
-    fn oir_and_volocity_clipping_synthetic_raw_validate_headers_and_payloads() {
-        let zero_width = temp_flim2_path("zero-width.oir");
-        write_synthetic_raw(
-            &zero_width,
-            SYNTHETIC_OIR_MAGIC,
-            (0, 2, 1, 1, 1),
-            SYNTHETIC_RAW_U8,
-            &[0, 1],
-        );
-        let err = OirReader::new().set_id(&zero_width).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::Format(ref message) if message.contains("width")),
-            "unexpected zero-width error: {err:?}"
-        );
-        let _ = std::fs::remove_file(zero_width);
-
-        let unsupported_pixel = temp_flim2_path("pixel.acff");
-        write_synthetic_raw(
-            &unsupported_pixel,
-            SYNTHETIC_VOLOCITY_CLIPPING_MAGIC,
-            (1, 1, 1, 1, 1),
-            99,
-            &[0],
-        );
-        let err = VolocityClippingReader::new()
-            .set_id(&unsupported_pixel)
-            .unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("pixel type")),
-            "unexpected pixel type error: {err:?}"
-        );
-        let _ = std::fs::remove_file(unsupported_pixel);
-
-        let short_payload = temp_flim2_path("short-payload.acff");
-        write_synthetic_raw(
-            &short_payload,
-            SYNTHETIC_VOLOCITY_CLIPPING_MAGIC,
-            (2, 2, 1, 1, 1),
-            SYNTHETIC_RAW_U16,
-            &[0, 1],
-        );
-        let err = VolocityClippingReader::new()
-            .set_id(&short_payload)
-            .unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("payload length")),
-            "unexpected payload length error: {err:?}"
-        );
-        let _ = std::fs::remove_file(short_payload);
-    }
 
     #[test]
     fn im3_reads_explicit_synthetic_raw_subset() {
@@ -5607,9 +6653,25 @@ mod tests {
         out.extend_from_slice(&(fields.len() as i32).to_le_bytes()); // flags = tagCount
         out.extend_from_slice(&0i32.to_le_bytes()); // skip 4
 
+        // The corrected parser navigates container-relative: it keeps the field
+        // cursor pinned at the container header (container_fp = 8) and re-seeks to
+        // `container_fp + nextField` for each sibling. So `nextField` must encode
+        // the container-relative offset of the *next* field, not the byte advance
+        // from the current one. Field 0 starts at dataFieldOffset (24); each record
+        // is 16 bytes + inline data.
+        let mut field_starts = Vec::with_capacity(fields.len());
+        let mut rel = 24i64; // dataFieldOffset: first field directly after header
+        for f in fields {
+            field_starts.push(rel);
+            rel += 16 + f.data.len() as i64;
+        }
+
         for (i, f) in fields.iter().enumerate() {
-            let record_len = 16 + f.data.len() as i64;
-            let next_field = if i + 1 < fields.len() { record_len } else { 0 };
+            let next_field = if i + 1 < fields.len() {
+                field_starts[i + 1]
+            } else {
+                0
+            };
             out.extend_from_slice(&f.field_type.to_le_bytes());
             out.extend_from_slice(&f.tag.to_le_bytes());
             out.extend_from_slice(&(next_field as u32).to_le_bytes());

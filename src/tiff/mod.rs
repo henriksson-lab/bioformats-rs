@@ -1,5 +1,6 @@
 mod compression;
 pub mod ifd;
+pub(crate) mod jpeg_restart;
 pub(crate) mod nikon;
 pub mod parser;
 mod reader;

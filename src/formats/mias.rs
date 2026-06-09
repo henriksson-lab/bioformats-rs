@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
@@ -53,20 +53,76 @@ fn checked_payload_len(meta: &ImageMetadata) -> Result<u64> {
 
 // ── CellWorxReader ────────────────────────────────────────────────────────────
 
+/// CellWorX / MetaXpress HCS reader.
+///
+/// Ported from the upstream Java `CellWorxReader` and its `MetaxpressTiffReader`
+/// subclass. The entry point is a `.HTD` plate-index file (flat `"key", value`
+/// text) describing the well grid, the site (field) grid, the timepoint/Z-step
+/// counts and the wavelengths. Pixel data live in per-well/per-wavelength TIFF
+/// files named `<plate>_<well>_w<wave>.TIF`; pixel reads are delegated to
+/// [`crate::tiff::TiffReader`].
+///
+/// One series is produced per well x field. Companion TIFFs that are missing on
+/// disk are tolerated: planes that reference them read back as zero-filled.
 pub struct CellWorxReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    pixels: Vec<u8>,
-    plane_len: usize,
+    htd_path: Option<PathBuf>,
+    /// One [`ImageMetadata`] per series (`field_count * well_count`).
+    series: Vec<ImageMetadata>,
+    current_series: usize,
+    /// `well_files[row][col]` = `Some(file list)` for selected wells.
+    well_files: Vec<Vec<Option<Vec<PathBuf>>>>,
+    /// Selected wells in row-major order; index = well index.
+    selected_wells: Vec<(usize, usize)>,
+    field_count: usize,
+    n_wavelengths: usize,
+    n_timepoints: u32,
+    z_steps: u32,
+    do_channels: bool,
+    tiff_reader: crate::tiff::TiffReader,
+    tiff_loaded: bool,
 }
 
 impl CellWorxReader {
     pub fn new() -> Self {
         CellWorxReader {
-            path: None,
-            meta: None,
-            pixels: Vec::new(),
-            plane_len: 0,
+            htd_path: None,
+            series: Vec::new(),
+            current_series: 0,
+            well_files: Vec::new(),
+            selected_wells: Vec::new(),
+            field_count: 0,
+            n_wavelengths: 0,
+            n_timepoints: 1,
+            z_steps: 1,
+            do_channels: false,
+            tiff_reader: crate::tiff::TiffReader::new(),
+            tiff_loaded: false,
+        }
+    }
+
+    /// Resolve the .pnl/.tif file backing the given series + plane index,
+    /// following `CellWorxReader.getFile`.
+    fn get_file(&self, series: usize, no: u32) -> Option<PathBuf> {
+        if self.field_count == 0 {
+            return None;
+        }
+        let well_index = series / self.field_count;
+        let field = series % self.field_count;
+        let &(row, col) = self.selected_wells.get(well_index)?;
+        let files = self.well_files.get(row)?.get(col)?.as_ref()?;
+        if files.is_empty() {
+            return None;
+        }
+        let image_count = files.len() / self.field_count.max(1);
+        let idx = field * image_count + no as usize;
+        if idx < files.len() {
+            files.get(idx).cloned()
+        } else if field < files.len() {
+            files.get(field).cloned()
+        } else if image_count == 0 && files.len() == 1 {
+            files.first().cloned()
+        } else {
+            None
         }
     }
 }
@@ -77,166 +133,239 @@ impl Default for CellWorxReader {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CellWorxLayout {
-    image_count: u32,
-    raw: Option<CellWorxRawLayout>,
+/// Parsed contents of a CellWorX / MetaXpress `.HTD` plate-index file.
+struct HtdInfo {
+    x_wells: usize,
+    y_wells: usize,
+    /// `well_selected[row][col]`
+    well_selected: Vec<Vec<bool>>,
+    /// field acquisition map (sites grid)
+    field_map: Vec<Vec<bool>>,
+    n_timepoints: u32,
+    z_steps: u32,
+    do_channels: bool,
+    /// One entry per wavelength; `Some(name)` if a `WaveName<i>` was present.
+    wavelengths: Vec<Option<String>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CellWorxRawLayout {
-    width: u32,
-    height: u32,
-    pixel_type: PixelType,
-    little_endian: bool,
+/// `Boolean.parseBoolean` semantics: true only when the token is "true".
+fn htd_bool(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("true")
 }
 
-fn parse_htd(path: &Path) -> Result<(CellWorxLayout, Option<String>)> {
+/// Parse a CellWorX `.HTD` file. Lines are `"key", value[, value...]`; the key
+/// is delimited from the value by the literal `",` sequence (matching the Java
+/// `line.indexOf("\",")` logic).
+fn parse_htd(path: &Path) -> Result<HtdInfo> {
     let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-    let mut x_sites = None;
-    let mut y_sites = None;
-    let mut timepoints = None;
-    let mut z_steps = None;
-    let mut wavelengths = None;
-    let mut has_strict_raw_marker = false;
-    let mut raw_width = None;
-    let mut raw_height = None;
-    let mut raw_pixel_type = None;
-    let mut raw_little_endian = None;
-    let mut raw_file = None;
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line == "BF_CELLWORX_RAW_V1" {
-            has_strict_raw_marker = true;
-        } else if let Some(v) = htd_kv(line, "BioFormatsRaw") {
-            has_strict_raw_marker = parse_bool_htd("BioFormatsRaw", v)?;
-        } else if let Some(v) = htd_kv(line, "XSites") {
-            x_sites = Some(parse_positive_htd_u32("XSites", v)?);
-        } else if let Some(v) = htd_kv(line, "YSites") {
-            y_sites = Some(parse_positive_htd_u32("YSites", v)?);
-        } else if let Some(v) = htd_kv(line, "TimePoints") {
-            timepoints = Some(parse_positive_htd_u32("TimePoints", v)?);
-        } else if let Some(v) = htd_kv(line, "ZSteps") {
-            z_steps = Some(parse_positive_htd_u32("ZSteps", v)?);
-        } else if let Some(v) = htd_kv(line, "Wavelengths") {
-            wavelengths = Some(parse_positive_htd_u32("Wavelengths", v)?);
-        } else if let Some(v) = htd_kv(line, "RawWidth") {
-            raw_width = Some(parse_positive_htd_u32("RawWidth", v)?);
-        } else if let Some(v) = htd_kv(line, "RawHeight") {
-            raw_height = Some(parse_positive_htd_u32("RawHeight", v)?);
-        } else if let Some(v) = htd_kv(line, "RawPixelType") {
-            raw_pixel_type = Some(parse_cellworx_pixel_type(v)?);
-        } else if let Some(v) = htd_kv(line, "RawLittleEndian") {
-            raw_little_endian = Some(parse_bool_htd("RawLittleEndian", v)?);
-        } else if let Some(v) = htd_kv(line, "RawFile") {
-            raw_file = Some(v.split(',').next().unwrap_or(v).trim().to_string());
+    let mut x_wells = 0usize;
+    let mut y_wells = 0usize;
+    let mut well_selected: Vec<Vec<bool>> = Vec::new();
+    let mut x_fields = 0usize;
+    let mut y_fields = 0usize;
+    let mut field_map: Option<Vec<Vec<bool>>> = None;
+    let mut n_timepoints = 1u32;
+    let mut z_steps = 1u32;
+    let mut do_channels = false;
+    let mut wavelengths: Vec<Option<String>> = Vec::new();
+
+    for line in content.split('\n') {
+        let split = match line.find("\",") {
+            Some(s) if s >= 1 => s,
+            _ => continue,
+        };
+        let key = line[1..split].trim();
+        let value = line[split + 2..].trim();
+
+        if key == "XWells" {
+            x_wells = value.parse().unwrap_or(0);
+        } else if key == "YWells" {
+            y_wells = value.parse().unwrap_or(0);
+            well_selected = vec![vec![false; x_wells]; y_wells];
+        } else if let Some(rest) = key.strip_prefix("WellsSelection") {
+            if let Ok(row1) = rest.trim().parse::<usize>() {
+                if row1 >= 1 && row1 <= well_selected.len() {
+                    let row = row1 - 1;
+                    let mapping: Vec<&str> = value.split(',').collect();
+                    for (col, slot) in well_selected[row].iter_mut().enumerate() {
+                        if let Some(tok) = mapping.get(col) {
+                            if htd_bool(tok) {
+                                *slot = true;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if key == "XSites" {
+            x_fields = value.parse().unwrap_or(0);
+        } else if key == "YSites" {
+            y_fields = value.parse().unwrap_or(0);
+            // If field acquisition was turned off ("Sites" == FALSE), the
+            // single-site map is already set; don't overwrite it.
+            if field_map.is_none() {
+                field_map = Some(vec![vec![false; x_fields]; y_fields]);
+            }
+        } else if key == "Sites" {
+            if value.eq_ignore_ascii_case("false") {
+                field_map = Some(vec![vec![true]]);
+            }
+        } else if key == "TimePoints" {
+            n_timepoints = value.parse().unwrap_or(1).max(1);
+        } else if key == "ZSteps" {
+            z_steps = value.parse().unwrap_or(1).max(1);
+        } else if let Some(rest) = key.strip_prefix("SiteSelection") {
+            if let (Ok(row1), Some(fm)) = (rest.trim().parse::<usize>(), field_map.as_mut()) {
+                if row1 >= 1 && row1 <= fm.len() {
+                    let row = row1 - 1;
+                    let mapping: Vec<&str> = value.split(',').collect();
+                    for (col, slot) in fm[row].iter_mut().enumerate() {
+                        if let Some(tok) = mapping.get(col) {
+                            *slot = htd_bool(tok);
+                        }
+                    }
+                }
+            }
+        } else if key == "Waves" {
+            do_channels = htd_bool(value);
+        } else if key == "NWavelengths" {
+            let n = value.parse().unwrap_or(0);
+            wavelengths = vec![None; n];
+        } else if let Some(rest) = key.strip_prefix("WaveName") {
+            if let Ok(idx1) = rest.trim().parse::<usize>() {
+                if idx1 >= 1 && idx1 <= wavelengths.len() {
+                    wavelengths[idx1 - 1] = Some(value.replace('"', ""));
+                }
+            }
         }
     }
 
-    let x_sites = x_sites.ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat("CellWorX HTD header missing XSites".into())
-    })?;
-    let y_sites = y_sites.ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat("CellWorX HTD header missing YSites".into())
-    })?;
-    let timepoints = timepoints.unwrap_or(1);
-    let z_steps = z_steps.unwrap_or(1);
-    let wavelengths = wavelengths.unwrap_or(1);
-    let image_count = x_sites
-        .checked_mul(y_sites)
-        .and_then(|n| n.checked_mul(timepoints))
-        .and_then(|n| n.checked_mul(z_steps))
-        .and_then(|n| n.checked_mul(wavelengths))
-        .ok_or_else(|| BioFormatsError::Format("CellWorX HTD image count overflows".into()))?;
-    let raw = if has_strict_raw_marker {
-        Some(CellWorxRawLayout {
-            width: raw_width.ok_or_else(|| {
-                BioFormatsError::UnsupportedFormat(
-                    "CellWorX strict raw HTD header missing RawWidth".into(),
-                )
-            })?,
-            height: raw_height.ok_or_else(|| {
-                BioFormatsError::UnsupportedFormat(
-                    "CellWorX strict raw HTD header missing RawHeight".into(),
-                )
-            })?,
-            pixel_type: raw_pixel_type.ok_or_else(|| {
-                BioFormatsError::UnsupportedFormat(
-                    "CellWorX strict raw HTD header missing RawPixelType".into(),
-                )
-            })?,
-            little_endian: raw_little_endian.unwrap_or(true),
-        })
-    } else {
-        None
-    };
-
-    Ok((CellWorxLayout { image_count, raw }, raw_file))
-}
-
-fn htd_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let stripped = line.strip_prefix(key)?.trim_start();
-    Some(stripped.strip_prefix(',')?.trim_start())
-}
-
-fn parse_positive_htd_u32(key: &str, value: &str) -> Result<u32> {
-    let value = value.split(',').next().unwrap_or(value).trim();
-    let n = value.parse::<u32>().map_err(|_| {
-        BioFormatsError::UnsupportedFormat(format!("CellWorX HTD header has invalid {key}"))
-    })?;
-    if n == 0 {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "CellWorX HTD header has zero {key}"
-        )));
+    let mut field_map = field_map.unwrap_or_else(|| vec![vec![true]]);
+    // If the acquisition only contains one site, SiteSelection1 may be absent.
+    // In that case, assume the field was selected.
+    if x_fields == 1 && y_fields == 1 && !field_map.is_empty() && !field_map[0].is_empty() {
+        field_map[0][0] = true;
     }
-    Ok(n)
-}
-
-fn parse_bool_htd(key: &str, value: &str) -> Result<bool> {
-    let value = value.split(',').next().unwrap_or(value).trim();
-    match value.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => Ok(true),
-        "0" | "false" | "no" => Ok(false),
-        _ => Err(BioFormatsError::UnsupportedFormat(format!(
-            "CellWorX HTD header has invalid {key}"
-        ))),
+    if wavelengths.is_empty() {
+        wavelengths.push(None);
     }
+
+    Ok(HtdInfo {
+        x_wells,
+        y_wells,
+        well_selected,
+        field_map,
+        n_timepoints,
+        z_steps,
+        do_channels,
+        wavelengths,
+    })
 }
 
-fn parse_cellworx_pixel_type(value: &str) -> Result<PixelType> {
-    let value = value.split(',').next().unwrap_or(value).trim();
-    match value.to_ascii_lowercase().as_str() {
-        "uint8" | "u8" => Ok(PixelType::Uint8),
-        "uint16" | "u16" => Ok(PixelType::Uint16),
-        "int16" | "i16" => Ok(PixelType::Int16),
-        "uint32" | "u32" => Ok(PixelType::Uint32),
-        "int32" | "i32" => Ok(PixelType::Int32),
-        "float32" | "f32" => Ok(PixelType::Float32),
-        _ => Err(BioFormatsError::UnsupportedFormat(
-            "CellWorX strict raw HTD header has unsupported RawPixelType".into(),
-        )),
-    }
-}
-
-fn resolve_cellworx_raw_path(cfg_path: &Path, raw_file: Option<String>) -> Result<PathBuf> {
-    let raw_file = raw_file.ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat("CellWorX strict raw HTD header missing RawFile".into())
-    })?;
-    let relative = Path::new(&raw_file);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
-    {
-        return Err(BioFormatsError::Format(
-            "CellWorX strict raw RawFile must stay beside the HTD header".into(),
+/// Locate the `.HTD` plate-index file given any member of the dataset.
+fn find_htd(path: &Path) -> Result<PathBuf> {
+    let is_htd = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("htd"))
+        .unwrap_or(false);
+    if is_htd {
+        if path.exists() {
+            return Ok(path.to_path_buf());
+        }
+        return Err(BioFormatsError::UnsupportedFormat(
+            "CellWorX HTD file does not exist".into(),
         ));
     }
-    Ok(cfg_path
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join(relative))
+    // Derive from a pixel file: strip everything after the last '_'.
+    let s = path.to_string_lossy();
+    if let Some(us) = s.rfind('_') {
+        for ext in ["HTD", "htd"] {
+            let cand = PathBuf::from(format!("{}.{}", &s[..us], ext));
+            if cand.exists() {
+                return Ok(cand);
+            }
+        }
+    }
+    // Fall back to scanning the parent directory for any .htd file.
+    if let Some(parent) = path.parent() {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for p in paths {
+                if p.extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("htd"))
+                    .unwrap_or(false)
+                {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+    Err(BioFormatsError::UnsupportedFormat(
+        "CellWorX: could not locate companion .htd file".into(),
+    ))
+}
+
+/// Build the plate-name prefix: the HTD path with its extension stripped, plus `_`.
+fn plate_base(htd: &Path) -> String {
+    let s = htd.to_string_lossy();
+    let cut = s.rfind('.').unwrap_or(s.len());
+    format!("{}_", &s[..cut])
+}
+
+/// Well label as used in MetaXpress TIFF names, e.g. row 0 col 0 -> "A01".
+fn well_name(row: usize, col: usize) -> String {
+    let letter = (b'A' + (row as u8 % 26)) as char;
+    format!("{}{:02}", letter, col + 1)
+}
+
+/// Build the per-well TIFF file list, following
+/// `MetaxpressTiffReader.getTiffFiles`. The list is ordered field, channel,
+/// timepoint. The on-disk extension (`.tif` vs `.TIF`) is probed per file.
+fn build_well_files(
+    plate: &str,
+    row: usize,
+    col: usize,
+    field_count: usize,
+    channels: usize,
+    n_timepoints: u32,
+    do_channels: bool,
+) -> Vec<PathBuf> {
+    let base = format!("{}{}", plate, well_name(row, col));
+    let mut files: Vec<PathBuf> = Vec::with_capacity(field_count * channels * n_timepoints as usize);
+    for field in 0..field_count {
+        for channel in 0..channels {
+            for _t in 0..n_timepoints {
+                let mut name = base.clone();
+                if field_count > 1 {
+                    name.push_str(&format!("_s{}", field + 1));
+                }
+                if do_channels || channels > 1 {
+                    name.push_str(&format!("_w{}", channel + 1));
+                }
+                if n_timepoints > 1 {
+                    // Matches the upstream quirk: the timepoint *count* is used.
+                    name.push_str(&format!("_t{}", n_timepoints));
+                }
+                let lower = PathBuf::from(format!("{}.tif", name));
+                if lower.exists() {
+                    files.push(lower);
+                } else {
+                    files.push(PathBuf::from(format!("{}.TIF", name)));
+                }
+            }
+        }
+    }
+    files
+}
+
+/// Z coordinate of a plane index under an `XYCZT` dimension order.
+fn z_coord(meta: &ImageMetadata, no: u32) -> u32 {
+    let sc = meta.size_c.max(1);
+    let sz = meta.size_z.max(1);
+    (no / sc) % sz
 }
 
 impl FormatReader for CellWorxReader {
@@ -254,89 +383,232 @@ impl FormatReader for CellWorxReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        // If .pnl, look for companion .htd
-        let cfg_path = if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pnl"))
-            .unwrap_or(false)
-        {
-            path.with_extension("htd")
-        } else {
-            path.to_path_buf()
-        };
 
-        if !cfg_path.exists() {
+        let htd = find_htd(path)?;
+        let info = parse_htd(&htd)?;
+
+        // Field (site) count = number of selected sites in the field map.
+        let field_count = info
+            .field_map
+            .iter()
+            .flatten()
+            .filter(|&&b| b)
+            .count()
+            .max(1);
+
+        // Enumerate selected wells in row-major order and build their file lists.
+        let plate = plate_base(&htd);
+        let channels = info.wavelengths.len();
+        let mut well_files: Vec<Vec<Option<Vec<PathBuf>>>> =
+            vec![vec![None; info.x_wells]; info.y_wells];
+        let mut selected_wells: Vec<(usize, usize)> = Vec::new();
+        for row in 0..info.y_wells {
+            for col in 0..info.x_wells {
+                if info.well_selected[row][col] {
+                    let files = build_well_files(
+                        &plate,
+                        row,
+                        col,
+                        field_count,
+                        channels,
+                        info.n_timepoints,
+                        info.do_channels,
+                    );
+                    well_files[row][col] = Some(files);
+                    selected_wells.push((row, col));
+                }
+            }
+        }
+
+        let well_count = selected_wells.len();
+        let series_count = field_count * well_count;
+        if series_count == 0 {
             return Err(BioFormatsError::UnsupportedFormat(
-                "CellWorX HTD/PNL companion header is missing".to_string(),
+                "CellWorX HTD declares no selected wells".into(),
             ));
         }
-        let (layout, raw_file) = parse_htd(&cfg_path)?;
-        let Some(raw) = layout.raw else {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "CellWorX HTD/PNL parsed {} declared planes; native companion image payload decoding is unsupported unless explicit BF_CELLWORX_RAW_V1 sidecar fields are present",
-                layout.image_count
-            )));
-        };
 
-        let raw_path = resolve_cellworx_raw_path(&cfg_path, raw_file)?;
-        let mut meta = simple_meta(raw.width, raw.height, layout.image_count, raw.pixel_type);
-        meta.is_little_endian = raw.little_endian;
-        meta.series_metadata.insert(
-            "CellWorX strict raw file".into(),
-            MetadataValue::String(raw_path.to_string_lossy().into_owned()),
-        );
-        let expected = checked_payload_len(&meta)?;
-        let pixels = std::fs::read(&raw_path).map_err(BioFormatsError::Io)?;
-        if pixels.len() as u64 != expected {
-            return Err(BioFormatsError::Format(format!(
-                "CellWorX strict raw payload length {} does not match declared length {expected}",
-                pixels.len()
-            )));
+        // Store enough state for `get_file` so we can probe for a real TIFF.
+        self.htd_path = Some(htd);
+        self.well_files = well_files;
+        self.selected_wells = selected_wells;
+        self.field_count = field_count;
+        self.n_wavelengths = channels;
+        self.n_timepoints = info.n_timepoints;
+        self.z_steps = info.z_steps;
+        self.do_channels = info.do_channels;
+
+        // Find the first companion TIFF that actually exists on disk.
+        let planes_per = (info.z_steps as usize) * (info.n_timepoints as usize) * channels;
+        let mut series_idx = 0usize;
+        let mut plane_idx = 0u32;
+        let mut probe: Option<PathBuf> = None;
+        loop {
+            if let Some(f) = self.get_file(series_idx, plane_idx) {
+                if f.exists() {
+                    probe = Some(f);
+                    break;
+                }
+            }
+            if (plane_idx as usize) < planes_per {
+                plane_idx += 1;
+            } else if series_idx < series_count - 1 {
+                plane_idx = 0;
+                series_idx += 1;
+            } else {
+                break;
+            }
         }
-        self.plane_len = expected as usize / meta.image_count as usize;
-        self.path = Some(cfg_path);
-        self.meta = Some(meta);
-        self.pixels = pixels;
+        let probe = probe.ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "CellWorX/MetaXpress: no companion pixel files found on disk".into(),
+            )
+        })?;
+
+        self.tiff_reader.set_id(&probe)?;
+        let tm = self.tiff_reader.metadata();
+        let size_x = tm.size_x;
+        let size_y = tm.size_y;
+        let pixel_type = tm.pixel_type;
+        let bits = tm.bits_per_pixel;
+        let little_endian = tm.is_little_endian;
+        let interleaved = tm.is_interleaved;
+        let _ = self.tiff_reader.close();
+
+        let image_count = info.z_steps * channels as u32 * info.n_timepoints;
+        let mut series = Vec::with_capacity(series_count);
+        for s in 0..series_count {
+            let (row, col) = self.selected_wells[s / field_count];
+            let mut md = HashMap::new();
+            md.insert(
+                "format".into(),
+                MetadataValue::String("MetaXpress/CellWorX".into()),
+            );
+            md.insert("Well".into(), MetadataValue::String(well_name(row, col)));
+            for (i, w) in info.wavelengths.iter().enumerate() {
+                if let Some(name) = w {
+                    md.insert(
+                        format!("Wavelength {}", i + 1),
+                        MetadataValue::String(name.clone()),
+                    );
+                }
+            }
+            series.push(ImageMetadata {
+                size_x,
+                size_y,
+                size_z: info.z_steps,
+                size_c: channels as u32,
+                size_t: info.n_timepoints,
+                pixel_type,
+                bits_per_pixel: bits,
+                image_count,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb: false,
+                is_interleaved: interleaved,
+                is_indexed: false,
+                is_little_endian: little_endian,
+                resolution_count: 1,
+                series_metadata: md,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            });
+        }
+
+        self.series = series;
+        self.current_series = 0;
+        self.tiff_loaded = false;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.pixels.clear();
-        self.plane_len = 0;
+        self.htd_path = None;
+        self.series.clear();
+        self.current_series = 0;
+        self.well_files.clear();
+        self.selected_wells.clear();
+        self.field_count = 0;
+        self.n_wavelengths = 0;
+        self.n_timepoints = 1;
+        self.z_steps = 1;
+        self.do_channels = false;
+        if self.tiff_loaded {
+            let _ = self.tiff_reader.close();
+            self.tiff_loaded = false;
+        }
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.series.len()
     }
+
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
+        if self.series.is_empty() {
             Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
-            Ok(())
-        } else {
+        } else if s >= self.series.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            self.current_series = s;
+            Ok(())
         }
     }
+
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
+
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.series
+            .get(self.current_series)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        let (plane_bytes, size_z) = {
+            let meta = self
+                .series
+                .get(self.current_series)
+                .ok_or(BioFormatsError::NotInitialized)?;
+            if plane_index >= meta.image_count {
+                return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            }
+            let bps = meta.pixel_type.bytes_per_sample();
+            (
+                meta.size_x as usize * meta.size_y as usize * bps,
+                meta.size_z,
+            )
+        };
+
+        // Resolve the backing file; a missing companion reads back as zeros.
+        let file = match self.get_file(self.current_series, plane_index) {
+            Some(f) if f.exists() => f,
+            _ => return Ok(vec![0u8; plane_bytes]),
+        };
+
+        if self.tiff_loaded {
+            let _ = self.tiff_reader.close();
+            self.tiff_loaded = false;
         }
-        let start = plane_index as usize * self.plane_len;
-        Ok(self.pixels[start..start + self.plane_len].to_vec())
+        if self.tiff_reader.set_id(&file).is_err() {
+            return Ok(vec![0u8; plane_bytes]);
+        }
+        self.tiff_loaded = true;
+
+        let tiff_series = self.tiff_reader.series_count();
+        let tiff_imgs = self.tiff_reader.metadata().image_count;
+        let plane = if tiff_series == self.field_count && self.field_count > 1 {
+            let field = self.current_series % self.field_count;
+            let _ = self.tiff_reader.set_series(field);
+            plane_index
+        } else if tiff_imgs == size_z {
+            let meta = &self.series[self.current_series];
+            z_coord(meta, plane_index)
+        } else {
+            0
+        };
+        self.tiff_reader.open_bytes(plane)
     }
 
     fn open_bytes_region(
@@ -348,7 +620,10 @@ impl FormatReader for CellWorxReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         crop_full_plane("CellWorX", &full, meta, 1, x, y, w, h)
     }
 

@@ -116,15 +116,37 @@ real_data_test!(real_psd, "psd/fgf8_pcw5.psd");
 real_data_test!(real_dm3, "dm3/clem_fig3b.dm3");
 real_data_test!(real_imagic, "imagic/12409.stpm.hed");
 real_data_test!(real_vsi, "vsi/HN 485 HNSCC APOBEC3A-1.1000.vsi");
+
+// Formerly untested formats (small public samples via download_test_data.sh).
+real_data_test!(real_pic, "pic/sdub1.pic");
+real_data_test!(real_nrrd, "nrrd/dt-helix.nrrd");
+real_data_test!(real_spe, "spe/test_000_.spe");
+real_data_test!(real_stk, "stk/C0.stk");
+real_data_test!(real_sif, "sif/image.sif");
+// real_klb omitted — KlbReader is an unimplemented stub (refuses to decode img.klb).
+real_data_test!(real_jpg, "jpg/scifio-test.jpg");
+real_data_test!(real_png, "png/scifio-test.png");
+real_data_test!(real_bmp, "bmp/scribble_P_RGB.bmp");
+real_data_test!(real_metaimage, "mha/HeadMRVolume.mhd");
 real_data_test!(real_oif, "oif/Source Data Figure S5c-d CTRL.oif");
 
-/// The >4 GB Hamamatsu NDPI: exercises the 64-bit offset reconstruction
-/// (Mechanism A/B). A region near the bottom-right of full resolution is read;
-/// those JPEG tiles are stored past 4 GB in the file, so a successful decode
-/// validates the offset correction (a wrong/un-wrapped offset would seek to the
-/// low 32 bits and fail to JPEG-decode).
+/// The >4 GB Hamamatsu NDPI: exercises the 64-bit ("fake BigTIFF") IFD chain and
+/// the marker-driven windowed JPEG read. The header's first-IFD pointer and every
+/// next-IFD / value offset wrap mod 2^32 past 4 GB; the reader un-wraps them via
+/// the NDPI 64-bit layout (8-byte next pointers + per-entry high-word trailer).
+/// Full resolution (188160×101376) is stored as ONE ~4.8 GB JPEG strip, so a
+/// region is read using the NDPI restart-marker offset array (tags 65426/65432):
+/// only the JPEG header and the intervals overlapping the region are read from
+/// disk, never the whole strip — keeping the read bounded (~hundreds of MiB).
+///
+/// Despite "LARGE" this is now memory-bounded, but it still reads a multi-GB file
+/// and takes a few seconds, so it is OPT-IN behind `BIOFORMATS_RS_NDPI_LARGE=1`.
 #[test]
 fn real_ndpi_large_64bit_offset() {
+    if std::env::var("BIOFORMATS_RS_NDPI_LARGE").as_deref() != Ok("1") {
+        eprintln!("SKIP real_ndpi_large_64bit_offset (set BIOFORMATS_RS_NDPI_LARGE=1)");
+        return;
+    }
     let path = testdata("Hamamatsu-1.ndpi");
     // Skip unless the full file is present (the download is large and may still
     // be in progress; a partial file would fail spuriously).
@@ -144,25 +166,33 @@ fn real_ndpi_large_64bit_offset() {
             return;
         }
     }
-    let mut reader = ImageReader::open(&path).expect("open >4GB NDPI");
+    let mut reader = ImageReader::open(&path).expect("open >4GB NDPI (64-bit IFD walk)");
+    // Java NDPIReader reports an 8-series pyramid with full resolution 188160×101376.
+    let n = reader.series_count();
+    assert_eq!(n, 8, "expected 8 NDPI series, got {n}");
+    reader.set_series(0).unwrap();
     let (sx, sy) = {
         let m = reader.metadata();
         (m.size_x, m.size_y)
     };
-    assert!(
-        sx > 4096 && sy > 4096,
-        "expected a large whole-slide image, got {sx}x{sy}"
-    );
-    let w = 256.min(sx);
-    let h = 256.min(sy);
-    let x = sx - w;
-    let y = sy - h;
+    assert_eq!((sx, sy), (188160, 101376), "full-resolution dimensions");
+
+    // Read a 256×256 region near the bottom-right of full resolution — its JPEG
+    // restart intervals live past 4 GB in the strip. A wrong offset/byte-count
+    // (un-corrected high word) would seek into the low 32 bits and fail to decode.
+    let (w, h) = (256u32, 256u32);
+    let (x, y) = (sx - w, sy - h);
     let bytes = reader
         .open_bytes_region(0, x, y, w, h)
         .expect("read a >4GB-offset region from full resolution");
+    assert_eq!(
+        bytes.len(),
+        (w * h * 3) as usize,
+        "expected RGB region of {w}x{h}"
+    );
     assert!(
-        !bytes.is_empty(),
-        "the >4GB-offset region decoded to zero bytes"
+        bytes.iter().any(|&b| b != 0),
+        "the >4GB-offset region decoded to all zeros"
     );
     eprintln!("OK   Hamamatsu-1.ndpi: {sx}x{sy}, decoded {}-byte region at ({x},{y})", bytes.len());
 }

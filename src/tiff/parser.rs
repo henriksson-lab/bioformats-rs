@@ -20,7 +20,16 @@ pub struct TiffParser<R: Read + Seek> {
     pub variant: TiffVariant,
     /// Offset of the first IFD.
     pub first_ifd_offset: u64,
+    /// Remaining budget (bytes) for out-of-line IFD value arrays across the whole
+    /// IFD chain. A malformed chain (e.g. a garbage >4 GB-NDPI offset table) can
+    /// otherwise accumulate gigabytes of clamped "rest of file" values; this caps
+    /// total parse allocation. Reset at the start of `read_ifds`.
+    ifd_value_budget: u64,
 }
+
+/// Total bytes allowed for out-of-line IFD value arrays while parsing one IFD
+/// chain. Real files use kilobytes-to-low-megabytes; this is a generous backstop.
+const IFD_VALUE_BUDGET: u64 = 256 << 20; // 256 MiB
 
 impl<R: Read + Seek> TiffParser<R> {
     /// Parse the TIFF/BigTIFF file header.
@@ -89,11 +98,13 @@ impl<R: Read + Seek> TiffParser<R> {
             little_endian,
             variant,
             first_ifd_offset,
+            ifd_value_budget: IFD_VALUE_BUDGET,
         })
     }
 
     /// Read all IFDs in the main IFD chain.
     pub fn read_ifds(&mut self) -> Result<Vec<Ifd>> {
+        self.ifd_value_budget = IFD_VALUE_BUDGET;
         let mut ifds = Vec::new();
         let mut offset = self.first_ifd_offset;
         let mut visited_offsets = HashSet::new();
@@ -218,6 +229,110 @@ impl<R: Read + Seek> TiffParser<R> {
         Ok((Ifd { entries }, next_ifd))
     }
 
+    /// Parse the IFD chain of a >4 GB Hamamatsu NDPI file.
+    ///
+    /// NDPI is a classic (32-bit-field) TIFF, but for files larger than 4 GB it
+    /// uses Hamamatsu's "fake BigTIFF" trick (Java `NDPIReader` +
+    /// `TiffParser.setUse64BitOffsets`): every file offset is effectively 64-bit.
+    /// Concretely each IFD is laid out as
+    ///   `count(2) | count*entry(12) | nextIFD(8) | count*highWord(4)`
+    /// where the 4-byte inline value/offset field of each entry holds only the
+    /// *low* 32 bits and the trailing per-entry `highWord` supplies the high 32
+    /// bits (`true = low | (high << 32)`). The header's first-IFD pointer is
+    /// likewise a 64-bit value read at byte 4. A naive 32-bit-pointer walk wraps
+    /// (mod 2^32) and lands on garbage, so this dedicated walk is required.
+    ///
+    /// Mirrors `NDPIReader.initStandardMetadata` (per-entry high-word fix-up);
+    /// the multi-strip `OFFSET_HIGH_BYTES`/`BYTE_COUNT_HIGH_BYTES` arrays
+    /// (Mechanism B) are applied separately by the NDPI reader.
+    pub fn read_ifds_ndpi64(&mut self) -> Result<Vec<Ifd>> {
+        self.ifd_value_budget = IFD_VALUE_BUDGET;
+        let file_len = self.file_len()?;
+        // First-IFD pointer is a 64-bit value stored at byte 4 (after II/MM + 42).
+        self.reader.seek(SeekFrom::Start(4))?;
+        let mut offset = read_u64(&mut self.reader, self.little_endian)?;
+
+        let mut ifds = Vec::new();
+        let mut visited = HashSet::new();
+        while offset != 0 && offset < file_len {
+            if !visited.insert(offset) {
+                break;
+            }
+            let (ifd, next) = self.read_ifd_ndpi64(offset, file_len)?;
+            ifds.push(ifd);
+            offset = next;
+            if ifds.len() > 100_000 {
+                break; // runaway guard
+            }
+        }
+        if ifds.is_empty() {
+            return Err(BioFormatsError::Format(
+                "NDPI 64-bit IFD walk found no IFDs".into(),
+            ));
+        }
+        Ok(ifds)
+    }
+
+    /// Read one NDPI 64-bit IFD at `offset`; returns the IFD and the 64-bit
+    /// next-IFD offset. See [`read_ifds_ndpi64`](Self::read_ifds_ndpi64).
+    fn read_ifd_ndpi64(&mut self, offset: u64, file_len: u64) -> Result<(Ifd, u64)> {
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let entry_count = read_u16(&mut self.reader, self.little_endian)? as usize;
+
+        // Pass 1: read the raw entry table (low 32 bits only), the 64-bit
+        // next-IFD pointer, then the per-entry high-word trailer.
+        let mut raw: Vec<(u16, u16, u64, u64)> = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let tag = read_u16(&mut self.reader, self.little_endian)?;
+            let type_code = read_u16(&mut self.reader, self.little_endian)?;
+            let count = read_u32(&mut self.reader, self.little_endian)? as u64;
+            let low32 = read_u32(&mut self.reader, self.little_endian)? as u64;
+            raw.push((tag, type_code, count, low32));
+        }
+        let next_ifd = read_u64(&mut self.reader, self.little_endian)?;
+        let mut high = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            high.push(read_u32(&mut self.reader, self.little_endian)? as u64);
+        }
+
+        // Pass 2: materialise each entry, combining low + (high << 32).
+        let mut entries = HashMap::new();
+        for (i, &(tag, type_code, count, low32)) in raw.iter().enumerate() {
+            let Some(type_size) = Self::ifd_type_size(type_code) else {
+                continue;
+            };
+            let high_word = high.get(i).copied().unwrap_or(0);
+            let total_bytes = count.saturating_mul(type_size);
+            let value = if total_bytes <= 4 {
+                if high_word > 0 {
+                    // An inline scalar offset/value that overflows 32 bits
+                    // (e.g. single-strip StripOffsets/StripByteCounts past 4 GB):
+                    // the true value is low | (high << 32).
+                    IfdValue::Long8(vec![low32 | (high_word << 32)])
+                } else {
+                    // Ordinary inline value: decode the 4 field bytes in file order.
+                    let fb = if self.little_endian {
+                        (low32 as u32).to_le_bytes()
+                    } else {
+                        (low32 as u32).to_be_bytes()
+                    };
+                    self.read_ifd_value(type_code, count, low32, &fb)?
+                }
+            } else {
+                // Out-of-line array: its storage offset is corrected by the high
+                // word, then the array is read from there as usual.
+                let corrected = low32 | (high_word << 32);
+                if corrected >= file_len {
+                    continue;
+                }
+                self.read_ifd_value(type_code, count, corrected, &[0u8; 4])?
+            };
+            entries.insert(tag, value);
+        }
+
+        Ok((Ifd { entries }, next_ifd))
+    }
+
     fn file_len(&mut self) -> Result<u64> {
         let pos = self.reader.stream_position()?;
         let len = self.reader.seek(SeekFrom::End(0))?;
@@ -275,9 +390,26 @@ impl<R: Read + Seek> TiffParser<R> {
             // truncates the element count to what actually fits in the file
             // (count = (fileLen - offset) / bytesPerElement) rather than
             // erroring. This tolerates slightly-truncated files that Java reads.
+            //
+            // But the clamp is to "rest of file", so a garbage IFD (e.g. from a
+            // malformed >4 GB NDPI offset chain, where a bogus tag carries a
+            // billion-element count) would clamp to multiple GB and eagerly
+            // allocate them. No legitimate TIFF tag value is anywhere near this
+            // large, so cap the eager read: real arrays are unaffected, garbage
+            // tags get a bounded (harmless) truncated value instead of an OOM.
+            const MAX_IFD_VALUE_BYTES: u64 = 64 << 20; // 64 MiB
             let file_len = self.file_len()?;
             let available = file_len.saturating_sub(value_or_offset);
-            let usable_bytes = (total_bytes.min(available) / type_size) * type_size;
+            let usable_bytes =
+                (total_bytes.min(available).min(MAX_IFD_VALUE_BYTES) / type_size) * type_size;
+            // Charge against the per-chain budget so a malformed IFD chain can't
+            // accumulate gigabytes of clamped value arrays during open().
+            self.ifd_value_budget = self.ifd_value_budget.checked_sub(usable_bytes).ok_or_else(|| {
+                BioFormatsError::Format(
+                    "TIFF IFD value arrays exceed the parse budget (malformed/garbage IFD chain)"
+                        .into(),
+                )
+            })?;
             let usable_count = usable_bytes / type_size;
             let usable_bytes = usize::try_from(usable_bytes).map_err(|_| {
                 BioFormatsError::Format("TIFF IFD value byte count does not fit in memory".into())

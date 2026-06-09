@@ -334,23 +334,68 @@ macro_rules! placeholder_reader {
 // ---------------------------------------------------------------------------
 // 1. Applied Precision APL
 // ---------------------------------------------------------------------------
-/// Applied Precision format reader (`.apl`).
+/// Olympus APL format reader (`.apl`/`.mtb`/`.tnb`).
 ///
-/// Applied Precision APL is a proprietary binary format used by DeltaVision
-/// instruments. The internal structure requires vendor documentation.
+/// Faithful port of Bio-Formats `loci.formats.in.APLReader`. An APL dataset is
+/// an MS-Access database sidecar (`*_d.mtb`) listing one multi-page TIFF per
+/// acquisition, stored in a `*_DocumentFiles` directory. Each listed TIFF
+/// becomes one Bio-Formats series; dimensions come from the database row
+/// (Frames/Z-Layers/Color Channels) reconciled against the TIFF's IFDs, and
+/// pixel reads are delegated to [`crate::tiff::TiffReader`].
+///
+/// The `.mtb` is parsed via [`crate::common::mdb`] (mdbtools-rs), matching
+/// Java's `MDBService`. Per-channel/physical-size OME store calls are not
+/// represented in `ImageMetadata` and are omitted.
+struct AplSeries {
+    meta: ImageMetadata,
+    tiff_path: PathBuf,
+}
+
 pub struct AplReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    layout: Option<StrictRawLayout>,
+    series_list: Vec<AplSeries>,
+    series: usize,
+    cache: Option<(usize, crate::tiff::TiffReader)>,
 }
 
 impl AplReader {
     pub fn new() -> Self {
         AplReader {
-            path: None,
-            meta: None,
-            layout: None,
+            series_list: Vec::new(),
+            series: 0,
+            cache: None,
         }
+    }
+
+    fn check_suffix(name: &str, suffix: &str) -> bool {
+        name.to_ascii_lowercase()
+            .ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
+    }
+
+    fn index_of(columns: &[String], name: &str) -> Option<usize> {
+        columns.iter().position(|c| c == name)
+    }
+
+    /// Parse an integer dimension; Java falls back to 1 on parse failure.
+    fn parse_dimension(s: &str) -> u32 {
+        s.trim().parse::<i64>().map(|v| v.max(0) as u32).unwrap_or(1)
+    }
+
+    fn cell<'a>(row: &'a [String], idx: Option<usize>) -> &'a str {
+        idx.and_then(|i| row.get(i)).map(|s| s.trim()).unwrap_or("")
+    }
+
+    /// Port of Java `parseFilename`.
+    fn parse_filename(row: &[String], filename_idx: Option<usize>, path_idx: Option<usize>) -> String {
+        let file = Self::cell(row, filename_idx);
+        if Self::check_suffix(file, "tif") {
+            return file.to_string();
+        }
+        let file_path = Self::cell(row, path_idx).replace('\\', "/");
+        file_path
+            .rsplit('/')
+            .next()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -362,68 +407,260 @@ impl Default for AplReader {
 
 impl FormatReader for AplReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // Java METADATA_SUFFIXES = {apl, tnb, mtb}.
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("apl"))
+        matches!(ext.as_deref(), Some("apl") | Some("tnb") | Some("mtb"))
     }
 
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(b"BFAPL\0\0\0")
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // APL has no magic-byte signature (suffixSufficient is false but there
+        // is no isThisType(stream) override either).
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.layout = None;
-        let (meta, layout) =
-            parse_strict_raw_subset(path, b"BFAPL\0\0\0", "Applied Precision APL")?;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.series_list.clear();
+        self.series = 0;
+        self.cache = None;
+
+        let id = path.to_string_lossy().to_string();
+
+        // -- locate the corresponding .mtb file --
+        let mtb_path: PathBuf = if Self::check_suffix(&id, "mtb") {
+            path.to_path_buf()
+        } else if Self::check_suffix(&id, "apl")
+            || Self::check_suffix(&id, "tnb")
+        {
+            let separator = id.rfind('/').map(|i| i as i64).unwrap_or(0);
+            let mut underscore = id.rfind('_').map(|i| i as i64).unwrap_or(-1);
+            if underscore < separator || Self::check_suffix(&id, "apl") {
+                underscore = id.rfind('.').map(|i| i as i64).unwrap_or(-1);
+            }
+            if underscore < 0 {
+                return Err(BioFormatsError::Format("APL: .mtb file not found".to_string()));
+            }
+            let mtb = format!("{}_d.mtb", &id[..underscore as usize]);
+            let mtb_pb = PathBuf::from(&mtb);
+            if !mtb_pb.exists() {
+                return Err(BioFormatsError::Format("APL: .mtb file not found".to_string()));
+            }
+            mtb_pb
+        } else {
+            // Some other file (e.g. a .tif): look two directories up for a .mtb.
+            let parent = path
+                .parent()
+                .and_then(|p| p.parent())
+                .ok_or_else(|| BioFormatsError::Format("APL: .mtb file not found".to_string()))?;
+            let mut found = None;
+            for entry in std::fs::read_dir(parent).map_err(BioFormatsError::Io)? {
+                let entry = entry.map_err(BioFormatsError::Io)?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if Self::check_suffix(&name, "mtb") {
+                    found = Some(entry.path());
+                    break;
+                }
+            }
+            found.ok_or_else(|| BioFormatsError::Format("APL: .mtb file not found".to_string()))?
+        };
+
+        // -- parse the .mtb database (first table) --
+        let tables = crate::common::mdb::parse_database(&mtb_path)?;
+        let table = tables
+            .into_iter()
+            .next()
+            .ok_or_else(|| BioFormatsError::Format("APL: empty .mtb database".to_string()))?;
+        let columns = &table.columns;
+        let data_rows = &table.rows;
+
+        let color_channels = Self::index_of(columns, "Color Channels");
+        let frames = Self::index_of(columns, "Frames");
+        let path_idx = Self::index_of(columns, "Image Path")
+            .or_else(|| Self::index_of(columns, "Path"));
+        let filename_idx = Self::index_of(columns, "File Name");
+        let image_type = Self::index_of(columns, "Image Type");
+        let z_layers = Self::index_of(columns, "Z-Layers");
+
+        let parent_directory = mtb_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // -- find the *_DocumentFiles directory holding the TIFFs --
+        // First, use the path recorded in the database rows (Java starts at
+        // database row index 2, i.e. the second data row).
+        let mut path_name = String::new();
+        for r in 1..data_rows.len() {
+            let v = Self::cell(&data_rows[r], path_idx);
+            if !v.is_empty() {
+                path_name = v.to_string();
+                break;
+            }
+        }
+        path_name = path_name.replace('\\', "/");
+
+        let mut top_directory: Option<PathBuf> = None;
+        for component in path_name.split('/').rev() {
+            if component.find("_DocumentFiles").map(|i| i > 0).unwrap_or(false) {
+                let candidate = parent_directory.join(component);
+                if candidate.exists() {
+                    top_directory = Some(candidate);
+                    break;
+                }
+            }
+        }
+        if top_directory.is_none() {
+            if let Ok(entries) = std::fs::read_dir(&parent_directory) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if entry.path().is_dir()
+                        && name.find("_DocumentFiles").map(|i| i > 0).unwrap_or(false)
+                    {
+                        top_directory = Some(entry.path());
+                        break;
+                    }
+                }
+            }
+        }
+        let top_directory = top_directory.ok_or_else(|| {
+            BioFormatsError::Format("APL: could not find a directory with TIFF files".to_string())
+        })?;
+
+        // -- collect the data rows that reference an existing TIFF --
+        let mut series_rows: Vec<usize> = Vec::new();
+        for (di, row) in data_rows.iter().enumerate() {
+            let file = Self::parse_filename(row, filename_idx, path_idx);
+            if file.is_empty() {
+                continue;
+            }
+            let full = top_directory.join(&file);
+            if full.exists() && Self::check_suffix(&file, "tif") {
+                series_rows.push(di);
+            }
+        }
+        if series_rows.is_empty() {
+            return Err(BioFormatsError::Format(
+                "APL: no referenced TIFF files were found".to_string(),
+            ));
+        }
+
+        for &di in &series_rows {
+            let row3 = &data_rows[di];
+
+            let mut size_t = 1u32;
+            let mut size_z = 1u32;
+            let mut size_c = 1u32;
+            if frames.is_some() {
+                size_t = Self::parse_dimension(Self::cell(row3, frames));
+            }
+            if z_layers.is_some() {
+                size_z = Self::parse_dimension(Self::cell(row3, z_layers));
+            }
+            if color_channels.is_some() {
+                size_c = Self::parse_dimension(Self::cell(row3, color_channels));
+            } else if image_type.is_some() && Self::cell(row3, image_type) == "RGB" {
+                size_c = 3;
+            }
+            if size_z == 0 {
+                size_z = 1;
+            }
+            if size_c == 0 {
+                size_c = 1;
+            }
+            if size_t == 0 {
+                size_t = 1;
+            }
+
+            let tiff_path = top_directory.join(Self::parse_filename(row3, filename_idx, path_idx));
+
+            // Read core metadata from the TIFF.
+            let mut tiff = crate::tiff::TiffReader::new();
+            tiff.set_id(&tiff_path)?;
+            let tm = tiff.metadata();
+            let size_x = tm.size_x;
+            let size_y = tm.size_y;
+            let pixel_type = tm.pixel_type;
+            let little_endian = tm.is_little_endian;
+            let is_rgb = tm.is_rgb;
+            let image_count = tm.image_count;
+
+            // Reconcile dimensions with the IFD count (Java's correction).
+            let effective_c = if is_rgb { 1 } else { size_c };
+            if effective_c > 0 && size_z * size_t * effective_c != image_count {
+                size_t = image_count / effective_c;
+                size_z = 1;
+            }
+
+            let meta = ImageMetadata {
+                size_x,
+                size_y,
+                size_z,
+                size_c,
+                size_t,
+                pixel_type,
+                bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+                image_count,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb,
+                is_little_endian: little_endian,
+                ..ImageMetadata::default()
+            };
+            self.series_list.push(AplSeries { meta, tiff_path });
+        }
+
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.layout = None;
+        self.series_list.clear();
+        self.series = 0;
+        self.cache = None;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.series_list.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
-            Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
-            Ok(())
-        } else {
+        if s >= self.series_list.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            self.series = s;
+            Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.series_list
+            .get(self.series)
+            .map(|s| &s.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
+        let series = self
+            .series_list
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= series.meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
-        read_strict_raw_plane(path, layout, plane_index)
+        let tiff_path = series.tiff_path.clone();
+        let needs_open = !matches!(&self.cache, Some((s, _)) if *s == self.series);
+        if needs_open {
+            let mut tiff = crate::tiff::TiffReader::new();
+            tiff.set_id(&tiff_path)?;
+            self.cache = Some((self.series, tiff));
+        }
+        let tiff = &mut self.cache.as_mut().unwrap().1;
+        tiff.open_bytes(plane_index)
     }
 
     fn open_bytes_region(
@@ -434,14 +671,21 @@ impl FormatReader for AplReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let meta = meta.clone();
+        let meta = self
+            .series_list
+            .get(self.series)
+            .map(|s| s.meta.clone())
+            .ok_or(BioFormatsError::NotInitialized)?;
         let plane = self.open_bytes(plane_index)?;
         crop_plane(&plane, &meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .series_list
+            .get(self.series)
+            .map(|s| &s.meta)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
@@ -692,20 +936,39 @@ impl FormatReader for ArfReader {
 // ---------------------------------------------------------------------------
 /// I2I format reader (`.i2i`).
 ///
-/// I2I is a proprietary format with undocumented structure.
+/// Faithful port of Bio-Formats `loci.formats.in.I2IReader`. I2I is a simple
+/// raw format with a fixed 1024-byte ASCII/binary header:
+///   - byte 0: pixel-type character `'I'` (INT16), `'R'` (FLOAT32) or `'C'`
+///     (complex, unsupported);
+///   - byte 1: a space `' '`;
+///   - bytes 2..8, 8..14, 14..20: sizeX, sizeY, sizeZ as 6-char ASCII integers;
+///   - byte 20: endianness flag (`'B'` ⇒ big-endian, otherwise little-endian);
+///   - then int16 min/max/x/y and the additional-dimension count `n` (`sizeT`),
+///     33 reserved bytes and 15×64 history strings.
+/// Pixel data starts at offset `HEADER_SIZE` (1024); planes are stored raw and
+/// contiguous.
 pub struct I2iReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    layout: Option<StrictRawLayout>,
 }
+
+const I2I_HEADER_SIZE: u64 = 1024;
 
 impl I2iReader {
     pub fn new() -> Self {
         I2iReader {
             path: None,
             meta: None,
-            layout: None,
         }
+    }
+
+    /// Parse a 6-byte ASCII dimension field, trimming whitespace. Mirrors the
+    /// Java `getDimension`: a non-numeric/blank field yields 0.
+    fn parse_dimension(bytes: &[u8]) -> i32 {
+        String::from_utf8_lossy(bytes)
+            .trim()
+            .parse::<i32>()
+            .unwrap_or(0)
     }
 }
 
@@ -725,24 +988,117 @@ impl FormatReader for I2iReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(b"BFI2I\0\0\0")
+        // Java isThisType: requires at least HEADER_SIZE bytes, a valid pixel
+        // type character, a space separator, and a positive pixel count.
+        if header.len() < 20 {
+            return false;
+        }
+        let pixel_type = header[0];
+        if pixel_type != b'I' && pixel_type != b'R' && pixel_type != b'C' {
+            return false;
+        }
+        if header[1] != b' ' {
+            return false;
+        }
+        let sx = Self::parse_dimension(&header[2..8]) as i64;
+        let sy = Self::parse_dimension(&header[8..14]) as i64;
+        let sz = Self::parse_dimension(&header[14..20]) as i64;
+        sx * sy * sz > 0
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.layout = None;
-        let (meta, layout) = parse_strict_raw_subset(path, b"BFI2I\0\0\0", "I2I")?;
+
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let mut header = [0u8; 64];
+        f.read_exact(&mut header).map_err(BioFormatsError::Io)?;
+
+        let pixel_type = match header[0] {
+            b'I' => PixelType::Int16,
+            b'R' => PixelType::Float32,
+            b'C' => {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "I2I complex pixel data not yet supported".to_string(),
+                ))
+            }
+            other => {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "I2I invalid pixel type: {}",
+                    other as char
+                )))
+            }
+        };
+        if header[1] != b' ' {
+            return Err(BioFormatsError::InvalidData(
+                "I2I expected space after pixel type character".to_string(),
+            ));
+        }
+
+        let size_x = Self::parse_dimension(&header[2..8]);
+        let size_y = Self::parse_dimension(&header[8..14]);
+        let mut size_z = Self::parse_dimension(&header[14..20]);
+
+        // byte 20: endianness flag.
+        let little_endian = header[20] != b'B';
+        let read_i16 = |b: &[u8]| -> i16 {
+            if little_endian {
+                i16::from_le_bytes([b[0], b[1]])
+            } else {
+                i16::from_be_bytes([b[0], b[1]])
+            }
+        };
+
+        // shorts at offset 21: min, max, x, y, then n.
+        let n = read_i16(&header[29..31]) as i32;
+
+        // The stored Z value is the total plane count; divide by n (the
+        // additional dimension) to get the true Z count, per the Java reader.
+        if n > 0 {
+            size_z /= n;
+        }
+        let size_t = n;
+
+        if size_x <= 0 || size_y <= 0 || size_z <= 0 || size_t <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "I2I header has non-positive dimensions".to_string(),
+            ));
+        }
+
+        let size_z = size_z as u32;
+        let size_t = size_t as u32;
+        let image_count = size_z
+            .checked_mul(size_t)
+            .ok_or_else(|| BioFormatsError::Format("I2I image count overflows".to_string()))?;
+
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.meta = Some(ImageMetadata {
+            size_x: size_x as u32,
+            size_y: size_y as u32,
+            size_z,
+            size_c: 1,
+            size_t,
+            pixel_type,
+            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            image_count,
+            dimension_order: DimensionOrder::XYZTC,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: little_endian,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.layout = None;
         Ok(())
     }
 
@@ -775,9 +1131,19 @@ impl FormatReader for I2iReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
+        let plane_size = checked_plane_len(meta)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
-        read_strict_raw_plane(path, layout, plane_index)
+        let offset = I2I_HEADER_SIZE + plane_index as u64 * plane_size as u64;
+
+        // Java leaves the buffer zero-filled when the offset is out of range.
+        let mut buf = vec![0u8; plane_size];
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if offset + plane_size as u64 <= file_len {
+            f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+            f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        }
+        Ok(buf)
     }
 
     fn open_bytes_region(
@@ -807,22 +1173,56 @@ impl FormatReader for I2iReader {
 // ---------------------------------------------------------------------------
 // 4. JDCE format
 // ---------------------------------------------------------------------------
-/// JDCE format reader (`.jdce`).
+/// Molecular Devices JDCE plate reader (`.jdce`).
 ///
-/// JDCE is a proprietary format with undocumented structure.
+/// Faithful port of Bio-Formats `loci.formats.in.JDCEReader`. A `.jdce` file is
+/// a JSON description of a high-content-screening plate that references a CSV
+/// image-metadata file; the CSV in turn lists one TIFF file per plane. Each
+/// well/field becomes one Bio-Formats series and pixel reads are delegated to
+/// the matching TIFF via [`crate::tiff::TiffReader`].
+///
+/// Blind translation (no sample). The plate/channel/timestamp metadata that the
+/// Java reader pushes into the OME store is not represented in `ImageMetadata`
+/// and is therefore parsed only as far as needed to size the planes; per-plane
+/// CSV sizes fall back to the first TIFF's dimensions.
 pub struct JdceReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    layout: Option<StrictRawLayout>,
+    series_list: Vec<JdceSeries>,
+    series: usize,
+}
+
+struct JdceSeries {
+    meta: ImageMetadata,
+    /// Plane index -> absolute TIFF path (None = missing plane, zero-filled).
+    files: Vec<Option<String>>,
+}
+
+#[derive(Default)]
+struct JdceWell {
+    row: i32,
+    col: i32,
+    field_count: usize,
+    /// (field, plane) -> absolute TIFF path.
+    files: HashMap<(u32, u32), String>,
 }
 
 impl JdceReader {
     pub fn new() -> Self {
         JdceReader {
-            path: None,
-            meta: None,
-            layout: None,
+            series_list: Vec::new(),
+            series: 0,
         }
+    }
+
+    /// FormatTools.getIndex for dimension order "XYCZT": C varies fastest,
+    /// then Z, then T.
+    fn get_index(z: u32, c: u32, t: u32, size_z: u32, size_c: u32) -> u32 {
+        ((t * size_z) + z) * size_c + c
+    }
+
+    fn json_obj<'a>(v: &'a serde_json::Value, key: &str) -> Result<&'a serde_json::Value> {
+        v.get(key).ok_or_else(|| {
+            BioFormatsError::Format(format!("JDCE: missing JSON element \"{key}\""))
+        })
     }
 }
 
@@ -841,60 +1241,310 @@ impl FormatReader for JdceReader {
         matches!(ext.as_deref(), Some("jdce"))
     }
 
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(b"BFJDCE\0\0")
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // JDCE is detected by its ".jdce" suffix (suffixSufficient in Java);
+        // the payload is generic JSON with no fixed magic.
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.layout = None;
-        let (meta, layout) = parse_strict_raw_subset(path, b"BFJDCE\0\0", "JDCE")?;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.series_list.clear();
+        self.series = 0;
+
+        let parent_dir = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let mut json_text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+        if !json_text.starts_with('{') {
+            if let Some(brace) = json_text.find('{') {
+                json_text = json_text[brace..].to_string();
+            }
+        }
+        let root: serde_json::Value = serde_json::from_str(&json_text)
+            .map_err(|e| BioFormatsError::Format(format!("Could not parse .jdce file: {e}")))?;
+
+        let image_stack = Self::json_obj(&root, "ImageStack")?;
+        let image_format = Self::json_obj(image_stack, "ImageFormat")?
+            .as_str()
+            .unwrap_or("");
+        if !image_format.eq_ignore_ascii_case("TIFF") {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "JDCE unsupported image format {image_format}"
+            )));
+        }
+
+        let acquisition = Self::json_obj(image_stack, "AutoLeadAcquisitionProtocol")?;
+        let plate_map = Self::json_obj(acquisition, "PlateMap")?;
+        let time_schedule = Self::json_obj(plate_map, "TimeSchedule")?;
+        let timepoints = Self::json_obj(time_schedule, "Times")?
+            .as_array()
+            .ok_or_else(|| BioFormatsError::Format("JDCE: Times is not an array".to_string()))?;
+        let size_t = timepoints.len().max(1) as u32;
+
+        let z_dimension = Self::json_obj(plate_map, "ZDimensionParameters")?;
+        let mut size_z = Self::json_obj(z_dimension, "NumberOfSlices")?
+            .as_i64()
+            .unwrap_or(1)
+            .max(1) as u32;
+
+        let wavelengths = Self::json_obj(acquisition, "Wavelengths")?
+            .as_array()
+            .ok_or_else(|| {
+                BioFormatsError::Format("JDCE: Wavelengths is not an array".to_string())
+            })?;
+        let wavelength_count = wavelengths.len().max(1) as u32;
+
+        // Reset Z to 1 when every channel is a "Max Intensity Projection".
+        let mut single_z = true;
+        let mut first_mode: Option<String> = None;
+        for w in wavelengths {
+            let mode = w.get("ImagingMode").and_then(|m| m.as_str()).unwrap_or("");
+            let first = first_mode.get_or_insert_with(|| mode.to_string()).clone();
+            if mode != "Max Intensity Projection" || mode != first {
+                single_z = false;
+            }
+        }
+        if single_z {
+            size_z = 1;
+        }
+
+        let metadata_files = Self::json_obj(image_stack, "ImageMetadataFiles")?
+            .as_array()
+            .ok_or_else(|| {
+                BioFormatsError::Format(
+                    "JDCE: ImageMetadataFiles missing, cannot find TIFF list".to_string(),
+                )
+            })?;
+        let csv_name = metadata_files
+            .first()
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BioFormatsError::Format("JDCE: empty ImageMetadataFiles".to_string()))?;
+        let csv_path = parent_dir.join(csv_name);
+
+        // image_count uses the wavelength channel count (matching Java, which
+        // sets ms0.imageCount before multiplying sizeC by the TIFF channels).
+        let image_count = size_z * wavelength_count * size_t;
+
+        let csv_text = std::fs::read_to_string(&csv_path).map_err(BioFormatsError::Io)?;
+        let mut lines = csv_text.split("\r\n");
+        let header = lines
+            .next()
+            .ok_or_else(|| BioFormatsError::Format("JDCE: empty CSV".to_string()))?;
+        let columns: Vec<&str> = header.split(',').collect();
+        let col = |name: &str| columns.iter().position(|c| *c == name);
+
+        let well_row_index = col("Row");
+        let well_col_index = col("Column");
+        let field_index = col("Field");
+        let wavelength_index = col("Wavelength");
+        let timepoint_index = col("Timepoint");
+        let z_index = col("ZIndex");
+        let subfolder_index = col("ImageSubFolderPath");
+        let filename_index = col("ImageFileName");
+        let width_index = col("ImageSizeXPx");
+        let height_index = col("ImageSizeYPx");
+
+        let (
+            well_row_index,
+            well_col_index,
+            field_index,
+            wavelength_index,
+            timepoint_index,
+            z_index,
+            subfolder_index,
+            filename_index,
+        ) = match (
+            well_row_index,
+            well_col_index,
+            field_index,
+            wavelength_index,
+            timepoint_index,
+            z_index,
+            subfolder_index,
+            filename_index,
+        ) {
+            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(g), Some(h)) => {
+                (a, b, c, d, e, f, g, h)
+            }
+            _ => {
+                return Err(BioFormatsError::Format(
+                    "JDCE: CSV missing required columns".to_string(),
+                ))
+            }
+        };
+
+        let mut wells: Vec<JdceWell> = Vec::new();
+        let mut size_x: u32 = 0;
+        let mut size_y: u32 = 0;
+        let mut pixel_type = PixelType::Uint8;
+        let mut little_endian = true;
+        let mut tiff_size_c: u32 = 1;
+        let mut is_rgb = false;
+        let mut first_file = true;
+
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split(',').collect();
+            let get = |i: usize| fields.get(i).map(|s| s.trim()).unwrap_or("");
+            let parse = |i: usize| get(i).parse::<i64>().unwrap_or(0);
+
+            let field = parse(field_index).max(0) as u32;
+            let z = parse(z_index).max(0) as u32;
+            let wavelength = parse(wavelength_index).max(0) as u32;
+            let timepoint = parse(timepoint_index).max(0) as u32;
+
+            let subfolder = get(subfolder_index);
+            let filename = get(filename_index);
+            let image_path = parent_dir
+                .join(subfolder)
+                .join(filename)
+                .to_string_lossy()
+                .into_owned();
+
+            let well_row = parse(well_row_index) as i32 - 1;
+            let well_col = parse(well_col_index) as i32 - 1;
+
+            let well_pos = wells
+                .iter()
+                .position(|w| w.row == well_row && w.col == well_col);
+            let well = match well_pos {
+                Some(i) => &mut wells[i],
+                None => {
+                    wells.push(JdceWell {
+                        row: well_row,
+                        col: well_col,
+                        field_count: 0,
+                        files: HashMap::new(),
+                    });
+                    wells.last_mut().unwrap()
+                }
+            };
+            let plane = Self::get_index(z, wavelength, timepoint, size_z, wavelength_count);
+            well.files.insert((field, plane), image_path.clone());
+            well.field_count = well.field_count.max(field as usize + 1);
+
+            // CSV per-plane sizes (used as fallback for the TIFF width/height).
+            let csv_w = width_index
+                .and_then(|i| get(i).parse::<u32>().ok())
+                .unwrap_or(0);
+            let csv_h = height_index
+                .and_then(|i| get(i).parse::<u32>().ok())
+                .unwrap_or(0);
+
+            if first_file {
+                let mut tiff = crate::tiff::TiffReader::new();
+                if tiff.set_id(Path::new(&image_path)).is_ok() {
+                    let m = tiff.metadata();
+                    size_x = if csv_w == 0 { m.size_x } else { csv_w };
+                    size_y = if csv_h == 0 { m.size_y } else { csv_h };
+                    pixel_type = m.pixel_type;
+                    little_endian = m.is_little_endian;
+                    tiff_size_c = m.size_c.max(1);
+                    is_rgb = m.is_rgb;
+                    first_file = false;
+                } else {
+                    size_x = csv_w;
+                    size_y = csv_h;
+                }
+            }
+        }
+
+        if wells.is_empty() {
+            return Err(BioFormatsError::Format(
+                "JDCE: no image entries found in CSV".to_string(),
+            ));
+        }
+        if size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "JDCE: could not determine plane dimensions".to_string(),
+            ));
+        }
+
+        let size_c = wavelength_count * tiff_size_c;
+        let bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
+
+        // Sort wells by (row, column), then expand fields into series.
+        wells.sort_by_key(|w| (w.row, w.col));
+        for well in &wells {
+            for field in 0..well.field_count as u32 {
+                let mut files = vec![None; image_count as usize];
+                for (plane, slot) in files.iter_mut().enumerate() {
+                    if let Some(f) = well.files.get(&(field, plane as u32)) {
+                        *slot = Some(f.clone());
+                    }
+                }
+                let meta = ImageMetadata {
+                    size_x,
+                    size_y,
+                    size_z,
+                    size_c,
+                    size_t,
+                    pixel_type,
+                    bits_per_pixel,
+                    image_count,
+                    dimension_order: DimensionOrder::XYCZT,
+                    is_rgb,
+                    is_interleaved: false,
+                    is_indexed: false,
+                    is_little_endian: little_endian,
+                    resolution_count: 1,
+                    series_metadata: HashMap::new(),
+                    lookup_table: None,
+                    modulo_z: None,
+                    modulo_c: None,
+                    modulo_t: None,
+                };
+                self.series_list.push(JdceSeries { meta, files });
+            }
+        }
+
+        if self.series_list.is_empty() {
+            return Err(BioFormatsError::Format("JDCE: no series found".to_string()));
+        }
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.layout = None;
+        self.series_list.clear();
+        self.series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.series_list.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
-            Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
-            Ok(())
-        } else {
+        if s >= self.series_list.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            self.series = s;
+            Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.series_list
+            .get(self.series)
+            .map(|s| &s.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
-        read_strict_raw_plane(path, layout, plane_index)
+        let series = self
+            .series_list
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let (w, h) = (series.meta.size_x, series.meta.size_y);
+        self.open_bytes_region(plane_index, 0, 0, w, h)
     }
 
     fn open_bytes_region(
@@ -905,18 +1555,37 @@ impl FormatReader for JdceReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let meta = meta.clone();
-        let plane = self.open_bytes(plane_index)?;
-        crop_plane(&plane, &meta, x, y, w, h)
+        let series = self
+            .series_list
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= series.meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let bpp = series.meta.pixel_type.bytes_per_sample();
+        let fill_len = (w as usize) * (h as usize) * bpp;
+        let file = series.files.get(plane_index as usize).and_then(|f| f.clone());
+        if let Some(file) = file {
+            let mut tiff = crate::tiff::TiffReader::new();
+            if tiff.set_id(Path::new(&file)).is_ok() {
+                if let Ok(bytes) = tiff.open_bytes_region(0, x, y, w, h) {
+                    return Ok(bytes);
+                }
+            }
+        }
+        // Missing/unreadable plane: zero-filled, as in the Java reader.
+        Ok(vec![0u8; fill_len])
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
+        let series = self
+            .series_list
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let tw = series.meta.size_x.min(256);
+        let th = series.meta.size_y.min(256);
+        let tx = (series.meta.size_x - tw) / 2;
+        let ty = (series.meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
@@ -998,14 +1667,23 @@ impl FormatReader for JpxReader {
 // ---------------------------------------------------------------------------
 // 6. Capture Pro Image (PCI)
 // ---------------------------------------------------------------------------
-/// Capture Pro Image format reader (`.pci`).
+/// SimplePCI / Compix `.cxd`/`.pci` format reader.
 ///
-/// Capture Pro is a proprietary format from Media Cybernetics with
-/// undocumented binary structure.
+/// Faithful port of Bio-Formats `loci.formats.in.PCIReader`. The file is an
+/// OLE2/POI compound document whose streams hold either little-endian scalar
+/// metadata (8-byte doubles, ints, shorts) or pixel data (raw planes or
+/// embedded TIFFs in `Bitmap*` / `Image*/Data` streams). Dimensions are derived
+/// from `Image_Width`/`Image_Height`/`Image_Depth`, `Field Count`, `GroupMode`,
+/// `GroupSelectedFields` and Z positions exactly as in the Java reader.
+///
+/// Blind translation (no sample available). Metadata parsing and raw/TIFF plane
+/// reading are implemented; the `getImageIndex` field re-indexing is ported
+/// literally but unverified against real data.
 pub struct PciReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    layout: Option<StrictRawLayout>,
+    /// Plane index -> OLE2 stream path holding that plane's pixels.
+    image_files: HashMap<u32, String>,
 }
 
 impl PciReader {
@@ -1013,8 +1691,144 @@ impl PciReader {
         PciReader {
             path: None,
             meta: None,
-            layout: None,
+            image_files: HashMap::new(),
         }
+    }
+
+    fn read_f64_le(b: &[u8]) -> Option<f64> {
+        if b.len() < 8 {
+            return None;
+        }
+        Some(f64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+    fn read_i32_le(b: &[u8]) -> Option<i32> {
+        if b.len() < 4 {
+            return None;
+        }
+        Some(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn read_i16_le(b: &[u8]) -> Option<i16> {
+        if b.len() < 2 {
+            return None;
+        }
+        Some(i16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn pixel_type_from_bytes(bytes: i64) -> Result<PixelType> {
+        Ok(match bytes {
+            1 => PixelType::Uint8,
+            2 => PixelType::Uint16,
+            4 => PixelType::Uint32,
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "PCI unsupported sample size {bytes} bytes"
+                )))
+            }
+        })
+    }
+
+    /// Split an OLE2 document path into (parent, trimmed last component).
+    fn split_path(name: &str) -> (&str, &str) {
+        match name.rfind('/') {
+            Some(sep) => (&name[..sep], name[sep + 1..].trim()),
+            None => ("", name.trim()),
+        }
+    }
+
+    /// Port of Java `getImageIndex`.
+    fn image_index(path: &str, effective_size_c: i64) -> Option<u32> {
+        let space = path.rfind(' ').map(|i| i + 1)?;
+        if space >= path.len() {
+            return None;
+        }
+        let end = path[space..].find('/').map(|i| space + i)?;
+        let field = &path[space..end];
+
+        let mut image = "1".to_string();
+        if let Some(pos) = path.find("Image") {
+            let image_index = pos + 5;
+            let end2 = path[image_index..]
+                .find('/')
+                .map(|i| image_index + i)
+                .unwrap_or(path.len());
+            image = path[image_index..end2].to_string();
+        }
+        let channel = image.parse::<i64>().ok()? - 1;
+        let field_num = field.parse::<i64>().ok()? - 1;
+        let idx = effective_size_c * field_num + channel;
+        if idx < 0 {
+            None
+        } else {
+            Some(idx as u32)
+        }
+    }
+
+    /// Decode one image stream: an embedded TIFF (delegated to `TiffReader`
+    /// via a temp file) or a raw planar block cropped to the requested region.
+    fn read_image_stream(
+        &self,
+        ole: &mut crate::common::ole::OleFile,
+        file: &str,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let bytes = ole.document_bytes(file)?;
+
+        let is_tiff = bytes.len() >= 4
+            && (bytes[..2] == *b"II" || bytes[..2] == *b"MM")
+            && (bytes[2] == 42 || bytes[3] == 42);
+        if is_tiff {
+            let mut tmp = std::env::temp_dir();
+            tmp.push(format!(
+                "bioformats_pci_{}_{}.tif",
+                std::process::id(),
+                x as u64 * 131 + y as u64 * 17 + w as u64
+            ));
+            std::fs::write(&tmp, &bytes).map_err(BioFormatsError::Io)?;
+            let mut tiff = crate::tiff::TiffReader::new();
+            let result = (|| {
+                tiff.set_id(&tmp)?;
+                tiff.open_bytes_region(0, x, y, w, h)
+            })();
+            let _ = std::fs::remove_file(&tmp);
+            return result;
+        }
+
+        // Raw planar block: tightly packed channel planes, one after another.
+        let bpp = meta.pixel_type.bytes_per_sample();
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        let size_c = meta.size_c.max(1) as usize;
+        let channel_plane = size_x
+            .checked_mul(size_y)
+            .and_then(|p| p.checked_mul(bpp))
+            .ok_or_else(|| BioFormatsError::Format("PCI plane too large".to_string()))?;
+
+        if x as usize + w as usize > size_x || y as usize + h as usize > size_y {
+            return Err(BioFormatsError::Format(
+                "requested region is outside the image bounds".to_string(),
+            ));
+        }
+
+        let crop_row = w as usize * bpp;
+        let mut out = vec![0u8; crop_row * h as usize * size_c];
+        for c in 0..size_c {
+            let cbase = c * channel_plane;
+            for row in 0..h as usize {
+                let src = cbase + ((y as usize + row) * size_x + x as usize) * bpp;
+                let dst = c * crop_row * h as usize + row * crop_row;
+                if src + crop_row <= bytes.len() {
+                    out[dst..dst + crop_row].copy_from_slice(&bytes[src..src + crop_row]);
+                }
+                // Missing bytes stay zero (truncated/short streams).
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1030,29 +1844,230 @@ impl FormatReader for PciReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("pci"))
+        matches!(ext.as_deref(), Some("pci") | Some("cxd"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(b"BFPCI\0\0\0")
+        // PCI files are OLE2 compound documents (magic 0xD0CF11E0...).
+        crate::common::ole::is_ole2_header(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.layout = None;
-        let (meta, layout) =
-            parse_strict_raw_subset(path, b"BFPCI\0\0\0", "Capture Pro Image (PCI)")?;
+        self.image_files.clear();
+
+        let mut ole = crate::common::ole::OleFile::open(path)?;
+        let all_files = ole.document_list();
+        if all_files.is_empty() {
+            return Err(BioFormatsError::Format(
+                "No files were found - the .cxd may be corrupt.".to_string(),
+            ));
+        }
+
+        let mut size_x: i64 = 0;
+        let mut size_y: i64 = 0;
+        let mut size_z: i64 = 0;
+        let mut size_c: i64 = 0;
+        let mut image_count: i64 = 0;
+        let mut bits_per_pixel: i64 = 0;
+        let mut pixel_type = PixelType::Uint8;
+        let mut mode: i32 = 0;
+        let mut first_z = 0.0f64;
+        let mut second_z = 0.0f64;
+        let mut unique_z: Vec<f64> = Vec::new();
+        let mut insertion: Vec<String> = Vec::new();
+
+        for name in &all_files {
+            let (parent, relative) = Self::split_path(name);
+            let is_image_stream =
+                relative.starts_with("Bitmap") || (relative == "Data" && parent.contains("Image"));
+
+            let stream = if !is_image_stream {
+                Some(ole.document_bytes(name)?)
+            } else {
+                None
+            };
+
+            if relative == "Field Count" {
+                if let Some(v) = stream.as_deref().and_then(Self::read_i32_le) {
+                    image_count = v as i64;
+                }
+            } else if relative == "File Has Image" {
+                if stream.as_deref().and_then(Self::read_i16_le) == Some(0) {
+                    return Err(BioFormatsError::Format(
+                        "This file does not contain image data.".to_string(),
+                    ));
+                }
+            } else if is_image_stream {
+                insertion.push(name.clone());
+                if size_x != 0 && size_y != 0 {
+                    let bpp = pixel_type.bytes_per_sample() as i64;
+                    let plane = size_x * size_y * bpp;
+                    let file_size = ole.file_size(name).unwrap_or(0) as i64;
+                    if plane > 0 && (size_c == 0 || size_c * plane > file_size) {
+                        size_c = file_size / plane;
+                    }
+                }
+            } else if relative.contains("Image_Depth") {
+                if let Some(d) = stream.as_deref().and_then(Self::read_f64_le) {
+                    let first_bits = bits_per_pixel == 0;
+                    let mut bits = d as i64;
+                    bits_per_pixel = bits;
+                    while bits % 8 != 0 || bits == 0 {
+                        bits += 1;
+                    }
+                    if bits % 3 == 0 {
+                        size_c = 3;
+                        bits /= 3;
+                        bits_per_pixel /= 3;
+                    }
+                    bits /= 8;
+                    pixel_type = Self::pixel_type_from_bytes(bits)?;
+                    if size_c > 1 && first_bits && bits > 0 {
+                        size_c /= bits;
+                    }
+                }
+            } else if relative.contains("Image_Height") && size_y == 0 {
+                if let Some(d) = stream.as_deref().and_then(Self::read_f64_le) {
+                    size_y = d as i64;
+                }
+            } else if relative.contains("Image_Width") && size_x == 0 {
+                if let Some(d) = stream.as_deref().and_then(Self::read_f64_le) {
+                    size_x = d as i64;
+                }
+            } else if relative.contains("Time_From_Start") {
+                // Timestamps are metadata-only; parsed but not stored.
+            } else if relative.ends_with("Position_Z") {
+                if let Some(z) = stream.as_deref().and_then(Self::read_f64_le) {
+                    if !unique_z.contains(&z) && size_z <= 1 {
+                        unique_z.push(z);
+                    }
+                    if name.contains("Field 1/") {
+                        first_z = z;
+                    } else if name.contains("Field 2/") {
+                        second_z = z;
+                    }
+                }
+            } else if relative == "GroupMode" {
+                if let Some(v) = stream.as_deref().and_then(Self::read_i32_le) {
+                    mode = v;
+                }
+            } else if relative == "GroupSelectedFields" {
+                size_z = stream.as_ref().map(|s| s.len() as i64 / 8).unwrap_or(0);
+            }
+            // Remaining metadata (Binning, Comments, physical sizes) omitted.
+        }
+
+        let z_first = (first_z - second_z).abs() > f64::EPSILON;
+
+        if size_c == 0 {
+            size_c = 1;
+        }
+        if mode == 0 {
+            size_z = 0;
+        }
+        if size_z <= 1 || (size_z != 0 && image_count % size_z != 0) {
+            size_z = if unique_z.is_empty() {
+                1
+            } else {
+                unique_z.len() as i64
+            };
+        }
+        if size_z == 0 {
+            size_z = 1;
+        }
+        let mut size_t = image_count / size_z;
+        while size_z * size_t < image_count {
+            size_z += 1;
+            size_t = image_count / size_z;
+        }
+        if size_t == 0 {
+            size_t = 1;
+        }
+
+        let rgb = size_c > 1;
+        if insertion.len() as i64 > image_count && size_c == 1 && image_count > 0 {
+            size_c = insertion.len() as i64 / image_count;
+            image_count *= size_c;
+        } else {
+            image_count = size_z * size_t;
+        }
+
+        if size_x <= 0 || size_y <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PCI: could not determine image dimensions".to_string(),
+            ));
+        }
+
+        let dimension_order = if z_first {
+            DimensionOrder::XYCZT
+        } else {
+            DimensionOrder::XYCTZ
+        };
+
+        let effective_size_c = if rgb { 1 } else { size_c };
+        let bpp = pixel_type.bytes_per_sample() as i64;
+        let expected_plane_size = size_x * size_y * bpp * size_c;
+
+        // Build index -> file map: insertion order first, then overlay the
+        // computed field/channel index (Java overwrites the HashMap entries).
+        for (i, f) in insertion.iter().enumerate() {
+            self.image_files.insert(i as u32, f.clone());
+        }
+        for f in &insertion {
+            let (parent, _) = Self::split_path(f);
+            if let Some(idx) = Self::image_index(parent, effective_size_c) {
+                self.image_files.insert(idx, f.clone());
+            }
+        }
+
+        // Correct sizeX when a raw stream is larger than the expected plane.
+        if let Some(first) = self.image_files.get(&0).cloned() {
+            if let Ok(bytes) = ole.document_bytes(&first) {
+                let is_tiff = bytes.len() >= 4
+                    && (bytes[..2] == *b"II" || bytes[..2] == *b"MM")
+                    && (bytes[2] == 42 || bytes[3] == 42);
+                if !is_tiff && (bytes.len() as i64) > expected_plane_size && size_c > 0 {
+                    let extra = bytes.len() as i64 - expected_plane_size;
+                    let per_row = size_y * bpp * size_c;
+                    if per_row > 0 {
+                        size_x += extra / per_row;
+                    }
+                }
+            }
+        }
+
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.meta = Some(ImageMetadata {
+            size_x: size_x as u32,
+            size_y: size_y as u32,
+            size_z: size_z as u32,
+            size_c: size_c.max(1) as u32,
+            size_t: size_t as u32,
+            pixel_type,
+            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            image_count: image_count.max(0) as u32,
+            dimension_order,
+            is_rgb: rgb,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        let _ = bits_per_pixel;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.layout = None;
+        self.image_files.clear();
         Ok(())
     }
 
@@ -1082,12 +2097,8 @@ impl FormatReader for PciReader {
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
-        read_strict_raw_plane(path, layout, plane_index)
+        let (w, h) = (meta.size_x, meta.size_y);
+        self.open_bytes_region(plane_index, 0, 0, w, h)
     }
 
     fn open_bytes_region(
@@ -1099,9 +2110,17 @@ impl FormatReader for PciReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let meta = meta.clone();
-        let plane = self.open_bytes(plane_index)?;
-        crop_plane(&plane, &meta, x, y, w, h)
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let file = self
+            .image_files
+            .get(&plane_index)
+            .cloned()
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut ole = crate::common::ole::OleFile::open(path)?;
+        self.read_image_stream(&mut ole, &file, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1974,22 +2993,26 @@ impl FormatReader for HisReader {
 // ---------------------------------------------------------------------------
 // 9. HRDC GDF format
 // ---------------------------------------------------------------------------
-/// HRDC GDF format reader (`.gdf`).
+/// NOAA-HRD Gridded Data Format reader.
 ///
-/// HRDC GDF is a proprietary format from the Health Research Data Council
-/// with undocumented binary structure.
+/// Faithful port of Bio-Formats `loci.formats.in.HRDGDFReader`. These are ASCII
+/// files describing hurricane surface wind components produced by NOAA's
+/// Hurricane Research Division. The two wind-speed components (east-west and
+/// north-south) are exposed as two channels of `double` (Float64) pixels stored
+/// big-endian, matching the Java reader.
 pub struct HrdgdfReader {
-    path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    layout: Option<StrictRawLayout>,
+    /// Two channels (`[0]` = east-west, `[1]` = north-south), each `sizeX*sizeY`.
+    surface_wind: Vec<Vec<f64>>,
 }
+
+const HRDGDF_MAGIC: &[u8] = b"SURFACE WIND COMPONENTS";
 
 impl HrdgdfReader {
     pub fn new() -> Self {
         HrdgdfReader {
-            path: None,
             meta: None,
-            layout: None,
+            surface_wind: Vec::new(),
         }
     }
 }
@@ -2001,33 +3024,118 @@ impl Default for HrdgdfReader {
 }
 
 impl FormatReader for HrdgdfReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("gdf"))
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        // Java: empty suffix, suffixSufficient=false, suffixNecessary=false.
+        // Detection is purely by the magic string at the start of the file.
+        false
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(b"BFGDF\0\0\0")
+        header.starts_with(HRDGDF_MAGIC)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = None;
         self.meta = None;
-        self.layout = None;
-        let (meta, layout) = parse_strict_raw_subset(path, b"BFGDF\0\0\0", "HRDC GDF")?;
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.surface_wind = Vec::new();
+
+        let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+        // Java splits on the regex "[\r\n]", i.e. on each CR or LF character.
+        let data: Vec<&str> = text.split(['\r', '\n']).collect();
+        if data.is_empty() {
+            return Err(BioFormatsError::Format("HRDGDF: empty file".to_string()));
+        }
+
+        // Header lines (metadata only; not required to build the image).
+        let hurricane = data[0]
+            .rsplit(' ')
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        // Skip ahead to the surface wind section.
+        let mut line_number = 3usize;
+        while line_number < data.len() && !data[line_number].starts_with("SURFACE WIND COMPONENTS")
+        {
+            line_number += 1;
+        }
+        // Consume the "SURFACE WIND COMPONENTS" marker line.
+        line_number += 1;
+        if line_number >= data.len() {
+            return Err(BioFormatsError::Format(
+                "HRDGDF: missing surface wind section".to_string(),
+            ));
+        }
+
+        // Dimensions line: "X Y".
+        let dims = data[line_number].trim();
+        line_number += 1;
+        let mut dim_iter = dims.split_whitespace();
+        let size_x: u32 = dim_iter
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| BioFormatsError::Format("HRDGDF: invalid dimensions".to_string()))?;
+        let size_y: u32 = dim_iter
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| BioFormatsError::Format("HRDGDF: invalid dimensions".to_string()))?;
+        let n = (size_x as usize)
+            .checked_mul(size_y as usize)
+            .ok_or_else(|| BioFormatsError::Format("HRDGDF: image too large".to_string()))?;
+
+        let mut surface_wind = vec![vec![0.0f64; n]; 2];
+        let mut pix_index = 0usize;
+        while line_number < data.len() {
+            let mut line = data[line_number];
+            line_number += 1;
+            while let Some(open) = line.find('(') {
+                let Some(close_rel) = line[open..].find(')') else {
+                    break;
+                };
+                let close = open + close_rel;
+                let pixel = &line[open + 1..close];
+                line = &line[close + 1..];
+                let Some(comma) = pixel.find(',') else {
+                    continue;
+                };
+                if pix_index >= n {
+                    break;
+                }
+                let ew = pixel[..comma].trim().parse::<f64>().unwrap_or(0.0);
+                let ns = pixel[comma + 1..].trim().parse::<f64>().unwrap_or(0.0);
+                surface_wind[0][pix_index] = ew;
+                surface_wind[1][pix_index] = ns;
+                pix_index += 1;
+            }
+        }
+
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert(
+            "Hurricane".to_string(),
+            MetadataValue::String(hurricane),
+        );
+
+        self.surface_wind = surface_wind;
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z: 1,
+            size_c: 2,
+            size_t: 1,
+            pixel_type: PixelType::Float64,
+            bits_per_pixel: 64,
+            image_count: 2,
+            dimension_order: DimensionOrder::XYCTZ,
+            is_rgb: false,
+            is_little_endian: false,
+            series_metadata,
+            ..ImageMetadata::default()
+        });
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
         self.meta = None;
-        self.layout = None;
+        self.surface_wind = Vec::new();
         Ok(())
     }
 
@@ -2057,12 +3165,8 @@ impl FormatReader for HrdgdfReader {
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
-        read_strict_raw_plane(path, layout, plane_index)
+        let (w, h) = (meta.size_x, meta.size_y);
+        self.open_bytes_region(plane_index, 0, 0, w, h)
     }
 
     fn open_bytes_region(
@@ -2074,9 +3178,27 @@ impl FormatReader for HrdgdfReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let meta = meta.clone();
-        let plane = self.open_bytes(plane_index)?;
-        crop_plane(&plane, &meta, x, y, w, h)
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if x.checked_add(w).is_none_or(|e| e > meta.size_x)
+            || y.checked_add(h).is_none_or(|e| e > meta.size_y)
+        {
+            return Err(BioFormatsError::Format(
+                "requested region is outside the image bounds".to_string(),
+            ));
+        }
+        let size_x = meta.size_x as usize;
+        let channel = &self.surface_wind[plane_index as usize];
+        let mut out = Vec::with_capacity((w as usize) * (h as usize) * 8);
+        for row in y..y + h {
+            for col in x..x + w {
+                let v = channel[row as usize * size_x + col as usize];
+                // Java: big-endian double (isLittleEndian() == false).
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -2404,12 +3526,36 @@ impl FormatReader for FilePatternReaderStub {
 // ---------------------------------------------------------------------------
 /// KLB (Keller Lab Block) format reader (`.klb`).
 ///
-/// KLB is a compressed block-based format for light-sheet microscopy data.
-/// Requires a dedicated KLB decoder library which is not available in pure Rust.
+/// Faithful port of Bio-Formats `loci.formats.in.KLBReader` (the single-file
+/// case). KLB stores a 5D (x, y, z, c, t) volume as a grid of independently
+/// compressed blocks. The header gives the dimensions, block size, pixel type
+/// and compression scheme; an array of cumulative block end-offsets follows.
+/// Each block is compressed with zlib, bzip2 or stored raw.
+///
+/// Only the single-file layout is implemented (Java's `isGroupFiles` multi-file
+/// channel/timepoint grouping is not). For a single file the Java reader forces
+/// `sizeC = sizeT = 1`, so the plane count equals `sizeZ`.
+const KLB_DATA_DIMS: usize = 5;
+const KLB_METADATA_SIZE: usize = 256;
+const KLB_COMPRESSION_NONE: u8 = 0;
+const KLB_COMPRESSION_BZIP2: u8 = 1;
+const KLB_COMPRESSION_ZLIB: u8 = 2;
+
+#[derive(Clone)]
+struct KlbLayout {
+    block_size: [u32; KLB_DATA_DIMS],
+    compression_type: u8,
+    header_size: u64,
+    /// Cumulative end-offsets (relative to `header_size`) of each compressed
+    /// block, one per block in x-fastest then y, z, c, t order.
+    block_offsets: Vec<u64>,
+    blocks_per_plane: usize,
+}
+
 pub struct KlbReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    layout: Option<StrictRawLayout>,
+    layout: Option<KlbLayout>,
 }
 
 impl KlbReader {
@@ -2418,6 +3564,34 @@ impl KlbReader {
             path: None,
             meta: None,
             layout: None,
+        }
+    }
+
+    /// Port of `KLBReader.convertPixelType`. Note the Java quirk that FLOAT64
+    /// maps to the 32-bit FormatTools.FLOAT and (U)INT64 map to DOUBLE.
+    fn convert_pixel_type(code: u8) -> Result<PixelType> {
+        Ok(match code {
+            0 => PixelType::Uint8,
+            1 => PixelType::Uint16,
+            2 => PixelType::Uint32,
+            3 | 7 => PixelType::Float64, // UINT64 / INT64 -> DOUBLE
+            4 => PixelType::Int8,
+            5 => PixelType::Int16,
+            6 => PixelType::Int32,
+            8 | 9 => PixelType::Float32, // FLOAT32 / FLOAT64 -> FLOAT
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "KLB unknown pixel type: {other}"
+                )))
+            }
+        })
+    }
+
+    fn div_ceil_u32(a: u32, b: u32) -> u32 {
+        if b == 0 {
+            0
+        } else {
+            a.div_ceil(b)
         }
     }
 }
@@ -2430,6 +3604,7 @@ impl Default for KlbReader {
 
 impl FormatReader for KlbReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // Java sets suffixSufficient=true: KLB is recognised by its extension.
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -2437,18 +3612,117 @@ impl FormatReader for KlbReader {
         matches!(ext.as_deref(), Some("klb"))
     }
 
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(b"BFKLB\0\0\0")
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // KLB has no magic-byte signature (the file starts with a version byte);
+        // upstream relies on the suffix.
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.path = None;
         self.meta = None;
         self.layout = None;
-        let (meta, layout) = parse_strict_raw_subset(path, b"BFKLB\0\0\0", "KLB")?;
+
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+
+        // -- readHeader --
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).map_err(BioFormatsError::Io)?; // headerVersion
+
+        let mut buf32 = [0u8; 4];
+        let mut read_u32 = |f: &mut std::fs::File| -> Result<u32> {
+            f.read_exact(&mut buf32).map_err(BioFormatsError::Io)?;
+            Ok(u32::from_le_bytes(buf32))
+        };
+        let mut dims_xyzct = [0u32; KLB_DATA_DIMS];
+        for d in dims_xyzct.iter_mut() {
+            *d = read_u32(&mut f)?;
+        }
+
+        let size_x = dims_xyzct[0];
+        let size_y = dims_xyzct[1];
+        let size_z = dims_xyzct[2];
+        // Single-file case: Java forces sizeC = sizeT = 1.
+        let size_c = 1u32;
+        let size_t = 1u32;
+        if size_x == 0 || size_y == 0 || size_z == 0 {
+            return Err(BioFormatsError::Format(
+                "KLB header has zero image dimensions".to_string(),
+            ));
+        }
+
+        // dims_pixelSize: 5 x float32 (parsed but unused here)
+        f.seek(SeekFrom::Current((KLB_DATA_DIMS * 4) as i64))
+            .map_err(BioFormatsError::Io)?;
+
+        f.read_exact(&mut byte).map_err(BioFormatsError::Io)?;
+        let pixel_type = Self::convert_pixel_type(byte[0])?;
+
+        f.read_exact(&mut byte).map_err(BioFormatsError::Io)?;
+        let compression_type = byte[0];
+
+        // user_metadata
+        f.seek(SeekFrom::Current(KLB_METADATA_SIZE as i64))
+            .map_err(BioFormatsError::Io)?;
+
+        let mut block_size = [0u32; KLB_DATA_DIMS];
+        for b in block_size.iter_mut() {
+            *b = read_u32(&mut f)?;
+        }
+        if block_size.iter().any(|&b| b == 0) {
+            return Err(BioFormatsError::Format(
+                "KLB header has zero block size".to_string(),
+            ));
+        }
+
+        let blocks_per_plane = (Self::div_ceil_u32(size_x, block_size[0]) as usize)
+            .checked_mul(Self::div_ceil_u32(size_y, block_size[1]) as usize)
+            .ok_or_else(|| BioFormatsError::Format("KLB block count overflows".to_string()))?;
+
+        let mut num_blocks: u64 = 1;
+        for i in 0..KLB_DATA_DIMS {
+            num_blocks = num_blocks
+                .checked_mul(Self::div_ceil_u32(dims_xyzct[i], block_size[i]) as u64)
+                .ok_or_else(|| BioFormatsError::Format("KLB block count overflows".to_string()))?;
+        }
+
+        let header_size =
+            (KLB_DATA_DIMS as u64 * 12) + 2 + (num_blocks * 8) + KLB_METADATA_SIZE as u64 + 1;
+
+        // The cumulative block end-offsets follow immediately (offsetFilePointer).
+        let mut offset_bytes = vec![0u8; (num_blocks as usize) * 8];
+        f.read_exact(&mut offset_bytes).map_err(BioFormatsError::Io)?;
+        let block_offsets: Vec<u64> = offset_bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        let image_count = size_z
+            .checked_mul(size_c)
+            .and_then(|v| v.checked_mul(size_t))
+            .ok_or_else(|| BioFormatsError::Format("KLB image count overflows".to_string()))?;
+
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c,
+            size_t,
+            pixel_type,
+            bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+            image_count,
+            dimension_order: DimensionOrder::XYZCT,
+            is_little_endian: true,
+            ..ImageMetadata::default()
+        });
+        self.layout = Some(KlbLayout {
+            block_size,
+            compression_type,
+            header_size,
+            block_offsets,
+            blocks_per_plane,
+        });
         Ok(())
     }
 
@@ -2488,9 +3762,102 @@ impl FormatReader for KlbReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
+        let layout = self.layout.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
-        read_strict_raw_plane(path, layout, plane_index)
+
+        let bpp = meta.pixel_type.bytes_per_sample();
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        let size_z = meta.size_z;
+        let bs0 = layout.block_size[0] as usize;
+        let bs1 = layout.block_size[1] as usize;
+        let bs2 = layout.block_size[2];
+
+        // Single-file: c = t = 0, so the plane index is the z coordinate.
+        let z = plane_index;
+        if z >= size_z {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let z_block = (z / bs2) as usize;
+        let local_z = (z % bs2) as usize;
+
+        let blocks_per_row = Self::div_ceil_u32(meta.size_x, layout.block_size[0]) as usize;
+        let blocks_per_col = Self::div_ceil_u32(meta.size_y, layout.block_size[1]) as usize;
+        let blocks_per_plane = layout.blocks_per_plane;
+
+        let mut out = vec![0u8; size_x * size_y * bpp];
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+
+        for by in 0..blocks_per_col {
+            for bx in 0..blocks_per_row {
+                let block_in_plane = by * blocks_per_row + bx;
+                let global_block = z_block * blocks_per_plane + block_in_plane;
+                if global_block + 1 > layout.block_offsets.len() {
+                    return Err(BioFormatsError::Format(
+                        "KLB block offset index out of range".to_string(),
+                    ));
+                }
+
+                let x0 = bx * bs0;
+                let y0 = by * bs1;
+                let bw = bs0.min(size_x - x0); // actual block width
+                let bh = bs1.min(size_y - y0); // actual block height
+
+                let start = if global_block == 0 {
+                    0
+                } else {
+                    layout.block_offsets[global_block - 1]
+                };
+                let end = layout.block_offsets[global_block];
+                if end < start {
+                    return Err(BioFormatsError::Format(
+                        "KLB block has negative size".to_string(),
+                    ));
+                }
+                let comp_len = (end - start) as usize;
+
+                f.seek(SeekFrom::Start(layout.header_size + start))
+                    .map_err(BioFormatsError::Io)?;
+                let mut compressed = vec![0u8; comp_len];
+                f.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;
+
+                let block = match layout.compression_type {
+                    KLB_COMPRESSION_NONE => compressed,
+                    KLB_COMPRESSION_ZLIB => {
+                        crate::common::codec::decompress_deflate(&compressed)?
+                    }
+                    KLB_COMPRESSION_BZIP2 => {
+                        // The on-disk block is a standard "BZh" stream; our
+                        // decoder consumes it whole (unlike Java's Ant
+                        // CBZip2InputStream, which strips the first two bytes).
+                        crate::common::codec::decompress_bzip2(&compressed)?
+                    }
+                    other => {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "KLB unsupported compression type {other}"
+                        )))
+                    }
+                };
+
+                // Within the decompressed block, planes are compacted to the
+                // actual (bw x bh) extent; the wanted z-slice is at local_z.
+                let plane_bytes = bw * bh * bpp;
+                let slice_off = local_z * plane_bytes;
+                let row_bytes = bw * bpp;
+                for r in 0..bh {
+                    let src = slice_off + r * row_bytes;
+                    if src + row_bytes > block.len() {
+                        break;
+                    }
+                    let dst = ((y0 + r) * size_x + x0) * bpp;
+                    if dst + row_bytes <= out.len() {
+                        out[dst..dst + row_bytes].copy_from_slice(&block[src..src + row_bytes]);
+                    }
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     fn open_bytes_region(
@@ -2520,24 +3887,696 @@ impl FormatReader for KlbReader {
 // ---------------------------------------------------------------------------
 // 13. OBF (Imspector OBF)
 // ---------------------------------------------------------------------------
-/// OBF/MSR Imspector format reader (`.obf`).
+const OBF_FILE_MAGIC: &[u8] = b"OMAS_BF\n";
+const OBF_STACK_MAGIC: &[u8] = b"OMAS_BF_STACK\n";
+const OBF_MAGIC_NUMBER: u16 = 0xFFFF;
+const OBF_MAX_DIMS: usize = 15;
+
+/// One OBF stack (= one Bio-Formats series).
+struct ObfStack {
+    /// File offset where this stack's pixel data begins.
+    position: u64,
+    compression: bool,
+    samples_written: i64,
+    bytes_per_sample: usize,
+    flush_points: Option<Vec<u64>>,
+    flush_block_size: u64,
+    chunk_logical_positions: Option<Vec<u64>>,
+    chunk_file_positions: Option<Vec<u64>>,
+}
+
+/// Little-endian sequential reader over the OBF file used during parsing.
+struct ObfIn {
+    file: std::fs::File,
+}
+
+impl ObfIn {
+    fn seek(&mut self, p: u64) -> Result<()> {
+        self.file
+            .seek(SeekFrom::Start(p))
+            .map_err(BioFormatsError::Io)?;
+        Ok(())
+    }
+    fn pos(&mut self) -> Result<u64> {
+        self.file.stream_position().map_err(BioFormatsError::Io)
+    }
+    fn read_n(&mut self, n: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        self.file.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        Ok(buf)
+    }
+    fn skip(&mut self, n: u64) -> Result<()> {
+        self.file
+            .seek(SeekFrom::Current(n as i64))
+            .map_err(BioFormatsError::Io)?;
+        Ok(())
+    }
+    fn u16(&mut self) -> Result<u16> {
+        let b = self.read_n(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn i32(&mut self) -> Result<i32> {
+        let b = self.read_n(4)?;
+        Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn i64(&mut self) -> Result<i64> {
+        let b = self.read_n(8)?;
+        Ok(i64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+    fn f64(&mut self) -> Result<f64> {
+        Ok(f64::from_bits(self.i64()? as u64))
+    }
+}
+
+/// Decode state for one frame read, mirroring OBFReader.State.
+struct ObfReadState {
+    file: std::fs::File,
+    pos: u64,
+    next_read_position: i64,
+    current_chunk: i64,
+    chunk_logical_start: u64,
+    chunk_file_start: u64,
+    chunk_size: u64,
+    decompress: Option<flate2::Decompress>,
+    inflate_input: Vec<u8>,
+    inflate_in_cursor: usize,
+    inflate_in_len: usize,
+}
+
+impl ObfReadState {
+    fn new(file: std::fs::File) -> Self {
+        ObfReadState {
+            file,
+            pos: 0,
+            next_read_position: -1,
+            current_chunk: -1,
+            chunk_logical_start: 0,
+            chunk_file_start: 0,
+            chunk_size: 0,
+            decompress: None,
+            inflate_input: Vec::new(),
+            inflate_in_cursor: 0,
+            inflate_in_len: 0,
+        }
+    }
+
+    fn seek(&mut self, p: u64) -> Result<()> {
+        self.pos = p;
+        self.file
+            .seek(SeekFrom::Start(p))
+            .map_err(BioFormatsError::Io)?;
+        Ok(())
+    }
+
+    fn remaining_in_chunk(&self) -> i64 {
+        (self.chunk_file_start + self.chunk_size) as i64 - self.pos as i64
+    }
+
+    fn switch_chunk(&mut self, stack: &ObfStack, chunk_index: i64) -> Result<()> {
+        let logical = stack
+            .chunk_logical_positions
+            .as_ref()
+            .ok_or_else(|| BioFormatsError::Format("OBF: missing chunk positions".to_string()))?;
+        let filepos = stack.chunk_file_positions.as_ref().unwrap();
+        if chunk_index < 0 || chunk_index as usize >= logical.len() {
+            return Err(BioFormatsError::Format("Missing OBF data chunks".to_string()));
+        }
+        let ci = chunk_index as usize;
+        self.current_chunk = chunk_index;
+        self.chunk_logical_start = logical[ci];
+        self.chunk_file_start = filepos[ci] + stack.position;
+        let stack_byte_count = stack.samples_written as u64 * stack.bytes_per_sample as u64;
+        if ci + 1 == logical.len() {
+            self.chunk_size = stack_byte_count.saturating_sub(self.chunk_logical_start);
+        } else {
+            self.chunk_size = logical[ci + 1] - self.chunk_logical_start;
+        }
+        Ok(())
+    }
+
+    /// Read `bytes` raw bytes from the stack, walking chunk boundaries. When
+    /// `out` is `Some`, fills it; otherwise skips. Short reads past EOF are
+    /// zero-filled (matching Java's lenient read past a truncated stream).
+    fn read_from_stack_raw(
+        &mut self,
+        stack: &ObfStack,
+        mut out: Option<&mut [u8]>,
+        mut bytes: usize,
+    ) -> Result<()> {
+        let mut done = 0usize;
+        let mut remaining = self.remaining_in_chunk();
+        while bytes > 0 {
+            while remaining == 0 {
+                self.switch_chunk(stack, self.current_chunk + 1)?;
+                self.seek(self.chunk_file_start)?;
+                remaining = self.remaining_in_chunk();
+            }
+            if remaining < 0 {
+                return Err(BioFormatsError::Format(
+                    "Negative remaining bytes in chunk; malformed OBF file".to_string(),
+                ));
+            }
+            let to_read = std::cmp::min(bytes as i64, remaining) as usize;
+            self.file
+                .seek(SeekFrom::Start(self.pos))
+                .map_err(BioFormatsError::Io)?;
+            if let Some(o) = out.as_deref_mut() {
+                let region = &mut o[done..done + to_read];
+                let mut filled = 0;
+                while filled < to_read {
+                    let n = self
+                        .file
+                        .read(&mut region[filled..])
+                        .map_err(BioFormatsError::Io)?;
+                    if n == 0 {
+                        for b in &mut region[filled..] {
+                            *b = 0;
+                        }
+                        break;
+                    }
+                    filled += n;
+                }
+            }
+            self.pos += to_read as u64;
+            done += to_read;
+            remaining -= to_read as i64;
+            bytes -= to_read;
+        }
+        Ok(())
+    }
+
+    /// Read `region.len()` decompressed bytes into `region`.
+    fn read_from_stack(&mut self, stack: &ObfStack, region: &mut [u8]) -> Result<()> {
+        let bytes = region.len();
+        let stack_byte_count = stack.samples_written as u64 * stack.bytes_per_sample as u64;
+
+        if !stack.compression {
+            self.read_from_stack_raw(stack, Some(region), bytes)?;
+        } else {
+            let mut produced_total = 0usize;
+            while produced_total < bytes {
+                if self.inflate_in_cursor >= self.inflate_in_len {
+                    let logical_offset =
+                        self.chunk_logical_start + (self.pos - self.chunk_file_start);
+                    let remainder = stack_byte_count as i64 - logical_offset as i64;
+                    if remainder > 0 {
+                        let length = std::cmp::min(remainder as usize, self.inflate_input.len());
+                        let mut tmp = std::mem::take(&mut self.inflate_input);
+                        self.read_from_stack_raw(stack, Some(&mut tmp[0..length]), length)?;
+                        self.inflate_input = tmp;
+                        self.inflate_in_cursor = 0;
+                        self.inflate_in_len = length;
+                    } else {
+                        return Err(BioFormatsError::Format(
+                            "Corrupted zlib compression".to_string(),
+                        ));
+                    }
+                }
+                let cursor = self.inflate_in_cursor;
+                let len = self.inflate_in_len;
+                let dec = self
+                    .decompress
+                    .as_mut()
+                    .ok_or_else(|| BioFormatsError::Format("OBF: no inflater".to_string()))?;
+                let before_in = dec.total_in();
+                let before_out = dec.total_out();
+                let status = dec
+                    .decompress(
+                        &self.inflate_input[cursor..len],
+                        &mut region[produced_total..bytes],
+                        flate2::FlushDecompress::None,
+                    )
+                    .map_err(|e| BioFormatsError::Format(format!("OBF inflate: {e}")))?;
+                let consumed = (dec.total_in() - before_in) as usize;
+                let produced = (dec.total_out() - before_out) as usize;
+                self.inflate_in_cursor += consumed;
+                produced_total += produced;
+                if status == flate2::Status::StreamEnd {
+                    // Remaining output (if any) stays zero, matching the Java
+                    // tolerance for a zlib error past the end of the stream.
+                    break;
+                }
+                if consumed == 0 && produced == 0 && self.inflate_in_cursor < self.inflate_in_len {
+                    // No forward progress with input still available: bail out
+                    // to avoid an infinite loop on malformed data.
+                    break;
+                }
+            }
+        }
+        self.next_read_position += bytes as i64;
+        Ok(())
+    }
+
+    fn skip_bytes(&mut self, stack: &ObfStack, byte_count: u64) -> Result<()> {
+        let has_chunks = stack.chunk_logical_positions.is_some();
+        if !stack.compression && !has_chunks {
+            self.seek(self.pos + byte_count)?;
+            self.next_read_position += byte_count as i64;
+        } else if stack.compression {
+            let mut remaining = byte_count;
+            let mut skip_buf = vec![0u8; 8192];
+            while remaining > 0 {
+                let read_size = std::cmp::min(8192u64, remaining) as usize;
+                self.read_from_stack(stack, &mut skip_buf[0..read_size])?;
+                remaining -= read_size as u64;
+            }
+        } else {
+            let mut remaining = byte_count;
+            while remaining > 0 {
+                let skip_size = std::cmp::min(remaining, i32::MAX as u64) as usize;
+                self.read_from_stack_raw(stack, None, skip_size)?;
+                remaining -= skip_size as u64;
+            }
+        }
+        Ok(())
+    }
+
+    fn seek_to_frame_start(&mut self, stack: &ObfStack, sample_offset: i64) -> Result<()> {
+        let has_chunks = stack.chunk_logical_positions.is_some();
+        let stack_byte_offset = (sample_offset * stack.bytes_per_sample as i64) as u64;
+
+        if self.next_read_position == stack_byte_offset as i64 {
+            return Ok(());
+        }
+        self.next_read_position = stack_byte_offset as i64;
+
+        if !has_chunks {
+            self.chunk_logical_start = 0;
+            self.chunk_file_start = stack.position;
+            self.chunk_size = stack.samples_written as u64 * stack.bytes_per_sample as u64;
+            if !stack.compression {
+                self.seek(stack.position + stack_byte_offset)?;
+                return Ok(());
+            }
+        }
+
+        let mut seek_destination: u64 = 0;
+        let mut extra_skip_bytes: u64 = stack_byte_offset;
+
+        if let Some(fp) = stack.flush_points.as_ref() {
+            if stack.flush_block_size != 0 {
+                let flush_block_index = (stack_byte_offset / stack.flush_block_size) as usize;
+                if flush_block_index > 0 {
+                    seek_destination = fp[flush_block_index - 1];
+                    extra_skip_bytes -= flush_block_index as u64 * stack.flush_block_size;
+                }
+            }
+        }
+
+        if stack.compression {
+            // new Inflater(nowrap = seekDestination != 0); flate2's zlib_header
+            // flag is the inverse of nowrap.
+            self.decompress = Some(flate2::Decompress::new(seek_destination == 0));
+            self.inflate_in_cursor = 0;
+            self.inflate_in_len = 0;
+            if self.inflate_input.is_empty() {
+                self.inflate_input = vec![0u8; 8192];
+            }
+        }
+
+        if !has_chunks {
+            self.seek(stack.position + seek_destination)?;
+            self.skip_bytes(stack, extra_skip_bytes)?;
+            return Ok(());
+        }
+
+        let logical = stack.chunk_logical_positions.as_ref().unwrap();
+        let idx = match logical.binary_search(&seek_destination) {
+            Ok(i) => i as i64,
+            Err(i) => i as i64,
+        };
+        self.switch_chunk(stack, idx)?;
+        self.seek(self.chunk_file_start + seek_destination - self.chunk_logical_start)?;
+        self.skip_bytes(stack, extra_skip_bytes)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_stack_frame(
+        &mut self,
+        stack: &ObfStack,
+        size_x: u32,
+        size_y: u32,
+        sample_offset: i64,
+        region: &mut [u8],
+        w: u32,
+        h: u32,
+    ) -> Result<()> {
+        let columns = size_x as i64;
+        let rows = size_y as i64;
+        let bps = stack.bytes_per_sample as i64;
+        let frame_samples_total = columns * rows;
+        let mut frame_bytes_written = std::cmp::max(
+            std::cmp::min(stack.samples_written - sample_offset, frame_samples_total) * bps,
+            0,
+        );
+        if frame_bytes_written > 0 {
+            self.seek_to_frame_start(stack, sample_offset)?;
+        }
+        let row_skip_bytes = (columns - w as i64) * bps;
+        let mut cur = 0usize;
+        for yy in 0..h as i64 {
+            if yy != 0 && row_skip_bytes > 0 {
+                let written_skip = std::cmp::min(row_skip_bytes, frame_bytes_written);
+                self.skip_bytes(stack, written_skip as u64)?;
+                frame_bytes_written -= written_skip;
+            }
+            let total_row_bytes = (w as i64) * bps;
+            let written_row_bytes = std::cmp::min(total_row_bytes, frame_bytes_written);
+            if written_row_bytes > 0 {
+                let wrb = written_row_bytes as usize;
+                self.read_from_stack(stack, &mut region[cur..cur + wrb])?;
+                cur += wrb;
+                frame_bytes_written -= written_row_bytes;
+            }
+            // Unwritten row bytes remain zero (region is pre-zeroed).
+        }
+        Ok(())
+    }
+}
+
+/// OBF / MSR (Imspector / Abberior STED) format reader.
 ///
-/// OBF files are handled by ImspectorReader in the extended module.
-/// This reader exists as a fallback for files that do not match the
-/// Imspector magic bytes.
+/// Faithful port of Bio-Formats `loci.formats.in.OBFReader`. OBF files start
+/// with the `OMAS_BF\n` magic plus a version, then a linked list of stacks;
+/// each stack carries its own dimensions, data type and an optionally
+/// zlib-compressed, possibly chunked pixel block. Each stack maps to one
+/// Bio-Formats series. The non-FLIM read path is implemented (chunk walking,
+/// flush-point seeking and streaming inflate); the OME-XML side metadata block
+/// (file version >= 2) is skipped, so dimensions always come from the raw
+/// stack headers.
 pub struct ObfReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    layout: Option<StrictRawLayout>,
+    metas: Vec<ImageMetadata>,
+    stacks: Vec<ObfStack>,
+    series: usize,
 }
 
 impl ObfReader {
     pub fn new() -> Self {
         ObfReader {
             path: None,
-            meta: None,
-            layout: None,
+            metas: Vec::new(),
+            stacks: Vec::new(),
+            series: 0,
         }
+    }
+
+    fn pixel_type(type_code: i32) -> Result<(PixelType, u8)> {
+        Ok(match type_code {
+            0x01 => (PixelType::Uint8, 8),
+            0x02 => (PixelType::Int8, 8),
+            0x04 => (PixelType::Uint16, 16),
+            0x08 => (PixelType::Int16, 16),
+            0x10 => (PixelType::Uint32, 32),
+            0x20 => (PixelType::Int32, 32),
+            0x40 => (PixelType::Float32, 32),
+            0x80 => (PixelType::Float64, 64),
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "OBF unsupported data type {other}"
+                )))
+            }
+        })
+    }
+
+    fn file_version(input: &mut ObfIn) -> Result<i32> {
+        input.seek(0)?;
+        let magic = match input.read_n(OBF_FILE_MAGIC.len()) {
+            Ok(m) => m,
+            Err(_) => return Ok(-1),
+        };
+        let magic_number = input.u16().unwrap_or(0);
+        let version = input.i32().unwrap_or(-1);
+        if magic == OBF_FILE_MAGIC && magic_number == OBF_MAGIC_NUMBER {
+            Ok(version)
+        } else {
+            Ok(-1)
+        }
+    }
+
+    /// Parse one stack starting at `current`; returns the offset of the next
+    /// stack (0 = end of list).
+    fn init_stack(&mut self, input: &mut ObfIn, current: u64) -> Result<u64> {
+        input.seek(current)?;
+        let magic = input.read_n(OBF_STACK_MAGIC.len())?;
+        let magic_number = input.u16()?;
+        let stack_version = input.i32()?;
+
+        if magic != OBF_STACK_MAGIC || magic_number != OBF_MAGIC_NUMBER {
+            return Err(BioFormatsError::Format(
+                "Unsupported OBF stack format".to_string(),
+            ));
+        }
+
+        let num_dims = input.i32()?;
+        if num_dims > 5 {
+            return Err(BioFormatsError::Format(format!(
+                "Unsupported number of {num_dims} dimensions"
+            )));
+        }
+        let num_dims = num_dims.max(0) as usize;
+
+        let mut samples_written: i64 = 1;
+        let mut sizes = [1i32; OBF_MAX_DIMS];
+        for (d, slot) in sizes.iter_mut().enumerate() {
+            let size = input.i32()?;
+            if d < num_dims {
+                samples_written *= size as i64;
+                *slot = size;
+            } else {
+                *slot = 1;
+            }
+        }
+
+        let size_x = sizes[0].max(0) as u32;
+        let size_y = sizes[1].max(0) as u32;
+        let size_z = sizes[2].max(0) as u32;
+        let size_c = sizes[3].max(0) as u32;
+        let size_t = sizes[4].max(0) as u32;
+        let image_count = size_z * size_c * size_t;
+
+        // lengths (15 doubles) and offsets (15 doubles) - parsed but unused.
+        for _ in 0..OBF_MAX_DIMS {
+            input.f64()?;
+        }
+        for _ in 0..OBF_MAX_DIMS {
+            input.f64()?;
+        }
+
+        let type_code = input.i32()?;
+        let (pixel_type, bits_per_pixel) = Self::pixel_type(type_code)?;
+        let bytes_per_sample = (bits_per_pixel / 8) as usize;
+
+        let compression = match input.i32()? {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "OBF unsupported compression {other}"
+                )))
+            }
+        };
+
+        input.skip(4)?;
+        let length_of_name = input.i32()?;
+        let length_of_description = input.i32()?;
+        input.skip(8)?;
+        let length_of_data = input.i64()?;
+        if length_of_data < 0 {
+            return Err(BioFormatsError::Format(
+                "Negative OBF stack length on disk".to_string(),
+            ));
+        }
+        let next = input.i64()?;
+        input.skip(length_of_name.max(0) as u64)?;
+        input.skip(length_of_description.max(0) as u64)?;
+
+        let position = input.pos()?;
+
+        let mut stack = ObfStack {
+            position,
+            compression,
+            samples_written,
+            bytes_per_sample,
+            flush_points: None,
+            flush_block_size: 0,
+            chunk_logical_positions: None,
+            chunk_file_positions: None,
+        };
+
+        if stack_version >= 1 {
+            input.skip(length_of_data as u64)?;
+            let footer = input.pos()?;
+            let offset = input.i32()?;
+
+            // stepsPresent / stepLabelsPresent (15 ints each).
+            let mut steps_present = [false; OBF_MAX_DIMS];
+            for (d, slot) in steps_present.iter_mut().enumerate() {
+                let v = input.i32()?;
+                if d < num_dims {
+                    *slot = v != 0;
+                }
+            }
+            let mut step_labels_present = [false; OBF_MAX_DIMS];
+            for (d, slot) in step_labels_present.iter_mut().enumerate() {
+                let v = input.i32()?;
+                if d < num_dims {
+                    *slot = v != 0;
+                }
+            }
+
+            let mut obsolete_metadata_length: i64 = 0;
+            let mut num_flush_points: i64 = 0;
+            if stack_version >= 3 {
+                const SI_UNIT_SIZE: u64 = 80;
+                obsolete_metadata_length = input.i32()? as i64;
+                input.skip(SI_UNIT_SIZE * (OBF_MAX_DIMS as u64 + 1))?;
+                num_flush_points = input.i64()?;
+                stack.flush_block_size = input.i64()?.max(0) as u64;
+            }
+
+            let mut tag_dictionary_length: i64 = 0;
+            if stack_version >= 4 {
+                tag_dictionary_length = input.i64()?;
+                let _stack_end_disk = input.i64()?;
+                let _min_format_version = input.i32()?;
+            }
+
+            let mut num_chunk_positions: i64 = 0;
+            if stack_version >= 6 {
+                let _stack_end_used_disk = input.i64()?;
+                samples_written = input.i64()?;
+                stack.samples_written = samples_written;
+                num_chunk_positions = input.i64()?;
+            }
+
+            input.seek(footer + offset.max(0) as u64)?;
+
+            // labels (one length-prefixed string per real dimension).
+            for _ in 0..num_dims {
+                let length = input.i32()?;
+                input.skip(length.max(0) as u64)?;
+            }
+
+            // steps (doubles) per dimension when present.
+            for d in 0..num_dims {
+                if steps_present[d] {
+                    for _ in 0..sizes[d].max(0) {
+                        input.f64()?;
+                    }
+                }
+            }
+            // step labels (length-prefixed strings) per dimension when present.
+            for d in 0..num_dims {
+                if step_labels_present[d] {
+                    for _ in 0..sizes[d].max(0) {
+                        let length = input.i32()?;
+                        input.skip(length.max(0) as u64)?;
+                    }
+                }
+            }
+
+            input.skip(obsolete_metadata_length.max(0) as u64)?;
+
+            if num_flush_points > 0 {
+                let mut flush_points = Vec::with_capacity(num_flush_points as usize);
+                for _ in 0..num_flush_points {
+                    flush_points.push(input.i64()?.max(0) as u64);
+                }
+                stack.flush_points = Some(flush_points);
+            }
+
+            input.skip(tag_dictionary_length.max(0) as u64)?;
+
+            if num_chunk_positions > 0 {
+                let mut logical = Vec::with_capacity(num_chunk_positions as usize + 1);
+                let mut file = Vec::with_capacity(num_chunk_positions as usize + 1);
+                logical.push(0u64);
+                file.push(0u64);
+                for _ in 0..num_chunk_positions {
+                    logical.push(input.i64()?.max(0) as u64);
+                    file.push(input.i64()?.max(0) as u64);
+                }
+                stack.chunk_logical_positions = Some(logical);
+                stack.chunk_file_positions = Some(file);
+            }
+        } else {
+            return Err(BioFormatsError::Format(
+                "Unsupported OBF stack format".to_string(),
+            ));
+        }
+
+        self.stacks.push(stack);
+        self.metas.push(ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c,
+            size_t,
+            pixel_type,
+            bits_per_pixel,
+            image_count,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+
+        Ok(next.max(0) as u64)
+    }
+
+    fn read_region(&self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let meta = self
+            .metas
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let stack = &self.stacks[self.series];
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if x.checked_add(w).is_none_or(|e| e > meta.size_x)
+            || y.checked_add(h).is_none_or(|e| e > meta.size_y)
+        {
+            return Err(BioFormatsError::Format(
+                "requested region is outside the image bounds".to_string(),
+            ));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+
+        let bps = stack.bytes_per_sample;
+        let region_bytes = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::Format("OBF region too large".to_string()))?;
+        let mut region = vec![0u8; region_bytes];
+
+        let columns = meta.size_x as i64;
+        let rows = meta.size_y as i64;
+        let frame_start_sample_offset =
+            (plane_index as i64) * rows * columns + (y as i64) * columns + x as i64;
+
+        let mut state = ObfReadState::new(file);
+        state.read_stack_frame(
+            stack,
+            meta.size_x,
+            meta.size_y,
+            frame_start_sample_offset,
+            &mut region,
+            w,
+            h,
+        )?;
+        Ok(region)
     }
 }
 
@@ -2553,64 +4592,109 @@ impl FormatReader for ObfReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("obf"))
+        matches!(ext.as_deref(), Some("obf") | Some("msr"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(b"BFOBF\0\0\0")
+        // Magic "OMAS_BF\n" + 0xFFFF + a non-negative version int.
+        if header.len() < OBF_FILE_MAGIC.len() + 6 {
+            return false;
+        }
+        if &header[..OBF_FILE_MAGIC.len()] != OBF_FILE_MAGIC {
+            return false;
+        }
+        let mn = u16::from_le_bytes([header[8], header[9]]);
+        if mn != OBF_MAGIC_NUMBER {
+            return false;
+        }
+        let version = i32::from_le_bytes([header[10], header[11], header[12], header[13]]);
+        version >= 0
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.layout = None;
-        let (meta, layout) =
-            parse_strict_raw_subset(path, b"BFOBF\0\0\0", "OBF fallback synthetic raw")?;
+        self.metas.clear();
+        self.stacks.clear();
+        self.series = 0;
+
+        let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let mut input = ObfIn { file };
+
+        let version = Self::file_version(&mut input)?;
+        if version < 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "not an OBF file".to_string(),
+            ));
+        }
+
+        // After the magic check the pointer sits past the 14-byte file header.
+        input.seek(OBF_FILE_MAGIC.len() as u64 + 2 + 4)?;
+        let stack_position = input.i64()?;
+        let length_of_description = input.i32()?;
+        input.skip(length_of_description.max(0) as u64)?;
+        if version >= 2 {
+            // meta_data_position: OME-XML side metadata is skipped; dimensions
+            // come from the raw stack headers instead.
+            let _meta_data_position = input.i64()?;
+        }
+
+        if stack_position != 0 {
+            let mut cur = stack_position.max(0) as u64;
+            loop {
+                let next = self.init_stack(&mut input, cur)?;
+                if next == 0 {
+                    break;
+                }
+                cur = next;
+            }
+        }
+
+        if self.stacks.is_empty() {
+            return Err(BioFormatsError::Format("OBF file has no stacks".to_string()));
+        }
+
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.layout = None;
+        self.metas.clear();
+        self.stacks.clear();
+        self.series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.stacks.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
-            Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
-            Ok(())
-        } else {
+        if s >= self.stacks.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            self.series = s;
+            Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.metas
+            .get(self.series)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let layout = self.layout.ok_or(BioFormatsError::NotInitialized)?;
-        read_strict_raw_plane(path, layout, plane_index)
+        let meta = self
+            .metas
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let (w, h) = (meta.size_x, meta.size_y);
+        self.read_region(plane_index, 0, 0, w, h)
     }
 
     fn open_bytes_region(
@@ -2621,14 +4705,14 @@ impl FormatReader for ObfReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let meta = meta.clone();
-        let plane = self.open_bytes(plane_index)?;
-        crop_plane(&plane, &meta, x, y, w, h)
+        self.read_region(plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;

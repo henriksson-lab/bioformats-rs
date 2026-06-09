@@ -127,7 +127,10 @@ fn read_uic_dims(path: &Path, ifd: &Ifd, mm_planes: u32) -> Option<UicDims> {
     // UIC2: 24 bytes per plane: z-distance (rational, 8B), date (4B), time (4B),
     // mod-date (4B), mod-time (4B). Count non-zero z-distances -> sizeZ.
     let (le, uic2_offset, _count) = read_tag_value_offset(&data, UIC2_TAG)?;
-    let mut size_z = 0u32;
+    // Java MetamorphReader.java:1316 seeds sizeZ = 1 before parseUIC2Tags
+    // (line 1740) increments it once per non-zero z-distance. Mirror that base
+    // of 1 so the downstream Z/T reconciliation matches Java bitwise.
+    let mut size_z = 1u32;
     let mut image_count = mm_planes.max(1);
     {
         let mut z_planes = 0u32;
@@ -197,6 +200,74 @@ fn read_uic_dims(path: &Path, ifd: &Ifd, mm_planes: u32) -> Option<UicDims> {
         size_z,
         size_c,
     })
+}
+
+/// Read a signed 4-byte int at `off` with the given endianness.
+fn rd_i32_at(data: &[u8], off: usize, le: bool) -> Option<i32> {
+    if off + 4 > data.len() {
+        return None;
+    }
+    Some(if le {
+        i32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+    } else {
+        i32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+    })
+}
+
+/// Read a TIFF rational (num/den i32 pair) at `off`. Returns `num` when the
+/// denominator is zero, matching Java `TiffRational.doubleValue`.
+fn read_rational_at(data: &[u8], off: usize, le: bool) -> Option<f64> {
+    let num = rd_i32_at(data, off, le)?;
+    let den = rd_i32_at(data, off + 4, le)?;
+    Some(if den != 0 {
+        num as f64 / den as f64
+    } else {
+        num as f64
+    })
+}
+
+/// Java `FormatTools.getPhysicalSize*`: a physical size is only emitted when it
+/// is strictly positive.
+fn physical_size(value: f64) -> Option<f64> {
+    if value > 0.0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Parse the UIC1 X/Y calibration rationals (field IDs 4/5) and the first UIC2
+/// z-distance, returning the physical pixel sizes in µm. Mirrors Java
+/// MetamorphReader's XCalibration/YCalibration handling and `stepSize =
+/// zDistances[0]`.
+fn read_metamorph_physical_sizes(path: &Path) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let Ok(data) = std::fs::read(path) else {
+        return (None, None, None);
+    };
+    let mut phys_x = None;
+    let mut phys_y = None;
+    if let Some((le, uic1_offset, count)) = read_tag_value_offset(&data, UIC1_TAG) {
+        let mut off = uic1_offset as usize;
+        for _ in 0..count {
+            let (Some(id), Some(val_or_offset)) =
+                (rd_i32_at(&data, off, le), rd_i32_at(&data, off + 4, le))
+            else {
+                break;
+            };
+            let val_off = val_or_offset as u32 as usize;
+            match id {
+                4 => phys_x = read_rational_at(&data, val_off, le).and_then(physical_size),
+                5 => phys_y = read_rational_at(&data, val_off, le).and_then(physical_size),
+                _ => {}
+            }
+            off += 8;
+        }
+    }
+    // physicalSizeZ comes from the first UIC2 z-distance (Java stepSize).
+    let phys_z = read_tag_value_offset(&data, UIC2_TAG)
+        .and_then(|(le, uic2_offset, _)| read_rational_at(&data, uic2_offset as usize, le))
+        .and_then(physical_size);
+    (phys_x, phys_y, phys_z)
 }
 
 // ── Per-plane UIC metadata (UIC1/UIC2/UIC3), ported from Java MetamorphReader ──
@@ -381,6 +452,14 @@ pub struct MetamorphReader {
     /// Whether the `.nd` series is a "Both lasers"/DUAL bizarre multichannel
     /// acquisition (Java `bizarreMultichannelAcquisition`).
     bizarre_multichannel: bool,
+    /// OME image name for a standalone STK (Java `makeImageName`, which is the
+    /// empty string for a single-file STK). `None` for `.nd` series.
+    image_name: Option<String>,
+    /// Physical pixel sizes (µm) from the UIC1 X/Y calibration rationals and
+    /// the first UIC2 z-distance (Java XCalibration/YCalibration/stepSize).
+    phys_x: Option<f64>,
+    phys_y: Option<f64>,
+    phys_z: Option<f64>,
 }
 
 impl MetamorphReader {
@@ -395,6 +474,10 @@ impl MetamorphReader {
             nd_filename: None,
             can_look_for_nd: true,
             bizarre_multichannel: false,
+            image_name: None,
+            phys_x: None,
+            phys_y: None,
+            phys_z: None,
         }
     }
 }
@@ -819,8 +902,22 @@ impl MetamorphReader {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let bps = meta.pixel_type.bytes_per_sample();
-        let plane_bytes = (meta.size_x as usize)
+        // RGB STK planes store all samples interleaved (chunky) within the
+        // plane, so the on-disk stride spans every sample (Java reconstructs one
+        // multi-sample IFD per plane). Account for that here, otherwise the
+        // per-plane offset for plane > 0 lands a third of the way into the plane.
+        let samples = if meta.is_rgb {
+            meta.size_c.max(1) as usize
+        } else {
+            1
+        };
+        let pixel_count = (meta.size_x as usize)
             .checked_mul(meta.size_y as usize)
+            .ok_or_else(|| {
+                BioFormatsError::InvalidData("MetaMorph STK plane byte count overflow".into())
+            })?;
+        let plane_bytes = pixel_count
+            .checked_mul(samples)
             .and_then(|px| px.checked_mul(bps))
             .ok_or_else(|| {
                 BioFormatsError::InvalidData("MetaMorph STK plane byte count overflow".into())
@@ -861,6 +958,50 @@ impl MetamorphReader {
         file.seek(SeekFrom::Start(offset))
             .map_err(BioFormatsError::Io)?;
         file.read_exact(&mut out).map_err(BioFormatsError::Io)?;
+        // On-disk RGB data is chunky (RGBRGB…); Bio-Formats exposes STK planes
+        // de-interleaved (isInterleaved() == false), i.e. planar RRR…GGG…BBB.
+        if samples > 1 {
+            let mut planar = vec![0u8; plane_bytes];
+            for c in 0..samples {
+                for px in 0..pixel_count {
+                    let dst = (c * pixel_count + px) * bps;
+                    let src = (px * samples + c) * bps;
+                    planar[dst..dst + bps].copy_from_slice(&out[src..src + bps]);
+                }
+            }
+            return Ok(planar);
+        }
+        Ok(out)
+    }
+
+    /// Crop a region from a full planar plane (RRR…GGG…BBB), keeping the planar
+    /// layout. Each sample sub-plane is cropped independently and concatenated.
+    fn crop_planar_plane(
+        meta: &ImageMetadata,
+        full: &[u8],
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let samples = if meta.is_rgb {
+            meta.size_c.max(1) as usize
+        } else {
+            1
+        };
+        if samples <= 1 {
+            return crop_full_plane("MetaMorph STK", full, meta, 1, x, y, w, h);
+        }
+        let bps = meta.pixel_type.bytes_per_sample();
+        let sub_len = (meta.size_x as usize) * (meta.size_y as usize) * bps;
+        let mut out = Vec::with_capacity(samples * (w as usize) * (h as usize) * bps);
+        for c in 0..samples {
+            let start = c * sub_len;
+            let sub = full
+                .get(start..start + sub_len)
+                .ok_or_else(|| BioFormatsError::InvalidData("MetaMorph STK plane too short".into()))?;
+            out.extend(crop_full_plane("MetaMorph STK", sub, meta, 1, x, y, w, h)?);
+        }
         Ok(out)
     }
 }
@@ -937,6 +1078,13 @@ impl FormatReader for MetamorphReader {
         }
 
         // Single-file STK path: one series.
+        // OME image name for a standalone STK is the empty string (Java
+        // makeImageName returns "" with no stage names / channel grid).
+        self.image_name = Some(String::new());
+        let (px, py, pz) = read_metamorph_physical_sizes(&stk_path);
+        self.phys_x = px;
+        self.phys_y = py;
+        self.phys_z = pz;
         self.metas = vec![base_meta.clone()];
         self.series = 0;
         self.stks = None;
@@ -954,6 +1102,10 @@ impl FormatReader for MetamorphReader {
         self.series = 0;
         self.nd_filename = None;
         self.bizarre_multichannel = false;
+        self.image_name = None;
+        self.phys_x = None;
+        self.phys_y = None;
+        self.phys_z = None;
         let _ = self.inner.close();
         Ok(())
     }
@@ -1002,11 +1154,12 @@ impl FormatReader for MetamorphReader {
             return Ok(bytes);
         }
         let inner_count = self.inner.metadata().image_count;
-        // Planes map 1:1 to the inner TIFF reader when it exposes enough planes
-        // (Java rebuilds one IFD per plane). When the STK stores all planes as
-        // strips in a single IFD, fall back to reading the plane directly from
-        // the concatenated strip data.
-        if plane_index < inner_count {
+        // Planes map 1:1 to the inner TIFF reader only when it exposes a
+        // distinct IFD for every plane (true multi-IFD STK). When the STK packs
+        // all planes as strips in a single IFD, read every plane (including
+        // plane 0) from the concatenated strip data so RGB de-interleaving and
+        // per-plane stride stay consistent across planes.
+        if inner_count >= count {
             return self.inner.open_bytes(plane_index);
         }
         self.read_concatenated_plane(plane_index)
@@ -1036,13 +1189,13 @@ impl FormatReader for MetamorphReader {
             return crop_full_plane("MetaMorph STK", &full, meta, 1, x, y, w, h);
         }
         let inner_count = self.inner.metadata().image_count;
-        if plane_index < inner_count {
+        if inner_count >= count {
             return self.inner.open_bytes_region(plane_index, x, y, w, h);
         }
-        // Crop from the concatenated-strip plane.
+        // Crop from the concatenated-strip plane (planar RGB layout).
         let full = self.read_concatenated_plane(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        crop_full_plane("MetaMorph STK", &full, meta, 1, x, y, w, h)
+        Self::crop_planar_plane(meta, &full, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1054,6 +1207,31 @@ impl FormatReader for MetamorphReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.metadata();
+        if std::ptr::eq(meta, crate::common::reader::uninitialized_metadata()) {
+            return None;
+        }
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.first_mut() {
+            // Java sets the image name (makeImageName, "" for a standalone STK)
+            // and the physical pixel sizes from the UIC calibration tags.
+            if let Some(name) = &self.image_name {
+                image.name = Some(name.clone());
+            }
+            if image.physical_size_x.is_none() {
+                image.physical_size_x = self.phys_x;
+            }
+            if image.physical_size_y.is_none() {
+                image.physical_size_y = self.phys_y;
+            }
+            if image.physical_size_z.is_none() {
+                image.physical_size_z = self.phys_z;
+            }
+        }
+        Some(ome)
     }
 }
 
@@ -1316,7 +1494,10 @@ impl MetamorphReader {
             size_c,
             size_t,
             image_count,
-            dimension_order: DimensionOrder::XYZCT,
+            // Single-file STK keeps the MinimalTiffReader default order
+            // (XYCZT). Only the multi-file .nd path uses XYZCT (Java
+            // MetamorphReader.java:755 vs the inherited TIFF default).
+            dimension_order: DimensionOrder::XYCZT,
             series_metadata: meta_map,
             ..tiff_meta
         };

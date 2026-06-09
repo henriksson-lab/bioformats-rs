@@ -95,9 +95,9 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::svs::WholeSlideTiffReader::new()),
         // Extension-only Inveon (hdr+img pair, extension-only detection)
         Box::new(crate::formats::clinical::InveonReader::new()),
-        // SimFCS FLIM (extension-only)
+        // SimFCS FLIM (extension-only). Non-upstream extension: Bio-Formats has
+        // no SimFCS reader; kept as a documented extra (reads 256x256 .r64/.ref).
         Box::new(crate::formats::simfcs::SimfcsReader::new()),
-        Box::new(crate::formats::simfcs::LambertFlimReader::new()),
         // AFM formats (extension-only)
         Box::new(crate::formats::afm::TopoMetrixReader::new()),
         Box::new(crate::formats::afm::UnisokuReader::new()),
@@ -129,14 +129,12 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::lei::LeiReader::new()),
         // PerkinElmer FLEX HCS (TIFF-based)
         Box::new(crate::formats::flex::FlexReader::new()),
-        // Bruker OPUS FTIR strict blind raw subset (BFOPUS1\0 magic) plus extension fallback
-        Box::new(crate::formats::opus::BrukerOpusReader::new()),
+        // Bruker MRI / ParaVision (filename "fid"/"acqp", 2dseq pixel blocks)
+        Box::new(crate::formats::bruker::BrukerReader::new()),
         // Extension-only readers
         Box::new(crate::formats::volocity::VolocityReader::new()),
         Box::new(crate::formats::volocity::NikonNisReader::new()),
-        Box::new(crate::formats::opus::IssFlimReader::new()),
         Box::new(crate::formats::legacy::KodakBipReader::new()),
-        Box::new(crate::formats::legacy::WoolzReader::new()),
         Box::new(crate::formats::legacy::PictReader::new()),
         Box::new(crate::formats::xrm::XrmReader::new()),
         Box::new(crate::formats::zvi::ZviReader::new()),
@@ -155,11 +153,9 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::misc::Jpeg2000Reader::new()), // magic-byte detection
         Box::new(crate::formats::misc::QuickTimeReader::new()),
         Box::new(crate::formats::misc::MngReader::new()),
-        Box::new(crate::formats::misc::VolocityLibraryReader::new()),
         Box::new(crate::formats::misc::SlideBookReader::new()),
         Box::new(crate::formats::misc::MincReader::new()),
         Box::new(crate::formats::misc::OpenlabLiffReader::new()),
-        Box::new(crate::formats::misc::SedatReader::new()),
         Box::new(crate::formats::misc::SmCameraReader::new()),
         // Extended formats — TIFF wrappers
         Box::new(crate::formats::extended::DngReader::new()),
@@ -202,7 +198,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::sem::HitachiReader::new()),
         Box::new(crate::formats::sem::LeoReader::new()),
         Box::new(crate::formats::sem::ZeissLmsReader::new()),
-        Box::new(crate::formats::sem::ImrodReader::new()),
+        Box::new(crate::formats::sem::ImodReader::new()),
         // SPM — scanning probe / AFM
         Box::new(crate::formats::spm::PicoQuantReader::new()),
         Box::new(crate::formats::spm::RhkReader::new()),
@@ -251,6 +247,10 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::misc4::KlbReader::new()),
         Box::new(crate::formats::misc4::ObfReader::new()),
         Box::new(crate::formats::misc::TextReader::new()),
+        // OME-Zarr / OME-NGFF (directory-based; detected by `.zarr` path or a
+        // Zarr group marker). Handled explicitly in `open_reader` before
+        // `peek_header`, which cannot read a directory.
+        Box::new(crate::formats::zarr::OmeZarrReader::new()),
     ]
 }
 
@@ -310,6 +310,19 @@ impl ImageReader {
 }
 
 pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
+    // OME-Zarr is a directory-based format. `peek_header` cannot read a
+    // directory, so detect and dispatch it before any byte sniffing. Mirrors
+    // Java `ZarrReader.isThisType`, which matches on the `.zarr` path.
+    if crate::formats::zarr::is_zarr_path(path) {
+        let mut r = boxed_reader(crate::formats::zarr::OmeZarrReader::new());
+        match r.set_id(path) {
+            Ok(()) => return Ok(r),
+            // A directory cannot fall through to `peek_header`; surface the error.
+            Err(err) if path.is_dir() => return Err(err),
+            Err(_) => {}
+        }
+    }
+
     let header = peek_header(path, 512)?;
     let mut best_error = None;
 
@@ -1103,9 +1116,13 @@ mod tests {
                 "Volocity MVD2 native Metakit decoding is unsupported",
             ),
             ("sample.cif", "FlowSight CIF is not TIFF-like"),
-            ("sample.lof", "missing LMS_Object_File marker"),
-            ("sample.oir", "Not an Olympus OIR OLE2 CFB file"),
-            ("sample.acff", "Not a Volocity clipping OLE2 CFB file"),
+            // NOTE: LOF (Leica) is no longer a stub — LeicaLofReader is a real
+            // reader now; it rejects fake data with its own header error.
+            // NOTE: OIR and ACFF (Volocity clipping) are no longer stubs —
+            // OirReader and VolocityClippingReader are now real readers. They
+            // still reject fake data (no fabricated metadata), just with
+            // reader-specific messages covered by their own unit tests, so they
+            // are intentionally excluded from this not-yet-implemented list.
             // NOTE: XRM/TXRM are no longer stubs — XrmReader is a real CFB-based
             // reader. It rejects fake/short input with a genuine CFB error
             // ("XRM CFB open: Invalid CFB file ..."), not fabricated metadata.
@@ -1139,18 +1156,10 @@ mod tests {
                 "sample.vws",
                 "TillVision embedded VWS native payload decoding is unsupported",
             ),
-            (
-                "sample.abs",
-                "Bruker OPUS native spectral image decoding is unsupported",
-            ),
-            (
-                "sample.0",
-                "Bruker OPUS native spectral image decoding is unsupported",
-            ),
-            (
-                "sample.iss",
-                "ISS Vista FLIM native decoding is unsupported",
-            ),
+            // NOTE: Bruker OPUS (.abs/.0) and ISS Vista FLIM (.iss) were removed
+            // entirely — they were fabricated readers for formats Bio-Formats has
+            // no reader for. (Bruker MRI/ParaVision is now a real reader; SkyScan
+            // microCT remains MicroCtReader.)
             // NOTE: sample.gel was removed here: GEL is no longer a stub.
             // extended::GelReader is a real Molecular Dynamics GEL reader (TIFF-based),
             // so on fake data it rejects via the underlying TIFF parser
@@ -1165,8 +1174,6 @@ mod tests {
                 bytes.extend_from_slice(&0u64.to_le_bytes());
                 bytes.extend_from_slice(&0i32.to_le_bytes());
                 std::fs::write(&path, bytes).unwrap();
-            } else if name == "sample.abs" || name == "sample.0" {
-                std::fs::write(&path, b"\x0a\x01\0\0\x04\0\0\0not a real image").unwrap();
             } else {
                 std::fs::write(&path, b"not a real image").unwrap();
             }

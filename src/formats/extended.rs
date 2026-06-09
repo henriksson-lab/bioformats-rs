@@ -5,6 +5,8 @@
 //! Group C: Extension-only placeholder readers (MRW, Yokogawa, etc.).
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
@@ -3258,36 +3260,195 @@ fn yk_row_name(row: u32) -> String {
 // ---------------------------------------------------------------------------
 // 9. Leica single-image LOF
 // ---------------------------------------------------------------------------
-/// Leica single-image LOF reader (`.lof`).
+/// Leica Object Format (`.lof`) — single-image Leica container.
 ///
-/// Leica LOF is a proprietary binary format used by Leica Application Suite.
-/// The internal structure is vendor-specific and undocumented.
-const LEICA_LOF_MARKER: &[u8] = b"LMS_Object_File";
-const LEICA_LOF_STRICT_RAW_MAGIC: &[u8; 16] = b"BFLEICALOFRAW001";
-const LEICA_LOF_UNSUPPORTED: &str = "Leica LOF native payload decoding is unsupported";
+/// Faithful translation of upstream Java `LOFReader` (which extends
+/// `LMSFileReader`). A LOF file has three parts:
+///   1. a binary header (`0x70` magic, the `LMS_Object_File` type string, major
+///      and minor version ints, and a 64-bit memory size),
+///   2. the memory block holding the raw pixel data (`memorySize` bytes), and
+///   3. an XML section (`0x70` magic again) carrying a UTF-16LE Leica
+///      `<ImageDescription>`.
+///
+/// The header / layout parsing (`checkForLofLayout`) and pixel addressing
+/// (`openBytes` / `seekStartOfPlane`) are ported directly. Dimension and pixel
+/// type parsing reuses the Leica `<ImageDescription>` schema shared with LIF
+/// (`<Dimensions>`/`<DimensionDescription>` with `DimID` 1=X 2=Y 3=Z 4=T,
+/// 10=tile, plus `<Channels>`/`<ChannelDescription>`), mirroring
+/// `translateImageNodes`. The wider Leica LeicaMicrosystemsMetadata translation
+/// (instrument / detector / ROI / LUTs / BGR channel ordering) is intentionally
+/// not ported and is left as an honest gap.
+const LOF_MAGIC_BYTE: u32 = 0x70;
+const LOF_MEMORY_BYTE: u8 = 0x2a;
+const LOF_TYPE_NAME: &str = "LMS_Object_File";
 
-fn leica_lof_validate_header(bytes: &[u8]) -> Result<()> {
-    if bytes
-        .windows(LEICA_LOF_MARKER.len())
-        .any(|window| window == LEICA_LOF_MARKER)
-    {
-        Ok(())
-    } else {
-        Err(BioFormatsError::Format(
-            "Not a Leica LOF file: missing LMS_Object_File marker".to_string(),
-        ))
-    }
+/// In-memory little/big-endian byte cursor mirroring the subset of
+/// `loci.common.RandomAccessInputStream` used by the NAF and LOF readers.
+struct ByteCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+    little: bool,
 }
 
-fn leica_lof_unsupported() -> BioFormatsError {
-    BioFormatsError::UnsupportedFormat(LEICA_LOF_UNSUPPORTED.to_string())
+impl<'a> ByteCursor<'a> {
+    fn new(data: &'a [u8], little: bool) -> Self {
+        ByteCursor {
+            data,
+            pos: 0,
+            little,
+        }
+    }
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+    fn pos(&self) -> usize {
+        self.pos
+    }
+    fn seek(&mut self, p: usize) {
+        self.pos = p.min(self.data.len());
+    }
+    fn skip(&mut self, n: usize) {
+        self.pos = self.pos.saturating_add(n).min(self.data.len());
+    }
+    /// Java `read()`: one unsigned byte, or `None` at EOF.
+    fn read_u8_opt(&mut self) -> Option<u8> {
+        if self.pos < self.data.len() {
+            let b = self.data[self.pos];
+            self.pos += 1;
+            Some(b)
+        } else {
+            None
+        }
+    }
+    fn ensure(&self, n: usize, what: &str) -> Result<()> {
+        if self.pos + n > self.data.len() {
+            Err(BioFormatsError::Format(format!(
+                "{what}: unexpected end of file"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+    fn read_i16(&mut self, what: &str) -> Result<i16> {
+        self.ensure(2, what)?;
+        let p = self.pos;
+        let v = if self.little {
+            i16::from_le_bytes([self.data[p], self.data[p + 1]])
+        } else {
+            i16::from_be_bytes([self.data[p], self.data[p + 1]])
+        };
+        self.pos += 2;
+        Ok(v)
+    }
+    fn read_i32(&mut self, what: &str) -> Result<i32> {
+        self.ensure(4, what)?;
+        let p = self.pos;
+        let v = if self.little {
+            i32::from_le_bytes([
+                self.data[p],
+                self.data[p + 1],
+                self.data[p + 2],
+                self.data[p + 3],
+            ])
+        } else {
+            i32::from_be_bytes([
+                self.data[p],
+                self.data[p + 1],
+                self.data[p + 2],
+                self.data[p + 3],
+            ])
+        };
+        self.pos += 4;
+        Ok(v)
+    }
+    fn read_i64(&mut self, what: &str) -> Result<i64> {
+        self.ensure(8, what)?;
+        let p = self.pos;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&self.data[p..p + 8]);
+        self.pos += 8;
+        Ok(if self.little {
+            i64::from_le_bytes(a)
+        } else {
+            i64::from_be_bytes(a)
+        })
+    }
+    fn read_f32(&mut self, what: &str) -> Result<f32> {
+        self.ensure(4, what)?;
+        let p = self.pos;
+        let v = if self.little {
+            f32::from_le_bytes([
+                self.data[p],
+                self.data[p + 1],
+                self.data[p + 2],
+                self.data[p + 3],
+            ])
+        } else {
+            f32::from_be_bytes([
+                self.data[p],
+                self.data[p + 1],
+                self.data[p + 2],
+                self.data[p + 3],
+            ])
+        };
+        self.pos += 4;
+        Ok(v)
+    }
+    /// Java `readString(n)`: `n` bytes interpreted as ISO-8859-1.
+    fn read_string(&mut self, n: usize, what: &str) -> Result<String> {
+        self.ensure(n, what)?;
+        let s: String = self.data[self.pos..self.pos + n]
+            .iter()
+            .map(|&c| c as char)
+            .collect();
+        self.pos += n;
+        Ok(s)
+    }
+    /// Java `readCString()`: bytes up to and consuming the next NUL terminator.
+    fn read_cstring(&mut self) -> String {
+        let mut s = String::new();
+        while let Some(b) = self.read_u8_opt() {
+            if b == 0 {
+                break;
+            }
+            s.push(b as char);
+        }
+        s
+    }
+    /// Java loop of `readChar()`: `count` UTF-16 code units (2 bytes each).
+    fn read_utf16(&mut self, count: i32, what: &str) -> Result<String> {
+        if count < 0 {
+            return Err(BioFormatsError::Format(format!("{what}: negative length")));
+        }
+        let n = count as usize;
+        self.ensure(n * 2, what)?;
+        let mut units = Vec::with_capacity(n);
+        for _ in 0..n {
+            let p = self.pos;
+            units.push(if self.little {
+                u16::from_le_bytes([self.data[p], self.data[p + 1]])
+            } else {
+                u16::from_be_bytes([self.data[p], self.data[p + 1]])
+            });
+            self.pos += 2;
+        }
+        Ok(String::from_utf16_lossy(&units))
+    }
 }
 
 pub struct LeicaLofReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    pixel_data: Vec<u8>,
-    plane_bytes: usize,
+    ome: Option<OmeImage>,
+    /// File offset of the first pixel byte (Java `offsets.get(0)`).
+    data_offset: u64,
+    /// End of pixel data (Java `endPointer`; defaults to the file length).
+    end_pointer: u64,
+    /// Number of tiles (Java `metaTemp.tileCount[0]`); also the series count.
+    tile_count: u32,
+    /// Bytes-per-tile increment (Java `metaTemp.tileBytesInc[0]`).
+    tile_bytes_inc: u64,
+    current_series: usize,
 }
 
 impl LeicaLofReader {
@@ -3295,8 +3456,61 @@ impl LeicaLofReader {
         LeicaLofReader {
             path: None,
             meta: None,
-            pixel_data: Vec::new(),
-            plane_bytes: 0,
+            ome: None,
+            data_offset: 0,
+            end_pointer: 0,
+            tile_count: 1,
+            tile_bytes_inc: 0,
+            current_series: 0,
+        }
+    }
+
+    /// Lightweight LOF detection from a header prefix: validates the leading
+    /// `0x70` magic, the `0x2A` type marker, and the `LMS_Object_File` type
+    /// name. The full Java `isThisType` additionally walks past the memory block
+    /// to confirm the XML carries an image node, which is not reachable from a
+    /// bounded header slice.
+    fn check_magic(header: &[u8]) -> bool {
+        let mut c = ByteCursor::new(header, true);
+        if c.read_i32("lof magic").ok().map(|v| v as u32) != Some(LOF_MAGIC_BYTE) {
+            return false;
+        }
+        if c.read_i32("lof chunk").is_err() {
+            return false;
+        }
+        if c.read_u8_opt() != Some(LOF_MEMORY_BYTE) {
+            return false;
+        }
+        let nc = match c.read_i32("lof nc") {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if nc != LOF_TYPE_NAME.chars().count() as i32 {
+            return false;
+        }
+        matches!(c.read_utf16(nc, "lof type"), Ok(name) if name == LOF_TYPE_NAME)
+    }
+
+    /// Java `seekStartOfPlane`: maps a plane index to an absolute file offset,
+    /// taking the tile dimension into account.
+    fn seek_start_of_plane(&self, no: u32, plane_size: u64) -> u64 {
+        let number_of_tiles = self.tile_count.max(1) as u64;
+        if number_of_tiles > 1 && plane_size > 0 {
+            let bytes_inc_per_tile = self.tile_bytes_inc;
+            let frames_per_tile = bytes_inc_per_tile / plane_size;
+            if frames_per_tile == 0 {
+                return self.data_offset + no as u64 * plane_size;
+            }
+            let no_outside_tiles = no as u64 / frames_per_tile;
+            let no_inside_tiles = no as u64 % frames_per_tile;
+            // Single tile group, so the tile within the group is the series.
+            let tile = self.current_series as u64;
+            self.data_offset
+                + no_outside_tiles * bytes_inc_per_tile * number_of_tiles
+                + tile * bytes_inc_per_tile
+                + no_inside_tiles * plane_size
+        } else {
+            self.data_offset + no as u64 * plane_size
         }
     }
 }
@@ -3317,36 +3531,114 @@ impl FormatReader for LeicaLofReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(LEICA_LOF_STRICT_RAW_MAGIC)
+        LeicaLofReader::check_magic(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        if bytes.starts_with(LEICA_LOF_STRICT_RAW_MAGIC) {
-            let parsed =
-                parse_extended_strict_raw(&bytes, LEICA_LOF_STRICT_RAW_MAGIC, "Leica LOF")?;
-            self.path = Some(path.to_path_buf());
-            self.meta = Some(parsed.meta);
-            self.pixel_data = parsed.payload;
-            self.plane_bytes = parsed.plane_bytes;
-            return Ok(());
+        let file_len = bytes.len() as u64;
+        let mut c = ByteCursor::new(&bytes, true);
+
+        // ---- Part 1: header (Java LOFReader.checkForLofLayout) ----
+        if c.read_i32("LOF header magic")? as u32 != LOF_MAGIC_BYTE {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (error at header section)".into(),
+            ));
         }
-        leica_lof_validate_header(&bytes)?;
-        Err(leica_lof_unsupported())
+        c.read_i32("LOF chunk length")?; // length of the following binary chunk
+        if c.read_u8_opt() != Some(LOF_MEMORY_BYTE) {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (error at header section)".into(),
+            ));
+        }
+        let nc = c.read_i32("LOF type-name length")?;
+        let type_name = c.read_utf16(nc, "LOF type name")?;
+        if type_name != LOF_TYPE_NAME {
+            // Most likely a LIF file, not a single-image LOF.
+            return Err(BioFormatsError::Format(format!(
+                "Not a valid Leica LOF file (typename={type_name})"
+            )));
+        }
+        // 1.2 major version, 1.3 minor version
+        if c.read_u8_opt() != Some(LOF_MEMORY_BYTE) {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (error at header section)".into(),
+            ));
+        }
+        c.read_i32("LOF major version")?;
+        if c.read_u8_opt() != Some(LOF_MEMORY_BYTE) {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (error at header section)".into(),
+            ));
+        }
+        c.read_i32("LOF minor version")?;
+        // 1.4 memory size
+        if c.read_u8_opt() != Some(LOF_MEMORY_BYTE) {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (error at header section)".into(),
+            ));
+        }
+        let memory_size = c.read_i64("LOF memory size")?;
+        if memory_size <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Leica LOF contains no image data, it cannot be opened directly".into(),
+            ));
+        }
+        let data_offset = c.pos() as u64;
+
+        // ---- Part 2: memory block (raw pixel data) ----
+        c.skip(memory_size as usize);
+        if c.pos() >= c.len() {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (xml section not found)".into(),
+            ));
+        }
+
+        // ---- Part 3: XML ----
+        if c.read_i32("LOF xml magic")? as u32 != LOF_MAGIC_BYTE {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (error at xml section)".into(),
+            ));
+        }
+        c.read_i32("LOF xml chunk length")?;
+        if c.read_u8_opt() != Some(LOF_MEMORY_BYTE) {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (error at xml section)".into(),
+            ));
+        }
+        let xml_length = c.read_i32("LOF xml length")?;
+        let lof_xml = c.read_utf16(xml_length, "LOF xml content")?;
+
+        // Translate the Leica <ImageDescription> into core metadata.
+        let info = lof_translate_metadata(&lof_xml)?;
+
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(info.meta);
+        self.ome = Some(info.ome);
+        self.data_offset = data_offset;
+        self.end_pointer = file_len;
+        self.tile_count = info.tile_count.max(1);
+        self.tile_bytes_inc = info.tile_bytes_inc;
+        self.current_series = 0;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.pixel_data.clear();
-        self.plane_bytes = 0;
+        self.ome = None;
+        self.data_offset = 0;
+        self.end_pointer = 0;
+        self.tile_count = 1;
+        self.tile_bytes_inc = 0;
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
         if self.meta.is_some() {
-            1
+            self.tile_count.max(1) as usize
         } else {
             0
         }
@@ -3356,15 +3648,16 @@ impl FormatReader for LeicaLofReader {
         if self.meta.is_none() {
             return Err(BioFormatsError::NotInitialized);
         }
-        if s != 0 {
+        if s >= self.tile_count.max(1) as usize {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
@@ -3374,20 +3667,66 @@ impl FormatReader for LeicaLofReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let start = self
-            .plane_bytes
-            .checked_mul(plane_index as usize)
-            .ok_or_else(|| {
-                BioFormatsError::Format("Leica LOF strict raw plane offset overflows".into())
-            })?;
-        let end = start.checked_add(self.plane_bytes).ok_or_else(|| {
-            BioFormatsError::Format("Leica LOF strict raw plane end overflows".into())
-        })?;
-        Ok(self.pixel_data[start..end].to_vec())
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        let bytes = meta.pixel_type.bytes_per_sample();
+        let rgb_channel_count = if meta.is_rgb {
+            meta.size_c.max(1) as usize
+        } else {
+            1
+        };
+        let bpp = bytes * rgb_channel_count;
+        let plane_size = (meta.size_x as u64) * (meta.size_y as u64) * bpp as u64;
+        let plane_bytes = plane_size as usize;
+
+        // Java row-padding (bytesToSkip) calculation.
+        let mut bytes_to_skip: i64 = self.end_pointer as i64
+            - self.data_offset as i64
+            - plane_size as i64 * meta.image_count as i64;
+        if plane_size == 0 || bytes_to_skip % plane_size as i64 != 0 {
+            bytes_to_skip = 0;
+        }
+        if meta.size_y > 0 {
+            bytes_to_skip /= meta.size_y as i64;
+        } else {
+            bytes_to_skip = 0;
+        }
+        if meta.size_x % 4 == 0 {
+            bytes_to_skip = 0;
+        }
+        let bytes_to_skip = bytes_to_skip.max(0) as u64;
+
+        let start = self.seek_start_of_plane(plane_index, plane_size)
+            + bytes_to_skip * meta.size_y as u64 * plane_index as u64;
+
+        // Truncated file: imitate LAS AF and return a blank (fill-0) plane.
+        if start.saturating_add(plane_size) > self.end_pointer {
+            return Ok(vec![0u8; plane_bytes]);
+        }
+
+        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(start)).map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; plane_bytes];
+        if bytes_to_skip == 0 {
+            f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        } else {
+            let row_bytes = meta.size_x as usize * bpp;
+            for row in 0..meta.size_y as usize {
+                f.read_exact(&mut buf[row * row_bytes..(row + 1) * row_bytes])
+                    .map_err(BioFormatsError::Io)?;
+                f.seek(SeekFrom::Current(bytes_to_skip as i64))
+                    .map_err(BioFormatsError::Io)?;
+            }
+        }
+        Ok(buf)
     }
 
     fn open_bytes_region(
@@ -3400,11 +3739,31 @@ impl FormatReader for LeicaLofReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("Leica LOF", &full, meta, 1, x, y, w, h)
+        let spp = if meta.is_rgb {
+            meta.size_c.max(1) as usize
+        } else {
+            1
+        };
+        crop_full_plane("Leica LOF", &full, meta, spp, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.open_bytes(plane_index)
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        if let (Some(img), Some(src)) = (ome.images.get_mut(0), self.ome.as_ref()) {
+            img.name = src.name.clone();
+            img.physical_size_x = src.physical_size_x;
+            img.physical_size_y = src.physical_size_y;
+            img.physical_size_z = src.physical_size_z;
+            if !src.channels.is_empty() {
+                img.channels = src.channels.clone();
+            }
+        }
+        Some(ome)
     }
 
     fn resolution_count(&self) -> usize {
@@ -3423,91 +3782,260 @@ impl FormatReader for LeicaLofReader {
     }
 }
 
-#[cfg(test)]
-mod leica_lof_tests {
-    use super::{LeicaLofReader, LEICA_LOF_STRICT_RAW_MAGIC};
-    use crate::common::error::BioFormatsError;
-    use crate::common::pixel_type::PixelType;
-    use crate::common::reader::FormatReader;
+/// Core metadata derived from a LOF `<ImageDescription>`.
+struct LofImageInfo {
+    meta: ImageMetadata,
+    ome: OmeImage,
+    tile_count: u32,
+    tile_bytes_inc: u64,
+}
 
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("bioformats_leica_lof_{name}"))
+/// Minimal Leica `<ImageDescription>` DOM node (tag name + attributes).
+struct LofNode {
+    name: String,
+    attrs: HashMap<String, String>,
+}
+
+/// Translate a LOF XML description into core metadata, mirroring the Leica
+/// `translateImageNodes` dimension/channel logic shared with the LIF reader.
+fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut nodes: Vec<LofNode> = Vec::new();
+    let mut has_image = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name == "Image" {
+                    has_image = true;
+                }
+                let mut attrs = HashMap::new();
+                for a in e.attributes().flatten() {
+                    let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
+                    let val = a.unescape_value().map(|v| v.to_string()).unwrap_or_default();
+                    attrs.insert(key, val);
+                }
+                nodes.push(LofNode { name, attrs });
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => {
+                return Err(BioFormatsError::Format(format!("LOF XML parse error: {e}")))
+            }
+        }
     }
 
-    #[test]
-    fn leica_lof_requires_marker_before_unsupported_payload() {
-        let path = temp_path("marker.lof");
-        std::fs::write(&path, b"\0\0LMS_Object_File\0payload").unwrap();
-
-        let mut reader = LeicaLofReader::new();
-        let err = reader.set_id(&path).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Leica LOF native payload decoding is unsupported")),
-            "{err:?}"
-        );
-        assert_eq!(reader.series_count(), 0);
-        assert!(matches!(
-            reader.set_series(0),
-            Err(BioFormatsError::NotInitialized)
+    if !has_image {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Leica LOF XML does not contain image data, it cannot be opened directly".into(),
         ));
-
-        let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn leica_lof_strict_raw_opens_planes_and_regions() {
-        let path = temp_path("strict.lof");
-        let plane0 = vec![1u8, 2, 3, 4, 5, 6];
-        let plane1 = vec![11u8, 12, 13, 14, 15, 16];
-        let mut payload = plane0.clone();
-        payload.extend_from_slice(&plane1);
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(LEICA_LOF_STRICT_RAW_MAGIC);
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&2u32.to_le_bytes());
-        bytes.extend_from_slice(&2u32.to_le_bytes());
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&40u64.to_le_bytes());
-        bytes.extend_from_slice(&payload);
-        std::fs::write(&path, bytes).unwrap();
+    // Channels.
+    let channel_nodes: Vec<&LofNode> = nodes
+        .iter()
+        .filter(|n| n.name == "ChannelDescription")
+        .collect();
+    let mut size_c = channel_nodes.len().max(1) as u32;
 
-        let mut reader = LeicaLofReader::new();
-        assert!(reader.is_this_type_by_bytes(LEICA_LOF_STRICT_RAW_MAGIC));
-        reader.set_id(&path).unwrap();
-        assert_eq!(reader.series_count(), 1);
-        assert_eq!(reader.metadata().size_x, 3);
-        assert_eq!(reader.metadata().size_y, 2);
-        assert_eq!(reader.metadata().size_t, 2);
-        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
-        assert_eq!(reader.open_bytes(0).unwrap(), plane0);
-        assert_eq!(reader.open_bytes(1).unwrap(), plane1);
-        assert_eq!(
-            reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
-            vec![12, 13, 15, 16]
-        );
-        assert!(matches!(
-            reader.open_bytes(2),
-            Err(BioFormatsError::PlaneOutOfRange(2))
+    let attr_u64 = |n: &LofNode, k: &str| -> u64 {
+        n.attrs
+            .get(k)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let attr_i32 = |n: &LofNode, k: &str| -> i32 {
+        n.attrs
+            .get(k)
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(0)
+    };
+    let attr_u32 = |n: &LofNode, k: &str| -> u32 {
+        n.attrs
+            .get(k)
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+
+    // Dimensions.
+    let dim_nodes: Vec<&LofNode> = nodes
+        .iter()
+        .filter(|n| n.name == "DimensionDescription")
+        .collect();
+    if dim_nodes.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Leica LOF XML has no <DimensionDescription> elements".into(),
         ));
-
-        let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn leica_lof_rejects_fake_payload_without_fake_metadata() {
-        let path = temp_path("fake.lof");
-        std::fs::write(&path, b"not a real image").unwrap();
+    let mut tile_count: u32 = 1;
+    let mut tile_bytes_inc: u64 = 0;
+    let mut extras: u64 = 1;
+    let mut size_z: u32 = 0;
+    let mut size_t: u32 = 0;
+    let mut size_x: u32 = 0;
+    let mut size_y: u32 = 0;
+    let mut is_rgb = false;
+    let mut pixel_type = PixelType::Uint8;
 
-        let mut reader = LeicaLofReader::new();
-        let err = reader.set_id(&path).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::Format(ref message) if message.contains("missing LMS_Object_File marker")),
-            "{err:?}"
-        );
-        assert_eq!(reader.series_count(), 0);
+    let mut physical_size_x: Option<f64> = None;
+    let mut physical_size_y: Option<f64> = None;
+    let mut physical_size_z: Option<f64> = None;
 
-        let _ = std::fs::remove_file(path);
+    for d in &dim_nodes {
+        let id = attr_i32(d, "DimID");
+        let len = attr_u32(d, "NumberOfElements");
+        let mut n_bytes = attr_u64(d, "BytesInc");
+        let phys = lof_physical_size_um(d, len);
+
+        match id {
+            1 => {
+                size_x = len;
+                physical_size_x = phys;
+                is_rgb = n_bytes > 0 && n_bytes % 3 == 0;
+                if is_rgb {
+                    n_bytes /= 3;
+                }
+                pixel_type = lof_pixel_type_from_bytes(n_bytes);
+            }
+            2 => {
+                if size_y != 0 {
+                    if size_z <= 1 {
+                        size_z = len;
+                        physical_size_z = phys.map(f64::abs);
+                    } else if size_t <= 1 {
+                        size_t = len;
+                    }
+                } else {
+                    size_y = len;
+                    physical_size_y = phys;
+                }
+            }
+            3 => {
+                if size_y == 0 {
+                    size_y = len;
+                    size_z = 1;
+                    physical_size_y = phys;
+                } else {
+                    size_z = len;
+                    physical_size_z = phys.map(f64::abs);
+                }
+            }
+            4 => {
+                if size_y == 0 {
+                    size_y = len;
+                    size_t = 1;
+                    physical_size_y = phys;
+                } else {
+                    size_t = len;
+                }
+            }
+            10 => {
+                tile_count = tile_count.saturating_mul(len.max(1));
+                tile_bytes_inc = n_bytes;
+            }
+            _ => {
+                extras = extras.saturating_mul(len.max(1) as u64);
+            }
+        }
+    }
+
+    if extras > 1 {
+        if size_z <= 1 {
+            size_z = extras as u32;
+        } else if size_t == 0 {
+            size_t = extras as u32;
+        } else {
+            size_t = size_t.saturating_mul(extras as u32);
+        }
+    }
+
+    if size_c == 0 {
+        size_c = 1;
+    }
+    let size_z = size_z.max(1);
+    let size_t = size_t.max(1);
+    let size_x = size_x.max(1);
+    let size_y = size_y.max(1);
+
+    let rgb_channel_count = if is_rgb { size_c } else { 1 };
+    let image_count = size_z * size_t * (size_c / rgb_channel_count.max(1)).max(1);
+
+    let meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z,
+        size_c,
+        size_t,
+        pixel_type,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        image_count,
+        dimension_order: DimensionOrder::XYCZT,
+        is_rgb,
+        is_interleaved: is_rgb,
+        is_indexed: !is_rgb,
+        is_little_endian: true,
+        resolution_count: 1,
+        series_metadata: HashMap::new(),
+        lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
+    };
+
+    let ome = OmeImage {
+        physical_size_x: physical_size_x.filter(|v| *v > 0.0),
+        physical_size_y: physical_size_y.filter(|v| *v > 0.0),
+        physical_size_z: physical_size_z.filter(|v| *v > 0.0),
+        ..OmeImage::default()
+    };
+
+    Ok(LofImageInfo {
+        meta,
+        ome,
+        tile_count,
+        tile_bytes_inc,
+    })
+}
+
+/// Leica calibration: `length / (numElements - 1)`, normalised to µm
+/// (`Unit="m"` → ×1e6, `Unit="Ks"` → ÷1000). Returns `None` when there is no
+/// usable calibration.
+fn lof_physical_size_um(node: &LofNode, num_elements: u32) -> Option<f64> {
+    if num_elements <= 1 {
+        return None;
+    }
+    let raw = node.attrs.get("Length").map(|s| s.trim()).unwrap_or("");
+    if raw.is_empty() {
+        return None;
+    }
+    let length: f64 = raw.parse().ok()?;
+    let mut value = length / (num_elements as f64 - 1.0);
+    match node.attrs.get("Unit").map(String::as_str) {
+        Some("Ks") => value /= 1000.0,
+        Some("m") => value *= 1_000_000.0,
+        _ => {}
+    }
+    if value.is_finite() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Java `FormatTools.pixelTypeFromBytes(nBytes, signed=false, fp=...)` as used
+/// by the Leica readers: unsigned integer types (8-byte → double).
+fn lof_pixel_type_from_bytes(n_bytes: u64) -> PixelType {
+    match n_bytes {
+        0 | 1 => PixelType::Uint8,
+        2 => PixelType::Uint16,
+        4 => PixelType::Uint32,
+        8 => PixelType::Float64,
+        _ => PixelType::Uint8,
     }
 }
 
@@ -3835,25 +4363,30 @@ impl FormatReader for PovRayReader {
 // ---------------------------------------------------------------------------
 // 12. NAF format
 // ---------------------------------------------------------------------------
-/// NAF format reader (`.naf`).
+/// Hamamatsu Aquacosmos NAF reader (`.naf`).
 ///
-/// NAF is a proprietary format with undocumented structure. This reader only
-/// accepts a strict synthetic raw subset with an explicit Bio-Formats Rust
-/// marker; native proprietary payloads are rejected.
+/// Faithful translation of upstream Java `NAFReader`. NAF stores a 2-byte
+/// endian marker (`"II"`/`"MM"`), a series count at offset 98, a description
+/// block, then one 256-byte core-metadata record per series (sizeX, sizeY,
+/// bit depth, sizeC, sizeZ, sizeT). The pixel-data offset for the first series
+/// is located by scanning for Hamamatsu's LUT/marker bytes (`0x03 0x25` runs
+/// and the `0xC0 0x2E` sentinel + fixed `LUT_SIZE`/`16063`/`352` deltas);
+/// subsequent series follow contiguously. Compressed payloads are unsupported
+/// (Java throws `UnsupportedCompressionException`).
 pub struct NafReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    pixel_data: Vec<u8>,
-    plane_bytes: usize,
+    series: Vec<ImageMetadata>,
+    offsets: Vec<u64>,
+    current_series: usize,
 }
 
 impl NafReader {
     pub fn new() -> Self {
         NafReader {
             path: None,
-            meta: None,
-            pixel_data: Vec::new(),
-            plane_bytes: 0,
+            series: Vec::new(),
+            offsets: Vec::new(),
+            current_series: 0,
         }
     }
 }
@@ -3864,126 +4397,22 @@ impl Default for NafReader {
     }
 }
 
-const NAF_STRICT_RAW_MAGIC: &[u8; 16] = b"BFNAFSTRICTRAW01";
-const BURLEIGH_STRICT_RAW_MAGIC: &[u8; 16] = b"BFBURLEIGHRAW001";
-const EXTENDED_STRICT_RAW_HEADER_LEN: usize = 40;
+const BURLEIGH_MAGIC: [u8; 4] = [0x66, 0x66, 0x46, 0x40];
+/// Java `NAFReader.LUT_SIZE`.
+const NAF_LUT_SIZE: u64 = 263168;
 
-#[derive(Clone)]
-struct ExtendedStrictRaw {
-    meta: ImageMetadata,
-    payload: Vec<u8>,
-    plane_bytes: usize,
-}
-
-fn extended_strict_raw_pixel_type(code: u16, label: &str) -> Result<(PixelType, u8)> {
-    match code {
+/// Java `FormatTools.pixelTypeFromBytes(nBytes, signed=false, fp=(nBytes==8))`
+/// as used by NAF.
+fn naf_pixel_type(n_bytes: i32) -> Result<(PixelType, u8)> {
+    match n_bytes {
         1 => Ok((PixelType::Uint8, 8)),
         2 => Ok((PixelType::Uint16, 16)),
-        3 => Ok((PixelType::Int16, 16)),
-        4 => Ok((PixelType::Float32, 32)),
+        4 => Ok((PixelType::Uint32, 32)),
+        8 => Ok((PixelType::Float64, 64)),
         _ => Err(BioFormatsError::UnsupportedFormat(format!(
-            "{label} strict raw unsupported pixel type code {code}"
+            "NAF unsupported bytes-per-pixel {n_bytes}"
         ))),
     }
-}
-
-fn parse_extended_strict_raw(
-    data: &[u8],
-    magic: &[u8; 16],
-    label: &str,
-) -> Result<ExtendedStrictRaw> {
-    if !data.starts_with(magic) {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "{label} native payload decoding is unsupported"
-        )));
-    }
-    if data.len() < EXTENDED_STRICT_RAW_HEADER_LEN {
-        return Err(BioFormatsError::Format(format!(
-            "{label} strict raw header is truncated"
-        )));
-    }
-
-    let width = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-    let height = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-    let planes = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-    let pixel_type_code = u16::from_le_bytes([data[28], data[29]]);
-    let reserved = u16::from_le_bytes([data[30], data[31]]);
-    let data_offset = u64::from_le_bytes([
-        data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
-    ]);
-
-    if width == 0 || height == 0 || planes == 0 {
-        return Err(BioFormatsError::Format(format!(
-            "{label} strict raw dimensions must be non-zero"
-        )));
-    }
-    if reserved != 0 {
-        return Err(BioFormatsError::Format(format!(
-            "{label} strict raw reserved header bytes must be zero"
-        )));
-    }
-    let data_offset = usize::try_from(data_offset).map_err(|_| {
-        BioFormatsError::Format(format!("{label} strict raw data offset overflows"))
-    })?;
-    if data_offset < EXTENDED_STRICT_RAW_HEADER_LEN {
-        return Err(BioFormatsError::Format(format!(
-            "{label} strict raw data offset points into header"
-        )));
-    }
-    if data_offset > data.len() {
-        return Err(BioFormatsError::Format(format!(
-            "{label} strict raw data offset points past end of file"
-        )));
-    }
-
-    let (pixel_type, bits_per_pixel) = extended_strict_raw_pixel_type(pixel_type_code, label)?;
-    let plane_bytes = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample()))
-        .ok_or_else(|| {
-            BioFormatsError::Format(format!("{label} strict raw plane size overflows"))
-        })?;
-    let expected = plane_bytes.checked_mul(planes as usize).ok_or_else(|| {
-        BioFormatsError::Format(format!("{label} strict raw payload size overflows"))
-    })?;
-    let available = data.len() - data_offset;
-    if available != expected {
-        return Err(BioFormatsError::Format(format!(
-            "{label} strict raw payload length mismatch: got {available} bytes, expected {expected}"
-        )));
-    }
-
-    let mut series_metadata = HashMap::new();
-    series_metadata.insert(
-        "format_subset".to_string(),
-        MetadataValue::String("strict-synthetic-raw".to_string()),
-    );
-
-    Ok(ExtendedStrictRaw {
-        meta: ImageMetadata {
-            size_x: width,
-            size_y: height,
-            size_z: 1,
-            size_c: 1,
-            size_t: planes,
-            pixel_type,
-            bits_per_pixel,
-            image_count: planes,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata,
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        },
-        payload: data[data_offset..].to_vec(),
-        plane_bytes,
-    })
 }
 
 impl FormatReader for NafReader {
@@ -3995,66 +4424,217 @@ impl FormatReader for NafReader {
         matches!(ext.as_deref(), Some("naf"))
     }
 
-    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(NAF_STRICT_RAW_MAGIC)
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // Java NAFReader has no isThisType(stream) override: extension-only.
+        false
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let parsed = parse_extended_strict_raw(&data, NAF_STRICT_RAW_MAGIC, "NAF")?;
+        let mut c = ByteCursor::new(&data, true);
+
+        let endian = c.read_string(2, "NAF endian marker")?;
+        let little = endian == "II";
+        c.little = little;
+
+        c.seek(98);
+        let series_count = c.read_i32("NAF series count")?;
+        if series_count <= 0 {
+            return Err(BioFormatsError::Format(
+                "NAF series count must be positive".into(),
+            ));
+        }
+        let series_count = series_count as usize;
+
+        // Description block: skip leading zero bytes, read a C-string, then skip
+        // any run of zero ints (Java `while (in.read()==0); readCString();
+        // while (in.readInt()==0);`).
+        c.seek(192);
+        while c.read_u8_opt() == Some(0) {}
+        let _description = c.read_cstring();
+        loop {
+            if c.read_i32("NAF post-description marker")? != 0 {
+                break;
+            }
+        }
+
+        let mut fp = c.pos() as i64;
+        if fp % 2 == 0 {
+            fp -= 4;
+        } else {
+            fp -= 1;
+        }
+        let fp = fp.max(0) as usize;
+
+        let mut offsets = vec![0u64; series_count];
+        let mut metas: Vec<ImageMetadata> = Vec::with_capacity(series_count);
+
+        for i in 0..series_count {
+            c.seek(fp + i * 256);
+            let size_x = c.read_i32("NAF sizeX")?;
+            let size_y = c.read_i32("NAF sizeY")?;
+            let num_bits = c.read_i32("NAF numBits")?;
+            let size_c = c.read_i32("NAF sizeC")?;
+            let size_z = c.read_i32("NAF sizeZ")?;
+            let size_t = c.read_i32("NAF sizeT")?;
+            if size_x <= 0 || size_y <= 0 || size_c <= 0 || size_z <= 0 || size_t <= 0 {
+                return Err(BioFormatsError::Format(
+                    "NAF core metadata dimensions must be positive".into(),
+                ));
+            }
+            let image_count = (size_z * size_c * size_t) as u32;
+            let n_bytes = num_bits / 8;
+            let (pixel_type, bits_per_pixel) = naf_pixel_type(n_bytes)?;
+
+            c.skip(4);
+            let pointer = c.pos();
+            let _name = c.read_cstring();
+
+            if i == 0 {
+                // Java: skipBytes(92 - getFilePointer() + pointer) -> pointer+92.
+                c.seek(pointer + 92);
+                loop {
+                    let check = c.read_i32("NAF first-series offset scan")? as i64;
+                    if check > c.pos() as i64 {
+                        offsets[i] = check as u64 + NAF_LUT_SIZE;
+                        break;
+                    }
+                    c.skip(92);
+                    if c.pos() + 4 > c.len() {
+                        return Err(BioFormatsError::Format(
+                            "NAF first-series pixel offset marker not found".into(),
+                        ));
+                    }
+                }
+            } else {
+                let mp = &metas[i - 1];
+                offsets[i] = offsets[i - 1]
+                    + (mp.size_x as u64)
+                        * (mp.size_y as u64)
+                        * (mp.image_count as u64)
+                        * (mp.pixel_type.bytes_per_sample() as u64);
+            }
+
+            offsets[i] += 352;
+            c.seek(offsets[i] as usize);
+            // Skip runs of the `0x03 0x25` + 114-byte block marker.
+            while c.pos() + 116 < c.len() {
+                if c.read_u8_opt() != Some(3) {
+                    break;
+                }
+                if c.read_u8_opt() != Some(37) {
+                    break;
+                }
+                c.skip(114);
+                offsets[i] = c.pos() as u64;
+            }
+
+            // Java: seek(getFilePointer() - 1); scan forward for 0xC0 0x2E.
+            let start = c.pos().saturating_sub(1);
+            let mut found = false;
+            let mut q = start;
+            while q + 1 < data.len() {
+                if data[q] == 192 && data[q + 1] == 46 {
+                    offsets[i] = q as u64;
+                    found = true;
+                    break;
+                }
+                q += 1;
+            }
+            if found {
+                offsets[i] += 16063;
+            }
+
+            // Last-series correction (Java): position so the final plane stack
+            // ends exactly at EOF.
+            if i == series_count - 1 && i > 0 {
+                let needed =
+                    (size_x as i64) * (size_y as i64) * (image_count as i64) * (n_bytes as i64);
+                offsets[i] = (data.len() as i64 - needed).max(0) as u64;
+            }
+
+            metas.push(ImageMetadata {
+                size_x: size_x as u32,
+                size_y: size_y as u32,
+                size_z: size_z as u32,
+                size_c: size_c as u32,
+                size_t: size_t as u32,
+                pixel_type,
+                bits_per_pixel,
+                image_count,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: little,
+                resolution_count: 1,
+                series_metadata: HashMap::new(),
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            });
+        }
+
         self.path = Some(path.to_path_buf());
-        self.meta = Some(parsed.meta);
-        self.pixel_data = parsed.payload;
-        self.plane_bytes = parsed.plane_bytes;
+        self.series = metas;
+        self.offsets = offsets;
+        self.current_series = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.pixel_data.clear();
-        self.plane_bytes = 0;
+        self.series.clear();
+        self.offsets.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.series.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if s >= self.series.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.series
+            .get(self.current_series)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let start = self
-            .plane_bytes
-            .checked_mul(plane_index as usize)
-            .ok_or_else(|| {
-                BioFormatsError::Format("NAF strict raw plane offset overflows".into())
-            })?;
-        let end = start
-            .checked_add(self.plane_bytes)
-            .ok_or_else(|| BioFormatsError::Format("NAF strict raw plane end overflows".into()))?;
-        Ok(self.pixel_data[start..end].to_vec())
+        let plane_bytes =
+            meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample();
+        let base = self.offsets[self.current_series];
+        let offset = base + plane_index as u64 * plane_bytes as u64;
+
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; plane_bytes];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        Ok(buf)
     }
 
     fn open_bytes_region(
@@ -4066,7 +4646,10 @@ impl FormatReader for NafReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         crop_full_plane("NAF", &full, meta, 1, x, y, w, h)
     }
 
@@ -4093,16 +4676,22 @@ impl FormatReader for NafReader {
 // ---------------------------------------------------------------------------
 // 13. Burleigh piezo/SPM
 // ---------------------------------------------------------------------------
-/// Burleigh piezo/SPM reader (`.img`).
+/// Burleigh SPM reader (`.img`).
 ///
-/// NOTE: `.img` is a very generic extension shared by many formats.
-/// Burleigh SPM images have an undocumented proprietary structure.
-/// This reader is a last-resort extension fallback.
+/// Faithful translation of upstream Java `BurleighReader`. The file begins with
+/// a little-endian float whose integer part (minus one) gives the version (1 or
+/// 2), followed by 16-bit `sizeX`/`sizeY`. Pixel data is a single UINT16 plane
+/// at offset 8 (version 1) or 260 (version 2). The trailing acquisition block
+/// (scan size, magnification, mode, gain, sample volts, tunnel current) is
+/// parsed best-effort and exposed as global metadata and physical pixel sizes.
+///
+/// Detection follows the Java magic test (`0x66 0x66 {0x46|0x06} 0x40`); the
+/// `.img` extension is too generic to be sufficient on its own.
 pub struct BurleighReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    pixel_data: Vec<u8>,
-    plane_bytes: usize,
+    ome: Option<OmeImage>,
+    pixels_offset: u64,
 }
 
 impl BurleighReader {
@@ -4110,8 +4699,8 @@ impl BurleighReader {
         BurleighReader {
             path: None,
             meta: None,
-            pixel_data: Vec::new(),
-            plane_bytes: 0,
+            ome: None,
+            pixels_offset: 0,
         }
     }
 }
@@ -4132,25 +4721,139 @@ impl FormatReader for BurleighReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(BURLEIGH_STRICT_RAW_MAGIC)
+        // Java: magic[0]==0x66 && magic[1]==0x66 && magic[3]==0x40 &&
+        //       (magic[2]==0x46 || magic[2]==0x06)
+        header.len() >= 4
+            && header[0] == BURLEIGH_MAGIC[0]
+            && header[1] == BURLEIGH_MAGIC[1]
+            && header[3] == BURLEIGH_MAGIC[3]
+            && (header[2] == 0x46 || header[2] == 0x06)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let parsed = parse_extended_strict_raw(&data, BURLEIGH_STRICT_RAW_MAGIC, "Burleigh SPM")?;
+        let mut c = ByteCursor::new(&data, true);
+
+        let version = c.read_f32("Burleigh version")? as i32 - 1;
+        let size_x = c.read_i16("Burleigh sizeX")? as i32;
+        let size_y = c.read_i16("Burleigh sizeY")? as i32;
+        if size_x <= 0 || size_y <= 0 {
+            return Err(BioFormatsError::Format(
+                "Burleigh image dimensions must be positive".into(),
+            ));
+        }
+
+        let pixels_offset = if version == 1 { 8u64 } else { 260u64 };
+
+        // Best-effort acquisition metadata block (Java guards with metadata
+        // level != MINIMUM). Parse errors are ignored, leaving sizes unset.
+        let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
+        let (mut x_size, mut y_size, mut z_size) = (0.0f64, 0.0f64, 0.0f64);
+        let parsed = (|| -> Result<()> {
+            let mut time_per_pixel = 0.0f64;
+            let (mut mode, mut gain, mut mag) = (0i32, 0i32, 0i32);
+            let (mut sample_volts, mut tunnel_current) = (0.0f64, 0.0f64);
+            if version == 1 {
+                let len = c.len();
+                if len < 40 {
+                    return Err(BioFormatsError::Format("Burleigh v1 file too short".into()));
+                }
+                c.seek(len - 40);
+                c.skip(12);
+                x_size = c.read_i32("Burleigh xSize")? as f64;
+                y_size = c.read_i32("Burleigh ySize")? as f64;
+                z_size = c.read_i32("Burleigh zSize")? as f64;
+                time_per_pixel = c.read_i16("Burleigh timePerPixel")? as f64 * 50.0;
+                mag = c.read_i16("Burleigh mag")? as i32;
+                mag = match mag {
+                    3 => 10,
+                    4 => 50,
+                    5 => 250,
+                    other => other,
+                };
+                if mag != 0 {
+                    x_size /= mag as f64;
+                    y_size /= mag as f64;
+                    z_size /= mag as f64;
+                }
+                mode = c.read_i16("Burleigh mode")? as i32;
+                gain = c.read_i16("Burleigh gain")? as i32;
+                sample_volts = c.read_f32("Burleigh sampleVolts")? as f64 / 1000.0;
+                tunnel_current = c.read_f32("Burleigh tunnelCurrent")? as f64;
+            } else if version == 2 {
+                c.skip(14);
+                x_size = c.read_i32("Burleigh xSize")? as f64;
+                y_size = c.read_i32("Burleigh ySize")? as f64;
+                z_size = c.read_i32("Burleigh zSize")? as f64;
+                mode = c.read_i16("Burleigh mode")? as i32;
+                c.skip(4);
+                gain = c.read_i16("Burleigh gain")? as i32;
+                time_per_pixel = c.read_i16("Burleigh timePerPixel")? as f64 * 50.0;
+                c.skip(12);
+                sample_volts = c.read_f32("Burleigh sampleVolts")? as f64;
+                tunnel_current = c.read_f32("Burleigh tunnelCurrent")? as f64;
+                series_metadata.insert(
+                    "Force".into(),
+                    MetadataValue::Float(c.read_f32("Burleigh force")? as f64),
+                );
+            }
+            series_metadata.insert("Version".into(), MetadataValue::Int(version as i64));
+            series_metadata.insert("Image mode".into(), MetadataValue::Int(mode as i64));
+            series_metadata.insert("Z gain".into(), MetadataValue::Int(gain as i64));
+            series_metadata.insert(
+                "Time per pixel (s)".into(),
+                MetadataValue::Float(time_per_pixel),
+            );
+            series_metadata.insert("Sample volts".into(), MetadataValue::Float(sample_volts));
+            series_metadata.insert("Tunnel current".into(), MetadataValue::Float(tunnel_current));
+            series_metadata.insert("Magnification".into(), MetadataValue::Int(mag as i64));
+            Ok(())
+        })();
+        let _ = parsed;
+
+        let meta = ImageMetadata {
+            size_x: size_x as u32,
+            size_y: size_y as u32,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        };
+
+        // Physical pixel sizes (Java getPhysicalSizeX(xSize / sizeX), etc.).
+        let ome = OmeImage {
+            physical_size_x: Some(x_size / size_x as f64).filter(|v| *v > 0.0 && v.is_finite()),
+            physical_size_y: Some(y_size / size_y as f64).filter(|v| *v > 0.0 && v.is_finite()),
+            physical_size_z: Some(z_size).filter(|v| *v > 0.0 && v.is_finite()),
+            ..OmeImage::default()
+        };
+
         self.path = Some(path.to_path_buf());
-        self.meta = Some(parsed.meta);
-        self.pixel_data = parsed.payload;
-        self.plane_bytes = parsed.plane_bytes;
+        self.meta = Some(meta);
+        self.ome = Some(ome);
+        self.pixels_offset = pixels_offset;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.pixel_data.clear();
-        self.plane_bytes = 0;
+        self.ome = None;
+        self.pixels_offset = 0;
         Ok(())
     }
 
@@ -4181,16 +4884,15 @@ impl FormatReader for BurleighReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let start = self
-            .plane_bytes
-            .checked_mul(plane_index as usize)
-            .ok_or_else(|| {
-                BioFormatsError::Format("Burleigh SPM strict raw plane offset overflows".into())
-            })?;
-        let end = start.checked_add(self.plane_bytes).ok_or_else(|| {
-            BioFormatsError::Format("Burleigh SPM strict raw plane end overflows".into())
-        })?;
-        Ok(self.pixel_data[start..end].to_vec())
+        let plane_bytes =
+            meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample();
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(self.pixels_offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; plane_bytes];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        Ok(buf)
     }
 
     fn open_bytes_region(
@@ -4208,6 +4910,17 @@ impl FormatReader for BurleighReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.open_bytes(plane_index)
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        if let (Some(img), Some(src)) = (ome.images.get_mut(0), self.ome.as_ref()) {
+            img.physical_size_x = src.physical_size_x;
+            img.physical_size_y = src.physical_size_y;
+            img.physical_size_z = src.physical_size_z;
+        }
+        Some(ome)
     }
 
     fn resolution_count(&self) -> usize {

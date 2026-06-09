@@ -87,11 +87,55 @@ pub fn decompress_packbits(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Decompress JPEG data (both lossy and lossless/SOF3 variants).
+///
+/// Standard baseline/progressive streams are decoded with `zune-jpeg` (faster,
+/// and numerically closer to libjpeg-turbo). Anything `zune-jpeg` cannot handle
+/// — lossless SOF3, CMYK/YCCK, Adobe-RGB, 16-bit, or any decode error — falls
+/// back to `jpeg-decoder`, which is the authoritative path for those cases. The
+/// output byte layout is identical to the previous `jpeg-decoder`-only path:
+/// interleaved RGB for YCbCr 3-component input, single-byte grayscale for
+/// 1-component input.
 pub fn decompress_jpeg(data: &[u8]) -> Result<Vec<u8>> {
+    if let Some(out) = try_decompress_jpeg_zune(data) {
+        return Ok(out);
+    }
+    decompress_jpeg_fallback(data)
+}
+
+/// Decode with `jpeg-decoder` (default color transform). The authoritative path
+/// for everything `zune-jpeg` does not handle.
+pub(crate) fn decompress_jpeg_fallback(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = jpeg_decoder::Decoder::new(data);
     decoder
         .decode()
         .map_err(|e| BioFormatsError::Codec(e.to_string()))
+}
+
+/// Attempt to decode a standard baseline/progressive JPEG with `zune-jpeg`.
+///
+/// Returns `Some(bytes)` only for the cases whose output layout provably matches
+/// `jpeg-decoder`'s default: 1-component (Luma → 1 byte/px) and 3-component
+/// YCbCr (→ interleaved RGB). For any other input colorspace (RGB/CMYK/YCCK),
+/// lossless SOF3 (which `zune-jpeg` does not support), or any decode error,
+/// returns `None` so the caller falls back to `jpeg-decoder`.
+pub(crate) fn try_decompress_jpeg_zune(data: &[u8]) -> Option<Vec<u8>> {
+    use zune_core::bytestream::ZCursor;
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+
+    let mut decoder = zune_jpeg::JpegDecoder::new(ZCursor::new(data));
+    if decoder.decode_headers().is_err() {
+        return None;
+    }
+    let info = decoder.info()?;
+    let out_colorspace = match (decoder.input_colorspace()?, info.components) {
+        (ColorSpace::Luma, 1) => ColorSpace::Luma,
+        (ColorSpace::YCbCr, 3) => ColorSpace::RGB,
+        // RGB/CMYK/YCCK/other: defer to jpeg-decoder to preserve exact bytes.
+        _ => return None,
+    };
+    decoder.set_options(DecoderOptions::default().jpeg_set_out_colorspace(out_colorspace));
+    decoder.decode().ok()
 }
 
 /// Decompress Zstd data.

@@ -35,10 +35,28 @@ dl() {
   curl -L -C - --fail --retry 3 -o "${dir}/${out}" "${url}"
 }
 
+dlzip() {
+  # dlzip <subdir> <url> <member-in-zip> <output-filename> <description>
+  # Downloads a .zip and extracts a single member as <output-filename>.
+  local sub="$1" url="$2" member="$3" out="$4" desc="$5"
+  local dir="${DEST}/${sub}"
+  mkdir -p "$dir"
+  local tmp; tmp="$(mktemp --suffix=.zip)"
+  echo
+  echo "==> [${sub}] ${out}  (${desc})"
+  echo "    ${url}  ::${member}"
+  curl -L --fail --retry 3 -o "${tmp}" "${url}"
+  unzip -p "${tmp}" "${member}" > "${dir}/${out}"
+  rm -f "${tmp}"
+}
+
 OME="https://downloads.openmicroscopy.org/images"
 OPENSLIDE="https://openslide.cs.cmu.edu/download/openslide-testdata"
 FIJI="https://samples.fiji.sc"
 NASA_FITS="https://fits.gsfc.nasa.gov/samples"
+SCIF="https://samples.scif.io"
+GH="https://github.com"
+VTKEX="${GH}/lorensen/VTKExamples/raw/master/src/Testing/Data"
 
 ############################################################
 # Per-format functions
@@ -136,11 +154,60 @@ f_bdv() {             # BigDataViewer / BDV-HDF5 (.h5 + .xml, fetch both)
   dl bdv "${OME}/BDV/samples/HisYFP-SPIM.h5" "HisYFP-SPIM.h5" "~357 MB, BDV HDF5 SPIM dataset"
 }
 
+f_pic() {             # Bio-Rad PIC (BioRadReader)
+  # sdub.zip contains 12 single-plane-stack .pic files (sdub1..sdub12); take one.
+  dlzip pic "${SCIF}/sdub.zip" "sdub1.pic" "sdub1.pic" "~216 KB, Bio-Rad PIC 192x128x9 uint8 (Java oracle: ok)"
+}
+
+f_nrrd() {            # NRRD (NrrdReader) — self-contained, attached gzip-encoded data.
+  # NOTE: server name has a .gz suffix but the file is a complete .nrrd
+  # (magic NRRD0001, internal 'encoding: gzip'); store it as plain .nrrd.
+  dl nrrd "${OME}/NRRD/glencoe/gzip/dt-helix.nrrd.gz" "dt-helix.nrrd" "~1.0 MB, self-contained NRRD 38x39x40, 7ch float (Java oracle: ok)"
+}
+
+f_spe() {             # Princeton Instruments SPE (SpeReader)
+  dl spe "${GH}/imageio/imageio-binaries/raw/master/images/test_000_.SPE" "test_000_.spe" "~8 KB, SPE 32x32 uint16, 2 frames (Java oracle: ok)"
+}
+
+f_andor() {           # Andor SIF (AndorSifReader)
+  dl sif "${GH}/fujiisoup/sif_reader/raw/master/testings/public_testdata/image.sif" "image.sif" "~2.1 MB, Andor SIF 512x512 float (Java oracle: ok)"
+}
+
+f_klb() {             # KLB (KlbReader)
+  dl klb "${OME}/KLB/samples/img.klb" "img.klb" "~373 KB, KLB 101x151x29 uint16 (Java oracle: ok)"
+}
+
+f_metaimage() {       # MetaImage (MetaImageReader) — detached .mhd + .raw pair.
+  # NOTE: Java Bio-Formats has NO MetaImage reader, so the oracle cannot verify
+  # this; it is a Rust-only reader. A LOCAL self-contained .mha is avoided because
+  # the current Rust parser reads the header line-by-line as UTF-8 and chokes on
+  # the trailing binary; a detached .mhd (pure-text header) + .raw works.
+  dl mha "${VTKEX}/HeadMRVolume.mhd" "HeadMRVolume.mhd" "231 B, MetaImage header 48x62x42 uint8 (Java: no reader; Rust: ok)"
+  dl mha "${VTKEX}/HeadMRVolume.raw" "HeadMRVolume.raw" "~122 KB, raw pixel data paired with HeadMRVolume.mhd"
+}
+
+f_stk() {             # Metamorph STK (MetamorphReader) — standalone .stk stack.
+  # f_metamorph fetches the .nd + .TIF dataset; this is a true single-file .stk.
+  dl stk "${GH}/CellProfiler/CellProfiler/raw/main/tests/core/data/modules/loadimages/C0.stk" "C0.stk" "~13 MB, Metamorph STK 800x800, 7 planes, 3ch uint8 (Java oracle: ok)"
+}
+
+f_jpg() {             # plain JPEG (JpegReader)
+  dlzip jpg "${SCIF}/test-jpg.zip" "scifio-test.jpg" "scifio-test.jpg" "~102 KB, JPEG 500x500 RGB (Java oracle: ok)"
+}
+
+f_png() {             # plain PNG (PngReader)
+  dlzip png "${SCIF}/test-png.zip" "scifio-test.png" "scifio-test.png" "~71 KB, PNG 500x500 RGB (Java oracle: ok)"
+}
+
+f_bmp() {             # plain BMP (BmpReader)
+  dl bmp "${GH}/imageio/imageio-binaries/raw/master/images/scribble_P_RGB.bmp" "scribble_P_RGB.bmp" "~470 KB, BMP 800x600 indexed (Java oracle: ok)"
+}
+
 ############################################################
 # Dispatch
 ############################################################
 
-FORMATS=(ndpi svs scn czi nd2 lif ometiff lsm dicom flex ims ics fits mrc nifti amira dv metamorph gatan sdt bdv)
+FORMATS=(ndpi svs scn czi nd2 lif ometiff lsm dicom flex ims ics fits mrc nifti amira dv metamorph gatan sdt bdv pic nrrd spe andor klb metaimage stk jpg png bmp)
 
 list_formats() {
   echo "Available --format selectors:"
@@ -155,8 +222,11 @@ run_format() {
     lif) f_lif ;; ometiff|ome-tiff) f_ometiff ;; lsm) f_lsm ;; dicom) f_dicom ;;
     flex) f_flex ;; ims|imaris) f_ims ;; ics|ids) f_ics ;; fits) f_fits ;;
     mrc) f_mrc ;; nifti) f_nifti ;; amira) f_amira ;; dv|deltavision) f_dv ;;
-    metamorph|stk|nd) f_metamorph ;; gatan|dm4|dm3) f_gatan ;; sdt) f_sdt ;;
+    metamorph|nd) f_metamorph ;; gatan|dm4|dm3) f_gatan ;; sdt) f_sdt ;;
     bdv|h5) f_bdv ;;
+    pic|biorad) f_pic ;; nrrd) f_nrrd ;; spe) f_spe ;;
+    andor|sif) f_andor ;; klb) f_klb ;; metaimage|mha|mhd) f_metaimage ;;
+    stk) f_stk ;; jpg|jpeg) f_jpg ;; png) f_png ;; bmp) f_bmp ;;
     *) echo "Unknown format: $1" >&2; list_formats; exit 1 ;;
   esac
 }

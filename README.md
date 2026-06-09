@@ -281,24 +281,43 @@ Roughly **108 complete, 42 partial, 36 stub** out of ~185 registered readers
 
 ### Not yet implemented (stubs)
 
-Detection works; `set_id` returns a descriptive `UnsupportedFormat`. Mostly
-proprietary/undocumented formats or ones needing an unported container parser or
-codec.
+Detection works; `set_id` returns a descriptive `UnsupportedFormat` (or only a
+synthetic subset is read). Each maps to a real Bio-Formats Java reader that has
+not yet been fully ported.
 
 | Format | Extensions | Reason |
 |--------|-----------|--------|
 | QuickTime | `.mov` `.qt` | MOV atom container not parsed |
-| Volocity library / MVD2 / clipping | `.acff` `.mvd2` | OLE2 / Metakit container |
-| SlideBook / SlideBook 7 | `.sld` | Proprietary undocumented |
-| Openlab LIFF | `.liff` | Proprietary undocumented |
-| Sedat / APL / I2I / JDCE / PCI / HRD-GDF / NAF | `.sedat` `.apl` `.i2i` `.jdce` `.pci` `.gdf` `.naf` | Proprietary undocumented |
-| KLB | `.klb` | No pure-Rust KLB decoder |
-| Imspector OBF/MSR | `.obf` `.msr` | Header parses; stack payload not decoded |
-| Leica LOF | `.lof` | Leica LAS proprietary binary |
-| Burleigh | `.img` | `.img` too generic to detect |
-| Woolz | `.wlz` | Graph-based format |
+| JEOL | `.dat` `.img` `.par` | Proprietary EM container not ported |
+| Zeiss LMS (LMSFile) | `.lms` | Proprietary container not ported |
+| TillVision | `.vws` | Embedded VWS payload not decoded |
 | File-pattern dataset | `.pattern` | Needs glob/regex multi-file expansion |
-| FEI SER | `.ser` | Header parses; `set_id` unsupported |
+
+Various SPM/camera readers (`spm.rs`, `camera2.rs`) similarly detect but return
+`UnsupportedFormat` for the pixel payload.
+
+> **Note.** Several formats previously listed here are now implemented as faithful
+> translations of their Java readers: OBF, Olympus OIR, CellWorX/MetaXpress, I2I,
+> JDCE, SimplePCI, Volocity clipping, KLB, Olympus APL, HRD-GDF, Hamamatsu NAF,
+> Burleigh, Leica LOF, MNG, 3i SlideBook, Openlab LIFF, IMOD, and Bruker MRI
+> (ParaVision). Conversely, four fabricated readers for formats Bio-Formats has no
+> reader for (Bruker OPUS, ISS Vista FLIM) or that duplicated real readers
+> (Lambert FLIM → LI-FLIM, Volocity Library → Volocity; plus a `Sedat`/`Woolz`
+> invention) were **removed** — this project is a translation of Bio-Formats, not
+> a superset.
+
+### Non-upstream extensions (deliberate extras)
+
+A few readers have **no counterpart in Bio-Formats** but read a real format and
+are kept as documented extensions rather than removed:
+
+| Reader | Extensions | Note |
+|--------|-----------|------|
+| MetaImage (ITK) | `.mha` `.mhd` | ITK/MetaIO volume; not a Bio-Formats format |
+| OME-Zarr / NGFF | `.zarr` | Translated from the separate `ome/ZarrReader`, not core Bio-Formats |
+| OpenSlide | `.mrxs` `.vms` … | Optional `openslide` feature; wraps the OpenSlide library |
+| SimFCS | `.r64` `.ref` | Globals SimFCS raw 256×256 FLIM frames |
+| Photon Dynamics | `.img` | Header + raw pixel sidecar |
 
 ## API overview
 
@@ -446,6 +465,42 @@ Reproduce by building the warmup harnesses and running `bench/BfBench.java` and
 `bench/bench_rust.rs` against the same fixture. This measures open + read all
 planes + close per iteration after warmup, not cold JVM startup.
 
+
+
+## Java parity & known divergences
+
+Readers and writers are checked against the reference Java Bio-Formats
+(`bioformats_package.jar`) by a parity harness (`tests/java_parity_test.rs` for
+reads, `tests/java_writer_parity_test.rs` for writes; oracle in
+`parity/BfParityOracle.java`). For each file it compares **core metadata**, **OME
+metadata** (image name, physical sizes, channels/wavelengths) and **pixels**
+(CRC of the top-left crop of every plane, the whole plane for small images, and a
+centered off-origin region). Pixel results are classified **bitwise** /
+**tolerant** (≤5 levels, JPEG IDCT rounding) / **⚠ Java-bug** / **✗**. Run with
+`BIOFORMATS_RS_JAVA_PARITY=1` (skipped otherwise, so a plain `cargo test` needs
+no JVM).
+
+Core metadata reaches full parity; the remaining divergences are documented and
+intentional:
+
+- **OME image name — IMAGIC (`.hed`/`.img`).** The OME *image name* convention is
+  the file basename, which we populate for every reader to match Java. IMAGIC is
+  the one exception: Java's `IMAGICReader` takes the name from a header field
+  rather than the filename, and in real files that field often contains numeric
+  header junk (e.g. `"!--0.507 41.5 10.9 …"`). We deliberately leave the name
+  unset (`None`) rather than replicate the junk — matching Java here would be
+  *less* useful, not more. This is the only OME-metadata divergence in the suite.
+
+- **JPEG-compressed pixels** (whole-slide SVS/SCN/NDPI, VSI overview, baseline
+  JPEG). These match Java to within ±1–3 levels per sample but not bitwise: the
+  pure-Rust JPEG decoder uses a different integer IDCT than libjpeg-turbo. Counted
+  as *tolerant*, not failures.
+
+- **BigDataViewer HDF5 (`bdv`), setup-8 levels.** Our decode is correct; Java
+  diverges because the libhdf5 (1.10.5) bundled in Bio-Formats has an off-by-one
+  in `H5Zscaleoffset.c` that mis-reads full-precision scale-offset chunks (fixed
+  upstream only in HDF5 2.0.0). Classified **⚠ Java-bug**, not a failure. Full
+  write-up in `bioformats_bug.txt`.
 
 
 ## How to cite

@@ -323,7 +323,15 @@ impl FormatReader for SpeReader {
         // SPEReader.java populates pixels only; exposure time is stored as a
         // global metadata int (microseconds, per the SPE spec) and is not mapped
         // to per-plane OME PlaneDeltaT, so we mirror the pixel-only mapping.
-        Some(OmeMetadata::from_image_metadata(meta))
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        // MetadataTools.populatePixels sets the image name to the file's basename.
+        if let (Some(path), Some(img)) = (self.path.as_ref(), ome.images.get_mut(0)) {
+            img.name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+        }
+        Some(ome)
     }
 }
 

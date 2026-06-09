@@ -564,6 +564,34 @@ impl FormatReader for BmpReader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::metadata::MetadataValue;
+        use crate::common::ome_metadata::OmeMetadata;
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        if let Some(img) = ome.images.get_mut(0) {
+            // MetadataTools.populatePixels sets the image name to the basename.
+            img.name = self
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            // BMPReader.java: resolution is stored as pixels-per-metre; convert
+            // to microns-per-pixel via 1000000 / pixelsPerMetre. A non-positive
+            // value yields no PhysicalSize (FormatTools.getPhysicalSizeX -> null).
+            let phys = |key: &str| -> Option<f64> {
+                match meta.series_metadata.get(key) {
+                    Some(MetadataValue::Int(v)) if *v > 0 => Some(1_000_000.0 / *v as f64),
+                    _ => None,
+                }
+            };
+            img.physical_size_x = phys("X resolution");
+            img.physical_size_y = phys("Y resolution");
+        }
+        Some(ome)
+    }
 }
 
 use crate::common::writer::FormatWriter;

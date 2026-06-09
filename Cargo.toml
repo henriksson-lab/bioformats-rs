@@ -31,6 +31,8 @@ zip          = { version = "2", default-features = false, features = ["deflate",
 flate2       = "1"
 weezl        = "0.1"
 jpeg-decoder = "0.3"
+zune-jpeg    = "0.5"
+zune-core    = "0.5"
 zstd-pure-rs = "0.1"
 quick-xml    = "0.37"
 encoding_rs  = "0.8"
@@ -44,6 +46,8 @@ jpegxr        = { version = "0.3", optional = true }
 openslide-pure-rs = { version = "0.1", optional = true }
 mdbtools      = { package = "mdbtools-pure-rs", version = "0.1" }
 bzip2 = "0.6"
+zarrs         = { version = "0.23", features = ["filesystem"] }
+serde_json    = "1"
 
 [features]
 jpegxr = ["dep:jpegxr"]

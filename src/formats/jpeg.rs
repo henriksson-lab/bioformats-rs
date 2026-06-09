@@ -1,8 +1,9 @@
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::ome_metadata::OmeMetadata;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
+use crate::common::region::validate_region;
 use std::path::{Path, PathBuf};
 
 pub struct JpegReader {
@@ -32,7 +33,18 @@ fn load_jpeg(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     let img = image::open(path).map_err(|e| BioFormatsError::Format(e.to_string()))?;
     let (w, h) = img.dimensions();
     let rgb = img.to_rgb8();
-    let raw = rgb.into_raw();
+    let interleaved = rgb.into_raw();
+    // Java's JPEGReader reports isInterleaved() == false: openBytes returns the
+    // plane with channels separated (all R, then all G, then all B). Convert the
+    // interleaved RGBRGB buffer from the `image` crate into that planar layout so
+    // pixel bytes match Java's.
+    let plane = (w as usize) * (h as usize);
+    let mut planar = vec![0u8; interleaved.len()];
+    for (i, px) in interleaved.chunks_exact(3).enumerate() {
+        planar[i] = px[0];
+        planar[plane + i] = px[1];
+        planar[2 * plane + i] = px[2];
+    }
     let meta = ImageMetadata {
         size_x: w,
         size_y: h,
@@ -44,13 +56,14 @@ fn load_jpeg(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         image_count: 1,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb: true,
-        is_interleaved: true,
+        is_interleaved: false,
         is_indexed: false,
-        is_little_endian: true,
+        // Java's DelegateReader (ImageIO path) reports little-endian == false.
+        is_little_endian: false,
         resolution_count: 1,
         ..Default::default()
     };
-    Ok((meta, raw))
+    Ok((meta, planar))
 }
 
 impl FormatReader for JpegReader {
@@ -118,7 +131,21 @@ impl FormatReader for JpegReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        crop_full_plane("JPEG", &full, meta, 3, x, y, w, h)
+        validate_region("JPEG", meta.size_x, meta.size_y, x, y, w, h)?;
+        // Pixels are stored channel-separated (planar): all R, then all G, then
+        // all B. Crop each channel's plane independently and concatenate so the
+        // output stays planar, matching Java's isInterleaved()==false layout.
+        let sx = meta.size_x as usize;
+        let channel = sx * meta.size_y as usize;
+        let mut out = Vec::with_capacity(3 * (w as usize) * (h as usize));
+        for c in 0..3usize {
+            let base = c * channel;
+            for row in 0..h as usize {
+                let start = base + (y as usize + row) * sx + x as usize;
+                out.extend_from_slice(&full[start..start + w as usize]);
+            }
+        }
+        Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -128,6 +155,23 @@ impl FormatReader for JpegReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        // Java's JPEGReader sets the OME image name to the source filename.
+        if let Some(name) = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            if let Some(img) = ome.images.first_mut() {
+                img.name = Some(name.to_string());
+            }
+        }
+        Some(ome)
     }
 }
 

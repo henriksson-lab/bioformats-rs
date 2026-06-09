@@ -886,7 +886,6 @@ fn unsupported_raw_sem(format_name: &str) -> BioFormatsError {
 
 const JEOL_STRICT_MAGIC: &[u8] = b"BIOFORMATS-RS-JEOL-SEM-STRICT-RAW-V1\n";
 const ZEISS_LMS_STRICT_MAGIC: &[u8] = b"BIOFORMATS-RS-ZEISS-LMS-STRICT-RAW-V1\n";
-const IMROD_STRICT_MAGIC: &[u8] = b"BIOFORMATS-RS-IMROD-STRICT-RAW-V1\n";
 
 fn read_le_u32_strict(data: &[u8], offset: usize, label: &str, format_name: &str) -> Result<u32> {
     let bytes = data.get(offset..offset + 4).ok_or_else(|| {
@@ -1697,33 +1696,415 @@ impl FormatReader for ZeissLmsReader {
     }
 }
 
-/// IMOD mesh format reader (`.mod`).
+/// IMOD binary model magic string (big-endian file). See
+/// <http://bio3d.colorado.edu/imod/doc/binspec.html>.
+const IMOD_MAGIC_STRING: &[u8] = b"IMODV1.2";
+
+/// Minimal big-endian cursor over an in-memory IMOD model file.
 ///
-/// Supports only the conservative BioFormats-rs strict raw subset identified
-/// by `BIOFORMATS-RS-IMROD-STRICT-RAW-V1\n`.
-pub struct ImrodReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    data_offset: u64,
+/// Mirrors the subset of `loci.common.RandomAccessInputStream` used by the
+/// Java `IMODReader`: big-endian integers/floats, single-byte reads, and
+/// length-bounded string reads.
+struct ImodCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
 }
 
-impl ImrodReader {
-    pub fn new() -> Self {
-        ImrodReader {
-            path: None,
-            meta: None,
-            data_offset: 0,
+impl<'a> ImodCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        ImodCursor { data, pos: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn seek(&mut self, p: usize) {
+        self.pos = p;
+    }
+
+    fn eof() -> BioFormatsError {
+        BioFormatsError::Format("IMOD model file is truncated".into())
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self.pos.checked_add(n).ok_or_else(Self::eof)?;
+        let s = self.data.get(self.pos..end).ok_or_else(Self::eof)?;
+        self.pos = end;
+        Ok(s)
+    }
+
+    /// Reads `n` bytes as a string, returning fewer bytes at EOF (matching the
+    /// behaviour of `RandomAccessInputStream.readString(int)`).
+    fn read_string(&mut self, n: usize) -> String {
+        let end = self.pos.saturating_add(n).min(self.data.len());
+        let s = &self.data[self.pos..end];
+        self.pos = end;
+        String::from_utf8_lossy(s).into_owned()
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        let b = *self.data.get(self.pos).ok_or_else(Self::eof)?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn read_i16(&mut self) -> Result<i16> {
+        let b = self.take(2)?;
+        Ok(i16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn read_i32(&mut self) -> Result<i32> {
+        let b = self.take(4)?;
+        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn read_f32(&mut self) -> Result<f32> {
+        let b = self.take(4)?;
+        Ok(f32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn skip(&mut self, n: usize) -> Result<()> {
+        let end = self.pos.checked_add(n).ok_or_else(Self::eof)?;
+        if end > self.data.len() {
+            return Err(Self::eof());
         }
+        self.pos = end;
+        Ok(())
     }
 }
 
-impl Default for ImrodReader {
+/// Reader for IMOD binary model files (`.mod`).
+///
+/// Faithful port of Java Bio-Formats' `IMODReader`. It parses the IMOD binary
+/// model header (magic `IMODV1.2`, big-endian) and walks the object / contour /
+/// mesh structure to validate the file and collect global metadata. As in the
+/// Java reader, the contour rasterization in `openBytes` is disabled, so the
+/// produced RGB planes are blank (zero-filled): IMOD stores a vector model, not
+/// a raster image.
+pub struct ImodReader {
+    meta: Option<ImageMetadata>,
+}
+
+impl ImodReader {
+    pub fn new() -> Self {
+        ImodReader { meta: None }
+    }
+}
+
+impl Default for ImodReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for ImrodReader {
+/// Parses the IMOD model header and walks objects/contours/meshes, mirroring
+/// `IMODReader.initFile`. Returns the populated [`ImageMetadata`].
+fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
+    let mut c = ImodCursor::new(data);
+
+    let check = c.read_string(8);
+    if check.as_bytes() != IMOD_MAGIC_STRING {
+        return Err(BioFormatsError::Format(format!(
+            "Invalid IMOD file ID: {check}"
+        )));
+    }
+
+    let filename = c.read_string(128);
+    let size_x = c.read_i32()?;
+    let size_y = c.read_i32()?;
+    let size_z = c.read_i32()?;
+
+    let n_objects = c.read_i32()?;
+    if n_objects < 0 {
+        return Err(BioFormatsError::Format(
+            "IMOD model declares a negative object count".into(),
+        ));
+    }
+
+    let flags = c.read_i32()?;
+    let draw_mode = c.read_i32()?;
+    let mouse_mode = c.read_i32()?;
+    let black_level = c.read_i32()?;
+    let white_level = c.read_i32()?;
+
+    let x_offset = c.read_f32()?;
+    let y_offset = c.read_f32()?;
+    let z_offset = c.read_f32()?;
+
+    let x_scale = c.read_f32()?;
+    let y_scale = c.read_f32()?;
+    let z_scale = c.read_f32()?;
+
+    let _current_object = c.read_i32()?;
+    let _current_contour = c.read_i32()?;
+    let _current_point = c.read_i32()?;
+
+    let _res = c.read_i32()?;
+    let _thresh = c.read_i32()?;
+
+    let _pix_size = c.read_f32()?;
+    let pix_size_units = c.read_i32()?;
+
+    let _checksum = c.read_i32()?;
+
+    let alpha = c.read_f32()?;
+    let beta = c.read_f32()?;
+    let gamma = c.read_f32()?;
+
+    let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
+    let mut put_s = |k: &str, v: String| {
+        series_metadata.insert(k.to_string(), MetadataValue::String(v));
+    };
+    put_s("Model name", filename);
+    let mut put_i = |k: &str, v: i64| {
+        series_metadata.insert(k.to_string(), MetadataValue::Int(v));
+    };
+    put_i("Model flags", flags as i64);
+    put_i("Model drawing mode", draw_mode as i64);
+    put_i("Mouse mode", mouse_mode as i64);
+    put_i("Black level", black_level as i64);
+    put_i("White level", white_level as i64);
+    let mut put_f = |k: &str, v: f64| {
+        series_metadata.insert(k.to_string(), MetadataValue::Float(v));
+    };
+    put_f("X offset", x_offset as f64);
+    put_f("Y offset", y_offset as f64);
+    put_f("Z offset", z_offset as f64);
+    put_f("X scale", x_scale as f64);
+    put_f("Y scale", y_scale as f64);
+    put_f("Z scale", z_scale as f64);
+    put_f("Alpha", alpha as f64);
+    put_f("Beta", beta as f64);
+    put_f("Gamma", gamma as f64);
+
+    // Per-object colours, used by the (disabled) rasterizer in Java.
+    let mut colors: Vec<[u8; 3]> = Vec::with_capacity(n_objects as usize);
+
+    'objects: for _obj in 0..n_objects {
+        // Skip any inter-object chunks (e.g. IMAT) until the next OBJT.
+        let mut objt = c.read_string(4);
+        while objt != "OBJT" && c.pos() < c.len() {
+            if objt == "IMAT" {
+                // ambient, diffuse, specular, shininess, fill r/g/b, sphere quality
+                for _ in 0..8 {
+                    c.read_u8()?;
+                }
+                c.skip(4)?;
+                c.read_u8()?; // black level
+                c.read_u8()?; // white level
+                c.skip(2)?;
+            }
+            objt = c.read_string(4);
+        }
+
+        if objt != "OBJT" {
+            break 'objects;
+        }
+
+        let _obj_name = c.read_string(64);
+        c.skip(64)?; // unused
+
+        let n_contours = c.read_i32()?;
+        let _obj_flags = c.read_i32()?;
+        let _axis = c.read_i32()?;
+        let _obj_draw_mode = c.read_i32()?;
+
+        let red = c.read_f32()?;
+        let green = c.read_f32()?;
+        let blue = c.read_f32()?;
+        colors.push([
+            (red * 255.0) as i32 as u8,
+            (green * 255.0) as i32 as u8,
+            (blue * 255.0) as i32 as u8,
+        ]);
+
+        let _pixel_radius = c.read_i32()?;
+        let _pixel_symbol = c.read_u8()?;
+        let _symbol_size = c.read_u8()?;
+        let _line_width_2d = c.read_u8()?;
+        let _line_width_3d = c.read_u8()?;
+        let _line_style = c.read_u8()?;
+        let _symbol_flags = c.read_u8()?;
+        let _symbol_padding = c.read_u8()?;
+        let _transparency = c.read_u8()?;
+
+        let n_meshes = c.read_i32()?;
+        let _n_surfaces = c.read_i32()?;
+
+        if n_contours < 0 {
+            return Err(BioFormatsError::Format(
+                "IMOD object declares a negative contour count".into(),
+            ));
+        }
+
+        for _contour in 0..n_contours {
+            c.skip(4)?; // CONT
+
+            let mut n_points = c.read_i32()?;
+            let _contour_flags = c.read_i32()?;
+            let _time_index = c.read_i32()?;
+            let _surface = c.read_i32()?;
+
+            if (n_points as i64) > (c.len() as i64) || n_points < 0 {
+                // Resync: scan backwards for the next CONT marker, as Java does.
+                let mut guard = 0u32;
+                loop {
+                    let tag = c.read_string(4);
+                    if tag == "CONT" {
+                        break;
+                    }
+                    if c.pos() < 8 {
+                        return Err(BioFormatsError::Format(
+                            "IMOD contour resync ran past the start of the file".into(),
+                        ));
+                    }
+                    c.seek(c.pos() - 8);
+                    guard += 1;
+                    if guard > 1_000_000 {
+                        return Err(BioFormatsError::Format(
+                            "IMOD contour resync did not converge".into(),
+                        ));
+                    }
+                }
+                n_points = c.read_i32()?;
+                let _contour_flags = c.read_i32()?;
+                let _time_index = c.read_i32()?;
+                let _surface = c.read_i32()?;
+            }
+
+            if n_points < 0 {
+                return Err(BioFormatsError::Format(
+                    "IMOD contour declares a negative point count".into(),
+                ));
+            }
+            // Three big-endian floats (x, y, z) per point.
+            let bytes = (n_points as usize)
+                .checked_mul(12)
+                .ok_or_else(|| BioFormatsError::Format("IMOD contour size overflows".into()))?;
+            c.skip(bytes)?;
+        }
+
+        if n_meshes < 0 {
+            return Err(BioFormatsError::Format(
+                "IMOD object declares a negative mesh count".into(),
+            ));
+        }
+        for _mesh in 0..n_meshes {
+            c.skip(4)?; // MESH
+            let vsize = c.read_i32()?;
+            let lsize = c.read_i32()?;
+            let _mesh_flags = c.read_i32()?;
+            let _time_index = c.read_i16()?;
+            let _surface = c.read_i16()?;
+            if vsize < 0 || lsize < 0 {
+                return Err(BioFormatsError::Format(
+                    "IMOD mesh declares a negative size".into(),
+                ));
+            }
+            let skip = (vsize as usize)
+                .checked_mul(12)
+                .and_then(|v| v.checked_add((lsize as usize).checked_mul(4)?))
+                .ok_or_else(|| BioFormatsError::Format("IMOD mesh size overflows".into()))?;
+            c.skip(skip)?;
+        }
+    }
+
+    // Trailing chunks: pick up the physical pixel sizes from MINX.
+    let mut physical_x = 0.0f64;
+    let mut physical_y = 0.0f64;
+    let mut physical_z = 0.0f64;
+    while c.pos() + 4 < c.len() {
+        let chunk = c.read_string(4);
+        match chunk.as_str() {
+            "IMAT" => c.skip(20)?,
+            "VIEW" => {
+                c.skip(4)?;
+                if c.read_i32()? != 1 {
+                    c.skip(176)?;
+                    let bytes_per_view = c.read_i32()?;
+                    if bytes_per_view < 0 {
+                        return Err(BioFormatsError::Format(
+                            "IMOD VIEW chunk declares a negative size".into(),
+                        ));
+                    }
+                    c.skip(bytes_per_view as usize)?;
+                }
+            }
+            "MINX" => {
+                c.skip(40)?; // old transformation values
+                physical_x = c.read_f32()? as f64;
+                physical_y = c.read_f32()? as f64;
+                physical_z = c.read_f32()? as f64;
+            }
+            _ => {}
+        }
+    }
+
+    if physical_x > 0.0 {
+        series_metadata.insert(
+            "PhysicalSizeX".to_string(),
+            MetadataValue::Float(physical_x),
+        );
+    }
+    if physical_y > 0.0 {
+        series_metadata.insert(
+            "PhysicalSizeY".to_string(),
+            MetadataValue::Float(physical_y),
+        );
+    }
+    if physical_z > 0.0 {
+        series_metadata.insert(
+            "PhysicalSizeZ".to_string(),
+            MetadataValue::Float(physical_z),
+        );
+    }
+    series_metadata.insert(
+        "Physical size unit code".to_string(),
+        MetadataValue::Int(pix_size_units as i64),
+    );
+
+    if size_x < 0 || size_y < 0 || size_z < 0 {
+        return Err(BioFormatsError::Format(
+            "IMOD model declares negative dimensions".into(),
+        ));
+    }
+
+    // Core metadata, exactly as the Java reader sets it: an RGB, interleaved,
+    // big-endian UINT8 image with one plane per Z (sizeT == 1).
+    let size_t: u32 = 1;
+    let size_z = size_z as u32;
+    let image_count = size_t
+        .checked_mul(size_z)
+        .ok_or_else(|| BioFormatsError::Format("IMOD plane count overflows".into()))?;
+
+    let meta = ImageMetadata {
+        size_x: size_x as u32,
+        size_y: size_y as u32,
+        size_z,
+        size_c: 3,
+        size_t,
+        pixel_type: PixelType::Uint8,
+        bits_per_pixel: 8,
+        image_count,
+        dimension_order: DimensionOrder::XYCZT,
+        is_rgb: true,
+        is_interleaved: true,
+        is_indexed: false,
+        is_little_endian: false,
+        resolution_count: 1,
+        series_metadata,
+        ..ImageMetadata::default()
+    };
+
+    Ok(meta)
+}
+
+impl FormatReader for ImodReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -1733,22 +2114,19 @@ impl FormatReader for ImrodReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(IMROD_STRICT_MAGIC)
+        header.starts_with(IMOD_MAGIC_STRING)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, data_offset) = parse_strict_sem_raw(path, IMROD_STRICT_MAGIC, "IMROD")?;
-        self.path = Some(path.to_path_buf());
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let meta = parse_imod(&data)?;
         self.meta = Some(meta);
-        self.data_offset = data_offset;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.path = None;
         self.meta = None;
-        self.data_offset = 0;
         Ok(())
     }
 
@@ -1782,17 +2160,14 @@ impl FormatReader for ImrodReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
+        // The Java reader's contour rasterization is commented out, so the
+        // returned RGB-interleaved plane is left blank (zero-filled).
         let n_bytes = (meta.size_x as usize)
             .checked_mul(meta.size_y as usize)
+            .and_then(|n| n.checked_mul(meta.size_c as usize))
             .and_then(|n| n.checked_mul(meta.pixel_type.bytes_per_sample()))
-            .ok_or_else(|| BioFormatsError::Format("IMROD plane size overflows".into()))?;
-        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; n_bytes];
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+            .ok_or_else(|| BioFormatsError::Format("IMOD plane size overflows".into()))?;
+        Ok(vec![0u8; n_bytes])
     }
 
     fn open_bytes_region(
@@ -1812,7 +2187,7 @@ impl FormatReader for ImrodReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let full = self.open_bytes(plane_index)?;
-        crop_full_plane("IMROD", &full, &meta, 1, x, y, w, h)
+        crop_full_plane("IMOD", &full, &meta, 3, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

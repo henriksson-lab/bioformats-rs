@@ -1,13 +1,12 @@
 use std::path::Path;
 
-use bioformats::formats::flim2::{OirReader, VolocityClippingReader};
-use bioformats::formats::mias::CellWorxReader;
-use bioformats::formats::misc::VolocityLibraryReader;
-use bioformats::formats::misc4::{
-    FilePatternReaderStub, I2iReader, JdceReader, ObfReader, PciReader,
-};
-use bioformats::formats::opus::{BrukerOpusReader, IssFlimReader};
-use bioformats::formats::simfcs::LambertFlimReader;
+// NOTE: OirReader, VolocityClippingReader, CellWorxReader, ObfReader, I2iReader,
+// JdceReader, and PciReader were formerly stubs but are now real readers.
+// BrukerOpusReader, IssFlimReader, LambertFlimReader, VolocityLibraryReader, and
+// SedatReader/WoolzReader were fabricated readers for formats Bio-Formats has no
+// reader for (or duplicates of real readers) and have been DELETED. The only
+// remaining hand-written placeholder is FilePatternReaderStub.
+use bioformats::formats::misc4::FilePatternReaderStub;
 use bioformats::{BioFormatsError, FormatReader};
 
 fn assert_uninitialized_placeholder<R: FormatReader>(mut reader: R, path: &str) {
@@ -42,22 +41,6 @@ fn assert_uninitialized_placeholder<R: FormatReader>(mut reader: R, path: &str) 
 }
 
 #[test]
-fn flim2_placeholder_readers_stay_uninitialized() {
-    assert_uninitialized_placeholder(OirReader::new(), "sample.oir");
-    assert_uninitialized_placeholder(VolocityClippingReader::new(), "sample.acff");
-    assert_uninitialized_placeholder(VolocityLibraryReader::new(), "sample.acff");
-    assert_uninitialized_placeholder(BrukerOpusReader::new(), "sample.0");
-    assert_uninitialized_placeholder(IssFlimReader::new(), "sample.iss");
-    assert_uninitialized_placeholder(LambertFlimReader::new(), "sample.asc");
-}
-
-#[test]
 fn unsupported_hand_written_placeholders_stay_uninitialized() {
-    assert_uninitialized_placeholder(CellWorxReader::new(), "sample.htd");
-
-    assert_uninitialized_placeholder(I2iReader::new(), "sample.i2i");
-    assert_uninitialized_placeholder(JdceReader::new(), "sample.jdce");
-    assert_uninitialized_placeholder(PciReader::new(), "sample.pci");
     assert_uninitialized_placeholder(FilePatternReaderStub::new(), "sample.pattern");
-    assert_uninitialized_placeholder(ObfReader::new(), "sample.obf");
 }

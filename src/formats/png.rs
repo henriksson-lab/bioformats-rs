@@ -78,11 +78,13 @@ fn load_png(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         pixel_type,
         bits_per_pixel: bpp,
         image_count: 1,
-        dimension_order: DimensionOrder::XYCZT,
+        // APNGReader.java sets dimensionOrder "XYCTZ"; the core metadata
+        // defaults to big-endian (littleEndian = false).
+        dimension_order: DimensionOrder::XYCTZ,
         is_rgb,
         is_interleaved: true,
         is_indexed: false,
-        is_little_endian: true,
+        is_little_endian: false,
         resolution_count: 1,
         ..Default::default()
     };
@@ -201,6 +203,20 @@ impl FormatReader for PngReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::OmeMetadata;
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        // MetadataTools.populatePixels sets the image name to the file's basename.
+        if let (Some(path), Some(img)) = (self.path.as_ref(), ome.images.get_mut(0)) {
+            img.name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+        }
+        Some(ome)
     }
 }
 
