@@ -286,7 +286,8 @@ fn harvest_zvi_ome_tags(data: &[u8], info: &mut ZviOmeInfo, c_index: &mut i32) {
             }
             TAG_CHANNEL_NAME => {
                 if *c_index != -1 {
-                    info.channel_names.insert(*c_index as u32, value.trim().to_string());
+                    info.channel_names
+                        .insert(*c_index as u32, value.trim().to_string());
                 }
             }
             TAG_EMISSION => {

@@ -1088,8 +1088,8 @@ fn build_dicom_file_list(
 
             // Clamp the target position: a bogus InstanceNumber must not drive
             // an unbounded placeholder pre-fill (see `max_position` above).
-            let position = ((candidate.instance.unwrap_or(1).max(1) - 1).max(0) as usize)
-                .min(max_position);
+            let position =
+                ((candidate.instance.unwrap_or(1).max(1) - 1).max(0) as usize).min(max_position);
             let bucket = file_list.entry(series).or_default();
             if position < bucket.len() {
                 let mut pos = position;
@@ -2154,7 +2154,11 @@ impl FormatReader for DicomReader {
         // ImageType is absent it leaves the default name (the file name).
         if let Some(MetadataValue::String(s)) = meta.series_metadata.get("(0008,0008)") {
             let tokens: Vec<&str> = s.split('\\').collect();
-            let idx = if tokens.len() > 2 { 2 } else { tokens.len().saturating_sub(1) };
+            let idx = if tokens.len() > 2 {
+                2
+            } else {
+                tokens.len().saturating_sub(1)
+            };
             if let Some(tok) = tokens.get(idx) {
                 img.name = Some(tok.trim().to_string());
             }

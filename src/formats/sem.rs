@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -993,6 +993,7 @@ pub struct JeolReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
+    plane_bytes: u64,
 }
 
 impl JeolReader {
@@ -1001,7 +1002,114 @@ impl JeolReader {
             path: None,
             meta: None,
             data_offset: 0,
+            plane_bytes: 0,
         }
+    }
+
+    fn resolve_image_path(path: &Path) -> Result<PathBuf> {
+        let is_par = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("par"))
+            .unwrap_or(false);
+        if !is_par {
+            return Ok(path.to_path_buf());
+        }
+
+        for ext in ["IMG", "DAT", "img", "dat"] {
+            let candidate = path.with_extension(ext);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        Err(BioFormatsError::UnsupportedFormat(
+            "JEOL SEM could not find companion image file for .par".into(),
+        ))
+    }
+
+    fn parse_native(path: &Path) -> Result<(ImageMetadata, u64, u64)> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let mut series_metadata = HashMap::new();
+        let (size_x, size_y, pixel_offset) = if data.starts_with(b"MG") {
+            let need = 0x63cusize + 8 + 540;
+            if data.len() < need {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "JEOL MG header is truncated".into(),
+                ));
+            }
+            let size_x = u32::from_le_bytes(data[0x63c..0x640].try_into().unwrap());
+            let size_y = u32::from_le_bytes(data[0x640..0x644].try_into().unwrap());
+            (size_x, size_y, (0x644 + 540) as u64)
+        } else if data.starts_with(b"IM") {
+            if data.len() < 4 + 56 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "JEOL IM header is truncated".into(),
+                ));
+            }
+            let comment_len = u16::from_le_bytes(data[2..4].try_into().unwrap()) as u64;
+            let pixel_offset = 4u64
+                .checked_add(comment_len)
+                .and_then(|v| v.checked_add(56))
+                .ok_or_else(|| BioFormatsError::Format("JEOL IM pixel offset overflows".into()))?;
+            if pixel_offset > data.len() as u64 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "JEOL IM pixel offset points past end of file".into(),
+                ));
+            }
+            let available = data.len() as u64 - pixel_offset;
+            (1024, (available / 1024) as u32, pixel_offset)
+        } else if data.len() == 1024 * 1024 {
+            (1024, 1024, 0)
+        } else {
+            return Err(unsupported_raw_sem("JEOL SEM"));
+        };
+
+        if size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "JEOL SEM dimensions must be non-zero".into(),
+            ));
+        }
+        let plane_bytes = (size_x as u64)
+            .checked_mul(size_y as u64)
+            .ok_or_else(|| BioFormatsError::Format("JEOL SEM plane size overflows".into()))?;
+        let expected = pixel_offset
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("JEOL SEM file size overflows".into()))?;
+        if (data.len() as u64) < expected {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "JEOL SEM pixel payload is shorter than declared dimensions".into(),
+            ));
+        }
+        series_metadata.insert(
+            "Pixel data offset".into(),
+            MetadataValue::Int(pixel_offset as i64),
+        );
+
+        Ok((
+            ImageMetadata {
+                size_x,
+                size_y,
+                size_z: 1,
+                size_c: 1,
+                size_t: 1,
+                pixel_type: PixelType::Uint8,
+                bits_per_pixel: 8,
+                image_count: 1,
+                dimension_order: DimensionOrder::XYZCT,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: true,
+                resolution_count: 1,
+                series_metadata,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            },
+            pixel_offset,
+            plane_bytes,
+        ))
     }
 }
 
@@ -1017,19 +1125,34 @@ impl FormatReader for JeolReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("dat"))
+        matches!(ext.as_deref(), Some("dat") | Some("img") | Some("par"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
         header.starts_with(JEOL_STRICT_MAGIC)
+            || header.starts_with(b"MG")
+            || header.starts_with(b"IM")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, data_offset) = parse_strict_sem_raw(path, JEOL_STRICT_MAGIC, "JEOL SEM")?;
-        self.path = Some(path.to_path_buf());
+        let image_path = Self::resolve_image_path(path)?;
+        let data = std::fs::read(&image_path).map_err(BioFormatsError::Io)?;
+        let (meta, data_offset, plane_bytes) = if data.starts_with(JEOL_STRICT_MAGIC) {
+            let (meta, data_offset) =
+                parse_strict_sem_raw(&image_path, JEOL_STRICT_MAGIC, "JEOL SEM")?;
+            let plane_bytes = (meta.size_x as u64)
+                .checked_mul(meta.size_y as u64)
+                .and_then(|n| n.checked_mul(meta.pixel_type.bytes_per_sample() as u64))
+                .ok_or_else(|| BioFormatsError::Format("JEOL SEM plane size overflows".into()))?;
+            (meta, data_offset, plane_bytes)
+        } else {
+            Self::parse_native(&image_path)?
+        };
+        self.path = Some(image_path);
         self.meta = Some(meta);
         self.data_offset = data_offset;
+        self.plane_bytes = plane_bytes;
         Ok(())
     }
 
@@ -1037,6 +1160,7 @@ impl FormatReader for JeolReader {
         self.path = None;
         self.meta = None;
         self.data_offset = 0;
+        self.plane_bytes = 0;
         Ok(())
     }
 
@@ -1070,10 +1194,8 @@ impl FormatReader for JeolReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
-        let n_bytes = (meta.size_x as usize)
-            .checked_mul(meta.size_y as usize)
-            .and_then(|n| n.checked_mul(meta.pixel_type.bytes_per_sample()))
-            .ok_or_else(|| BioFormatsError::Format("JEOL SEM plane size overflows".into()))?;
+        let n_bytes = usize::try_from(self.plane_bytes)
+            .map_err(|_| BioFormatsError::Format("JEOL SEM plane size overflows".into()))?;
         let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(self.data_offset))
@@ -1559,17 +1681,163 @@ impl FormatReader for LeoReader {
 /// by `BIOFORMATS-RS-ZEISS-LMS-STRICT-RAW-V1\n`.
 pub struct ZeissLmsReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    data_offset: u64,
+    metas: Vec<ImageMetadata>,
+    data_offsets: Vec<u64>,
+    current_series: usize,
 }
 
 impl ZeissLmsReader {
+    const CHECK: &'static [u8] = b"LMSFLE";
+    const MARKER: &'static [u8] = b"BM6";
+    const WIDTH: u32 = 1280;
+    const HEIGHT: u32 = 1024;
+
     pub fn new() -> Self {
         ZeissLmsReader {
             path: None,
-            meta: None,
-            data_offset: 0,
+            metas: Vec::new(),
+            data_offsets: Vec::new(),
+            current_series: 0,
         }
+    }
+
+    fn next_marker(data: &[u8], start: usize) -> Option<usize> {
+        let mut pos = start;
+        while pos + 3 <= data.len() {
+            if &data[pos..pos + 3] == Self::MARKER {
+                return Some(pos + 4);
+            }
+            pos += 1;
+        }
+        None
+    }
+
+    fn parse_native(path: &Path) -> Result<(Vec<ImageMetadata>, Vec<u64>)> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < 16
+            || !data[..16]
+                .windows(Self::CHECK.len())
+                .any(|w| w == Self::CHECK)
+        {
+            return Err(unsupported_raw_sem("Zeiss LMS"));
+        }
+
+        let magnification = if data.len() >= 22 {
+            u32::from_le_bytes(data[18..22].try_into().unwrap()) as i64
+        } else {
+            0
+        };
+
+        let thumb_marker = Self::next_marker(&data, 0).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("Zeiss LMS missing thumbnail marker".into())
+        })?;
+        let thumb_offset = thumb_marker.checked_add(50).ok_or_else(|| {
+            BioFormatsError::Format("Zeiss LMS thumbnail offset overflows".into())
+        })?;
+        let thumb_bytes = (Self::WIDTH as usize)
+            .checked_mul(Self::HEIGHT as usize)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or_else(|| BioFormatsError::Format("Zeiss LMS thumbnail size overflows".into()))?;
+        let after_thumb = thumb_offset
+            .checked_add(thumb_bytes)
+            .ok_or_else(|| BioFormatsError::Format("Zeiss LMS thumbnail size overflows".into()))?;
+        if after_thumb > data.len() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Zeiss LMS thumbnail payload is shorter than declared dimensions".into(),
+            ));
+        }
+
+        let image_marker = Self::next_marker(&data, after_thumb).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("Zeiss LMS missing image marker".into())
+        })?;
+        let lut_offset = image_marker
+            .checked_add(50)
+            .ok_or_else(|| BioFormatsError::Format("Zeiss LMS LUT offset overflows".into()))?;
+        if lut_offset + 1024 > data.len() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Zeiss LMS LUT is truncated".into(),
+            ));
+        }
+        let mut red = Vec::with_capacity(256);
+        let mut green = Vec::with_capacity(256);
+        let mut blue = Vec::with_capacity(256);
+        for i in 0..256 {
+            let base = lut_offset + i * 4;
+            red.push(data[base] as u16);
+            green.push(data[base + 1] as u16);
+            blue.push(data[base + 2] as u16);
+        }
+        let main_offset = lut_offset + 1024;
+        let plane_bytes = (Self::WIDTH as u64)
+            .checked_mul(Self::HEIGHT as u64)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| BioFormatsError::Format("Zeiss LMS plane size overflows".into()))?;
+        let available = data.len() as u64 - main_offset as u64;
+        let size_z = available / plane_bytes;
+        if size_z == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Zeiss LMS has no complete 16-bit image planes".into(),
+            ));
+        }
+
+        let mut main_metadata = HashMap::new();
+        main_metadata.insert(
+            "Objective nominal magnification".into(),
+            MetadataValue::Int(magnification),
+        );
+        let main = ImageMetadata {
+            size_x: Self::WIDTH,
+            size_y: Self::HEIGHT,
+            size_z: size_z as u32,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count: size_z as u32,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: true,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: main_metadata,
+            lookup_table: Some(LookupTable { red, green, blue }),
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        };
+
+        let mut thumb_metadata = HashMap::new();
+        thumb_metadata.insert(
+            "Objective nominal magnification".into(),
+            MetadataValue::Int(magnification),
+        );
+        let thumb = ImageMetadata {
+            size_x: Self::WIDTH,
+            size_y: Self::HEIGHT,
+            size_z: 1,
+            size_c: 3,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: true,
+            is_interleaved: true,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: thumb_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        };
+
+        Ok((
+            vec![main, thumb],
+            vec![main_offset as u64, thumb_offset as u64],
+        ))
     }
 }
 
@@ -1590,32 +1858,46 @@ impl FormatReader for ZeissLmsReader {
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
         header.starts_with(ZEISS_LMS_STRICT_MAGIC)
+            || (header.len() >= 16
+                && header[..16]
+                    .windows(Self::CHECK.len())
+                    .any(|w| w == Self::CHECK))
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, data_offset) = parse_strict_sem_raw(path, ZEISS_LMS_STRICT_MAGIC, "Zeiss LMS")?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let (metas, data_offsets) = if data.starts_with(ZEISS_LMS_STRICT_MAGIC) {
+            let (meta, data_offset) =
+                parse_strict_sem_raw(path, ZEISS_LMS_STRICT_MAGIC, "Zeiss LMS")?;
+            (vec![meta], vec![data_offset])
+        } else {
+            Self::parse_native(path)?
+        };
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.data_offset = data_offset;
+        self.metas = metas;
+        self.data_offsets = data_offsets;
+        self.current_series = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.data_offset = 0;
+        self.metas.clear();
+        self.data_offsets.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.metas.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
+        if self.metas.is_empty() {
             Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
+        } else if s < self.metas.len() {
+            self.current_series = s;
             Ok(())
         } else {
             Err(BioFormatsError::SeriesOutOfRange(s))
@@ -1623,28 +1905,51 @@ impl FormatReader for ZeissLmsReader {
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.metas
+            .get(self.current_series)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
         let n_bytes = (meta.size_x as usize)
             .checked_mul(meta.size_y as usize)
+            .and_then(|n| {
+                if meta.is_rgb {
+                    n.checked_mul(meta.size_c as usize)
+                } else {
+                    Some(n)
+                }
+            })
             .and_then(|n| n.checked_mul(meta.pixel_type.bytes_per_sample()))
             .ok_or_else(|| BioFormatsError::Format("Zeiss LMS plane size overflows".into()))?;
         let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(self.data_offset))
+        let base = *self
+            .data_offsets
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let offset = base
+            .checked_add(
+                (n_bytes as u64)
+                    .checked_mul(plane_index as u64)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("Zeiss LMS plane offset overflows".into())
+                    })?,
+            )
+            .ok_or_else(|| BioFormatsError::Format("Zeiss LMS plane offset overflows".into()))?;
+        f.seek(SeekFrom::Start(offset))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
@@ -1660,19 +1965,20 @@ impl FormatReader for ZeissLmsReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let meta = self
-            .meta
-            .as_ref()
+            .metas
+            .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let full = self.open_bytes(plane_index)?;
-        crop_full_plane("Zeiss LMS", &full, &meta, 1, x, y, w, h)
+        let channels = if meta.is_rgb { meta.size_c as usize } else { 1 };
+        crop_full_plane("Zeiss LMS", &full, &meta, channels, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self.metadata();
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
@@ -2280,7 +2586,14 @@ mod inr_tests {
             let path = write_inr(&tmp, &name, &body, &payload);
             let mut r = InrReader::new();
             r.set_id(&path).unwrap();
-            assert_eq!(r.metadata().pixel_type, *expected, "case {}: {} {}", i, ty, bits);
+            assert_eq!(
+                r.metadata().pixel_type,
+                *expected,
+                "case {}: {} {}",
+                i,
+                ty,
+                bits
+            );
             let _ = std::fs::remove_file(&path);
         }
     }

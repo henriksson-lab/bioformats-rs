@@ -570,7 +570,11 @@ impl<R: Read + Seek> DmReader<R> {
                 // Java passes the group's label as the new parent, but keeps the
                 // current parent when the label is empty (GatanReader.java:633).
                 20 => {
-                    let child_parent = if name.is_empty() { parent } else { name.as_str() };
+                    let child_parent = if name.is_empty() {
+                        parent
+                    } else {
+                        name.as_str()
+                    };
                     self.parse_tag_group(depth + 1, child_parent)?
                 }
                 21 => self.parse_tag_data(&name)?, // leaf
@@ -875,8 +879,7 @@ impl FormatReader for GatanReader {
 
         let img = find_image_data(&root)?;
 
-        let (mut pixel_type, mut bytes_per_pixel) =
-            dm_pixel_type_and_bytes(img.dm_data_type)?;
+        let (mut pixel_type, mut bytes_per_pixel) = dm_pixel_type_and_bytes(img.dm_data_type)?;
         let image_count = img.depth;
 
         // Reconcile the DataType-derived bytes-per-pixel with the bpp implied by

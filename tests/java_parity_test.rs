@@ -73,7 +73,8 @@ const FILES: &[&str] = &[
     "spe/test_000_.spe",
     "stk/C0.stk",
     "sif/image.sif",
-    // klb/img.klb omitted — KlbReader is an unimplemented stub (refuses to decode).
+    // klb/img.klb omitted — the Rust KLB reader covers bounded single-file layouts,
+    // but this fixture still needs a Java parity oracle for its exact grouping/layout.
     "jpg/scifio-test.jpg",
     "png/scifio-test.png",
     "bmp/scribble_P_RGB.bmp",
@@ -88,7 +89,9 @@ const MAX_PLANES: u32 = 64;
 const REGION: u32 = 256;
 
 fn testdata(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(rel)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join(rel)
 }
 
 fn jar_path() -> PathBuf {
@@ -297,7 +300,11 @@ fn java_parity() {
     // Optional comma-separated substring filter, so a worker can verify just its
     // own files quickly: BIOFORMATS_RS_JAVA_PARITY_FILES="lsm/,nd2/"
     let filter = std::env::var("BIOFORMATS_RS_JAVA_PARITY_FILES").unwrap_or_default();
-    let filters: Vec<&str> = filter.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let filters: Vec<&str> = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     let Some(cp) = oracle_classpath() else { return };
 
     let mut score = Score::default();
@@ -318,7 +325,12 @@ fn java_parity() {
             eprintln!("skip (absent): {rel}");
             continue;
         }
-        let Some(j) = run_oracle(cp, &path, oracle_max_planes(rel), !oracle_no_full_plane(rel)) else {
+        let Some(j) = run_oracle(
+            cp,
+            &path,
+            oracle_max_planes(rel),
+            !oracle_no_full_plane(rel),
+        ) else {
             eprintln!("skip (oracle no output): {rel}");
             continue;
         };
@@ -374,12 +386,42 @@ fn java_parity() {
                     out.push(format!("{name}: java={jv} rust={rv}"));
                 }
             };
-            cmp_u("sizeX", js["sizeX"].as_u64().unwrap_or(0), m.size_x as u64, &mut core_diffs);
-            cmp_u("sizeY", js["sizeY"].as_u64().unwrap_or(0), m.size_y as u64, &mut core_diffs);
-            cmp_u("sizeZ", js["sizeZ"].as_u64().unwrap_or(0), m.size_z as u64, &mut core_diffs);
-            cmp_u("sizeC", js["sizeC"].as_u64().unwrap_or(0), m.size_c as u64, &mut core_diffs);
-            cmp_u("sizeT", js["sizeT"].as_u64().unwrap_or(0), m.size_t as u64, &mut core_diffs);
-            cmp_u("imageCount", js["imageCount"].as_u64().unwrap_or(0), m.image_count as u64, &mut core_diffs);
+            cmp_u(
+                "sizeX",
+                js["sizeX"].as_u64().unwrap_or(0),
+                m.size_x as u64,
+                &mut core_diffs,
+            );
+            cmp_u(
+                "sizeY",
+                js["sizeY"].as_u64().unwrap_or(0),
+                m.size_y as u64,
+                &mut core_diffs,
+            );
+            cmp_u(
+                "sizeZ",
+                js["sizeZ"].as_u64().unwrap_or(0),
+                m.size_z as u64,
+                &mut core_diffs,
+            );
+            cmp_u(
+                "sizeC",
+                js["sizeC"].as_u64().unwrap_or(0),
+                m.size_c as u64,
+                &mut core_diffs,
+            );
+            cmp_u(
+                "sizeT",
+                js["sizeT"].as_u64().unwrap_or(0),
+                m.size_t as u64,
+                &mut core_diffs,
+            );
+            cmp_u(
+                "imageCount",
+                js["imageCount"].as_u64().unwrap_or(0),
+                m.image_count as u64,
+                &mut core_diffs,
+            );
             if js["pixelType"].as_str() != Some(pixel_type_to_java(m.pixel_type)) {
                 core_diffs.push(format!(
                     "pixelType: java={} rust={}",
@@ -414,8 +456,13 @@ fn java_parity() {
             if core_diffs.is_empty() {
                 println!(
                     "  s{si} core ✓  {}x{} z{} c{} t{} {} ic={}",
-                    m.size_x, m.size_y, m.size_z, m.size_c, m.size_t,
-                    pixel_type_to_java(m.pixel_type), m.image_count
+                    m.size_x,
+                    m.size_y,
+                    m.size_z,
+                    m.size_c,
+                    m.size_t,
+                    pixel_type_to_java(m.pixel_type),
+                    m.image_count
                 );
                 score.core_ok += 1;
             } else {
@@ -467,11 +514,11 @@ fn java_parity() {
             let mut worst_tol = 0u8;
             let mut full_checks = 0usize; // how many whole-plane (b) checks ran
             let mut off_checks = 0usize; // how many offset-region (c) checks ran
-            // Track first divergence separately for the OLD sampling envelope
-            // (top-left 256² crop of planes 0..OLD_MAX_PLANES) vs the NEW deeper
-            // checks (crop of deep planes, whole-plane CRC, offset region), so
-            // the report can attribute findings the old harness would have
-            // missed. `first_px_diff` is the first across both (for the line).
+                                         // Track first divergence separately for the OLD sampling envelope
+                                         // (top-left 256² crop of planes 0..OLD_MAX_PLANES) vs the NEW deeper
+                                         // checks (crop of deep planes, whole-plane CRC, offset region), so
+                                         // the report can attribute findings the old harness would have
+                                         // missed. `first_px_diff` is the first across both (for the line).
             const OLD_MAX_PLANES: u32 = 8;
             let mut first_px_diff: Option<String> = None;
             let mut first_old_diff: Option<String> = None;
@@ -613,9 +660,8 @@ fn java_parity() {
 
             if px_total > 0 {
                 let passed = px_exact + px_tol;
-                let coverage = format!(
-                    "{px_total} checks [crop+{full_checks} full+{off_checks} offset]"
-                );
+                let coverage =
+                    format!("{px_total} checks [crop+{full_checks} full+{off_checks} offset]");
                 if passed == px_total && px_tol == 0 {
                     println!("  s{si} pixels ✓  {px_exact}/{coverage} bitwise");
                     score.px_exact += 1;
@@ -640,12 +686,17 @@ fn java_parity() {
                     // first-8/256² envelope was clean.
                     if first_old_diff.is_none() {
                         if let Some(nd) = &first_new_diff {
-                            println!("       ↳ NEW-coverage finding (old sampling was clean): {nd}");
+                            println!(
+                                "       ↳ NEW-coverage finding (old sampling was clean): {nd}"
+                            );
                             new_findings.push(format!("{rel} s{si}: {nd}"));
                         }
                     } else if let Some(nd) = &first_new_diff {
                         // Old sampling also diverged, but record the new one too.
-                        println!("       ↳ (old sampling also diverged: {})", first_old_diff.as_deref().unwrap_or(""));
+                        println!(
+                            "       ↳ (old sampling also diverged: {})",
+                            first_old_diff.as_deref().unwrap_or("")
+                        );
                         let _ = nd;
                     }
                     score.px_bad += 1;
@@ -733,14 +784,26 @@ fn java_parity() {
                 score.ome_ok += 1;
             } else {
                 let shown: Vec<_> = ome_diffs.iter().take(6).cloned().collect();
-                println!("  OME ✗  {}{}", shown.join("; "),
-                    if ome_diffs.len() > 6 { format!(" (+{} more)", ome_diffs.len() - 6) } else { String::new() });
+                println!(
+                    "  OME ✗  {}{}",
+                    shown.join("; "),
+                    if ome_diffs.len() > 6 {
+                        format!(" (+{} more)", ome_diffs.len() - 6)
+                    } else {
+                        String::new()
+                    }
+                );
                 score.ome_bad += 1;
                 if strict {
                     hard_failures.push(rel.to_string());
                 }
             }
-        } else if jome.get("images").and_then(Value::as_array).map(|a| !a.is_empty()) == Some(true) {
+        } else if jome
+            .get("images")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            == Some(true)
+        {
             println!("  OME ✗  java exposed OME images, rust returned None");
             score.ome_bad += 1;
             if strict {
@@ -752,8 +815,14 @@ fn java_parity() {
     // ---- scoreboard ----
     println!("\n══════════════ PARITY SUMMARY ══════════════");
     println!("files compared : {checked}");
-    println!("core metadata  : {} series ✓ / {} series ✗", score.core_ok, score.core_bad);
-    println!("OME metadata   : {} files ✓ / {} files ✗", score.ome_ok, score.ome_bad);
+    println!(
+        "core metadata  : {} series ✓ / {} series ✗",
+        score.core_ok, score.core_bad
+    );
+    println!(
+        "OME metadata   : {} files ✓ / {} files ✗",
+        score.ome_ok, score.ome_bad
+    );
     println!(
         "pixels         : {} bitwise / {} tolerant(±{PIXEL_TOL} JPEG) / {} ⚠ Java-bug / {} ✗",
         score.px_exact, score.px_tol, score.px_java_div, score.px_bad

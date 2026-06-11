@@ -2,7 +2,7 @@
 //!
 //! Group A: TIFF-based wrappers (DNG, QPTIFF, GEL).
 //! Group B: Binary readers with structure (Imspector OBF, Hamamatsu VMS, Cellomics).
-//! Group C: Extension-only placeholder readers (MRW, Yokogawa, etc.).
+//! Group C: Extension-only unsupported detectors and small native readers.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -12,11 +12,12 @@ use std::path::{Path, PathBuf};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::ome_metadata::{
-    create_lsid, OmeImage, OmeMetadata, OmePlate, OmeWell, OmeWellSample,
+    create_lsid, OmeChannel, OmeImage, OmeMetadata, OmePlate, OmeWell, OmeWellSample,
 };
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
+use crate::tiff::jpeg_restart;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -872,6 +873,7 @@ struct ImspectorStack {
     meta: ImageMetadata,
     payload_offset: usize,
     plane_len: usize,
+    decoded_payload: Option<Vec<u8>>,
 }
 
 fn parse_imspector_header(bytes: &[u8]) -> Result<ImspectorHeader> {
@@ -1091,11 +1093,7 @@ fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack
         imspector_positive_dim(imspector_read_i32(bytes, &mut offset, "size T")?, "size T")?;
     let type_code = imspector_read_i32(bytes, &mut offset, "data type")?;
     let compression = imspector_read_i32(bytes, &mut offset, "compression")?;
-    if imspector_compression_flag(compression)? {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "Imspector OBF/MSR compressed synthetic stack payload is unsupported; explicit uncompressed BFIMSPECTOR_RAW_STACK_V1 payloads are supported".to_string(),
-        ));
-    }
+    let compressed = imspector_compression_flag(compression)?;
     let payload_offset =
         imspector_stack_length(imspector_read_i64(bytes, &mut offset, "payload offset")?)?;
     let payload_len =
@@ -1130,11 +1128,27 @@ fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack
     let expected_len = plane_len.checked_mul(image_count as usize).ok_or_else(|| {
         BioFormatsError::Format("Imspector OBF/MSR stack payload size overflows".into())
     })?;
-    if payload_len != expected_len {
+    let decoded_payload = if compressed {
+        let decoded = crate::common::codec::decompress_deflate(&bytes[payload_offset..payload_end])
+            .map_err(|e| {
+                BioFormatsError::Codec(format!(
+                    "Imspector OBF/MSR compressed synthetic stack payload could not be decompressed: {e}"
+                ))
+            })?;
+        if decoded.len() != expected_len {
+            return Err(BioFormatsError::Format(format!(
+                "Imspector OBF/MSR decompressed payload length {} does not match declared stack size {expected_len}",
+                decoded.len()
+            )));
+        }
+        Some(decoded)
+    } else if payload_len != expected_len {
         return Err(BioFormatsError::Format(format!(
             "Imspector OBF/MSR payload length {payload_len} does not match declared stack size {expected_len}"
         )));
-    }
+    } else {
+        None
+    };
 
     let mut meta = ImageMetadata {
         size_x: width,
@@ -1155,20 +1169,25 @@ fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack
     };
     meta.series_metadata.insert(
         "imspector_version_subset".into(),
-        MetadataValue::String("synthetic-uncompressed-raw".into()),
+        MetadataValue::String(if compressed {
+            "synthetic-zlib-raw".into()
+        } else {
+            "synthetic-uncompressed-raw".into()
+        }),
     );
 
     Ok(Some(ImspectorStack {
         meta,
-        payload_offset,
+        payload_offset: if compressed { 0 } else { payload_offset },
         plane_len,
+        decoded_payload,
     }))
 }
 
 /// Imspector OBF/MSR STED microscopy format (`.obf`, `.msr`).
 ///
 /// Header parsing is translated from Bio-Formats' `OBFReader`. Only a strict,
-/// uncompressed raw subset with an explicit stack marker is decoded; unknown
+/// raw subset with an explicit stack marker is decoded; unknown
 /// stack layouts are still intentionally rejected instead of guessed.
 pub struct ImspectorReader {
     path: Option<PathBuf>,
@@ -1287,7 +1306,8 @@ impl FormatReader for ImspectorReader {
         let end = start.checked_add(stack.plane_len).ok_or_else(|| {
             BioFormatsError::Format("Imspector OBF/MSR plane end offset overflows".into())
         })?;
-        Ok(self.bytes[start..end].to_vec())
+        let source = stack.decoded_payload.as_deref().unwrap_or(&self.bytes);
+        Ok(source[start..end].to_vec())
     }
 
     fn open_bytes_region(
@@ -1349,7 +1369,29 @@ mod imspector_tests {
         std::env::temp_dir().join(format!("bioformats_imspector_{name}"))
     }
 
+    fn zlib_compress(bytes: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
     fn synthetic_stack(width: i32, height: i32, z: i32, c: i32, t: i32, pixels: &[u8]) -> Vec<u8> {
+        synthetic_stack_with_compression(width, height, z, c, t, 0, pixels)
+    }
+
+    fn synthetic_stack_with_compression(
+        width: i32,
+        height: i32,
+        z: i32,
+        c: i32,
+        t: i32,
+        compression: i32,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut bytes = imspector_header(7);
         let stack_offset = 32u64;
         bytes.extend_from_slice(&stack_offset.to_le_bytes());
@@ -1361,12 +1403,12 @@ mod imspector_tests {
         bytes.extend_from_slice(&c.to_le_bytes());
         bytes.extend_from_slice(&t.to_le_bytes());
         bytes.extend_from_slice(&0x01i32.to_le_bytes());
-        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&compression.to_le_bytes());
         let payload_offset =
             (stack_offset as usize + IMSPECTOR_SYNTHETIC_STACK_MAGIC.len() + 44) as i64;
         bytes.extend_from_slice(&payload_offset.to_le_bytes());
-        bytes.extend_from_slice(&(pixels.len() as i64).to_le_bytes());
-        bytes.extend_from_slice(pixels);
+        bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(payload);
         bytes
     }
 
@@ -1495,6 +1537,38 @@ mod imspector_tests {
     }
 
     #[test]
+    fn imspector_synthetic_compressed_stack_opens_planes_and_regions() {
+        let path = temp_path("synthetic_zlib.obf");
+        let pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let compressed = zlib_compress(&pixels);
+        std::fs::write(
+            &path,
+            synthetic_stack_with_compression(2, 2, 2, 1, 1, 1, &compressed),
+        )
+        .unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.image_count, 2);
+        match meta.series_metadata.get("imspector_version_subset") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "synthetic-zlib-raw")
+            }
+            other => panic!("unexpected imspector_version_subset metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+        assert_eq!(reader.open_bytes_region(1, 0, 1, 2, 1).unwrap(), vec![7, 8]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn imspector_synthetic_stack_rejects_bad_payload_bounds_and_dimensions() {
         let short_payload = temp_path("synthetic_short_payload.obf");
         let mut bytes = synthetic_stack(2, 2, 1, 1, 1, &[1, 2, 3]);
@@ -1529,30 +1603,58 @@ mod imspector_tests {
         ));
         let _ = std::fs::remove_file(truncated_stack);
     }
+
+    #[test]
+    fn imspector_synthetic_compressed_stack_rejects_wrong_decompressed_size() {
+        let path = temp_path("synthetic_zlib_wrong_size.obf");
+        let compressed = zlib_compress(&[1, 2, 3]);
+        std::fs::write(
+            &path,
+            synthetic_stack_with_compression(2, 2, 1, 1, 1, 1, &compressed),
+        )
+        .unwrap();
+
+        let mut reader = ImspectorReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::Format(message)
+                if message.contains("decompressed payload length 3")
+                    && message.contains("declared stack size 4")
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 5. Hamamatsu VMS whole-slide
 // ---------------------------------------------------------------------------
 
-const HAMAMATSU_VMS_UNSUPPORTED: &str =
-    "Hamamatsu VMS/VMU native JPEG tile payload decoding is unsupported";
+fn hamamatsu_vms_normalize_key(key: &str) -> String {
+    key.trim()
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
 
-fn hamamatsu_vms_looks_like_index(bytes: &[u8]) -> Result<()> {
+fn hamamatsu_vms_parse_index(bytes: &[u8]) -> Result<HashMap<String, String>> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         BioFormatsError::Format("Not a Hamamatsu VMS/VMU text index file".to_string())
     })?;
     let mut saw_assignment = false;
     let mut saw_vms_key = false;
+    let mut values = HashMap::new();
 
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if let Some((key, _value)) = line.split_once('=') {
+        if let Some((key, value)) = line.split_once('=') {
             saw_assignment = true;
-            let key = key.trim().to_ascii_lowercase();
+            let key = hamamatsu_vms_normalize_key(key);
             if matches!(
                 key.as_str(),
                 "nolayers"
@@ -1567,11 +1669,12 @@ fn hamamatsu_vms_looks_like_index(bytes: &[u8]) -> Result<()> {
             ) {
                 saw_vms_key = true;
             }
+            values.insert(key, value.trim().to_string());
         }
     }
 
     if saw_assignment && saw_vms_key {
-        Ok(())
+        Ok(values)
     } else {
         Err(BioFormatsError::Format(
             "Not a Hamamatsu VMS/VMU text index file".to_string(),
@@ -1579,23 +1682,894 @@ fn hamamatsu_vms_looks_like_index(bytes: &[u8]) -> Result<()> {
     }
 }
 
-fn hamamatsu_vms_unsupported() -> BioFormatsError {
-    BioFormatsError::UnsupportedFormat(HAMAMATSU_VMS_UNSUPPORTED.to_string())
+fn hamamatsu_vms_required_u32(values: &HashMap<String, String>, key: &str) -> Result<u32> {
+    values
+        .get(key)
+        .ok_or_else(|| BioFormatsError::UnsupportedFormat(format!("Hamamatsu VMS missing {key}")))?
+        .parse::<u32>()
+        .map_err(|_| BioFormatsError::UnsupportedFormat(format!("Hamamatsu VMS invalid {key}")))
 }
 
-/// Hamamatsu VMS/VMU whole-slide format stub (`.vms`, `.vmu`).
+fn hamamatsu_vms_optional_u32(
+    values: &HashMap<String, String>,
+    keys: &[String],
+) -> Result<Option<u32>> {
+    for key in keys {
+        if let Some(value) = values.get(key) {
+            return value.parse::<u32>().map(Some).map_err(|_| {
+                BioFormatsError::UnsupportedFormat(format!("Hamamatsu VMS invalid {key}"))
+            });
+        }
+    }
+    Ok(None)
+}
+
+fn hamamatsu_vms_tile_key(col: u32, row: u32) -> String {
+    if col == 0 && row == 0 {
+        "imagefile".to_string()
+    } else {
+        format!("imagefile({col},{row})")
+    }
+}
+
+fn hamamatsu_vms_push_key(keys: &mut Vec<String>, key: String) {
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+fn hamamatsu_vms_tile_key_candidates(
+    prefix: &str,
+    layer: u32,
+    col: u32,
+    row: u32,
+    include_plain: bool,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    if include_plain && layer == 0 && col == 0 && row == 0 {
+        hamamatsu_vms_push_key(&mut keys, prefix.to_string());
+    }
+    if layer == 0 {
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}({col},{row})"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}({row},{col})"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}[{col},{row}]"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}[{row},{col}]"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}[{col}][{row}]"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}[{row}][{col}]"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}_{col}_{row}"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}_{row}_{col}"));
+    }
+    if col == 0 && row == 0 {
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}({layer})"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}[{layer}]"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}_{layer}"));
+    }
+    for (a, b, c) in [
+        (layer, col, row),
+        (col, row, layer),
+        (layer, row, col),
+        (col, layer, row),
+        (row, col, layer),
+        (row, layer, col),
+    ] {
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}({a},{b},{c})"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}[{a},{b},{c}]"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}[{a}][{b}][{c}]"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}_{a}_{b}_{c}"));
+    }
+    keys
+}
+
+fn hamamatsu_vms_tile_value<'a>(
+    values: &'a HashMap<String, String>,
+    layer: u32,
+    col: u32,
+    row: u32,
+) -> Option<&'a String> {
+    let keys = hamamatsu_vms_tile_key_candidates("imagefile", layer, col, row, true);
+    for key in &keys {
+        if let Some(value) = values.get(key) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn hamamatsu_vms_pyramid_key(level: u32, name: &str) -> Vec<String> {
+    [
+        format!("pyramidlevel{level}{name}"),
+        format!("pyramidlevel{level}.{name}"),
+        format!("resolution{level}{name}"),
+        format!("resolution{level}.{name}"),
+        format!("level{level}{name}"),
+        format!("level{level}.{name}"),
+        format!("opt.pyramidlevel{level}{name}"),
+        format!("opt.pyramidlevel{level}.{name}"),
+        format!("opt.resolution{level}{name}"),
+        format!("opt.resolution{level}.{name}"),
+        format!("opt.level{level}{name}"),
+        format!("opt.level{level}.{name}"),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn hamamatsu_vms_pyramid_tile_value<'a>(
+    values: &'a HashMap<String, String>,
+    level: u32,
+    layer: u32,
+    col: u32,
+    row: u32,
+) -> Option<&'a String> {
+    let mut keys = Vec::new();
+    for prefix in hamamatsu_vms_pyramid_key(level, "imagefile") {
+        keys.extend(hamamatsu_vms_tile_key_candidates(
+            &prefix, layer, col, row, true,
+        ));
+    }
+    for key in &keys {
+        if let Some(value) = values.get(key) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct HamamatsuVmsJpegMarkerMetadata {
+    sof_marker: Option<u8>,
+    precision: Option<u8>,
+    components: Option<u8>,
+    restart_interval: Option<u16>,
+    jfif: bool,
+    exif: bool,
+    adobe_transform: Option<u8>,
+    icc_declared_chunks: Option<u8>,
+    icc_seen_chunks: u8,
+    icc_missing_chunks: u8,
+    icc_invalid_chunks: u8,
+    icc_duplicate_chunks: u8,
+    icc_profile: Option<Vec<u8>>,
+}
+
+impl HamamatsuVmsJpegMarkerMetadata {
+    fn color_model(&self) -> &'static str {
+        match (self.components, self.adobe_transform) {
+            (Some(1), _) => "grayscale",
+            (Some(3), Some(0)) => "rgb",
+            (Some(3), _) => "ycbcr",
+            (Some(4), Some(2)) => "ycck",
+            (Some(4), _) => "cmyk",
+            _ => "unknown",
+        }
+    }
+
+    fn sof_family(&self) -> Option<&'static str> {
+        match self.sof_marker? {
+            0xc0 => Some("baseline dct"),
+            0xc1 => Some("extended sequential dct"),
+            0xc2 => Some("progressive dct"),
+            0xc3 => Some("lossless sequential"),
+            0xc5 => Some("differential sequential dct"),
+            0xc6 => Some("differential progressive dct"),
+            0xc7 => Some("differential lossless"),
+            0xc9 => Some("extended sequential arithmetic"),
+            0xca => Some("progressive arithmetic"),
+            0xcb => Some("lossless arithmetic"),
+            0xcd => Some("differential sequential arithmetic"),
+            0xce => Some("differential progressive arithmetic"),
+            0xcf => Some("differential lossless arithmetic"),
+            _ => Some("unknown"),
+        }
+    }
+
+    fn is_progressive(&self) -> bool {
+        matches!(self.sof_marker, Some(0xc2 | 0xc6 | 0xca | 0xce))
+    }
+
+    fn is_lossless(&self) -> bool {
+        matches!(self.sof_marker, Some(0xc3 | 0xc7 | 0xcb | 0xcf))
+    }
+
+    fn uses_arithmetic_coding(&self) -> bool {
+        matches!(
+            self.sof_marker,
+            Some(0xc9 | 0xca | 0xcb | 0xcd | 0xce | 0xcf)
+        )
+    }
+
+    fn icc_complete(&self) -> bool {
+        match (self.icc_declared_chunks, self.icc_profile.as_ref()) {
+            (Some(count), Some(_)) => count == self.icc_seen_chunks && count > 0,
+            _ => false,
+        }
+    }
+
+    fn has_icc_markers(&self) -> bool {
+        self.icc_declared_chunks.is_some()
+            || self.icc_seen_chunks > 0
+            || self.icc_invalid_chunks > 0
+            || self.icc_duplicate_chunks > 0
+    }
+
+    fn color_conversion_note(&self) -> &'static str {
+        match self.color_model() {
+            "grayscale" => "grayscale expanded to rgb",
+            "rgb" => "decoder rgb output",
+            "ycbcr" => "decoder ycbcr to rgb",
+            "cmyk" => "cmyk formula without icc",
+            "ycck" => "decoder ycck/cmyk path without icc",
+            _ => "unknown jpeg color encoding",
+        }
+    }
+
+    fn color_management_note(&self) -> &'static str {
+        if self.icc_complete() {
+            "icc profile preserved but not applied"
+        } else if self.has_icc_markers() {
+            "incomplete icc profile markers preserved but not applied"
+        } else {
+            "no icc profile markers found"
+        }
+    }
+}
+
+fn hamamatsu_vms_read_marker_byte(file: &mut File) -> Result<Option<u8>> {
+    let mut byte = [0u8; 1];
+    loop {
+        match file.read_exact(&mut byte) {
+            Ok(()) if byte[0] == 0xff => break,
+            Ok(()) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(BioFormatsError::Io(e)),
+        }
+    }
+    loop {
+        match file.read_exact(&mut byte) {
+            Ok(()) if byte[0] == 0xff => continue,
+            Ok(()) if byte[0] == 0x00 => return Ok(None),
+            Ok(()) => return Ok(Some(byte[0])),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(BioFormatsError::Io(e)),
+        }
+    }
+}
+
+fn hamamatsu_vms_parse_jpeg_marker_metadata(path: &Path) -> Result<HamamatsuVmsJpegMarkerMetadata> {
+    let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut soi = [0u8; 2];
+    file.read_exact(&mut soi).map_err(BioFormatsError::Io)?;
+    if soi != [0xff, 0xd8] {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Hamamatsu VMS JPEG marker metadata expected SOI marker: {}",
+            path.display()
+        )));
+    }
+
+    let mut meta = HamamatsuVmsJpegMarkerMetadata::default();
+    let mut icc_chunks: HashMap<u8, Vec<u8>> = HashMap::new();
+    while let Some(marker) = hamamatsu_vms_read_marker_byte(&mut file)? {
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if (0xd0..=0xd7).contains(&marker) || marker == 0x01 {
+            continue;
+        }
+
+        let mut len_bytes = [0u8; 2];
+        file.read_exact(&mut len_bytes)
+            .map_err(BioFormatsError::Io)?;
+        let segment_len = u16::from_be_bytes(len_bytes) as usize;
+        if segment_len < 2 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Hamamatsu VMS JPEG marker 0xff{marker:02x} has invalid length in {}",
+                path.display()
+            )));
+        }
+        let payload_len = segment_len - 2;
+
+        match marker {
+            0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc6 | 0xc7 | 0xc9 | 0xca | 0xcb | 0xcd | 0xce
+            | 0xcf => {
+                let mut payload = vec![0u8; payload_len];
+                file.read_exact(&mut payload).map_err(BioFormatsError::Io)?;
+                if payload.len() >= 6 {
+                    meta.sof_marker = Some(marker);
+                    meta.precision = Some(payload[0]);
+                    meta.components = Some(payload[5]);
+                }
+            }
+            0xdd => {
+                let mut payload = [0u8; 2];
+                if payload_len == 2 {
+                    file.read_exact(&mut payload).map_err(BioFormatsError::Io)?;
+                    meta.restart_interval = Some(u16::from_be_bytes(payload));
+                } else {
+                    file.seek(SeekFrom::Current(payload_len as i64))
+                        .map_err(BioFormatsError::Io)?;
+                }
+            }
+            0xe0 | 0xe1 | 0xe2 | 0xee => {
+                let mut payload = vec![0u8; payload_len];
+                file.read_exact(&mut payload).map_err(BioFormatsError::Io)?;
+                match marker {
+                    0xe0 if payload.starts_with(b"JFIF\0") => meta.jfif = true,
+                    0xe1 if payload.starts_with(b"Exif\0\0") => meta.exif = true,
+                    0xe2 if payload.starts_with(b"ICC_PROFILE\0") && payload.len() >= 14 => {
+                        let seq = payload[12];
+                        let count = payload[13];
+                        if seq > 0 && count > 0 {
+                            meta.icc_declared_chunks = Some(count);
+                            if seq > count {
+                                meta.icc_invalid_chunks = meta.icc_invalid_chunks.saturating_add(1);
+                            } else if icc_chunks.insert(seq, payload[14..].to_vec()).is_some() {
+                                meta.icc_duplicate_chunks =
+                                    meta.icc_duplicate_chunks.saturating_add(1);
+                            }
+                        } else {
+                            meta.icc_invalid_chunks = meta.icc_invalid_chunks.saturating_add(1);
+                        }
+                    }
+                    0xee if payload.starts_with(b"Adobe") && payload.len() >= 12 => {
+                        meta.adobe_transform = Some(payload[11]);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                file.seek(SeekFrom::Current(payload_len as i64))
+                    .map_err(BioFormatsError::Io)?;
+            }
+        }
+    }
+
+    if let Some(count) = meta.icc_declared_chunks {
+        meta.icc_seen_chunks = icc_chunks.len() as u8;
+        meta.icc_missing_chunks = (1..=count)
+            .filter(|seq| !icc_chunks.contains_key(seq))
+            .count() as u8;
+        if meta.icc_seen_chunks == count && meta.icc_missing_chunks == 0 {
+            let total_len = (1..=count)
+                .filter_map(|seq| icc_chunks.get(&seq))
+                .map(Vec::len)
+                .sum();
+            let mut profile = Vec::with_capacity(total_len);
+            for seq in 1..=count {
+                if let Some(chunk) = icc_chunks.remove(&seq) {
+                    profile.extend_from_slice(&chunk);
+                }
+            }
+            meta.icc_profile = Some(profile);
+        }
+    }
+
+    Ok(meta)
+}
+
+fn hamamatsu_vms_insert_jpeg_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    prefix: &str,
+    path: &Path,
+) -> Result<()> {
+    let markers = hamamatsu_vms_parse_jpeg_marker_metadata(path)?;
+    metadata.insert(
+        format!("{prefix} JPEG color model"),
+        MetadataValue::String(markers.color_model().into()),
+    );
+    metadata.insert(
+        format!("{prefix} JPEG color conversion"),
+        MetadataValue::String(markers.color_conversion_note().into()),
+    );
+    metadata.insert(
+        format!("{prefix} JPEG color management"),
+        MetadataValue::String(markers.color_management_note().into()),
+    );
+    metadata.insert(
+        format!("{prefix} JPEG progressive"),
+        MetadataValue::Bool(markers.is_progressive()),
+    );
+    metadata.insert(
+        format!("{prefix} JPEG lossless"),
+        MetadataValue::Bool(markers.is_lossless()),
+    );
+    metadata.insert(
+        format!("{prefix} JPEG arithmetic coding"),
+        MetadataValue::Bool(markers.uses_arithmetic_coding()),
+    );
+    metadata.insert(
+        format!("{prefix} JPEG ICC profile applied"),
+        MetadataValue::Bool(false),
+    );
+    metadata.insert(
+        format!("{prefix} JPEG ICC profile complete"),
+        MetadataValue::Bool(markers.icc_complete()),
+    );
+    if let Some(marker) = markers.sof_marker {
+        metadata.insert(
+            format!("{prefix} JPEG SOF marker"),
+            MetadataValue::String(format!("0x{marker:02x}")),
+        );
+    }
+    if let Some(family) = markers.sof_family() {
+        metadata.insert(
+            format!("{prefix} JPEG SOF family"),
+            MetadataValue::String(family.into()),
+        );
+    }
+    if let Some(precision) = markers.precision {
+        metadata.insert(
+            format!("{prefix} JPEG precision"),
+            MetadataValue::Int(precision as i64),
+        );
+    }
+    if let Some(components) = markers.components {
+        metadata.insert(
+            format!("{prefix} JPEG components"),
+            MetadataValue::Int(components as i64),
+        );
+    }
+    if let Some(interval) = markers.restart_interval {
+        metadata.insert(
+            format!("{prefix} JPEG restart interval"),
+            MetadataValue::Int(interval as i64),
+        );
+    }
+    if markers.jfif {
+        metadata.insert(format!("{prefix} JPEG JFIF"), MetadataValue::Bool(true));
+    }
+    if markers.exif {
+        metadata.insert(format!("{prefix} JPEG Exif"), MetadataValue::Bool(true));
+    }
+    if let Some(transform) = markers.adobe_transform {
+        metadata.insert(
+            format!("{prefix} JPEG Adobe transform"),
+            MetadataValue::Int(transform as i64),
+        );
+    }
+    if markers.has_icc_markers() {
+        metadata.insert(
+            format!("{prefix} JPEG ICC markers present"),
+            MetadataValue::Bool(true),
+        );
+    }
+    if let Some(count) = markers.icc_declared_chunks {
+        metadata.insert(
+            format!("{prefix} JPEG ICC declared chunks"),
+            MetadataValue::Int(count as i64),
+        );
+        metadata.insert(
+            format!("{prefix} JPEG ICC seen chunks"),
+            MetadataValue::Int(markers.icc_seen_chunks as i64),
+        );
+        metadata.insert(
+            format!("{prefix} JPEG ICC missing chunks"),
+            MetadataValue::Int(markers.icc_missing_chunks as i64),
+        );
+        if markers.icc_invalid_chunks > 0 {
+            metadata.insert(
+                format!("{prefix} JPEG ICC invalid chunks"),
+                MetadataValue::Int(markers.icc_invalid_chunks as i64),
+            );
+        }
+        if markers.icc_duplicate_chunks > 0 {
+            metadata.insert(
+                format!("{prefix} JPEG ICC duplicate chunks"),
+                MetadataValue::Int(markers.icc_duplicate_chunks as i64),
+            );
+        }
+    }
+    if let Some(profile) = markers.icc_profile {
+        metadata.insert(
+            format!("{prefix} JPEG ICC profile bytes"),
+            MetadataValue::Int(profile.len() as i64),
+        );
+        metadata.insert(
+            format!("{prefix} JPEG ICC profile"),
+            MetadataValue::Bytes(profile),
+        );
+    }
+    Ok(())
+}
+
+fn hamamatsu_vms_parse_optional_index(path: &Path) -> Result<HashMap<String, String>> {
+    let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "Hamamatsu VMS optimisation file is not UTF-8 text: {}",
+            path.display()
+        ))
+    })?;
+    let mut values = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with(';')
+            || (line.starts_with('[') && line.ends_with(']'))
+        {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            values.insert(
+                format!("opt.{}", hamamatsu_vms_normalize_key(key)),
+                value.trim().to_string(),
+            );
+        }
+    }
+    Ok(values)
+}
+
+fn hamamatsu_vms_decode_jpeg(path: &Path, scale_denom: u32) -> Result<(u32, u32, Vec<u8>)> {
+    let file = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut decoder = jpeg_decoder::Decoder::new(file);
+    if scale_denom > 1 {
+        let (width, height) = hamamatsu_vms_jpeg_dimensions(path)?;
+        if width % scale_denom != 0 || height % scale_denom != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Hamamatsu VMS JPEG tile dimensions are not divisible by {scale_denom}: {}",
+                path.display()
+            )));
+        }
+        let requested_width = (width / scale_denom) as u16;
+        let requested_height = (height / scale_denom) as u16;
+        let (scaled_width, scaled_height) = decoder
+            .scale(requested_width, requested_height)
+            .map_err(|err| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "Hamamatsu VMS JPEG tile scaled header decode failed for {}: {err}",
+                    path.display()
+                ))
+            })?;
+        if scaled_width != requested_width || scaled_height != requested_height {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Hamamatsu VMS JPEG tile cannot be decoded at exact 1/{scale_denom} scale: {}",
+                path.display()
+            )));
+        }
+    }
+    let data = decoder.decode().map_err(|err| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "Hamamatsu VMS JPEG tile decode failed for {}: {err}",
+            path.display()
+        ))
+    })?;
+    let info = decoder.info().ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "Hamamatsu VMS JPEG tile has no image info: {}",
+            path.display()
+        ))
+    })?;
+
+    let rgb = match info.pixel_format {
+        jpeg_decoder::PixelFormat::RGB24 => data,
+        jpeg_decoder::PixelFormat::L8 => {
+            let mut out = Vec::with_capacity(data.len() * 3);
+            for v in data {
+                out.extend_from_slice(&[v, v, v]);
+            }
+            out
+        }
+        jpeg_decoder::PixelFormat::CMYK32 => hamamatsu_vms_cmyk_to_rgb(&data),
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Hamamatsu VMS JPEG tile pixel format {other:?} is unsupported"
+            )));
+        }
+    };
+    Ok((info.width as u32, info.height as u32, rgb))
+}
+
+struct HamamatsuVmsDecodedJpegBand {
+    width: u32,
+    height: u32,
+    y: u32,
+    rows: u32,
+    rgb: Vec<u8>,
+}
+
+fn hamamatsu_vms_decode_jpeg_rows(
+    path: &Path,
+    scale_denom: u32,
+    y: u32,
+    h: u32,
+) -> Result<HamamatsuVmsDecodedJpegBand> {
+    if scale_denom == 1 && h > 0 {
+        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
+        if let Some(index) = jpeg_restart::index(&data) {
+            if let Some(decoded) = index.decode_rows_default(&data, y, h) {
+                let band = decoded?;
+                let rgb = hamamatsu_vms_jpeg_pixels_to_rgb(
+                    band.pixels,
+                    band.band_width,
+                    band.band_height,
+                    path,
+                )?;
+                return Ok(HamamatsuVmsDecodedJpegBand {
+                    width: band.band_width,
+                    height: index.height(),
+                    y: band.band_y0,
+                    rows: band.band_height,
+                    rgb,
+                });
+            }
+        }
+    }
+
+    let (width, height, rgb) = hamamatsu_vms_decode_jpeg(path, scale_denom)?;
+    Ok(HamamatsuVmsDecodedJpegBand {
+        width,
+        height,
+        y: 0,
+        rows: height,
+        rgb,
+    })
+}
+
+fn hamamatsu_vms_jpeg_pixels_to_rgb(
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| BioFormatsError::Format("Hamamatsu VMS JPEG band size overflows".into()))?;
+    let channels = data
+        .len()
+        .checked_div(pixels.max(1))
+        .filter(|channels| pixels == 0 || channels * pixels == data.len())
+        .ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "Hamamatsu VMS JPEG tile has inconsistent decoded byte count: {}",
+                path.display()
+            ))
+        })?;
+    match channels {
+        3 => Ok(data),
+        1 => {
+            let mut out = Vec::with_capacity(data.len() * 3);
+            for v in data {
+                out.extend_from_slice(&[v, v, v]);
+            }
+            Ok(out)
+        }
+        4 => Ok(hamamatsu_vms_cmyk_to_rgb(&data)),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "Hamamatsu VMS JPEG tile decoded to {other} channels: {}",
+            path.display()
+        ))),
+    }
+}
+
+fn hamamatsu_vms_cmyk_to_rgb(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 4 * 3);
+    for pixel in data.chunks_exact(4) {
+        let c = 255 - u16::from(pixel[0]);
+        let m = 255 - u16::from(pixel[1]);
+        let y = 255 - u16::from(pixel[2]);
+        let k = 255 - u16::from(pixel[3]);
+        out.push(((k * c) / 255) as u8);
+        out.push(((k * m) / 255) as u8);
+        out.push(((k * y) / 255) as u8);
+    }
+    out
+}
+
+fn hamamatsu_vms_jpeg_dimensions(path: &Path) -> Result<(u32, u32)> {
+    let file = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut decoder = jpeg_decoder::Decoder::new(file);
+    if decoder.read_info().is_err() {
+        return hamamatsu_vms_jpeg_dimensions_from_decode(path);
+    }
+    let info = decoder.info().ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "Hamamatsu VMS JPEG tile has no image info: {}",
+            path.display()
+        ))
+    })?;
+    Ok((info.width as u32, info.height as u32))
+}
+
+fn hamamatsu_vms_jpeg_dimensions_from_decode(path: &Path) -> Result<(u32, u32)> {
+    let file = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut decoder = jpeg_decoder::Decoder::new(file);
+    decoder.decode().map_err(|err| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "Hamamatsu VMS JPEG tile header decode failed for {}: {err}",
+            path.display()
+        ))
+    })?;
+    let info = decoder.info().ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "Hamamatsu VMS JPEG tile has no image info: {}",
+            path.display()
+        ))
+    })?;
+    Ok((info.width as u32, info.height as u32))
+}
+
+#[derive(Clone)]
+struct HamamatsuVmsTile {
+    path: PathBuf,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    scale_denom: u32,
+}
+
+enum HamamatsuVmsPixels {
+    TilePyramid(Vec<Vec<Vec<HamamatsuVmsTile>>>),
+    Jpeg(PathBuf),
+}
+
+struct HamamatsuVmsSeries {
+    metadata: Vec<ImageMetadata>,
+    pixels: HamamatsuVmsPixels,
+}
+
+fn hamamatsu_vms_build_tile_layers<F>(
+    values: &HashMap<String, String>,
+    parent: &Path,
+    cols: u32,
+    rows: u32,
+    layers: u32,
+    mut tile_name: F,
+) -> Result<(Vec<Vec<HamamatsuVmsTile>>, u32, u32)>
+where
+    F: FnMut(&HashMap<String, String>, u32, u32, u32) -> Option<&String>,
+{
+    if cols == 0 || rows == 0 || layers == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Hamamatsu VMS tile grid and layer count must be positive".into(),
+        ));
+    }
+    let tile_count = cols
+        .checked_mul(rows)
+        .ok_or_else(|| BioFormatsError::Format("Hamamatsu VMS tile count overflows".into()))?;
+    let mut layer_tiles = Vec::with_capacity(layers as usize);
+    let mut full_size_x = 0u32;
+    let mut full_size_y = 0u32;
+
+    for layer in 0..layers {
+        let mut grid: Vec<Option<HamamatsuVmsTile>> = vec![None; tile_count as usize];
+        let mut col_widths = vec![0u32; cols as usize];
+        let mut row_heights = vec![0u32; rows as usize];
+
+        for row in 0..rows {
+            for col in 0..cols {
+                let name = tile_name(values, layer, col, row).ok_or_else(|| {
+                    let key = hamamatsu_vms_tile_key(col, row);
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "Hamamatsu VMS missing layer {layer} {key}"
+                    ))
+                })?;
+                let tile_path = parent.join(name);
+                let (width, height) = hamamatsu_vms_jpeg_dimensions(&tile_path)?;
+                col_widths[col as usize] = col_widths[col as usize].max(width);
+                row_heights[row as usize] = row_heights[row as usize].max(height);
+                grid[(row * cols + col) as usize] = Some(HamamatsuVmsTile {
+                    path: tile_path,
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    scale_denom: 1,
+                });
+            }
+        }
+
+        let mut x_offsets = Vec::with_capacity(cols as usize);
+        let mut size_x = 0u32;
+        for width in &col_widths {
+            x_offsets.push(size_x);
+            size_x = size_x.checked_add(*width).ok_or_else(|| {
+                BioFormatsError::Format("Hamamatsu VMS image width overflows".into())
+            })?;
+        }
+        let mut y_offsets = Vec::with_capacity(rows as usize);
+        let mut size_y = 0u32;
+        for height in &row_heights {
+            y_offsets.push(size_y);
+            size_y = size_y.checked_add(*height).ok_or_else(|| {
+                BioFormatsError::Format("Hamamatsu VMS image height overflows".into())
+            })?;
+        }
+        if layer == 0 {
+            full_size_x = size_x;
+            full_size_y = size_y;
+        } else if size_x != full_size_x || size_y != full_size_y {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Hamamatsu VMS layer {layer} dimensions {size_x}x{size_y} differ from layer 0 {full_size_x}x{full_size_y}"
+            )));
+        }
+
+        let mut tiles = Vec::with_capacity(grid.len());
+        for row in 0..rows {
+            for col in 0..cols {
+                let mut tile = grid[(row * cols + col) as usize].take().unwrap();
+                tile.x = x_offsets[col as usize];
+                tile.y = y_offsets[row as usize];
+                tiles.push(tile);
+            }
+        }
+        layer_tiles.push(tiles);
+    }
+
+    Ok((layer_tiles, full_size_x, full_size_y))
+}
+
+fn hamamatsu_vms_scaled_tile_layers(
+    source_layers: &[Vec<HamamatsuVmsTile>],
+    scale_denom: u32,
+) -> Option<(Vec<Vec<HamamatsuVmsTile>>, u32, u32)> {
+    if !matches!(scale_denom, 2 | 4 | 8) || source_layers.is_empty() {
+        return None;
+    }
+
+    let mut scaled_layers = Vec::with_capacity(source_layers.len());
+    let mut scaled_size_x = 0u32;
+    let mut scaled_size_y = 0u32;
+    for (layer, tiles) in source_layers.iter().enumerate() {
+        let mut scaled_tiles = Vec::with_capacity(tiles.len());
+        let mut layer_size_x = 0u32;
+        let mut layer_size_y = 0u32;
+        for tile in tiles {
+            if tile.x % scale_denom != 0
+                || tile.y % scale_denom != 0
+                || tile.width % scale_denom != 0
+                || tile.height % scale_denom != 0
+                || tile.scale_denom != 1
+            {
+                return None;
+            }
+            let scaled_x = tile.x / scale_denom;
+            let scaled_y = tile.y / scale_denom;
+            let scaled_width = tile.width / scale_denom;
+            let scaled_height = tile.height / scale_denom;
+            layer_size_x = layer_size_x.max(scaled_x.checked_add(scaled_width)?);
+            layer_size_y = layer_size_y.max(scaled_y.checked_add(scaled_height)?);
+            scaled_tiles.push(HamamatsuVmsTile {
+                path: tile.path.clone(),
+                x: scaled_x,
+                y: scaled_y,
+                width: scaled_width,
+                height: scaled_height,
+                scale_denom,
+            });
+        }
+        if layer == 0 {
+            scaled_size_x = layer_size_x;
+            scaled_size_y = layer_size_y;
+        } else if layer_size_x != scaled_size_x || layer_size_y != scaled_size_y {
+            return None;
+        }
+        scaled_layers.push(scaled_tiles);
+    }
+
+    Some((scaled_layers, scaled_size_x, scaled_size_y))
+}
+
+/// Hamamatsu VMS/VMU whole-slide format (`.vms`, `.vmu`).
 ///
-/// Native tile metadata and JPEG payload decoding are unsupported.
+/// The text index names a grid of native JPEG tile files. Pixel dimensions are
+/// read from the tile JPEG headers because the index only stores physical sizes.
 pub struct HamamatsuVmsReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    series: Vec<HamamatsuVmsSeries>,
+    current_series: usize,
+    current_resolution: usize,
 }
 
 impl HamamatsuVmsReader {
     pub fn new() -> Self {
         HamamatsuVmsReader {
             path: None,
-            meta: None,
+            series: Vec::new(),
+            current_series: 0,
+            current_resolution: 0,
         }
     }
 }
@@ -1620,83 +2594,472 @@ impl FormatReader for HamamatsuVmsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = None;
-        self.meta = None;
+        self.close()?;
         let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        hamamatsu_vms_looks_like_index(&bytes)?;
-        Err(hamamatsu_vms_unsupported())
+        let mut values = hamamatsu_vms_parse_index(&bytes)?;
+        let cols = hamamatsu_vms_required_u32(&values, "nojpegcolumns")?;
+        let rows = hamamatsu_vms_required_u32(&values, "nojpegrows")?;
+        let layers = values
+            .get("nolayers")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        if cols == 0 || rows == 0 || layers == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Hamamatsu VMS tile grid and layer count must be positive".into(),
+            ));
+        }
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+
+        if let Some(name) = values
+            .get("optimisationfile")
+            .or_else(|| values.get("optimizationfile"))
+            .cloned()
+        {
+            let opt_path = parent.join(name);
+            for (key, value) in hamamatsu_vms_parse_optional_index(&opt_path)? {
+                values.insert(key, value);
+            }
+        }
+
+        let base_series_metadata: HashMap<String, MetadataValue> = values
+            .iter()
+            .map(|(k, v)| (format!("VMS {k}"), MetadataValue::String(v.to_string())))
+            .collect();
+
+        let mut series = Vec::new();
+        let (full_layer_tiles, full_size_x, full_size_y) =
+            hamamatsu_vms_build_tile_layers(&values, parent, cols, rows, layers, |v, l, c, r| {
+                hamamatsu_vms_tile_value(v, l, c, r)
+            })?;
+        let declared_resolution_count = values
+            .get("pyramidlevels")
+            .or_else(|| values.get("opt.pyramidlevels"))
+            .or_else(|| values.get("resolutioncount"))
+            .or_else(|| values.get("opt.resolutioncount"))
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let mut pyramid_tiles = vec![full_layer_tiles];
+        let mut pyramid_sizes = vec![(full_size_x, full_size_y)];
+        for level in 1..declared_resolution_count {
+            let scale_denom = 1u32.checked_shl(level).unwrap_or(0);
+            let col_keys = hamamatsu_vms_pyramid_key(level, "nojpegcolumns");
+            let row_keys = hamamatsu_vms_pyramid_key(level, "nojpegrows");
+            let level_cols = hamamatsu_vms_optional_u32(&values, &col_keys)?;
+            let level_rows = hamamatsu_vms_optional_u32(&values, &row_keys)?;
+            let (tiles, size_x, size_y) =
+                if let (Some(level_cols), Some(level_rows)) = (level_cols, level_rows) {
+                    hamamatsu_vms_build_tile_layers(
+                        &values,
+                        parent,
+                        level_cols,
+                        level_rows,
+                        layers,
+                        |v, l, c, r| hamamatsu_vms_pyramid_tile_value(v, level, l, c, r),
+                    )
+                    .map_err(|err| match err {
+                        BioFormatsError::UnsupportedFormat(message) => {
+                            BioFormatsError::UnsupportedFormat(format!(
+                                "Hamamatsu VMS pyramid level {level}: {message}"
+                            ))
+                        }
+                        other => other,
+                    })?
+                } else if let Some(scaled) =
+                    hamamatsu_vms_scaled_tile_layers(&pyramid_tiles[0], scale_denom)
+                {
+                    scaled
+                } else {
+                    break;
+                };
+            if size_x >= full_size_x || size_y >= full_size_y {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Hamamatsu VMS pyramid level {level} is not lower resolution"
+                )));
+            }
+            pyramid_tiles.push(tiles);
+            pyramid_sizes.push((size_x, size_y));
+        }
+        let mut full_metadata = base_series_metadata.clone();
+        full_metadata.insert(
+            "VMS series kind".into(),
+            MetadataValue::String("full resolution".into()),
+        );
+        if let (Some(physical_width), true) = (
+            values
+                .get("physicalwidth")
+                .and_then(|v| v.parse::<f64>().ok()),
+            full_size_x > 0,
+        ) {
+            full_metadata.insert(
+                "VMS physical_size_x".into(),
+                MetadataValue::Float(physical_width / full_size_x as f64),
+            );
+        }
+        if let (Some(physical_height), true) = (
+            values
+                .get("physicalheight")
+                .and_then(|v| v.parse::<f64>().ok()),
+            full_size_y > 0,
+        ) {
+            full_metadata.insert(
+                "VMS physical_size_y".into(),
+                MetadataValue::Float(physical_height / full_size_y as f64),
+            );
+        }
+        if let Some(first_tile_path) = pyramid_tiles
+            .first()
+            .and_then(|resolution| resolution.first())
+            .and_then(|layer| layer.first())
+            .map(|tile| tile.path.clone())
+        {
+            hamamatsu_vms_insert_jpeg_metadata(&mut full_metadata, "VMS tile", &first_tile_path)?;
+        }
+        let mut pyramid_metadata = Vec::with_capacity(pyramid_sizes.len());
+        for (resolution, (size_x, size_y)) in pyramid_sizes.iter().copied().enumerate() {
+            let mut metadata = full_metadata.clone();
+            metadata.insert(
+                "VMS resolution".into(),
+                MetadataValue::Int(resolution as i64),
+            );
+            pyramid_metadata.push(ImageMetadata {
+                size_x: full_size_x,
+                size_y: full_size_y,
+                size_z: 1,
+                size_c: 3,
+                size_t: 1,
+                pixel_type: PixelType::Uint8,
+                bits_per_pixel: 8,
+                image_count: layers,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb: true,
+                is_interleaved: true,
+                is_indexed: false,
+                is_little_endian: true,
+                resolution_count: pyramid_sizes.len() as u32,
+                series_metadata: metadata,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            });
+            let last = pyramid_metadata.last_mut().unwrap();
+            last.size_x = size_x;
+            last.size_y = size_y;
+            if let (Some(physical_width), true) = (
+                values
+                    .get("physicalwidth")
+                    .and_then(|v| v.parse::<f64>().ok()),
+                size_x > 0,
+            ) {
+                last.series_metadata.insert(
+                    "VMS physical_size_x".into(),
+                    MetadataValue::Float(physical_width / size_x as f64),
+                );
+            }
+            if let (Some(physical_height), true) = (
+                values
+                    .get("physicalheight")
+                    .and_then(|v| v.parse::<f64>().ok()),
+                size_y > 0,
+            ) {
+                last.series_metadata.insert(
+                    "VMS physical_size_y".into(),
+                    MetadataValue::Float(physical_height / size_y as f64),
+                );
+            }
+        }
+        series.push(HamamatsuVmsSeries {
+            metadata: pyramid_metadata,
+            pixels: HamamatsuVmsPixels::TilePyramid(pyramid_tiles),
+        });
+
+        for (kind, key, physical_width_key, physical_height_key) in [
+            (
+                "macro",
+                "macroimage",
+                "physicalmacrowidth",
+                "physicalmacroheight",
+            ),
+            ("map", "mapfile", "", ""),
+        ] {
+            let Some(name) = values.get(key) else {
+                continue;
+            };
+            let image_path = parent.join(name);
+            let (size_x, size_y) = hamamatsu_vms_jpeg_dimensions(&image_path)?;
+            let mut series_metadata = base_series_metadata.clone();
+            series_metadata.insert("VMS series kind".into(), MetadataValue::String(kind.into()));
+            hamamatsu_vms_insert_jpeg_metadata(&mut series_metadata, "VMS image", &image_path)?;
+            if let (Some(physical_width), true) = (
+                values
+                    .get(physical_width_key)
+                    .and_then(|v| v.parse::<f64>().ok()),
+                size_x > 0,
+            ) {
+                series_metadata.insert(
+                    "VMS physical_size_x".into(),
+                    MetadataValue::Float(physical_width / size_x as f64),
+                );
+            }
+            if let (Some(physical_height), true) = (
+                values
+                    .get(physical_height_key)
+                    .and_then(|v| v.parse::<f64>().ok()),
+                size_y > 0,
+            ) {
+                series_metadata.insert(
+                    "VMS physical_size_y".into(),
+                    MetadataValue::Float(physical_height / size_y as f64),
+                );
+            }
+            series.push(HamamatsuVmsSeries {
+                metadata: vec![ImageMetadata {
+                    size_x,
+                    size_y,
+                    size_z: 1,
+                    size_c: 3,
+                    size_t: 1,
+                    pixel_type: PixelType::Uint8,
+                    bits_per_pixel: 8,
+                    image_count: 1,
+                    dimension_order: DimensionOrder::XYCZT,
+                    is_rgb: true,
+                    is_interleaved: true,
+                    is_indexed: false,
+                    is_little_endian: true,
+                    resolution_count: 1,
+                    series_metadata,
+                    lookup_table: None,
+                    modulo_z: None,
+                    modulo_c: None,
+                    modulo_t: None,
+                }],
+                pixels: HamamatsuVmsPixels::Jpeg(image_path),
+            });
+        }
+
+        self.path = Some(path.to_path_buf());
+        self.series = series;
+        self.current_series = 0;
+        self.current_resolution = 0;
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
+        self.series.clear();
+        self.current_series = 0;
+        self.current_resolution = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        if self.meta.is_some() {
-            1
-        } else {
-            0
-        }
+        self.series.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
+        if self.series.is_empty() {
             return Err(BioFormatsError::NotInitialized);
         }
-        if s != 0 {
+        if s >= self.series.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
+            self.current_resolution = 0;
             Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.series
+            .get(self.current_series)
+            .and_then(|s| s.metadata.get(self.current_resolution))
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        let meta = self.metadata();
+        if std::ptr::eq(meta, crate::common::reader::uninitialized_metadata()) {
+            return None;
+        }
+
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        let _ = ome.add_original_metadata_annotations(meta, 0);
+        Some(ome)
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let _ = plane_index;
-        Err(hamamatsu_vms_unsupported())
+        let meta = self
+            .series
+            .get(self.current_series)
+            .and_then(|s| s.metadata.get(self.current_resolution))
+            .ok_or(BioFormatsError::NotInitialized)?;
+        self.open_bytes_region(plane_index, 0, 0, meta.size_x, meta.size_y)
     }
 
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let _ = (plane_index, w, h);
-        Err(hamamatsu_vms_unsupported())
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let meta = series
+            .metadata
+            .get(self.current_resolution)
+            .ok_or_else(|| {
+                BioFormatsError::Format("Hamamatsu VMS resolution out of range".into())
+            })?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let x2 = x.checked_add(w).ok_or_else(|| {
+            BioFormatsError::Format("Hamamatsu VMS region width overflows".into())
+        })?;
+        let y2 = y.checked_add(h).ok_or_else(|| {
+            BioFormatsError::Format("Hamamatsu VMS region height overflows".into())
+        })?;
+        if x2 > meta.size_x || y2 > meta.size_y {
+            return Err(BioFormatsError::Format(
+                "Hamamatsu VMS region is outside image bounds".into(),
+            ));
+        }
+
+        let row_bytes = (w as usize)
+            .checked_mul(3)
+            .ok_or_else(|| BioFormatsError::Format("Hamamatsu VMS row size overflows".into()))?;
+        let out_len = row_bytes.checked_mul(h as usize).ok_or_else(|| {
+            BioFormatsError::Format("Hamamatsu VMS output buffer size overflows".into())
+        })?;
+        let mut out = vec![0u8; out_len];
+        match &series.pixels {
+            HamamatsuVmsPixels::TilePyramid(pyramid) => {
+                let layers = pyramid.get(self.current_resolution).ok_or_else(|| {
+                    BioFormatsError::Format("Hamamatsu VMS resolution out of range".into())
+                })?;
+                let tiles = layers
+                    .get(plane_index as usize)
+                    .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
+                for tile in tiles {
+                    let tx2 = tile.x + tile.width;
+                    let ty2 = tile.y + tile.height;
+                    if tx2 <= x || tile.x >= x2 || ty2 <= y || tile.y >= y2 {
+                        continue;
+                    }
+
+                    let ix0 = tile.x.max(x);
+                    let iy0 = tile.y.max(y);
+                    let ix1 = tx2.min(x2);
+                    let iy1 = ty2.min(y2);
+                    let band_y = iy0 - tile.y;
+                    let band_h = iy1 - iy0;
+                    let decoded = hamamatsu_vms_decode_jpeg_rows(
+                        &tile.path,
+                        tile.scale_denom,
+                        band_y,
+                        band_h,
+                    )?;
+                    if decoded.width != tile.width || decoded.height != tile.height {
+                        return Err(BioFormatsError::Format(format!(
+                            "Hamamatsu VMS tile dimensions changed for {}",
+                            tile.path.display()
+                        )));
+                    }
+                    if band_y < decoded.y || band_y + band_h > decoded.y + decoded.rows {
+                        return Err(BioFormatsError::Format(format!(
+                            "Hamamatsu VMS tile restart band does not cover requested rows for {}",
+                            tile.path.display()
+                        )));
+                    }
+                    let copy_w = (ix1 - ix0) as usize;
+                    let src_x = (ix0 - tile.x) as usize;
+                    let src_y = (band_y - decoded.y) as usize;
+                    let dst_x = (ix0 - x) as usize;
+                    let dst_y = (iy0 - y) as usize;
+                    let src_stride = tile.width as usize * 3;
+                    for row in 0..(iy1 - iy0) as usize {
+                        let src = (src_y + row) * src_stride + src_x * 3;
+                        let dst = (dst_y + row) * row_bytes + dst_x * 3;
+                        out[dst..dst + copy_w * 3]
+                            .copy_from_slice(&decoded.rgb[src..src + copy_w * 3]);
+                    }
+                }
+            }
+            HamamatsuVmsPixels::Jpeg(path) => {
+                let decoded = hamamatsu_vms_decode_jpeg_rows(path, 1, y, h)?;
+                if decoded.width != meta.size_x || decoded.height != meta.size_y {
+                    return Err(BioFormatsError::Format(format!(
+                        "Hamamatsu VMS associated image dimensions changed for {}",
+                        path.display()
+                    )));
+                }
+                if y < decoded.y || y + h > decoded.y + decoded.rows {
+                    return Err(BioFormatsError::Format(format!(
+                        "Hamamatsu VMS associated image restart band does not cover requested rows for {}",
+                        path.display()
+                    )));
+                }
+                let src_stride = decoded.width as usize * 3;
+                let src_x = x as usize;
+                let src_y = (y - decoded.y) as usize;
+                for row in 0..h as usize {
+                    let src = (src_y + row) * src_stride + src_x * 3;
+                    let dst = row * row_bytes;
+                    out[dst..dst + row_bytes].copy_from_slice(&decoded.rgb[src..src + row_bytes]);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let _ = plane_index;
-        Err(hamamatsu_vms_unsupported())
+        let meta = self
+            .series
+            .get(self.current_series)
+            .and_then(|s| s.metadata.get(self.current_resolution))
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
     fn resolution_count(&self) -> usize {
-        1
+        self.series
+            .get(self.current_series)
+            .map(|s| s.metadata.len())
+            .unwrap_or(0)
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if level != 0 {
+        if self.series.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        if level >= self.resolution_count() {
             Err(BioFormatsError::Format(format!(
                 "resolution {} out of range",
                 level
             )))
         } else {
+            self.current_resolution = level;
             Ok(())
         }
+    }
+
+    fn resolution(&self) -> usize {
+        self.current_resolution
     }
 }
 
@@ -1704,34 +3067,751 @@ impl FormatReader for HamamatsuVmsReader {
 mod hamamatsu_vms_tests {
     use super::HamamatsuVmsReader;
     use crate::common::error::BioFormatsError;
+    use crate::common::metadata::MetadataValue;
+    use crate::common::ome_metadata::OmeAnnotation;
+    use crate::common::pixel_type::PixelType;
     use crate::common::reader::FormatReader;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("bioformats_hamamatsu_vms_{name}"))
     }
 
+    fn write_rgb_jpeg(path: &std::path::Path, rgb: [u8; 3]) {
+        write_rgb_jpeg_pixels(path, 1, 1, &rgb);
+    }
+
+    fn write_rgb_jpeg_pixels(path: &std::path::Path, width: u32, height: u32, rgb: &[u8]) {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 100)
+            .encode(rgb, width, height, image::ColorType::Rgb8.into())
+            .unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_gray_jpeg_pixels(path: &std::path::Path, width: u32, height: u32, gray: &[u8]) {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 100)
+            .encode(gray, width, height, image::ColorType::L8.into())
+            .unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_rgb_jpeg_with_marker_segments(path: &std::path::Path, rgb: [u8; 3]) {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 100)
+            .encode(&rgb, 1, 1, image::ColorType::Rgb8.into())
+            .unwrap();
+        let mut segments = Vec::new();
+
+        let icc = b"synthetic-icc-profile";
+        let app2_len = 2 + 14 + icc.len();
+        segments.extend_from_slice(&[0xff, 0xe2]);
+        segments.extend_from_slice(&(app2_len as u16).to_be_bytes());
+        segments.extend_from_slice(b"ICC_PROFILE\0");
+        segments.extend_from_slice(&[1, 1]);
+        segments.extend_from_slice(icc);
+
+        segments.extend_from_slice(&[0xff, 0xee, 0x00, 0x0e]);
+        segments.extend_from_slice(b"Adobe");
+        segments.extend_from_slice(&100u16.to_be_bytes());
+        segments.extend_from_slice(&0u16.to_be_bytes());
+        segments.extend_from_slice(&0u16.to_be_bytes());
+        segments.push(1);
+
+        segments.extend_from_slice(&[0xff, 0xdd, 0x00, 0x04]);
+        segments.extend_from_slice(&4u16.to_be_bytes());
+
+        bytes.splice(2..2, segments);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_rgb_jpeg_with_invalid_icc_sequence(path: &std::path::Path, rgb: [u8; 3]) {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 100)
+            .encode(&rgb, 1, 1, image::ColorType::Rgb8.into())
+            .unwrap();
+        let icc = b"out-of-range";
+        let app2_len = 2 + 14 + icc.len();
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&[0xff, 0xe2]);
+        segment.extend_from_slice(&(app2_len as u16).to_be_bytes());
+        segment.extend_from_slice(b"ICC_PROFILE\0");
+        segment.extend_from_slice(&[2, 1]);
+        segment.extend_from_slice(icc);
+        bytes.splice(2..2, segment);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn decode_scaled_jpeg(path: &std::path::Path, width: u16, height: u16) -> Vec<u8> {
+        let file = std::fs::File::open(path).unwrap();
+        let mut decoder = jpeg_decoder::Decoder::new(file);
+        assert_eq!(decoder.scale(width, height).unwrap(), (width, height));
+        decoder.decode().unwrap()
+    }
+
     #[test]
-    fn hamamatsu_vms_validates_text_index_before_unsupported_payload() {
+    fn hamamatsu_vms_decodes_small_jpeg_tile_grid() {
         let path = temp_path("index.vms");
+        let tile0 = temp_path("tile0.jpg");
+        let tile1 = temp_path("tile1.jpg");
+        write_rgb_jpeg(&tile0, [240, 10, 20]);
+        write_rgb_jpeg(&tile1, [30, 220, 40]);
         std::fs::write(
             &path,
-            b"NoLayers=1\nImageFile=tile.jpg\nPhysicalWidth=2\nPhysicalHeight=2\n",
+            format!(
+                "NoLayers=1\nNoJpegColumns=2\nNoJpegRows=1\nImageFile={}\nImageFile(1,0)={}\nPhysicalWidth=2\nPhysicalHeight=1\n",
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile1.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.size_c), (2, 1, 3));
+        assert_eq!(reader.series_count(), 1);
+
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane.len(), 6);
+        assert!(plane[0] > plane[1] && plane[0] > plane[2], "{plane:?}");
+        assert!(plane[4] > plane[3] && plane[4] > plane[5], "{plane:?}");
+        let region = reader.open_bytes_region(0, 1, 0, 1, 1).unwrap();
+        assert_eq!(region, plane[3..6]);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(tile1);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reads_layers_macro_map_and_opt_metadata() {
+        let path = temp_path("advanced.vms");
+        let opt = temp_path("advanced.opt");
+        let tile0 = temp_path("advanced_l0.jpg");
+        let tile1 = temp_path("advanced_l1.jpg");
+        let macro_image = temp_path("advanced_macro.jpg");
+        let map_image = temp_path("advanced_map.jpg");
+        write_rgb_jpeg(&tile0, [240, 10, 20]);
+        write_rgb_jpeg(&tile1, [20, 30, 240]);
+        write_rgb_jpeg_pixels(&macro_image, 2, 1, &[10, 200, 20, 210, 20, 30]);
+        write_rgb_jpeg(&map_image, [80, 90, 100]);
+        std::fs::write(&opt, b"[Pyramid]\nTileWidth=1024\n").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=2\n",
+                    "NoJpegColumns=1\n",
+                    "NoJpegRows=1\n",
+                    "ImageFile={}\n",
+                    "ImageFile(1,0,0)={}\n",
+                    "MacroImage={}\n",
+                    "MapFile={}\n",
+                    "OptimisationFile={}\n",
+                    "PhysicalWidth=4\n",
+                    "PhysicalHeight=2\n",
+                    "PhysicalMacroWidth=8\n",
+                    "PhysicalMacroHeight=2\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile1.file_name().unwrap().to_string_lossy(),
+                macro_image.file_name().unwrap().to_string_lossy(),
+                map_image.file_name().unwrap().to_string_lossy(),
+                opt.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 3);
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.size_c), (1, 1, 3));
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert!(matches!(
+            meta.series_metadata.get("VMS opt.tilewidth"),
+            Some(MetadataValue::String(v)) if v == "1024"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("VMS physical_size_x"),
+            Some(MetadataValue::Float(v)) if (*v - 4.0).abs() < 0.0001
+        ));
+
+        let layer0 = reader.open_bytes(0).unwrap();
+        let layer1 = reader.open_bytes(1).unwrap();
+        assert!(layer0[0] > layer0[2], "{layer0:?}");
+        assert!(layer1[2] > layer1[0], "{layer1:?}");
+        assert!(matches!(
+            reader.open_bytes(2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.series(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        assert_eq!(reader.metadata().image_count, 1);
+        assert!(matches!(
+            reader.metadata().series_metadata.get("VMS series kind"),
+            Some(MetadataValue::String(v)) if v == "macro"
+        ));
+        let macro_plane = reader.open_bytes(0).unwrap();
+        assert_eq!(macro_plane.len(), 6);
+
+        reader.set_series(2).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        assert!(matches!(
+            reader.metadata().series_metadata.get("VMS series kind"),
+            Some(MetadataValue::String(v)) if v == "map"
+        ));
+        assert_eq!(reader.open_bytes_region(0, 0, 0, 1, 1).unwrap().len(), 3);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(opt);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(tile1);
+        let _ = std::fs::remove_file(macro_image);
+        let _ = std::fs::remove_file(map_image);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reads_layer_key_with_column_layer_row_order() {
+        let path = temp_path("layer_key_variants.vms");
+        let tile0 = temp_path("layer_key_variants_l0.jpg");
+        let tile1 = temp_path("layer_key_variants_l1.jpg");
+        write_rgb_jpeg(&tile0, [240, 10, 20]);
+        write_rgb_jpeg(&tile1, [20, 30, 240]);
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=2\n",
+                    "NoJpegColumns=1\n",
+                    "NoJpegRows=1\n",
+                    "ImageFile={}\n",
+                    "ImageFile(0,1,0)={}\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile1.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().image_count, 2);
+        let layer0 = reader.open_bytes(0).unwrap();
+        let layer1 = reader.open_bytes(1).unwrap();
+        assert!(layer0[0] > layer0[2], "{layer0:?}");
+        assert!(layer1[2] > layer1[0], "{layer1:?}");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(tile1);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reads_spaced_and_alternate_tile_key_variants() {
+        let path = temp_path("alternate_tile_key_variants.vms");
+        let tile0 = temp_path("alternate_tile_key_variants_0.jpg");
+        let tile1 = temp_path("alternate_tile_key_variants_1.jpg");
+        let tile2 = temp_path("alternate_tile_key_variants_2.jpg");
+        write_rgb_jpeg(&tile0, [240, 10, 20]);
+        write_rgb_jpeg(&tile1, [30, 220, 40]);
+        write_rgb_jpeg(&tile2, [20, 30, 240]);
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "No Layers=1\n",
+                    "No Jpeg Columns=3\n",
+                    "No Jpeg Rows=1\n",
+                    "Image File={}\n",
+                    "ImageFile[1,0]={}\n",
+                    "ImageFile_2_0={}\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile1.file_name().unwrap().to_string_lossy(),
+                tile2.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (3, 1));
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane.len(), 9);
+        assert!(plane[0] > plane[1] && plane[0] > plane[2], "{plane:?}");
+        assert!(plane[4] > plane[3] && plane[4] > plane[5], "{plane:?}");
+        assert!(plane[8] > plane[6] && plane[8] > plane[7], "{plane:?}");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(tile1);
+        let _ = std::fs::remove_file(tile2);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reads_two_index_row_column_tile_key_variant() {
+        let path = temp_path("row_column_tile_key_variant.vms");
+        let tile0 = temp_path("row_column_tile_key_variant_0.jpg");
+        let tile1 = temp_path("row_column_tile_key_variant_1.jpg");
+        write_rgb_jpeg(&tile0, [240, 10, 20]);
+        write_rgb_jpeg(&tile1, [20, 30, 240]);
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=1\n",
+                    "NoJpegRows=2\n",
+                    "ImageFile={}\n",
+                    "ImageFile(1,0)={}\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile1.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 2));
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane.len(), 6);
+        assert!(plane[0] > plane[2], "{plane:?}");
+        assert!(plane[5] > plane[3], "{plane:?}");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(tile1);
+    }
+
+    #[test]
+    fn hamamatsu_vms_records_jpeg_marker_metadata_without_applying_icc() {
+        let path = temp_path("jpeg_marker_metadata.vms");
+        let tile = temp_path("jpeg_marker_metadata.jpg");
+        write_rgb_jpeg_with_marker_segments(&tile, [240, 10, 20]);
+        std::fs::write(
+            &path,
+            format!(
+                "NoLayers=1\nNoJpegColumns=1\nNoJpegRows=1\nImageFile={}\n",
+                tile.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("VMS tile JPEG color model"),
+            Some(MetadataValue::String(v)) if v == "ycbcr"
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG color conversion"),
+            Some(MetadataValue::String(v)) if v == "decoder ycbcr to rgb"
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG color management"),
+            Some(MetadataValue::String(v)) if v == "icc profile preserved but not applied"
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG progressive"),
+            Some(MetadataValue::Bool(false))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG lossless"),
+            Some(MetadataValue::Bool(false))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG arithmetic coding"),
+            Some(MetadataValue::Bool(false))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG restart interval"),
+            Some(MetadataValue::Int(4))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG SOF family"),
+            Some(MetadataValue::String(v)) if v == "baseline dct"
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG Adobe transform"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC markers present"),
+            Some(MetadataValue::Bool(true))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC profile complete"),
+            Some(MetadataValue::Bool(true))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC profile bytes"),
+            Some(MetadataValue::Int(21))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC profile applied"),
+            Some(MetadataValue::Bool(false))
+        ));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile);
+    }
+
+    #[test]
+    fn hamamatsu_vms_projects_original_metadata_to_ome_annotation() {
+        let path = temp_path("ome_original_metadata.vms");
+        let tile = temp_path("ome_original_metadata.jpg");
+        write_rgb_jpeg(&tile, [240, 10, 20]);
+        std::fs::write(
+            &path,
+            format!(
+                "NoLayers=1\nNoJpegColumns=1\nNoJpegRows=1\nImageFile={}\nPhysicalWidth=4\nPhysicalHeight=2\n",
+                tile.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().expect("OME metadata");
+        assert_eq!(ome.images.len(), 1);
+        let original_metadata = ome
+            .annotations
+            .iter()
+            .find_map(|annotation| match annotation {
+                OmeAnnotation::MapAnnotation {
+                    namespace, values, ..
+                } if namespace.as_deref()
+                    == Some("openmicroscopy.org/bioformats/original-metadata") =>
+                {
+                    Some(values)
+                }
+                _ => None,
+            })
+            .expect("original metadata annotation");
+
+        assert!(original_metadata
+            .iter()
+            .any(|(key, value)| key == "Image" && value == "Image:0"));
+        assert!(original_metadata
+            .iter()
+            .any(|(key, value)| key == "VMS physicalwidth" && value == "4"));
+        assert!(original_metadata
+            .iter()
+            .any(|(key, value)| { key == "VMS tile JPEG color model" && value == "ycbcr" }));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reports_incomplete_icc_sequence_without_applying_profile() {
+        let path = temp_path("jpeg_incomplete_icc.vms");
+        let tile = temp_path("jpeg_incomplete_icc.jpg");
+        write_rgb_jpeg_with_invalid_icc_sequence(&tile, [240, 10, 20]);
+        std::fs::write(
+            &path,
+            format!(
+                "NoLayers=1\nNoJpegColumns=1\nNoJpegRows=1\nImageFile={}\n",
+                tile.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC profile complete"),
+            Some(MetadataValue::Bool(false))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG color management"),
+            Some(MetadataValue::String(v))
+                if v == "incomplete icc profile markers preserved but not applied"
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC markers present"),
+            Some(MetadataValue::Bool(true))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC declared chunks"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC seen chunks"),
+            Some(MetadataValue::Int(0))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC missing chunks"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC invalid chunks"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(!metadata.contains_key("VMS tile JPEG ICC profile"));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC profile applied"),
+            Some(MetadataValue::Bool(false))
+        ));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile);
+    }
+
+    #[test]
+    fn hamamatsu_vms_expands_grayscale_jpeg_tiles_to_rgb() {
+        let path = temp_path("gray_tile.vms");
+        let tile = temp_path("gray_tile.jpg");
+        write_gray_jpeg_pixels(&tile, 2, 1, &[40, 210]);
+        std::fs::write(
+            &path,
+            format!(
+                "NoLayers=1\nNoJpegColumns=1\nNoJpegRows=1\nImageFile={}\n",
+                tile.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        assert_eq!(reader.metadata().size_c, 3);
+        assert!(reader.metadata().is_rgb);
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("VMS tile JPEG color model"),
+            Some(MetadataValue::String(v)) if v == "grayscale"
+        ));
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("VMS tile JPEG color conversion"),
+            Some(MetadataValue::String(v)) if v == "grayscale expanded to rgb"
+        ));
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane.len(), 6);
+        assert_eq!(plane[0], plane[1]);
+        assert_eq!(plane[1], plane[2]);
+        assert_eq!(plane[3], plane[4]);
+        assert_eq!(plane[4], plane[5]);
+        assert!(plane[3] > plane[0], "{plane:?}");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile);
+    }
+
+    #[test]
+    fn hamamatsu_vms_converts_cmyk_jpeg_pixels_to_rgb() {
+        let rgb = super::hamamatsu_vms_cmyk_to_rgb(&[
+            0, 255, 255, 0, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 128,
+        ]);
+        assert_eq!(
+            rgb,
+            vec![
+                255, 0, 0, // cyan ink absent, magenta/yellow present
+                0, 255, 0, // magenta ink absent
+                0, 0, 255, // yellow ink absent
+                0, 0, 0, // black ink only
+            ]
+        );
+    }
+
+    #[test]
+    fn hamamatsu_vms_decodes_lower_resolution_pyramid_tiles() {
+        let path = temp_path("pyramid.vms");
+        let opt = temp_path("pyramid.opt");
+        let tile0 = temp_path("pyramid_full0.jpg");
+        let tile1 = temp_path("pyramid_full1.jpg");
+        let low = temp_path("pyramid_low.jpg");
+        write_rgb_jpeg_pixels(&tile0, 1, 2, &[240, 10, 20, 230, 20, 10]);
+        write_rgb_jpeg_pixels(&tile1, 1, 2, &[30, 220, 40, 20, 210, 30]);
+        write_rgb_jpeg(&low, [20, 30, 240]);
+        std::fs::write(
+            &opt,
+            format!(
+                concat!(
+                    "PyramidLevels=2\n",
+                    "PyramidLevel1NoJpegColumns=1\n",
+                    "PyramidLevel1NoJpegRows=1\n",
+                    "PyramidLevel1ImageFile={}\n"
+                ),
+                low.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=2\n",
+                    "NoJpegRows=1\n",
+                    "ImageFile={}\n",
+                    "ImageFile(1,0)={}\n",
+                    "OptimisationFile={}\n",
+                    "PhysicalWidth=4\n",
+                    "PhysicalHeight=2\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile1.file_name().unwrap().to_string_lossy(),
+                opt.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.resolution(), 0);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 1).unwrap().len(), 3);
+
+        reader.set_resolution(1).unwrap();
+        assert_eq!(reader.resolution(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        assert!(matches!(
+            reader.metadata().series_metadata.get("VMS resolution"),
+            Some(MetadataValue::Int(1))
+        ));
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane.len(), 3);
+        assert!(plane[2] > plane[0], "{plane:?}");
+        assert!(matches!(
+            reader.set_resolution(2),
+            Err(BioFormatsError::Format(ref message)) if message.contains("resolution 2 out of range")
+        ));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(opt);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(tile1);
+        let _ = std::fs::remove_file(low);
+    }
+
+    #[test]
+    fn hamamatsu_vms_infers_declared_pyramid_from_scaled_full_tiles() {
+        let path = temp_path("pyramid_inferred.vms");
+        let opt = temp_path("pyramid_inferred.opt");
+        let tile0 = temp_path("pyramid_inferred.jpg");
+        write_rgb_jpeg_pixels(
+            &tile0,
+            2,
+            2,
+            &[240, 10, 20, 230, 20, 10, 30, 220, 40, 20, 210, 30],
+        );
+        let expected_low = decode_scaled_jpeg(&tile0, 1, 1);
+        std::fs::write(&opt, b"PyramidLevels=2\n").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=1\n",
+                    "NoJpegRows=1\n",
+                    "ImageFile={}\n",
+                    "OptimisationFile={}\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                opt.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
+        reader.set_resolution(1).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), expected_low);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(opt);
+        let _ = std::fs::remove_file(tile0);
+    }
+
+    #[test]
+    fn hamamatsu_vms_does_not_expose_inexact_inferred_pyramid() {
+        let path = temp_path("pyramid_inexact.vms");
+        let opt = temp_path("pyramid_inexact.opt");
+        let tile0 = temp_path("pyramid_inexact.jpg");
+        write_rgb_jpeg_pixels(
+            &tile0,
+            3,
+            2,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+            ],
+        );
+        std::fs::write(&opt, b"PyramidLevels=2\n").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=1\n",
+                    "NoJpegRows=1\n",
+                    "ImageFile={}\n",
+                    "OptimisationFile={}\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                opt.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.resolution_count(), 1);
+        assert!(matches!(
+            reader.set_resolution(1),
+            Err(BioFormatsError::Format(ref message)) if message.contains("resolution 1 out of range")
+        ));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(opt);
+        let _ = std::fs::remove_file(tile0);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reports_missing_layer_tiles() {
+        let path = temp_path("missing_layer.vms");
+        let tile0 = temp_path("missing_layer_l0.jpg");
+        write_rgb_jpeg(&tile0, [1, 2, 3]);
+        std::fs::write(
+            &path,
+            format!(
+                "NoLayers=2\nNoJpegColumns=1\nNoJpegRows=1\nImageFile={}\n",
+                tile0.file_name().unwrap().to_string_lossy(),
+            ),
         )
         .unwrap();
 
         let mut reader = HamamatsuVmsReader::new();
         let err = reader.set_id(&path).unwrap_err();
         assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("native JPEG tile payload decoding is unsupported")),
+            matches!(
+                err,
+                BioFormatsError::UnsupportedFormat(ref message)
+                    if message.contains("missing layer 1 imagefile")
+            ),
             "{err:?}"
         );
-        assert_eq!(reader.series_count(), 0);
-        assert!(matches!(
-            reader.set_series(0),
-            Err(BioFormatsError::NotInitialized)
-        ));
 
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile0);
     }
 
     #[test]
@@ -3275,9 +5355,10 @@ fn yk_row_name(row: u32) -> String {
 /// type parsing reuses the Leica `<ImageDescription>` schema shared with LIF
 /// (`<Dimensions>`/`<DimensionDescription>` with `DimID` 1=X 2=Y 3=Z 4=T,
 /// 10=tile, plus `<Channels>`/`<ChannelDescription>`), mirroring
-/// `translateImageNodes`. The wider Leica LeicaMicrosystemsMetadata translation
-/// (instrument / detector / ROI / LUTs / BGR channel ordering) is intentionally
-/// not ported and is left as an honest gap.
+/// `translateImageNodes`. Direct channel attributes (names, wavelengths, LUT
+/// names) are projected as conservative metadata, but the wider Leica
+/// LeicaMicrosystemsMetadata translation (instrument / detector / ROI / BGR
+/// channel ordering) is intentionally not ported and is left as an honest gap.
 const LOF_MAGIC_BYTE: u32 = 0x70;
 const LOF_MEMORY_BYTE: u8 = 0x2a;
 const LOF_TYPE_NAME: &str = "LMS_Object_File";
@@ -3713,7 +5794,8 @@ impl FormatReader for LeicaLofReader {
         }
 
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(start)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(start))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         if bytes_to_skip == 0 {
             f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
@@ -3816,16 +5898,17 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
                 let mut attrs = HashMap::new();
                 for a in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
-                    let val = a.unescape_value().map(|v| v.to_string()).unwrap_or_default();
+                    let val = a
+                        .unescape_value()
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
                     attrs.insert(key, val);
                 }
                 nodes.push(LofNode { name, attrs });
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
-            Err(e) => {
-                return Err(BioFormatsError::Format(format!("LOF XML parse error: {e}")))
-            }
+            Err(e) => return Err(BioFormatsError::Format(format!("LOF XML parse error: {e}"))),
         }
     }
 
@@ -3965,6 +6048,14 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
     let rgb_channel_count = if is_rgb { size_c } else { 1 };
     let image_count = size_z * size_t * (size_c / rgb_channel_count.max(1)).max(1);
 
+    let mut series_metadata = HashMap::new();
+    for (channel_index, channel_node) in channel_nodes.iter().enumerate() {
+        lof_insert_channel_metadata(&mut series_metadata, channel_index, channel_node);
+    }
+
+    let effective_c = (size_c / rgb_channel_count.max(1)).max(1) as usize;
+    let channels = lof_ome_channels(&channel_nodes, effective_c, rgb_channel_count);
+
     let meta = ImageMetadata {
         size_x,
         size_y,
@@ -3980,7 +6071,7 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
         is_indexed: !is_rgb,
         is_little_endian: true,
         resolution_count: 1,
-        series_metadata: HashMap::new(),
+        series_metadata,
         lookup_table: None,
         modulo_z: None,
         modulo_c: None,
@@ -3991,6 +6082,7 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
         physical_size_x: physical_size_x.filter(|v| *v > 0.0),
         physical_size_y: physical_size_y.filter(|v| *v > 0.0),
         physical_size_z: physical_size_z.filter(|v| *v > 0.0),
+        channels,
         ..OmeImage::default()
     };
 
@@ -4000,6 +6092,104 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
         tile_count,
         tile_bytes_inc,
     })
+}
+
+fn lof_insert_channel_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    channel_index: usize,
+    channel_node: &LofNode,
+) {
+    let prefix = format!("lof.channel.{channel_index}");
+    for key in ["Name", "DyeName", "Dye", "LUTName"] {
+        if let Some(value) = lof_clean_attr(channel_node, key) {
+            metadata.insert(
+                format!("{prefix}.{}", lof_key_name(key)),
+                MetadataValue::String(value),
+            );
+        }
+    }
+    for key in [
+        "ExcitationWavelength",
+        "EmissionWavelength",
+        "Pinhole",
+        "PinholeAiry",
+        "PinholeSize",
+        "BytesInc",
+    ] {
+        if let Some(value) = lof_attr_f64(channel_node, key) {
+            metadata.insert(
+                format!("{prefix}.{}", lof_key_name(key)),
+                MetadataValue::Float(value),
+            );
+        }
+    }
+    if let Some(bits) = channel_node
+        .attrs
+        .get("Resolution")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
+        metadata.insert(format!("{prefix}.resolution"), MetadataValue::Int(bits));
+    }
+}
+
+fn lof_ome_channels(
+    channel_nodes: &[&LofNode],
+    effective_c: usize,
+    samples_per_pixel: u32,
+) -> Vec<OmeChannel> {
+    (0..effective_c)
+        .map(|channel_index| {
+            let node = channel_nodes.get(channel_index).copied();
+            OmeChannel {
+                name: node.and_then(lof_channel_name),
+                samples_per_pixel,
+                excitation_wavelength: node.and_then(|n| lof_attr_f64(n, "ExcitationWavelength")),
+                emission_wavelength: node.and_then(|n| lof_attr_f64(n, "EmissionWavelength")),
+                ..OmeChannel::default()
+            }
+        })
+        .collect()
+}
+
+fn lof_channel_name(node: &LofNode) -> Option<String> {
+    ["Name", "DyeName", "Dye"]
+        .into_iter()
+        .find_map(|key| lof_clean_attr(node, key))
+}
+
+fn lof_clean_attr(node: &LofNode, key: &str) -> Option<String> {
+    let trimmed = node.attrs.get(key)?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn lof_attr_f64(node: &LofNode, key: &str) -> Option<f64> {
+    let parsed = node.attrs.get(key)?.trim().parse::<f64>().ok()?;
+    parsed.is_finite().then_some(parsed)
+}
+
+fn lof_key_name(key: &str) -> String {
+    match key {
+        "DyeName" => return "dye_name".to_string(),
+        "LUTName" => return "lut_name".to_string(),
+        "ExcitationWavelength" => return "excitation_wavelength".to_string(),
+        "EmissionWavelength" => return "emission_wavelength".to_string(),
+        "PinholeAiry" => return "pinhole_airy".to_string(),
+        "PinholeSize" => return "pinhole_size".to_string(),
+        "BytesInc" => return "bytes_inc".to_string(),
+        _ => {}
+    }
+    let mut out = String::new();
+    for (i, ch) in key.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
 }
 
 /// Leica calibration: `length / (numElements - 1)`, normalised to µm
@@ -4806,7 +6996,10 @@ impl FormatReader for BurleighReader {
                 MetadataValue::Float(time_per_pixel),
             );
             series_metadata.insert("Sample volts".into(), MetadataValue::Float(sample_volts));
-            series_metadata.insert("Tunnel current".into(), MetadataValue::Float(tunnel_current));
+            series_metadata.insert(
+                "Tunnel current".into(),
+                MetadataValue::Float(tunnel_current),
+            );
             series_metadata.insert("Magnification".into(), MetadataValue::Int(mag as i64));
             Ok(())
         })();

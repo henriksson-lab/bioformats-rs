@@ -112,14 +112,11 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
         .map_err(|_| {
             BioFormatsError::UnsupportedFormat("TopoMetrix version field not ASCII".into())
         })?;
-    let version: i32 = version_str
-        .parse::<f64>()
-        .map(|v| v as i32)
-        .map_err(|_| {
-            BioFormatsError::UnsupportedFormat(format!(
-                "TopoMetrix invalid version field {version_str:?}"
-            ))
-        })?;
+    let version: i32 = version_str.parse::<f64>().map(|v| v as i32).map_err(|_| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "TopoMetrix invalid version field {version_str:?}"
+        ))
+    })?;
 
     // [8..12): pixelOffset as 4-byte ASCII parsed as long (Java L112).
     let pixel_offset_str = std::str::from_utf8(&content[8..12])
@@ -163,8 +160,8 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
             "TopoMetrix header truncated within comment region".into(),
         ));
     }
-    let comment = String::from_utf8_lossy(java_trim(&content[comment_start..comment_end]))
-        .into_owned();
+    let comment =
+        String::from_utf8_lossy(java_trim(&content[comment_start..comment_end])).into_owned();
     // After reading the comment, fp == 14 + 240 == 254.
     pos = comment_end;
 
@@ -213,18 +210,12 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
     }
 
     let mut series_metadata = HashMap::new();
-    series_metadata.insert(
-        "Version".to_string(),
-        MetadataValue::Int(version as i64),
-    );
+    series_metadata.insert("Version".to_string(), MetadataValue::Int(version as i64));
     if !comment.is_empty() {
         series_metadata.insert("Comment".to_string(), MetadataValue::String(comment));
     }
     if !date.is_empty() {
-        series_metadata.insert(
-            "Acquisition date".to_string(),
-            MetadataValue::String(date),
-        );
+        series_metadata.insert("Acquisition date".to_string(), MetadataValue::String(date));
     }
 
     let meta = ImageMetadata {

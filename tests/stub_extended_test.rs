@@ -6,7 +6,7 @@
 //! reader parses.
 
 use bioformats::formats::extended::{BurleighReader, LeicaLofReader, NafReader};
-use bioformats::FormatReader;
+use bioformats::{FormatReader, MetadataValue};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,7 +44,7 @@ fn burleigh_reads_version1_uint16_plane() {
     let mut bytes = vec![0x66, 0x66, 0x06, 0x40];
     bytes.extend_from_slice(&2i16.to_le_bytes()); // sizeX
     bytes.extend_from_slice(&2i16.to_le_bytes()); // sizeY
-    // 2x2 UINT16 plane at offset 8 (version 1).
+                                                  // 2x2 UINT16 plane at offset 8 (version 1).
     let plane: Vec<u8> = vec![1, 0, 2, 0, 3, 0, 4, 0];
     bytes.extend_from_slice(&plane);
 
@@ -57,10 +57,7 @@ fn burleigh_reads_version1_uint16_plane() {
     assert_eq!(meta.size_x, 2);
     assert_eq!(meta.size_y, 2);
     assert_eq!(meta.image_count, 1);
-    assert_eq!(
-        meta.pixel_type,
-        bioformats::PixelType::Uint16
-    );
+    assert_eq!(meta.pixel_type, bioformats::PixelType::Uint16);
 
     assert_eq!(reader.open_bytes(0).unwrap(), plane);
     // Column x=1 of the 2x2 plane (two UINT16 values: 2 and 4).
@@ -88,6 +85,10 @@ fn build_lof(width: u32, height: u32, channel_bytes_inc: u32, pixels: &[u8]) -> 
 </Dimensions>\
 </ImageDescription></Image>"
     );
+    build_lof_with_xml(&xml, pixels)
+}
+
+fn build_lof_with_xml(xml: &str, pixels: &[u8]) -> Vec<u8> {
     let xml_units = xml.encode_utf16().count() as i32;
 
     let mut b = Vec::new();
@@ -145,14 +146,64 @@ fn lof_reads_single_image() {
     assert_eq!(meta.size_x, 4);
     assert_eq!(meta.size_y, 1);
     assert_eq!(meta.image_count, 1);
-    assert_eq!(
-        meta.pixel_type,
-        bioformats::PixelType::Uint8
-    );
+    assert_eq!(meta.pixel_type, bioformats::PixelType::Uint8);
 
     assert_eq!(reader.open_bytes(0).unwrap(), pixels);
-    assert_eq!(reader.open_bytes_region(0, 1, 0, 2, 1).unwrap(), vec![20, 30]);
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 2, 1).unwrap(),
+        vec![20, 30]
+    );
     assert!(reader.open_bytes(1).is_err());
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn lof_projects_channel_names_lut_and_wavelength_metadata() {
+    let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let xml = "\
+<Image><ImageDescription>\
+<Channels>\
+<ChannelDescription Name=\"DAPI\" Resolution=\"8\" BytesInc=\"1\" ExcitationWavelength=\"405\" EmissionWavelength=\"460\" LUTName=\"Blue\"/>\
+<ChannelDescription DyeName=\"FITC\" Resolution=\"8\" BytesInc=\"1\" ExcitationWavelength=\"488\" EmissionWavelength=\"525\" LUTName=\"Green\"/>\
+</Channels>\
+<Dimensions>\
+<DimensionDescription DimID=\"1\" NumberOfElements=\"4\" BytesInc=\"1\"/>\
+<DimensionDescription DimID=\"2\" NumberOfElements=\"1\" BytesInc=\"4\"/>\
+</Dimensions>\
+</ImageDescription></Image>";
+    let bytes = build_lof_with_xml(xml, &pixels);
+    let path = temp_path("channel_metadata.lof");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut reader = LeicaLofReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.image_count, 2);
+    assert!(matches!(
+        meta.series_metadata.get("lof.channel.0.name"),
+        Some(MetadataValue::String(value)) if value == "DAPI"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("lof.channel.1.dye_name"),
+        Some(MetadataValue::String(value)) if value == "FITC"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("lof.channel.1.lut_name"),
+        Some(MetadataValue::String(value)) if value == "Green"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("lof.channel.0.excitation_wavelength"),
+        Some(MetadataValue::Float(value)) if (*value - 405.0).abs() < f64::EPSILON
+    ));
+
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(ome.images[0].channels.len(), 2);
+    assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+    assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("FITC"));
+    assert_eq!(ome.images[0].channels[0].excitation_wavelength, Some(405.0));
+    assert_eq!(ome.images[0].channels[1].emission_wavelength, Some(525.0));
 
     let _ = std::fs::remove_file(path);
 }

@@ -491,7 +491,11 @@ fn build_expected_region(js: &Json, pt: PixelType, plane: u32, smooth: bool) -> 
         for y in 0..h {
             for x in 0..w {
                 for s in 0..channels {
-                    buf.extend_from_slice(&encode_sample(pt, model_value(smooth, x, y, plane, s), le));
+                    buf.extend_from_slice(&encode_sample(
+                        pt,
+                        model_value(smooth, x, y, plane, s),
+                        le,
+                    ));
                 }
             }
         }
@@ -499,7 +503,11 @@ fn build_expected_region(js: &Json, pt: PixelType, plane: u32, smooth: bool) -> 
         for s in 0..channels {
             for y in 0..h {
                 for x in 0..w {
-                    buf.extend_from_slice(&encode_sample(pt, model_value(smooth, x, y, plane, s), le));
+                    buf.extend_from_slice(&encode_sample(
+                        pt,
+                        model_value(smooth, x, y, plane, s),
+                        le,
+                    ));
                 }
             }
         }
@@ -794,7 +802,11 @@ fn verify_case(cp: &str, case: &Case) -> (Vec<String>, Vec<String>, Vec<String>)
         return finish(case, fails, info);
     }
 
-    let js = match j.get("series").and_then(Json::as_array).and_then(|a| a.first()) {
+    let js = match j
+        .get("series")
+        .and_then(Json::as_array)
+        .and_then(|a| a.first())
+    {
         Some(s) => s,
         None => {
             fails.push(format!("{}: oracle returned no series", case.label));
@@ -807,10 +819,20 @@ fn verify_case(cp: &str, case: &Case) -> (Vec<String>, Vec<String>, Vec<String>)
 
     // --- always-hard core checks ---
     if js.u("sizeX") != m.size_x as u64 {
-        fails.push(format!("{}: sizeX java={} rust={}", case.label, js.u("sizeX"), m.size_x));
+        fails.push(format!(
+            "{}: sizeX java={} rust={}",
+            case.label,
+            js.u("sizeX"),
+            m.size_x
+        ));
     }
     if js.u("sizeY") != m.size_y as u64 {
-        fails.push(format!("{}: sizeY java={} rust={}", case.label, js.u("sizeY"), m.size_y));
+        fails.push(format!(
+            "{}: sizeY java={} rust={}",
+            case.label,
+            js.u("sizeY"),
+            m.size_y
+        ));
     }
     if js.u("imageCount") != m.image_count as u64 {
         fails.push(format!(
@@ -892,10 +914,12 @@ fn verify_case(cp: &str, case: &Case) -> (Vec<String>, Vec<String>, Vec<String>)
                     let detail = if let Some(b64) = pj["b64"].as_str() {
                         let jb = b64_decode(b64);
                         if jb.len() == expected.len() {
-                            let (maxd, ndiff) = jb.iter().zip(&expected).fold(
-                                (0u8, 0usize),
-                                |(mx, n), (a, b)| (mx.max(a.abs_diff(*b)), n + (a != b) as usize),
-                            );
+                            let (maxd, ndiff) = jb
+                                .iter()
+                                .zip(&expected)
+                                .fold((0u8, 0usize), |(mx, n), (a, b)| {
+                                    (mx.max(a.abs_diff(*b)), n + (a != b) as usize)
+                                });
                             format!("maxdiff={maxd} over {ndiff}/{} bytes", expected.len())
                         } else {
                             format!("len java={} ours={}", jb.len(), expected.len())
@@ -913,7 +937,11 @@ fn verify_case(cp: &str, case: &Case) -> (Vec<String>, Vec<String>, Vec<String>)
                 };
                 let jb = b64_decode(b64);
                 if jb.len() != expected.len() {
-                    worst = Some(format!("plane{p}: len java={} ours={}", jb.len(), expected.len()));
+                    worst = Some(format!(
+                        "plane{p}: len java={} ours={}",
+                        jb.len(),
+                        expected.len()
+                    ));
                     continue;
                 }
                 let (sum, maxd) = jb

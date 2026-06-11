@@ -149,7 +149,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::tiff_wrappers::ZeissApotomeTiffReader::new()),
         Box::new(crate::formats::tiff_wrappers::FluoviewTiffReader::new()),
         Box::new(crate::formats::tiff_wrappers::MolecularDevicesTiffReader::new()),
-        // Misc extension-only / placeholder formats
+        // Misc readers: partial native ports plus explicit unsupported detectors
         Box::new(crate::formats::misc::Jpeg2000Reader::new()), // magic-byte detection
         Box::new(crate::formats::misc::QuickTimeReader::new()),
         Box::new(crate::formats::misc::MngReader::new()),
@@ -165,7 +165,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::extended::ImspectorReader::new()), // magic "OMAS_BF_"
         Box::new(crate::formats::extended::HamamatsuVmsReader::new()),
         Box::new(crate::formats::extended::CellomicsReader::new()),
-        // Extended formats — extension-only placeholders
+        // Extended formats — real native readers plus explicit unsupported detectors
         Box::new(crate::formats::extended::MrwReader::new()),
         Box::new(crate::formats::extended::YokogawaReader::new()),
         Box::new(crate::formats::extended::LeicaLofReader::new()),
@@ -242,11 +242,9 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::misc4::PdsReader::new()),
         Box::new(crate::formats::misc4::HisReader::new()),
         Box::new(crate::formats::misc4::HrdgdfReader::new()),
-        Box::new(crate::formats::misc4::TextImageReader::new()),
         Box::new(crate::formats::misc4::FilePatternReaderStub::new()),
         Box::new(crate::formats::misc4::KlbReader::new()),
         Box::new(crate::formats::misc4::ObfReader::new()),
-        Box::new(crate::formats::misc::TextReader::new()),
         // OME-Zarr / OME-NGFF (directory-based; detected by `.zarr` path or a
         // Zarr group marker). Handled explicitly in `open_reader` before
         // `peek_header`, which cannot read a directory.

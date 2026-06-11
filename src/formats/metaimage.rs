@@ -297,13 +297,21 @@ impl MetaImageReader {
         // packed file all planes share one file; for per-slice layouts each
         // file holds exactly one plane.
         let (data_path, base_offset, planes_in_file, plane_in_file) = match &hdr.layout {
-            Some(DataLayout::Local) => {
-                (mhd_path.clone(), hdr.data_offset, meta.image_count, plane_index)
-            }
+            Some(DataLayout::Local) => (
+                mhd_path.clone(),
+                hdr.data_offset,
+                meta.image_count,
+                plane_index,
+            ),
             Some(DataLayout::Single(s)) => (resolve(s)?, 0, meta.image_count, plane_index),
             None => {
                 // Default: sibling .raw file, all planes packed.
-                (mhd_path.with_extension("raw"), 0, meta.image_count, plane_index)
+                (
+                    mhd_path.with_extension("raw"),
+                    0,
+                    meta.image_count,
+                    plane_index,
+                )
             }
             Some(DataLayout::PerSlice(files)) => {
                 let f = files.get(plane_index as usize).ok_or_else(|| {

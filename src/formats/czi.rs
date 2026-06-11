@@ -1100,7 +1100,10 @@ fn channel_blocks(scope: &str) -> Vec<&str> {
         // Skip "<Channels" (the wrapper, though we already stripped it) and any
         // longer element name; require the next char to be space or '>'.
         let after = channels[start + "<Channel".len()..].chars().next();
-        if !matches!(after, Some(' ') | Some('>') | Some('\t') | Some('\r') | Some('\n')) {
+        if !matches!(
+            after,
+            Some(' ') | Some('>') | Some('\t') | Some('\r') | Some('\n')
+        ) {
             pos = start + "<Channel".len();
             continue;
         }
@@ -1695,7 +1698,8 @@ impl CziReader {
         // metadata. When dim_count is large (dir_entry_len > 240) the padding skip
         // is 0, so pixel data starts immediately after metadata (no fixed 256).
         let skip = 20 * dim_count + (256 - 16 - dir_entry_len).max(0) + metadata_size as i64;
-        f.seek(SeekFrom::Current(skip)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Current(skip))
+            .map_err(BioFormatsError::Io)?;
 
         let mut compressed = vec![0u8; data_size as usize];
         f.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;
@@ -2017,8 +2021,7 @@ impl FormatReader for CziReader {
         if self.meta_xml.is_empty() {
             return None;
         }
-        let mut ome =
-            crate::common::ome_metadata::OmeMetadata::from_czi_xml(&self.meta_xml);
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_czi_xml(&self.meta_xml);
         // Override channel enumeration to match ZeissCZIReader: the channel
         // count and wavelengths come from Information/Image/Dimensions/Channels,
         // names from DisplaySetting/Channels (the generic XML scan over-counts

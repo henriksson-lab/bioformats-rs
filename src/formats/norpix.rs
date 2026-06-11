@@ -88,6 +88,8 @@ pub struct NorpixReader {
     /// Per-frame absolute byte offsets of the image payload (excludes the
     /// trailing 8/10-byte timestamp). Empty for the uncompressed fast path.
     frame_offsets: Vec<u64>,
+    /// Per-frame compressed payload lengths. Empty for uncompressed data.
+    frame_lengths: Vec<usize>,
     /// Per-frame timestamps in seconds since the Unix epoch.
     timestamps: Vec<f64>,
 }
@@ -100,6 +102,7 @@ impl NorpixReader {
             frame_size: 0,
             compressed: false,
             frame_offsets: Vec::new(),
+            frame_lengths: Vec::new(),
             timestamps: Vec::new(),
         }
     }
@@ -138,9 +141,16 @@ impl FormatReader for NorpixReader {
         let desc_fmt = r_u32_le(&hdr, 592);
         let width = positive_u32_seq_dim(r_u32_le(&hdr, 596), "width")?;
         let height = positive_u32_seq_dim(r_u32_le(&hdr, 600), "height")?;
+        let header_size = r_i32_le(&hdr, 32);
+        let compression = r_u32_le(&hdr, 612);
         // StreamPix description-format codes: 0=mono8, 1=mono16, 2=BGR24,
         // 100=JPEG mono8, 101=mono16 (uncompressed), 102=JPEG BGR24.
         let compressed = matches!(desc_fmt, 100 | 102);
+        if !compressed && compression != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Norpix SEQ unsupported compression code {compression} for description format {desc_fmt}"
+            )));
+        }
 
         let (pixel_type, bpp, channels): (PixelType, u8, u32) = match desc_fmt {
             0 | 100 => (PixelType::Uint8, 8, 1), // mono 8-bit (raw / JPEG)
@@ -175,19 +185,34 @@ impl FormatReader for NorpixReader {
         // a 4-byte little-endian size followed by the JPEG codestream.
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
         let mut frame_offsets = Vec::with_capacity(n_frames as usize);
+        let mut frame_lengths = Vec::with_capacity(n_frames as usize);
         let mut timestamps = Vec::with_capacity(n_frames as usize);
         if compressed {
             let mut pos = 1024u64;
-            for _ in 0..n_frames {
+            for i in 0..n_frames {
                 if pos + 4 > file_len {
-                    break;
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Norpix SEQ compressed frame {i} is missing its size prefix"
+                    )));
                 }
                 f.seek(SeekFrom::Start(pos)).map_err(BioFormatsError::Io)?;
                 let mut size_buf = [0u8; 4];
                 f.read_exact(&mut size_buf).map_err(BioFormatsError::Io)?;
                 let jpeg_size = u32::from_le_bytes(size_buf) as u64;
+                if jpeg_size == 0 {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Norpix SEQ compressed frame {i} has zero JPEG payload length"
+                    )));
+                }
                 let img_off = pos + 4;
+                if img_off + jpeg_size > file_len {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Norpix SEQ compressed frame {i} payload is shorter than declared: need {} bytes, found {file_len}",
+                        img_off + jpeg_size
+                    )));
+                }
                 frame_offsets.push(img_off);
+                frame_lengths.push(jpeg_size as usize);
                 // Timestamp follows the JPEG payload.
                 let ts = read_seq_timestamp(&mut f, img_off + jpeg_size, file_len);
                 timestamps.push(ts);
@@ -227,6 +252,51 @@ impl FormatReader for NorpixReader {
             "format".into(),
             MetadataValue::String("Norpix StreamPix SEQ".into()),
         );
+        if !printable_ascii(&hdr[..24]).is_empty() {
+            meta_map.insert(
+                "norpix.description".into(),
+                MetadataValue::String(printable_ascii(&hdr[..24])),
+            );
+        }
+        meta_map.insert(
+            "norpix.version".into(),
+            MetadataValue::Int(i64::from_le_bytes([
+                hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31],
+            ])),
+        );
+        meta_map.insert(
+            "norpix.header_size".into(),
+            MetadataValue::Int(header_size as i64),
+        );
+        meta_map.insert(
+            "norpix.allocated_frames".into(),
+            MetadataValue::Int(n_frames as i64),
+        );
+        meta_map.insert(
+            "norpix.true_image_size".into(),
+            MetadataValue::Int(true_image_size as i64),
+        );
+        meta_map.insert(
+            "norpix.description_format".into(),
+            MetadataValue::Int(desc_fmt as i64),
+        );
+        meta_map.insert(
+            "norpix.compression".into(),
+            MetadataValue::Int(compression as i64),
+        );
+        meta_map.insert("norpix.compressed".into(), MetadataValue::Bool(compressed));
+        if timestamps.iter().any(|&t| t != 0.0) {
+            meta_map.insert(
+                "norpix.timestamps_unix_seconds".into(),
+                MetadataValue::String(
+                    timestamps
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            );
+        }
 
         self.meta = Some(ImageMetadata {
             size_x: width,
@@ -252,6 +322,7 @@ impl FormatReader for NorpixReader {
         self.frame_size = frame_size;
         self.compressed = compressed;
         self.frame_offsets = frame_offsets;
+        self.frame_lengths = frame_lengths;
         self.timestamps = timestamps;
         self.path = Some(path.to_path_buf());
         Ok(())
@@ -262,6 +333,7 @@ impl FormatReader for NorpixReader {
         self.meta = None;
         self.compressed = false;
         self.frame_offsets.clear();
+        self.frame_lengths.clear();
         self.timestamps.clear();
         Ok(())
     }
@@ -298,20 +370,15 @@ impl FormatReader for NorpixReader {
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
 
         if self.compressed {
-            // Decode the JPEG frame at the recorded offset. The next frame's
-            // offset (minus the 4-byte size prefix) bounds the payload; for the
-            // last frame, read to EOF.
+            // Decode exactly the length declared by the frame's size prefix.
             let start = *self
                 .frame_offsets
                 .get(plane_index as usize)
                 .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
-            let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
-            let end = self
-                .frame_offsets
-                .get(plane_index as usize + 1)
-                .map(|next| next.saturating_sub(4))
-                .unwrap_or(file_len);
-            let len = end.saturating_sub(start) as usize;
+            let len = *self
+                .frame_lengths
+                .get(plane_index as usize)
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
             f.seek(SeekFrom::Start(start))
                 .map_err(BioFormatsError::Io)?;
             let mut jpeg = vec![0u8; len];
@@ -365,6 +432,7 @@ impl FormatReader for NorpixReader {
         use crate::common::ome_metadata::{OmeMetadata, OmePlane};
         let meta = self.meta.as_ref()?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
+        let _ = ome.add_original_metadata_annotations(meta, 0);
         if !self.timestamps.is_empty() {
             // Expose per-frame DeltaT relative to the first frame's timestamp.
             let base = self.timestamps[0];

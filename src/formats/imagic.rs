@@ -22,6 +22,7 @@ use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
 const HDR_RECORD_BYTES: usize = 1024;
+const IMAGE_NAME_OFFSET: u64 = 116;
 
 fn r_i32_le(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
@@ -57,6 +58,7 @@ pub struct ImagicReader {
     hed_path: Option<PathBuf>,
     img_path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    image_name: Option<String>,
     bytes_per_sample: usize,
 }
 
@@ -66,6 +68,7 @@ impl ImagicReader {
             hed_path: None,
             img_path: None,
             meta: None,
+            image_name: None,
             bytes_per_sample: 4,
         }
     }
@@ -131,6 +134,18 @@ impl FormatReader for ImagicReader {
             .unwrap_or("")
             .trim_end_matches(char::from(0))
             .to_string();
+        let last_name = if num_images > 0 {
+            let last_record = (num_images - 1) * HDR_RECORD_BYTES as u64;
+            f.seek(SeekFrom::Start(last_record + IMAGE_NAME_OFFSET))
+                .map_err(BioFormatsError::Io)?;
+            let mut name = [0u8; 80];
+            f.read_exact(&mut name).map_err(BioFormatsError::Io)?;
+            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            let trimmed = String::from_utf8_lossy(&name[..end]).trim().to_string();
+            Some(trimmed)
+        } else {
+            None
+        };
 
         let (pixel_type, bpp) = imagic_pixel_type(&type_str)?;
         let plane_bytes = (size_x as u64)
@@ -179,6 +194,7 @@ impl FormatReader for ImagicReader {
         self.bytes_per_sample = pixel_type.bytes_per_sample();
         self.hed_path = Some(hed_path);
         self.img_path = Some(img_path);
+        self.image_name = last_name;
         Ok(())
     }
 
@@ -186,6 +202,7 @@ impl FormatReader for ImagicReader {
         self.hed_path = None;
         self.img_path = None;
         self.meta = None;
+        self.image_name = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -247,5 +264,14 @@ impl FormatReader for ImagicReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(img) = ome.images.first_mut() {
+            img.name = self.image_name.clone();
+        }
+        Some(ome)
     }
 }

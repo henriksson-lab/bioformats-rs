@@ -500,7 +500,12 @@ impl NdpiReader {
             .inner
             .series_list()
             .iter()
-            .map(|s| (s.ifd_indices.first().copied().unwrap_or(0), s.metadata.size_c.max(1)))
+            .map(|s| {
+                (
+                    s.ifd_indices.first().copied().unwrap_or(0),
+                    s.metadata.size_c.max(1),
+                )
+            })
             .collect();
         for (i, (ifd_idx, channels)) in series.into_iter().enumerate() {
             let (px, py) = self
@@ -539,20 +544,14 @@ impl NdpiReader {
     /// Build per-series `ImageMetadata` from an IFD, mirroring Java's
     /// per-CoreMetadata population (`NDPIReader.java:582-660`). `size_z` is the
     /// focal-plane count for the pyramid series (1 for extras).
-    fn ndpi_plane_meta(
-        &self,
-        ifd_index: usize,
-        little_endian: bool,
-        size_z: u32,
-    ) -> ImageMetadata {
+    fn ndpi_plane_meta(&self, ifd_index: usize, little_endian: bool, size_z: u32) -> ImageMetadata {
         let mut meta = ImageMetadata::default();
         if let Some(ifd) = self.inner.ifd(ifd_index) {
             let spp = ifd.samples_per_pixel();
             // Java clamps bits-per-sample up to 8 (NDPIReader.java:558-564).
             let bps = ifd.bits_per_sample().first().copied().unwrap_or(8).max(8);
             let photometric = ifd.photometric();
-            let is_rgb =
-                spp > 1 || matches!(photometric, crate::tiff::ifd::Photometric::Rgb);
+            let is_rgb = spp > 1 || matches!(photometric, crate::tiff::ifd::Photometric::Rgb);
             meta.size_x = ifd.image_width().unwrap_or(0);
             meta.size_y = ifd.image_length().unwrap_or(0);
             meta.size_c = if is_rgb { spp as u32 } else { 1 };
@@ -562,8 +561,7 @@ impl NdpiReader {
                 .get_u16(crate::tiff::ifd::tag::SAMPLE_FORMAT)
                 .unwrap_or(1);
             meta.pixel_type = tiff_pixel_type(bps, sample_format);
-            meta.is_indexed =
-                matches!(photometric, crate::tiff::ifd::Photometric::Palette);
+            meta.is_indexed = matches!(photometric, crate::tiff::ifd::Photometric::Palette);
         }
         meta.size_z = size_z.max(1);
         meta.size_t = 1;
@@ -586,8 +584,10 @@ impl NdpiReader {
 
         if let Some(v) = ifd.get(NDPI_SOURCE_LENS) {
             if let Some(mag) = v.as_vec_f32().and_then(|s| s.first().copied()) {
-                meta.series_metadata
-                    .insert("ndpi.magnification".into(), MetadataValue::Float(mag as f64));
+                meta.series_metadata.insert(
+                    "ndpi.magnification".into(),
+                    MetadataValue::Float(mag as f64),
+                );
             }
         }
         if let Some(v) = ifd.get(NDPI_X_POSITION) {
@@ -701,7 +701,6 @@ impl NdpiReader {
         }
     }
 }
-
 
 /// Outcome of applying NDPI >4 GB offset correction to one IFD.
 enum NdpiOffsetFix {
@@ -3230,5 +3229,4 @@ mod ndpi_offset64_tests {
         // Offset left untouched (low 32 bits only).
         assert_eq!(ifd.get(tag::STRIP_OFFSETS).unwrap().as_vec_u64(), vec![100]);
     }
-
 }

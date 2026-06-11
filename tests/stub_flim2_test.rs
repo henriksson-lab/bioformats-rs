@@ -66,7 +66,9 @@ fn oir_opens_sample_with_correct_dimensions_and_reads_plane0() {
 
     // All declared planes should be readable.
     for p in 0..meta.image_count {
-        let bytes = reader.open_bytes(p).unwrap_or_else(|e| panic!("plane {p}: {e:?}"));
+        let bytes = reader
+            .open_bytes(p)
+            .unwrap_or_else(|e| panic!("plane {p}: {e:?}"));
         assert_eq!(bytes.len(), 1024 * 1024 * 2);
     }
 

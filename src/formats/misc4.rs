@@ -12,6 +12,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::stitcher::{FilePattern, FileStitcher};
 
 fn checked_plane_len(meta: &ImageMetadata) -> Result<usize> {
     let bytes_per_pixel = (meta.bits_per_pixel as usize)
@@ -377,7 +378,10 @@ impl AplReader {
 
     /// Parse an integer dimension; Java falls back to 1 on parse failure.
     fn parse_dimension(s: &str) -> u32 {
-        s.trim().parse::<i64>().map(|v| v.max(0) as u32).unwrap_or(1)
+        s.trim()
+            .parse::<i64>()
+            .map(|v| v.max(0) as u32)
+            .unwrap_or(1)
     }
 
     fn cell<'a>(row: &'a [String], idx: Option<usize>) -> &'a str {
@@ -385,7 +389,11 @@ impl AplReader {
     }
 
     /// Port of Java `parseFilename`.
-    fn parse_filename(row: &[String], filename_idx: Option<usize>, path_idx: Option<usize>) -> String {
+    fn parse_filename(
+        row: &[String],
+        filename_idx: Option<usize>,
+        path_idx: Option<usize>,
+    ) -> String {
         let file = Self::cell(row, filename_idx);
         if Self::check_suffix(file, "tif") {
             return file.to_string();
@@ -431,21 +439,23 @@ impl FormatReader for AplReader {
         // -- locate the corresponding .mtb file --
         let mtb_path: PathBuf = if Self::check_suffix(&id, "mtb") {
             path.to_path_buf()
-        } else if Self::check_suffix(&id, "apl")
-            || Self::check_suffix(&id, "tnb")
-        {
+        } else if Self::check_suffix(&id, "apl") || Self::check_suffix(&id, "tnb") {
             let separator = id.rfind('/').map(|i| i as i64).unwrap_or(0);
             let mut underscore = id.rfind('_').map(|i| i as i64).unwrap_or(-1);
             if underscore < separator || Self::check_suffix(&id, "apl") {
                 underscore = id.rfind('.').map(|i| i as i64).unwrap_or(-1);
             }
             if underscore < 0 {
-                return Err(BioFormatsError::Format("APL: .mtb file not found".to_string()));
+                return Err(BioFormatsError::Format(
+                    "APL: .mtb file not found".to_string(),
+                ));
             }
             let mtb = format!("{}_d.mtb", &id[..underscore as usize]);
             let mtb_pb = PathBuf::from(&mtb);
             if !mtb_pb.exists() {
-                return Err(BioFormatsError::Format("APL: .mtb file not found".to_string()));
+                return Err(BioFormatsError::Format(
+                    "APL: .mtb file not found".to_string(),
+                ));
             }
             mtb_pb
         } else {
@@ -477,8 +487,8 @@ impl FormatReader for AplReader {
 
         let color_channels = Self::index_of(columns, "Color Channels");
         let frames = Self::index_of(columns, "Frames");
-        let path_idx = Self::index_of(columns, "Image Path")
-            .or_else(|| Self::index_of(columns, "Path"));
+        let path_idx =
+            Self::index_of(columns, "Image Path").or_else(|| Self::index_of(columns, "Path"));
         let filename_idx = Self::index_of(columns, "File Name");
         let image_type = Self::index_of(columns, "Image Type");
         let z_layers = Self::index_of(columns, "Z-Layers");
@@ -503,7 +513,11 @@ impl FormatReader for AplReader {
 
         let mut top_directory: Option<PathBuf> = None;
         for component in path_name.split('/').rev() {
-            if component.find("_DocumentFiles").map(|i| i > 0).unwrap_or(false) {
+            if component
+                .find("_DocumentFiles")
+                .map(|i| i > 0)
+                .unwrap_or(false)
+            {
                 let candidate = parent_directory.join(component);
                 if candidate.exists() {
                     top_directory = Some(candidate);
@@ -1140,7 +1154,8 @@ impl FormatReader for I2iReader {
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
         if offset + plane_size as u64 <= file_len {
-            f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+            f.seek(SeekFrom::Start(offset))
+                .map_err(BioFormatsError::Io)?;
             f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         }
         Ok(buf)
@@ -1220,9 +1235,8 @@ impl JdceReader {
     }
 
     fn json_obj<'a>(v: &'a serde_json::Value, key: &str) -> Result<&'a serde_json::Value> {
-        v.get(key).ok_or_else(|| {
-            BioFormatsError::Format(format!("JDCE: missing JSON element \"{key}\""))
-        })
+        v.get(key)
+            .ok_or_else(|| BioFormatsError::Format(format!("JDCE: missing JSON element \"{key}\"")))
     }
 }
 
@@ -1564,7 +1578,10 @@ impl FormatReader for JdceReader {
         }
         let bpp = series.meta.pixel_type.bytes_per_sample();
         let fill_len = (w as usize) * (h as usize) * bpp;
-        let file = series.files.get(plane_index as usize).and_then(|f| f.clone());
+        let file = series
+            .files
+            .get(plane_index as usize)
+            .and_then(|f| f.clone());
         if let Some(file) = file {
             let mut tiff = crate::tiff::TiffReader::new();
             if tiff.set_id(Path::new(&file)).is_ok() {
@@ -2334,25 +2351,20 @@ impl FormatReader for PdsReader {
                     }
                 }
                 "FILE REC LEN" => {
-                    record_width = value
-                        .parse::<u32>()
-                        .map_err(|_| {
-                            BioFormatsError::Format(
-                                "PDS FILE REC LEN is not a valid integer".to_string(),
-                            )
-                        })?
-                        / 2;
+                    record_width = value.parse::<u32>().map_err(|_| {
+                        BioFormatsError::Format(
+                            "PDS FILE REC LEN is not a valid integer".to_string(),
+                        )
+                    })? / 2;
                 }
                 _ => {}
             }
         }
 
-        let size_x = size_x.ok_or_else(|| {
-            BioFormatsError::Format("PDS header missing NXP keyword".to_string())
-        })?;
-        let size_y = size_y.ok_or_else(|| {
-            BioFormatsError::Format("PDS header missing NYP keyword".to_string())
-        })?;
+        let size_x = size_x
+            .ok_or_else(|| BioFormatsError::Format("PDS header missing NXP keyword".to_string()))?;
+        let size_y = size_y
+            .ok_or_else(|| BioFormatsError::Format("PDS header missing NYP keyword".to_string()))?;
         if size_x == 0 || size_y == 0 {
             return Err(BioFormatsError::Format(
                 "PDS NXP/NYP must be non-zero".to_string(),
@@ -2504,25 +2516,17 @@ impl FormatReader for PdsReader {
         let data = std::fs::read(pixels_file).map_err(BioFormatsError::Io)?;
 
         let bpp = 2usize; // UINT16
-        // Java: pad = recordWidth - (sizeX % recordWidth)
+                          // Java: pad = recordWidth - (sizeX % recordWidth)
         let pad = self.record_width - (size_x % self.record_width);
         let scanline = (size_x + pad) as usize; // samples per on-disk row
-        // On-disk size (in samples) of one full padded channel plane.
+                                                // On-disk size (in samples) of one full padded channel plane.
         let channel_plane = scanline
             .checked_mul(size_y as usize)
             .ok_or_else(|| BioFormatsError::Format("PDS plane is too large".to_string()))?;
 
         // Java: realX/realY flip the read origin when mirroring is requested.
-        let real_x = if self.reverse_x {
-            size_x - w - x
-        } else {
-            x
-        };
-        let real_y = if self.reverse_y {
-            size_y - h - y
-        } else {
-            y
-        };
+        let real_x = if self.reverse_x { size_x - w - x } else { x };
+        let real_y = if self.reverse_y { size_y - h - y } else { y };
 
         // Output buffer: planar, tightly packed (w*h per channel), w*bpp stride.
         let out_channel_bytes = (w as usize)
@@ -3046,11 +3050,7 @@ impl FormatReader for HrdgdfReader {
         }
 
         // Header lines (metadata only; not required to build the image).
-        let hurricane = data[0]
-            .rsplit(' ')
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let hurricane = data[0].rsplit(' ').next().unwrap_or("").to_string();
 
         // Skip ahead to the surface wind section.
         let mut line_number = 3usize;
@@ -3109,10 +3109,7 @@ impl FormatReader for HrdgdfReader {
         }
 
         let mut series_metadata = HashMap::new();
-        series_metadata.insert(
-            "Hurricane".to_string(),
-            MetadataValue::String(hurricane),
-        );
+        series_metadata.insert("Hurricane".to_string(), MetadataValue::String(hurricane));
 
         self.surface_wind = surface_wind;
         self.meta = Some(ImageMetadata {
@@ -3212,207 +3209,21 @@ impl FormatReader for HrdgdfReader {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Text/CSV image format
-// ---------------------------------------------------------------------------
-/// Text/CSV image reader (`.csv`).
-///
-/// Reads a CSV/TSV text file where each row is a line and columns are separated
-/// by commas, tabs, or spaces. Each cell is parsed as f64, then stored as Float32
-/// pixel data.
-pub struct TextImageReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    pixel_data: Vec<u8>,
-}
-
-impl TextImageReader {
-    pub fn new() -> Self {
-        TextImageReader {
-            path: None,
-            meta: None,
-            pixel_data: Vec::new(),
-        }
-    }
-}
-
-impl Default for TextImageReader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FormatReader for TextImageReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("csv"))
-    }
-
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
-    }
-
-    fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.pixel_data.clear();
-
-        let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-        let mut rows: Vec<Vec<f32>> = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut cells: Vec<f32> = Vec::new();
-            for cell in line
-                .split(|c: char| c == ',' || c == '\t' || c == ' ')
-                .filter(|s| !s.is_empty())
-            {
-                let value = cell.trim().parse::<f64>().map_err(|_| {
-                    BioFormatsError::UnsupportedFormat(format!(
-                        "TextImageReader: non-numeric cell {cell:?}"
-                    ))
-                })?;
-                cells.push(value as f32);
-            }
-            if !cells.is_empty() {
-                rows.push(cells);
-            }
-        }
-        if rows.is_empty() {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "TextImageReader: file contains no numeric data".to_string(),
-            ));
-        }
-        let height = u32::try_from(rows.len())
-            .map_err(|_| BioFormatsError::Format("TextImageReader: too many rows".to_string()))?;
-        let width = rows[0].len();
-        if rows.iter().any(|row| row.len() != width) {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "TextImageReader: rows have inconsistent column counts".to_string(),
-            ));
-        }
-        let width = u32::try_from(width).map_err(|_| {
-            BioFormatsError::Format("TextImageReader: too many columns".to_string())
-        })?;
-        // Build Float32 pixel buffer (row-major).
-        let pixel_bytes = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|px| px.checked_mul(4))
-            .ok_or_else(|| {
-                BioFormatsError::Format("TextImageReader: pixel buffer is too large".to_string())
-            })?;
-        let mut pixel_data = Vec::with_capacity(pixel_bytes);
-        for row in &rows {
-            for &val in row {
-                pixel_data.extend_from_slice(&val.to_le_bytes());
-            }
-        }
-        self.path = Some(path.to_path_buf());
-        self.pixel_data = pixel_data;
-        self.meta = Some(ImageMetadata {
-            size_x: width,
-            size_y: height,
-            size_z: 1,
-            size_c: 1,
-            size_t: 1,
-            pixel_type: PixelType::Float32,
-            bits_per_pixel: 32,
-            image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata: HashMap::new(),
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
-        Ok(())
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.pixel_data.clear();
-        Ok(())
-    }
-
-    fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
-    }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
-            Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
-            Ok(())
-        } else {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        }
-    }
-
-    fn series(&self) -> usize {
-        0
-    }
-
-    fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
-            .unwrap_or(crate::common::reader::uninitialized_metadata())
-    }
-
-    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        Ok(self.pixel_data.clone())
-    }
-
-    fn open_bytes_region(
-        &mut self,
-        plane_index: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-    ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        crop_plane(&self.pixel_data, meta, x, y, w, h)
-    }
-
-    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 11. FilePatternReader - reads file patterns
+// 10. FilePatternReader - reads file patterns
 // ---------------------------------------------------------------------------
 /// File pattern reader (`.pattern`).
 ///
 /// Pattern files describe a set of files to combine into a multi-dimensional
-/// dataset. Native glob/regex expansion is unsupported; explicit synthetic raw
-/// pattern fixtures are supported.
+/// dataset. A bounded Java-style subset of `<...>`, `[...]`, and `{...}`
+/// blocks is supported: comma-separated values and ranges with optional
+/// positive steps, including nested blocks inside brace/class alternatives.
+/// Simple `*` and `?` path-component globs plus bounded recursive `**`
+/// directory globs are expanded from the pattern file's directory.
 pub struct FilePatternReaderStub {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     layout: Option<StrictRawLayout>,
+    stitcher: Option<FileStitcher>,
 }
 
 impl FilePatternReaderStub {
@@ -3421,8 +3232,100 @@ impl FilePatternReaderStub {
             path: None,
             meta: None,
             layout: None,
+            stitcher: None,
         }
     }
+
+    fn resolve_pattern_path(pattern_file: &Path, pattern: &str) -> PathBuf {
+        let target = PathBuf::from(pattern);
+        if target.is_absolute() {
+            return target;
+        }
+        pattern_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(target)
+    }
+
+    fn expand_pattern(pattern: &Path) -> Result<Option<ExpandedFilePattern>> {
+        let text = pattern.to_string_lossy();
+        if !contains_filepattern_block(&text) {
+            reject_unsupported_filepattern_syntax(&text)?;
+            if contains_simple_glob(&text) {
+                let files = expand_simple_glob(pattern)?;
+                let glob_pattern = normalize_path_lexically(pattern);
+                let file_pattern = FilePattern::from_expanded_glob(&glob_pattern, &files)?;
+                return Ok(Some(ExpandedFilePattern::Glob {
+                    files,
+                    pattern: file_pattern,
+                }));
+            }
+            return Ok(None);
+        }
+        let mut names = Vec::new();
+        expand_pattern_text(&text, &mut names)?;
+        if names.is_empty() {
+            return Err(BioFormatsError::Format(
+                "FilePattern: expanded pattern produced no files".to_string(),
+            ));
+        }
+        if contains_simple_glob(&text) {
+            reject_mixed_file_component_globs(pattern)?;
+            let mut files = Vec::new();
+            for name in names {
+                files.extend(expand_simple_glob(Path::new(&name))?);
+            }
+            files.sort();
+            files.dedup();
+            if files.is_empty() {
+                return Err(BioFormatsError::Format(
+                    "FilePattern: expanded pattern produced no files".to_string(),
+                ));
+            }
+            let normalized_pattern =
+                normalize_path_lexically(Path::new(&replace_pattern_blocks_with_globs(&text)?));
+            let file_pattern = FilePattern::from_expanded_glob(&normalized_pattern, &files)?;
+            return Ok(Some(ExpandedFilePattern::Glob {
+                files,
+                pattern: file_pattern,
+            }));
+        }
+        let mut missing = Vec::new();
+        let mut files = Vec::with_capacity(names.len());
+        for name in names {
+            let path = PathBuf::from(name);
+            if path.exists() {
+                files.push(path);
+            } else {
+                missing.push(path);
+            }
+        }
+        if !missing.is_empty() {
+            let shown = missing
+                .iter()
+                .take(3)
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let suffix = if missing.len() > 3 {
+                format!(" and {} more", missing.len() - 3)
+            } else {
+                String::new()
+            };
+            return Err(BioFormatsError::Format(format!(
+                "FilePattern: expanded pattern references missing files: {shown}{suffix}"
+            )));
+        }
+        Ok(Some(ExpandedFilePattern::Explicit(files)))
+    }
+}
+
+enum ExpandedFilePattern {
+    Explicit(Vec<PathBuf>),
+    Glob {
+        files: Vec<PathBuf>,
+        pattern: FilePattern,
+    },
 }
 
 impl Default for FilePatternReaderStub {
@@ -3448,11 +3351,49 @@ impl FormatReader for FilePatternReaderStub {
         self.path = None;
         self.meta = None;
         self.layout = None;
-        let (meta, layout) =
-            parse_strict_raw_subset(path, b"BFPATT\0\0", "FilePattern synthetic raw")?;
+        self.stitcher = None;
+
+        let header = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if header.starts_with(b"BFPATT\0\0") {
+            let (meta, layout) =
+                parse_strict_raw_subset(path, b"BFPATT\0\0", "FilePattern synthetic raw")?;
+            self.path = Some(path.to_path_buf());
+            self.meta = Some(meta);
+            self.layout = Some(layout);
+            return Ok(());
+        }
+
+        let pattern = String::from_utf8_lossy(&header).trim().to_string();
+        if pattern.is_empty() {
+            return Err(BioFormatsError::Format(
+                "FilePattern: pattern file is empty".to_string(),
+            ));
+        }
+        let target = Self::resolve_pattern_path(path, &pattern);
+        if target
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("pattern"))
+        {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FilePattern: nested .pattern files are not supported".to_string(),
+            ));
+        }
+
+        let stitcher = if let Some(expanded) = Self::expand_pattern(&target)? {
+            match expanded {
+                ExpandedFilePattern::Explicit(files) => {
+                    FileStitcher::from_files_with_pattern(files, &target)?
+                }
+                ExpandedFilePattern::Glob { files, pattern } => {
+                    FileStitcher::from_files_with_file_pattern(files, pattern)?
+                }
+            }
+        } else {
+            FileStitcher::open(&target)?
+        };
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.layout = Some(layout);
+        self.stitcher = Some(stitcher);
         Ok(())
     }
 
@@ -3460,14 +3401,24 @@ impl FormatReader for FilePatternReaderStub {
         self.path = None;
         self.meta = None;
         self.layout = None;
+        if let Some(mut stitcher) = self.stitcher.take() {
+            let _ = stitcher.close();
+        }
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        if let Some(stitcher) = &self.stitcher {
+            stitcher.series_count()
+        } else {
+            usize::from(self.meta.is_some())
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
+        if let Some(stitcher) = &mut self.stitcher {
+            return stitcher.set_series(s);
+        }
         if self.meta.is_none() {
             Err(BioFormatsError::NotInitialized)
         } else if s == 0 {
@@ -3478,16 +3429,25 @@ impl FormatReader for FilePatternReaderStub {
     }
 
     fn series(&self) -> usize {
-        0
+        self.stitcher
+            .as_ref()
+            .map_or(0, |stitcher| stitcher.series())
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
-            .unwrap_or(crate::common::reader::uninitialized_metadata())
+        if let Some(stitcher) = &self.stitcher {
+            stitcher.metadata()
+        } else {
+            self.meta
+                .as_ref()
+                .unwrap_or(crate::common::reader::uninitialized_metadata())
+        }
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        if let Some(stitcher) = &mut self.stitcher {
+            return stitcher.open_bytes(plane_index);
+        }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -3505,6 +3465,9 @@ impl FormatReader for FilePatternReaderStub {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        if let Some(stitcher) = &mut self.stitcher {
+            return stitcher.open_bytes_region(plane_index, x, y, w, h);
+        }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let meta = meta.clone();
         let plane = self.open_bytes(plane_index)?;
@@ -3512,6 +3475,9 @@ impl FormatReader for FilePatternReaderStub {
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        if let Some(stitcher) = &mut self.stitcher {
+            return stitcher.open_thumb_bytes(plane_index);
+        }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
@@ -3519,6 +3485,535 @@ impl FormatReader for FilePatternReaderStub {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+}
+
+fn expand_pattern_text(pattern: &str, out: &mut Vec<String>) -> Result<()> {
+    let Some((start, open, close)) = find_next_filepattern_block(pattern) else {
+        reject_unsupported_filepattern_syntax(pattern)?;
+        out.push(pattern.to_string());
+        return Ok(());
+    };
+    let end = find_matching_filepattern_block_end(pattern, start, open, close)?;
+    let prefix = &pattern[..start];
+    let suffix = &pattern[end + close.len_utf8()..];
+    for value in parse_pattern_block(&pattern[start + open.len_utf8()..end])? {
+        let candidate = format!("{prefix}{value}{suffix}");
+        expand_pattern_text(&candidate, out)?;
+    }
+    Ok(())
+}
+
+fn reject_mixed_file_component_globs(pattern: &Path) -> Result<()> {
+    let normal_components = pattern
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(file_component) = normal_components.last() {
+        let text = file_component.to_str().ok_or_else(|| {
+            BioFormatsError::Format("FilePattern: glob path is not UTF-8".to_string())
+        })?;
+        if contains_simple_glob(text) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FilePattern: mixing pattern blocks with glob wildcards is only supported for directory components"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn replace_pattern_blocks_with_globs(pattern: &str) -> Result<String> {
+    let Some((start, open, close)) = find_next_filepattern_block(pattern) else {
+        reject_unsupported_filepattern_syntax(pattern)?;
+        return Ok(pattern.to_string());
+    };
+    let end = find_matching_filepattern_block_end(pattern, start, open, close)?;
+    let _ = parse_pattern_block(&pattern[start + open.len_utf8()..end])?;
+    let suffix = replace_pattern_blocks_with_globs(&pattern[end + close.len_utf8()..])?;
+    Ok(format!("{}*{suffix}", &pattern[..start]))
+}
+
+fn reject_unsupported_filepattern_syntax(pattern: &str) -> Result<()> {
+    for ch in ['>', ']', '}'] {
+        if pattern.contains(ch) {
+            return Err(BioFormatsError::Format(format!(
+                "FilePattern: unmatched pattern block delimiter {ch}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn contains_filepattern_block(pattern: &str) -> bool {
+    find_next_filepattern_block(pattern).is_some()
+}
+
+fn find_next_filepattern_block(pattern: &str) -> Option<(usize, char, char)> {
+    pattern.char_indices().find_map(|(idx, ch)| match ch {
+        '<' => Some((idx, '<', '>')),
+        '[' => Some((idx, '[', ']')),
+        '{' => Some((idx, '{', '}')),
+        _ => None,
+    })
+}
+
+fn find_matching_filepattern_block_end(
+    pattern: &str,
+    start: usize,
+    open: char,
+    close: char,
+) -> Result<usize> {
+    let mut stack = vec![close];
+    for (rel_idx, ch) in pattern[start + open.len_utf8()..].char_indices() {
+        let idx = start + open.len_utf8() + rel_idx;
+        match ch {
+            '<' => stack.push('>'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            '>' | ']' | '}' => {
+                if stack.pop() != Some(ch) {
+                    return Err(BioFormatsError::Format(format!(
+                        "FilePattern: unmatched pattern block delimiter {ch}"
+                    )));
+                }
+                if stack.is_empty() {
+                    return Ok(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(BioFormatsError::Format(format!(
+        "FilePattern: unterminated {open}{close} pattern block"
+    )))
+}
+
+fn contains_simple_glob(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+const MAX_RECURSIVE_GLOB_ENTRIES: usize = 4096;
+
+fn expand_simple_glob(pattern: &Path) -> Result<Vec<PathBuf>> {
+    if !contains_simple_glob(&pattern.to_string_lossy()) {
+        return Ok(vec![pattern.to_path_buf()]);
+    }
+
+    let mut components = pattern.components();
+    let mut roots = Vec::new();
+    let mut globs = Vec::new();
+    for component in components.by_ref() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                if globs.is_empty() {
+                    roots.push(PathBuf::from(component.as_os_str()));
+                } else {
+                    return Err(BioFormatsError::Format(
+                        "FilePattern: invalid glob path".to_string(),
+                    ));
+                }
+            }
+            std::path::Component::CurDir => {
+                if globs.is_empty() && roots.is_empty() {
+                    roots.push(PathBuf::from("."));
+                }
+            }
+            std::path::Component::ParentDir => {
+                if globs.is_empty() {
+                    if roots.is_empty() {
+                        roots.push(PathBuf::from(".."));
+                    } else if let Some(root) = roots.last_mut() {
+                        root.push("..");
+                    }
+                } else {
+                    globs.push("..".to_string());
+                }
+            }
+            std::path::Component::Normal(part) => {
+                let text = part.to_str().ok_or_else(|| {
+                    BioFormatsError::Format("FilePattern: glob path is not UTF-8".to_string())
+                })?;
+                globs.push(text.to_string());
+            }
+        }
+    }
+    if roots.is_empty() {
+        roots.push(PathBuf::from("."));
+    }
+
+    let mut paths = roots;
+    let mut confinement_roots: Option<Vec<PathBuf>> = None;
+    let mut saw_wildcard = false;
+    for (idx, component_pattern) in globs.iter().enumerate() {
+        let last = idx + 1 == globs.len();
+        if component_pattern == ".." && saw_wildcard {
+            paths = expand_parent_after_glob_component(
+                paths,
+                confinement_roots.as_deref().unwrap_or(&[]),
+            )?;
+            continue;
+        }
+        if !saw_wildcard && is_glob_component(component_pattern) {
+            confinement_roots = Some(
+                paths
+                    .iter()
+                    .map(|path| normalize_path_lexically(path))
+                    .collect(),
+            );
+            saw_wildcard = true;
+        }
+        paths = expand_glob_component(paths, component_pattern, last)?;
+        if paths.is_empty() {
+            break;
+        }
+    }
+    let mut files: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| path.is_file())
+        .map(|path| normalize_path_lexically(&path))
+        .collect();
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return Err(BioFormatsError::Format(format!(
+            "FilePattern: glob pattern matched no files: {}",
+            pattern.display()
+        )));
+    }
+    Ok(files)
+}
+
+fn is_glob_component(component: &str) -> bool {
+    component == "**" || contains_simple_glob(component)
+}
+
+fn expand_parent_after_glob_component(
+    bases: Vec<PathBuf>,
+    confinement_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let mut parents = Vec::new();
+    for base in bases {
+        let candidate = base.join("..");
+        let normalized = normalize_path_lexically(&candidate);
+        if !path_is_confined_to_roots(&normalized, confinement_roots) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FilePattern: parent directory traversal after a glob escapes the pattern root"
+                    .to_string(),
+            ));
+        }
+        parents.push(candidate);
+    }
+    parents.sort();
+    parents.dedup();
+    Ok(parents)
+}
+
+fn path_is_confined_to_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| path == root || path.starts_with(root))
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+fn expand_glob_component(
+    bases: Vec<PathBuf>,
+    component_pattern: &str,
+    last: bool,
+) -> Result<Vec<PathBuf>> {
+    if component_pattern == "**" {
+        return expand_recursive_glob_component(bases, last);
+    }
+
+    if !contains_simple_glob(component_pattern) {
+        return Ok(bases
+            .into_iter()
+            .map(|mut base| {
+                base.push(component_pattern);
+                base
+            })
+            .collect());
+    }
+
+    let mut matches = Vec::new();
+    for base in bases {
+        let entries = match std::fs::read_dir(&base) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(BioFormatsError::Io(err)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(BioFormatsError::Io)?;
+            let file_type = entry.file_type().map_err(BioFormatsError::Io)?;
+            if !last && !file_type.is_dir() {
+                continue;
+            }
+            if last && !file_type.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if simple_glob_matches(component_pattern, name) {
+                matches.push(entry.path());
+            }
+        }
+    }
+    matches.sort();
+    Ok(matches)
+}
+
+fn expand_recursive_glob_component(bases: Vec<PathBuf>, last: bool) -> Result<Vec<PathBuf>> {
+    let mut matches = Vec::new();
+    for base in bases {
+        collect_recursive_glob_paths(&base, last, &mut matches)?;
+    }
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+fn collect_recursive_glob_paths(
+    base: &Path,
+    files: bool,
+    matches: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if matches.len() >= MAX_RECURSIVE_GLOB_ENTRIES {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "FilePattern: recursive ** glob exceeded {MAX_RECURSIVE_GLOB_ENTRIES} entries"
+        )));
+    }
+
+    if files {
+        if base.is_file() {
+            matches.push(base.to_path_buf());
+            return Ok(());
+        }
+    } else if base.is_dir() {
+        matches.push(base.to_path_buf());
+    }
+
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(BioFormatsError::Io(err)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(BioFormatsError::Io)?;
+        let file_type = entry.file_type().map_err(BioFormatsError::Io)?;
+        if file_type.is_dir() {
+            collect_recursive_glob_paths(&entry.path(), files, matches)?;
+        } else if files {
+            matches.push(entry.path());
+            if matches.len() >= MAX_RECURSIVE_GLOB_ENTRIES {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "FilePattern: recursive ** glob exceeded {MAX_RECURSIVE_GLOB_ENTRIES} entries"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn simple_glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let name = name.as_bytes();
+    let mut p = 0usize;
+    let mut n = 0usize;
+    let mut star = None;
+    let mut after_star_name = 0usize;
+
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            after_star_name = n;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            after_star_name += 1;
+            n = after_star_name;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn parse_pattern_block(block: &str) -> Result<Vec<String>> {
+    if block.trim().is_empty() {
+        return Err(BioFormatsError::Format(
+            "FilePattern: empty pattern block".to_string(),
+        ));
+    }
+
+    let mut values = Vec::new();
+    for part in split_top_level_pattern_commas(block)? {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(BioFormatsError::Format(
+                "FilePattern: empty pattern list entry".to_string(),
+            ));
+        }
+        values.extend(parse_pattern_block_part(part)?);
+    }
+    Ok(values)
+}
+
+fn parse_pattern_block_part(part: &str) -> Result<Vec<String>> {
+    if contains_filepattern_block(part) {
+        let mut nested = Vec::new();
+        expand_pattern_text(part, &mut nested)?;
+        for value in &nested {
+            reject_pattern_value(value)?;
+        }
+        return Ok(nested);
+    }
+
+    let (range, step) = match part.split_once(':') {
+        Some((range, step)) => (
+            range,
+            step.parse::<i64>().map_err(|_| {
+                BioFormatsError::Format("FilePattern: invalid range step".to_string())
+            })?,
+        ),
+        None => (part, 1),
+    };
+    if step <= 0 {
+        return Err(BioFormatsError::Format(
+            "FilePattern: range step must be positive".to_string(),
+        ));
+    }
+
+    if let Some((first_text, last_text)) = range.split_once('-') {
+        let width = first_text.len().max(last_text.len());
+        if let (Ok(first), Ok(last)) = (first_text.parse::<i64>(), last_text.parse::<i64>()) {
+            let mut out = Vec::new();
+            let mut value = first;
+            if first <= last {
+                while value <= last {
+                    out.push(format!("{value:0width$}"));
+                    value += step;
+                }
+            } else {
+                while value >= last {
+                    out.push(format!("{value:0width$}"));
+                    value -= step;
+                }
+            }
+            return Ok(out);
+        }
+
+        if first_text.chars().count() == 1 && last_text.chars().count() == 1 {
+            let first = first_text.chars().next().unwrap();
+            let last = last_text.chars().next().unwrap();
+            if first.is_ascii_alphabetic() && last.is_ascii_alphabetic() {
+                let mut out = Vec::new();
+                let mut value = first as i64;
+                let last = last as i64;
+                if value <= last {
+                    while value <= last {
+                        out.push(char::from_u32(value as u32).unwrap().to_string());
+                        value += step;
+                    }
+                } else {
+                    while value >= last {
+                        out.push(char::from_u32(value as u32).unwrap().to_string());
+                        value -= step;
+                    }
+                }
+                return Ok(out);
+            }
+        }
+
+        return Err(BioFormatsError::Format(
+            "FilePattern: invalid range bounds".to_string(),
+        ));
+    }
+
+    reject_pattern_value(range)?;
+    Ok(vec![range.to_string()])
+}
+
+fn split_top_level_pattern_commas(block: &str) -> Result<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut stack = Vec::new();
+    for (idx, ch) in block.char_indices() {
+        match ch {
+            '<' => stack.push('>'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            '>' | ']' | '}' => {
+                if stack.pop() != Some(ch) {
+                    return Err(BioFormatsError::Format(format!(
+                        "FilePattern: unmatched pattern block delimiter {ch}"
+                    )));
+                }
+            }
+            ',' if stack.is_empty() => {
+                parts.push(&block[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if let Some(close) = stack.pop() {
+        return Err(BioFormatsError::Format(format!(
+            "FilePattern: unterminated pattern block delimiter {close}"
+        )));
+    }
+    parts.push(&block[start..]);
+    Ok(parts)
+}
+
+fn reject_pattern_value(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.contains('<')
+        || value.contains('>')
+        || value.contains('[')
+        || value.contains(']')
+        || value.contains('{')
+        || value.contains('}')
+        || value.contains('/')
+        || value.contains('\\')
+    {
+        return Err(BioFormatsError::Format(
+            "FilePattern: invalid value".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3660,6 +4155,14 @@ impl FormatReader for KlbReader {
 
         f.read_exact(&mut byte).map_err(BioFormatsError::Io)?;
         let compression_type = byte[0];
+        if !matches!(
+            compression_type,
+            KLB_COMPRESSION_NONE | KLB_COMPRESSION_BZIP2 | KLB_COMPRESSION_ZLIB
+        ) {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "KLB unsupported compression type {compression_type}"
+            )));
+        }
 
         // user_metadata
         f.seek(SeekFrom::Current(KLB_METADATA_SIZE as i64))
@@ -3685,17 +4188,45 @@ impl FormatReader for KlbReader {
                 .checked_mul(Self::div_ceil_u32(dims_xyzct[i], block_size[i]) as u64)
                 .ok_or_else(|| BioFormatsError::Format("KLB block count overflows".to_string()))?;
         }
+        let num_blocks_usize = usize::try_from(num_blocks)
+            .map_err(|_| BioFormatsError::Format("KLB block count overflows".to_string()))?;
 
-        let header_size =
-            (KLB_DATA_DIMS as u64 * 12) + 2 + (num_blocks * 8) + KLB_METADATA_SIZE as u64 + 1;
+        let header_size = (KLB_DATA_DIMS as u64 * 12)
+            .checked_add(2)
+            .and_then(|v| v.checked_add(num_blocks.checked_mul(8)?))
+            .and_then(|v| v.checked_add(KLB_METADATA_SIZE as u64))
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| BioFormatsError::Format("KLB header size overflows".to_string()))?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if file_len < header_size {
+            return Err(BioFormatsError::Format(format!(
+                "KLB header is truncated: got {file_len} bytes, expected at least {header_size}"
+            )));
+        }
 
         // The cumulative block end-offsets follow immediately (offsetFilePointer).
-        let mut offset_bytes = vec![0u8; (num_blocks as usize) * 8];
-        f.read_exact(&mut offset_bytes).map_err(BioFormatsError::Io)?;
+        let mut offset_bytes = vec![0u8; num_blocks_usize * 8];
+        f.read_exact(&mut offset_bytes)
+            .map_err(BioFormatsError::Io)?;
         let block_offsets: Vec<u64> = offset_bytes
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
             .collect();
+        let payload_len = file_len - header_size;
+        let mut prev = 0u64;
+        for &end in &block_offsets {
+            if end < prev {
+                return Err(BioFormatsError::Format(
+                    "KLB block offset table is not monotonic".to_string(),
+                ));
+            }
+            if end > payload_len {
+                return Err(BioFormatsError::Format(format!(
+                    "KLB block offset table points past EOF: block end {end}, payload {payload_len}"
+                )));
+            }
+            prev = end;
+        }
 
         let image_count = size_z
             .checked_mul(size_c)
@@ -3762,7 +4293,10 @@ impl FormatReader for KlbReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let layout = self.layout.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let layout = self
+            .layout
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let bpp = meta.pixel_type.bytes_per_sample();
@@ -3785,14 +4319,18 @@ impl FormatReader for KlbReader {
         let blocks_per_col = Self::div_ceil_u32(meta.size_y, layout.block_size[1]) as usize;
         let blocks_per_plane = layout.blocks_per_plane;
 
-        let mut out = vec![0u8; size_x * size_y * bpp];
+        let out_len = size_x
+            .checked_mul(size_y)
+            .and_then(|px| px.checked_mul(bpp))
+            .ok_or_else(|| BioFormatsError::Format("KLB plane is too large".to_string()))?;
+        let mut out = vec![0u8; out_len];
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
 
         for by in 0..blocks_per_col {
             for bx in 0..blocks_per_row {
                 let block_in_plane = by * blocks_per_row + bx;
                 let global_block = z_block * blocks_per_plane + block_in_plane;
-                if global_block + 1 > layout.block_offsets.len() {
+                if global_block >= layout.block_offsets.len() {
                     return Err(BioFormatsError::Format(
                         "KLB block offset index out of range".to_string(),
                     ));
@@ -3823,9 +4361,7 @@ impl FormatReader for KlbReader {
 
                 let block = match layout.compression_type {
                     KLB_COMPRESSION_NONE => compressed,
-                    KLB_COMPRESSION_ZLIB => {
-                        crate::common::codec::decompress_deflate(&compressed)?
-                    }
+                    KLB_COMPRESSION_ZLIB => crate::common::codec::decompress_deflate(&compressed)?,
                     KLB_COMPRESSION_BZIP2 => {
                         // The on-disk block is a standard "BZh" stream; our
                         // decoder consumes it whole (unlike Java's Ant
@@ -3841,14 +4377,26 @@ impl FormatReader for KlbReader {
 
                 // Within the decompressed block, planes are compacted to the
                 // actual (bw x bh) extent; the wanted z-slice is at local_z.
-                let plane_bytes = bw * bh * bpp;
-                let slice_off = local_z * plane_bytes;
-                let row_bytes = bw * bpp;
+                let plane_bytes = bw
+                    .checked_mul(bh)
+                    .and_then(|px| px.checked_mul(bpp))
+                    .ok_or_else(|| BioFormatsError::Format("KLB block is too large".to_string()))?;
+                let slice_off = local_z
+                    .checked_mul(plane_bytes)
+                    .ok_or_else(|| BioFormatsError::Format("KLB block is too large".to_string()))?;
+                let row_bytes = bw
+                    .checked_mul(bpp)
+                    .ok_or_else(|| BioFormatsError::Format("KLB block is too large".to_string()))?;
+                if slice_off
+                    .checked_add(plane_bytes)
+                    .is_none_or(|end| end > block.len())
+                {
+                    return Err(BioFormatsError::Format(
+                        "KLB decompressed block is shorter than expected".to_string(),
+                    ));
+                }
                 for r in 0..bh {
                     let src = slice_off + r * row_bytes;
-                    if src + row_bytes > block.len() {
-                        break;
-                    }
                     let dst = ((y0 + r) * size_x + x0) * bpp;
                     if dst + row_bytes <= out.len() {
                         out[dst..dst + row_bytes].copy_from_slice(&block[src..src + row_bytes]);
@@ -3922,7 +4470,9 @@ impl ObfIn {
     }
     fn read_n(&mut self, n: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; n];
-        self.file.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        self.file
+            .read_exact(&mut buf)
+            .map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
     fn skip(&mut self, n: u64) -> Result<()> {
@@ -4001,7 +4551,9 @@ impl ObfReadState {
             .ok_or_else(|| BioFormatsError::Format("OBF: missing chunk positions".to_string()))?;
         let filepos = stack.chunk_file_positions.as_ref().unwrap();
         if chunk_index < 0 || chunk_index as usize >= logical.len() {
-            return Err(BioFormatsError::Format("Missing OBF data chunks".to_string()));
+            return Err(BioFormatsError::Format(
+                "Missing OBF data chunks".to_string(),
+            ));
         }
         let ci = chunk_index as usize;
         self.current_chunk = chunk_index;
@@ -4650,7 +5202,9 @@ impl FormatReader for ObfReader {
         }
 
         if self.stacks.is_empty() {
-            return Err(BioFormatsError::Format("OBF file has no stacks".to_string()));
+            return Err(BioFormatsError::Format(
+                "OBF file has no stacks".to_string(),
+            ));
         }
 
         self.path = Some(path.to_path_buf());
@@ -4720,7 +5274,6 @@ impl FormatReader for ObfReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
-
 
 #[cfg(test)]
 mod pds_tests {
@@ -4862,8 +5415,7 @@ mod pds_tests {
             10, 20, 30, // row 0
             40, 50, 60, // row 1
         ];
-        let (hdr, img) =
-            write_gray_fixture("rev", size_x, size_y, record_width, "-", "-", &pixels);
+        let (hdr, img) = write_gray_fixture("rev", size_x, size_y, record_width, "-", "-", &pixels);
 
         let mut r = PdsReader::new();
         r.set_id(&hdr).unwrap();

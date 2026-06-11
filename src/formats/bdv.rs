@@ -83,7 +83,9 @@ fn parse_view_setups(xml: &str) -> Vec<ViewSetupXml> {
     let mut pos = 0;
     while let Some(open) = xml[pos..].find("<ViewSetup>") {
         let start = pos + open + "<ViewSetup>".len();
-        let end_rel = xml[start..].find("</ViewSetup>").unwrap_or(xml.len() - start);
+        let end_rel = xml[start..]
+            .find("</ViewSetup>")
+            .unwrap_or(xml.len() - start);
         let block = &xml[start..start + end_rel];
         pos = start + end_rel;
 
@@ -92,7 +94,10 @@ fn parse_view_setups(xml: &str) -> Vec<ViewSetupXml> {
         // <voxelSize><size>X Y Z</size></voxelSize>
         let voxel_size = inner_text(block, "voxelSize").and_then(|vs| {
             inner_text(&vs, "size").and_then(|s| {
-                let parts: Vec<f64> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+                let parts: Vec<f64> = s
+                    .split_whitespace()
+                    .filter_map(|p| p.parse().ok())
+                    .collect();
                 if parts.len() >= 3 {
                     Some((parts[0], parts[1], parts[2]))
                 } else {
@@ -128,12 +133,14 @@ fn parse_timepoints(xml: &str) -> Vec<u32> {
         let pat = pat.trim();
         // first-last:increment
         let (range_part, inc) = match pat.split_once(':') {
-            Some((r, i)) => (r, i.trim().parse::<u32>().ok().filter(|&v| v > 0).unwrap_or(1)),
+            Some((r, i)) => (
+                r,
+                i.trim().parse::<u32>().ok().filter(|&v| v > 0).unwrap_or(1),
+            ),
             None => (pat, 1),
         };
         if let Some((first, last)) = range_part.split_once('-') {
-            if let (Ok(first), Ok(last)) =
-                (first.trim().parse::<u32>(), last.trim().parse::<u32>())
+            if let (Ok(first), Ok(last)) = (first.trim().parse::<u32>(), last.trim().parse::<u32>())
             {
                 if last >= first {
                     return (first..=last).step_by(inc as usize).collect();
@@ -188,9 +195,7 @@ fn parse_bdv(path: &Path) -> Result<Vec<SeriesInfo>> {
             members
                 .iter()
                 .filter(|n| {
-                    n.len() == 3
-                        && n.starts_with('s')
-                        && n[1..].chars().all(|c| c.is_ascii_digit())
+                    n.len() == 3 && n.starts_with('s') && n[1..].chars().all(|c| c.is_ascii_digit())
                 })
                 .filter_map(|n| n[1..].parse::<u32>().ok())
                 .map(|id| ViewSetupXml {
@@ -214,9 +219,7 @@ fn parse_bdv(path: &Path) -> Result<Vec<SeriesInfo>> {
                 .unwrap_or_default()
                 .iter()
                 .filter(|n| {
-                    n.len() == 6
-                        && n.starts_with('t')
-                        && n[1..].chars().all(|c| c.is_ascii_digit())
+                    n.len() == 6 && n.starts_with('t') && n[1..].chars().all(|c| c.is_ascii_digit())
                 })
                 .filter_map(|n| n[1..].parse::<u32>().ok())
                 .collect();
@@ -274,10 +277,9 @@ fn parse_bdv(path: &Path) -> Result<Vec<SeriesInfo>> {
                 let size_x = u32::try_from(shape[2])
                     .map_err(|_| BioFormatsError::Format("BDV X overflows".into()))?;
 
-                let dtype_size = ds
-                    .dtype()
-                    .map(|dt| dt.size())
-                    .map_err(|e| BioFormatsError::Format(format!("BDV: dtype {cells_path}: {e}")))?;
+                let dtype_size = ds.dtype().map(|dt| dt.size()).map_err(|e| {
+                    BioFormatsError::Format(format!("BDV: dtype {cells_path}: {e}"))
+                })?;
                 let (pixel_type, bytes_per_sample) = pixel_type_for_size(dtype_size)?;
 
                 let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
@@ -441,10 +443,7 @@ impl FormatReader for BdvReader {
 
         // sizeC = sizeT = 1, so the plane index is the Z slice directly.
         let z = plane_index as usize;
-        let ds_path = format!(
-            "t{:05}/s{:02}/{}/cells",
-            si.timepoint, si.setup, si.level
-        );
+        let ds_path = format!("t{:05}/s{:02}/{}/cells", si.timepoint, si.setup, si.level);
         let bps = meta.pixel_type.bytes_per_sample() as usize;
         let plane_pixels = meta.size_x as usize * meta.size_y as usize;
 
@@ -555,6 +554,8 @@ impl FormatReader for BdvReader {
                 }],
                 ..Default::default()
             });
+            let image_index = ome.images.len() - 1;
+            let _ = ome.add_original_metadata_annotations(&si.meta, image_index);
         }
         Some(ome)
     }

@@ -1,15 +1,17 @@
 //! Additional FLIM, flow cytometry, and miscellaneous imaging format readers.
 //!
-//! Includes FlowSightReader with basic binary header inspection and many
-//! extension-only placeholder readers.
+//! Includes FlowSightReader with binary header inspection plus explicit
+//! unsupported detectors and bounded native readers.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::read_bytes_at;
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{ImageMetadata, MetadataValue, ModuloAnnotation};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -747,7 +749,7 @@ impl FormatReader for FlowSightReader {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Amnis/Luminex IM3 — conservative synthetic raw subset
+// 2. Amnis/Luminex IM3
 // ---------------------------------------------------------------------------
 const SYNTHETIC_IM3_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-IM3-RAW-V1\0";
 const SYNTHETIC_SLIDEBOOK7_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-SLIDEBOOK7-RAW-V1\0";
@@ -788,6 +790,29 @@ impl SyntheticRawSpec {
     fn matches_bytes(self, header: &[u8]) -> bool {
         header.starts_with(self.magic)
     }
+}
+
+fn im3_native_cookie(header: &[u8]) -> bool {
+    header
+        .get(..4)
+        .is_some_and(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) == 1985)
+}
+
+fn ivision_native_header(header: &[u8]) -> bool {
+    ivision_structural_header(header) && header[5] <= 8
+}
+
+fn ivision_structural_header(header: &[u8]) -> bool {
+    if header.len() < 6 {
+        return false;
+    }
+    let Ok(version) = std::str::from_utf8(&header[..3]) else {
+        return false;
+    };
+    version.parse::<f64>().is_ok()
+        && version.contains('.')
+        && !version.contains('-')
+        && header[3].is_ascii_alphabetic()
 }
 
 fn synthetic_raw_unsupported(spec: SyntheticRawSpec) -> BioFormatsError {
@@ -973,20 +998,668 @@ fn synthetic_raw_open_bytes_region(
     crop_full_plane(spec.format_name, &full, &state.meta, 1, x, y, w, h)
 }
 
+#[derive(Clone)]
+struct Im3Record {
+    name: String,
+    rec_type: u32,
+    payload_offset: usize,
+    payload_len: usize,
+}
+
+struct Im3NativeState {
+    path: PathBuf,
+    datasets: Vec<Im3NativeDataset>,
+}
+
+struct Im3NativeDataset {
+    meta: ImageMetadata,
+    data_offset: u64,
+    interleaved_len: usize,
+}
+
+#[derive(Clone)]
+struct Im3DatasetCandidate {
+    container: Im3Record,
+    shape: Im3Record,
+    data: Im3Record,
+}
+
+enum Im3State {
+    Synthetic(SyntheticRawState),
+    Native(Im3NativeState),
+}
+
+fn im3_read_u32_le(bytes: &[u8], offset: usize, context: &str) -> Result<u32> {
+    let raw = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| BioFormatsError::Format(format!("IM3 native {context} is truncated")))?;
+    Ok(u32::from_le_bytes(raw.try_into().unwrap()))
+}
+
+fn im3_parse_record(bytes: &[u8], pos: &mut usize, end: usize) -> Result<Option<Im3Record>> {
+    if *pos + 4 > end {
+        return Ok(None);
+    }
+    let name_len = im3_read_u32_le(bytes, *pos, "record name length")? as usize;
+    *pos += 4;
+    let name_bytes = bytes
+        .get(*pos..pos.saturating_add(name_len))
+        .ok_or_else(|| BioFormatsError::Format("IM3 native record name is truncated".into()))?;
+    let name = std::str::from_utf8(name_bytes)
+        .map_err(|_| BioFormatsError::Format("IM3 native record name is not UTF-8".into()))?
+        .to_string();
+    *pos += name_len;
+    let length_field = im3_read_u32_le(bytes, *pos, "record length")? as usize;
+    *pos += 4;
+    if length_field < 8 {
+        return Err(BioFormatsError::Format(format!(
+            "IM3 native record {name} has invalid length {length_field}"
+        )));
+    }
+    let rec_type = im3_read_u32_le(bytes, *pos, "record type")?;
+    *pos += 4;
+    let payload_len = length_field - 8;
+    let payload_offset = *pos;
+    let next = payload_offset
+        .checked_add(payload_len)
+        .ok_or_else(|| BioFormatsError::Format("IM3 native record offset overflows".into()))?;
+    if next > end || next > bytes.len() {
+        return Err(BioFormatsError::Format(format!(
+            "IM3 native record {name} payload is truncated"
+        )));
+    }
+    *pos = next;
+    Ok(Some(Im3Record {
+        name,
+        rec_type,
+        payload_offset,
+        payload_len,
+    }))
+}
+
+fn im3_container_children(bytes: &[u8], rec: &Im3Record) -> Result<Vec<Im3Record>> {
+    if rec.rec_type != 0 {
+        return Ok(Vec::new());
+    }
+    if rec.payload_len < 8 {
+        return Err(BioFormatsError::Format(format!(
+            "IM3 native container {} is truncated",
+            rec.name
+        )));
+    }
+    let mut pos = rec.payload_offset + 8;
+    let end = rec.payload_offset + rec.payload_len;
+    let mut children = Vec::new();
+    while pos < end.saturating_sub(8) {
+        match im3_parse_record(bytes, &mut pos, end)? {
+            Some(child) => children.push(child),
+            None => break,
+        }
+    }
+    Ok(children)
+}
+
+fn im3_int_entries(bytes: &[u8], rec: &Im3Record) -> Result<Vec<u32>> {
+    if rec.rec_type != 6 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "IM3 native {} record is not an integer array",
+            rec.name
+        )));
+    }
+    if rec.payload_len < 8 {
+        return Err(BioFormatsError::Format(format!(
+            "IM3 native integer record {} is truncated",
+            rec.name
+        )));
+    }
+    let code = im3_read_u32_le(bytes, rec.payload_offset, "integer record code")?;
+    if code == 0 {
+        return Ok(vec![im3_read_u32_le(
+            bytes,
+            rec.payload_offset + 4,
+            "integer scalar",
+        )?]);
+    }
+    let count = im3_read_u32_le(bytes, rec.payload_offset + 4, "integer array count")? as usize;
+    let values_offset = rec.payload_offset + 8;
+    let byte_len = count.checked_mul(4).ok_or_else(|| {
+        BioFormatsError::Format("IM3 native integer array length overflows".into())
+    })?;
+    if values_offset + byte_len > rec.payload_offset + rec.payload_len {
+        return Err(BioFormatsError::Format(format!(
+            "IM3 native integer record {} values are truncated",
+            rec.name
+        )));
+    }
+    (0..count)
+        .map(|idx| im3_read_u32_le(bytes, values_offset + idx * 4, "integer array value"))
+        .collect()
+}
+
+fn im3_metadata_key(name: &str) -> Option<String> {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, ' ' | '_' | '-' | '.' | '/' | ':' | '#') && !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let key = out.trim_matches('_');
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    }
+}
+
+fn im3_string_entry(bytes: &[u8], rec: &Im3Record) -> Option<String> {
+    let raw = match rec.rec_type {
+        // Compatibility with earlier synthetic fixtures.
+        2 if rec.payload_len > 0 && rec.payload_len <= 512 => {
+            bytes.get(rec.payload_offset..rec.payload_offset + rec.payload_len)?
+        }
+        // Java IM3Reader StringIM3Record: skip 4 bytes, then parseString()
+        // (u32 byte length followed by UTF-8 bytes).
+        10 if rec.payload_len >= 8 && rec.payload_len <= 516 => {
+            let len =
+                im3_read_u32_le(bytes, rec.payload_offset + 4, "string length").ok()? as usize;
+            if len == 0 || len > 512 || 8 + len > rec.payload_len {
+                return None;
+            }
+            bytes.get(rec.payload_offset + 8..rec.payload_offset + 8 + len)?
+        }
+        _ => return None,
+    };
+    let end = raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len());
+    let text = std::str::from_utf8(&raw[..end]).ok()?.trim();
+    if text.is_empty()
+        || text
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r'))
+    {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+fn im3_float_entries(bytes: &[u8], rec: &Im3Record) -> Option<Vec<f64>> {
+    match (rec.rec_type, rec.payload_len) {
+        (3, 4) => {
+            let raw = bytes.get(rec.payload_offset..rec.payload_offset + 4)?;
+            let value = f32::from_le_bytes(raw.try_into().ok()?) as f64;
+            value.is_finite().then_some(vec![value])
+        }
+        (4, 8) => {
+            let raw = bytes.get(rec.payload_offset..rec.payload_offset + 8)?;
+            let value = f64::from_le_bytes(raw.try_into().ok()?);
+            value.is_finite().then_some(vec![value])
+        }
+        // Java IM3Reader FloatIM3Record: int32 code, int32 count, then f32s.
+        // A zero code stores a single f32 at offset + 4.
+        (7, len) if len >= 8 => {
+            let code = im3_read_u32_le(bytes, rec.payload_offset, "float record code").ok()?;
+            if code == 0 {
+                let raw = bytes.get(rec.payload_offset + 4..rec.payload_offset + 8)?;
+                let value = f32::from_le_bytes(raw.try_into().ok()?) as f64;
+                return value.is_finite().then_some(vec![value]);
+            }
+            let count =
+                im3_read_u32_le(bytes, rec.payload_offset + 4, "float array count").ok()? as usize;
+            let byte_len = count.checked_mul(4)?;
+            if 8 + byte_len > len || count > 4096 {
+                return None;
+            }
+            let mut values = Vec::with_capacity(count);
+            for index in 0..count {
+                let start = rec.payload_offset + 8 + index * 4;
+                let raw = bytes.get(start..start + 4)?;
+                let value = f32::from_le_bytes(raw.try_into().ok()?) as f64;
+                if !value.is_finite() {
+                    return None;
+                }
+                values.push(value);
+            }
+            Some(values)
+        }
+        _ => None,
+    }
+}
+
+fn im3_float_entry(bytes: &[u8], rec: &Im3Record) -> Option<f64> {
+    let values = im3_float_entries(bytes, rec)?;
+    (values.len() == 1).then_some(values[0])
+}
+
+fn im3_scalar_metadata_value(bytes: &[u8], rec: &Im3Record) -> Result<Option<MetadataValue>> {
+    if rec.rec_type == 6 && rec.name != "Shape" {
+        let values = im3_int_entries(bytes, rec)?;
+        if values.len() == 1 {
+            Ok(Some(MetadataValue::Int(values[0] as i64)))
+        } else {
+            Ok(Some(MetadataValue::String(
+                values
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )))
+        }
+    } else if let Some(value) = im3_string_entry(bytes, rec) {
+        Ok(Some(MetadataValue::String(value)))
+    } else if let Some(values) = im3_float_entries(bytes, rec) {
+        if values.len() == 1 {
+            Ok(Some(MetadataValue::Float(values[0])))
+        } else {
+            Ok(Some(MetadataValue::String(
+                values
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+fn im3_metadata_number(bytes: &[u8], rec: &Im3Record) -> Result<Option<f64>> {
+    if rec.rec_type == 6 && rec.name != "Shape" {
+        let values = im3_int_entries(bytes, rec)?;
+        Ok((values.len() == 1).then_some(values[0] as f64))
+    } else {
+        Ok(im3_float_entry(bytes, rec))
+    }
+}
+
+fn im3_channel_labels(value: &str, size_c: u32) -> Option<Vec<String>> {
+    let labels = value
+        .split([',', ';', '\t', '|'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (labels.len() == size_c as usize).then_some(labels)
+}
+
+fn im3_insert_interpreted_metadata(
+    bytes: &[u8],
+    children: &[Im3Record],
+    meta: &mut ImageMetadata,
+) -> Result<()> {
+    for child in children {
+        let Some(key) = im3_metadata_key(&child.name) else {
+            continue;
+        };
+        match key.as_str() {
+            "channel_wavelengths" | "wavelengths" | "emission_wavelengths" => {
+                if child.rec_type != 6 {
+                    continue;
+                }
+                let values = im3_int_entries(bytes, child)?;
+                if values.len() != meta.size_c as usize {
+                    continue;
+                }
+                let labels = values
+                    .iter()
+                    .map(|value| format!("{value} nm"))
+                    .collect::<Vec<_>>();
+                for (index, value) in values.iter().enumerate() {
+                    meta.series_metadata.insert(
+                        format!("im3.channel.{index}.emission_wavelength"),
+                        MetadataValue::Float(*value as f64),
+                    );
+                }
+                if values.len() >= 2 {
+                    let start = values[0] as f64;
+                    let end = *values.last().unwrap() as f64;
+                    let step = (end - start) / (values.len() - 1) as f64;
+                    meta.modulo_c = Some(ModuloAnnotation {
+                        parent_dimension: "C".into(),
+                        modulo_type: "lambda".into(),
+                        start,
+                        step,
+                        end,
+                        unit: "nm".into(),
+                        labels,
+                    });
+                }
+            }
+            "channel_names" | "channels" => {
+                if let Some(value) = im3_string_entry(bytes, child) {
+                    if let Some(labels) = im3_channel_labels(&value, meta.size_c) {
+                        for (index, label) in labels.into_iter().enumerate() {
+                            meta.series_metadata.insert(
+                                format!("im3.channel.{index}.name"),
+                                MetadataValue::String(label),
+                            );
+                        }
+                    }
+                }
+            }
+            "instrument_name" => {
+                if let Some(value) = im3_string_entry(bytes, child) {
+                    meta.series_metadata
+                        .insert("im3.instrument.name".into(), MetadataValue::String(value));
+                }
+            }
+            "exposure_time" | "exposure_seconds" | "laser_power" => {
+                if let Some(value) = im3_metadata_number(bytes, child)? {
+                    meta.series_metadata.insert(
+                        format!("im3.acquisition.{key}"),
+                        MetadataValue::Float(value),
+                    );
+                }
+            }
+            key if key.starts_with("camera_gain") => {
+                if let Some(value) = im3_metadata_number(bytes, child)? {
+                    meta.series_metadata.insert(
+                        "im3.acquisition.camera_gain".into(),
+                        MetadataValue::Float(value),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn im3_insert_container_scalar_metadata(
+    bytes: &[u8],
+    container: &Im3Record,
+    meta: &mut ImageMetadata,
+) -> Result<()> {
+    let children = im3_container_children(bytes, container)?;
+    im3_insert_interpreted_metadata(bytes, &children, meta)?;
+    let mut unsupported_records = Vec::new();
+    for child in children {
+        let Some(key) = im3_metadata_key(&child.name) else {
+            continue;
+        };
+        let value = im3_scalar_metadata_value(bytes, &child)?;
+        if let Some(value) = value {
+            meta.series_metadata
+                .insert(format!("im3.native.{key}"), value);
+        } else if let Some(diagnostic) = im3_unsupported_metadata_record(bytes, &child)? {
+            unsupported_records.push(diagnostic);
+        }
+    }
+    if !unsupported_records.is_empty() {
+        let total = unsupported_records.len();
+        unsupported_records.truncate(16);
+        let mut diagnostic = unsupported_records.join("; ");
+        if total > unsupported_records.len() {
+            diagnostic.push_str(&format!("; {} more", total - unsupported_records.len()));
+        }
+        meta.series_metadata.insert(
+            "im3.native.unsupported_metadata_records".into(),
+            MetadataValue::String(diagnostic),
+        );
+        meta.series_metadata.insert(
+            "im3.native.unsupported_metadata_record_count".into(),
+            MetadataValue::Int(total as i64),
+        );
+    }
+    Ok(())
+}
+
+fn im3_unsupported_metadata_record(bytes: &[u8], rec: &Im3Record) -> Result<Option<String>> {
+    if matches!(rec.name.as_str(), "Shape" | "Data") || rec.rec_type == 1 {
+        return Ok(None);
+    }
+    if rec.rec_type == 0 {
+        let children = im3_container_children(bytes, rec)?;
+        let has_pixels = children
+            .iter()
+            .any(|child| matches!(child.name.as_str(), "Shape" | "Data"));
+        if has_pixels {
+            return Ok(None);
+        }
+        return Ok(Some(format!(
+            "{}(type=0,len={},children={})",
+            rec.name,
+            rec.payload_len,
+            children.len()
+        )));
+    }
+    Ok(Some(format!(
+        "{}(type={},len={})",
+        rec.name, rec.rec_type, rec.payload_len
+    )))
+}
+
+fn im3_collect_dataset_candidates(
+    bytes: &[u8],
+    rec: &Im3Record,
+    out: &mut Vec<Im3DatasetCandidate>,
+) -> Result<()> {
+    let children = im3_container_children(bytes, rec)?;
+    let shape = children
+        .iter()
+        .find(|child| child.name == "Shape" && child.rec_type == 6)
+        .cloned();
+    let data = children
+        .iter()
+        .find(|child| child.name == "Data" && child.rec_type == 1)
+        .cloned();
+    if let (Some(shape), Some(data)) = (shape, data) {
+        out.push(Im3DatasetCandidate {
+            container: rec.clone(),
+            shape,
+            data,
+        });
+    }
+    for child in children.iter().filter(|child| child.rec_type == 0) {
+        im3_collect_dataset_candidates(bytes, child, out)?;
+    }
+    Ok(())
+}
+
+fn parse_im3_native(path: &Path) -> Result<Im3NativeState> {
+    let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    if !im3_native_cookie(&bytes) {
+        return Err(synthetic_raw_unsupported(Im3Reader::spec()));
+    }
+    if bytes.len() < 4 {
+        return Err(BioFormatsError::Format(
+            "IM3 native header is truncated".into(),
+        ));
+    }
+
+    let mut pos = 4;
+    let mut top_records = Vec::new();
+    while pos < bytes.len().saturating_sub(8) {
+        match im3_parse_record(&bytes, &mut pos, bytes.len())? {
+            Some(record) => top_records.push(record),
+            None => {
+                if pos > bytes.len().saturating_sub(16) {
+                    break;
+                }
+                let chunk_end = pos.checked_add(16).ok_or_else(|| {
+                    BioFormatsError::Format("IM3 native chunk offset overflows".into())
+                })?;
+                if chunk_end > bytes.len() {
+                    break;
+                }
+                pos = chunk_end;
+            }
+        }
+    }
+
+    let mut datasets = Vec::new();
+    for rec in top_records.iter().filter(|rec| rec.rec_type == 0) {
+        im3_collect_dataset_candidates(&bytes, rec, &mut datasets)?;
+    }
+    if datasets.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "IM3 native file contains no supported Shape/Data dataset".into(),
+        ));
+    }
+    let dataset_count = datasets.len();
+    let mut native_datasets = Vec::with_capacity(dataset_count);
+    for (dataset_index, dataset) in datasets.iter().enumerate() {
+        native_datasets.push(parse_im3_native_dataset(
+            &bytes,
+            dataset,
+            dataset_count,
+            dataset_index,
+        )?);
+    }
+
+    Ok(Im3NativeState {
+        path: path.to_path_buf(),
+        datasets: native_datasets,
+    })
+}
+
+fn parse_im3_native_dataset(
+    bytes: &[u8],
+    dataset: &Im3DatasetCandidate,
+    dataset_count: usize,
+    dataset_index: usize,
+) -> Result<Im3NativeDataset> {
+    let shape_rec = &dataset.shape;
+    let data_rec = &dataset.data;
+    let shape = im3_int_entries(bytes, shape_rec)?;
+    if shape.len() < 3 {
+        return Err(BioFormatsError::Format(
+            "IM3 native Shape record must contain width, height, and channels".into(),
+        ));
+    }
+    let size_x = shape[0];
+    let size_y = shape[1];
+    let size_c = shape[2];
+    if size_x == 0 || size_y == 0 || size_c == 0 {
+        return Err(BioFormatsError::Format(
+            "IM3 native dimensions must be non-zero".into(),
+        ));
+    }
+    if data_rec.payload_len < 16 {
+        return Err(BioFormatsError::Format(
+            "IM3 native Data record is truncated".into(),
+        ));
+    }
+    let data_width = im3_read_u32_le(bytes, data_rec.payload_offset + 4, "Data width")?;
+    let data_height = im3_read_u32_le(bytes, data_rec.payload_offset + 8, "Data height")?;
+    let data_channels = im3_read_u32_le(bytes, data_rec.payload_offset + 12, "Data channels")?;
+    if (data_width, data_height, data_channels) != (size_x, size_y, size_c) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "IM3 native Shape/Data mismatch: shape {size_x}x{size_y}x{size_c}, data {data_width}x{data_height}x{data_channels}"
+        )));
+    }
+
+    let samples = (size_x as usize)
+        .checked_mul(size_y as usize)
+        .and_then(|v| v.checked_mul(size_c as usize))
+        .ok_or_else(|| BioFormatsError::Format("IM3 native sample count overflows".into()))?;
+    let interleaved_len = samples
+        .checked_mul(2)
+        .ok_or_else(|| BioFormatsError::Format("IM3 native byte count overflows".into()))?;
+    let data_offset = data_rec
+        .payload_offset
+        .checked_add(16)
+        .ok_or_else(|| BioFormatsError::Format("IM3 native data offset overflows".into()))?;
+    if data_offset + interleaved_len > data_rec.payload_offset + data_rec.payload_len
+        || data_offset + interleaved_len > bytes.len()
+    {
+        return Err(BioFormatsError::InvalidData(format!(
+            "IM3 native Data payload is {}, expected at least {interleaved_len}",
+            (data_rec.payload_offset + data_rec.payload_len).saturating_sub(data_offset)
+        )));
+    }
+
+    let mut meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z: 1,
+        size_c,
+        size_t: 1,
+        pixel_type: PixelType::Uint16,
+        bits_per_pixel: 16,
+        image_count: size_c,
+        is_little_endian: true,
+        ..ImageMetadata::default()
+    };
+    meta.series_metadata.insert(
+        "IM3 DataSets".into(),
+        crate::common::metadata::MetadataValue::Int(dataset_count as i64),
+    );
+    meta.series_metadata.insert(
+        "IM3 DataSet Index".into(),
+        crate::common::metadata::MetadataValue::Int(dataset_index as i64),
+    );
+    im3_insert_container_scalar_metadata(bytes, &dataset.container, &mut meta)?;
+
+    Ok(Im3NativeDataset {
+        meta,
+        data_offset: data_offset as u64,
+        interleaved_len,
+    })
+}
+
+fn im3_native_open_bytes_region(
+    state: &Im3NativeState,
+    dataset: &Im3NativeDataset,
+    plane_index: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    if plane_index >= dataset.meta.image_count {
+        return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+    }
+    let meta = &dataset.meta;
+    if x.checked_add(w).is_none_or(|v| v > meta.size_x)
+        || y.checked_add(h).is_none_or(|v| v > meta.size_y)
+    {
+        return Err(BioFormatsError::Format(format!(
+            "IM3 region {}x{} at {},{} exceeds image {}x{}",
+            w, h, x, y, meta.size_x, meta.size_y
+        )));
+    }
+    let mut reader = BufReader::new(File::open(&state.path).map_err(BioFormatsError::Io)?);
+    let interleaved = read_bytes_at(&mut reader, dataset.data_offset, dataset.interleaved_len)?;
+    let channels = meta.size_c as usize;
+    let width = meta.size_x as usize;
+    let mut out = Vec::with_capacity((w as usize) * (h as usize) * 2);
+    for row in y as usize..(y + h) as usize {
+        for col in x as usize..(x + w) as usize {
+            let sample = (row * width + col)
+                .checked_mul(channels)
+                .and_then(|v| v.checked_add(plane_index as usize))
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("IM3 native plane offset overflows".into())
+                })?;
+            out.extend_from_slice(interleaved.get(sample..sample + 2).ok_or_else(|| {
+                BioFormatsError::InvalidData("IM3 native interleaved payload is truncated".into())
+            })?);
+        }
+    }
+    Ok(out)
+}
+
 /// Amnis/Luminex IM3 format reader (`.im3`).
 pub struct Im3Reader {
-    state: Option<SyntheticRawState>,
+    state: Option<Im3State>,
+    current_series: usize,
 }
 
 impl Im3Reader {
     pub fn new() -> Self {
-        Self { state: None }
+        Self {
+            state: None,
+            current_series: 0,
+        }
     }
 
     fn spec() -> SyntheticRawSpec {
         SyntheticRawSpec {
             format_name: "IM3",
-            unsupported_message: "IM3 proprietary native decoding is unsupported; explicit synthetic raw fixtures are supported",
+            unsupported_message: "IM3 proprietary native decoding is unsupported for this file; explicit synthetic raw fixtures are supported",
             extension: "im3",
             magic: SYNTHETIC_IM3_MAGIC,
         }
@@ -1005,52 +1678,107 @@ impl FormatReader for Im3Reader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        Self::spec().matches_bytes(header)
+        Self::spec().matches_bytes(header) || im3_native_cookie(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.state = Some(parse_synthetic_raw(path, Self::spec())?);
+        self.state = Some(match parse_synthetic_raw(path, Self::spec()) {
+            Ok(state) => Im3State::Synthetic(state),
+            Err(err @ BioFormatsError::UnsupportedFormat(_)) => {
+                let mut magic = vec![0u8; Self::spec().magic.len()];
+                if File::open(path)
+                    .and_then(|mut file| file.read_exact(&mut magic))
+                    .is_ok()
+                    && magic == Self::spec().magic
+                {
+                    return Err(err);
+                }
+                Im3State::Native(parse_im3_native(path)?)
+            }
+            Err(err) => return Err(err),
+        });
+        self.current_series = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.state = None;
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.state.is_some())
+        match self.state.as_ref() {
+            Some(Im3State::Synthetic(_)) => 1,
+            Some(Im3State::Native(state)) => state.datasets.len(),
+            None => 0,
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.state.is_none() {
-            Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
-            Ok(())
-        } else {
-            Err(BioFormatsError::SeriesOutOfRange(s))
+        match self.state.as_ref() {
+            Some(Im3State::Synthetic(_)) if s == 0 => {
+                self.current_series = 0;
+                Ok(())
+            }
+            Some(Im3State::Native(state)) if s < state.datasets.len() => {
+                self.current_series = s;
+                Ok(())
+            }
+            Some(_) => Err(BioFormatsError::SeriesOutOfRange(s)),
+            None => Err(BioFormatsError::NotInitialized),
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
         self.state
             .as_ref()
-            .map(|state| &state.meta)
+            .map(|state| match state {
+                Im3State::Synthetic(state) => &state.meta,
+                Im3State::Native(state) => &state.datasets[self.current_series].meta,
+            })
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes(state, Self::spec(), p)
+        match state {
+            Im3State::Synthetic(state) => synthetic_raw_open_bytes(state, Self::spec(), p),
+            Im3State::Native(state) => {
+                let dataset = &state.datasets[self.current_series];
+                im3_native_open_bytes_region(
+                    state,
+                    dataset,
+                    p,
+                    0,
+                    0,
+                    dataset.meta.size_x,
+                    dataset.meta.size_y,
+                )
+            }
+        }
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes_region(state, Self::spec(), p, x, y, w, h)
+        match state {
+            Im3State::Synthetic(state) => {
+                synthetic_raw_open_bytes_region(state, Self::spec(), p, x, y, w, h)
+            }
+            Im3State::Native(state) => im3_native_open_bytes_region(
+                state,
+                &state.datasets[self.current_series],
+                p,
+                x,
+                y,
+                w,
+                h,
+            ),
+        }
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
@@ -1061,28 +1789,1122 @@ impl FormatReader for Im3Reader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(p, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let state = self.state.as_ref()?;
+        match state {
+            Im3State::Synthetic(state) => {
+                let mut ome =
+                    crate::common::ome_metadata::OmeMetadata::from_image_metadata(&state.meta);
+                let _ = ome.add_original_metadata_annotations(&state.meta, 0);
+                Some(ome)
+            }
+            Im3State::Native(state) => {
+                let mut ome = crate::common::ome_metadata::OmeMetadata::default();
+                for (index, dataset) in state.datasets.iter().enumerate() {
+                    let mut image = crate::common::ome_metadata::OmeMetadata::from_image_metadata(
+                        &dataset.meta,
+                    );
+                    ome.images.extend(image.images.drain(..));
+                    let _ = ome.add_original_metadata_annotations(&dataset.meta, index);
+                }
+                Some(ome)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 3. 3i SlideBook 7 — conservative synthetic raw subset
+// 3. 3i SlideBook 7 — native directory subset + synthetic raw fixtures
 // ---------------------------------------------------------------------------
-/// 3i SlideBook 7 format reader (`.sld`).
+/// 3i SlideBook 7 format reader (`.sld`, `.sldy`, `.sldyz`).
 pub struct SlideBook7Reader {
-    state: Option<SyntheticRawState>,
+    state: Option<SlideBook7State>,
+    current_series: usize,
+}
+
+enum SlideBook7State {
+    Synthetic(SyntheticRawState),
+    Native(SlideBook7NativeState),
+}
+
+struct SlideBook7NativeState {
+    series: Vec<SlideBook7Series>,
+    extracted_dir: Option<PathBuf>,
+}
+
+struct SlideBook7Series {
+    meta: ImageMetadata,
+    files: Vec<SlideBook7PlaneFile>,
+    plane_len: usize,
+}
+
+#[derive(Clone)]
+struct SlideBook7PlaneFile {
+    path: PathBuf,
+    header_len: u64,
+    z_planes: u32,
+    timepoint: u32,
+    channel: u32,
+    compressed: bool,
+}
+
+struct SlideBook7NpyHeader {
+    header_len: u64,
+    pixel_type: PixelType,
+    little_endian: bool,
+    fortran_order: bool,
+    shape: Vec<u32>,
+}
+
+struct SlideBook7NativeRoot {
+    root: PathBuf,
+    extracted_dir: Option<PathBuf>,
+}
+
+fn slidebook7_missing_record(path: &Path, key: &str) -> BioFormatsError {
+    BioFormatsError::Format(format!(
+        "SlideBook 7 ImageRecord {} is missing {key}",
+        path.display()
+    ))
+}
+
+fn slidebook7_safe_archive_entry(name: &str) -> Option<PathBuf> {
+    let mut rel = PathBuf::new();
+    for component in Path::new(name).components() {
+        match component {
+            std::path::Component::Normal(part) => rel.push(part),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!rel.as_os_str().is_empty()).then_some(rel)
+}
+
+fn slidebook7_group_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut groups = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(BioFormatsError::Io)? {
+        let entry = entry.map_err(BioFormatsError::Io)?;
+        let group_path = entry.path();
+        if !group_path.is_dir() {
+            continue;
+        }
+        let Some(name) = group_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".imgdir") {
+            continue;
+        }
+        if group_path.join("ImageRecord.yaml").is_file() {
+            groups.push(group_path);
+        }
+    }
+    groups.sort();
+    Ok(groups)
+}
+
+fn slidebook7_nested_dir_roots(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(BioFormatsError::Io)? {
+            let entry = entry.map_err(BioFormatsError::Io)?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.ends_with(".dir"))
+            {
+                roots.push(path.clone());
+            }
+            pending.push(path);
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn slidebook7_yaml_u32(text: &str, keys: &[&str]) -> Option<u32> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"').trim_matches('\'');
+        if !keys.iter().any(|candidate| key == *candidate) {
+            continue;
+        }
+        let value = value
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        if let Ok(parsed) = value.parse::<u32>() {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn slidebook7_yaml_raw_scalar(value: &str) -> String {
+    value
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(',')
+        .trim()
+        .to_string()
+}
+
+fn slidebook7_yaml_scalar(line: &str) -> Option<(usize, bool, String, String, String)> {
+    let indent = line.len().saturating_sub(line.trim_start().len());
+    let mut trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let is_list_item = trimmed.starts_with('-');
+    if is_list_item {
+        trimmed = trimmed[1..].trim_start();
+        if trimmed.is_empty() {
+            return Some((indent, true, String::new(), String::new(), String::new()));
+        }
+    }
+    let (key, value) = trimmed.split_once(':')?;
+    let key = key.trim().trim_matches('"').trim_matches('\'');
+    if key.is_empty() {
+        return None;
+    }
+    let raw_value = slidebook7_yaml_raw_scalar(value);
+    let value = slidebook7_clean_yaml_scalar(&raw_value).unwrap_or_default();
+    Some((indent, is_list_item, key.to_string(), value, raw_value))
+}
+
+fn slidebook7_clean_yaml_scalar(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches(',');
+    if value.is_empty()
+        || value == "[]"
+        || value == "{}"
+        || value.starts_with('[')
+        || value.starts_with('{')
+    {
+        return None;
+    }
+    let value = value
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches(',')
+        .trim();
+    if value.is_empty() || value.len() > 512 {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn slidebook7_split_flow_items(text: &str) -> Option<Vec<String>> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in text.chars() {
+        match quote {
+            Some(q) if ch == q => {
+                quote = None;
+                current.push(ch);
+            }
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            None if ch == ',' => {
+                items.push(current.trim().to_string());
+                current.clear();
+            }
+            None if matches!(ch, '[' | ']' | '{' | '}') => return None,
+            None => current.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    items.push(current.trim().to_string());
+    Some(items)
+}
+
+fn slidebook7_inline_scalar_map(raw_value: &str) -> Option<Vec<(String, String)>> {
+    let trimmed = raw_value.trim();
+    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut pairs = Vec::new();
+    for item in slidebook7_split_flow_items(inner)? {
+        let (key, value) = item.split_once(':')?;
+        let key = key.trim().trim_matches('"').trim_matches('\'');
+        if key.is_empty() {
+            return None;
+        }
+        pairs.push((key.to_string(), slidebook7_clean_yaml_scalar(value)?));
+    }
+    Some(pairs)
+}
+
+fn slidebook7_inline_scalar_list(raw_value: &str) -> Option<Vec<String>> {
+    let trimmed = raw_value.trim();
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut values = Vec::new();
+    for item in slidebook7_split_flow_items(inner)? {
+        values.push(slidebook7_clean_yaml_scalar(&item)?);
+    }
+    Some(values)
+}
+
+fn slidebook7_is_channel_list_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower == "channels"
+        || lower == "mchannels"
+        || lower == "channelrecords"
+        || lower == "mchannelrecords"
+}
+
+fn slidebook7_is_channel_name_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "name" | "mname" | "channelname" | "mchannelname"
+    )
+}
+
+fn slidebook7_elapsed_key(key: &str) -> Option<&'static str> {
+    let lower = key.to_ascii_lowercase();
+    (lower.contains("elapsed") && lower.contains("time")).then_some("elapsed_time")
+}
+
+fn slidebook7_position_key(key: &str) -> Option<&'static str> {
+    let lower = key.to_ascii_lowercase();
+    if !(lower.contains("position") || lower.contains("stage")) {
+        return None;
+    }
+    if lower.ends_with('x') || lower.contains("_x") || lower.contains(" x") {
+        Some("position_x")
+    } else if lower.ends_with('y') || lower.contains("_y") || lower.contains(" y") {
+        Some("position_y")
+    } else if lower.ends_with('z') || lower.contains("_z") || lower.contains(" z") {
+        Some("position_z")
+    } else {
+        None
+    }
+}
+
+fn slidebook7_inline_position_key(parent_key: &str, child_key: &str) -> Option<&'static str> {
+    let parent = parent_key.to_ascii_lowercase();
+    if !(parent.contains("position") || parent.contains("stage")) {
+        return None;
+    }
+    match child_key.to_ascii_lowercase().as_str() {
+        "x" | "mx" => Some("position_x"),
+        "y" | "my" => Some("position_y"),
+        "z" | "mz" => Some("position_z"),
+        _ => None,
+    }
+}
+
+fn slidebook7_insert_float_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    key: String,
+    value: &str,
+) {
+    if let Ok(parsed) = value.parse::<f64>() {
+        if parsed.is_finite() {
+            metadata.insert(key, MetadataValue::Float(parsed));
+        }
+    }
+}
+
+fn slidebook7_metadata_key(key: &str) -> String {
+    let mut out = String::new();
+    for ch in key.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_');
+    if out.is_empty() {
+        "value".to_string()
+    } else {
+        out.to_string()
+    }
+}
+
+fn slidebook7_insert_scalar_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    key: String,
+    value: &str,
+) {
+    if let Ok(parsed) = value.parse::<i64>() {
+        metadata.insert(key, MetadataValue::Int(parsed));
+    } else if let Ok(parsed) = value.parse::<f64>() {
+        if parsed.is_finite() {
+            metadata.insert(key, MetadataValue::Float(parsed));
+        }
+    } else {
+        match value.to_ascii_lowercase().as_str() {
+            "true" => {
+                metadata.insert(key, MetadataValue::Bool(true));
+            }
+            "false" => {
+                metadata.insert(key, MetadataValue::Bool(false));
+            }
+            _ => {
+                metadata.insert(key, MetadataValue::String(value.to_string()));
+            }
+        };
+    }
+}
+
+fn slidebook7_yaml_record_path(stack: &[(usize, String)], key: &str) -> String {
+    let mut parts = stack
+        .iter()
+        .map(|(_, part)| part.as_str())
+        .collect::<Vec<_>>();
+    if !key.is_empty() {
+        parts.push(key);
+    }
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .map(slidebook7_metadata_key)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn slidebook7_image_record_metadata(text: &str) -> HashMap<String, MetadataValue> {
+    let mut metadata = HashMap::new();
+    let mut yaml_stack: Vec<(usize, String)> = Vec::new();
+    let mut list_counts: HashMap<String, u32> = HashMap::new();
+    let mut channel_list_indent: Option<usize> = None;
+    let mut current_channel: Option<u32> = None;
+    let mut channel_count = 0u32;
+
+    for line in text.lines() {
+        let Some((indent, is_list_item, key, value, raw_value)) = slidebook7_yaml_scalar(line)
+        else {
+            continue;
+        };
+        while yaml_stack
+            .last()
+            .is_some_and(|(stack_indent, _)| indent <= *stack_indent)
+        {
+            yaml_stack.pop();
+        }
+        if is_list_item {
+            let parent_path = slidebook7_yaml_record_path(&yaml_stack, "");
+            let item = list_counts.entry(parent_path).or_insert(0);
+            yaml_stack.push((indent, item.to_string()));
+            *item = item.saturating_add(1);
+        }
+        if !value.is_empty() {
+            let record_path = slidebook7_yaml_record_path(&yaml_stack, &key);
+            if !record_path.is_empty() {
+                slidebook7_insert_scalar_metadata(
+                    &mut metadata,
+                    format!("slidebook7.record.{record_path}"),
+                    &value,
+                );
+            }
+        } else if let Some(pairs) = slidebook7_inline_scalar_map(&raw_value) {
+            let record_path = slidebook7_yaml_record_path(&yaml_stack, &key);
+            if !record_path.is_empty() {
+                for (child_key, child_value) in pairs {
+                    let child_path =
+                        format!("{record_path}.{}", slidebook7_metadata_key(&child_key));
+                    slidebook7_insert_scalar_metadata(
+                        &mut metadata,
+                        format!("slidebook7.record.{child_path}"),
+                        &child_value,
+                    );
+                    if let Some(channel) = current_channel {
+                        if let Some(field) = slidebook7_inline_position_key(&key, &child_key) {
+                            slidebook7_insert_float_metadata(
+                                &mut metadata,
+                                format!("slidebook7.channel.{channel}.{field}"),
+                                &child_value,
+                            );
+                        }
+                    } else if let Some(field) = slidebook7_inline_position_key(&key, &child_key) {
+                        slidebook7_insert_float_metadata(
+                            &mut metadata,
+                            format!("slidebook7.{field}"),
+                            &child_value,
+                        );
+                    }
+                }
+            }
+        } else if let Some(values) = slidebook7_inline_scalar_list(&raw_value) {
+            let record_path = slidebook7_yaml_record_path(&yaml_stack, &key);
+            if !record_path.is_empty() {
+                for (index, child_value) in values.into_iter().enumerate() {
+                    slidebook7_insert_scalar_metadata(
+                        &mut metadata,
+                        format!("slidebook7.record.{record_path}.{index}"),
+                        &child_value,
+                    );
+                }
+            }
+        } else if !key.is_empty() {
+            yaml_stack.push((indent, key.clone()));
+        }
+
+        if channel_list_indent.is_some_and(|list_indent| indent <= list_indent) {
+            channel_list_indent = None;
+            current_channel = None;
+        }
+        if slidebook7_is_channel_list_key(&key) {
+            channel_list_indent = Some(indent);
+            current_channel = None;
+            continue;
+        }
+        if is_list_item && channel_list_indent.is_some() {
+            current_channel = Some(channel_count);
+            channel_count = channel_count.saturating_add(1);
+        }
+
+        if let Some(channel) = current_channel {
+            let prefix = format!("slidebook7.channel.{channel}");
+            if slidebook7_is_channel_name_key(&key) {
+                metadata.insert(format!("{prefix}.name"), MetadataValue::String(value));
+                continue;
+            }
+            if let Some(field) = slidebook7_elapsed_key(&key) {
+                slidebook7_insert_float_metadata(
+                    &mut metadata,
+                    format!("{prefix}.{field}"),
+                    &value,
+                );
+                continue;
+            }
+            if let Some(field) = slidebook7_position_key(&key) {
+                slidebook7_insert_float_metadata(
+                    &mut metadata,
+                    format!("{prefix}.{field}"),
+                    &value,
+                );
+                continue;
+            }
+        }
+
+        if let Some(field) = slidebook7_elapsed_key(&key) {
+            slidebook7_insert_float_metadata(&mut metadata, format!("slidebook7.{field}"), &value);
+        } else if let Some(field) = slidebook7_position_key(&key) {
+            slidebook7_insert_float_metadata(&mut metadata, format!("slidebook7.{field}"), &value);
+        }
+    }
+
+    metadata
+}
+
+fn slidebook7_filename_number(name: &str, marker: &str) -> Option<u32> {
+    let start = name.find(marker)? + marker.len();
+    let rest = name.get(start..)?;
+    let digits = rest
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .last()
+        .map(|(idx, c)| idx + c.len_utf8())?;
+    let value = &rest[..digits];
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<u32>().ok()
+}
+
+fn slidebook7_filename_fixed_number(name: &str, marker: &str, digits: usize) -> Option<u32> {
+    let start = name.find(marker)? + marker.len();
+    let value = name.get(start..start + digits)?;
+    if !value.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u32>().ok()
+}
+
+fn slidebook7_npy_zyx_shape(shape: &[u32], _declared_z: u32) -> Result<(u32, u32, u32)> {
+    match shape {
+        [y, x] => Ok((1, *y, *x)),
+        [z, y, x] => Ok((*z, *y, *x)),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "SlideBook 7 unsupported NPY shape {shape:?}; expected YX or ZYX"
+        ))),
+    }
+}
+
+fn slidebook7_npy_pixel_type(descr: &str) -> Result<(PixelType, bool)> {
+    let (endian, dtype) = descr.split_at(1);
+    let little_endian = match endian {
+        "<" | "|" => true,
+        ">" => false,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "SlideBook 7 unsupported NPY byte order marker {other:?}"
+            )));
+        }
+    };
+    let pixel_type = match dtype {
+        "u1" => PixelType::Uint8,
+        "i1" => PixelType::Int8,
+        "u2" => PixelType::Uint16,
+        "i2" => PixelType::Int16,
+        "u4" => PixelType::Uint32,
+        "i4" => PixelType::Int32,
+        "f4" => PixelType::Float32,
+        "f8" => PixelType::Float64,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "SlideBook 7 unsupported NPY pixel type {other:?}"
+            )));
+        }
+    };
+    Ok((pixel_type, little_endian))
+}
+
+fn slidebook7_header_string_value<'a>(header: &'a str, key: &str) -> Option<&'a str> {
+    let key_pos = header.find(key)?;
+    let after_key = &header[key_pos + key.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+    let quote = after_colon.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let rest = &after_colon[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(&rest[..end])
+}
+
+fn slidebook7_header_bool_value(header: &str, key: &str) -> Option<bool> {
+    let key_pos = header.find(key)?;
+    let after_key = &header[key_pos + key.len()..];
+    let colon = after_key.find(':')?;
+    let value = after_key[colon + 1..].trim_start();
+    if value.starts_with("True") {
+        Some(true)
+    } else if value.starts_with("False") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn slidebook7_header_shape(header: &str) -> Result<Vec<u32>> {
+    let start = header
+        .find('(')
+        .ok_or_else(|| BioFormatsError::Format("SlideBook 7 NPY header lacks shape".into()))?;
+    let end = header[start + 1..]
+        .find(')')
+        .map(|idx| start + 1 + idx)
+        .ok_or_else(|| BioFormatsError::Format("SlideBook 7 NPY header lacks shape".into()))?;
+    let mut shape = Vec::new();
+    for part in header[start + 1..end].split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        shape.push(trimmed.parse::<u32>().map_err(|_| {
+            BioFormatsError::Format(format!(
+                "SlideBook 7 NPY header has invalid shape value {trimmed:?}"
+            ))
+        })?);
+    }
+    if shape.len() < 2 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "SlideBook 7 unsupported NPY shape {shape:?}"
+        )));
+    }
+    Ok(shape)
+}
+
+fn slidebook7_npyz_decode(data: &[u8], path: &Path) -> Result<Vec<u8>> {
+    for kind in 0..3 {
+        let mut decoded = Vec::new();
+        let result = match kind {
+            0 => flate2::read::GzDecoder::new(data).read_to_end(&mut decoded),
+            1 => flate2::read::ZlibDecoder::new(data).read_to_end(&mut decoded),
+            _ => flate2::read::DeflateDecoder::new(data).read_to_end(&mut decoded),
+        };
+        if result.is_ok() && decoded.starts_with(b"\x93NUMPY") {
+            return Ok(decoded);
+        }
+    }
+    Err(BioFormatsError::UnsupportedFormat(format!(
+        "SlideBook 7 NPYZ image data is not a gzip/zlib/deflate-compressed NPY payload: {}",
+        path.display()
+    )))
+}
+
+fn slidebook7_npy_bytes(path: &Path) -> Result<(Vec<u8>, bool)> {
+    let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("npyz"))
+    {
+        Ok((slidebook7_npyz_decode(&data, path)?, true))
+    } else {
+        Ok((data, false))
+    }
+}
+
+fn parse_slidebook7_npy_header_bytes(data: &[u8], path: &Path) -> Result<SlideBook7NpyHeader> {
+    if data.len() < 10 || &data[..6] != b"\x93NUMPY" {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "SlideBook 7 image data is not a NPY file: {}",
+            path.display()
+        )));
+    }
+    let major = data[6];
+    let minor = data[7];
+    let (header_len, header_start) = match major {
+        1 => (u16::from_le_bytes([data[8], data[9]]) as usize, 10usize),
+        2 | 3 => {
+            if data.len() < 12 {
+                return Err(BioFormatsError::Format(format!(
+                    "SlideBook 7 NPY header is truncated: {}",
+                    path.display()
+                )));
+            }
+            (
+                u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize,
+                12usize,
+            )
+        }
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "SlideBook 7 unsupported NPY version {other}.{minor}: {}",
+                path.display()
+            )));
+        }
+    };
+    let header_end = header_start.checked_add(header_len).ok_or_else(|| {
+        BioFormatsError::Format(format!(
+            "SlideBook 7 NPY header length overflows: {}",
+            path.display()
+        ))
+    })?;
+    if header_end > data.len() {
+        return Err(BioFormatsError::Format(format!(
+            "SlideBook 7 NPY header extends past end of file: {}",
+            path.display()
+        )));
+    }
+    let header = std::str::from_utf8(&data[header_start..header_end]).map_err(|_| {
+        BioFormatsError::Format(format!(
+            "SlideBook 7 NPY header is not UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    let descr = slidebook7_header_string_value(header, "descr").ok_or_else(|| {
+        BioFormatsError::Format(format!(
+            "SlideBook 7 NPY header lacks dtype descriptor: {}",
+            path.display()
+        ))
+    })?;
+    let (pixel_type, little_endian) = slidebook7_npy_pixel_type(descr)?;
+    let fortran_order = slidebook7_header_bool_value(header, "fortran_order").ok_or_else(|| {
+        BioFormatsError::Format(format!(
+            "SlideBook 7 NPY header lacks fortran_order: {}",
+            path.display()
+        ))
+    })?;
+    Ok(SlideBook7NpyHeader {
+        header_len: header_end as u64,
+        pixel_type,
+        little_endian,
+        fortran_order,
+        shape: slidebook7_header_shape(header)?,
+    })
+}
+
+fn parse_slidebook7_npy_header(path: &Path) -> Result<SlideBook7NpyHeader> {
+    let (data, _) = slidebook7_npy_bytes(path)?;
+    parse_slidebook7_npy_header_bytes(&data, path)
 }
 
 impl SlideBook7Reader {
     pub fn new() -> Self {
-        Self { state: None }
+        Self {
+            state: None,
+            current_series: 0,
+        }
     }
 
     fn spec() -> SyntheticRawSpec {
         SyntheticRawSpec {
             format_name: "SlideBook 7",
-            unsupported_message: "SlideBook 7 proprietary native decoding is unsupported; explicit synthetic raw fixtures are supported",
+            unsupported_message: "SlideBook 7 native payload is not a supported uncompressed .sldy directory; explicit synthetic raw fixtures are supported",
             extension: "sld",
             magic: SYNTHETIC_SLIDEBOOK7_MAGIC,
         }
+    }
+
+    fn extract_sldyz(path: &Path) -> Result<SlideBook7NativeRoot> {
+        let file = File::open(path).map_err(BioFormatsError::Io)?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+            BioFormatsError::Format(format!(
+                "SlideBook 7 compressed .sldyz archive open error: {e}"
+            ))
+        })?;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let extracted_dir = std::env::temp_dir().join(format!(
+            "bioformats_slidebook7_sldyz_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&extracted_dir).map_err(BioFormatsError::Io)?;
+
+        let result = (|| -> Result<SlideBook7NativeRoot> {
+            for i in 0..archive.len() {
+                let mut entry = archive.by_index(i).map_err(|e| {
+                    BioFormatsError::Format(format!(
+                        "SlideBook 7 compressed .sldyz archive entry error: {e}"
+                    ))
+                })?;
+                let name = entry.name().to_string();
+                let rel_path = slidebook7_safe_archive_entry(&name).ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "SlideBook 7 compressed .sldyz archive has unsafe entry path: {name}"
+                    ))
+                })?;
+                let out_path = extracted_dir.join(rel_path);
+                if entry.is_dir() {
+                    std::fs::create_dir_all(&out_path).map_err(BioFormatsError::Io)?;
+                    continue;
+                }
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(BioFormatsError::Io)?;
+                }
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
+                std::fs::write(&out_path, &buf).map_err(BioFormatsError::Io)?;
+            }
+
+            for root in slidebook7_nested_dir_roots(&extracted_dir)? {
+                if !slidebook7_group_dirs(&root)?.is_empty() {
+                    return Ok(SlideBook7NativeRoot {
+                        root,
+                        extracted_dir: Some(extracted_dir.clone()),
+                    });
+                }
+            }
+            if !slidebook7_group_dirs(&extracted_dir)?.is_empty() {
+                return Ok(SlideBook7NativeRoot {
+                    root: extracted_dir.clone(),
+                    extracted_dir: Some(extracted_dir.clone()),
+                });
+            }
+            Err(BioFormatsError::UnsupportedFormat(
+                "SlideBook 7 compressed .sldyz archive has no image groups with ImageRecord.yaml"
+                    .into(),
+            ))
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&extracted_dir);
+        }
+        result
+    }
+
+    fn native_root(path: &Path) -> Result<SlideBook7NativeRoot> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if ext.as_deref() == Some("sldyz") {
+            return Self::extract_sldyz(path);
+        }
+        if ext.as_deref() != Some("sldy") {
+            return Err(synthetic_raw_unsupported(Self::spec()));
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| BioFormatsError::Format("SlideBook 7 path has no valid stem".into()))?;
+        Ok(SlideBook7NativeRoot {
+            root: path.with_file_name(format!("{stem}.dir")),
+            extracted_dir: None,
+        })
+    }
+
+    fn parse_native(path: &Path) -> Result<SlideBook7NativeState> {
+        let native_root = Self::native_root(path)?;
+        let root = native_root.root;
+        if !root.is_dir() {
+            if let Some(dir) = native_root.extracted_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "SlideBook 7 native root directory {} is missing",
+                root.display()
+            )));
+        }
+        let groups = match slidebook7_group_dirs(&root) {
+            Ok(groups) => groups,
+            Err(err) => {
+                if let Some(dir) = native_root.extracted_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                return Err(err);
+            }
+        };
+        if groups.is_empty() {
+            if let Some(dir) = native_root.extracted_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return Err(BioFormatsError::UnsupportedFormat(
+                "SlideBook 7 native directory has no image groups with ImageRecord.yaml".into(),
+            ));
+        }
+
+        let mut series = Vec::with_capacity(groups.len());
+        for group in groups {
+            match Self::parse_native_group(&group) {
+                Ok(parsed) => series.push(parsed),
+                Err(err) => {
+                    if let Some(dir) = native_root.extracted_dir {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(SlideBook7NativeState {
+            series,
+            extracted_dir: native_root.extracted_dir,
+        })
+    }
+
+    fn parse_native_group(group: &Path) -> Result<SlideBook7Series> {
+        let record_path = group.join("ImageRecord.yaml");
+        let record = std::fs::read_to_string(&record_path).map_err(BioFormatsError::Io)?;
+        let size_x = slidebook7_yaml_u32(&record, &["mWidth", "Width", "NumColumns"])
+            .ok_or_else(|| slidebook7_missing_record(&record_path, "mWidth"))?;
+        let size_y = slidebook7_yaml_u32(&record, &["mHeight", "Height", "NumRows"])
+            .ok_or_else(|| slidebook7_missing_record(&record_path, "mHeight"))?;
+        let size_z = slidebook7_yaml_u32(&record, &["mNumPlanes", "NumPlanes", "Planes"])
+            .unwrap_or(1)
+            .max(1);
+        let declared_c = slidebook7_yaml_u32(&record, &["mNumChannels", "NumChannels", "Channels"])
+            .unwrap_or(1)
+            .max(1);
+        let declared_t =
+            slidebook7_yaml_u32(&record, &["mNumTimepoints", "NumTimepoints", "Timepoints"])
+                .unwrap_or(1)
+                .max(1);
+        if size_x == 0 || size_y == 0 {
+            return Err(BioFormatsError::Format(format!(
+                "SlideBook 7 ImageRecord {} has zero dimensions",
+                record_path.display()
+            )));
+        }
+
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(group).map_err(BioFormatsError::Io)? {
+            let entry = entry.map_err(BioFormatsError::Io)?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let is_npy = name.ends_with(".npy");
+            let is_npyz = name.ends_with(".npyz");
+            if !name.starts_with("ImageData_") || (!is_npy && !is_npyz) {
+                continue;
+            }
+            let channel = slidebook7_filename_number(name, "_Ch").ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "SlideBook 7 image data filename lacks channel index: {name}"
+                ))
+            })?;
+            let timepoint = slidebook7_filename_fixed_number(name, "_TP", 7).ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "SlideBook 7 image data filename lacks timepoint index: {name}"
+                ))
+            })?;
+            let npy = parse_slidebook7_npy_header(&path)?;
+            if npy.fortran_order {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "SlideBook 7 Fortran-order NPY image data is unsupported: {}",
+                    path.display()
+                )));
+            }
+            let (npy_z, npy_y, npy_x) = slidebook7_npy_zyx_shape(&npy.shape, size_z)?;
+            if npy_x != size_x || npy_y != size_y {
+                return Err(BioFormatsError::Format(format!(
+                    "SlideBook 7 NPY shape {:?} does not match ImageRecord {}x{} for {}",
+                    npy.shape,
+                    size_x,
+                    size_y,
+                    path.display()
+                )));
+            }
+            files.push(SlideBook7PlaneFile {
+                path,
+                header_len: npy.header_len,
+                z_planes: npy_z,
+                timepoint,
+                channel,
+                compressed: is_npyz,
+            });
+        }
+        if files.is_empty() {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "SlideBook 7 image group {} has no ImageData .npy/.npyz files",
+                group.display()
+            )));
+        }
+        files.sort_by_key(|f| (f.timepoint, f.channel, f.path.clone()));
+
+        let first = parse_slidebook7_npy_header(&files[0].path)?;
+        let pixel_type = first.pixel_type;
+        let bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
+        let bytes_per_sample = pixel_type.bytes_per_sample();
+        for file in &files[1..] {
+            let npy = parse_slidebook7_npy_header(&file.path)?;
+            if npy.pixel_type != pixel_type {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "SlideBook 7 mixed NPY pixel types are unsupported in {}",
+                    group.display()
+                )));
+            }
+            if npy.little_endian != first.little_endian {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "SlideBook 7 mixed NPY byte orders are unsupported in {}",
+                    group.display()
+                )));
+            }
+        }
+
+        let max_c = files
+            .iter()
+            .map(|f| f.channel + 1)
+            .max()
+            .unwrap_or(declared_c);
+        let max_t = files
+            .iter()
+            .map(|f| f.timepoint + 1)
+            .max()
+            .unwrap_or(declared_t);
+        let size_c = declared_c.max(max_c);
+        let mut size_t = declared_t.max(max_t);
+        let single_file_timepoints = files.len() as u32 == size_c && size_z == 1;
+        if single_file_timepoints {
+            let max_file_z = files.iter().map(|f| f.z_planes).max().unwrap_or(1);
+            size_t = size_t.max(max_file_z);
+        }
+        let image_count = size_z
+            .checked_mul(size_c)
+            .and_then(|v| v.checked_mul(size_t))
+            .ok_or_else(|| BioFormatsError::Format("SlideBook 7 image count overflows".into()))?;
+        let plane_len = (size_x as usize)
+            .checked_mul(size_y as usize)
+            .and_then(|v| v.checked_mul(bytes_per_sample))
+            .ok_or_else(|| {
+                BioFormatsError::Format("SlideBook 7 plane byte count overflows".into())
+            })?;
+        let mut meta = ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c,
+            size_t,
+            pixel_type,
+            bits_per_pixel,
+            image_count,
+            is_little_endian: first.little_endian,
+            is_interleaved: true,
+            ..ImageMetadata::default()
+        };
+        meta.series_metadata = slidebook7_image_record_metadata(&record);
+        Ok(SlideBook7Series {
+            meta,
+            files,
+            plane_len,
+        })
+    }
+
+    fn native_series(&self) -> Result<&SlideBook7Series> {
+        match self.state.as_ref() {
+            Some(SlideBook7State::Native(state)) => state
+                .series
+                .get(self.current_series)
+                .ok_or(BioFormatsError::NotInitialized),
+            _ => Err(BioFormatsError::NotInitialized),
+        }
+    }
+
+    fn native_open_bytes(&self, p: u32) -> Result<Vec<u8>> {
+        let series = self.native_series()?;
+        if p >= series.meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(p));
+        }
+        let size_z = series.meta.size_z;
+        let size_c = series.meta.size_c;
+        let z = p % size_z;
+        let c = (p / size_z) % size_c;
+        let t = p / (size_z * size_c);
+        let file = series
+            .files
+            .iter()
+            .find(|f| {
+                f.channel == c
+                    && ((f.timepoint == t && z < f.z_planes)
+                        || (series.meta.size_z == 1 && f.timepoint == 0 && t < f.z_planes))
+            })
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "SlideBook 7 missing ImageData plane for T={t} C={c} Z={z}"
+                ))
+            })?;
+        let file_z = if series.meta.size_z == 1 && file.timepoint == 0 && t < file.z_planes {
+            t
+        } else {
+            z
+        };
+        let offset = file
+            .header_len
+            .checked_add(
+                (file_z as u64)
+                    .checked_mul(series.plane_len as u64)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("SlideBook 7 plane offset overflows".into())
+                    })?,
+            )
+            .ok_or_else(|| BioFormatsError::Format("SlideBook 7 plane offset overflows".into()))?;
+        if file.compressed {
+            let (data, _) = slidebook7_npy_bytes(&file.path)?;
+            let start = offset as usize;
+            let end = start.checked_add(series.plane_len).ok_or_else(|| {
+                BioFormatsError::Format("SlideBook 7 plane range overflows".into())
+            })?;
+            return data
+                .get(start..end)
+                .map(|plane| plane.to_vec())
+                .ok_or_else(|| {
+                    BioFormatsError::InvalidData(format!(
+                        "SlideBook 7 compressed ImageData plane is truncated: {}",
+                        file.path.display()
+                    ))
+                });
+        }
+        let mut reader = BufReader::new(File::open(&file.path).map_err(BioFormatsError::Io)?);
+        read_bytes_at(&mut reader, offset, series.plane_len)
     }
 }
 
@@ -1095,6 +2917,11 @@ impl Default for SlideBook7Reader {
 impl FormatReader for SlideBook7Reader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         Self::spec().matches_name(path)
+            || path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "sldy" | "sldyz"))
+                .unwrap_or(false)
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -1102,48 +2929,92 @@ impl FormatReader for SlideBook7Reader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.state = Some(parse_synthetic_raw(path, Self::spec())?);
-        Ok(())
+        self.close()?;
+        match parse_synthetic_raw(path, Self::spec()) {
+            Ok(state) => {
+                self.state = Some(SlideBook7State::Synthetic(state));
+                Ok(())
+            }
+            Err(BioFormatsError::UnsupportedFormat(_)) => {
+                self.state = Some(SlideBook7State::Native(Self::parse_native(path)?));
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn close(&mut self) -> Result<()> {
+        if let Some(SlideBook7State::Native(state)) = self.state.as_mut() {
+            if let Some(dir) = state.extracted_dir.take() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
         self.state = None;
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.state.is_some())
+        match &self.state {
+            Some(SlideBook7State::Synthetic(_)) => 1,
+            Some(SlideBook7State::Native(state)) => state.series.len(),
+            None => 0,
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.state.is_none() {
-            Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
-            Ok(())
-        } else {
-            Err(BioFormatsError::SeriesOutOfRange(s))
+        match &self.state {
+            Some(SlideBook7State::Synthetic(_)) if s == 0 => {
+                self.current_series = 0;
+                Ok(())
+            }
+            Some(SlideBook7State::Native(state)) if s < state.series.len() => {
+                self.current_series = s;
+                Ok(())
+            }
+            Some(_) => Err(BioFormatsError::SeriesOutOfRange(s)),
+            None => Err(BioFormatsError::NotInitialized),
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.state
-            .as_ref()
-            .map(|state| &state.meta)
-            .unwrap_or(crate::common::reader::uninitialized_metadata())
+        match &self.state {
+            Some(SlideBook7State::Synthetic(state)) => &state.meta,
+            Some(SlideBook7State::Native(state)) => state
+                .series
+                .get(self.current_series)
+                .map(|s| &s.meta)
+                .unwrap_or(crate::common::reader::uninitialized_metadata()),
+            None => crate::common::reader::uninitialized_metadata(),
+        }
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes(state, Self::spec(), p)
+        match &self.state {
+            Some(SlideBook7State::Synthetic(state)) => {
+                synthetic_raw_open_bytes(state, Self::spec(), p)
+            }
+            Some(SlideBook7State::Native(_)) => self.native_open_bytes(p),
+            None => Err(BioFormatsError::NotInitialized),
+        }
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes_region(state, Self::spec(), p, x, y, w, h)
+        match &self.state {
+            Some(SlideBook7State::Synthetic(state)) => {
+                synthetic_raw_open_bytes_region(state, Self::spec(), p, x, y, w, h)
+            }
+            Some(SlideBook7State::Native(_)) => {
+                let full = self.native_open_bytes(p)?;
+                let meta = self.metadata().clone();
+                crop_full_plane("SlideBook 7", &full, &meta, 1, x, y, w, h)
+            }
+            None => Err(BioFormatsError::NotInitialized),
+        }
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
@@ -1153,6 +3024,27 @@ impl FormatReader for SlideBook7Reader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(p, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        match self.state.as_ref()? {
+            SlideBook7State::Synthetic(state) => {
+                let mut ome =
+                    crate::common::ome_metadata::OmeMetadata::from_image_metadata(&state.meta);
+                let _ = ome.add_original_metadata_annotations(&state.meta, 0);
+                Some(ome)
+            }
+            SlideBook7State::Native(state) => {
+                let mut ome = crate::common::ome_metadata::OmeMetadata::default();
+                for (index, series) in state.series.iter().enumerate() {
+                    let mut image =
+                        crate::common::ome_metadata::OmeMetadata::from_image_metadata(&series.meta);
+                    ome.images.extend(image.images.drain(..));
+                    let _ = ome.add_original_metadata_annotations(&series.meta, index);
+                }
+                Some(ome)
+            }
+        }
     }
 }
 
@@ -1356,7 +3248,23 @@ impl FormatReader for NdpisReader {
 // ---------------------------------------------------------------------------
 /// iVision format reader (`.ipm`).
 pub struct IvisionReader {
-    state: Option<SyntheticRawState>,
+    state: Option<IvisionState>,
+}
+
+struct IvisionNativeState {
+    path: PathBuf,
+    meta: ImageMetadata,
+    ome: Option<crate::common::ome_metadata::OmeMetadata>,
+    image_offset: u64,
+    disk_plane_len: usize,
+    output_plane_len: usize,
+    has_padding_byte: bool,
+    unsupported_pixel_read: Option<&'static str>,
+}
+
+enum IvisionState {
+    Synthetic(SyntheticRawState),
+    Native(IvisionNativeState),
 }
 
 impl IvisionReader {
@@ -1380,17 +3288,611 @@ impl Default for IvisionReader {
     }
 }
 
+fn parse_ivision_native(path: &Path) -> Result<IvisionNativeState> {
+    let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    if !ivision_structural_header(&bytes) {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "iVision IPM native header is not recognized".into(),
+        ));
+    }
+    if bytes.len() < 72 {
+        return Err(BioFormatsError::Format(
+            "iVision IPM native header is truncated".into(),
+        ));
+    }
+
+    let version = std::str::from_utf8(&bytes[..4])
+        .unwrap_or("")
+        .trim_end_matches('\0')
+        .to_string();
+    let file_format = bytes[4];
+    let data_type = bytes[5];
+    let size_x = u32::from_be_bytes(bytes[6..10].try_into().unwrap());
+    let size_y = u32::from_be_bytes(bytes[10..14].try_into().unwrap());
+    let size_z = u16::from_be_bytes(bytes[20..22].try_into().unwrap()) as u32;
+
+    if size_x == 0 || size_y == 0 || size_z == 0 {
+        return Err(BioFormatsError::Format(
+            "iVision IPM native dimensions must be non-zero".into(),
+        ));
+    }
+
+    let (
+        pixel_type,
+        size_c,
+        has_padding_byte,
+        disk_bytes_per_sample,
+        disk_samples_per_pixel,
+        unsupported_pixel_read,
+        storage_layout,
+    ) = match data_type {
+        0 => (PixelType::Uint8, 1, false, 1, 1, None, "8-bit mono samples"),
+        1 => (
+            PixelType::Int16,
+            1,
+            false,
+            2,
+            1,
+            None,
+            "big-endian signed 16-bit mono samples",
+        ),
+        2 => (
+            PixelType::Int32,
+            1,
+            false,
+            4,
+            1,
+            None,
+            "big-endian signed 32-bit mono samples",
+        ),
+        3 => (
+            PixelType::Float32,
+            1,
+            false,
+            4,
+            1,
+            None,
+            "big-endian 32-bit float mono samples",
+        ),
+        4 => (
+            PixelType::Uint8,
+            3,
+            false,
+            2,
+            1,
+            Some("Packed 16-bit color iVision pixel decoding is not supported: data type 4 stores one 16-bit word per pixel, but the native header does not identify RGB555 vs RGB565 masks or channel bit order"),
+            "packed 16-bit color samples with unresolved RGB555/RGB565 masks",
+        ),
+        5 => (
+            PixelType::Uint8,
+            3,
+            true,
+            1,
+            3,
+            None,
+            "padded 8-bit RGB samples, one leading padding byte per pixel",
+        ),
+        6 => (
+            PixelType::Uint16,
+            1,
+            false,
+            2,
+            1,
+            None,
+            "big-endian unsigned 16-bit mono samples",
+        ),
+        7 => (
+            PixelType::Float32,
+            1,
+            false,
+            2,
+            1,
+            Some("Square-root iVision pixel decoding is not supported: the Java reader declares float output but leaves the square-root transfer curve unimplemented"),
+            "big-endian square-root encoded 16-bit samples with float output",
+        ),
+        8 => (
+            PixelType::Uint16,
+            3,
+            false,
+            2,
+            3,
+            None,
+            "big-endian unsigned 16-bit RGB samples",
+        ),
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "iVision IPM native data type {other} is unsupported"
+            )));
+        }
+    };
+
+    let image_offset = 72u64
+        .checked_add(if size_x > 1 && size_y > 1 { 2048 } else { 0 })
+        .ok_or_else(|| BioFormatsError::Format("iVision IPM image offset overflows".into()))?;
+    if bytes.len() < image_offset as usize {
+        return Err(BioFormatsError::Format(
+            "iVision IPM native LUT/header is truncated".into(),
+        ));
+    }
+
+    let output_samples = (size_x as usize)
+        .checked_mul(size_y as usize)
+        .and_then(|v| v.checked_mul(size_c as usize))
+        .ok_or_else(|| {
+            BioFormatsError::Format("iVision IPM plane sample count overflows".into())
+        })?;
+    let output_plane_len = output_samples
+        .checked_mul(pixel_type.bytes_per_sample())
+        .ok_or_else(|| BioFormatsError::Format("iVision IPM plane byte count overflows".into()))?;
+    let disk_samples = (size_x as usize)
+        .checked_mul(size_y as usize)
+        .and_then(|v| v.checked_mul(disk_samples_per_pixel))
+        .ok_or_else(|| {
+            BioFormatsError::Format("iVision IPM disk plane sample count overflows".into())
+        })?;
+    let unpadded_disk_plane_len =
+        disk_samples
+            .checked_mul(disk_bytes_per_sample)
+            .ok_or_else(|| {
+                BioFormatsError::Format("iVision IPM disk plane byte count overflows".into())
+            })?;
+    let disk_plane_len = if has_padding_byte {
+        unpadded_disk_plane_len
+            .checked_add(
+                (size_x as usize)
+                    .checked_mul(size_y as usize)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("iVision IPM padding byte count overflows".into())
+                    })?,
+            )
+            .ok_or_else(|| {
+                BioFormatsError::Format("iVision IPM padded plane size overflows".into())
+            })?
+    } else {
+        unpadded_disk_plane_len
+    };
+    let image_count = size_z;
+    let expected_pixel_end = image_offset
+        .checked_add(
+            (disk_plane_len as u64)
+                .checked_mul(image_count as u64)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("iVision IPM payload size overflows".into())
+                })?,
+        )
+        .ok_or_else(|| BioFormatsError::Format("iVision IPM payload end overflows".into()))?;
+    if bytes.len() < expected_pixel_end as usize {
+        return Err(BioFormatsError::InvalidData(format!(
+            "iVision IPM native pixel payload is {}, expected at least {}",
+            bytes.len().saturating_sub(image_offset as usize),
+            expected_pixel_end - image_offset
+        )));
+    }
+
+    let mut meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z,
+        size_c,
+        size_t: 1,
+        pixel_type,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        image_count,
+        is_little_endian: false,
+        ..ImageMetadata::default()
+    };
+    meta.series_metadata.insert(
+        "iVision Version".to_string(),
+        crate::common::metadata::MetadataValue::String(version),
+    );
+    meta.series_metadata.insert(
+        "iVision FileFormat".to_string(),
+        crate::common::metadata::MetadataValue::Int(file_format as i64),
+    );
+    meta.series_metadata.insert(
+        "iVision DataType".to_string(),
+        crate::common::metadata::MetadataValue::Int(data_type as i64),
+    );
+    meta.series_metadata.insert(
+        "iVision DataType Name".to_string(),
+        crate::common::metadata::MetadataValue::String(ivision_data_type_name(data_type).into()),
+    );
+    meta.series_metadata.insert(
+        "iVision Samples Per Pixel".to_string(),
+        crate::common::metadata::MetadataValue::Int(size_c as i64),
+    );
+    meta.series_metadata.insert(
+        "iVision Storage Layout".to_string(),
+        crate::common::metadata::MetadataValue::String(storage_layout.into()),
+    );
+    meta.series_metadata.insert(
+        "iVision Native Width".to_string(),
+        crate::common::metadata::MetadataValue::Int(size_x as i64),
+    );
+    meta.series_metadata.insert(
+        "iVision Native Height".to_string(),
+        crate::common::metadata::MetadataValue::Int(size_y as i64),
+    );
+    meta.series_metadata.insert(
+        "iVision Native Z Sections".to_string(),
+        crate::common::metadata::MetadataValue::Int(size_z as i64),
+    );
+    meta.series_metadata.insert(
+        "iVision Image Offset".to_string(),
+        crate::common::metadata::MetadataValue::Int(image_offset as i64),
+    );
+    meta.series_metadata.insert(
+        "iVision Disk Plane Bytes".to_string(),
+        crate::common::metadata::MetadataValue::Int(disk_plane_len as i64),
+    );
+    meta.series_metadata.insert(
+        "iVision Output Plane Bytes".to_string(),
+        crate::common::metadata::MetadataValue::Int(output_plane_len as i64),
+    );
+    meta.series_metadata.insert(
+        "iVision Has Padding Byte".to_string(),
+        crate::common::metadata::MetadataValue::Bool(has_padding_byte),
+    );
+
+    let ome = ivision_apply_xml_metadata(path, &bytes, expected_pixel_end as usize, &mut meta);
+
+    Ok(IvisionNativeState {
+        path: path.to_path_buf(),
+        meta,
+        ome,
+        image_offset,
+        disk_plane_len,
+        output_plane_len,
+        has_padding_byte,
+        unsupported_pixel_read,
+    })
+}
+
+fn ivision_data_type_name(data_type: u8) -> &'static str {
+    match data_type {
+        0 => "8-bit mono",
+        1 => "16-bit signed mono",
+        2 => "32-bit signed mono",
+        3 => "32-bit float mono",
+        4 => "16-bit color",
+        5 => "8-bit color with padding",
+        6 => "16-bit unsigned mono",
+        7 => "square-root float",
+        8 => "16-bit unsigned color",
+        _ => "unknown",
+    }
+}
+
+fn ivision_apply_xml_metadata(
+    path: &Path,
+    bytes: &[u8],
+    pixel_end: usize,
+    meta: &mut ImageMetadata,
+) -> Option<crate::common::ome_metadata::OmeMetadata> {
+    let mut xml_source = None;
+    let mut xml = None;
+
+    if let Some(tail) = bytes.get(pixel_end..) {
+        if let Some(found) = ivision_xml_from_bytes(tail) {
+            xml_source = Some("embedded_tail");
+            xml = Some(found);
+        }
+    }
+
+    if xml.is_none() {
+        let sidecar = path.with_extension("xml");
+        if let Ok(sidecar_bytes) = std::fs::read(&sidecar) {
+            if let Some(found) = ivision_xml_from_bytes(&sidecar_bytes) {
+                xml_source = Some("sidecar");
+                xml = Some(found);
+            }
+        }
+    }
+
+    let xml = xml?;
+
+    meta.series_metadata
+        .insert("iVision XML Metadata".into(), MetadataValue::Bool(true));
+    if let Some(source) = xml_source {
+        meta.series_metadata.insert(
+            "iVision XML Source".into(),
+            MetadataValue::String(source.into()),
+        );
+    }
+
+    let flattened = ivision_flatten_xml_metadata(&xml, meta);
+    if flattened > 0 {
+        meta.series_metadata.insert(
+            "iVision XML Flattened Fields".into(),
+            MetadataValue::Int(flattened as i64),
+        );
+    }
+
+    let mut ome = crate::common::ome_metadata::OmeMetadata::from_ome_xml(&xml);
+    let _ = ome.populate_pixels(meta, 0);
+    let image = ome.images.first()?;
+
+    if let Some(name) = image.name.as_ref().filter(|v| !v.trim().is_empty()) {
+        meta.series_metadata.insert(
+            "iVision XML Image Name".into(),
+            MetadataValue::String(name.clone()),
+        );
+    }
+    if let Some(value) = image.physical_size_x.filter(|v| v.is_finite()) {
+        meta.series_metadata.insert(
+            "iVision XML PhysicalSizeX".into(),
+            MetadataValue::Float(value),
+        );
+    }
+    if let Some(value) = image.physical_size_y.filter(|v| v.is_finite()) {
+        meta.series_metadata.insert(
+            "iVision XML PhysicalSizeY".into(),
+            MetadataValue::Float(value),
+        );
+    }
+    if let Some(value) = image.physical_size_z.filter(|v| v.is_finite()) {
+        meta.series_metadata.insert(
+            "iVision XML PhysicalSizeZ".into(),
+            MetadataValue::Float(value),
+        );
+    }
+    if let Some(value) = image.time_increment.filter(|v| v.is_finite()) {
+        meta.series_metadata.insert(
+            "iVision XML TimeIncrement".into(),
+            MetadataValue::Float(value),
+        );
+    }
+
+    for (index, channel) in image.channels.iter().enumerate().take(meta.size_c as usize) {
+        let prefix = format!("iVision XML Channel {index}");
+        if let Some(name) = channel.name.as_ref().filter(|v| !v.trim().is_empty()) {
+            meta.series_metadata.insert(
+                format!("{prefix} Name"),
+                MetadataValue::String(name.clone()),
+            );
+        }
+        if let Some(value) = channel.excitation_wavelength.filter(|v| v.is_finite()) {
+            meta.series_metadata.insert(
+                format!("{prefix} ExcitationWavelength"),
+                MetadataValue::Float(value),
+            );
+        }
+        if let Some(value) = channel.emission_wavelength.filter(|v| v.is_finite()) {
+            meta.series_metadata.insert(
+                format!("{prefix} EmissionWavelength"),
+                MetadataValue::Float(value),
+            );
+        }
+        if let Some(value) = channel.color {
+            meta.series_metadata
+                .insert(format!("{prefix} Color"), MetadataValue::Int(value as i64));
+        }
+    }
+
+    Some(ome)
+}
+
+fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
+    const MAX_FIELDS: usize = 128;
+    const MAX_VALUE_LEN: usize = 512;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut stack: Vec<String> = Vec::new();
+    let mut inserted = 0usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(element)) => {
+                stack.push(ivision_xml_component_name(element.name().as_ref()));
+                inserted += ivision_flatten_xml_attrs(
+                    &reader,
+                    &stack,
+                    element.attributes(),
+                    meta,
+                    MAX_FIELDS.saturating_sub(inserted),
+                    MAX_VALUE_LEN,
+                );
+            }
+            Ok(quick_xml::events::Event::Empty(element)) => {
+                stack.push(ivision_xml_component_name(element.name().as_ref()));
+                inserted += ivision_flatten_xml_attrs(
+                    &reader,
+                    &stack,
+                    element.attributes(),
+                    meta,
+                    MAX_FIELDS.saturating_sub(inserted),
+                    MAX_VALUE_LEN,
+                );
+                stack.pop();
+            }
+            Ok(quick_xml::events::Event::Text(text)) => {
+                if inserted >= MAX_FIELDS {
+                    continue;
+                }
+                if let Ok(value) = text.unescape() {
+                    let value = value.trim();
+                    if !value.is_empty() && value.len() <= MAX_VALUE_LEN {
+                        let key = ivision_flatten_xml_key(&stack, None);
+                        ivision_insert_flattened_xml_value(meta, key, value);
+                        inserted += 1;
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                stack.pop();
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        if inserted >= MAX_FIELDS {
+            break;
+        }
+    }
+
+    inserted
+}
+
+fn ivision_flatten_xml_attrs<'a>(
+    reader: &quick_xml::Reader<&[u8]>,
+    stack: &[String],
+    attrs: quick_xml::events::attributes::Attributes<'a>,
+    meta: &mut ImageMetadata,
+    remaining: usize,
+    max_value_len: usize,
+) -> usize {
+    let mut inserted = 0usize;
+    for attr in attrs.flatten() {
+        if inserted >= remaining {
+            break;
+        }
+        let name = ivision_xml_component_name(attr.key.as_ref());
+        if name.is_empty() {
+            continue;
+        }
+        let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() || value.len() > max_value_len {
+            continue;
+        }
+        let key = ivision_flatten_xml_key(stack, Some(&name));
+        ivision_insert_flattened_xml_value(meta, key, value);
+        inserted += 1;
+    }
+    inserted
+}
+
+fn ivision_xml_component_name(name: &[u8]) -> String {
+    let local = name.split(|byte| *byte == b':').next_back().unwrap_or(name);
+    String::from_utf8_lossy(local)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn ivision_flatten_xml_key(stack: &[String], attr: Option<&str>) -> String {
+    let mut key = String::from("iVision XML");
+    for part in stack.iter().filter(|part| !part.is_empty()) {
+        key.push(' ');
+        key.push_str(part);
+    }
+    if let Some(attr) = attr.filter(|value| !value.is_empty()) {
+        key.push(' ');
+        key.push_str(attr);
+    }
+    key
+}
+
+fn ivision_insert_flattened_xml_value(meta: &mut ImageMetadata, key: String, value: &str) {
+    let key = ivision_unique_metadata_key(&meta.series_metadata, key);
+    let value = if value.eq_ignore_ascii_case("true") {
+        MetadataValue::Bool(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        MetadataValue::Bool(false)
+    } else if let Ok(parsed) = value.parse::<i64>() {
+        MetadataValue::Int(parsed)
+    } else if let Ok(parsed) = value.parse::<f64>() {
+        if parsed.is_finite() {
+            MetadataValue::Float(parsed)
+        } else {
+            MetadataValue::String(value.to_string())
+        }
+    } else {
+        MetadataValue::String(value.to_string())
+    };
+    meta.series_metadata.insert(key, value);
+}
+
+fn ivision_unique_metadata_key(existing: &HashMap<String, MetadataValue>, key: String) -> String {
+    if !existing.contains_key(&key) {
+        return key;
+    }
+    for index in 2.. {
+        let candidate = format!("{key} {index}");
+        if !existing.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn ivision_xml_from_bytes(bytes: &[u8]) -> Option<String> {
+    let start = find_subslice(bytes, b"<?xml")
+        .or_else(|| find_subslice(bytes, b"<OME"))
+        .or_else(|| find_subslice(bytes, b"<Image"))?;
+    let text = std::str::from_utf8(&bytes[start..])
+        .ok()?
+        .trim_matches('\0')
+        .trim();
+    if text.starts_with("<?xml") || text.contains("<Image") || text.contains("<OME") {
+        Some(text.to_string())
+    } else {
+        None
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn ivision_native_open_bytes(state: &IvisionNativeState, plane_index: u32) -> Result<Vec<u8>> {
+    if plane_index >= state.meta.image_count {
+        return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+    }
+    if let Some(message) = state.unsupported_pixel_read {
+        return Err(BioFormatsError::UnsupportedFormat(message.into()));
+    }
+    let offset = state
+        .image_offset
+        .checked_add(
+            (plane_index as u64)
+                .checked_mul(state.disk_plane_len as u64)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("iVision IPM plane offset overflows".into())
+                })?,
+        )
+        .ok_or_else(|| BioFormatsError::Format("iVision IPM plane offset overflows".into()))?;
+    let mut reader = BufReader::new(File::open(&state.path).map_err(BioFormatsError::Io)?);
+    let disk = read_bytes_at(&mut reader, offset, state.disk_plane_len)?;
+    if !state.has_padding_byte {
+        return Ok(disk);
+    }
+
+    let mut out = Vec::with_capacity(state.output_plane_len);
+    let channels = state.meta.size_c as usize;
+    for px in disk.chunks_exact(channels + 1) {
+        out.extend_from_slice(&px[1..]);
+    }
+    if out.len() != state.output_plane_len {
+        return Err(BioFormatsError::InvalidData(
+            "iVision IPM padded plane did not decode to the expected length".into(),
+        ));
+    }
+    Ok(out)
+}
+
 impl FormatReader for IvisionReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         Self::spec().matches_name(path)
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        Self::spec().matches_bytes(header)
+        Self::spec().matches_bytes(header) || ivision_native_header(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.state = Some(parse_synthetic_raw(path, Self::spec())?);
+        self.state = Some(match parse_synthetic_raw(path, Self::spec()) {
+            Ok(state) => IvisionState::Synthetic(state),
+            Err(BioFormatsError::UnsupportedFormat(_)) => {
+                IvisionState::Native(parse_ivision_native(path)?)
+            }
+            Err(err) => return Err(err),
+        });
         Ok(())
     }
 
@@ -1420,13 +3922,21 @@ impl FormatReader for IvisionReader {
     fn metadata(&self) -> &ImageMetadata {
         self.state
             .as_ref()
-            .map(|state| &state.meta)
+            .map(|state| match state {
+                IvisionState::Synthetic(state) => &state.meta,
+                IvisionState::Native(state) => &state.meta,
+            })
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes(state, Self::spec(), plane_index)
+        match state {
+            IvisionState::Synthetic(state) => {
+                synthetic_raw_open_bytes(state, Self::spec(), plane_index)
+            }
+            IvisionState::Native(state) => ivision_native_open_bytes(state, plane_index),
+        }
     }
 
     fn open_bytes_region(
@@ -1438,7 +3948,24 @@ impl FormatReader for IvisionReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        synthetic_raw_open_bytes_region(state, Self::spec(), plane_index, x, y, w, h)
+        match state {
+            IvisionState::Synthetic(state) => {
+                synthetic_raw_open_bytes_region(state, Self::spec(), plane_index, x, y, w, h)
+            }
+            IvisionState::Native(state) => {
+                let full = ivision_native_open_bytes(state, plane_index)?;
+                crop_full_plane(
+                    "iVision IPM",
+                    &full,
+                    &state.meta,
+                    state.meta.size_c as usize,
+                    x,
+                    y,
+                    w,
+                    h,
+                )
+            }
+        }
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1448,6 +3975,17 @@ impl FormatReader for IvisionReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        match self.state.as_ref()? {
+            IvisionState::Synthetic(state) => {
+                Some(crate::common::ome_metadata::OmeMetadata::from_image_metadata(&state.meta))
+            }
+            IvisionState::Native(state) => state.ome.clone().or_else(|| {
+                Some(crate::common::ome_metadata::OmeMetadata::from_image_metadata(&state.meta))
+            }),
+        }
     }
 }
 
@@ -1818,21 +4356,880 @@ impl FormatReader for ImarisTiffReader {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Leica XLEF — TIFF delegate
+// 8. Leica XLEF — image delegate
 // ---------------------------------------------------------------------------
 /// Leica XLEF format reader (`.xlef`).
 ///
-/// XLEF files contain embedded TIFF data; delegates to `TiffReader`.
+/// XLEF files are Leica XML projects. Java resolves referenced XLIF/LOF or
+/// raster files through `LMSFileReader`; this bounded port follows local
+/// XLEF/XLIF graph references and exposes TIFF/LOF/raster leaves as project
+/// series.
 pub struct XlefReader {
-    inner: crate::tiff::TiffReader,
+    delegates: Vec<XlefDelegate>,
+    lms_metadata: Vec<ImageMetadata>,
+    series_map: Vec<XlefSeriesRef>,
+    project_metadata: Vec<ImageMetadata>,
+    current_series: usize,
+}
+
+struct XlefDelegate {
+    reader: Box<dyn FormatReader>,
+    path: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum XlefSeriesRef {
+    Delegate { delegate: usize, series: usize },
+    Lms { metadata: usize },
 }
 
 impl XlefReader {
     pub fn new() -> Self {
         XlefReader {
-            inner: crate::tiff::TiffReader::new(),
+            delegates: Vec::new(),
+            lms_metadata: Vec::new(),
+            series_map: Vec::new(),
+            project_metadata: Vec::new(),
+            current_series: 0,
         }
     }
+
+    fn referenced_images(path: &Path) -> Result<Vec<XlefReference>> {
+        let mut visited = HashSet::new();
+        let mut unsupported = Vec::new();
+        let refs = xlef_collect_referenced_images(path, &mut visited, &mut unsupported)?;
+        if refs.is_empty() {
+            if unsupported.is_empty() {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Leica XLEF project contains no supported local image or LMS metadata references"
+                        .into(),
+                ));
+            }
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Leica XLEF project references unsupported files {}; only local TIFF, LOF, JPEG, PNG, BMP, and bounded LMS metadata leaves are currently handled",
+                xlef_format_paths(&unsupported)
+            )));
+        }
+        if !unsupported.is_empty() {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Leica XLEF project mixes supported leaves with unsupported files {}; partial mixed-project opening is not implemented",
+                xlef_format_paths(&unsupported)
+            )));
+        }
+        Ok(refs)
+    }
+
+    fn current_delegate_mut(&mut self) -> Result<&mut (dyn FormatReader + '_)> {
+        match *self
+            .series_map
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?
+        {
+            XlefSeriesRef::Delegate { delegate, .. } => {
+                if let Some(delegate) = self.delegates.get_mut(delegate) {
+                    Ok(delegate.reader.as_mut())
+                } else {
+                    Err(BioFormatsError::NotInitialized)
+                }
+            }
+            XlefSeriesRef::Lms { .. } => Err(BioFormatsError::UnsupportedFormat(
+                "Leica XLEF LMS metadata series has no pixel delegate yet".into(),
+            )),
+        }
+    }
+
+    fn current_delegate(&self) -> Option<&dyn FormatReader> {
+        match self.series_map.get(self.current_series)? {
+            XlefSeriesRef::Delegate { delegate, .. } => self
+                .delegates
+                .get(*delegate)
+                .map(|delegate| delegate.reader.as_ref()),
+            XlefSeriesRef::Lms { .. } => None,
+        }
+    }
+
+    fn current_lms_metadata(&self) -> Option<&ImageMetadata> {
+        match self.series_map.get(self.current_series)? {
+            XlefSeriesRef::Delegate { .. } => None,
+            XlefSeriesRef::Lms { metadata } => self.lms_metadata.get(*metadata),
+        }
+    }
+
+    fn add_delegate(&mut self, reference: &Path, mut reader: Box<dyn FormatReader>) -> Result<()> {
+        reader.set_id(reference)?;
+        self.add_initialized_delegate(reference, reader)
+    }
+
+    fn add_initialized_delegate(
+        &mut self,
+        reference: &Path,
+        reader: Box<dyn FormatReader>,
+    ) -> Result<()> {
+        let delegate_index = self.delegates.len();
+        let series_count = reader.series_count();
+        if series_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Leica XLEF referenced image {} exposes no readable series",
+                reference.display()
+            )));
+        }
+        for series in 0..series_count {
+            self.series_map.push(XlefSeriesRef::Delegate {
+                delegate: delegate_index,
+                series,
+            });
+        }
+        self.delegates.push(XlefDelegate {
+            reader,
+            path: reference.to_path_buf(),
+        });
+        Ok(())
+    }
+
+    fn rebuild_project_metadata(&mut self, project_path: &Path) -> Result<()> {
+        let series_count = self.series_map.len();
+        let mut metadata = Vec::with_capacity(series_count);
+
+        for series_index in 0..series_count {
+            let mapping = self.series_map[series_index];
+            let (mut meta, source_path, source_kind) = match mapping {
+                XlefSeriesRef::Delegate { delegate, series } => {
+                    let delegate = self
+                        .delegates
+                        .get_mut(delegate)
+                        .ok_or(BioFormatsError::NotInitialized)?;
+                    delegate.reader.set_series(series)?;
+                    (
+                        delegate.reader.metadata().clone(),
+                        delegate.path.display().to_string(),
+                        "pixel_delegate",
+                    )
+                }
+                XlefSeriesRef::Lms { metadata } => {
+                    let meta = self
+                        .lms_metadata
+                        .get(metadata)
+                        .ok_or(BioFormatsError::NotInitialized)?
+                        .clone();
+                    let source_path =
+                        xlef_lms_metadata_string(&meta, "xlef.lms.path").unwrap_or_default();
+                    (meta, source_path, "lms_metadata")
+                }
+            };
+
+            meta.series_metadata.insert(
+                "xlef.project.path".into(),
+                MetadataValue::String(project_path.display().to_string()),
+            );
+            if let Some(name) = project_path.file_name().and_then(|name| name.to_str()) {
+                meta.series_metadata.insert(
+                    "xlef.project.name".into(),
+                    MetadataValue::String(name.to_string()),
+                );
+            }
+            meta.series_metadata.insert(
+                "xlef.project.series_index".into(),
+                MetadataValue::Int(series_index as i64),
+            );
+            meta.series_metadata.insert(
+                "xlef.project.series_count".into(),
+                MetadataValue::Int(series_count as i64),
+            );
+            meta.series_metadata.insert(
+                "xlef.project.source_path".into(),
+                MetadataValue::String(source_path),
+            );
+            meta.series_metadata.insert(
+                "xlef.project.source_kind".into(),
+                MetadataValue::String(source_kind.into()),
+            );
+            metadata.push(meta);
+        }
+
+        self.project_metadata = metadata;
+        Ok(())
+    }
+
+    fn set_delegate_series_for_current(&mut self) -> Result<()> {
+        if let Some(XlefSeriesRef::Delegate { delegate, series }) =
+            self.series_map.get(self.current_series).copied()
+        {
+            self.delegates[delegate].reader.set_series(series)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum XlefReference {
+    Image(PathBuf),
+    Lms(PathBuf),
+}
+
+fn xlef_collect_referenced_images(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    unsupported: &mut Vec<PathBuf>,
+) -> Result<Vec<XlefReference>> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical) {
+        return Ok(Vec::new());
+    }
+
+    let xml = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+    let mut images: Vec<XlefReference> = Vec::new();
+    for reference in xlef_referenced_paths(&xml, path) {
+        if xlef_is_project_reference(&reference) {
+            if reference.exists() {
+                for image in xlef_collect_referenced_images(&reference, visited, unsupported)? {
+                    if !images.iter().any(|p| p == &image) {
+                        images.push(image);
+                    }
+                }
+            } else {
+                unsupported.push(reference);
+            }
+        } else if xlef_is_supported_image_reference(&reference) {
+            let image = XlefReference::Image(reference);
+            if !images.iter().any(|p| p == &image) {
+                images.push(image);
+            }
+        } else if xlef_is_lms_reference(&reference) {
+            let lms = XlefReference::Lms(reference);
+            if !images.iter().any(|p| p == &lms) {
+                images.push(lms);
+            }
+        } else if !unsupported.iter().any(|p| p == &reference) {
+            unsupported.push(reference);
+        }
+    }
+    Ok(images)
+}
+
+fn xlef_referenced_paths(xml: &str, xlef_path: &Path) -> Vec<PathBuf> {
+    let parent = xlef_path.parent().unwrap_or_else(|| Path::new(""));
+    let mut refs = Vec::new();
+    for (_name, attrs) in scn_scan_tags(xml) {
+        for (key, value) in attrs {
+            if !xlef_is_reference_attribute(&key) {
+                continue;
+            }
+            if let Some(path) = xlef_reference_path(parent, &value) {
+                if !refs.iter().any(|p| p == &path) {
+                    refs.push(path);
+                }
+            }
+        }
+    }
+    for token in xml.split(['"', '\'', '<', '>', '\n', '\r', '\t', ' ']) {
+        let lower = token.to_ascii_lowercase();
+        if !(lower.ends_with(".tif")
+            || lower.ends_with(".tiff")
+            || lower.ends_with(".lof")
+            || lower.ends_with(".xlef")
+            || lower.ends_with(".xlif")
+            || lower.ends_with(".lms")
+            || lower.ends_with(".bmp")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".png"))
+        {
+            continue;
+        }
+        let cleaned = token.replace('\\', "/");
+        let candidate = Path::new(&cleaned);
+        let path = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            parent.join(candidate)
+        };
+        if !refs.iter().any(|p| p == &path) {
+            refs.push(path);
+        }
+    }
+    refs
+}
+
+fn xlef_is_reference_attribute(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "file" | "filename" | "filepath" | "path" | "relativepath" | "href" | "url" | "source"
+    )
+}
+
+fn xlef_reference_path(parent: &Path, value: &str) -> Option<PathBuf> {
+    let cleaned = value.trim().replace('\\', "/");
+    if cleaned.is_empty() || cleaned.starts_with('#') {
+        return None;
+    }
+    let lower = cleaned.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(PathBuf::from(cleaned));
+    }
+    let candidate = Path::new(&cleaned);
+    if candidate.extension().is_none() {
+        return None;
+    }
+    Some(if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        parent.join(candidate)
+    })
+}
+
+fn xlef_is_project_reference(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("xlef") | Some("xlif")
+    )
+}
+
+fn xlef_is_supported_image_reference(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("tif")
+            | Some("tiff")
+            | Some("lof")
+            | Some("jpg")
+            | Some("jpeg")
+            | Some("png")
+            | Some("bmp")
+    )
+}
+
+fn xlef_is_lms_reference(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("lms")
+    )
+}
+
+fn xlef_delegate_for_reference(reference: &Path) -> Box<dyn FormatReader> {
+    match reference
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("lof") => Box::new(crate::formats::extended::LeicaLofReader::new()),
+        Some("jpg") | Some("jpeg") => Box::new(crate::formats::jpeg::JpegReader::new()),
+        Some("png") => Box::new(crate::formats::png::PngReader::new()),
+        Some("bmp") => Box::new(crate::formats::bmp::BmpReader::new()),
+        _ => Box::new(crate::tiff::TiffReader::new()),
+    }
+}
+
+fn xlef_lms_delegate_for_reference(reference: &Path) -> Result<Option<Box<dyn FormatReader>>> {
+    let mut reader: Box<dyn FormatReader> = Box::new(crate::formats::sem::ZeissLmsReader::new());
+    match reader.set_id(reference) {
+        Ok(()) => Ok(Some(reader)),
+        Err(BioFormatsError::Io(err)) => Err(BioFormatsError::Io(err)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
+    let data = std::fs::read(reference).map_err(BioFormatsError::Io)?;
+    let xml = xlef_decode_lms_text(&data)?;
+    let tags = scn_scan_tags(&xml);
+    let mut meta = ImageMetadata::default();
+    meta.dimension_order = crate::common::metadata::DimensionOrder::XYZCT;
+    let mut channel_count_from_descriptions = 0u32;
+    let mut size_c_from_dimension = false;
+    meta.series_metadata.insert(
+        "xlef.lms.path".into(),
+        crate::common::metadata::MetadataValue::String(reference.display().to_string()),
+    );
+    meta.series_metadata.insert(
+        "xlef.lms.pixel_payload".into(),
+        crate::common::metadata::MetadataValue::String("unsupported".into()),
+    );
+
+    for (name, attrs) in &tags {
+        if name.eq_ignore_ascii_case("Element") {
+            if let Some(value) = attrs.get("Name").filter(|v| !v.is_empty()) {
+                meta.series_metadata.insert(
+                    "xlef.lms.element.name".into(),
+                    crate::common::metadata::MetadataValue::String(value.clone()),
+                );
+            }
+            if let Some(value) = xlef_lms_description_attr(attrs) {
+                meta.series_metadata
+                    .entry("xlef.lms.description".into())
+                    .or_insert_with(|| crate::common::metadata::MetadataValue::String(value));
+            }
+        } else if name.eq_ignore_ascii_case("Image") {
+            for key in ["Name", "File", "ID", "UUID"] {
+                if let Some(value) = attrs.get(key).filter(|v| !v.is_empty()) {
+                    meta.series_metadata.insert(
+                        format!("xlef.lms.image.{}", key.to_ascii_lowercase()),
+                        crate::common::metadata::MetadataValue::String(value.clone()),
+                    );
+                }
+            }
+            if let Some(value) = xlef_lms_description_attr(attrs) {
+                meta.series_metadata.insert(
+                    "xlef.lms.description".into(),
+                    crate::common::metadata::MetadataValue::String(value),
+                );
+            }
+        } else if name.eq_ignore_ascii_case("ImageDescription") {
+            if let Some(value) = xlef_lms_description_attr(attrs) {
+                meta.series_metadata
+                    .entry("xlef.lms.description".into())
+                    .or_insert_with(|| crate::common::metadata::MetadataValue::String(value));
+            }
+        } else if name.eq_ignore_ascii_case("ChannelDescription") {
+            let channel_index = channel_count_from_descriptions;
+            channel_count_from_descriptions = channel_count_from_descriptions.saturating_add(1);
+            xlef_lms_insert_channel_metadata(&mut meta, channel_index, attrs);
+            if let Some(bits) = attrs.get("Resolution").and_then(|v| v.parse::<u8>().ok()) {
+                meta.bits_per_pixel = bits;
+                meta.pixel_type = if bits <= 8 {
+                    PixelType::Uint8
+                } else if bits <= 16 {
+                    PixelType::Uint16
+                } else {
+                    PixelType::Float32
+                };
+            }
+        } else if name.eq_ignore_ascii_case("DimensionDescription") {
+            let Some(dim_id) = attrs.get("DimID").and_then(|v| v.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Some(elements) = attrs
+                .get("NumberOfElements")
+                .and_then(|v| v.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            meta.series_metadata.insert(
+                format!("xlef.lms.dimension.{dim_id}.elements"),
+                crate::common::metadata::MetadataValue::Int(elements as i64),
+            );
+            if let Some(unit) = attrs.get("Unit").filter(|v| !v.is_empty()) {
+                meta.series_metadata.insert(
+                    format!("xlef.lms.dimension.{dim_id}.unit"),
+                    crate::common::metadata::MetadataValue::String(unit.clone()),
+                );
+            }
+            if let Some(length) = attrs.get("Length").and_then(|v| xlef_parse_f64(v)) {
+                meta.series_metadata.insert(
+                    format!("xlef.lms.dimension.{dim_id}.length"),
+                    crate::common::metadata::MetadataValue::Float(length),
+                );
+            }
+            if let Some(physical_size_um) = xlef_lms_physical_size_um(attrs, elements) {
+                meta.series_metadata.insert(
+                    format!("xlef.lms.dimension.{dim_id}.physical_size_um"),
+                    crate::common::metadata::MetadataValue::Float(physical_size_um),
+                );
+                match dim_id {
+                    1 => {
+                        meta.series_metadata.insert(
+                            "xlef.lms.physical_size_x".into(),
+                            crate::common::metadata::MetadataValue::Float(physical_size_um),
+                        );
+                    }
+                    2 => {
+                        meta.series_metadata.insert(
+                            "xlef.lms.physical_size_y".into(),
+                            crate::common::metadata::MetadataValue::Float(physical_size_um),
+                        );
+                    }
+                    3 => {
+                        meta.series_metadata.insert(
+                            "xlef.lms.physical_size_z".into(),
+                            crate::common::metadata::MetadataValue::Float(physical_size_um),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            match dim_id {
+                1 if meta.size_x == 0 => meta.size_x = elements,
+                2 if meta.size_y == 0 => meta.size_y = elements,
+                3 => meta.size_z = elements.max(1),
+                4 => meta.size_t = elements.max(1),
+                5 => {
+                    meta.size_c = elements.max(1);
+                    size_c_from_dimension = true;
+                }
+                10 => {
+                    meta.series_metadata.insert(
+                        "xlef.lms.tile_count".into(),
+                        crate::common::metadata::MetadataValue::Int(elements as i64),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    xlef_lms_capture_graph_metadata(&mut meta, &tags);
+
+    if let Some(value) = xlef_lms_description_text(&xml) {
+        meta.series_metadata
+            .entry("xlef.lms.description".into())
+            .or_insert_with(|| crate::common::metadata::MetadataValue::String(value));
+    }
+
+    if !size_c_from_dimension && channel_count_from_descriptions > 0 {
+        meta.size_c = channel_count_from_descriptions;
+    }
+    if meta.size_x == 0 || meta.size_y == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Leica XLEF LMS metadata leaf {} does not declare bounded X/Y dimensions",
+            reference.display()
+        )));
+    }
+    meta.image_count = meta
+        .size_z
+        .saturating_mul(meta.size_c)
+        .saturating_mul(meta.size_t)
+        .max(1);
+    Ok(meta)
+}
+
+const XLEF_LMS_GRAPH_CAPTURE_LIMIT: usize = 16;
+
+fn xlef_lms_capture_graph_metadata(
+    meta: &mut ImageMetadata,
+    tags: &[(String, std::collections::HashMap<String, String>)],
+) {
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    meta.series_metadata.insert(
+        "xlef.lms.graph.tag_count".into(),
+        crate::common::metadata::MetadataValue::Int(tags.len() as i64),
+    );
+
+    for (name, attrs) in tags {
+        let Some(kind) = xlef_lms_graph_kind(name) else {
+            continue;
+        };
+        let index = counts.entry(kind).or_insert(0);
+        if *index < XLEF_LMS_GRAPH_CAPTURE_LIMIT {
+            xlef_lms_capture_graph_attrs(meta, kind, *index, attrs);
+        }
+        *index += 1;
+    }
+
+    for (kind, count) in counts {
+        meta.series_metadata.insert(
+            format!("xlef.lms.graph.{kind}_count"),
+            crate::common::metadata::MetadataValue::Int(count as i64),
+        );
+        if count > XLEF_LMS_GRAPH_CAPTURE_LIMIT {
+            meta.series_metadata.insert(
+                format!("xlef.lms.graph.{kind}_captured"),
+                crate::common::metadata::MetadataValue::Int(XLEF_LMS_GRAPH_CAPTURE_LIMIT as i64),
+            );
+        }
+    }
+}
+
+fn xlef_lms_graph_kind(name: &str) -> Option<&'static str> {
+    let local = name.rsplit(':').next().unwrap_or(name).to_ascii_lowercase();
+    match local.as_str() {
+        "detectordescription" | "detector" => Some("detector"),
+        "laserdescription" | "laser" | "lasersource" => Some("laser"),
+        "objectivedescription" | "objective" => Some("objective"),
+        "roi" | "roidescription" | "regionofinterest" => Some("roi"),
+        "stageposition" | "position" | "positiondescription" => Some("position"),
+        "timestamp" | "timestampdescription" | "timestamplist" => Some("timestamp"),
+        _ => None,
+    }
+}
+
+fn xlef_lms_capture_graph_attrs(
+    meta: &mut ImageMetadata,
+    kind: &str,
+    index: usize,
+    attrs: &std::collections::HashMap<String, String>,
+) {
+    for key in [
+        "ID",
+        "Id",
+        "UUID",
+        "Name",
+        "Type",
+        "Model",
+        "Manufacturer",
+        "Serial",
+        "SerialNumber",
+        "ClassName",
+        "Wavelength",
+        "Power",
+        "Magnification",
+        "NumericalAperture",
+        "NA",
+        "Immersion",
+        "Correction",
+        "Medium",
+        "X",
+        "Y",
+        "Z",
+        "PositionX",
+        "PositionY",
+        "PositionZ",
+        "Time",
+        "TimeStamp",
+    ] {
+        let Some(raw) = attrs.get(key) else {
+            continue;
+        };
+        let Some(value) = xlef_lms_clean_bounded_text(raw) else {
+            continue;
+        };
+        let metadata_value = if xlef_lms_graph_float_attr(key) {
+            let Some(float_value) = xlef_parse_f64(&value) else {
+                continue;
+            };
+            crate::common::metadata::MetadataValue::Float(float_value)
+        } else if let Ok(int_value) = value.parse::<i64>() {
+            crate::common::metadata::MetadataValue::Int(int_value)
+        } else if let Some(float_value) = xlef_parse_f64(&value) {
+            crate::common::metadata::MetadataValue::Float(float_value)
+        } else {
+            crate::common::metadata::MetadataValue::String(value)
+        };
+        meta.series_metadata.insert(
+            format!("xlef.lms.{kind}.{index}.{}", xlef_lms_key_name(key)),
+            metadata_value,
+        );
+    }
+}
+
+fn xlef_lms_graph_float_attr(key: &str) -> bool {
+    matches!(
+        key,
+        "Wavelength"
+            | "Power"
+            | "Magnification"
+            | "NumericalAperture"
+            | "NA"
+            | "X"
+            | "Y"
+            | "Z"
+            | "PositionX"
+            | "PositionY"
+            | "PositionZ"
+            | "Time"
+            | "TimeStamp"
+    )
+}
+
+fn xlef_lms_description_attr(attrs: &std::collections::HashMap<String, String>) -> Option<String> {
+    for key in ["Description", "Comment", "UserComment", "Notes"] {
+        if let Some(value) = attrs.get(key).and_then(|v| xlef_lms_clean_text(v)) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn xlef_lms_description_text(xml: &str) -> Option<String> {
+    for tag in ["Description", "Comment", "UserComment", "Notes"] {
+        if let Some(value) = scn_element_text(xml, tag).and_then(|v| xlef_lms_clean_text(&v)) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn xlef_lms_clean_text(value: &str) -> Option<String> {
+    xlef_lms_clean_text_with_limit(value, usize::MAX)
+}
+
+fn xlef_lms_clean_bounded_text(value: &str) -> Option<String> {
+    xlef_lms_clean_text_with_limit(value, 256)
+}
+
+fn xlef_lms_clean_text_with_limit(value: &str, max_chars: usize) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(max_chars).collect())
+    }
+}
+
+fn xlef_lms_insert_channel_metadata(
+    meta: &mut ImageMetadata,
+    channel_index: u32,
+    attrs: &std::collections::HashMap<String, String>,
+) {
+    let prefix = format!("xlef.lms.channel.{channel_index}");
+    for key in ["Name", "DyeName", "Dye", "LUTName"] {
+        if let Some(value) = attrs.get(key).filter(|v| !v.trim().is_empty()) {
+            meta.series_metadata.insert(
+                format!("{prefix}.{}", xlef_lms_key_name(key)),
+                crate::common::metadata::MetadataValue::String(value.trim().to_string()),
+            );
+        }
+    }
+    for key in [
+        "ExcitationWavelength",
+        "EmissionWavelength",
+        "Pinhole",
+        "PinholeAiry",
+        "PinholeSize",
+        "BytesInc",
+    ] {
+        if let Some(value) = attrs.get(key).and_then(|v| xlef_parse_f64(v)) {
+            meta.series_metadata.insert(
+                format!("{prefix}.{}", xlef_lms_key_name(key)),
+                crate::common::metadata::MetadataValue::Float(value),
+            );
+        }
+    }
+    if let Some(bits) = attrs.get("Resolution").and_then(|v| v.parse::<i64>().ok()) {
+        meta.series_metadata.insert(
+            format!("{prefix}.resolution"),
+            crate::common::metadata::MetadataValue::Int(bits),
+        );
+    }
+}
+
+fn xlef_lms_key_name(key: &str) -> String {
+    if key.chars().all(|ch| !ch.is_ascii_lowercase()) {
+        return key.to_ascii_lowercase();
+    }
+    let mut out = String::new();
+    for (i, ch) in key.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+fn xlef_parse_f64(value: &str) -> Option<f64> {
+    let parsed = value.trim().parse::<f64>().ok()?;
+    parsed.is_finite().then_some(parsed)
+}
+
+fn xlef_lms_physical_size_um(
+    attrs: &std::collections::HashMap<String, String>,
+    elements: u32,
+) -> Option<f64> {
+    if elements <= 1 {
+        return None;
+    }
+    let length = attrs.get("Length").and_then(|v| xlef_parse_f64(v))?;
+    let mut value = length / (elements as f64 - 1.0);
+    match attrs.get("Unit").map(|v| v.as_str()) {
+        Some("m") => value *= 1_000_000.0,
+        Some("mm") => value *= 1_000.0,
+        Some("nm") => value /= 1_000.0,
+        Some("Ks") => value /= 1_000.0,
+        _ => {}
+    }
+    value.is_finite().then_some(value.abs())
+}
+
+fn xlef_lms_metadata_float(meta: &ImageMetadata, key: &str) -> Option<f64> {
+    match meta.series_metadata.get(key) {
+        Some(crate::common::metadata::MetadataValue::Float(value)) if value.is_finite() => {
+            Some(*value)
+        }
+        Some(crate::common::metadata::MetadataValue::Int(value)) => Some(*value as f64),
+        Some(crate::common::metadata::MetadataValue::String(value)) => xlef_parse_f64(value),
+        _ => None,
+    }
+}
+
+fn xlef_lms_metadata_string(meta: &ImageMetadata, key: &str) -> Option<String> {
+    match meta.series_metadata.get(key) {
+        Some(crate::common::metadata::MetadataValue::String(value)) if !value.is_empty() => {
+            Some(value.clone())
+        }
+        _ => None,
+    }
+}
+
+fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::OmeMetadata {
+    let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+    if let Some(image) = ome.images.get_mut(0) {
+        image.name = xlef_lms_metadata_string(meta, "xlef.lms.image.name")
+            .or_else(|| xlef_lms_metadata_string(meta, "xlef.lms.element.name"));
+        image.description = xlef_lms_metadata_string(meta, "xlef.lms.description");
+        image.physical_size_x = xlef_lms_metadata_float(meta, "xlef.lms.physical_size_x");
+        image.physical_size_y = xlef_lms_metadata_float(meta, "xlef.lms.physical_size_y");
+        image.physical_size_z = xlef_lms_metadata_float(meta, "xlef.lms.physical_size_z");
+
+        let channel_count = if meta.is_rgb {
+            1
+        } else {
+            meta.size_c.max(1) as usize
+        };
+        if image.channels.len() < channel_count {
+            image.channels.resize_with(
+                channel_count,
+                crate::common::ome_metadata::OmeChannel::default,
+            );
+        }
+        for (channel_index, channel) in image.channels.iter_mut().enumerate() {
+            let prefix = format!("xlef.lms.channel.{channel_index}");
+            channel.name = xlef_lms_metadata_string(meta, &format!("{prefix}.name"))
+                .or_else(|| xlef_lms_metadata_string(meta, &format!("{prefix}.dye_name")))
+                .or_else(|| xlef_lms_metadata_string(meta, &format!("{prefix}.dye")));
+            channel.excitation_wavelength =
+                xlef_lms_metadata_float(meta, &format!("{prefix}.excitation_wavelength"))
+                    .filter(|v| *v > 0.0);
+            channel.emission_wavelength =
+                xlef_lms_metadata_float(meta, &format!("{prefix}.emission_wavelength"))
+                    .filter(|v| *v > 0.0);
+        }
+    }
+    let _ = ome.add_original_metadata_annotations(meta, 0);
+    ome
+}
+
+fn xlef_decode_lms_text(data: &[u8]) -> Result<String> {
+    if data.starts_with(&[0xff, 0xfe]) {
+        let units: Vec<u16> = data[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16(&units).map_err(|_| {
+            BioFormatsError::UnsupportedFormat(
+                "Leica XLEF LMS metadata is not valid UTF-16LE".into(),
+            )
+        });
+    }
+    if data.len() >= 4 && data[1] == 0 && data[3] == 0 {
+        let units: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16(&units).map_err(|_| {
+            BioFormatsError::UnsupportedFormat(
+                "Leica XLEF LMS metadata is not valid UTF-16LE".into(),
+            )
+        });
+    }
+    String::from_utf8(data.to_vec()).map_err(|_| {
+        BioFormatsError::UnsupportedFormat("Leica XLEF LMS metadata is not valid UTF-8".into())
+    })
+}
+
+fn xlef_format_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl Default for XlefReader {
@@ -1853,37 +5250,94 @@ impl FormatReader for XlefReader {
         false
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path)
+        self.close()?;
+        let references = Self::referenced_images(path)?;
+        for reference in references {
+            match reference {
+                XlefReference::Image(reference) => {
+                    self.add_delegate(&reference, xlef_delegate_for_reference(&reference))?;
+                }
+                XlefReference::Lms(reference) => {
+                    if let Some(reader) = xlef_lms_delegate_for_reference(&reference)? {
+                        self.add_initialized_delegate(&reference, reader)?;
+                    } else {
+                        let metadata = xlef_lms_metadata_for_reference(&reference)?;
+                        let metadata_index = self.lms_metadata.len();
+                        self.lms_metadata.push(metadata);
+                        self.series_map.push(XlefSeriesRef::Lms {
+                            metadata: metadata_index,
+                        });
+                    }
+                }
+            }
+        }
+        self.current_series = 0;
+        self.rebuild_project_metadata(path)?;
+        self.set_delegate_series_for_current()?;
+        Ok(())
     }
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        for delegate in &mut self.delegates {
+            delegate.reader.close()?;
+        }
+        self.delegates.clear();
+        self.lms_metadata.clear();
+        self.series_map.clear();
+        self.project_metadata.clear();
+        self.current_series = 0;
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.series_map.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        let mapping = *self
+            .series_map
+            .get(s)
+            .ok_or(BioFormatsError::SeriesOutOfRange(s))?;
+        if let XlefSeriesRef::Delegate { delegate, series } = mapping {
+            self.delegates[delegate].reader.set_series(series)?;
+        }
+        self.current_series = s;
+        Ok(())
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.project_metadata
+            .get(self.current_series)
+            .or_else(|| self.current_delegate().map(|reader| reader.metadata()))
+            .or_else(|| self.current_lms_metadata())
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        self.current_delegate_mut()?.open_bytes(p)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        self.current_delegate_mut()?
+            .open_bytes_region(p, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+        self.current_delegate_mut()?.open_thumb_bytes(p)
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        self.current_delegate()
+            .map(|reader| reader.resolution_count())
+            .unwrap_or(1)
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        self.current_delegate_mut()?.set_resolution(level)
+    }
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        match self.series_map.get(self.current_series)? {
+            XlefSeriesRef::Delegate { delegate, .. } => {
+                self.delegates.get(*delegate)?.reader.ome_metadata()
+            }
+            XlefSeriesRef::Lms { metadata } => {
+                self.lms_metadata.get(*metadata).map(xlef_lms_ome_metadata)
+            }
+        }
     }
 }
 
@@ -2150,11 +5604,7 @@ fn oir_skip_pixel_block(
     let data_offset = s.tell() as u64;
 
     if store && pixel_bytes > 0 {
-        if let Some(block_index) = uid
-            .rsplit('_')
-            .next()
-            .and_then(|t| t.parse::<i32>().ok())
-        {
+        if let Some(block_index) = uid.rsplit('_').next().and_then(|t| t.parse::<i32>().ok()) {
             if block_index >= *blocks_per_plane {
                 *blocks_per_plane = block_index + 1;
             }
@@ -2443,13 +5893,14 @@ fn oir_apply_xml(xml_blocks: &[String], meta: &mut ImageMetadata, channel_ids: &
                     meta.size_x = w;
                 }
             }
-            if let Some(h) = oir_xml_text(xml, "height").and_then(|v| v.trim().parse::<u32>().ok()) {
+            if let Some(h) = oir_xml_text(xml, "height").and_then(|v| v.trim().parse::<u32>().ok())
+            {
                 if meta.size_y == 0 {
                     meta.size_y = h;
                 }
             }
-            if let Some(mut depth) = oir_xml_text(xml, "depth")
-                .and_then(|v| v.trim().parse::<u32>().ok())
+            if let Some(mut depth) =
+                oir_xml_text(xml, "depth").and_then(|v| v.trim().parse::<u32>().ok())
             {
                 if rgb {
                     depth /= 3;
@@ -2460,8 +5911,8 @@ fn oir_apply_xml(xml_blocks: &[String], meta: &mut ImageMetadata, channel_ids: &
                     meta.bits_per_pixel = bits;
                 }
             }
-            if let Some(mut bits) = oir_xml_text(xml, "bitCounts")
-                .and_then(|v| v.trim().parse::<u32>().ok())
+            if let Some(mut bits) =
+                oir_xml_text(xml, "bitCounts").and_then(|v| v.trim().parse::<u32>().ok())
             {
                 if rgb {
                     bits /= 3;
@@ -2537,7 +5988,8 @@ fn oir_apply_axes(xml: &str, meta: &mut ImageMetadata) {
                 if local == "axis" {
                     in_axis_wrapper -= 1;
                     if in_axis_wrapper <= 0 {
-                        if let (Some(name), Some(size)) = (cur_axis_name.take(), cur_max_size.take())
+                        if let (Some(name), Some(size)) =
+                            (cur_axis_name.take(), cur_max_size.take())
                         {
                             oir_apply_one_axis(&name, size, meta);
                         }
@@ -2936,10 +6388,9 @@ fn oir_zct_coords(meta: &ImageMetadata, no: u32) -> (u32, u32, u32) {
 /// `usePyramid` is set), computes per-level tile grids and plane sizes following
 /// the Java halving rules, and assembles tiles into a full plane on
 /// `open_bytes`. Tiles are decoded according to the ETS compression code: RAW,
-/// JPEG, JPEG-2000 and JPEG-lossless reuse codec.rs decoders. PNG/BMP tile
-/// codecs are not wired in and produce an `UnsupportedFormat` error rather than
-/// wrong pixels. Tag 700-style metadata and label/overview images continue to be
-/// served by the inner TIFF.
+/// JPEG, JPEG-2000, JPEG-lossless, PNG and BMP reuse codec.rs decoders. Tag
+/// 700-style metadata and label/overview images continue to be served by the
+/// inner TIFF.
 pub struct CellSensReader {
     inner: crate::tiff::TiffReader,
     ets: Vec<EtsVolume>,
@@ -3618,7 +7069,7 @@ impl EtsVolume {
         let pt = self.pixel_type()?;
         let channels = self.rgb_channels();
         let image_count = level.size_z * level.size_t * (level.size_c / channels.max(1)).max(1);
-        Ok(ImageMetadata {
+        let mut meta = ImageMetadata {
             size_x: level.size_x,
             size_y: level.size_y,
             size_z: level.size_z.max(1),
@@ -3637,7 +7088,114 @@ impl EtsVolume {
             is_little_endian: self.compression == ETS_RAW,
             resolution_count: 1,
             ..ImageMetadata::default()
-        })
+        };
+        insert_cellsens_acquisition_metadata(&mut meta.series_metadata, "cellsens.ets", &self.meta);
+        Ok(meta)
+    }
+}
+
+fn insert_cellsens_acquisition_metadata(
+    sm: &mut HashMap<String, MetadataValue>,
+    prefix: &str,
+    m: &VsiPyramidMeta,
+) {
+    let strs: [(&str, Option<&String>); 6] = [
+        ("device_name", m.device_names.first()),
+        ("device_id", m.device_ids.first()),
+        ("device_subtype", m.device_subtypes.first()),
+        ("device_manufacturer", m.device_manufacturers.first()),
+        ("objective_name", m.objective_names.first()),
+        ("stack_type", m.stack_type.as_ref()),
+    ];
+    for (key, val) in strs {
+        if let Some(val) = val {
+            if !val.is_empty() {
+                sm.insert(
+                    format!("{prefix}.{key}"),
+                    MetadataValue::String(val.clone()),
+                );
+            }
+        }
+    }
+    let floats: [(&str, Option<f64>); 12] = [
+        ("objective_magnification", m.magnification),
+        ("numerical_aperture", m.numerical_aperture),
+        ("working_distance", m.working_distance),
+        ("refractive_index", m.refractive_index),
+        ("camera_gain", m.gain),
+        ("camera_offset", m.offset),
+        ("red_gain", m.red_gain),
+        ("green_gain", m.green_gain),
+        ("blue_gain", m.blue_gain),
+        ("red_offset", m.red_offset),
+        ("green_offset", m.green_offset),
+        ("blue_offset", m.blue_offset),
+    ];
+    for (key, val) in floats {
+        if let Some(x) = val {
+            sm.insert(format!("{prefix}.{key}"), MetadataValue::Float(x));
+        }
+    }
+    let ints: [(&str, Option<i64>); 5] = [
+        ("bit_depth", m.bit_depth),
+        ("binning_x", m.binning_x),
+        ("binning_y", m.binning_y),
+        ("acquisition_time", m.acquisition_time),
+        ("exposure_time", m.exposure_times.first().copied()),
+    ];
+    for (key, val) in ints {
+        if let Some(x) = val {
+            sm.insert(format!("{prefix}.{key}"), MetadataValue::Int(x));
+        }
+    }
+
+    let float_lists: [(&str, &Vec<f64>); 3] = [
+        ("channel_wavelength", &m.channel_wavelengths),
+        ("z_value", &m.z_values),
+        ("timestamp", &m.t_values),
+    ];
+    for (key, list) in float_lists {
+        for (idx, x) in list.iter().enumerate() {
+            sm.insert(format!("{prefix}.{key}.{idx}"), MetadataValue::Float(*x));
+        }
+    }
+    if let Some(x) = m.z_start {
+        sm.insert(format!("{prefix}.z_start"), MetadataValue::Float(x));
+    }
+    if let Some(x) = m.z_increment {
+        sm.insert(format!("{prefix}.z_increment"), MetadataValue::Float(x));
+    }
+    for (idx, name) in m.channel_names.iter().enumerate() {
+        if !name.is_empty() {
+            sm.insert(
+                format!("{prefix}.channel_name.{idx}"),
+                MetadataValue::String(name.clone()),
+            );
+        }
+    }
+    if let Some(name) = &m.name {
+        sm.insert(
+            format!("{prefix}.stack_name"),
+            MetadataValue::String(name.clone()),
+        );
+    }
+    if let Some(x) = m.default_exposure_time {
+        sm.insert(
+            format!("{prefix}.default_exposure_time"),
+            MetadataValue::Int(x),
+        );
+    }
+    for (idx, x) in m.other_exposure_times.iter().enumerate() {
+        sm.insert(
+            format!("{prefix}.other_exposure_time.{idx}"),
+            MetadataValue::Int(*x),
+        );
+    }
+    for (idx, x) in m.objective_types.iter().enumerate() {
+        sm.insert(
+            format!("{prefix}.objective_type.{idx}"),
+            MetadataValue::Int(*x),
+        );
     }
 }
 
@@ -3648,8 +7206,8 @@ impl EtsVolume {
 // full-resolution width/height (IMAGE_BOUNDARY), the tile-origin crop
 // (TILE_ORIGIN) and the canonical dimension ordering. This is a focused port of
 // the tree walk that collects only those geometry fields; the large body of
-// per-device acquisition metadata tags is intentionally not ported (reported as
-// remaining work).
+// per-device acquisition metadata tags is captured below into `VsiPyramidMeta`
+// and mirrored into both overview summary metadata and ETS logical series.
 
 // Real field types (CellSensReader.java:80-126).
 const VSI_CHAR: i32 = 1;
@@ -4631,111 +8189,7 @@ impl CellSensReader {
                 let _ = v.pixel_type_code;
 
                 // Non-geometry acquisition metadata (CellSensReader.java:1881-1979).
-                let m = &v.meta;
-                let sm = &mut s.metadata.series_metadata;
-                let strs: [(&str, Option<&String>); 6] = [
-                    ("device_name", m.device_names.first()),
-                    ("device_id", m.device_ids.first()),
-                    ("device_subtype", m.device_subtypes.first()),
-                    ("device_manufacturer", m.device_manufacturers.first()),
-                    ("objective_name", m.objective_names.first()),
-                    ("stack_type", m.stack_type.as_ref()),
-                ];
-                for (key, val) in strs {
-                    if let Some(val) = val {
-                        if !val.is_empty() {
-                            sm.insert(format!("{p}.{key}"), MetadataValue::String(val.clone()));
-                        }
-                    }
-                }
-                let floats: [(&str, Option<f64>); 12] = [
-                    ("objective_magnification", m.magnification),
-                    ("numerical_aperture", m.numerical_aperture),
-                    ("working_distance", m.working_distance),
-                    ("refractive_index", m.refractive_index),
-                    ("camera_gain", m.gain),
-                    ("camera_offset", m.offset),
-                    ("red_gain", m.red_gain),
-                    ("green_gain", m.green_gain),
-                    ("blue_gain", m.blue_gain),
-                    ("red_offset", m.red_offset),
-                    ("green_offset", m.green_offset),
-                    ("blue_offset", m.blue_offset),
-                ];
-                for (key, val) in floats {
-                    if let Some(x) = val {
-                        sm.insert(format!("{p}.{key}"), MetadataValue::Float(x));
-                    }
-                }
-                let ints: [(&str, Option<i64>); 5] = [
-                    ("bit_depth", m.bit_depth),
-                    ("binning_x", m.binning_x),
-                    ("binning_y", m.binning_y),
-                    ("acquisition_time", m.acquisition_time),
-                    ("exposure_time", m.exposure_times.first().copied()),
-                ];
-                for (key, val) in ints {
-                    if let Some(x) = val {
-                        sm.insert(format!("{p}.{key}"), MetadataValue::Int(x));
-                    }
-                }
-
-                // Prefix-gated VALUE metadata and per-channel/list fields
-                // (CellSensReader.java:1769-1778, 1899-1979). Java collects these
-                // into per-pyramid lists; here each list element is emitted under
-                // an indexed key (`{key}.{index}`) to preserve order and arity.
-                let float_lists: [(&str, &Vec<f64>); 3] = [
-                    // tagPrefix "Channel Wavelength " (CellSensReader.java:1961-1962)
-                    ("channel_wavelength", &m.channel_wavelengths),
-                    // tagPrefix "Z value" (CellSensReader.java:1973-1974)
-                    ("z_value", &m.z_values),
-                    // tagPrefix "Timestamp " (CellSensReader.java:1976-1977)
-                    ("timestamp", &m.t_values),
-                ];
-                for (key, list) in float_lists {
-                    for (idx, x) in list.iter().enumerate() {
-                        sm.insert(format!("{p}.{key}.{idx}"), MetadataValue::Float(*x));
-                    }
-                }
-                // Z start position / Z increment (CellSensReader.java:1967-1972).
-                if let Some(x) = m.z_start {
-                    sm.insert(format!("{p}.z_start"), MetadataValue::Float(x));
-                }
-                if let Some(x) = m.z_increment {
-                    sm.insert(format!("{p}.z_increment"), MetadataValue::Float(x));
-                }
-                // Per-channel names (CellSensReader.java:1769-1773).
-                for (idx, name) in m.channel_names.iter().enumerate() {
-                    if !name.is_empty() {
-                        sm.insert(
-                            format!("{p}.channel_name.{idx}"),
-                            MetadataValue::String(name.clone()),
-                        );
-                    }
-                }
-                // Stack name (CellSensReader.java:1774-1778).
-                if let Some(name) = &m.name {
-                    sm.insert(
-                        format!("{p}.stack_name"),
-                        MetadataValue::String(name.clone()),
-                    );
-                }
-                // EXPOSURE_TIME split by prefix (CellSensReader.java:1899-1905):
-                // empty-prefix exposures already emitted above as `exposure_time`;
-                // the prefixed default + the list of "other" exposures land here.
-                if let Some(x) = m.default_exposure_time {
-                    sm.insert(format!("{p}.default_exposure_time"), MetadataValue::Int(x));
-                }
-                for (idx, x) in m.other_exposure_times.iter().enumerate() {
-                    sm.insert(
-                        format!("{p}.other_exposure_time.{idx}"),
-                        MetadataValue::Int(*x),
-                    );
-                }
-                // Objective types (CellSensReader.java:1924-1926).
-                for (idx, x) in m.objective_types.iter().enumerate() {
-                    sm.insert(format!("{p}.objective_type.{idx}"), MetadataValue::Int(*x));
-                }
+                insert_cellsens_acquisition_metadata(&mut s.metadata.series_metadata, &p, &v.meta);
             }
         }
         self.ets = volumes;
@@ -4786,7 +8240,8 @@ impl CellSensReader {
                                 _ => None,
                             });
                     } else {
-                        self.series_names.push(format!("{filename} #{}", series_idx + 1));
+                        self.series_names
+                            .push(format!("{filename} #{}", series_idx + 1));
                         self.series_phys.push(None);
                     }
                 }
@@ -4868,6 +8323,20 @@ impl CellSensReader {
             .decode()
             .map_err(|e| BioFormatsError::Codec(e.to_string()))?;
         Ok(Some(pixels))
+    }
+
+    fn logical_series_metadata_for_ome(&self, target: CellSensTarget) -> Option<ImageMetadata> {
+        match target {
+            CellSensTarget::Tiff(ts) => {
+                let mut meta = self.inner.series_list().get(ts)?.metadata.clone();
+                meta.is_interleaved = false;
+                meta.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+                Some(meta)
+            }
+            CellSensTarget::Ets { volume, resolution } => {
+                self.ets.get(volume)?.level_metadata(resolution).ok()
+            }
+        }
     }
 }
 
@@ -5127,8 +8596,7 @@ impl FormatReader for CellSensReader {
                             for ch in 0..spp {
                                 let src = px * pixel + ch * sample;
                                 let dst = (ch * plane + px) * sample;
-                                out[dst..dst + sample]
-                                    .copy_from_slice(&buf[src..src + sample]);
+                                out[dst..dst + sample].copy_from_slice(&buf[src..src + sample]);
                             }
                         }
                         return Ok(out);
@@ -5174,15 +8642,13 @@ impl FormatReader for CellSensReader {
             // samplesPerPixel == the RGB channel count (CellSensReader exposes 3).
             let spp = match *target {
                 CellSensTarget::Ets { volume, .. } => self.ets[volume].rgb_channels(),
-                CellSensTarget::Tiff(ts) => {
-                    self.inner.series_list().get(ts).map_or(1, |s| {
-                        if s.metadata.is_rgb {
-                            s.metadata.size_c.max(1)
-                        } else {
-                            1
-                        }
-                    })
-                }
+                CellSensTarget::Tiff(ts) => self.inner.series_list().get(ts).map_or(1, |s| {
+                    if s.metadata.is_rgb {
+                        s.metadata.size_c.max(1)
+                    } else {
+                        1
+                    }
+                }),
             };
             images.push(OmeImage {
                 name: self.series_names.get(i).cloned(),
@@ -5196,10 +8662,16 @@ impl FormatReader for CellSensReader {
                 ..OmeImage::default()
             });
         }
-        Some(OmeMetadata {
+        let mut ome = OmeMetadata {
             images,
             ..OmeMetadata::default()
-        })
+        };
+        for (i, target) in self.series_map.iter().copied().enumerate() {
+            if let Some(meta) = self.logical_series_metadata_for_ome(target) {
+                let _ = ome.add_original_metadata_annotations(&meta, i);
+            }
+        }
+        Some(ome)
     }
 }
 
@@ -6010,6 +9482,43 @@ const SLIDEBOOK_CHANNEL_TAG: u16 = 65004;
 const SLIDEBOOK_MAGNIFICATION_TAG: u16 = 65005;
 const SLIDEBOOK_PHYSICAL_SIZE_TAG: u16 = 65007;
 
+fn slidebook_ifd_value_text(ifd: &Ifd, tag: u16) -> Option<String> {
+    match ifd.get(tag)? {
+        IfdValue::Ascii(s) => Some(s.clone()),
+        IfdValue::Byte(v) | IfdValue::Undefined(v) => {
+            let end = v.iter().position(|&b| b == 0).unwrap_or(v.len());
+            if v[..end].iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+                Some(String::from_utf8_lossy(&v[..end]).trim().to_string())
+            } else {
+                None
+            }
+        }
+        other => {
+            let values = other.as_vec_f64();
+            values.first().map(|v| v.to_string())
+        }
+    }
+}
+
+fn slidebook_ifd_value_f64(ifd: &Ifd, tag: u16) -> Option<f64> {
+    if let Some(s) = ifd.get_str(tag) {
+        return s.trim().parse::<f64>().ok();
+    }
+    ifd.get(tag)
+        .and_then(|value| value.as_vec_f64().first().copied())
+}
+
+fn slidebook_clean_channel_name(name: &str) -> String {
+    let mut n = name;
+    if let Some(p) = n.find(':') {
+        n = &n[p + 1..];
+    }
+    if let Some(p) = n.find(';') {
+        n = &n[..p];
+    }
+    n.trim().to_string()
+}
+
 impl SlidebookTiffReader {
     pub fn new() -> Self {
         SlidebookTiffReader {
@@ -6022,30 +9531,16 @@ impl SlidebookTiffReader {
         let mut vendor: Vec<(String, MetadataValue)> = Vec::new();
         let mut channel_name: Option<String> = None;
         if let Some(ifd) = self.inner.ifd(0) {
-            if let Some(name) = ifd.get_str(SLIDEBOOK_CHANNEL_TAG) {
-                // Java strips a "prefix:" and a ";suffix".
-                let mut n = name;
-                if let Some(p) = n.find(':') {
-                    n = &n[p + 1..];
-                }
-                if let Some(p) = n.find(';') {
-                    n = &n[..p];
-                }
-                channel_name = Some(n.trim().to_string());
+            if let Some(name) = slidebook_ifd_value_text(ifd, SLIDEBOOK_CHANNEL_TAG) {
+                channel_name = Some(slidebook_clean_channel_name(&name));
             }
-            if let Some(p) = ifd
-                .get_str(SLIDEBOOK_PHYSICAL_SIZE_TAG)
-                .and_then(|s| s.trim().parse::<f64>().ok())
-            {
+            if let Some(p) = slidebook_ifd_value_f64(ifd, SLIDEBOOK_PHYSICAL_SIZE_TAG) {
                 if p > 0.0 {
                     vendor.push(("slidebook.physical_size_x".into(), MetadataValue::Float(p)));
                     vendor.push(("slidebook.physical_size_y".into(), MetadataValue::Float(p)));
                 }
             }
-            if let Some(mag) = ifd
-                .get_str(SLIDEBOOK_MAGNIFICATION_TAG)
-                .and_then(|s| s.trim().parse::<f64>().ok())
-            {
+            if let Some(mag) = slidebook_ifd_value_f64(ifd, SLIDEBOOK_MAGNIFICATION_TAG) {
                 vendor.push(("slidebook.magnification".into(), MetadataValue::Float(mag)));
             }
             for (tag, key) in [
@@ -6053,7 +9548,7 @@ impl SlidebookTiffReader {
                 (SLIDEBOOK_Y_POS_TAG, "slidebook.position_y"),
                 (SLIDEBOOK_Z_POS_TAG, "slidebook.position_z"),
             ] {
-                if let Some(v) = ifd.get_str(tag).and_then(|s| s.trim().parse::<f64>().ok()) {
+                if let Some(v) = slidebook_ifd_value_f64(ifd, tag) {
                     vendor.push((key.into(), MetadataValue::Float(v)));
                 }
             }
@@ -6174,6 +9669,193 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn write_native_ivision(
+        path: &Path,
+        data_type: u8,
+        size_x: u32,
+        size_y: u32,
+        size_z: u16,
+        payload: &[u8],
+    ) {
+        let mut bytes = vec![0u8; 72];
+        bytes[..4].copy_from_slice(b"1.0A");
+        bytes[4] = 1;
+        bytes[5] = data_type;
+        bytes[6..10].copy_from_slice(&size_x.to_be_bytes());
+        bytes[10..14].copy_from_slice(&size_y.to_be_bytes());
+        bytes[20..22].copy_from_slice(&size_z.to_be_bytes());
+        if size_x > 1 && size_y > 1 {
+            bytes.extend_from_slice(&vec![0u8; 2048]);
+        }
+        bytes.extend_from_slice(payload);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn build_slidebook7_npy(descr: &str, shape: &[u32], payload: &[u8]) -> Vec<u8> {
+        let shape_text = if shape.len() == 1 {
+            format!("({},)", shape[0])
+        } else {
+            shape
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut header =
+            format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({shape_text}), }}");
+        let preamble_len = 10usize;
+        let padding = (16 - ((preamble_len + header.len() + 1) % 16)) % 16;
+        header.extend(std::iter::repeat_n(' ', padding));
+        header.push('\n');
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x93NUMPY");
+        bytes.push(1);
+        bytes.push(0);
+        bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn write_slidebook7_npy(path: &Path, descr: &str, shape: &[u32], payload: &[u8]) {
+        let bytes = build_slidebook7_npy(descr, shape, payload);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_slidebook7_npyz(path: &Path, descr: &str, shape: &[u32], payload: &[u8]) {
+        let npy = build_slidebook7_npy(descr, shape, payload);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&npy).unwrap();
+        std::fs::write(path, encoder.finish().unwrap()).unwrap();
+    }
+
+    fn write_native_slidebook7(
+        slide_path: &Path,
+        title: &str,
+        dims: (u32, u32, u32, u32, u32),
+        planes_by_channel_time: &[((u32, u32), Vec<u16>)],
+    ) {
+        std::fs::write(slide_path, b"SlideBook 7 native placeholder").unwrap();
+        let root = slide_path.with_extension("dir");
+        let group = root.join(format!("{title}.imgdir"));
+        std::fs::create_dir_all(&group).unwrap();
+        let image_record = format!(
+            "mWidth: {}\nmHeight: {}\nmNumPlanes: {}\nmNumChannels: {}\nmNumTimepoints: {}\n",
+            dims.0, dims.1, dims.2, dims.3, dims.4
+        );
+        std::fs::write(group.join("ImageRecord.yaml"), image_record).unwrap();
+        for ((channel, timepoint), values) in planes_by_channel_time {
+            let payload = values
+                .iter()
+                .copied()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let path = group.join(format!("ImageData_Ch{channel}_TP{timepoint:07}.npy"));
+            write_slidebook7_npy(&path, "<u2", &[dims.2, dims.1, dims.0], &payload);
+        }
+    }
+
+    fn im3_record(name: &str, rec_type: u32, payload: Vec<u8>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&((payload.len() + 8) as u32).to_le_bytes());
+        bytes.extend_from_slice(&rec_type.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    fn im3_container(name: &str, children: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut payload = vec![0u8; 8];
+        for child in children {
+            payload.extend_from_slice(&child);
+        }
+        im3_record(name, 0, payload)
+    }
+
+    fn im3_int_array(name: &str, values: &[u32]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&(values.len() as u32).to_le_bytes());
+        for value in values {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        im3_record(name, 6, payload)
+    }
+
+    fn im3_int_scalar(name: &str, value: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&value.to_le_bytes());
+        im3_record(name, 6, payload)
+    }
+
+    fn im3_string_scalar(name: &str, value: &str) -> Vec<u8> {
+        let mut payload = value.as_bytes().to_vec();
+        payload.push(0);
+        im3_record(name, 2, payload)
+    }
+
+    fn im3_java_string_scalar(name: &str, value: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(value.as_bytes());
+        im3_record(name, 10, payload)
+    }
+
+    fn im3_float_scalar(name: &str, value: f32) -> Vec<u8> {
+        im3_record(name, 3, value.to_le_bytes().to_vec())
+    }
+
+    fn im3_double_scalar(name: &str, value: f64) -> Vec<u8> {
+        im3_record(name, 4, value.to_le_bytes().to_vec())
+    }
+
+    fn im3_java_float_array(name: &str, values: &[f32]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&(values.len() as u32).to_le_bytes());
+        for value in values {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        im3_record(name, 7, payload)
+    }
+
+    fn im3_java_float_scalar(name: &str, value: f32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&value.to_le_bytes());
+        im3_record(name, 7, payload)
+    }
+
+    fn im3_data_record(size_x: u32, size_y: u32, size_c: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&size_x.to_le_bytes());
+        payload.extend_from_slice(&size_y.to_le_bytes());
+        payload.extend_from_slice(&size_c.to_le_bytes());
+        payload.extend_from_slice(pixels);
+        im3_record("Data", 1, payload)
+    }
+
+    fn write_native_im3(path: &Path, size_x: u32, size_y: u32, size_c: u32, pixels: &[u8]) {
+        let dataset = im3_container(
+            "",
+            vec![
+                im3_int_array("Shape", &[size_x, size_y, size_c]),
+                im3_data_record(size_x, size_y, size_c, pixels),
+            ],
+        );
+        let data_set = im3_container("DataSet", vec![dataset]);
+        let root = im3_container("Root", vec![data_set]);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&root);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn assert_synthetic_raw_reader<R: FormatReader>(mut reader: R, path: &Path, format_name: &str) {
         reader.set_id(path).expect("synthetic raw file");
         assert_eq!(reader.series_count(), 1);
@@ -6211,7 +9893,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn im3_reads_explicit_synthetic_raw_subset() {
         let path = temp_flim2_path("synthetic.im3");
@@ -6232,6 +9913,464 @@ mod tests {
         assert_synthetic_raw_reader(Im3Reader::new(), &path, "IM3");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn im3_reads_bounded_native_interleaved_uint16_channels_like_java() {
+        let path = temp_flim2_path("native.im3");
+        let pixels = [
+            10u16, 100, 20, 200, //
+            30, 300, 40, 400, //
+            50, 500, 60, 600,
+        ]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+        write_native_im3(&path, 3, 2, 2, &pixels);
+
+        let mut reader = Im3Reader::new();
+        assert!(reader.is_this_type_by_bytes(&1985u32.to_be_bytes()));
+        reader.set_id(&path).expect("native IM3 fixture");
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().size_x, 3);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().size_z, 1);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().size_t, 1);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+        assert_eq!(reader.metadata().bits_per_pixel, 16);
+        assert!(reader.metadata().is_little_endian);
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            [10u16, 20, 30, 40, 50, 60]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reader.open_bytes(1).unwrap(),
+            [100u16, 200, 300, 400, 500, 600]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reader.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
+            [200u16, 300, 500, 600]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            reader.open_bytes(2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn im3_reads_multi_dataset_native_as_series() {
+        let multi = temp_flim2_path("native-multi.im3");
+        let first_pixels = [1u16, 2]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let second_pixels = [10u16, 20, 30, 40]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let dataset_a = im3_container(
+            "",
+            vec![
+                im3_int_array("Shape", &[2, 1, 1]),
+                im3_data_record(2, 1, 1, &first_pixels),
+            ],
+        );
+        let dataset_b = im3_container(
+            "",
+            vec![
+                im3_int_array("Shape", &[2, 1, 2]),
+                im3_data_record(2, 1, 2, &second_pixels),
+            ],
+        );
+        let mut multi_bytes = Vec::new();
+        multi_bytes.extend_from_slice(&1985u32.to_be_bytes());
+        multi_bytes.extend_from_slice(&im3_container(
+            "Root",
+            vec![im3_container("DataSet", vec![dataset_a, dataset_b])],
+        ));
+        std::fs::write(&multi, multi_bytes).unwrap();
+
+        let mut reader = Im3Reader::new();
+        reader.set_id(&multi).expect("native multi-dataset IM3");
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.series(), 0);
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().image_count, 1);
+        assert!(matches!(
+            reader.metadata().series_metadata.get("IM3 DataSets"),
+            Some(crate::common::metadata::MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            reader.metadata().series_metadata.get("IM3 DataSet Index"),
+            Some(crate::common::metadata::MetadataValue::Int(0))
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), first_pixels);
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.series(), 1);
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert!(matches!(
+            reader.metadata().series_metadata.get("IM3 DataSet Index"),
+            Some(crate::common::metadata::MetadataValue::Int(1))
+        ));
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            [10u16, 30]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reader.open_bytes(1).unwrap(),
+            [20u16, 40]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            reader.set_series(2),
+            Err(BioFormatsError::SeriesOutOfRange(2))
+        ));
+        let _ = std::fs::remove_file(multi);
+    }
+
+    #[test]
+    fn im3_preserves_bounded_native_scalar_metadata() {
+        let path = temp_flim2_path("native-metadata.im3");
+        let pixels = [7u16, 70, 700, 11, 110, 1100]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let dataset = im3_container(
+            "",
+            vec![
+                im3_int_array("Shape", &[2, 1, 3]),
+                im3_int_scalar("Exposure Time", 125),
+                im3_int_array("Channel Wavelengths", &[420, 520, 620]),
+                im3_string_scalar("Channel Names", "DAPI,FITC,Cy5"),
+                im3_int_scalar("Camera-Gain#1", 9),
+                im3_string_scalar("Instrument Name", "ImageStream X"),
+                im3_float_scalar("Exposure Seconds", 0.125),
+                im3_double_scalar("Laser Power", 4.5),
+                im3_data_record(2, 1, 3, &pixels),
+            ],
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&im3_container(
+            "Root",
+            vec![im3_container("DataSet", vec![dataset])],
+        ));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = Im3Reader::new();
+        reader.set_id(&path).expect("native IM3 metadata fixture");
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("im3.native.exposure_time"),
+            Some(crate::common::metadata::MetadataValue::Int(125))
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.channel_wavelengths"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "420,520,620"
+        ));
+        assert!(matches!(
+            metadata.get("im3.channel.0.emission_wavelength"),
+            Some(crate::common::metadata::MetadataValue::Float(value)) if (*value - 420.0).abs() < 1e-12
+        ));
+        assert!(matches!(
+            metadata.get("im3.channel.2.emission_wavelength"),
+            Some(crate::common::metadata::MetadataValue::Float(value)) if (*value - 620.0).abs() < 1e-12
+        ));
+        assert!(matches!(
+            metadata.get("im3.channel.0.name"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "DAPI"
+        ));
+        assert!(matches!(
+            metadata.get("im3.channel.2.name"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "Cy5"
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.camera_gain_1"),
+            Some(crate::common::metadata::MetadataValue::Int(9))
+        ));
+        assert!(matches!(
+            metadata.get("im3.acquisition.camera_gain"),
+            Some(crate::common::metadata::MetadataValue::Float(value)) if (*value - 9.0).abs() < 1e-12
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.instrument_name"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "ImageStream X"
+        ));
+        assert!(matches!(
+            metadata.get("im3.instrument.name"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "ImageStream X"
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.exposure_seconds"),
+            Some(crate::common::metadata::MetadataValue::Float(value)) if (*value - 0.125).abs() < 1e-12
+        ));
+        assert!(matches!(
+            metadata.get("im3.acquisition.exposure_seconds"),
+            Some(crate::common::metadata::MetadataValue::Float(value)) if (*value - 0.125).abs() < 1e-12
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.laser_power"),
+            Some(crate::common::metadata::MetadataValue::Float(value)) if (*value - 4.5).abs() < 1e-12
+        ));
+        assert!(matches!(
+            metadata.get("im3.acquisition.laser_power"),
+            Some(crate::common::metadata::MetadataValue::Float(value)) if (*value - 4.5).abs() < 1e-12
+        ));
+        let modulo = reader
+            .metadata()
+            .modulo_c
+            .as_ref()
+            .expect("IM3 channel wavelength modulo");
+        assert_eq!(modulo.parent_dimension, "C");
+        assert_eq!(modulo.modulo_type, "lambda");
+        assert_eq!(modulo.unit, "nm");
+        assert_eq!(modulo.labels, ["420 nm", "520 nm", "620 nm"]);
+        assert!((modulo.start - 420.0).abs() < 1e-12);
+        assert!((modulo.step - 100.0).abs() < 1e-12);
+        assert!((modulo.end - 620.0).abs() < 1e-12);
+        let ome = reader.ome_metadata().expect("IM3 OME metadata");
+        let original = ome
+            .annotations
+            .iter()
+            .find_map(|annotation| match annotation {
+                crate::common::ome_metadata::OmeAnnotation::MapAnnotation {
+                    id: Some(id),
+                    values,
+                    ..
+                } if id == "Annotation:OriginalMetadata:0" => Some(values),
+                _ => None,
+            })
+            .expect("IM3 original metadata annotation");
+        assert!(original
+            .iter()
+            .any(|(key, value)| key == "im3.instrument.name" && value == "ImageStream X"));
+        assert!(original
+            .iter()
+            .any(|(key, value)| { key == "im3.channel.1.emission_wavelength" && value == "520" }));
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            [7u16, 11]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn im3_reports_bounded_unsupported_native_metadata_records() {
+        let path = temp_flim2_path("native-unsupported-metadata.im3");
+        let pixels = [5u16, 50]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let dataset = im3_container(
+            "",
+            vec![
+                im3_int_array("Shape", &[1, 1, 2]),
+                im3_string_scalar("Channel Names", "A,B"),
+                im3_record("Vendor Object", 99, vec![1, 2, 3, 4]),
+                im3_record("Packed Metadata", 3, vec![0, 1]),
+                im3_data_record(1, 1, 2, &pixels),
+            ],
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&im3_container(
+            "Root",
+            vec![im3_container("DataSet", vec![dataset])],
+        ));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = Im3Reader::new();
+        reader
+            .set_id(&path)
+            .expect("native IM3 unsupported metadata fixture");
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("im3.channel.0.name"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "A"
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.unsupported_metadata_record_count"),
+            Some(crate::common::metadata::MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.unsupported_metadata_records"),
+            Some(crate::common::metadata::MetadataValue::String(value))
+                if value.contains("Vendor Object(type=99,len=4)")
+                    && value.contains("Packed Metadata(type=3,len=2)")
+        ));
+        assert_eq!(
+            reader.open_bytes(1).unwrap(),
+            [50u16]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn im3_parses_java_string_and_float_record_types() {
+        let path = temp_flim2_path("native-java-record-types.im3");
+        let pixels = [5u16, 50]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let dataset = im3_container(
+            "",
+            vec![
+                im3_int_array("Shape", &[1, 1, 2]),
+                im3_java_string_scalar("Instrument Name", "Nuance FX"),
+                im3_java_float_scalar("Exposure Seconds", 0.25),
+                im3_java_float_array("Wavelengths", &[450.0, 550.0]),
+                im3_data_record(1, 1, 2, &pixels),
+            ],
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&im3_container(
+            "Root",
+            vec![im3_container("DataSet", vec![dataset])],
+        ));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = Im3Reader::new();
+        reader
+            .set_id(&path)
+            .expect("native IM3 Java-style record fixture");
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("im3.native.instrument_name"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "Nuance FX"
+        ));
+        assert!(matches!(
+            metadata.get("im3.instrument.name"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "Nuance FX"
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.exposure_seconds"),
+            Some(crate::common::metadata::MetadataValue::Float(value)) if (*value - 0.25).abs() < 1e-12
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.wavelengths"),
+            Some(crate::common::metadata::MetadataValue::String(value))
+                if value == "450,550"
+        ));
+        assert_eq!(
+            reader.open_bytes(1).unwrap(),
+            [50u16]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn im3_reports_bounded_unsupported_nested_native_metadata_records() {
+        let path = temp_flim2_path("native-unsupported-nested-metadata.im3");
+        let pixels = [9u16, 90]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let dataset = im3_container(
+            "",
+            vec![
+                im3_int_array("Shape", &[1, 1, 2]),
+                im3_container(
+                    "Spectral Library",
+                    vec![
+                        im3_string_scalar("Library Name", "Synthetic Spectra"),
+                        im3_record("Packed Entry", 99, vec![1, 2, 3]),
+                    ],
+                ),
+                im3_data_record(1, 1, 2, &pixels),
+            ],
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&im3_container(
+            "Root",
+            vec![im3_container("DataSet", vec![dataset])],
+        ));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = Im3Reader::new();
+        reader
+            .set_id(&path)
+            .expect("native IM3 nested unsupported metadata fixture");
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("im3.native.unsupported_metadata_record_count"),
+            Some(crate::common::metadata::MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("im3.native.unsupported_metadata_records"),
+            Some(crate::common::metadata::MetadataValue::String(value))
+                if value.contains("Spectral Library(type=0,")
+                    && value.contains("children=2")
+        ));
+        assert_eq!(
+            reader.open_bytes(1).unwrap(),
+            [90u16]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn im3_native_unsupported_variants_stay_explicit() {
+        let mismatch = temp_flim2_path("native-mismatch.im3");
+        let dataset = im3_container(
+            "",
+            vec![
+                im3_int_array("Shape", &[2, 1, 1]),
+                im3_data_record(1, 1, 1, &[0, 0]),
+            ],
+        );
+        let mut mismatch_bytes = Vec::new();
+        mismatch_bytes.extend_from_slice(&1985u32.to_be_bytes());
+        mismatch_bytes.extend_from_slice(&im3_container(
+            "Root",
+            vec![im3_container("DataSet", vec![dataset])],
+        ));
+        std::fs::write(&mismatch, mismatch_bytes).unwrap();
+        let err = Im3Reader::new().set_id(&mismatch).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Shape/Data mismatch")),
+            "unexpected native IM3 mismatch error: {err:?}"
+        );
+        let _ = std::fs::remove_file(mismatch);
     }
 
     #[test]
@@ -6257,6 +10396,181 @@ mod tests {
     }
 
     #[test]
+    fn slidebook7_reads_bounded_native_sldy_npy_planes() {
+        let path = temp_flim2_path("native.sldy");
+        write_native_slidebook7(
+            &path,
+            "Capture",
+            (2, 2, 2, 2, 1),
+            &[
+                ((0, 0), vec![0, 1, 2, 3, 10, 11, 12, 13]),
+                ((1, 0), vec![100, 101, 102, 103, 110, 111, 112, 113]),
+            ],
+        );
+
+        let mut reader = SlideBook7Reader::new();
+        reader.set_id(&path).expect("native SlideBook 7 fixture");
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().size_z, 2);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().size_t, 1);
+        assert_eq!(reader.metadata().image_count, 4);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+        assert!(reader.metadata().is_little_endian);
+        assert_eq!(
+            reader.open_bytes(2).unwrap(),
+            [100u16, 101, 102, 103]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reader.open_bytes_region(3, 1, 0, 1, 2).unwrap(),
+            [111u16, 113]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        let ome = reader.ome_metadata().expect("SlideBook 7 OME metadata");
+        let original = ome
+            .annotations
+            .iter()
+            .find_map(|annotation| match annotation {
+                crate::common::ome_metadata::OmeAnnotation::MapAnnotation {
+                    id: Some(id),
+                    values,
+                    ..
+                } if id == "Annotation:OriginalMetadata:0" => Some(values),
+                _ => None,
+            })
+            .expect("SlideBook 7 original metadata annotation");
+        assert!(original
+            .iter()
+            .any(|(key, value)| key == "slidebook7.record.mwidth" && value == "2"));
+        assert!(original
+            .iter()
+            .any(|(key, value)| key == "slidebook7.record.mnumchannels" && value == "2"));
+        assert!(matches!(
+            reader.open_bytes(4),
+            Err(BioFormatsError::PlaneOutOfRange(4))
+        ));
+
+        let _ = std::fs::remove_dir_all(path.with_extension("dir"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn slidebook7_reads_native_sldy_npyz_gzip_payload() {
+        let path = temp_flim2_path("native-npyz.sldy");
+        std::fs::write(&path, b"SlideBook 7 native placeholder").unwrap();
+        let root = path.with_extension("dir");
+        let group = root.join("Capture.imgdir");
+        std::fs::create_dir_all(&group).unwrap();
+        std::fs::write(
+            group.join("ImageRecord.yaml"),
+            "mWidth: 2\nmHeight: 2\nmNumPlanes: 1\nmNumChannels: 1\nmNumTimepoints: 2\n",
+        )
+        .unwrap();
+        let payload = [10u16, 11, 12, 13, 20, 21, 22, 23]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        write_slidebook7_npyz(
+            &group.join("ImageData_Ch0_TP0000000.npyz"),
+            "<u2",
+            &[2, 2, 2],
+            &payload,
+        );
+
+        let mut reader = SlideBook7Reader::new();
+        reader
+            .set_id(&path)
+            .expect("native SlideBook 7 npyz fixture");
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().size_z, 1);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().size_t, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(
+            reader.open_bytes(1).unwrap(),
+            [20u16, 21, 22, 23]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(),
+            [21u16, 23]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn slidebook7_parses_multi_digit_channel_indices() {
+        let path = temp_flim2_path("native-ch10.sldy");
+        std::fs::write(&path, b"SlideBook 7 native placeholder").unwrap();
+        let root = path.with_extension("dir");
+        let group = root.join("Capture.imgdir");
+        std::fs::create_dir_all(&group).unwrap();
+        std::fs::write(
+            group.join("ImageRecord.yaml"),
+            "mWidth: 2\nmHeight: 1\nmNumPlanes: 1\nmNumChannels: 11\nmNumTimepoints: 1\n",
+        )
+        .unwrap();
+        let payload = [100u16, 110]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        write_slidebook7_npy(
+            &group.join("ImageData_Ch10_TP0000000.npy"),
+            "<u2",
+            &[1, 2],
+            &payload,
+        );
+
+        let mut reader = SlideBook7Reader::new();
+        reader
+            .set_id(&path)
+            .expect("native SlideBook 7 Ch10 fixture");
+        assert_eq!(reader.metadata().size_c, 11);
+        assert_eq!(reader.metadata().image_count, 11);
+        assert_eq!(reader.open_bytes(10).unwrap(), payload);
+        assert!(matches!(
+            reader.open_bytes(9),
+            Err(BioFormatsError::UnsupportedFormat(ref message))
+                if message.contains("missing ImageData plane")
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn slidebook7_rejects_sldyz_archives_without_supported_native_groups() {
+        let path = temp_flim2_path("compressed.sldyz");
+        let file = File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("notes.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"not a SlideBook 7 native group").unwrap();
+        zip.finish().unwrap();
+        let err = SlideBook7Reader::new().set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("no image groups")),
+            "unexpected SlideBook 7 sldyz unsupported error: {err:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn im3_and_slidebook7_preserve_unsupported_for_nonmatching_files() {
         let im3 = temp_flim2_path("realish.im3");
         std::fs::write(&im3, b"not the synthetic im3 raw magic").unwrap();
@@ -6272,7 +10586,7 @@ mod tests {
         std::fs::write(&sld, b"not the synthetic slidebook raw magic").unwrap();
         let err = SlideBook7Reader::new().set_id(&sld).unwrap_err();
         assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("SlideBook 7 proprietary")),
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("SlideBook 7 native")),
             "unexpected SlideBook unsupported error: {err:?}"
         );
         assert!(!SlideBook7Reader::new()
@@ -6300,6 +10614,283 @@ mod tests {
         assert_synthetic_raw_reader(IvisionReader::new(), &path, "iVision IPM");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ivision_reads_bounded_native_big_endian_planes_like_java() {
+        let path = temp_flim2_path("native.ipm");
+        let payload = [
+            0x0102u16, 0x0304, 0x0506, 0x0708, 0x1112, 0x1314, 0x1516, 0x1718,
+        ]
+        .into_iter()
+        .flat_map(u16::to_be_bytes)
+        .collect::<Vec<_>>();
+        write_native_ivision(&path, 6, 2, 2, 2, &payload);
+
+        let mut reader = IvisionReader::new();
+        assert!(reader.is_this_type_by_bytes(b"1.0A\0\x06"));
+        reader.set_id(&path).expect("native iVision fixture");
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().size_z, 2);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().size_t, 1);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+        assert_eq!(reader.metadata().bits_per_pixel, 16);
+        assert!(!reader.metadata().is_little_endian);
+        let native_metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            native_metadata.get("iVision Version"),
+            Some(crate::common::metadata::MetadataValue::String(version)) if version == "1.0A"
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision FileFormat"),
+            Some(crate::common::metadata::MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision DataType"),
+            Some(crate::common::metadata::MetadataValue::Int(6))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision DataType Name"),
+            Some(crate::common::metadata::MetadataValue::String(name)) if name == "16-bit unsigned mono"
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Native Width"),
+            Some(crate::common::metadata::MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Native Height"),
+            Some(crate::common::metadata::MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Native Z Sections"),
+            Some(crate::common::metadata::MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Image Offset"),
+            Some(crate::common::metadata::MetadataValue::Int(2120))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Disk Plane Bytes"),
+            Some(crate::common::metadata::MetadataValue::Int(8))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Output Plane Bytes"),
+            Some(crate::common::metadata::MetadataValue::Int(8))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Has Padding Byte"),
+            Some(crate::common::metadata::MetadataValue::Bool(false))
+        ));
+        assert_eq!(
+            reader.open_bytes(1).unwrap(),
+            [0x1112u16, 0x1314, 0x1516, 0x1718]
+                .into_iter()
+                .flat_map(u16::to_be_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(),
+            [0x1314u16, 0x1718]
+                .into_iter()
+                .flat_map(u16::to_be_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            reader.open_bytes(2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ivision_native_padding_byte_rgb_planes_are_stripped() {
+        let path = temp_flim2_path("native-padding.ipm");
+        let payload = [
+            0, 1, 2, 3, //
+            0, 4, 5, 6, //
+        ];
+        write_native_ivision(&path, 5, 2, 1, 1, &payload);
+
+        let mut reader = IvisionReader::new();
+        reader.set_id(&path).expect("native padded iVision fixture");
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_c, 3);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("iVision Has Padding Byte"),
+            Some(crate::common::metadata::MetadataValue::Bool(true))
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(), [4, 5, 6]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ivision_native_unsigned_16bit_rgb_planes_are_bounded() {
+        let path = temp_flim2_path("native-u16-rgb.ipm");
+        let payload = [
+            0x0102u16, 0x0304, 0x0506, //
+            0x1112, 0x1314, 0x1516, //
+            0x2122, 0x2324, 0x2526, //
+            0x3132, 0x3334, 0x3536, //
+        ]
+        .into_iter()
+        .flat_map(u16::to_be_bytes)
+        .collect::<Vec<_>>();
+        write_native_ivision(&path, 8, 2, 2, 1, &payload);
+
+        let mut reader = IvisionReader::new();
+        reader
+            .set_id(&path)
+            .expect("native unsigned 16-bit RGB iVision fixture");
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().size_c, 3);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+        assert_eq!(reader.metadata().bits_per_pixel, 16);
+        assert!(!reader.metadata().is_little_endian);
+        let native_metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            native_metadata.get("iVision DataType Name"),
+            Some(crate::common::metadata::MetadataValue::String(name)) if name == "16-bit unsigned color"
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Samples Per Pixel"),
+            Some(crate::common::metadata::MetadataValue::Int(3))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Storage Layout"),
+            Some(crate::common::metadata::MetadataValue::String(layout))
+                if layout == "big-endian unsigned 16-bit RGB samples"
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Disk Plane Bytes"),
+            Some(crate::common::metadata::MetadataValue::Int(24))
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), payload);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+            [0x1112u16, 0x1314, 0x1516, 0x3132, 0x3334, 0x3536]
+                .into_iter()
+                .flat_map(u16::to_be_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ivision_native_unsupported_variants_stay_explicit() {
+        let path = temp_flim2_path("native-sqrt.ipm");
+        write_native_ivision(&path, 7, 2, 1, 1, &[0x01, 0x00, 0x04, 0x00]);
+
+        let mut reader = IvisionReader::new();
+        reader.set_id(&path).expect("square-root iVision metadata");
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Float32);
+        assert_eq!(reader.metadata().bits_per_pixel, 32);
+        let native_metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            native_metadata.get("iVision DataType Name"),
+            Some(crate::common::metadata::MetadataValue::String(name)) if name == "square-root float"
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Storage Layout"),
+            Some(crate::common::metadata::MetadataValue::String(layout))
+                if layout == "big-endian square-root encoded 16-bit samples with float output"
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Disk Plane Bytes"),
+            Some(crate::common::metadata::MetadataValue::Int(4))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Output Plane Bytes"),
+            Some(crate::common::metadata::MetadataValue::Int(8))
+        ));
+        let err = reader.open_bytes(0).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("Square-root iVision pixel decoding is not supported")
+                    && message.contains("transfer curve unimplemented")),
+            "unexpected iVision native unsupported error: {err:?}"
+        );
+        let err = reader.open_bytes_region(0, 0, 0, 1, 1).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("Square-root iVision pixel decoding is not supported")),
+            "unexpected iVision native region unsupported error: {err:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
+
+        let color = temp_flim2_path("native-16bit-color.ipm");
+        write_native_ivision(&color, 4, 2, 1, 1, &[0x7c, 0x00, 0x07, 0xe0]);
+
+        let mut reader = IvisionReader::new();
+        reader
+            .set_id(&color)
+            .expect("packed 16-bit color iVision metadata");
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_c, 3);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+        assert_eq!(reader.metadata().bits_per_pixel, 8);
+        let native_metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            native_metadata.get("iVision DataType Name"),
+            Some(crate::common::metadata::MetadataValue::String(name)) if name == "16-bit color"
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Storage Layout"),
+            Some(crate::common::metadata::MetadataValue::String(layout))
+                if layout == "packed 16-bit color samples with unresolved RGB555/RGB565 masks"
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Disk Plane Bytes"),
+            Some(crate::common::metadata::MetadataValue::Int(4))
+        ));
+        assert!(matches!(
+            native_metadata.get("iVision Output Plane Bytes"),
+            Some(crate::common::metadata::MetadataValue::Int(6))
+        ));
+        let err = reader.open_bytes(0).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("Packed 16-bit color iVision pixel decoding is not supported")
+                    && message.contains("does not identify RGB555 vs RGB565")),
+            "unexpected iVision native color error: {err:?}"
+        );
+        let err = reader.open_bytes_region(0, 0, 0, 1, 1).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("channel bit order")),
+            "unexpected iVision native color region error: {err:?}"
+        );
+
+        let _ = std::fs::remove_file(color);
+
+        let unknown = temp_flim2_path("native-unknown-type.ipm");
+        write_native_ivision(&unknown, 9, 1, 1, 1, &[]);
+
+        let err = IvisionReader::new().set_id(&unknown).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("native data type 9 is unsupported")),
+            "unexpected iVision native unknown type error: {err:?}"
+        );
+
+        let _ = std::fs::remove_file(unknown);
     }
 
     #[test]
@@ -6399,6 +10990,15 @@ mod tests {
         }
     }
 
+    fn double_entry(tag: u16, value: f64) -> TestEntry {
+        TestEntry {
+            tag,
+            typ: 12,
+            count: 1,
+            value: value.to_le_bytes().to_vec(),
+        }
+    }
+
     fn ifd_table_len(entry_count: usize) -> usize {
         2 + entry_count * 12 + 4
     }
@@ -6491,6 +11091,428 @@ mod tests {
 
         let mut file = File::create(path).unwrap();
         file.write_all(&data).unwrap();
+    }
+
+    fn write_slidebook_tiff(path: &Path) {
+        let mut entries = vec![
+            long_entry(tag::IMAGE_WIDTH, 1),
+            long_entry(tag::IMAGE_LENGTH, 1),
+            short_entry(tag::BITS_PER_SAMPLE, 8),
+            short_entry(tag::COMPRESSION, 1),
+            short_entry(tag::PHOTOMETRIC_INTERPRETATION, 1),
+            long_entry(tag::ROWS_PER_STRIP, 1),
+            long_entry(tag::STRIP_BYTE_COUNTS, 1),
+            ascii_entry(tag::SOFTWARE, "SlideBook"),
+            ascii_entry(SLIDEBOOK_CHANNEL_TAG, "Channel: DAPI; raw"),
+            double_entry(SLIDEBOOK_PHYSICAL_SIZE_TAG, 0.25),
+            double_entry(SLIDEBOOK_MAGNIFICATION_TAG, 60.0),
+            double_entry(SLIDEBOOK_X_POS_TAG, 1.5),
+            double_entry(SLIDEBOOK_Y_POS_TAG, 2.5),
+            double_entry(SLIDEBOOK_Z_POS_TAG, 3.5),
+        ];
+        let strip_offset = 8 + ifd_table_len(entries.len() + 1) + ifd_extra_len(&entries);
+        entries.push(long_entry(tag::STRIP_OFFSETS, strip_offset as u32));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        write_test_ifd(&mut data, &entries, 8, 0);
+        data.resize(strip_offset, 0);
+        data.push(0x7f);
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&data).unwrap();
+    }
+
+    fn write_one_pixel_tiff(path: &Path, value: u8) {
+        let mut entries = vec![
+            long_entry(tag::IMAGE_WIDTH, 1),
+            long_entry(tag::IMAGE_LENGTH, 1),
+            short_entry(tag::BITS_PER_SAMPLE, 8),
+            short_entry(tag::COMPRESSION, 1),
+            short_entry(tag::PHOTOMETRIC_INTERPRETATION, 1),
+            long_entry(tag::ROWS_PER_STRIP, 1),
+            long_entry(tag::STRIP_BYTE_COUNTS, 1),
+        ];
+        let strip_offset = 8 + ifd_table_len(entries.len() + 1) + ifd_extra_len(&entries);
+        entries.push(long_entry(tag::STRIP_OFFSETS, strip_offset as u32));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        write_test_ifd(&mut data, &entries, 8, 0);
+        data.resize(strip_offset, 0);
+        data.push(value);
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&data).unwrap();
+    }
+
+    fn write_one_pixel_png(path: &Path, value: u8) {
+        let image = image::GrayImage::from_raw(1, 1, vec![value]).unwrap();
+        image.save(path).unwrap();
+    }
+
+    fn write_one_pixel_bmp(path: &Path, red: u8, green: u8, blue: u8) {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"BM");
+        data.extend_from_slice(&58u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&54u32.to_le_bytes());
+        data.extend_from_slice(&40u32.to_le_bytes());
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&24u16.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(&0i32.to_le_bytes());
+        data.extend_from_slice(&0i32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&[blue, green, red, 0]);
+        std::fs::write(path, data).unwrap();
+    }
+
+    fn utf16le(value: &str) -> Vec<u8> {
+        value
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect()
+    }
+
+    fn build_xlef_test_lof(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let xml = format!(
+            "<Image><ImageDescription>\
+<Channels><ChannelDescription Resolution=\"8\" BytesInc=\"1\"/></Channels>\
+<Dimensions>\
+<DimensionDescription DimID=\"1\" NumberOfElements=\"{width}\" BytesInc=\"1\"/>\
+<DimensionDescription DimID=\"2\" NumberOfElements=\"{height}\" BytesInc=\"{width}\"/>\
+</Dimensions>\
+</ImageDescription></Image>"
+        );
+        let xml_units = xml.encode_utf16().count() as i32;
+
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x70i32.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.push(0x2a);
+        b.extend_from_slice(&15i32.to_le_bytes());
+        b.extend_from_slice(&utf16le("LMS_Object_File"));
+        b.push(0x2a);
+        b.extend_from_slice(&2i32.to_le_bytes());
+        b.push(0x2a);
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.push(0x2a);
+        b.extend_from_slice(&(pixels.len() as i64).to_le_bytes());
+        b.extend_from_slice(pixels);
+        b.extend_from_slice(&0x70i32.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.push(0x2a);
+        b.extend_from_slice(&xml_units.to_le_bytes());
+        b.extend_from_slice(&utf16le(&xml));
+        b
+    }
+
+    fn build_xlef_strict_lms(width: u32, height: u32, pixel_type: u16, payload: &[u8]) -> Vec<u8> {
+        let mut data = b"BIOFORMATS-RS-ZEISS-LMS-STRICT-RAW-V1\n".to_vec();
+        data.extend_from_slice(&width.to_le_bytes());
+        data.extend_from_slice(&height.to_le_bytes());
+        data.extend_from_slice(&pixel_type.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(payload);
+        data
+    }
+
+    #[test]
+    fn im3_and_ivision_native_byte_probes_match_java_headers() {
+        assert!(Im3Reader::new().is_this_type_by_bytes(&1985u32.to_be_bytes()));
+        assert!(!Im3Reader::new().is_this_type_by_bytes(&1985u32.to_le_bytes()));
+
+        assert!(IvisionReader::new().is_this_type_by_bytes(b"1.0A\0\x03"));
+        assert!(!IvisionReader::new().is_this_type_by_bytes(b"1-0A\0\x03"));
+        assert!(!IvisionReader::new().is_this_type_by_bytes(b"1.0A\0\x09"));
+    }
+
+    #[test]
+    fn slidebook7_accepts_java_native_suffixes() {
+        let reader = SlideBook7Reader::new();
+        assert!(reader.is_this_type_by_name(Path::new("dataset.sldy")));
+        assert!(reader.is_this_type_by_name(Path::new("dataset.sldyz")));
+    }
+
+    #[test]
+    fn xlef_references_single_tiff() {
+        let xlef = temp_flim2_path("project.xlef");
+        let tiff = xlef.with_file_name("image.tif");
+        std::fs::write(&xlef, r#"<XLEF><Image File="image.tif"/></XLEF>"#).unwrap();
+        let refs = xlef_referenced_paths(&std::fs::read_to_string(&xlef).unwrap(), &xlef);
+        assert_eq!(refs, vec![tiff]);
+        let images = XlefReader::referenced_images(&xlef).unwrap();
+        assert_eq!(images, vec![XlefReference::Image(refs[0].clone())]);
+        let _ = std::fs::remove_file(xlef);
+    }
+
+    #[test]
+    fn xlef_opens_multiple_tiff_references_as_project_series() {
+        let xlef = temp_flim2_path("multi.xlef");
+        let tiff_a = xlef.with_file_name("a.tif");
+        let tiff_b = xlef.with_file_name("b.tif");
+        write_one_pixel_tiff(&tiff_a, 11);
+        write_one_pixel_tiff(&tiff_b, 22);
+        std::fs::write(
+            &xlef,
+            r#"<XLEF><Image File="a.tif"/><Image File="b.tif"/></XLEF>"#,
+        )
+        .unwrap();
+
+        let mut reader = XlefReader::new();
+        reader.set_id(&xlef).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.metadata().size_x, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![22]);
+
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_file(tiff_a);
+        let _ = std::fs::remove_file(tiff_b);
+    }
+
+    #[test]
+    fn xlef_follows_xlif_to_tiff_and_lof_leaves() {
+        let xlef = temp_flim2_path("nested.xlef");
+        let xlif = xlef.with_file_name("nested.xlif");
+        let tiff = xlef.with_file_name("nested.tif");
+        let lof = xlef.with_file_name("nested.lof");
+        write_one_pixel_tiff(&tiff, 33);
+        std::fs::write(&lof, build_xlef_test_lof(4, 1, &[1, 2, 3, 4])).unwrap();
+        std::fs::write(
+            &xlif,
+            r#"<XLIF><Image File="nested.tif"/><Image File="nested.lof"/></XLIF>"#,
+        )
+        .unwrap();
+        std::fs::write(&xlef, r#"<XLEF><Project File="nested.xlif"/></XLEF>"#).unwrap();
+
+        let mut reader = XlefReader::new();
+        reader.set_id(&xlef).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![33]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.metadata().size_x, 4);
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 2, 1).unwrap(), vec![2, 3]);
+
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_file(xlif);
+        let _ = std::fs::remove_file(tiff);
+        let _ = std::fs::remove_file(lof);
+    }
+
+    #[test]
+    fn xlef_opens_raster_png_and_bmp_leaves_as_project_series() {
+        let xlef = temp_flim2_path("rasters.xlef");
+        let xlif = xlef.with_file_name("rasters.xlif");
+        let png = xlef.with_file_name("leaf.png");
+        let bmp = xlef.with_file_name("leaf.bmp");
+        write_one_pixel_png(&png, 77);
+        write_one_pixel_bmp(&bmp, 10, 20, 30);
+        std::fs::write(
+            &xlif,
+            r#"<XLIF><Image File="leaf.png"/><Image File="leaf.bmp"/></XLIF>"#,
+        )
+        .unwrap();
+        std::fs::write(&xlef, r#"<XLEF><Project File="rasters.xlif"/></XLEF>"#).unwrap();
+
+        let mut reader = XlefReader::new();
+        reader.set_id(&xlef).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.metadata().size_x, 1);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![77]);
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.metadata().size_c, 3);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 20, 30]);
+
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_file(xlif);
+        let _ = std::fs::remove_file(png);
+        let _ = std::fs::remove_file(bmp);
+    }
+
+    #[test]
+    fn xlef_opens_strict_lms_leaf_with_pixel_delegate() {
+        let xlef = temp_flim2_path("lms_only.xlef");
+        let lms = xlef.with_extension("lms");
+        let pixels = vec![1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0];
+        std::fs::write(&lms, build_xlef_strict_lms(3, 2, 2, &pixels)).unwrap();
+        std::fs::write(
+            &xlef,
+            format!(
+                r#"<XLEF><Image File="{}"/></XLEF>"#,
+                lms.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let mut reader = XlefReader::new();
+        reader.set_id(&xlef).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 3);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
+            vec![2, 0, 3, 0, 5, 0, 6, 0]
+        );
+
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_file(lms);
+    }
+
+    #[test]
+    fn xlef_exposes_xml_lms_leaves_as_metadata_only_series() {
+        let xlef = temp_flim2_path("lms_xml_only.xlef");
+        let lms = xlef.with_extension("lms");
+        std::fs::write(
+            &lms,
+            r#"<XLIF><Element Name="LMS dataset"><Data><Image Name="scan">
+<ImageDescription>
+<Channels><ChannelDescription Resolution="16"/></Channels>
+<Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="5"/>
+<DimensionDescription DimID="2" NumberOfElements="4"/>
+<DimensionDescription DimID="3" NumberOfElements="2"/>
+<DimensionDescription DimID="5" NumberOfElements="3"/>
+</Dimensions>
+</ImageDescription>
+</Image></Data></Element></XLIF>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &xlef,
+            format!(
+                r#"<XLEF><Image File="{}"/></XLEF>"#,
+                lms.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let mut reader = XlefReader::new();
+        reader.set_id(&xlef).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 5);
+        assert_eq!(meta.size_y, 4);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert!(matches!(
+            meta.series_metadata.get("xlef.lms.element.name"),
+            Some(crate::common::metadata::MetadataValue::String(name)) if name == "LMS dataset"
+        ));
+        let err = reader.open_bytes(0).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("LMS metadata series has no pixel delegate"))
+        );
+
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_file(lms);
+    }
+
+    #[test]
+    fn xlef_opens_supported_leaves_and_lms_metadata_series() {
+        let xlef = temp_flim2_path("mixed.xlef");
+        let tiff = xlef.with_file_name("supported.tif");
+        let lms = xlef.with_extension("lms");
+        write_one_pixel_tiff(&tiff, 44);
+        std::fs::write(
+            &lms,
+            r#"<XLIF><Element Name="metadata only"><Data><Image>
+<ImageDescription><Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="2"/>
+<DimensionDescription DimID="2" NumberOfElements="3"/>
+</Dimensions></ImageDescription>
+</Image></Data></Element></XLIF>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &xlef,
+            format!(
+                r#"<XLEF><Image File="supported.tif"/><Image File="{}"/></XLEF>"#,
+                lms.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let mut reader = XlefReader::new();
+        reader.set_id(&xlef).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![44]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 3);
+        assert!(reader.open_bytes(0).is_err());
+
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_file(tiff);
+        let _ = std::fs::remove_file(lms);
+    }
+
+    #[test]
+    fn xlef_lms_leaf_requires_bounded_xy_metadata() {
+        let xlef = temp_flim2_path("bad_lms.xlef");
+        let lms = xlef.with_extension("lms");
+        std::fs::write(&lms, r#"<XLIF><Element Name="bad"/></XLIF>"#).unwrap();
+        std::fs::write(
+            &xlef,
+            format!(
+                r#"<XLEF><Image File="{}"/></XLEF>"#,
+                lms.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let err = XlefReader::new().set_id(&xlef).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("does not declare bounded X/Y dimensions"))
+        );
+
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_file(lms);
+    }
+
+    #[test]
+    fn slidebook_tiff_enriches_numeric_private_tags() {
+        let path = temp_flim2_path("slidebook.tif");
+        write_slidebook_tiff(&path);
+
+        let mut reader = SlidebookTiffReader::new();
+        reader.set_id(&path).expect("SlideBook TIFF should open");
+        let md = &reader.metadata().series_metadata;
+
+        assert!(matches!(
+            md.get("slidebook.channel.0.name"),
+            Some(crate::common::metadata::MetadataValue::String(name)) if name == "DAPI"
+        ));
+        assert!(matches!(
+            md.get("slidebook.physical_size_x"),
+            Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 0.25).abs() < 1e-12
+        ));
+        assert!(matches!(
+            md.get("slidebook.magnification"),
+            Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 60.0).abs() < 1e-12
+        ));
+        assert!(matches!(
+            md.get("slidebook.position_z"),
+            Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 3.5).abs() < 1e-12
+        ));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -7129,6 +12151,148 @@ mod tests {
         assert_eq!(m.numerical_aperture, Some(0.95));
         assert_eq!(m.bit_depth, Some(12));
         assert_eq!(m.exposure_times, vec![25000]);
+    }
+
+    #[test]
+    fn ets_level_metadata_includes_cellsens_acquisition_metadata() {
+        let mut vol = EtsVolume {
+            n_dimensions: 2,
+            size_c: 1,
+            compression: ETS_RAW,
+            tile_x: 1,
+            tile_y: 1,
+            pixel_type_code: ETS_PT_UCHAR,
+            tiles: vec![(vec![0, 0], 0, 1)],
+            meta: VsiPyramidMeta {
+                device_names: vec!["CameraX".to_string()],
+                device_ids: vec!["cam-1".to_string()],
+                objective_names: vec!["UPlanSApo".to_string()],
+                magnification: Some(40.0),
+                numerical_aperture: Some(0.95),
+                gain: Some(1.5),
+                bit_depth: Some(12),
+                exposure_times: vec![25000],
+                channel_wavelengths: vec![488.0],
+                channel_names: vec!["DAPI".to_string()],
+                name: Some("Stack A".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        vol.compute_levels();
+
+        let meta = vol.level_metadata(0).unwrap();
+        let md = &meta.series_metadata;
+        assert!(matches!(
+            md.get("cellsens.ets.device_name"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "CameraX"
+        ));
+        assert!(matches!(
+            md.get("cellsens.ets.device_id"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "cam-1"
+        ));
+        assert!(matches!(
+            md.get("cellsens.ets.objective_name"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "UPlanSApo"
+        ));
+        assert!(matches!(
+            md.get("cellsens.ets.objective_magnification"),
+            Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 40.0).abs() < 1e-12
+        ));
+        assert!(matches!(
+            md.get("cellsens.ets.camera_gain"),
+            Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 1.5).abs() < 1e-12
+        ));
+        assert!(matches!(
+            md.get("cellsens.ets.bit_depth"),
+            Some(crate::common::metadata::MetadataValue::Int(12))
+        ));
+        assert!(matches!(
+            md.get("cellsens.ets.exposure_time"),
+            Some(crate::common::metadata::MetadataValue::Int(25000))
+        ));
+        assert!(matches!(
+            md.get("cellsens.ets.channel_wavelength.0"),
+            Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 488.0).abs() < 1e-12
+        ));
+        assert!(matches!(
+            md.get("cellsens.ets.channel_name.0"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "DAPI"
+        ));
+        assert!(matches!(
+            md.get("cellsens.ets.stack_name"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "Stack A"
+        ));
+    }
+
+    #[test]
+    fn cellsens_ome_metadata_preserves_ets_original_metadata_annotation() {
+        let mut vol = EtsVolume {
+            n_dimensions: 2,
+            size_c: 1,
+            compression: ETS_RAW,
+            tile_x: 1,
+            tile_y: 1,
+            pixel_type_code: ETS_PT_UCHAR,
+            tiles: vec![(vec![0, 0], 0, 1)],
+            meta: VsiPyramidMeta {
+                device_names: vec!["CameraX".to_string()],
+                objective_names: vec!["UPlanSApo".to_string()],
+                channel_wavelengths: vec![488.0],
+                name: Some("Stack A".to_string()),
+                ..Default::default()
+            },
+            physical_size_x: Some(0.25),
+            physical_size_y: Some(0.5),
+            ..Default::default()
+        };
+        vol.compute_levels();
+
+        let mut reader = CellSensReader::new();
+        reader.ets.push(vol);
+        reader.series_map.push(CellSensTarget::Ets {
+            volume: 0,
+            resolution: 0,
+        });
+        reader.series_names.push("Stack A".to_string());
+        reader.series_phys.push(Some((0.25, 0.5)));
+
+        let ome = reader.ome_metadata().expect("CellSens OME metadata");
+        assert_eq!(ome.images.len(), 1);
+        assert_eq!(ome.images[0].name.as_deref(), Some("Stack A"));
+        assert_eq!(ome.images[0].physical_size_x, Some(0.25));
+        assert_eq!(ome.images[0].physical_size_y, Some(0.5));
+
+        let values = ome
+            .annotations
+            .iter()
+            .find_map(|ann| match ann {
+                crate::common::ome_metadata::OmeAnnotation::MapAnnotation {
+                    id,
+                    namespace,
+                    values,
+                } if id.as_deref() == Some("Annotation:OriginalMetadata:0")
+                    && namespace.as_deref()
+                        == Some("openmicroscopy.org/bioformats/original-metadata") =>
+                {
+                    Some(values)
+                }
+                _ => None,
+            })
+            .expect("CellSens original metadata annotation");
+
+        assert!(values
+            .iter()
+            .any(|(key, value)| key == "cellsens.ets.device_name" && value == "CameraX"));
+        assert!(values
+            .iter()
+            .any(|(key, value)| key == "cellsens.ets.objective_name" && value == "UPlanSApo"));
+        assert!(values
+            .iter()
+            .any(|(key, value)| key == "cellsens.ets.channel_wavelength.0" && value == "488"));
+        assert!(values
+            .iter()
+            .any(|(key, value)| key == "cellsens.ets.stack_name" && value == "Stack A"));
     }
 
     /// Prefix-gated VALUE metadata: the same VALUE tag is disambiguated entirely

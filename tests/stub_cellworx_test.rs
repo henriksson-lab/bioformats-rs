@@ -41,7 +41,10 @@ fn cellworx_parses_htd_and_reads_present_plane() {
         assert_eq!(m.size_z, 1);
         assert_eq!(m.size_t, 1);
         assert_eq!(m.image_count, 2);
-        assert_eq!(m.pixel_type, bioformats::common::pixel_type::PixelType::Uint16);
+        assert_eq!(
+            m.pixel_type,
+            bioformats::common::pixel_type::PixelType::Uint16
+        );
         assert!(m.is_little_endian);
     }
 

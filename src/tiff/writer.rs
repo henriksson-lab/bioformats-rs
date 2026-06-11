@@ -468,8 +468,7 @@ impl PyramidOmeTiffWriter {
                         ]);
                         if count > 1 {
                             let abs_off = classic_tiff_u32(extra_file_off, "sub-IFD BPS offset")?;
-                            ifd_bytes[off + 8..off + 12]
-                                .copy_from_slice(&abs_off.to_le_bytes());
+                            ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                         }
                     }
                 }

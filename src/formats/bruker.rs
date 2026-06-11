@@ -137,10 +137,8 @@ impl SeriesParse {
             }
 
             // addSeriesMeta(key.substring(3), value)
-            self.meta.insert(
-                key[3..].to_string(),
-                MetadataValue::String(value.clone()),
-            );
+            self.meta
+                .insert(key[3..].to_string(), MetadataValue::String(value.clone()));
 
             match key {
                 "##$NI" => self.ni = parse_i64(&value),
@@ -390,9 +388,7 @@ fn build_metadata(p: &mut SeriesParse, parsed_proc_file: bool) -> Result<ImageMe
 
     // Reset the dimensions if the d3proc data does not match the pixel file
     // size; otherwise discard the IM_* dims and recompute from sizes/ni/nr/ns.
-    if parsed_proc_file
-        && p.size_z * p.size_t != p.nr * p.ni
-        && (p.ni > 1 || p.nr > 1 || p.ns > 1)
+    if parsed_proc_file && p.size_z * p.size_t != p.nr * p.ni && (p.ni > 1 || p.nr > 1 || p.ns > 1)
     {
         p.ni = 1;
         p.nr = 1;
@@ -617,7 +613,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bruker_test_{}_{}", std::process::id(), nanos));
+        let dir =
+            std::env::temp_dir().join(format!("bruker_test_{}_{}", std::process::id(), nanos));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

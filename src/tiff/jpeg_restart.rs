@@ -209,7 +209,11 @@ pub(crate) fn decode_rows_ndpi<R: Read + Seek>(
     // is at most a few KB; cap the read at the marker[1] offset (the first RSTn)
     // or 1 MiB, whichever is smaller, so we never read the multi-GB scan here.
     const HEADER_CAP: u64 = 1 << 20;
-    let header_len = markers.get(1).copied().unwrap_or(HEADER_CAP).min(HEADER_CAP);
+    let header_len = markers
+        .get(1)
+        .copied()
+        .unwrap_or(HEADER_CAP)
+        .min(HEADER_CAP);
     let header_len = header_len.min(strip_byte_count).max(2) as usize;
     let mut head_buf = read_at(reader, strip_offset, header_len).ok()?;
     // Abbreviated streams keep the tables in JPEGTables (tag 347); splice them in.
@@ -321,18 +325,22 @@ pub(crate) fn decode_rows_ndpi<R: Read + Seek>(
     synthetic.push(0xFF);
     synthetic.push(0xD9);
 
-    Some(decompress_jpeg_color(&synthetic, color).map(|pixels| DecodedBand {
-        pixels,
-        band_x0,
-        band_width: synth_width,
-        band_y0,
-        band_height,
-    }))
+    Some(
+        decompress_jpeg_color(&synthetic, color).map(|pixels| DecodedBand {
+            pixels,
+            band_x0,
+            band_width: synth_width,
+            band_y0,
+            band_height,
+        }),
+    )
 }
 
 /// Read exactly `len` bytes at absolute `offset` from `reader`.
 fn read_at<R: Read + Seek>(reader: &mut R, offset: u64, len: usize) -> Result<Vec<u8>> {
-    reader.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(BioFormatsError::Io)?;
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
     Ok(buf)
@@ -499,6 +507,10 @@ pub(crate) fn index(jpeg: &[u8]) -> Option<JpegRestartIndex> {
 }
 
 impl JpegRestartIndex {
+    pub(crate) fn height(&self) -> u32 {
+        self.height
+    }
+
     /// Decode only the band of MCU rows covering `[y, y+h)`.
     ///
     /// Returns:
@@ -543,25 +555,24 @@ impl JpegRestartIndex {
         //      == 0, the usual Hamamatsu/Aperio NDPI layout): each MCU row is an
         //      exact whole number of intervals, so any MCU-row boundary is also
         //      an interval boundary and the band is exactly [mr0, mr1).
-        let (band_mr0, band_mr1, i0, i1) =
-            if self.restart_interval % self.mcus_per_row == 0 {
-                let rows_per_interval = self.restart_interval / self.mcus_per_row;
-                if rows_per_interval == 0 {
-                    return None;
-                }
-                let i0 = mr0 / rows_per_interval;
-                let i1 = mr1.div_ceil(rows_per_interval);
-                let band_mr0 = i0 * rows_per_interval;
-                let band_mr1 = (i1 * rows_per_interval).min(self.mcu_rows);
-                (band_mr0, band_mr1, i0 as usize, i1 as usize)
-            } else if self.mcus_per_row % self.restart_interval == 0 {
-                let intervals_per_row = self.mcus_per_row / self.restart_interval;
-                let i0 = mr0 * intervals_per_row;
-                let i1 = mr1 * intervals_per_row;
-                (mr0, mr1, i0 as usize, i1 as usize)
-            } else {
+        let (band_mr0, band_mr1, i0, i1) = if self.restart_interval % self.mcus_per_row == 0 {
+            let rows_per_interval = self.restart_interval / self.mcus_per_row;
+            if rows_per_interval == 0 {
                 return None;
-            };
+            }
+            let i0 = mr0 / rows_per_interval;
+            let i1 = mr1.div_ceil(rows_per_interval);
+            let band_mr0 = i0 * rows_per_interval;
+            let band_mr1 = (i1 * rows_per_interval).min(self.mcu_rows);
+            (band_mr0, band_mr1, i0 as usize, i1 as usize)
+        } else if self.mcus_per_row % self.restart_interval == 0 {
+            let intervals_per_row = self.mcus_per_row / self.restart_interval;
+            let i0 = mr0 * intervals_per_row;
+            let i1 = mr1 * intervals_per_row;
+            (mr0, mr1, i0 as usize, i1 as usize)
+        } else {
+            return None;
+        };
 
         let i1 = i1.min(self.restart_offsets.len());
         if i0 >= self.restart_offsets.len() || i1 <= i0 {
@@ -622,12 +633,27 @@ impl JpegRestartIndex {
         synthetic.push(0xFF);
         synthetic.push(0xD9);
 
-        Some(decompress_jpeg_color(&synthetic, color).map(|pixels| DecodedBand {
-            pixels,
-            band_x0: 0,
-            band_width: self.width,
-            band_y0,
-            band_height,
-        }))
+        Some(
+            decompress_jpeg_color(&synthetic, color).map(|pixels| DecodedBand {
+                pixels,
+                band_x0: 0,
+                band_width: self.width,
+                band_y0,
+                band_height,
+            }),
+        )
+    }
+
+    /// Decode a row band using the JPEG stream's default color transform.
+    ///
+    /// This keeps non-TIFF callers from depending on the private TIFF
+    /// compression module while reusing the same restart-windowing machinery.
+    pub(crate) fn decode_rows_default(
+        &self,
+        jpeg: &[u8],
+        y: u32,
+        h: u32,
+    ) -> Option<Result<DecodedBand>> {
+        self.decode_rows(jpeg, y, h, JpegColor::Default)
     }
 }

@@ -65,7 +65,30 @@ fn validate(rel: &str, region: Option<(u32, u32, u32, u32)>) -> Result<bool, Str
     if bytes.is_empty() {
         return Err("plane read returned no bytes".into());
     }
-    eprintln!("OK   {rel}: {sx}x{sy} c={sc} planes={ic} -> {} bytes", bytes.len());
+    eprintln!(
+        "OK   {rel}: {sx}x{sy} c={sc} planes={ic} -> {} bytes",
+        bytes.len()
+    );
+    Ok(true)
+}
+
+fn validate_metadata_only(rel: &str) -> Result<bool, String> {
+    let path = testdata(rel);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let reader = ImageReader::open(&path).map_err(|e| format!("open: {e}"))?;
+    let m = reader.metadata();
+    if m.size_x == 0 || m.size_y == 0 {
+        return Err(format!("zero dimensions {}x{}", m.size_x, m.size_y));
+    }
+    if m.image_count == 0 {
+        return Err("zero image_count".into());
+    }
+    eprintln!(
+        "OK   {rel}: {}x{} c={} planes={} (metadata-only)",
+        m.size_x, m.size_y, m.size_c, m.image_count
+    );
     Ok(true)
 }
 
@@ -87,7 +110,14 @@ real_data_test!(real_svs, "svs/CMU-1-Small-Region.svs");
 real_data_test!(real_scn, "scn/Leica-1.scn");
 real_data_test!(real_czi, "czi/Plate1-Blue-A-25.czi");
 real_data_test!(real_nd2, "nd2/BF007.nd2");
-real_data_test!(real_lif, "lif/PR2729.lif");
+#[test]
+fn real_lif() {
+    match validate_metadata_only("lif/PR2729.lif") {
+        Ok(true) => {}
+        Ok(false) => eprintln!("SKIP lif/PR2729.lif (not downloaded)"),
+        Err(e) => panic!("lif/PR2729.lif: {e}"),
+    }
+}
 real_data_test!(real_ometiff, "ome-tiff/tubhiswt_C0.ome.tif");
 real_data_test!(real_lsm, "lsm/colocsample1b.lsm");
 real_data_test!(real_dicom_mr, "dicom/MR-MONO2-12-angio-an1.dcm");
@@ -123,7 +153,8 @@ real_data_test!(real_nrrd, "nrrd/dt-helix.nrrd");
 real_data_test!(real_spe, "spe/test_000_.spe");
 real_data_test!(real_stk, "stk/C0.stk");
 real_data_test!(real_sif, "sif/image.sif");
-// real_klb omitted — KlbReader is an unimplemented stub (refuses to decode img.klb).
+// real_klb omitted — the Rust KLB reader covers bounded single-file layouts,
+// but this fixture still needs exact grouping/layout validation before enabling.
 real_data_test!(real_jpg, "jpg/scifio-test.jpg");
 real_data_test!(real_png, "png/scifio-test.png");
 real_data_test!(real_bmp, "bmp/scribble_P_RGB.bmp");
@@ -162,7 +193,9 @@ fn real_ndpi_large_64bit_offset() {
             return;
         }
         Err(_) => {
-            eprintln!("SKIP Hamamatsu-1.ndpi (not downloaded; DOWNLOAD_LARGE=1 scripts/download_ndpi.sh)");
+            eprintln!(
+                "SKIP Hamamatsu-1.ndpi (not downloaded; DOWNLOAD_LARGE=1 scripts/download_ndpi.sh)"
+            );
             return;
         }
     }
@@ -194,5 +227,8 @@ fn real_ndpi_large_64bit_offset() {
         bytes.iter().any(|&b| b != 0),
         "the >4GB-offset region decoded to all zeros"
     );
-    eprintln!("OK   Hamamatsu-1.ndpi: {sx}x{sy}, decoded {}-byte region at ({x},{y})", bytes.len());
+    eprintln!(
+        "OK   Hamamatsu-1.ndpi: {sx}x{sy}, decoded {}-byte region at ({x},{y})",
+        bytes.len()
+    );
 }

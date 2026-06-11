@@ -365,9 +365,7 @@ impl FormatReader for FitsReader {
         // FitsReader does not call setImageName, so Java falls back to the
         // current file's basename (with extension).
         if let (Some(path), Some(img)) = (self.path.as_ref(), ome.images.get_mut(0)) {
-            img.name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned());
+            img.name = path.file_name().map(|n| n.to_string_lossy().into_owned());
         }
         Some(ome)
     }

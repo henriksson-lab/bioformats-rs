@@ -183,10 +183,7 @@ fn collect_dataset_metadata(
     path: &str,
     meta_map: &mut HashMap<String, MetadataValue>,
 ) {
-    let dtype_size = dataset
-        .dtype()
-        .map(|dt| hdf5_dtype_size(&dt))
-        .unwrap_or(0);
+    let dtype_size = dataset.dtype().map(|dt| hdf5_dtype_size(&dt)).unwrap_or(0);
     let shape = dataset.shape().unwrap_or_default();
     meta_map.insert(
         format!("cellh5_dataset:{path}"),
@@ -333,12 +330,9 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
                 other => other,
             })?;
 
-        let dtype_size = ds
-            .dtype()
-            .map(|dt| hdf5_dtype_size(&dt))
-            .map_err(|e| {
-                BioFormatsError::Format(format!("CellH5: cannot read dtype for {ds_path}: {e}"))
-            })?;
+        let dtype_size = ds.dtype().map(|dt| hdf5_dtype_size(&dt)).map_err(|e| {
+            BioFormatsError::Format(format!("CellH5: cannot read dtype for {ds_path}: {e}"))
+        })?;
         // Java CellH5Reader.java:445-455 maps element size to pixel type:
         // 1 → UINT8, 2 → UINT16, 4 → INT32 (signed).
         let pixel_type = match dtype_size {

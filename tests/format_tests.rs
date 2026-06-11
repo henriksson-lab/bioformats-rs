@@ -1,6 +1,6 @@
 use bioformats::{
-    BioFormatsError, FormatReader, FormatWriter, ImageMetadata, ImageReader, ImageWriter,
-    MetadataValue, PixelType,
+    BioFormatsError, DimensionOrder, FormatReader, FormatWriter, ImageMetadata, ImageReader,
+    ImageWriter, MetadataValue, OmeAnnotation, PixelType,
 };
 use std::path::Path;
 
@@ -103,14 +103,33 @@ fn append_ptu_int_tag(out: &mut Vec<u8>, ident: &str, value: i64) {
     append_ptu_tag(out, ident, 0x1000_0008, value);
 }
 
+fn append_ptu_float_tag(out: &mut Vec<u8>, ident: &str, value: f64) {
+    append_ptu_tag(out, ident, 0x2000_0008, value.to_bits() as i64);
+}
+
+fn append_ptu_indexed_int_tag(out: &mut Vec<u8>, ident: &str, index: i32, value: i64) {
+    append_ptu_indexed_tag(out, ident, index, 0x1000_0008, value);
+}
+
 fn append_ptu_tag(out: &mut Vec<u8>, ident: &str, tag_type: u32, value: i64) {
+    append_ptu_indexed_tag(out, ident, -1, tag_type, value);
+}
+
+fn append_ptu_indexed_tag(out: &mut Vec<u8>, ident: &str, index: i32, tag_type: u32, value: i64) {
     let mut tag = [0u8; 48];
     let ident_bytes = ident.as_bytes();
     tag[..ident_bytes.len().min(32)].copy_from_slice(&ident_bytes[..ident_bytes.len().min(32)]);
-    tag[32..36].copy_from_slice(&(-1i32).to_le_bytes());
+    tag[32..36].copy_from_slice(&index.to_le_bytes());
     tag[36..40].copy_from_slice(&tag_type.to_le_bytes());
     tag[40..48].copy_from_slice(&value.to_le_bytes());
     out.extend_from_slice(&tag);
+}
+
+fn append_ptu_ansi_tag(out: &mut Vec<u8>, ident: &str, value: &str) {
+    let mut payload = value.as_bytes().to_vec();
+    payload.push(0);
+    append_ptu_tag(out, ident, 0x4001_ffff, payload.len() as i64);
+    out.extend_from_slice(&payload);
 }
 
 fn minimal_ptu_header(tags: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
@@ -120,6 +139,31 @@ fn minimal_ptu_header(tags: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     tags(&mut data);
     append_ptu_tag(&mut data, "Header_End", 0xffff_0008, 0);
     data
+}
+
+fn append_ptu_t3_marker(out: &mut Vec<u8>, marker: u8, nsync: u16) {
+    let record = 0x8000_0000u32 | ((marker as u32) << 25) | u32::from(nsync & 0x03ff);
+    out.extend_from_slice(&record.to_le_bytes());
+}
+
+fn append_ptu_t3_photon(out: &mut Vec<u8>, channel: u8, nsync: u16) {
+    append_ptu_t3_photon_with_dtime(out, channel, 0, nsync);
+}
+
+fn append_ptu_t3_photon_with_dtime(out: &mut Vec<u8>, channel: u8, dtime: u16, nsync: u16) {
+    let record =
+        ((channel as u32) << 25) | (u32::from(dtime & 0x7fff) << 10) | u32::from(nsync & 0x03ff);
+    out.extend_from_slice(&record.to_le_bytes());
+}
+
+fn append_ptu_t2_marker(out: &mut Vec<u8>, marker: u8, timetag: u32) {
+    let record = 0x8000_0000u32 | ((marker as u32) << 25) | (timetag & 0x01ff_ffff);
+    out.extend_from_slice(&record.to_le_bytes());
+}
+
+fn append_ptu_t2_photon(out: &mut Vec<u8>, channel: u8, timetag: u32) {
+    let record = ((channel as u32) << 25) | (timetag & 0x01ff_ffff);
+    out.extend_from_slice(&record.to_le_bytes());
 }
 
 fn sm_camera_bytes(width: u16, height: u16, pixels: &[u8]) -> Vec<u8> {
@@ -171,6 +215,95 @@ fn strict_misc4_raw_bytes(
     data
 }
 
+fn tillvision_native_cimage_contents() -> Vec<u8> {
+    let mut contents = vec![0u8; 125];
+    contents[0..4].copy_from_slice(b"\xf0\x3f\xff\x00");
+    contents[12..16].copy_from_slice(b"\x00\x00\xff\x00");
+    contents[22..26].copy_from_slice(b"\x08\x00\x04\x00");
+    contents[26] = 11;
+    contents[27..38].copy_from_slice(b"NativeImage");
+    contents[48..50].copy_from_slice(b"sB");
+    let dims = 70;
+    contents[dims..dims + 4].copy_from_slice(&2u32.to_le_bytes());
+    contents[dims + 4..dims + 8].copy_from_slice(&2u32.to_le_bytes());
+    contents[dims + 8..dims + 12].copy_from_slice(&1u32.to_le_bytes());
+    contents[dims + 12..dims + 16].copy_from_slice(&2u32.to_le_bytes());
+    contents[dims + 16..dims + 20].copy_from_slice(&1u32.to_le_bytes());
+    contents[dims + 20..dims + 24].copy_from_slice(&2u32.to_le_bytes());
+    contents.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    contents
+}
+
+fn tillvision_native_cimage_contents_with_shifted_object_marker() -> Vec<u8> {
+    let mut contents = tillvision_native_cimage_contents();
+    contents.splice(22..22, [0x55; 8]);
+    contents
+}
+
+fn tillvision_native_cimage_contents_with_description() -> Vec<u8> {
+    let mut contents = tillvision_native_cimage_contents();
+    let description = b"Date: 05/26/26\r\nStart time of experiment: 09:10:11 AM\r\nExposure time [ms]: 25.5\r\nImage type: fluorescence\r\n; ignored comment\r\n";
+    contents.extend_from_slice(b"\0\0\0\0\0\xff");
+    contents.extend_from_slice(&(description.len() as u16).to_le_bytes());
+    contents.extend_from_slice(description);
+    contents
+}
+
+fn tillvision_native_cimage_contents_with_payload_and_description(
+    payload: &[u8],
+    description: &[u8],
+) -> Vec<u8> {
+    let mut contents = tillvision_native_cimage_contents();
+    contents.truncate(125);
+    contents.extend_from_slice(payload);
+    contents.extend_from_slice(b"\0\0\0\0\0\xff");
+    contents.extend_from_slice(&(description.len() as u16).to_le_bytes());
+    contents.extend_from_slice(description);
+    contents
+}
+
+fn tillvision_native_cimage_contents_with_payload_at_offset(
+    payload: &[u8],
+    payload_offset: usize,
+    description: &[u8],
+) -> Vec<u8> {
+    let mut contents = tillvision_native_cimage_contents();
+    contents.truncate(125);
+    assert!(payload_offset >= contents.len());
+    contents.resize(payload_offset, 0xaa);
+    contents.extend_from_slice(payload);
+    contents.extend_from_slice(b"\0\0\0\0\0\xff");
+    contents.extend_from_slice(&(description.len() as u16).to_le_bytes());
+    contents.extend_from_slice(description);
+    contents
+}
+
+fn tillvision_native_cimage_contents_with_payload_fragments(
+    fragments: &[(usize, &[u8])],
+    description: &[u8],
+) -> Vec<u8> {
+    let mut contents = tillvision_native_cimage_contents();
+    contents.truncate(125);
+    for &(offset, payload) in fragments {
+        assert!(offset >= contents.len());
+        contents.resize(offset, 0xaa);
+        contents.extend_from_slice(payload);
+    }
+    contents.extend_from_slice(b"\0\0\0\0\0\xff");
+    contents.extend_from_slice(&(description.len() as u16).to_le_bytes());
+    contents.extend_from_slice(description);
+    contents
+}
+
+fn write_tillvision_vws_with_contents(path: &Path, contents: &[u8]) {
+    use std::io::Write;
+
+    let mut comp = cfb::create(path).unwrap();
+    comp.create_stream("/Contents")
+        .unwrap()
+        .write_all(contents)
+        .unwrap();
+}
 
 fn strict_spm_raw_bytes(
     magic: &[u8; 16],
@@ -191,7 +324,6 @@ fn strict_spm_raw_bytes(
     data.extend_from_slice(payload);
     data
 }
-
 
 fn append_fei_ser_2d_element(
     out: &mut Vec<u8>,
@@ -843,6 +975,96 @@ fn norpix_seq_rejects_clamped_dimensions_unknown_format_and_short_payload() {
         .unwrap_err();
     assert!(err.to_string().contains("shorter than declared"));
     let _ = std::fs::remove_file(short);
+
+    let compressed_short = tmp("compressed_short.seq");
+    let mut data = seq_header(1, 1, 1, 100, 1);
+    data.extend_from_slice(&4u32.to_le_bytes());
+    data.extend_from_slice(&[0xff, 0xd8]);
+    std::fs::write(&compressed_short, data).unwrap();
+    let err = bioformats::formats::norpix::NorpixReader::new()
+        .set_id(&compressed_short)
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("compressed frame 0 payload is shorter than declared"));
+    let _ = std::fs::remove_file(compressed_short);
+
+    let unsupported_compression = tmp("unsupported_compression.seq");
+    let mut data = seq_header(1, 1, 1, 0, 1);
+    data[612..616].copy_from_slice(&7u32.to_le_bytes());
+    std::fs::write(&unsupported_compression, data).unwrap();
+    let err = bioformats::formats::norpix::NorpixReader::new()
+        .set_id(&unsupported_compression)
+        .unwrap_err();
+    assert!(err.to_string().contains("unsupported compression code 7"));
+    let _ = std::fs::remove_file(unsupported_compression);
+}
+
+#[test]
+fn norpix_seq_preserves_header_metadata_and_timestamps_in_ome() {
+    let path = tmp("metadata.seq");
+    let mut data = vec![0u8; 1024];
+    data[..10].copy_from_slice(b"Norpix seq");
+    data[24..32].copy_from_slice(&3i64.to_le_bytes());
+    data[32..36].copy_from_slice(&1024i32.to_le_bytes());
+    data[548..552].copy_from_slice(&2u32.to_le_bytes());
+    data[572..576].copy_from_slice(&10u32.to_le_bytes());
+    data[592..596].copy_from_slice(&0u32.to_le_bytes());
+    data[596..600].copy_from_slice(&2u32.to_le_bytes());
+    data[600..604].copy_from_slice(&1u32.to_le_bytes());
+    data.extend_from_slice(&[1, 2]);
+    data.extend_from_slice(&1000u32.to_le_bytes());
+    data.extend_from_slice(&250u16.to_le_bytes());
+    data.extend_from_slice(&500u16.to_le_bytes());
+    data.extend_from_slice(&[3, 4]);
+    data.extend_from_slice(&1002u32.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::norpix::NorpixReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_z, 2);
+    assert!(matches!(
+        meta.series_metadata.get("norpix.version"),
+        Some(MetadataValue::Int(3))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("norpix.description_format"),
+        Some(MetadataValue::Int(0))
+    ));
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 4]);
+
+    let ome = reader.ome_metadata().expect("Norpix OME metadata");
+    assert_eq!(ome.images[0].planes.len(), 2);
+    assert_eq!(ome.images[0].planes[0].delta_t, Some(0.0));
+    assert!((ome.images[0].planes[1].delta_t.unwrap() - 1.7495).abs() < 1.0e-12);
+    let original = ome
+        .annotations
+        .iter()
+        .find_map(|annotation| match annotation {
+            OmeAnnotation::MapAnnotation {
+                id,
+                namespace,
+                values,
+            } if id.as_deref() == Some("Annotation:OriginalMetadata:0")
+                && namespace.as_deref()
+                    == Some("openmicroscopy.org/bioformats/original-metadata") =>
+            {
+                Some(values)
+            }
+            _ => None,
+        })
+        .expect("Norpix original metadata annotation");
+    assert!(original
+        .iter()
+        .any(|(key, value)| key == "norpix.true_image_size" && value == "10"));
+    assert!(original
+        .iter()
+        .any(|(key, _)| key == "norpix.timestamps_unix_seconds"));
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -952,6 +1174,32 @@ fn imagic_rejects_unknown_pixel_type_and_requires_initialization_for_series() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn imagic_ome_image_name_uses_last_header_record_like_java() {
+    let dir = isolated_tmp_dir("imagic_image_name");
+    let hed = dir.join("sample.hed");
+    let img = dir.join("sample.img");
+    let mut headers = vec![0u8; 2048];
+    for record in 0..2 {
+        let off = record * 1024;
+        write_i32_le(&mut headers, off + 48, 1);
+        write_i32_le(&mut headers, off + 52, 1);
+        headers[off + 56..off + 60].copy_from_slice(b"PACK");
+    }
+    headers[116..116 + 5].copy_from_slice(b"first");
+    headers[1024 + 116..1024 + 116 + 12].copy_from_slice(b"  last name ");
+    std::fs::write(&hed, headers).unwrap();
+    std::fs::write(&img, [7u8, 9]).unwrap();
+
+    let mut reader = bioformats::formats::imagic::ImagicReader::new();
+    reader.set_id(&hed).unwrap();
+    assert_eq!(reader.metadata().image_count, 2);
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(ome.images[0].name.as_deref(), Some("last name"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 // Build a binary TopoMetrix fixture matching the Java TopometrixReader layout:
 // "#R" magic in the 2-byte pad, version ASCII at [2..6), pixelOffset ASCII at
 // [8..12), an empty date line at offset 14 (so the comment region ends at 254),
@@ -1018,13 +1266,577 @@ fn topometrix_region_crops_real_pixels() {
 }
 
 #[test]
-fn picoquant_ptu_parses_unified_header_dimensions_without_decoding_events() {
+fn picoquant_ptu_reconstructs_hydraharp_t3_marker_raster() {
     let path = tmp("minimal.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 2);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 2);
+        append_ptu_int_tag(out, "ImgHdr_Frame", 1);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 9);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0304);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t3_marker(&mut data, 1, 0);
+    append_ptu_t3_photon(&mut data, 0, 1);
+    append_ptu_t3_photon(&mut data, 1, 3);
+    append_ptu_t3_marker(&mut data, 2, 4);
+    append_ptu_t3_marker(&mut data, 1, 4);
+    append_ptu_t3_photon(&mut data, 0, 5);
+    append_ptu_t3_photon(&mut data, 0, 5);
+    append_ptu_t3_photon(&mut data, 0, 7);
+    append_ptu_t3_marker(&mut data, 2, 8);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 2);
+    assert_eq!(meta.size_z, 1);
+    assert_eq!(meta.size_c, 1);
+    assert_eq!(meta.size_t, 1);
+    assert_eq!(meta.image_count, 1);
+    assert_eq!(meta.pixel_type, PixelType::Uint32);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.ImgHdr_PixX"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.TTResult_NumberOfRecords"),
+        Some(MetadataValue::Int(9))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("HydraHarp T3")
+    ));
+
+    let plane = reader.open_bytes(0).unwrap();
+    let counts: Vec<u32> = plane
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(counts, vec![1, 1, 2, 1]);
+    let crop = reader.open_bytes_region(0, 1, 0, 1, 2).unwrap();
+    let crop_counts: Vec<u32> = crop
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(crop_counts, vec![1, 1]);
+    assert!(matches!(
+        reader.open_bytes_region(1, 0, 0, 1, 1),
+        Err(BioFormatsError::PlaneOutOfRange(1))
+    ));
+    assert!(matches!(
+        reader.open_bytes(1),
+        Err(BioFormatsError::PlaneOutOfRange(1))
+    ));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_reconstructs_timeharp_t3_marker_raster() {
+    let path = tmp("timeharp_t3_marker_raster.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 2);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_Frame", 1);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 4);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0305);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t3_marker(&mut data, 1, 0);
+    append_ptu_t3_photon(&mut data, 0, 1);
+    append_ptu_t3_photon(&mut data, 0, 3);
+    append_ptu_t3_marker(&mut data, 2, 4);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 1);
+    assert_eq!(meta.image_count, 1);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_record_type"),
+        Some(MetadataValue::String(value)) if value == "TimeHarp 260N T3"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_hydraharp_layout"),
+        Some(MetadataValue::Bool(false))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("TimeHarp 260N T3")
+    ));
+
+    let counts: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(counts, vec![1, 1]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_reconstructs_timeharp_t2_marker_raster() {
+    let path = tmp("timeharp_t2_marker_raster.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 2);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_Frame", 1);
+        append_ptu_int_tag(out, "ImgHdr_DetectorChannels", 2);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 5);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0206);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t2_marker(&mut data, 1, 0);
+    append_ptu_t2_photon(&mut data, 0, 1);
+    append_ptu_t2_photon(&mut data, 1, 2);
+    append_ptu_t2_photon(&mut data, 1, 3);
+    append_ptu_t2_marker(&mut data, 2, 4);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.image_count, 2);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_record_type"),
+        Some(MetadataValue::String(value)) if value == "TimeHarp 260P T2"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("TimeHarp 260P T2")
+    ));
+
+    let channel_0: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    let channel_1: Vec<u32> = reader
+        .open_bytes(1)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(channel_0, vec![1, 0]);
+    assert_eq!(channel_1, vec![0, 2]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_splits_hydraharp_t3_detector_channels() {
+    let path = tmp("minimal_detector_channels.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 2);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_Frame", 1);
+        append_ptu_int_tag(out, "ImgHdr_DetectorChannels", 2);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 5);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0304);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t3_marker(&mut data, 1, 0);
+    append_ptu_t3_photon(&mut data, 0, 1);
+    append_ptu_t3_photon(&mut data, 1, 3);
+    append_ptu_t3_photon(&mut data, 1, 3);
+    append_ptu_t3_marker(&mut data, 2, 4);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_t, 1);
+    assert_eq!(meta.image_count, 2);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.detector_channels"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("split into 2 detector channels")
+    ));
+
+    let channel_0: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    let channel_1: Vec<u32> = reader
+        .open_bytes(1)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(channel_0, vec![1, 0]);
+    assert_eq!(channel_1, vec![0, 2]);
+
+    let crop = reader.open_bytes_region(1, 1, 0, 1, 1).unwrap();
+    assert_eq!(u32::from_le_bytes(crop.try_into().unwrap()), 2);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_splits_hydraharp_t3_lifetime_bins() {
+    let path = tmp("minimal_lifetime_bins.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 2);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_Frame", 1);
+        append_ptu_int_tag(out, "ImgHdr_LifetimeBins", 3);
+        append_ptu_int_tag(out, "ImgHdr_LifetimeBinWidth", 8);
+        append_ptu_float_tag(out, "MeasDesc_Resolution", 2.5e-11);
+        append_ptu_float_tag(out, "MeasDesc_GlobalResolution", 1.0e-8);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 6);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0304);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t3_marker(&mut data, 1, 0);
+    append_ptu_t3_photon_with_dtime(&mut data, 0, 0, 1);
+    append_ptu_t3_photon_with_dtime(&mut data, 0, 9, 1);
+    append_ptu_t3_photon_with_dtime(&mut data, 0, 16, 3);
+    append_ptu_t3_photon_with_dtime(&mut data, 0, 23, 3);
+    append_ptu_t3_marker(&mut data, 2, 4);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 3);
+    assert_eq!(meta.image_count, 3);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.lifetime_bins"),
+        Some(MetadataValue::Int(3))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.acquisition_mode"),
+        Some(MetadataValue::String(value)) if value == "tttr_t3"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_record_type"),
+        Some(MetadataValue::String(value)) if value == "HydraHarp T3"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("ptu.lifetime_dtime_resolution_seconds"),
+        Some(MetadataValue::Float(value)) if (*value - 2.5e-11).abs() < 1.0e-18
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.lifetime_bin_width_dtime"),
+        Some(MetadataValue::Int(8))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.lifetime_bin_width_seconds"),
+        Some(MetadataValue::Float(value)) if (*value - 2.0e-10).abs() < 1.0e-18
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.lifetime_range_seconds"),
+        Some(MetadataValue::Float(value)) if (*value - 6.0e-10).abs() < 1.0e-18
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.sync_resolution_seconds"),
+        Some(MetadataValue::Float(value)) if (*value - 1.0e-8).abs() < 1.0e-18
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("3 lifetime bins")
+    ));
+
+    let bin_0: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    let bin_1: Vec<u32> = reader
+        .open_bytes(1)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    let bin_2: Vec<u32> = reader
+        .open_bytes(2)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(bin_0, vec![1, 0]);
+    assert_eq!(bin_1, vec![1, 0]);
+    assert_eq!(bin_2, vec![0, 2]);
+
+    let crop = reader.open_bytes_region(2, 1, 0, 1, 1).unwrap();
+    assert_eq!(u32::from_le_bytes(crop.try_into().unwrap()), 2);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_reconstructs_hydraharp_t2_marker_raster() {
+    let path = tmp("minimal_t2.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 2);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_Frame", 1);
+        append_ptu_int_tag(out, "ImgHdr_DetectorChannels", 2);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 6);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0204);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t2_marker(&mut data, 1, 0);
+    append_ptu_t2_photon(&mut data, 0, 1);
+    append_ptu_t2_photon(&mut data, 1, 2);
+    append_ptu_t2_photon(&mut data, 1, 3);
+    append_ptu_t2_photon(&mut data, 0, 3);
+    append_ptu_t2_marker(&mut data, 2, 4);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_t, 1);
+    assert_eq!(meta.image_count, 2);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("HydraHarp T2")
+    ));
+
+    let channel_0: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    let channel_1: Vec<u32> = reader
+        .open_bytes(1)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(channel_0, vec![1, 1]);
+    assert_eq!(channel_1, vec![0, 2]);
+
+    let crop = reader.open_bytes_region(1, 1, 0, 1, 1).unwrap();
+    assert_eq!(u32::from_le_bytes(crop.try_into().unwrap()), 2);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_applies_bidirectional_scan_correction() {
+    let path = tmp("minimal_bidirectional.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 4);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 2);
+        append_ptu_int_tag(out, "ImgHdr_Frame", 1);
+        append_ptu_int_tag(out, "ImgHdr_BiDirectional", 1);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 6);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0304);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t3_marker(&mut data, 1, 0);
+    append_ptu_t3_photon(&mut data, 0, 1);
+    append_ptu_t3_marker(&mut data, 2, 4);
+    append_ptu_t3_marker(&mut data, 1, 4);
+    append_ptu_t3_photon(&mut data, 0, 5);
+    append_ptu_t3_marker(&mut data, 2, 8);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata.get("ptu.bidirectional"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("bidirectional scan correction")
+    ));
+
+    let counts: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(counts, vec![0, 1, 0, 0, 0, 0, 1, 0]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_rejects_invalid_bidirectional_tag() {
+    let path = tmp("bad_bidirectional.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 1);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_BiDirectional", 2);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 3);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0304);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t3_marker(&mut data, 1, 0);
+    append_ptu_t3_photon(&mut data, 0, 0);
+    append_ptu_t3_marker(&mut data, 2, 1);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("ptu.reconstruction_unsupported"),
+        Some(MetadataValue::String(value)) if value.contains("bidirectional scan tag must be 0 or 1")
+    ));
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("bidirectional scan tag must be 0 or 1")),
+        "{err:?}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_rejects_t2_lifetime_binning() {
+    let path = tmp("bad_t2_lifetime.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 1);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_LifetimeBins", 2);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 3);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0204);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t2_marker(&mut data, 1, 0);
+    append_ptu_t2_photon(&mut data, 0, 1);
+    append_ptu_t2_marker(&mut data, 2, 2);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("ptu.reconstruction_unsupported"),
+        Some(MetadataValue::String(value)) if value.contains("T2 records do not carry lifetime dtime values")
+    ));
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("T2 records do not carry lifetime dtime values")),
+        "{err:?}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_rejects_lifetime_bin_outside_declared_split() {
+    let path = tmp("bad_lifetime_bin.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 1);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_LifetimeBins", 2);
+        append_ptu_int_tag(out, "ImgHdr_LifetimeBinWidth", 4);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 3);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0304);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t3_marker(&mut data, 1, 0);
+    append_ptu_t3_photon_with_dtime(&mut data, 0, 8, 1);
+    append_ptu_t3_marker(&mut data, 2, 2);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("ptu.reconstruction_unsupported"),
+        Some(MetadataValue::String(value)) if value.contains("photon lifetime bin 2 exceeds declared lifetime bin count 2")
+    ));
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("photon lifetime bin 2 exceeds declared lifetime bin count 2")),
+        "{err:?}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_rejects_detector_channel_outside_declared_split() {
+    let path = tmp("bad_detector_channel.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 1);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_DetectorChannels", 1);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 3);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0304);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t3_marker(&mut data, 1, 0);
+    append_ptu_t3_photon(&mut data, 1, 1);
+    append_ptu_t3_marker(&mut data, 2, 2);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("ptu.reconstruction_unsupported"),
+        Some(MetadataValue::String(value)) if value.contains("photon detector channel 1 exceeds declared detector channel count 1")
+    ));
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("photon detector channel 1 exceeds declared detector channel count 1")),
+        "{err:?}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_reports_missing_timing_for_unmapped_tttr_stream() {
+    let path = tmp("minimal_metadata_only.ptu");
     let data = minimal_ptu_header(|out| {
         append_ptu_int_tag(out, "ImgHdr_PixX", 7);
         append_ptu_int_tag(out, "ImgHdr_PixY", 5);
         append_ptu_int_tag(out, "ImgHdr_Frame", 3);
         append_ptu_int_tag(out, "TTResult_NumberOfRecords", 0);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0304);
     });
     std::fs::write(&path, data).unwrap();
 
@@ -1033,27 +1845,19 @@ fn picoquant_ptu_parses_unified_header_dimensions_without_decoding_events() {
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 7);
     assert_eq!(meta.size_y, 5);
-    assert_eq!(meta.size_z, 1);
-    assert_eq!(meta.size_c, 1);
-    assert_eq!(meta.size_t, 3);
     assert_eq!(meta.image_count, 3);
-    assert_eq!(meta.pixel_type, PixelType::Uint32);
     assert!(matches!(
-        meta.series_metadata.get("ptu.ImgHdr_PixX"),
-        Some(MetadataValue::Int(7))
-    ));
-    assert!(matches!(
-        meta.series_metadata.get("ptu.TTResult_NumberOfRecords"),
-        Some(MetadataValue::Int(0))
+        meta.series_metadata.get("ptu.reconstruction_unsupported"),
+        Some(MetadataValue::String(value)) if value.contains("missing line-start marker")
     ));
 
     let err = reader.open_bytes(0).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("event-stream image reconstruction is unsupported") && message.contains("explicit image dimensions"))
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("missing line-start marker"))
     );
     let err = reader.open_bytes_region(1, 0, 0, 1, 1).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("not decoded to image planes"))
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("missing line-start marker"))
     );
     assert!(matches!(
         reader.open_bytes_region(3, 0, 0, 1, 1),
@@ -1067,6 +1871,302 @@ fn picoquant_ptu_parses_unified_header_dimensions_without_decoding_events() {
 }
 
 #[test]
+fn picoquant_ptu_histogram_acquisition_opens_metadata_only() {
+    let path = tmp("histogram_metadata_only.ptu");
+    let data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "HistResDscr_HistogramBins", 4);
+        append_ptu_int_tag(out, "HistResDscr_CurveIndex", 0);
+        append_ptu_ansi_tag(out, "CreatorSW_Name", "SymPhoTime");
+    });
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 4);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 1);
+    assert_eq!(meta.size_t, 1);
+    assert_eq!(meta.image_count, 1);
+    assert_eq!(meta.pixel_type, PixelType::Uint32);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.acquisition_mode"),
+        Some(MetadataValue::String(value)) if value == "histogram"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_bins"),
+        Some(MetadataValue::Int(4))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_curves"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("ptu.histogram_payload_expected_bytes"),
+        Some(MetadataValue::Int(16))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("ptu.histogram_payload_actual_bytes"),
+        Some(MetadataValue::Int(0))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_payload_ambiguous"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.CreatorSW_Name"),
+        Some(MetadataValue::String(value)) if value == "SymPhoTime"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction_unsupported"),
+        Some(MetadataValue::String(value)) if value.contains("histogram acquisition")
+    ));
+
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("histogram acquisition image-plane decoding is unsupported")),
+        "{err:?}"
+    );
+    assert!(matches!(
+        reader.open_bytes_region(0, 4, 0, 1, 1),
+        Err(BioFormatsError::Format(_))
+    ));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_decodes_exact_uint16_histogram_payload() {
+    let path = tmp("histogram_uint16_payload.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "HistResDscr_HistogramBins", 4);
+        append_ptu_int_tag(out, "HistResDscr_CurveIndex", 0);
+    });
+    for value in [1u16, 2, 3, 4] {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.pixel_type, PixelType::Uint16);
+    assert_eq!(meta.bits_per_pixel, 16);
+    assert_eq!(meta.size_x, 4);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 1);
+    assert!(matches!(
+        meta.series_metadata
+            .get("ptu.histogram_payload_expected_bytes"),
+        Some(MetadataValue::Int(8))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("ptu.histogram_payload_actual_bytes"),
+        Some(MetadataValue::Int(8))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_payload_ambiguous"),
+        Some(MetadataValue::Bool(false))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_payload_layout"),
+        Some(MetadataValue::String(value)) if value == "little-endian uint16 bins"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_sample_bytes"),
+        Some(MetadataValue::Int(2))
+    ));
+
+    let counts: Vec<u16> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(2)
+        .map(|px| u16::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(counts, vec![1, 2, 3, 4]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_decodes_exact_uint8_histogram_payload() {
+    let path = tmp("histogram_uint8_payload.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "HistResDscr_HistogramBins", 4);
+        append_ptu_int_tag(out, "HistResDscr_CurveIndex", 0);
+    });
+    data.extend_from_slice(&[1, 2, 3, 4]);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.pixel_type, PixelType::Uint8);
+    assert_eq!(meta.bits_per_pixel, 8);
+    assert!(matches!(
+        meta.series_metadata
+            .get("ptu.histogram_payload_expected_bytes"),
+        Some(MetadataValue::Int(4))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_payload_layout"),
+        Some(MetadataValue::String(value)) if value == "uint8 bins"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_reports_ambiguous_histogram_payload_size() {
+    let path = tmp("histogram_ambiguous_payload.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "HistResDscr_HistogramBins", 4);
+        append_ptu_int_tag(out, "HistResDscr_CurveIndex", 0);
+    });
+    data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("ptu.histogram_payload_expected_bytes"),
+        Some(MetadataValue::Int(16))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("ptu.histogram_payload_actual_bytes"),
+        Some(MetadataValue::Int(12))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_payload_ambiguous"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction_unsupported"),
+        Some(MetadataValue::String(value)) if value.contains("12 payload bytes found")
+    ));
+
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("12 payload bytes found")),
+        "{err:?}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_decodes_bounded_histogram_payload() {
+    let path = tmp("histogram_payload.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "HistResDscr_HistogramBins", 4);
+        append_ptu_int_tag(out, "HistResDscr_CurveIndex", 0);
+    });
+    for value in [3u32, 0, 7, 11] {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 4);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 1);
+    assert_eq!(meta.image_count, 1);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("histogram payload decoded")
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_curves"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_payload_ambiguous"),
+        Some(MetadataValue::Bool(false))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_payload_layout"),
+        Some(MetadataValue::String(value)) if value == "little-endian uint32 bins"
+    ));
+
+    let counts: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(counts, vec![3, 0, 7, 11]);
+    let crop = reader.open_bytes_region(0, 2, 0, 2, 1).unwrap();
+    let crop_counts: Vec<u32> = crop
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(crop_counts, vec![7, 11]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_decodes_indexed_histogram_curves() {
+    let path = tmp("histogram_indexed_curves.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_indexed_int_tag(out, "HistResDscr_HistogramBins", 0, 3);
+        append_ptu_indexed_int_tag(out, "HistResDscr_CurveIndex", 0, 0);
+        append_ptu_indexed_int_tag(out, "HistResDscr_HistogramBins", 1, 3);
+        append_ptu_indexed_int_tag(out, "HistResDscr_CurveIndex", 1, 1);
+    });
+    for value in [1u32, 2, 3, 4, 5, 6] {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 3);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.image_count, 2);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_bins"),
+        Some(MetadataValue::Int(3))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.histogram_curves"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.HistResDscr_HistogramBins[1]"),
+        Some(MetadataValue::Int(3))
+    ));
+
+    let curve_0: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    let curve_1: Vec<u32> = reader
+        .open_bytes(1)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(curve_0, vec![1, 2, 3]);
+    assert_eq!(curve_1, vec![4, 5, 6]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn picoquant_ptu_rejects_missing_explicit_dimensions() {
     let path = tmp("no_dims.ptu");
     std::fs::write(&path, minimal_ptu_header(|_| {})).unwrap();
@@ -1075,6 +2175,27 @@ fn picoquant_ptu_rejects_missing_explicit_dimensions() {
     let err = reader.set_id(&path).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("missing explicit image width"))
+    );
+    assert_eq!(reader.metadata().size_x, 0);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_rejects_histogram_without_bins_or_dimensions() {
+    let path = tmp("histogram_no_bins.ptu");
+    std::fs::write(
+        &path,
+        minimal_ptu_header(|out| {
+            append_ptu_int_tag(out, "HistResDscr_CurveIndex", 0);
+        }),
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let err = reader.set_id(&path).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("histogram acquisition missing bounded histogram bin descriptor")),
+        "{err:?}"
     );
     assert_eq!(reader.metadata().size_x, 0);
     let _ = std::fs::remove_file(path);
@@ -1912,7 +3033,7 @@ fn tillvision_pst_entrypoint_reads_sidecar_inf_pixels() {
     let inf = tmp("direct_tillvision.inf");
     std::fs::write(
         &inf,
-        "Width=3\nHeight=2\nBands=1\nSlices=1\nFrames=1\nDatatype=2\n",
+        "Width=3\nHeight=2\nBands=1\nSlices=1\nFrames=1\nDatatype=2\nImageName=Till scalar metadata\nExposureTime=12.5\nImageType=brightfield\nDate=05/27/26\nStart Time=10:11:12 AM\nPixelSizeX [um]=0.25\nPixelSizeY [um]=0.5\nZStep [um]=1.5\nFrameInterval [ms]=2500\nChannel Name 1=DAPI\nChannel Excitation Wavelength 1 [nm]=405\nChannel Emission Wavelength 1 [nm]=460\n",
     )
     .unwrap();
     std::fs::write(&pst, [1, 2, 3, 4, 5, 6]).unwrap();
@@ -1927,6 +3048,50 @@ fn tillvision_pst_entrypoint_reads_sidecar_inf_pixels() {
     let mut reader = ImageReader::open(&pst).unwrap();
     assert_eq!(reader.metadata().size_x, 3);
     assert_eq!(reader.metadata().size_y, 2);
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("tillvision.exposure_time_seconds"),
+        Some(MetadataValue::Float(value)) if (*value - 0.0125).abs() < 1.0e-12
+    ));
+    assert!(matches!(
+        reader.metadata().series_metadata.get("tillvision.image_type"),
+        Some(MetadataValue::String(value)) if value == "brightfield"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("tillvision.acquisition_datetime"),
+        Some(MetadataValue::String(value)) if value == "05/27/26 10:11:12 AM"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("tillvision.acquisition_datetime_iso8601"),
+        Some(MetadataValue::String(value)) if value == "2026-05-27T10:11:12"
+    ));
+    let ome = reader.ome_metadata().expect("TillVision OME metadata");
+    let image = &ome.images[0];
+    assert_eq!(image.name.as_deref(), Some("Till scalar metadata"));
+    assert_eq!(image.physical_size_x, Some(0.25));
+    assert_eq!(image.physical_size_y, Some(0.5));
+    assert_eq!(image.physical_size_z, Some(1.5));
+    assert_eq!(image.time_increment, Some(2.5));
+    assert_eq!(image.channels[0].name.as_deref(), Some("DAPI"));
+    assert_eq!(image.channels[0].excitation_wavelength, Some(405.0));
+    assert_eq!(image.channels[0].emission_wavelength, Some(460.0));
+    assert!(image
+        .planes
+        .iter()
+        .all(|plane| plane.exposure_time == Some(0.0125)));
+    assert!(ome.annotations.iter().any(|annotation| matches!(
+        annotation,
+        bioformats::OmeAnnotation::MapAnnotation { values, .. }
+            if values.iter().any(|(key, value)| key == "AcquisitionDate" && value == "2026-05-27T10:11:12")
+    )));
     assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
     assert_eq!(
         reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
@@ -2008,6 +3173,419 @@ fn tillvision_vws_reads_embedded_strict_raw_subset() {
 }
 
 #[test]
+fn tillvision_vws_reads_native_ole_cimage_contents() {
+    let dir = isolated_tmp_dir("tillvision_vws_native_cimage");
+    let vws = dir.join("native.vws");
+    write_tillvision_vws_with_contents(&vws, &tillvision_native_cimage_contents());
+
+    let mut reader = ImageReader::open(&vws).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("Info image_name"),
+        Some(MetadataValue::String(name)) if name == "NativeImage"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+    assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(), vec![6, 8]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tillvision_vws_reads_zlib_compressed_native_cimage_payload() {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("tillvision_vws_native_cimage_zlib");
+    let vws = dir.join("native_zlib.vws");
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let description = b"Compression: zlib\r\nImage type: compressed native\r\n";
+    write_tillvision_vws_with_contents(
+        &vws,
+        &tillvision_native_cimage_contents_with_payload_and_description(&compressed, description),
+    );
+
+    let mut reader = ImageReader::open(&vws).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("Info Compression"),
+        Some(MetadataValue::String(value)) if value == "zlib"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+    assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![2, 4]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tillvision_vws_reads_raw_deflate_compressed_native_cimage_payload() {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("tillvision_vws_native_cimage_raw_deflate");
+    let vws = dir.join("native_raw_deflate.vws");
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let description = b"Compression: deflate\r\nImage type: raw deflate native\r\n";
+    write_tillvision_vws_with_contents(
+        &vws,
+        &tillvision_native_cimage_contents_with_payload_and_description(&compressed, description),
+    );
+
+    let mut reader = ImageReader::open(&vws).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("Info Compression"),
+        Some(MetadataValue::String(value)) if value == "deflate"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+    assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(), vec![6, 8]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tillvision_vws_reads_native_cimage_with_shifted_object_marker() {
+    let dir = isolated_tmp_dir("tillvision_vws_native_cimage_shifted_marker");
+    let vws = dir.join("native_shifted_marker.vws");
+    write_tillvision_vws_with_contents(
+        &vws,
+        &tillvision_native_cimage_contents_with_shifted_object_marker(),
+    );
+
+    let mut reader = ImageReader::open(&vws).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tillvision_vws_compressed_flag_does_not_mask_declared_zlib_algorithm() {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("tillvision_vws_native_cimage_compressed_flag_zlib");
+    let vws = dir.join("native_compressed_flag_zlib.vws");
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let description = b"Compressed: 1\r\nCompression: zlib\r\n";
+    write_tillvision_vws_with_contents(
+        &vws,
+        &tillvision_native_cimage_contents_with_payload_and_description(&compressed, description),
+    );
+
+    let mut reader = ImageReader::open(&vws).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tillvision_vws_rejects_compressed_flag_without_algorithm() {
+    let dir = isolated_tmp_dir("tillvision_vws_native_cimage_compressed_flag");
+    let vws = dir.join("native_compressed_flag.vws");
+    let description = b"Compressed: true\r\n";
+    write_tillvision_vws_with_contents(
+        &vws,
+        &tillvision_native_cimage_contents_with_payload_and_description(
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            description,
+        ),
+    );
+
+    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let err = reader.set_id(&vws).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+            if message.contains("compressed payload without a supported algorithm")),
+        "{err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tillvision_vws_reads_noncontiguous_native_cimage_payload_offset() {
+    let dir = isolated_tmp_dir("tillvision_vws_native_cimage_offset");
+    let vws = dir.join("native_offset.vws");
+    let description = b"Payload offset: 160\r\nImage type: offset native\r\n";
+    write_tillvision_vws_with_contents(
+        &vws,
+        &tillvision_native_cimage_contents_with_payload_at_offset(
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            160,
+            description,
+        ),
+    );
+
+    let mut reader = ImageReader::open(&vws).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("Info Payload offset"),
+        Some(MetadataValue::String(value)) if value == "160"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+    assert_eq!(reader.open_bytes_region(1, 0, 1, 2, 1).unwrap(), vec![7, 8]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tillvision_vws_reads_fragmented_native_cimage_payload_table() {
+    let dir = isolated_tmp_dir("tillvision_vws_native_cimage_fragments");
+    let vws = dir.join("native_fragments.vws");
+    let description = b"Payload fragments: 160:3, 180:5\r\nImage type: fragmented native\r\n";
+    write_tillvision_vws_with_contents(
+        &vws,
+        &tillvision_native_cimage_contents_with_payload_fragments(
+            &[(160, &[1, 2, 3]), (180, &[4, 5, 6, 7, 8])],
+            description,
+        ),
+    );
+
+    let mut reader = ImageReader::open(&vws).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("Info Payload fragments"),
+        Some(MetadataValue::String(value)) if value == "160:3, 180:5"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+    assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![2, 4]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tillvision_vws_reads_native_description_metadata() {
+    let dir = isolated_tmp_dir("tillvision_vws_native_description");
+    let vws = dir.join("native_description.vws");
+    write_tillvision_vws_with_contents(&vws, &tillvision_native_cimage_contents_with_description());
+
+    let mut reader = ImageReader::open(&vws).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata.get("Info Date"),
+        Some(MetadataValue::String(value)) if value == "05/26/26"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Info Start time of experiment"),
+        Some(MetadataValue::String(value)) if value == "09:10:11 AM"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Info Exposure time [ms]"),
+        Some(MetadataValue::String(value)) if value == "25.5"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Info Exposure time [s]"),
+        Some(MetadataValue::String(value)) if value == "0.0255"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("tillvision.exposure_time_seconds"),
+        Some(MetadataValue::Float(value)) if (*value - 0.0255).abs() < 1.0e-12
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Info Image type"),
+        Some(MetadataValue::String(value)) if value == "fluorescence"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("tillvision.image_type"),
+        Some(MetadataValue::String(value)) if value == "fluorescence"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Info Acquisition date/time"),
+        Some(MetadataValue::String(value)) if value == "05/26/26 09:10:11 AM"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("tillvision.acquisition_datetime"),
+        Some(MetadataValue::String(value)) if value == "05/26/26 09:10:11 AM"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("tillvision.acquisition_datetime_iso8601"),
+        Some(MetadataValue::String(value)) if value == "2026-05-26T09:10:11"
+    ));
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(ome.images[0].name.as_deref(), Some("NativeImage"));
+    assert_eq!(ome.images[0].planes.len(), 2);
+    assert!(ome.images[0]
+        .planes
+        .iter()
+        .all(|plane| plane.exposure_time == Some(0.0255)));
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tillvision_two_digit_year_metadata_uses_fixed_century_pivot() {
+    let pst = tmp("two_digit_year_tillvision.pst");
+    let inf = tmp("two_digit_year_tillvision.inf");
+    std::fs::write(
+        &inf,
+        "Width=1\nHeight=1\nBands=1\nSlices=1\nFrames=1\nDatatype=2\nDate=12/31/99\nStart Time=11:59:58 PM\n",
+    )
+    .unwrap();
+    std::fs::write(&pst, [42]).unwrap();
+
+    let mut reader = ImageReader::open(&pst).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("tillvision.acquisition_datetime"),
+        Some(MetadataValue::String(value)) if value == "12/31/99 11:59:58 PM"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("tillvision.acquisition_datetime_iso8601"),
+        Some(MetadataValue::String(value)) if value == "1999-12-31T23:59:58"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![42]);
+
+    let _ = std::fs::remove_file(pst);
+    let _ = std::fs::remove_file(inf);
+}
+
+#[test]
+fn tillvision_vws_native_ole_reports_precise_cimage_blockers() {
+    let dir = isolated_tmp_dir("tillvision_vws_native_errors");
+
+    let empty_contents = dir.join("empty_contents.vws");
+    write_tillvision_vws_with_contents(&empty_contents, b"not a cimage stream");
+    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let err = reader.set_id(&empty_contents).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("contains no supported CImage records")),
+        "{err:?}"
+    );
+
+    let missing_contents = dir.join("missing_contents.vws");
+    {
+        let mut comp = cfb::create(&missing_contents).unwrap();
+        comp.create_stream("/Other").unwrap();
+    }
+    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let err = reader.set_id(&missing_contents).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("lacks Root Entry/Contents")),
+        "{err:?}"
+    );
+
+    let short_payload = dir.join("short_payload_native.vws");
+    let mut contents = tillvision_native_cimage_contents();
+    contents.truncate(contents.len() - 1);
+    write_tillvision_vws_with_contents(&short_payload, &contents);
+    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let err = reader.set_id(&short_payload).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("payload is shorter than declared")),
+        "{err:?}"
+    );
+
+    let invalid_exposure = dir.join("invalid_exposure_native.vws");
+    let mut contents = tillvision_native_cimage_contents();
+    let description = b"Exposure time [ms]: not-a-number\r\n";
+    contents.extend_from_slice(b"\0\0\0\0\0\xff");
+    contents.extend_from_slice(&(description.len() as u16).to_le_bytes());
+    contents.extend_from_slice(description);
+    write_tillvision_vws_with_contents(&invalid_exposure, &contents);
+    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let err = reader.set_id(&invalid_exposure).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("invalid Exposure time [ms]")),
+        "{err:?}"
+    );
+
+    let unsupported_compression = dir.join("unsupported_compression_native.vws");
+    let description = b"Compression: lzw\r\n";
+    write_tillvision_vws_with_contents(
+        &unsupported_compression,
+        &tillvision_native_cimage_contents_with_payload_and_description(
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            description,
+        ),
+    );
+    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let err = reader.set_id(&unsupported_compression).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("unsupported compression Compression: lzw")),
+        "{err:?}"
+    );
+
+    let invalid_payload_offset = dir.join("invalid_payload_offset_native.vws");
+    let description = b"Payload offset: 64\r\n";
+    write_tillvision_vws_with_contents(
+        &invalid_payload_offset,
+        &tillvision_native_cimage_contents_with_payload_at_offset(
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            160,
+            description,
+        ),
+    );
+    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let err = reader.set_id(&invalid_payload_offset).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("before parsed payload start")),
+        "{err:?}"
+    );
+
+    let short_fragments = dir.join("short_fragment_table_native.vws");
+    let description = b"Payload fragments: 160:2, 180:5\r\n";
+    write_tillvision_vws_with_contents(
+        &short_fragments,
+        &tillvision_native_cimage_contents_with_payload_fragments(
+            &[(160, &[1, 2]), (180, &[3, 4, 5, 6, 7])],
+            description,
+        ),
+    );
+    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let err = reader.set_id(&short_fragments).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("fragments assemble to 7 bytes, expected 8")),
+        "{err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn tillvision_vws_rejects_malformed_embedded_or_nonmatching_payloads() {
     let dir = isolated_tmp_dir("tillvision_vws_embedded_errors");
     let magic = *b"BFTILLVISIONVWS1";
@@ -2054,7 +3632,7 @@ fn tillvision_vws_rejects_malformed_embedded_or_nonmatching_payloads() {
     let mut reader = bioformats::formats::lim::TillVisionReader::new();
     let err = reader.set_id(&native).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("embedded VWS native payload decoding is unsupported")),
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("no supported companion PST/INF pixels")),
         "{err:?}"
     );
 
@@ -2063,7 +3641,7 @@ fn tillvision_vws_rejects_malformed_embedded_or_nonmatching_payloads() {
     let mut reader = bioformats::formats::lim::TillVisionReader::new();
     let err = reader.set_id(&fake).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("embedded VWS native payload decoding is unsupported")),
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("no supported companion PST/INF pixels")),
         "{err:?}"
     );
 
@@ -2079,7 +3657,7 @@ fn tillvision_vws_without_pst_sidecar_stays_unsupported() {
     let mut reader = bioformats::formats::lim::TillVisionReader::new();
     let err = reader.set_id(&vws).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("embedded VWS native payload decoding is unsupported")),
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("no supported companion PST/INF pixels")),
         "{err:?}"
     );
     assert_eq!(reader.series_count(), 0);
@@ -2112,6 +3690,38 @@ fn simfcs_requires_whole_frames_and_crops_real_pixels() {
     reader.set_id(&path).unwrap();
     assert_eq!(reader.series_count(), 1);
     reader.set_series(0).unwrap();
+    assert!(matches!(
+        reader.metadata().series_metadata.get("simfcs.extension"),
+        Some(MetadataValue::String(value)) if value == "b64"
+    ));
+    assert!(matches!(
+        reader.metadata().series_metadata.get("simfcs.frame_bytes"),
+        Some(MetadataValue::Int(65536))
+    ));
+    let ome = reader.ome_metadata().expect("SimFCS OME metadata");
+    let original = ome
+        .annotations
+        .iter()
+        .find_map(|annotation| match annotation {
+            OmeAnnotation::MapAnnotation {
+                id,
+                namespace,
+                values,
+            } if id.as_deref() == Some("Annotation:OriginalMetadata:0")
+                && namespace.as_deref()
+                    == Some("openmicroscopy.org/bioformats/original-metadata") =>
+            {
+                Some(values)
+            }
+            _ => None,
+        })
+        .expect("SimFCS original metadata annotation");
+    assert!(original
+        .iter()
+        .any(|(key, value)| key == "simfcs.extension" && value == "b64"));
+    assert!(original
+        .iter()
+        .any(|(key, value)| key == "simfcs.payload_bytes" && value == "65536"));
     assert!(matches!(
         reader.set_series(1),
         Err(BioFormatsError::SeriesOutOfRange(1))
@@ -2147,6 +3757,57 @@ fn dcimg_rejects_out_of_bounds_regions() {
     assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![4, 2]);
     assert!(reader.open_bytes_region(0, 1, 0, 2, 1).is_err());
     assert!(reader.open_bytes_region(0, 0, 0, 0, 1).is_err());
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn dcimg_ome_metadata_preserves_original_header_metadata() {
+    let path = tmp("original_metadata.dcimg");
+    let mut data = vec![0u8; 64];
+    data[0..5].copy_from_slice(b"DCIMG");
+    data[16..20].copy_from_slice(&64u32.to_le_bytes());
+    data[20..24].copy_from_slice(&1u32.to_le_bytes());
+    data[32..36].copy_from_slice(&2u32.to_le_bytes());
+    data[36..40].copy_from_slice(&2u32.to_le_bytes());
+    data[40..44].copy_from_slice(&8u32.to_le_bytes());
+    data[48..52].copy_from_slice(&2u32.to_le_bytes());
+    data.extend_from_slice(&[1, 2, 3, 4]);
+    std::fs::write(&path, &data).unwrap();
+
+    let mut reader = bioformats::formats::hamamatsu::DcimgReader::new();
+    reader.set_id(&path).unwrap();
+    let ome = reader.ome_metadata().expect("DCIMG OME metadata");
+    let values = ome
+        .annotations
+        .iter()
+        .find_map(|annotation| match annotation {
+            OmeAnnotation::MapAnnotation {
+                id,
+                namespace,
+                values,
+            } if id.as_deref() == Some("Annotation:OriginalMetadata:0")
+                && namespace.as_deref()
+                    == Some("openmicroscopy.org/bioformats/original-metadata") =>
+            {
+                Some(values)
+            }
+            _ => None,
+        })
+        .expect("DCIMG original metadata annotation");
+
+    assert!(values
+        .iter()
+        .any(|(key, value)| key == "format" && value == "Hamamatsu DCIMG"));
+    assert!(values
+        .iter()
+        .any(|(key, value)| key == "version" && value == "0"));
+    assert!(values
+        .iter()
+        .any(|(key, value)| key == "header_size" && value == "64"));
+    assert!(values
+        .iter()
+        .any(|(key, value)| key == "bit_depth" && value == "8"));
 
     let _ = std::fs::remove_file(path);
 }
@@ -2850,6 +4511,38 @@ fn spm_remaining_placeholders_read_strict_raw_subsets() {
 }
 
 #[test]
+fn quesant_reads_java_variable_table_native_pixels() {
+    let path = tmp("native_quesant.afm");
+    let pixel_offset = 1024usize;
+    let mut data = vec![0u8; pixel_offset];
+    data[0..4].copy_from_slice(b"IMAG");
+    data[4..8].copy_from_slice(&(pixel_offset as u32).to_le_bytes());
+    data[8..12].copy_from_slice(b"SDES");
+    data[12..16].copy_from_slice(&900u32.to_le_bytes());
+    data[900..915].copy_from_slice(b"native quesant\0");
+    data.extend_from_slice(&3u16.to_le_bytes());
+    data.extend_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0]);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::QuesantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!((meta.size_x, meta.size_y), (3, 3));
+    assert_eq!(meta.pixel_type, PixelType::Uint16);
+    assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
+    assert!(matches!(
+        meta.series_metadata.get("Quesant description"),
+        Some(MetadataValue::String(s)) if s == "native quesant"
+    ));
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
+        vec![2, 0, 3, 0, 5, 0, 6, 0]
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn spm_strict_raw_rejects_malformed_or_nonmatching_inputs() {
     let magic = *b"BFQUESANTAFMRAW!";
     let cases: Vec<(&str, Vec<u8>, &str)> = vec![
@@ -3332,6 +5025,111 @@ fn sem_remaining_readers_open_strict_raw_subsets() {
 }
 
 #[test]
+fn jeol_reads_java_mg_native_uint8_pixels() {
+    let path = tmp("native_mg.dat");
+    let pixel_offset = 0x644usize + 540;
+    let mut data = vec![0u8; pixel_offset];
+    data[0..2].copy_from_slice(b"MG");
+    data[0x63c..0x640].copy_from_slice(&3u32.to_le_bytes());
+    data[0x640..0x644].copy_from_slice(&2u32.to_le_bytes());
+    data.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::sem::JeolReader::new();
+    assert!(reader.is_this_type_by_bytes(b"MG"));
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!((meta.size_x, meta.size_y), (3, 2));
+    assert_eq!(meta.pixel_type, PixelType::Uint8);
+    assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
+        vec![2, 3, 5, 6]
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn jeol_par_resolves_companion_image_like_java() {
+    let par = tmp("native_pair.PAR");
+    let img = tmp("native_pair.IMG");
+    let pixel_offset = 4usize + 56;
+    let mut data = vec![0u8; pixel_offset];
+    data[0..2].copy_from_slice(b"IM");
+    data[2..4].copy_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&[1, 2, 3, 4]);
+    data.resize(pixel_offset + 1024, 0);
+    std::fs::write(&img, data).unwrap();
+    std::fs::write(&par, b"parameters").unwrap();
+
+    let mut reader = bioformats::formats::sem::JeolReader::new();
+    reader.set_id(&par).unwrap();
+    assert_eq!(
+        (reader.metadata().size_x, reader.metadata().size_y),
+        (1024, 1)
+    );
+    assert_eq!(&reader.open_bytes(0).unwrap()[..4], &[1, 2, 3, 4]);
+
+    let _ = std::fs::remove_file(par);
+    let _ = std::fs::remove_file(img);
+}
+
+#[test]
+fn zeiss_lms_reads_java_markers_lut_and_thumbnail_series() {
+    let path = tmp("native.lms");
+    let width = 1280usize;
+    let height = 1024usize;
+    let thumb_bytes = width * height * 3;
+    let main_bytes = width * height * 2;
+
+    let mut data = vec![0u8; 64];
+    data[0..6].copy_from_slice(b"LMSFLE");
+    data[18..22].copy_from_slice(&40u32.to_le_bytes());
+    data[32..36].copy_from_slice(b"BM6!");
+    let thumb_offset = 32 + 4 + 50;
+    data.resize(thumb_offset, 0);
+    data.extend_from_slice(&[10, 20, 30, 40, 50, 60]);
+    data.resize(thumb_offset + thumb_bytes, 0);
+    data.extend_from_slice(b"BM6!");
+    data.extend_from_slice(&[0u8; 50]);
+    for i in 0..256u16 {
+        data.push(i as u8);
+        data.push(255u8.wrapping_sub(i as u8));
+        data.push((i / 2) as u8);
+        data.push(0);
+    }
+    data.extend_from_slice(&[1, 0, 2, 0, 3, 0]);
+    data.resize(data.len() + main_bytes - 6, 0);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::sem::ZeissLmsReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.series_count(), 2);
+    let main = reader.metadata();
+    assert_eq!((main.size_x, main.size_y, main.size_z), (1280, 1024, 1));
+    assert_eq!(main.pixel_type, PixelType::Uint16);
+    assert!(main.is_indexed);
+    assert_eq!(main.lookup_table.as_ref().unwrap().red[2], 2);
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 2, 1).unwrap(),
+        vec![2, 0, 3, 0]
+    );
+
+    reader.set_series(1).unwrap();
+    let thumb = reader.metadata();
+    assert_eq!((thumb.size_x, thumb.size_y, thumb.size_c), (1280, 1024, 3));
+    assert!(thumb.is_rgb);
+    assert_eq!(
+        reader.open_bytes_region(0, 0, 0, 2, 1).unwrap(),
+        vec![10, 20, 30, 40, 50, 60]
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sem_strict_raw_rejects_invalid_headers() {
     let bad_payload = strict_sem_raw(
         3,
@@ -3519,8 +5317,16 @@ fn misc4_raw_payload_readers_crop_real_pixels() {
 
     // PDS (Perkin Elmer densitometer): a .hdr + companion .IMG. 3x2 UINT16
     // grayscale, record width 4 (one pad sample per row).
-    let pds_path =
-        write_pds_fixture("pds_crop.hdr", '+', '+', 1, 3, 2, 4, &[10, 20, 30, 40, 50, 60]);
+    let pds_path = write_pds_fixture(
+        "pds_crop.hdr",
+        '+',
+        '+',
+        1,
+        3,
+        2,
+        4,
+        &[10, 20, 30, 40, 50, 60],
+    );
     let mut pds = bioformats::formats::misc4::PdsReader::new();
     pds.set_id(&pds_path).unwrap();
     assert_eq!(pds.series_count(), 1);
@@ -3545,40 +5351,10 @@ fn misc4_raw_payload_readers_crop_real_pixels() {
         his.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
         vec![2, 0, 3, 0, 5, 0, 6, 0]
     );
-
-    let csv_path = tmp("crop.csv");
-    std::fs::write(&csv_path, b"1 2 3\n4 5 6\n").unwrap();
-    let mut csv = bioformats::formats::misc4::TextImageReader::new();
-    csv.set_id(&csv_path).unwrap();
-    assert_eq!(csv.series_count(), 1);
-    csv.set_series(0).unwrap();
-    let mut expected = Vec::new();
-    for value in [2.0f32, 3.0, 5.0, 6.0] {
-        expected.extend_from_slice(&value.to_le_bytes());
-    }
-    assert_eq!(csv.open_bytes_region(0, 1, 0, 2, 2).unwrap(), expected);
 }
 
 #[test]
-fn text_table_readers_reject_ragged_or_nonnumeric_rows() {
-    let csv_path = tmp("ragged.csv");
-    std::fs::write(&csv_path, b"1 2 3\n4 5\n").unwrap();
-    let mut csv = bioformats::formats::misc4::TextImageReader::new();
-    let err = csv.set_id(&csv_path).unwrap_err();
-    assert!(
-        err.to_string().contains("inconsistent column counts"),
-        "unexpected CSV error: {err}"
-    );
-
-    let txt_path = tmp("ragged.txt");
-    std::fs::write(&txt_path, b"1,2\n3,4,5\n").unwrap();
-    let mut txt = bioformats::formats::misc::TextReader::new();
-    let err = txt.set_id(&txt_path).unwrap_err();
-    assert!(
-        err.to_string().contains("inconsistent column counts"),
-        "unexpected text error: {err}"
-    );
-
+fn tecan_reader_rejects_nonnumeric_rows() {
     let asc_path = tmp("bad_tecan.asc");
     std::fs::write(&asc_path, b"1\t2\n3\tbad\n").unwrap();
     let mut asc = bioformats::formats::hcs2::TecanReader::new();
@@ -3905,17 +5681,6 @@ fn misc4_readers_clear_state_after_failed_reopen() {
     assert_eq!(his.series_count(), 0);
     assert_eq!(his.metadata().size_x, 0);
 
-    let csv_valid = tmp("valid_then_bad.csv");
-    std::fs::write(&csv_valid, b"1 2\n").unwrap();
-    let csv_invalid = tmp("bad_reopen.csv");
-    std::fs::write(&csv_invalid, b"1 nope\n").unwrap();
-    let mut csv = bioformats::formats::misc4::TextImageReader::new();
-    csv.set_id(&csv_valid).unwrap();
-    assert_eq!(csv.series_count(), 1);
-    let _ = csv.set_id(&csv_invalid).unwrap_err();
-    assert_eq!(csv.series_count(), 0);
-    assert_eq!(csv.metadata().size_x, 0);
-
     for path in [
         arf_valid,
         arf_invalid,
@@ -3923,8 +5688,6 @@ fn misc4_readers_clear_state_after_failed_reopen() {
         pds_invalid,
         his_valid,
         his_invalid,
-        csv_valid,
-        csv_invalid,
     ] {
         let _ = std::fs::remove_file(path);
     }
@@ -3936,7 +5699,6 @@ fn misc4_readers_report_not_initialized_for_preinit_set_series() {
         Box::new(bioformats::formats::misc4::ArfReader::new()),
         Box::new(bioformats::formats::misc4::PdsReader::new()),
         Box::new(bioformats::formats::misc4::HisReader::new()),
-        Box::new(bioformats::formats::misc4::TextImageReader::new()),
         Box::new(bioformats::formats::misc4::FilePatternReaderStub::new()),
         // NOTE: I2i/Jdce/Pci/Obf/Apl/Hrdgdf/Klb removed — they are now real
         // readers (see tests/stub_misc4*_test.rs), no longer placeholders.
@@ -4069,7 +5831,7 @@ fn povray_df3_regions_crop_real_voxel_data() {
 }
 
 #[test]
-fn extended_hamamatsu_vms_validates_index_then_reports_native_payload_unsupported() {
+fn extended_hamamatsu_vms_validates_index_then_requires_tile_grid() {
     let path = tmp("native.vms");
     std::fs::write(
         &path,
@@ -4080,7 +5842,7 @@ fn extended_hamamatsu_vms_validates_index_then_reports_native_payload_unsupporte
     let mut reader = bioformats::formats::extended::HamamatsuVmsReader::new();
     let err = reader.set_id(&path).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Hamamatsu VMS/VMU native JPEG tile payload decoding is unsupported")),
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Hamamatsu VMS missing nojpegcolumns")),
         "{err:?}"
     );
     assert_eq!(reader.series_count(), 0);
@@ -5429,7 +7191,10 @@ fn dicom_metadata_uses_dictionary_names_and_decodes_value_representations() {
     let image = &ome.images[0];
     // Java DicomReader derives the image name from (0008,0008) ImageType, falling
     // back to the file name when ImageType is absent (it does NOT use PatientName).
-    assert_eq!(image.name.as_deref(), Some("bioformats_fmt_metadata_dictionary.dcm"));
+    assert_eq!(
+        image.name.as_deref(),
+        Some("bioformats_fmt_metadata_dictionary.dcm")
+    );
     // PixelSpacing/SliceThickness are stored as raw millimetre OME Length values
     // to match Java (FormatTools.getPhysicalSizeX(value, UNITS.MILLIMETER)), not
     // rescaled to micrometres. PixelSpacing is "row\col" so X=col=0.25, Y=row=0.5.
@@ -5532,6 +7297,22 @@ fn bdv_preserves_companion_xml_original_metadata() {
         metadata.get("bdv_level"),
         Some(MetadataValue::Int(0))
     ));
+    let ome = reader.ome_metadata().expect("OME metadata");
+    let original = ome
+        .annotations
+        .iter()
+        .find_map(|annotation| match annotation {
+            OmeAnnotation::MapAnnotation {
+                id: Some(id),
+                values,
+                ..
+            } if id == "Annotation:OriginalMetadata:0" => Some(values),
+            _ => None,
+        })
+        .expect("BDV original metadata annotation");
+    assert!(original
+        .iter()
+        .any(|(key, value)| key == "bdv_timepoint" && value == "2"));
     let err = reader.open_bytes_region(0, 2, 0, 2, 1).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::Format(ref message) if message.contains("outside image bounds")),
@@ -5618,7 +7399,8 @@ fn bdv_requires_real_dimensions_and_initialized_series() {
     // No companion XML and no sNN groups in the HDF5 → no setups to enumerate.
     let err = uninit.set_id(&path).unwrap_err();
     assert!(
-        err.to_string().contains("no ViewSetups / setup groups found"),
+        err.to_string()
+            .contains("no ViewSetups / setup groups found"),
         "unexpected BDV error: {err}"
     );
     assert_eq!(uninit.series_count(), 0);
@@ -5632,7 +7414,8 @@ fn bdv_requires_real_dimensions_and_initialized_series() {
     .unwrap();
     let err = uninit.set_id(&path).unwrap_err();
     assert!(
-        err.to_string().contains("no ViewSetups / setup groups found"),
+        err.to_string()
+            .contains("no ViewSetups / setup groups found"),
         "unexpected BDV error: {err}"
     );
 
@@ -5675,6 +7458,211 @@ fn imaris_derives_dimensions_from_dataset_shape_not_attributes() {
     let m = reader.metadata();
     assert_eq!((m.size_x, m.size_y, m.size_z, m.size_c), (4, 3, 1, 1));
     assert_eq!(reader.open_bytes(0).unwrap().len(), 12);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn imaris_reads_java_style_underscore_layout() {
+    let path = tmp("underscore_layout_ims.ims");
+    let _ = std::fs::remove_file(&path);
+
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut info = file.create_group("DataSetInfo").unwrap();
+        let mut image = info.create_group("Image").unwrap();
+        image.add_fixed_ascii_attr("X", "99", 8).unwrap();
+        image.add_fixed_ascii_attr("Y", "99", 8).unwrap();
+        image.add_fixed_ascii_attr("Z", "99", 8).unwrap();
+        let mut channel_info = info.create_group("Channel_0").unwrap();
+        channel_info
+            .add_fixed_ascii_attr("Name", "underscore channel", 32)
+            .unwrap();
+    }
+    {
+        let mut dataset = file.create_group("DataSet").unwrap();
+        let mut res = dataset.create_group("ResolutionLevel_0").unwrap();
+        let mut time = res.create_group("TimePoint_0").unwrap();
+        let mut channel = time.create_group("Channel_0").unwrap();
+        channel
+            .new_dataset_builder("Data")
+            .shape(&[1, 2, 3])
+            .write::<u8>(&[10u8, 11, 12, 13, 14, 15])
+            .unwrap();
+    }
+    file.flush().unwrap();
+
+    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(
+        (meta.size_x, meta.size_y, meta.size_z, meta.size_c),
+        (3, 2, 1, 1)
+    );
+    assert!(matches!(
+        meta.series_metadata.get("imaris.channel.0.Name"),
+        Some(MetadataValue::String(v)) if v == "underscore channel"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 11, 12, 13, 14, 15]);
+
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(
+        ome.images[0].channels[0].name.as_deref(),
+        Some("underscore channel")
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn imaris_preserves_recording_spacing_and_dataset_metadata() {
+    let path = tmp("rich_metadata_ims.ims");
+    let _ = std::fs::remove_file(&path);
+
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut info = file.create_group("DataSetInfo").unwrap();
+        let mut image = info.create_group("Image").unwrap();
+        image.add_fixed_ascii_attr("X", "1", 8).unwrap();
+        image.add_fixed_ascii_attr("Y", "1", 8).unwrap();
+        image.add_fixed_ascii_attr("Z", "1", 8).unwrap();
+        image
+            .add_fixed_ascii_attr("RecordingEntrySampleSpacing", "0.25", 16)
+            .unwrap();
+        image
+            .add_fixed_ascii_attr("RecordingEntryLineSpacing", "0.5", 16)
+            .unwrap();
+        image
+            .add_fixed_ascii_attr("RecordingEntryPlaneSpacing", "1", 16)
+            .unwrap();
+        image.add_fixed_ascii_attr("ExtMin0", "0", 16).unwrap();
+        image.add_fixed_ascii_attr("ExtMin1", "0", 16).unwrap();
+        image.add_fixed_ascii_attr("ExtMin2", "0", 16).unwrap();
+        image.add_fixed_ascii_attr("ExtMax0", "10", 16).unwrap();
+        image.add_fixed_ascii_attr("ExtMax1", "20", 16).unwrap();
+        image.add_fixed_ascii_attr("ExtMax2", "6", 16).unwrap();
+        image
+            .add_fixed_ascii_attr("Description", "synthetic Imaris notes", 32)
+            .unwrap();
+
+        let mut imaris = info.create_group("Imaris").unwrap();
+        imaris
+            .add_fixed_ascii_attr("Version", "9.9.0-test", 32)
+            .unwrap();
+        let mut time = info.create_group("TimeInfo").unwrap();
+        time.add_attr("FileTimePoints", 1i64).unwrap();
+        let mut channel_info = info.create_group("Channel 0").unwrap();
+        channel_info
+            .add_fixed_ascii_attr("Name", "DAPI", 16)
+            .unwrap();
+        channel_info
+            .add_fixed_ascii_attr("Color", "0.1 0.2 0.3", 32)
+            .unwrap();
+        channel_info
+            .add_fixed_ascii_attr("LSMEmissionWavelength", "520", 16)
+            .unwrap();
+        channel_info
+            .add_fixed_ascii_attr("LSMExcitationWavelength", "405", 16)
+            .unwrap();
+        channel_info.add_attr("Gain", 7i64).unwrap();
+    }
+    {
+        let mut dataset = file.create_group("DataSet").unwrap();
+        let mut res = dataset.create_group("ResolutionLevel 0").unwrap();
+        let mut time = res.create_group("TimePoint 0").unwrap();
+        let mut channel = time.create_group("Channel 0").unwrap();
+        channel
+            .new_dataset_builder("Data")
+            .shape(&[2, 2, 2])
+            .write::<u8>(&[1u8, 2, 3, 4, 5, 6, 7, 8])
+            .unwrap();
+    }
+    file.flush().unwrap();
+
+    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_z, 2);
+    assert!(matches!(
+        meta.series_metadata.get("imaris.recording_spacing_x"),
+        Some(MetadataValue::Float(v)) if *v == 0.25
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.recording_spacing_y"),
+        Some(MetadataValue::Float(v)) if *v == 0.5
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.channel.0.Gain"),
+        Some(MetadataValue::Int(7))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.channel.0.color.red"),
+        Some(MetadataValue::Int(26))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.channel.0.color.green"),
+        Some(MetadataValue::Int(51))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.channel.0.color.blue"),
+        Some(MetadataValue::Int(77))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.channel.0.color.alpha"),
+        Some(MetadataValue::Int(255))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.info.Version"),
+        Some(MetadataValue::String(v)) if v == "9.9.0-test"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.channel.0.emission_wavelength"),
+        Some(MetadataValue::Float(v)) if *v == 520.0
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.channel.0.excitation_wavelength"),
+        Some(MetadataValue::Float(v)) if *v == 405.0
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.dataset.0.shape"),
+        Some(MetadataValue::String(v)) if v == "2 2 2"
+    ));
+    assert!(meta
+        .series_metadata
+        .contains_key("imaris.dataset.0.layout_class"));
+
+    let ome = reader.ome_metadata().unwrap();
+    let image = &ome.images[0];
+    assert_eq!(image.physical_size_x, Some(0.25));
+    assert_eq!(image.physical_size_y, Some(0.5));
+    assert_eq!(image.physical_size_z, Some(3.0));
+    assert_eq!(image.description.as_deref(), Some("synthetic Imaris notes"));
+    assert_eq!(image.channels[0].name.as_deref(), Some("DAPI"));
+    assert_eq!(
+        image.channels[0].color,
+        Some(u32::from_be_bytes([26, 51, 77, 255]) as i32)
+    );
+    assert_eq!(image.channels[0].emission_wavelength, Some(520.0));
+    assert_eq!(image.channels[0].excitation_wavelength, Some(405.0));
+    let original = ome
+        .annotations
+        .iter()
+        .find_map(|annotation| match annotation {
+            bioformats::OmeAnnotation::MapAnnotation {
+                id: Some(id),
+                values,
+                ..
+            } if id == "Annotation:OriginalMetadata:0" => Some(values),
+            _ => None,
+        })
+        .expect("Imaris original metadata annotation");
+    assert!(original
+        .iter()
+        .any(|(key, value)| key == "imaris.info.Version" && value == "9.9.0-test"));
+    assert!(original.iter().any(|(key, value)| {
+        key == "imaris.channel.0.color.rgba"
+            && value == &(u32::from_be_bytes([26, 51, 77, 255]) as i32).to_string()
+    }));
     let _ = std::fs::remove_file(&path);
 }
 
@@ -5761,8 +7749,12 @@ fn cellh5_preserves_hdf5_attributes_and_dataset_metadata() {
     // `image/channel` dataset is itself the 5D [channel, time, zslice, y, x]
     // image stack. Here c=1,t=2,z=1,y=2,x=3, keeping x=3, y=2, t=2.
     let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
-    file.add_fixed_ascii_attr("experiment_name", "synthetic assay", "synthetic assay".len())
-        .unwrap();
+    file.add_fixed_ascii_attr(
+        "experiment_name",
+        "synthetic assay",
+        "synthetic assay".len(),
+    )
+    .unwrap();
     {
         let mut sample = file.create_group("sample").unwrap();
         let mut zero = sample.create_group("0").unwrap();
@@ -6212,6 +8204,143 @@ fn nd2_chunk_map_finds_non_contiguous_image_chunks() {
 }
 
 #[test]
+fn nd2_orders_image_data_chunks_by_sequence_index() {
+    let path = tmp("sequence_order.nd2");
+    let mut bytes = Vec::new();
+    let attr_xml = b"<uiWidth>1</uiWidth><uiHeight>1</uiHeight><uiComp>1</uiComp><uiBpc>8</uiBpc>";
+    push_nd2_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
+    push_nd2_chunk(&mut bytes, "ImageDataSeq|1!", &[22, 0]);
+    push_nd2_chunk(&mut bytes, "ImageDataSeq|0!", &[11, 0]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().image_count, 2);
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_image_data_chunks"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_sequence_indices"),
+        Some(MetadataValue::String(value)) if value == "0,1"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_lengths"),
+        Some(MetadataValue::String(value)) if value == "2,2"
+    ));
+    assert!(matches!(
+        md.get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "raw"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![22]);
+}
+
+#[test]
+fn nd2_records_bounded_image_data_and_metadata_sequence_diagnostics() {
+    let path = tmp("sequence_diagnostics.nd2");
+    let mut bytes = Vec::new();
+    let attr_xml = b"<uiWidth>2</uiWidth><uiHeight>1</uiHeight><uiComp>1</uiComp><uiBpc>8</uiBpc>";
+    push_nd2_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
+
+    let mut frame1 = 0.50f64.to_le_bytes().to_vec();
+    frame1.extend_from_slice(&[22, 23]);
+    push_nd2_chunk(&mut bytes, "ImageDataSeq|1!", &frame1);
+    push_nd2_chunk(
+        &mut bytes,
+        "ImageMetadataSeqLV|1!",
+        br#"<sDescription value="later"/><dTimeMSec value="500"/><dZPos value="2.5"/>"#,
+    );
+
+    let mut frame0 = 0.25f64.to_le_bytes().to_vec();
+    frame0.extend_from_slice(&[11, 12]);
+    push_nd2_chunk(&mut bytes, "ImageDataSeq|0!", &frame0);
+    push_nd2_chunk(
+        &mut bytes,
+        "ImageMetadataSeq|0!",
+        br#"<sDescription value="first"/><dTimeMSec value="0"/><dZPos value="1.5"/>"#,
+    );
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![11, 12]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![22, 23]);
+
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_image_data_encodings"),
+        Some(MetadataValue::String(value)) if value == "raw_with_8_byte_prefix,raw_with_8_byte_prefix"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_payload_offsets"),
+        Some(MetadataValue::String(value)) if value == "8,8"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_timestamps"),
+        Some(MetadataValue::String(value)) if value == "0.25,0.5"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_metadata_seq_chunks"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        md.get("nd2_image_metadata_seq_indices"),
+        Some(MetadataValue::String(value)) if value == "0,1"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_metadata_seq_matches_images"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        md.get("nd2_image_metadata_seq_timestamps"),
+        Some(MetadataValue::String(value)) if value == "0,0.5"
+    ));
+
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(ome.images[0].planes.len(), 2);
+    assert_eq!(ome.images[0].planes[0].delta_t, Some(0.25));
+    assert_eq!(ome.images[0].planes[1].delta_t, Some(0.5));
+    assert_eq!(ome.images[0].planes[0].position_z, Some(1.5));
+    assert_eq!(ome.images[0].planes[1].position_z, Some(2.5));
+}
+
+#[test]
+fn nd2_uses_modern_loop_counts_for_z_and_t_dimensions() {
+    let path = tmp("loop_counts.nd2");
+    let mut bytes = Vec::new();
+    let attr_xml = br#"<?xml version="1.0"?>
+<variant>
+  <uiWidth value="1"/>
+  <uiHeight value="1"/>
+  <uiComp value="1"/>
+  <uiBpc value="8"/>
+  <uiSequenceCount value="6"/>
+  <uiCount runtype="CLxZStackLoop" value="2"/>
+  <uiCount runtype="CLxTimeLoop" value="3"/>
+</variant>"#;
+    push_nd2_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
+    for i in 0..6u8 {
+        push_nd2_chunk(&mut bytes, &format!("ImageDataSeq|{}!", i), &[10 + i, 0]);
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_z, 2);
+    assert_eq!(reader.metadata().size_t, 3);
+    assert_eq!(reader.metadata().image_count, 6);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("nd2_loop_size_z"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        reader.metadata().series_metadata.get("nd2_loop_size_t"),
+        Some(MetadataValue::Int(3))
+    ));
+    assert_eq!(reader.open_bytes(5).unwrap(), vec![15]);
+}
+
+#[test]
 fn nd2_decodes_raw_frame_with_eight_byte_prefix() {
     let path = tmp("raw_frame_prefix.nd2");
     let mut frame = b"ND2FRAME".to_vec();
@@ -6259,9 +8388,16 @@ fn nd2_rejects_unrecognized_oversized_frame_prefix() {
     write_synthetic_nd2(&path, &[1, 2, 3, 19, 29]);
 
     let mut reader = ImageReader::open(&path).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "unknown_oversized"
+    ));
     let err = reader.open_bytes(0).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(msg) if msg.contains("unsupported structured frame encoding"))
+        matches!(err, BioFormatsError::UnsupportedFormat(msg) if msg.contains("ImageDataSeq|0!") && msg.contains("length 5") && msg.contains("unsupported structured frame encoding"))
     );
 }
 
@@ -6378,6 +8514,49 @@ fn nd2_uses_sensor_user_rectangle_from_metadata_chunk() {
     assert_eq!(reader.metadata().size_x, 164);
     assert_eq!(reader.metadata().size_y, 156);
     assert_eq!(reader.open_bytes(0).unwrap().len(), 164 * 156 * 2);
+}
+
+#[test]
+fn nd2_extracts_xml_calibration_and_channel_metadata() {
+    let path = tmp("xml_calibration_channels.nd2");
+    let mut bytes = Vec::new();
+    let attr_xml = br#"<?xml version="1.0"?>
+<variant>
+  <uiWidth value="1"/>
+  <uiHeight value="1"/>
+  <uiComp value="2"/>
+  <uiBpc value="8"/>
+</variant>"#;
+    let calibration_xml = br#"<?xml version="1.0"?>
+<variant>
+  <dCalibration value="0.25"/>
+  <dZStep value="1.5"/>
+</variant>"#;
+    let metadata_xml = br#"<?xml version="1.0"?>
+<variant>
+  <sDescription value="DAPI"/>
+  <sDescription value="FITC"/>
+  <EmWavelength value="460"/>
+  <EmWavelength value="525"/>
+</variant>"#;
+    push_nd2_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
+    push_nd2_chunk(&mut bytes, "ImageCalibrationLV!", calibration_xml);
+    push_nd2_chunk(&mut bytes, "ImageMetadataSeqLV!", metadata_xml);
+    push_nd2_chunk(&mut bytes, "ImageDataSeq|0!", &[3, 7]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 7]);
+
+    let ome = reader.ome_metadata().unwrap();
+    let image = &ome.images[0];
+    assert_eq!(image.physical_size_x, Some(0.25));
+    assert_eq!(image.physical_size_y, Some(0.25));
+    assert_eq!(image.physical_size_z, Some(1.5));
+    assert_eq!(image.channels[0].name.as_deref(), Some("DAPI"));
+    assert_eq!(image.channels[1].name.as_deref(), Some("FITC"));
+    assert_eq!(image.channels[0].emission_wavelength, Some(460.0));
+    assert_eq!(image.channels[1].emission_wavelength, Some(525.0));
 }
 
 fn push_jp2_box(bytes: &mut Vec<u8>, box_type: &[u8; 4], payload: &[u8]) {
@@ -7291,70 +9470,215 @@ fn spider_rejects_invalid_dimensions_iform_and_short_payload() {
     assert_eq!(reader.series_count(), 0);
 }
 
+fn quicktime_atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&((payload.len() as u32) + 8).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(payload);
+    out
+}
 
-#[test]
-fn quicktime_reads_blind_uncompressed_rgb_samples() {
-    fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&((payload.len() as u32) + 8).to_be_bytes());
-        out.extend_from_slice(kind);
-        out.extend_from_slice(payload);
-        out
+fn quicktime_full_atom(kind: &[u8; 4], version: u8, payload: &[u8]) -> Vec<u8> {
+    let mut full_payload = Vec::new();
+    full_payload.push(version);
+    full_payload.extend_from_slice(&[0, 0, 0]);
+    full_payload.extend_from_slice(payload);
+    quicktime_atom(kind, &full_payload)
+}
+
+fn quicktime_mdhd_atom(timescale: u32, duration: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&timescale.to_be_bytes());
+    payload.extend_from_slice(&duration.to_be_bytes());
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    quicktime_full_atom(b"mdhd", 0, &payload)
+}
+
+fn quicktime_stts_atom(entries: &[(u32, u32)]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for &(sample_count, sample_delta) in entries {
+        payload.extend_from_slice(&sample_count.to_be_bytes());
+        payload.extend_from_slice(&sample_delta.to_be_bytes());
     }
+    quicktime_full_atom(b"stts", 0, &payload)
+}
 
-    let path = tmp("blind_raw.mov");
-    let sample0 = [1u8, 2, 3, 4, 5, 6];
-    let sample1 = [7u8, 8, 9, 10, 11, 12];
+fn quicktime_elst_atom(entries: &[(u32, i32, i32)]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for &(segment_duration, media_time, media_rate_fixed) in entries {
+        payload.extend_from_slice(&segment_duration.to_be_bytes());
+        payload.extend_from_slice(&media_time.to_be_bytes());
+        payload.extend_from_slice(&media_rate_fixed.to_be_bytes());
+    }
+    quicktime_full_atom(b"elst", 0, &payload)
+}
 
-    let mut ftyp = Vec::new();
-    ftyp.extend_from_slice(b"qt  ");
-    ftyp.extend_from_slice(&0u32.to_be_bytes());
-    ftyp.extend_from_slice(b"qt  ");
-    let ftyp = atom(b"ftyp", &ftyp);
+struct QuickTimeTimingAtoms {
+    mdhd: Option<Vec<u8>>,
+    stts: Option<Vec<u8>>,
+    elst: Option<Vec<u8>>,
+}
 
-    let mut mdat_payload = Vec::new();
-    mdat_payload.extend_from_slice(&sample0);
-    mdat_payload.extend_from_slice(&sample1);
-    let first_sample_offset = (ftyp.len() + 8) as u32;
-    let second_sample_offset = first_sample_offset + sample0.len() as u32;
-    let mdat = atom(b"mdat", &mdat_payload);
+fn quicktime_video_track_atom(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    samples: &[&[u8]],
+    offsets: &[u32],
+    use_stsc: bool,
+) -> Vec<u8> {
+    quicktime_video_track_atom_with_depth(codec, width, height, samples, offsets, use_stsc, 0)
+}
 
+fn quicktime_video_track_atom_with_depth(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    samples: &[&[u8]],
+    offsets: &[u32],
+    use_stsc: bool,
+    depth: u16,
+) -> Vec<u8> {
+    quicktime_video_track_atom_with_timing(
+        codec, width, height, samples, offsets, use_stsc, depth, None,
+    )
+}
+
+fn quicktime_video_track_atom_with_timing(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    samples: &[&[u8]],
+    offsets: &[u32],
+    use_stsc: bool,
+    depth: u16,
+    timing: Option<&QuickTimeTimingAtoms>,
+) -> Vec<u8> {
     let mut sample_entry = vec![0u8; 86];
     sample_entry[..4].copy_from_slice(&86u32.to_be_bytes());
-    sample_entry[4..8].copy_from_slice(b"raw ");
+    sample_entry[4..8].copy_from_slice(codec);
     sample_entry[14..16].copy_from_slice(&1u16.to_be_bytes());
-    sample_entry[32..34].copy_from_slice(&2u16.to_be_bytes());
-    sample_entry[34..36].copy_from_slice(&1u16.to_be_bytes());
+    sample_entry[32..34].copy_from_slice(&width.to_be_bytes());
+    sample_entry[34..36].copy_from_slice(&height.to_be_bytes());
+    sample_entry[82..84].copy_from_slice(&depth.to_be_bytes());
     let mut stsd_payload = Vec::new();
     stsd_payload.extend_from_slice(&0u32.to_be_bytes());
     stsd_payload.extend_from_slice(&1u32.to_be_bytes());
     stsd_payload.extend_from_slice(&sample_entry);
-    let stsd = atom(b"stsd", &stsd_payload);
+    let stsd = quicktime_atom(b"stsd", &stsd_payload);
 
     let mut stsz_payload = Vec::new();
     stsz_payload.extend_from_slice(&0u32.to_be_bytes());
     stsz_payload.extend_from_slice(&0u32.to_be_bytes());
-    stsz_payload.extend_from_slice(&2u32.to_be_bytes());
-    stsz_payload.extend_from_slice(&(sample0.len() as u32).to_be_bytes());
-    stsz_payload.extend_from_slice(&(sample1.len() as u32).to_be_bytes());
-    let stsz = atom(b"stsz", &stsz_payload);
+    stsz_payload.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+    for sample in samples {
+        stsz_payload.extend_from_slice(&(sample.len() as u32).to_be_bytes());
+    }
+    let stsz = quicktime_atom(b"stsz", &stsz_payload);
 
     let mut stco_payload = Vec::new();
     stco_payload.extend_from_slice(&0u32.to_be_bytes());
-    stco_payload.extend_from_slice(&2u32.to_be_bytes());
-    stco_payload.extend_from_slice(&first_sample_offset.to_be_bytes());
-    stco_payload.extend_from_slice(&second_sample_offset.to_be_bytes());
-    let stco = atom(b"stco", &stco_payload);
+    stco_payload.extend_from_slice(&(offsets.len() as u32).to_be_bytes());
+    for offset in offsets {
+        stco_payload.extend_from_slice(&offset.to_be_bytes());
+    }
+    let stco = quicktime_atom(b"stco", &stco_payload);
 
     let mut stbl_payload = Vec::new();
     stbl_payload.extend_from_slice(&stsd);
     stbl_payload.extend_from_slice(&stsz);
     stbl_payload.extend_from_slice(&stco);
-    let moov = atom(
+    if use_stsc {
+        let mut stsc_payload = Vec::new();
+        stsc_payload.extend_from_slice(&0u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        stbl_payload.extend_from_slice(&quicktime_atom(b"stsc", &stsc_payload));
+    }
+    if let Some(timing) = timing {
+        if let Some(stts) = &timing.stts {
+            stbl_payload.extend_from_slice(stts);
+        }
+    }
+
+    let mut mdia_payload = Vec::new();
+    if let Some(timing) = timing {
+        if let Some(mdhd) = &timing.mdhd {
+            mdia_payload.extend_from_slice(mdhd);
+        }
+    }
+    mdia_payload.extend_from_slice(&quicktime_atom(
+        b"minf",
+        &quicktime_atom(b"stbl", &stbl_payload),
+    ));
+
+    let mut trak_payload = Vec::new();
+    if let Some(timing) = timing {
+        if let Some(elst) = &timing.elst {
+            trak_payload.extend_from_slice(&quicktime_atom(b"edts", elst));
+        }
+    }
+    trak_payload.extend_from_slice(&quicktime_atom(b"mdia", &mdia_payload));
+    quicktime_atom(b"trak", &trak_payload)
+}
+
+fn quicktime_test_movie(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    samples: &[&[u8]],
+    use_stsc: bool,
+) -> Vec<u8> {
+    quicktime_test_movie_with_depth(codec, width, height, samples, use_stsc, 0)
+}
+
+fn quicktime_test_movie_with_depth(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    samples: &[&[u8]],
+    use_stsc: bool,
+    depth: u16,
+) -> Vec<u8> {
+    quicktime_test_movie_with_timing(codec, width, height, samples, use_stsc, depth, None)
+}
+
+fn quicktime_test_movie_with_timing(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    samples: &[&[u8]],
+    use_stsc: bool,
+    depth: u16,
+    timing: Option<&QuickTimeTimingAtoms>,
+) -> Vec<u8> {
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(b"qt  ");
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(b"qt  ");
+    let ftyp = quicktime_atom(b"ftyp", &ftyp);
+
+    let mut mdat_payload = Vec::new();
+    let mut offsets = Vec::new();
+    let mut next_offset = (ftyp.len() + 8) as u32;
+    for sample in samples {
+        offsets.push(next_offset);
+        mdat_payload.extend_from_slice(sample);
+        next_offset += sample.len() as u32;
+    }
+    let mdat = quicktime_atom(b"mdat", &mdat_payload);
+
+    let moov = quicktime_atom(
         b"moov",
-        &atom(
-            b"trak",
-            &atom(b"mdia", &atom(b"minf", &atom(b"stbl", &stbl_payload))),
+        &quicktime_video_track_atom_with_timing(
+            codec, width, height, samples, &offsets, use_stsc, depth, timing,
         ),
     );
 
@@ -7362,6 +9686,64 @@ fn quicktime_reads_blind_uncompressed_rgb_samples() {
     mov.extend_from_slice(&ftyp);
     mov.extend_from_slice(&mdat);
     mov.extend_from_slice(&moov);
+    mov
+}
+
+fn quicktime_test_movie_with_two_video_tracks(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    sample0: &[u8],
+    sample1: &[u8],
+) -> Vec<u8> {
+    quicktime_test_movie_with_two_custom_video_tracks(
+        codec, width, height, sample0, codec, width, height, sample1,
+    )
+}
+
+fn quicktime_test_movie_with_two_custom_video_tracks(
+    codec0: &[u8; 4],
+    width0: u16,
+    height0: u16,
+    sample0: &[u8],
+    codec1: &[u8; 4],
+    width1: u16,
+    height1: u16,
+    sample1: &[u8],
+) -> Vec<u8> {
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(b"qt  ");
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(b"qt  ");
+    let ftyp = quicktime_atom(b"ftyp", &ftyp);
+
+    let offset0 = (ftyp.len() + 8) as u32;
+    let offset1 = offset0 + sample0.len() as u32;
+    let mut mdat_payload = Vec::new();
+    mdat_payload.extend_from_slice(sample0);
+    mdat_payload.extend_from_slice(sample1);
+    let mdat = quicktime_atom(b"mdat", &mdat_payload);
+
+    let track0 = quicktime_video_track_atom(codec0, width0, height0, &[sample0], &[offset0], false);
+    let track1 = quicktime_video_track_atom(codec1, width1, height1, &[sample1], &[offset1], false);
+    let mut moov_payload = Vec::new();
+    moov_payload.extend_from_slice(&track0);
+    moov_payload.extend_from_slice(&track1);
+    let moov = quicktime_atom(b"moov", &moov_payload);
+
+    let mut mov = Vec::new();
+    mov.extend_from_slice(&ftyp);
+    mov.extend_from_slice(&mdat);
+    mov.extend_from_slice(&moov);
+    mov
+}
+
+#[test]
+fn quicktime_reads_blind_uncompressed_rgb_samples() {
+    let path = tmp("blind_raw.mov");
+    let sample0 = [1u8, 2, 3, 4, 5, 6];
+    let sample1 = [7u8, 8, 9, 10, 11, 12];
+    let mov = quicktime_test_movie(b"raw ", 2, 1, &[&sample0, &sample1], false);
     std::fs::write(&path, mov).unwrap();
 
     let mut reader = ImageReader::open(&path).unwrap();
@@ -7369,11 +9751,651 @@ fn quicktime_reads_blind_uncompressed_rgb_samples() {
     assert_eq!(reader.metadata().size_y, 1);
     assert!(reader.metadata().is_rgb);
     assert_eq!(reader.metadata().image_count, 2);
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("quicktime.sample_count"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.sample_sizes"),
+        Some(MetadataValue::String(value)) if value == "6,6"
+    ));
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.chunk_offsets"),
+        Some(MetadataValue::String(value)) if value == "28,34"
+    ));
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.sample_offsets"),
+        Some(MetadataValue::String(value)) if value == "28,34"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("quicktime.chunk_offset_table_type"),
+        Some(MetadataValue::String(value)) if value == "stco"
+    ));
     assert_eq!(reader.open_bytes(0).unwrap(), sample0);
     assert_eq!(reader.open_bytes(1).unwrap(), sample1);
     assert_eq!(
         reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(),
         vec![10, 11, 12]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_records_media_timescale_and_sample_durations() {
+    let path = tmp("timed_raw.mov");
+    let sample0 = [1u8, 2, 3];
+    let sample1 = [4u8, 5, 6];
+    let sample2 = [7u8, 8, 9];
+    let timing = QuickTimeTimingAtoms {
+        mdhd: Some(quicktime_mdhd_atom(600, 160)),
+        stts: Some(quicktime_stts_atom(&[(2, 40), (1, 80)])),
+        elst: None,
+    };
+    let mov = quicktime_test_movie_with_timing(
+        b"raw ",
+        1,
+        1,
+        &[&sample0, &sample1, &sample2],
+        false,
+        0,
+        Some(&timing),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_t, 3);
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.timescale"),
+        Some(MetadataValue::Int(600))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.duration_ticks"),
+        Some(MetadataValue::Int(160))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.duration_seconds"),
+        Some(MetadataValue::Float(value)) if (*value - (160.0 / 600.0)).abs() < 1.0e-12
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.stts.entries"),
+        Some(MetadataValue::String(value)) if value == "2x40,1x80"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.stts.duration_ticks"),
+        Some(MetadataValue::Int(160))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_media_time_ticks"),
+        Some(MetadataValue::String(value)) if value == "0,40,80"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_presentation_time_ticks"),
+        Some(MetadataValue::String(value)) if value == "0,40,80"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_presentation_time_seconds"),
+        Some(MetadataValue::String(value)) if value == "0,0.06666666666666667,0.13333333333333333"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.average_frame_duration_seconds"),
+        Some(MetadataValue::Float(value)) if (*value - (160.0 / 600.0 / 3.0)).abs() < 1.0e-12
+    ));
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(ome.images[0].planes.len(), 3);
+    assert_eq!(ome.images[0].planes[0].the_t, 0);
+    assert_eq!(ome.images[0].planes[1].the_t, 1);
+    assert_eq!(ome.images[0].planes[2].the_t, 2);
+    assert_eq!(ome.images[0].planes[0].delta_t, Some(0.0));
+    assert!((ome.images[0].planes[1].delta_t.unwrap() - (40.0 / 600.0)).abs() < 1.0e-12);
+    assert!((ome.images[0].planes[2].delta_t.unwrap() - (80.0 / 600.0)).abs() < 1.0e-12);
+    let annotation = ome
+        .annotations
+        .iter()
+        .find_map(|annotation| match annotation {
+            OmeAnnotation::MapAnnotation {
+                id,
+                namespace,
+                values,
+            } if id.as_deref() == Some("Annotation:OriginalMetadata:0")
+                && namespace.as_deref()
+                    == Some("openmicroscopy.org/bioformats/original-metadata") =>
+            {
+                Some(values)
+            }
+            _ => None,
+        })
+        .expect("QuickTime original metadata annotation");
+    assert!(annotation
+        .iter()
+        .any(|(key, value)| key == "quicktime.codec" && value == "raw "));
+    assert!(annotation
+        .iter()
+        .any(|(key, value)| key == "quicktime.sample_media_time_ticks" && value == "0,40,80"));
+    assert_eq!(reader.open_bytes(2).unwrap(), sample2);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_records_edit_list_metadata() {
+    let path = tmp("edit_list.mov");
+    let sample0 = [1u8, 2, 3];
+    let sample1 = [4u8, 5, 6];
+    let timing = QuickTimeTimingAtoms {
+        mdhd: Some(quicktime_mdhd_atom(1000, 2000)),
+        stts: Some(quicktime_stts_atom(&[(2, 1000)])),
+        elst: Some(quicktime_elst_atom(&[
+            (500, -1, 1 << 16),
+            (1500, 1000, 1 << 16),
+        ])),
+    };
+    let mov = quicktime_test_movie_with_timing(
+        b"raw ",
+        1,
+        1,
+        &[&sample0, &sample1],
+        false,
+        0,
+        Some(&timing),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.edit_list.count"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.edit_list.entries"),
+        Some(MetadataValue::String(value))
+            if value == "duration=500,media_time=-1,rate=1;duration=1500,media_time=1000,rate=1"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_status"),
+        Some(MetadataValue::String(value)) if value == "applied_leading_empty_edits_single_normal_speed_media_segment"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_media_time_ticks"),
+        Some(MetadataValue::String(value)) if value == "0,1000"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_presentation_time_ticks"),
+        Some(MetadataValue::String(value)) if value == "-1000,0"
+    ));
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(ome.images[0].planes.len(), 2);
+    assert_eq!(ome.images[0].planes[0].delta_t, Some(-1.0));
+    assert_eq!(ome.images[0].planes[1].delta_t, Some(0.0));
+    let mut reader = reader;
+    assert_eq!(reader.open_bytes(0).unwrap(), sample0);
+    assert_eq!(reader.open_bytes(1).unwrap(), sample1);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_rejects_stts_sample_count_mismatch() {
+    let path = tmp("bad_stts_count.mov");
+    let sample = [1u8, 2, 3];
+    let timing = QuickTimeTimingAtoms {
+        mdhd: Some(quicktime_mdhd_atom(1000, 1000)),
+        stts: Some(quicktime_stts_atom(&[(2, 1000)])),
+        elst: None,
+    };
+    let mov = quicktime_test_movie_with_timing(b"raw ", 1, 1, &[&sample], false, 0, Some(&timing));
+    std::fs::write(&path, mov).unwrap();
+
+    let err = match ImageReader::open(&path) {
+        Ok(_) => panic!("QuickTime with mismatched stts sample count unexpectedly opened"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("stts sample count 2 does not match stsz sample count 1")),
+        "unexpected QuickTime stts mismatch error: {err}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_decodes_mjpeg_samples_with_stsc_chunk_table() {
+    let path = tmp("mjpeg_stsc.mov");
+    let rgb0 = [255u8, 0, 0, 0, 255, 0];
+    let rgb1 = [0u8, 0, 255, 255, 255, 0];
+    let mut jpeg0 = Vec::new();
+    let mut jpeg1 = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg0, 100)
+        .encode(&rgb0, 2, 1, image::ColorType::Rgb8.into())
+        .unwrap();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg1, 100)
+        .encode(&rgb1, 2, 1, image::ColorType::Rgb8.into())
+        .unwrap();
+    let mut dec0 = jpeg_decoder::Decoder::new(jpeg0.as_slice());
+    let expected0 = dec0.decode().unwrap();
+    let mut dec1 = jpeg_decoder::Decoder::new(jpeg1.as_slice());
+    let expected1 = dec1.decode().unwrap();
+    let mov = quicktime_test_movie(b"mjpg", 2, 1, &[&jpeg0, &jpeg1], true);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 1);
+    assert!(reader.metadata().is_rgb);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.codec"),
+        Some(MetadataValue::String(codec)) if codec == "mjpg"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("quicktime.stsc.entry_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.stsc.entries"),
+        Some(MetadataValue::String(value))
+            if value == "first_chunk=1,samples_per_chunk=1,sample_description_index=1"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), expected0);
+    assert_eq!(reader.open_bytes(1).unwrap(), expected1);
+    assert_eq!(
+        reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(),
+        expected1[3..6].to_vec()
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_decodes_png_samples() {
+    use image::ImageEncoder;
+
+    let path = tmp("png_codec.mov");
+    let rgb = [10u8, 20, 30, 40, 50, 60];
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&rgb, 2, 1, image::ColorType::Rgb8.into())
+        .unwrap();
+    let mov = quicktime_test_movie(b"png ", 2, 1, &[&png], false);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 1);
+    assert!(reader.metadata().is_rgb);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.codec"),
+        Some(MetadataValue::String(codec)) if codec == "png "
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), rgb);
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+        vec![40, 50, 60]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_decodes_rpza_samples() {
+    let path = tmp("rpza_codec.mov");
+    let rpza = [
+        0xe1, 0x00, 0x00, 0x07, // chunk marker and length
+        0xa0, 0x7c, 0x00, // one RGB555 red 4x4 block
+    ];
+    let mov = quicktime_test_movie(b"rpza", 4, 4, &[&rpza], false);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 4);
+    assert_eq!(reader.metadata().size_y, 4);
+    assert!(reader.metadata().is_rgb);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.codec"),
+        Some(MetadataValue::String(codec)) if codec == "rpza"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![255, 0, 0].repeat(16));
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 1, 2, 2).unwrap(),
+        vec![255, 0, 0].repeat(4)
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+fn quicktime_animation_rle_sample(width: usize, rows: &[&[[u8; 3]]]) -> Vec<u8> {
+    let mut sample = Vec::new();
+    sample.extend_from_slice(&0u32.to_be_bytes());
+    sample.extend_from_slice(&0u16.to_be_bytes());
+    for row in rows {
+        assert_eq!(row.len(), width);
+        sample.push(1);
+        sample.push(row.len() as u8);
+        for pixel in *row {
+            sample.extend_from_slice(pixel);
+        }
+        sample.push(0xff);
+    }
+    let size = sample.len() as u32;
+    sample[0..4].copy_from_slice(&size.to_be_bytes());
+    sample
+}
+
+fn quicktime_animation_rle16_sample(width: usize, rows: &[&[u16]]) -> Vec<u8> {
+    let mut sample = Vec::new();
+    sample.extend_from_slice(&0u32.to_be_bytes());
+    sample.extend_from_slice(&0u16.to_be_bytes());
+    for row in rows {
+        assert_eq!(row.len(), width);
+        sample.push(1);
+        sample.push(row.len() as u8);
+        for pixel in *row {
+            sample.extend_from_slice(&pixel.to_be_bytes());
+        }
+        sample.push(0xff);
+    }
+    let size = sample.len() as u32;
+    sample[0..4].copy_from_slice(&size.to_be_bytes());
+    sample
+}
+
+fn quicktime_animation_rle32_sample(width: usize, rows: &[&[[u8; 4]]]) -> Vec<u8> {
+    let mut sample = Vec::new();
+    sample.extend_from_slice(&0u32.to_be_bytes());
+    sample.extend_from_slice(&0u16.to_be_bytes());
+    for row in rows {
+        assert_eq!(row.len(), width);
+        sample.push(1);
+        sample.push(row.len() as u8);
+        for pixel in *row {
+            sample.extend_from_slice(pixel);
+        }
+        sample.push(0xff);
+    }
+    let size = sample.len() as u32;
+    sample[0..4].copy_from_slice(&size.to_be_bytes());
+    sample
+}
+
+fn quicktime_animation_rle24_delta_sample(
+    start_line: u16,
+    line_count: u16,
+    line_data: &[u8],
+) -> Vec<u8> {
+    let mut sample = Vec::new();
+    sample.extend_from_slice(&0u32.to_be_bytes());
+    sample.extend_from_slice(&0x0008u16.to_be_bytes());
+    sample.extend_from_slice(&start_line.to_be_bytes());
+    sample.extend_from_slice(&0u16.to_be_bytes());
+    sample.extend_from_slice(&line_count.to_be_bytes());
+    sample.extend_from_slice(&0u16.to_be_bytes());
+    sample.extend_from_slice(line_data);
+    let size = sample.len() as u32;
+    sample[0..4].copy_from_slice(&size.to_be_bytes());
+    sample
+}
+
+#[test]
+fn quicktime_decodes_animation_rle_samples() {
+    let path = tmp("animation_rle.mov");
+    let row0 = [[1u8, 2, 3], [4, 5, 6], [7, 8, 9]];
+    let row1 = [[10u8, 11, 12], [13, 14, 15], [16, 17, 18]];
+    let rle = quicktime_animation_rle_sample(3, &[&row0, &row1]);
+    let mov = quicktime_test_movie(b"rle ", 3, 2, &[&rle], false);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 3);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert!(reader.metadata().is_rgb);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.codec"),
+        Some(MetadataValue::String(codec)) if codec == "rle "
+    ));
+    assert_eq!(
+        reader.open_bytes(0).unwrap(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    );
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 1, 2, 1).unwrap(),
+        vec![13, 14, 15, 16, 17, 18]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_decodes_animation_rle_delta_frames() {
+    let path = tmp("animation_rle_delta_decode.mov");
+    let row0 = [[1u8, 2, 3], [4, 5, 6], [7, 8, 9]];
+    let row1 = [[10u8, 11, 12], [13, 14, 15], [16, 17, 18]];
+    let keyframe = quicktime_animation_rle_sample(3, &[&row0, &row1]);
+
+    let mut line = Vec::new();
+    line.push(1);
+    line.push(1);
+    line.extend_from_slice(&[20, 21, 22]);
+    line.push(0);
+    line.push(2);
+    line.push(1);
+    line.extend_from_slice(&[30, 31, 32]);
+    line.push(0xff);
+    let delta = quicktime_animation_rle24_delta_sample(1, 1, &line);
+    let mov = quicktime_test_movie(b"rle ", 3, 2, &[&keyframe, &delta], false);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(
+        reader.open_bytes(1).unwrap(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 21, 22, 13, 14, 15, 30, 31, 32]
+    );
+    assert_eq!(
+        reader.open_bytes_region(1, 1, 1, 1, 1).unwrap(),
+        vec![13, 14, 15]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_decodes_animation_rle_argb32_samples() {
+    let path = tmp("animation_rle_argb32.mov");
+    let row0 = [[0u8, 1, 2, 3], [128, 4, 5, 6]];
+    let row1 = [[255u8, 7, 8, 9], [64, 10, 11, 12]];
+    let rle = quicktime_animation_rle32_sample(2, &[&row0, &row1]);
+    let mov = quicktime_test_movie_with_depth(b"rle ", 2, 2, &[&rle], false, 32);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert!(reader.metadata().is_rgb);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.rle.depth"),
+        Some(MetadataValue::Int(32))
+    ));
+    assert_eq!(
+        reader.open_bytes(0).unwrap(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    );
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+        vec![4, 5, 6, 10, 11, 12]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_decodes_animation_rle_rgb555_samples() {
+    let path = tmp("animation_rle_rgb555.mov");
+    let row0 = [0x7c00u16, 0x03e0u16];
+    let row1 = [0x001fu16, 0x7fffu16];
+    let rle = quicktime_animation_rle16_sample(2, &[&row0, &row1]);
+    let mov = quicktime_test_movie_with_depth(b"rle ", 2, 2, &[&rle], false, 16);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert!(reader.metadata().is_rgb);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("quicktime.rle.depth"),
+        Some(MetadataValue::Int(16))
+    ));
+    assert_eq!(
+        reader.open_bytes(0).unwrap(),
+        vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]
+    );
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 1, 1, 1).unwrap(),
+        vec![255, 255, 255]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_animation_rle_rejects_partial_delta_frames() {
+    let path = tmp("animation_rle_delta.mov");
+    let mut sample = Vec::new();
+    sample.extend_from_slice(&14u32.to_be_bytes());
+    sample.extend_from_slice(&0x0008u16.to_be_bytes());
+    sample.extend_from_slice(&1u16.to_be_bytes());
+    sample.extend_from_slice(&0u16.to_be_bytes());
+    sample.extend_from_slice(&1u16.to_be_bytes());
+    sample.extend_from_slice(&0u16.to_be_bytes());
+    let mov = quicktime_test_movie(b"rle ", 2, 2, &[&sample], false);
+    std::fs::write(&path, mov).unwrap();
+
+    let err = match ImageReader::open(&path) {
+        Ok(_) => panic!("partial QuickTime Animation RLE frame unexpectedly opened"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("partial/delta frame")),
+        "unexpected QuickTime Animation RLE error: {err}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_animation_rle_rejects_unsupported_depth() {
+    let path = tmp("animation_rle_depth8.mov");
+    let sample = quicktime_animation_rle_sample(1, &[&[[1u8, 2, 3]]]);
+    let mov = quicktime_test_movie_with_depth(b"rle ", 1, 1, &[&sample], false, 8);
+    std::fs::write(&path, mov).unwrap();
+
+    let err = match ImageReader::open(&path) {
+        Ok(_) => panic!("unsupported QuickTime Animation RLE depth unexpectedly opened"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Animation RLE depth 8 is unsupported")),
+        "unexpected QuickTime Animation RLE depth error: {err}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_maps_compatible_video_tracks_to_series() {
+    let path = tmp("multiple_video_tracks.mov");
+    let sample0 = [1u8, 2, 3, 4, 5, 6];
+    let sample1 = [7u8, 8, 9, 10, 11, 12];
+    let mov = quicktime_test_movie_with_two_video_tracks(b"raw ", 2, 1, &sample0, &sample1);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.series_count(), 2);
+    assert_eq!(reader.series(), 0);
+    assert_eq!(reader.metadata().image_count, 1);
+    assert!(
+        matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("quicktime.video_track_count"),
+            Some(MetadataValue::Int(2))
+        ),
+        "missing QuickTime video track count"
+    );
+    assert!(
+        matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("quicktime.video_track_index"),
+            Some(MetadataValue::Int(0))
+        ),
+        "missing QuickTime video track index for series 0"
+    );
+    assert_eq!(reader.open_bytes(0).unwrap(), sample0);
+
+    reader.set_series(1).unwrap();
+    assert_eq!(reader.series(), 1);
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 1);
+    assert_eq!(reader.metadata().image_count, 1);
+    assert!(
+        matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("quicktime.video_track_index"),
+            Some(MetadataValue::Int(1))
+        ),
+        "missing QuickTime video track index for series 1"
+    );
+    assert_eq!(reader.open_bytes(0).unwrap(), sample1);
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+        vec![10, 11, 12]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_rejects_incompatible_multiple_video_tracks() {
+    let path = tmp("incompatible_video_tracks.mov");
+    let sample0 = [1u8, 2, 3, 4, 5, 6];
+    let sample1 = [7u8, 8, 9];
+    let mov = quicktime_test_movie_with_two_custom_video_tracks(
+        b"raw ", 2, 1, &sample0, b"raw ", 1, 1, &sample1,
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let err = match ImageReader::open(&path) {
+        Ok(_) => panic!("incompatible multi-video-track QuickTime unexpectedly opened"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("multiple incompatible video tracks")),
+        "unexpected QuickTime multi-track incompatibility error: {err}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_reports_unsupported_codec_fourcc() {
+    let path = tmp("unsupported_codec.mov");
+    let sample = [0u8; 6];
+    let mov = quicktime_test_movie(b"avc1", 2, 1, &[&sample], false);
+    std::fs::write(&path, mov).unwrap();
+
+    let err = match ImageReader::open(&path) {
+        Ok(_) => panic!("unsupported QuickTime codec unexpectedly opened"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("QuickTime codec avc1 is unsupported")),
+        "unexpected QuickTime unsupported codec error: {err}"
     );
     let _ = std::fs::remove_file(path);
 }

@@ -1148,8 +1148,8 @@ pub fn parse_modulo(
             .next()
         {
             let sa_start = sa_pos + start_tag_at(full_xml, sa_pos).len();
-            let sa_end = find_end_tag(full_xml, "StructuredAnnotations", sa_start)
-                .unwrap_or(full_xml.len());
+            let sa_end =
+                find_end_tag(full_xml, "StructuredAnnotations", sa_start).unwrap_or(full_xml.len());
             let sa_xml = &full_xml[sa_pos..sa_end.max(sa_pos)];
 
             for ann_pos in all_tag_positions(sa_xml, "XMLAnnotation") {

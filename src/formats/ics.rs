@@ -92,25 +92,23 @@ impl IcsHeader {
                     hdr.image_name = Some(base);
                     hdr.filename = Some(PathBuf::from(joined));
                 }
-                "parameter" if tokens.len() >= 2 => {
-                    match tokens[1].to_ascii_lowercase().as_str() {
-                        "scale" => {
-                            hdr.scales = tokens[2..]
-                                .iter()
-                                .map(|s| s.parse::<f64>().unwrap_or(f64::NAN))
-                                .collect();
-                        }
-                        "labels" => {
-                            hdr.scale_axes =
-                                tokens[2..].iter().map(|s| s.to_ascii_lowercase()).collect();
-                        }
-                        "units" => {
-                            hdr.scale_units =
-                                tokens[2..].iter().map(|s| s.to_ascii_lowercase()).collect();
-                        }
-                        _ => {}
+                "parameter" if tokens.len() >= 2 => match tokens[1].to_ascii_lowercase().as_str() {
+                    "scale" => {
+                        hdr.scales = tokens[2..]
+                            .iter()
+                            .map(|s| s.parse::<f64>().unwrap_or(f64::NAN))
+                            .collect();
                     }
-                }
+                    "labels" => {
+                        hdr.scale_axes =
+                            tokens[2..].iter().map(|s| s.to_ascii_lowercase()).collect();
+                    }
+                    "units" => {
+                        hdr.scale_units =
+                            tokens[2..].iter().map(|s| s.to_ascii_lowercase()).collect();
+                    }
+                    _ => {}
+                },
                 "sensor" if tokens.len() >= 4 && tokens[1].eq_ignore_ascii_case("s_params") => {
                     match tokens[2] {
                         "LambdaEm" => {
@@ -128,9 +126,7 @@ impl IcsHeader {
                         _ => {}
                     }
                 }
-                "history"
-                    if tokens.len() >= 3 && tokens[1].eq_ignore_ascii_case("software") =>
-                {
+                "history" if tokens.len() >= 3 && tokens[1].eq_ignore_ascii_case("software") => {
                     if tokens[2..].join(" ").contains("SVI") {
                         hdr.invert_y = true;
                     }
@@ -409,10 +405,7 @@ impl IcsReader {
             // from the `filename` recorded inside the header — that internal
             // name may differ from the on-disk name). Match the .ics extension
             // case so .ICS -> .IDS, .ics -> .ids.
-            let derived = match ics_path
-                .extension()
-                .and_then(|e| e.to_str())
-            {
+            let derived = match ics_path.extension().and_then(|e| e.to_str()) {
                 Some(ext) if ext.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
                     ics_path.with_extension("IDS")
                 }
@@ -426,15 +419,12 @@ impl IcsReader {
             // the on-disk stem). Reject names that escape the image directory.
             if let Some(filename) = &hdr.filename {
                 let name = filename.to_string_lossy();
-                return confined_join(
-                    ics_path.parent().unwrap_or_else(|| Path::new("")),
-                    &name,
-                )
-                .ok_or_else(|| {
-                    BioFormatsError::Format(format!(
-                        "ICS companion filename escapes image directory: {name}"
-                    ))
-                });
+                return confined_join(ics_path.parent().unwrap_or_else(|| Path::new("")), &name)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format(format!(
+                            "ICS companion filename escapes image directory: {name}"
+                        ))
+                    });
             }
             Ok(derived)
         } else {

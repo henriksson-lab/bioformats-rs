@@ -417,8 +417,7 @@ impl FormatReader for LsmReader {
         for i in 0..ifd_count {
             if let Some(ifd) = self.inner.ifd_mut(i) {
                 if ifd.compression() != Compression::Lzw {
-                    ifd.entries
-                        .insert(tag::PREDICTOR, IfdValue::Short(vec![1]));
+                    ifd.entries.insert(tag::PREDICTOR, IfdValue::Short(vec![1]));
                 }
             }
         }
@@ -725,7 +724,7 @@ mod tests {
         let names_offset: i32 = 24;
         let mut buf = vec![0u8; 4]; // 0..4 header padding (base = 4)
         buf.resize(4 + names_offset as usize, 0); // fill up to the names table
-                                                   // +12 colorsOffset, +16 namesOffset relative to base=4
+                                                  // +12 colorsOffset, +16 namesOffset relative to base=4
         buf[4 + 12..4 + 16].copy_from_slice(&0i32.to_le_bytes());
         buf[4 + 16..4 + 20].copy_from_slice(&names_offset.to_le_bytes());
         // names table at base + names_offset = index 28

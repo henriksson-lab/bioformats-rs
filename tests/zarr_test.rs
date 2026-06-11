@@ -77,7 +77,11 @@ fn single_multiscales_bitwise_pixels_level0() {
     for y in 0..32u32 {
         for x in 0..32u32 {
             let got = le_u16(&buf, (y * 32 + x) as usize);
-            assert_eq!(got, pat(t, c, z, y, x, 0), "mismatch at z{z} c{c} y{y} x{x}");
+            assert_eq!(
+                got,
+                pat(t, c, z, y, x, 0),
+                "mismatch at z{z} c{c} y{y} x{x}"
+            );
         }
     }
 }
@@ -203,8 +207,10 @@ fn multi_image_bioformats2raw_layout() {
 #[test]
 fn real_idr0062a_multiscales() {
     let Some(dir) = sample_dir("idr0062A_6001240.ome.zarr") else {
-        eprintln!("skipping: testdata/zarr/idr0062A_6001240.ome.zarr absent \
-            (run scripts/download_zarr_sample.sh)");
+        eprintln!(
+            "skipping: testdata/zarr/idr0062A_6001240.ome.zarr absent \
+            (run scripts/download_zarr_sample.sh)"
+        );
         return;
     };
     let mut r = OmeZarrReader::new();

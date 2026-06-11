@@ -274,8 +274,16 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
             r.seek(block_start.saturating_add(block_len.max(0) as usize));
             offset = r.fp();
             return finish_psd(
-                &data, &mut r, offset, channels, height, width, depth, color_mode,
-                pixel_type, lookup_table,
+                &data,
+                &mut r,
+                offset,
+                channels,
+                height,
+                width,
+                depth,
+                color_mode,
+                pixel_type,
+                lookup_table,
             );
         }
         if layer_len == 0 && layer_count == 0 {
@@ -353,7 +361,15 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     }
 
     finish_psd(
-        &data, &mut r, offset, channels, height, width, depth, color_mode, pixel_type,
+        &data,
+        &mut r,
+        offset,
+        channels,
+        height,
+        width,
+        depth,
+        color_mode,
+        pixel_type,
         lookup_table,
     )
 }
@@ -569,7 +585,10 @@ impl FormatReader for PsdReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let full = self.pixels.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let full = self
+            .pixels
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
 
         validate_region("PSD", meta.size_x, meta.size_y, x, y, w, h)?;
 

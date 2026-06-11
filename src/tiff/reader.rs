@@ -620,8 +620,7 @@ impl TiffReader {
                 build_ome_plane_maps(&image, ifds.len(), &companions);
             // Fall back to sequential mapping only when neither a local IFD nor a
             // companion was resolved for any plane.
-            if plane_map.iter().all(Option::is_none)
-                && external_planes.iter().all(Option::is_none)
+            if plane_map.iter().all(Option::is_none) && external_planes.iter().all(Option::is_none)
             {
                 for (i, slot) in plane_map.iter_mut().enumerate() {
                     if i < ifds.len() {
@@ -661,13 +660,13 @@ impl TiffReader {
                     image.samples_per_pixel > 1 || info.photometric == Photometric::Rgb,
                     is_interleaved_rgb(info),
                     info.photometric == Photometric::Palette,
-                    info.color_map.as_ref().map(|(r, g, b)| {
-                        crate::common::metadata::LookupTable {
+                    info.color_map
+                        .as_ref()
+                        .map(|(r, g, b)| crate::common::metadata::LookupTable {
                             red: r.clone(),
                             green: g.clone(),
                             blue: b.clone(),
-                        }
-                    }),
+                        }),
                 ),
                 None => (
                     image.samples_per_pixel > 1 || image.effective_c < image.size_c,
@@ -1335,22 +1334,26 @@ impl TiffReader {
                     "[jpeg_restart] single-strip JPEG {}x{}: index={}",
                     info.width,
                     info.height,
-                    if indexed.is_some() { "Some(has restart markers)" } else { "None (no DRI/restart markers)" }
+                    if indexed.is_some() {
+                        "Some(has restart markers)"
+                    } else {
+                        "None (no DRI/restart markers)"
+                    }
                 );
             }
             if let Some(idx) = indexed {
                 let decoded = idx.decode_rows(&merged, y, h, jpeg_color_for(info));
                 if decoded.is_none() && std::env::var("BF_JR_DEBUG").is_ok() {
-                    eprintln!("[jpeg_restart] decode_rows=None (restart intervals not row-aligned)");
+                    eprintln!(
+                        "[jpeg_restart] decode_rows=None (restart intervals not row-aligned)"
+                    );
                 }
                 if let Some(result) = decoded {
                     let band = result?;
                     // Crop [y, y_end) rows from the band, exactly like the generic
                     // path crops within a strip (band_y0 plays strip_start_row).
                     let row_start = y.saturating_sub(band.band_y0) as usize;
-                    let row_end = y_end
-                        .saturating_sub(band.band_y0)
-                        .min(band.band_height) as usize;
+                    let row_end = y_end.saturating_sub(band.band_y0).min(band.band_height) as usize;
                     for row in row_start..row_end {
                         let rs = checked_mul_usize(row, row_bytes, "TIFF JPEG band row offset")?;
                         let re = rs.checked_add(row_bytes).ok_or_else(|| {
@@ -2669,9 +2672,8 @@ fn build_ome_plane_maps(
     // For each TiffData index, where do its pixels live? The closure returns
     // `None` for a local TiffData (pixels in the current file) and `Some(opt)`
     // for a companion TiffData (`opt` = resolved path, or `None` if missing).
-    let companion_for = |i: usize| -> Option<&Option<PathBuf>> {
-        companions.get(i).and_then(|c| c.as_ref())
-    };
+    let companion_for =
+        |i: usize| -> Option<&Option<PathBuf>> { companions.get(i).and_then(|c| c.as_ref()) };
 
     let mut explicit_starts = vec![false; plane_count];
     for (i, td) in image.tiff_data.iter().enumerate() {

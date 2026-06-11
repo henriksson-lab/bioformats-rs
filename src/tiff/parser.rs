@@ -404,12 +404,15 @@ impl<R: Read + Seek> TiffParser<R> {
                 (total_bytes.min(available).min(MAX_IFD_VALUE_BYTES) / type_size) * type_size;
             // Charge against the per-chain budget so a malformed IFD chain can't
             // accumulate gigabytes of clamped value arrays during open().
-            self.ifd_value_budget = self.ifd_value_budget.checked_sub(usable_bytes).ok_or_else(|| {
-                BioFormatsError::Format(
+            self.ifd_value_budget =
+                self.ifd_value_budget
+                    .checked_sub(usable_bytes)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format(
                     "TIFF IFD value arrays exceed the parse budget (malformed/garbage IFD chain)"
                         .into(),
                 )
-            })?;
+                    })?;
             let usable_count = usable_bytes / type_size;
             let usable_bytes = usize::try_from(usable_bytes).map_err(|_| {
                 BioFormatsError::Format("TIFF IFD value byte count does not fit in memory".into())

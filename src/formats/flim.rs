@@ -359,15 +359,14 @@ fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
     };
 
     // Setup text block: parse for SCAN_X/Y, ADC_RE, SCAN_RX, IMG_X/Y.
-    let setup =
-        read_sdt_setup_block(f, setup_offs, setup_length, file_len)?.unwrap_or(SdtSetup {
-            scan_x: 0,
-            scan_y: 0,
-            adc_re: 256,
-            scan_rx: 0,
-            img_x: 0,
-            img_y: 0,
-        });
+    let setup = read_sdt_setup_block(f, setup_offs, setup_length, file_len)?.unwrap_or(SdtSetup {
+        scan_x: 0,
+        scan_y: 0,
+        adc_re: 256,
+        scan_rx: 0,
+        img_x: 0,
+        img_y: 0,
+    });
     let mut width: u32 = setup.scan_x.max(1);
     let mut height: u32 = setup.scan_y.max(1);
     let mut time_bins: u32 = setup.adc_re.max(1);
@@ -898,9 +897,7 @@ impl FormatReader for SdtReader {
                     ..Default::default()
                 })
                 .collect();
-            let name = file_name
-                .as_ref()
-                .map(|f| format!("{f} #{}", i + 1));
+            let name = file_name.as_ref().map(|f| format!("{f} #{}", i + 1));
             ome.images.push(OmeImage {
                 name,
                 channels,

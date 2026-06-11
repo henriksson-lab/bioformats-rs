@@ -115,7 +115,10 @@ fn hrdgdf_synthetic_roundtrip() {
     assert_eq!(m.image_count, 2);
     assert_eq!(m.pixel_type, PixelType::Float64);
     assert_eq!(m.dimension_order, DimensionOrder::XYCTZ);
-    assert!(!m.is_little_endian, "HRDGDF is big-endian per the Java reader");
+    assert!(
+        !m.is_little_endian,
+        "HRDGDF is big-endian per the Java reader"
+    );
 
     // Channel 0 = east-west: pixels in row-major order are 1,3,5,7.
     let ch0 = r.open_bytes(0).expect("plane 0");

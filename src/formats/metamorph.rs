@@ -997,9 +997,9 @@ impl MetamorphReader {
         let mut out = Vec::with_capacity(samples * (w as usize) * (h as usize) * bps);
         for c in 0..samples {
             let start = c * sub_len;
-            let sub = full
-                .get(start..start + sub_len)
-                .ok_or_else(|| BioFormatsError::InvalidData("MetaMorph STK plane too short".into()))?;
+            let sub = full.get(start..start + sub_len).ok_or_else(|| {
+                BioFormatsError::InvalidData("MetaMorph STK plane too short".into())
+            })?;
             out.extend(crop_full_plane("MetaMorph STK", sub, meta, 1, x, y, w, h)?);
         }
         Ok(out)
@@ -1339,10 +1339,7 @@ impl MetamorphReader {
         // derived from the actual file counts, then recomputes imageCount.
         if series_count as i32 > grid.nstages && grid.stks.len() > 1 {
             // hasZ.size() > 1 && hasZ.get(1) && base sizeZ == 1 ? zc : 1
-            let midx_size_z = if grid.wave_do_z.len() > 1
-                && grid.wave_do_z[1]
-                && grid.size_z == 1
-            {
+            let midx_size_z = if grid.wave_do_z.len() > 1 && grid.wave_do_z[1] && grid.size_z == 1 {
                 grid.zc.max(1) as u32
             } else {
                 1u32

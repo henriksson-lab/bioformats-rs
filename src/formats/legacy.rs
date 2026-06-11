@@ -262,9 +262,9 @@ impl Default for PictReader {
     }
 }
 
-struct PictDecoded {
-    meta: ImageMetadata,
-    pixels: Vec<u8>,
+pub(crate) struct PictDecoded {
+    pub(crate) meta: ImageMetadata,
+    pub(crate) pixels: Vec<u8>,
 }
 
 struct PictCursor<'a> {
@@ -455,7 +455,11 @@ fn decode_pict_jpeg(
 
 fn parse_pict(path: &Path) -> Result<PictDecoded> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-    let mut c = PictCursor::new(&data);
+    parse_pict_bytes(&data)
+}
+
+pub(crate) fn parse_pict_bytes(data: &[u8]) -> Result<PictDecoded> {
+    let mut c = PictCursor::new(data);
     c.seek(518)?;
     let mut height = c.read_i16()?.max(0) as u32;
     let mut width = c.read_i16()?.max(0) as u32;

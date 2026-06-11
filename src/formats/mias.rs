@@ -334,7 +334,8 @@ fn build_well_files(
     do_channels: bool,
 ) -> Vec<PathBuf> {
     let base = format!("{}{}", plate, well_name(row, col));
-    let mut files: Vec<PathBuf> = Vec::with_capacity(field_count * channels * n_timepoints as usize);
+    let mut files: Vec<PathBuf> =
+        Vec::with_capacity(field_count * channels * n_timepoints as usize);
     for field in 0..field_count {
         for channel in 0..channels {
             for _t in 0..n_timepoints {

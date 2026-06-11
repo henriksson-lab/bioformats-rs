@@ -22,7 +22,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{ImageMetadata, MetadataValue};
+use crate::common::ome_metadata::OmeMetadata;
 use crate::common::reader::FormatReader;
 
 /// File stitcher that combines multiple files into one multi-dimensional reader.
@@ -74,8 +75,50 @@ impl FileStitcher {
 
         let mut first = crate::registry::ImageReader::open(&files[0])?;
         let base_meta = first.metadata().clone();
-        let pattern = FilePattern::from_file(&files[0]).ok();
+        let pattern = FilePattern::from_file_list(&files).ok();
         let (meta, plane_map) = stitch_layout(&files, &base_meta, pattern.as_ref())?;
+        let _ = first.close();
+
+        Ok(FileStitcher {
+            files,
+            meta: Some(meta),
+            plane_map,
+            current_reader: None,
+        })
+    }
+
+    /// Open with an explicit file list and the `.pattern` text that produced it.
+    pub fn from_files_with_pattern(files: Vec<PathBuf>, pattern_path: &Path) -> Result<Self> {
+        if files.is_empty() {
+            return Err(BioFormatsError::Format("Empty file list".into()));
+        }
+
+        let mut first = crate::registry::ImageReader::open(&files[0])?;
+        let base_meta = first.metadata().clone();
+        let pattern = FilePattern::from_explicit_pattern(pattern_path)?;
+        let (meta, plane_map) = stitch_layout(&files, &base_meta, Some(&pattern))?;
+        let _ = first.close();
+
+        Ok(FileStitcher {
+            files,
+            meta: Some(meta),
+            plane_map,
+            current_reader: None,
+        })
+    }
+
+    /// Open with an explicit file list and an already-parsed file pattern.
+    pub(crate) fn from_files_with_file_pattern(
+        files: Vec<PathBuf>,
+        pattern: FilePattern,
+    ) -> Result<Self> {
+        if files.is_empty() {
+            return Err(BioFormatsError::Format("Empty file list".into()));
+        }
+
+        let mut first = crate::registry::ImageReader::open(&files[0])?;
+        let base_meta = first.metadata().clone();
+        let (meta, plane_map) = stitch_layout(&files, &base_meta, Some(&pattern))?;
         let _ = first.close();
 
         Ok(FileStitcher {
@@ -235,6 +278,7 @@ fn stitch_layout(
             size_z: files.len() as u32,
             size_c: 1,
             size_t: 1,
+            axis_types: pattern.map(AxisGuesser::guess).unwrap_or_default(),
         });
 
     meta.size_z = checked_axis_mul(base_meta.size_z, file_axes.size_z, "Z")?;
@@ -264,6 +308,9 @@ fn stitch_layout(
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| BioFormatsError::Format("Incomplete stitched plane map".into()))?;
+    if let Some(pattern) = pattern {
+        annotate_file_pattern_metadata(&mut meta, pattern, &file_axes);
+    }
     Ok((meta, plane_map))
 }
 
@@ -272,6 +319,7 @@ struct FileAxisLayout {
     size_z: u32,
     size_c: u32,
     size_t: u32,
+    axis_types: Vec<AxisType>,
 }
 
 fn infer_file_axes(
@@ -304,15 +352,15 @@ fn infer_file_axes(
 
     let mut file_values = Vec::with_capacity(files.len());
     for file in files {
-        let name = file.file_name()?.to_str()?;
-        file_values.push(pattern.match_filename(name)?);
+        let name = pattern.match_text_for_path(file)?;
+        file_values.push(pattern.match_filename(&name)?);
     }
 
     let axis_len = |axis_type| {
         guessed
             .iter()
             .position(|axis| *axis == axis_type)
-            .map(|idx| pattern.blocks[idx].values.len() as u32)
+            .map(|idx| pattern.blocks[idx].value_labels().len() as u32)
             .unwrap_or(1)
     };
     let size_z = axis_len(AxisType::Z);
@@ -325,7 +373,7 @@ fn infer_file_axes(
         let mut c = 0;
         let mut t = 0;
         for (idx, value) in values.iter().enumerate() {
-            let ordinal = pattern.blocks[idx].values.iter().position(|v| v == value)? as u32;
+            let ordinal = pattern.blocks[idx].position_of(value)? as u32;
             match guessed[idx] {
                 AxisType::Z => z = ordinal,
                 AxisType::Channel => c = ordinal,
@@ -341,7 +389,79 @@ fn infer_file_axes(
         size_z,
         size_c,
         size_t,
+        axis_types: guessed,
     })
+}
+
+fn annotate_file_pattern_metadata(
+    meta: &mut ImageMetadata,
+    pattern: &FilePattern,
+    file_axes: &FileAxisLayout,
+) {
+    if let Some(source_pattern) = &pattern.source_pattern {
+        meta.series_metadata.insert(
+            "FilePattern pattern".to_string(),
+            MetadataValue::String(source_pattern.clone()),
+        );
+    }
+    if let Some(source_root) = &pattern.source_root {
+        meta.series_metadata.insert(
+            "FilePattern root".to_string(),
+            MetadataValue::String(source_root.display().to_string()),
+        );
+    }
+    meta.series_metadata.insert(
+        "FilePattern file count".to_string(),
+        MetadataValue::Int(file_axes.file_coords.len() as i64),
+    );
+
+    let axes = file_axes
+        .axis_types
+        .iter()
+        .map(|axis| axis.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    meta.series_metadata
+        .insert("FilePattern axes".to_string(), MetadataValue::String(axes));
+
+    for (idx, block) in pattern.blocks.iter().enumerate() {
+        let axis = file_axes
+            .axis_types
+            .get(idx)
+            .copied()
+            .unwrap_or(AxisType::Unknown)
+            .as_str();
+        meta.series_metadata.insert(
+            format!("FilePattern block {idx} axis"),
+            MetadataValue::String(axis.to_string()),
+        );
+        if let Some(token) = &block.token {
+            meta.series_metadata.insert(
+                format!("FilePattern block {idx} token"),
+                MetadataValue::String(token.clone()),
+            );
+        }
+        meta.series_metadata.insert(
+            format!("FilePattern block {idx} values"),
+            MetadataValue::String(block.value_labels().join(",")),
+        );
+    }
+
+    for (block_idx, block) in pattern.blocks.iter().enumerate() {
+        if file_axes.axis_types.get(block_idx) != Some(&AxisType::Channel) {
+            continue;
+        }
+        for (channel_idx, label) in block.value_labels().iter().enumerate() {
+            meta.series_metadata.insert(
+                format!("FilePattern channel {channel_idx} name"),
+                MetadataValue::String(label.clone()),
+            );
+            meta.series_metadata.insert(
+                format!("Channel {channel_idx} Name"),
+                MetadataValue::String(label.clone()),
+            );
+        }
+    }
 }
 
 /// Map a [`DimensionOrder`] to its 5-character string form (e.g. "XYZCT"),
@@ -475,6 +595,20 @@ impl FormatReader for FileStitcher {
         let reader = self.ensure_reader(file_idx)?;
         reader.open_thumb_bytes(local_plane)
     }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        let image = ome.images.get_mut(0)?;
+        for (idx, channel) in image.channels.iter_mut().enumerate() {
+            if let Some(MetadataValue::String(name)) =
+                meta.series_metadata.get(&format!("Channel {idx} Name"))
+            {
+                channel.name = Some(name.clone());
+            }
+        }
+        Some(ome)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -492,6 +626,14 @@ impl FormatReader for FileStitcher {
 pub struct FilePattern {
     /// Directory containing the files.
     pub dir: PathBuf,
+    /// Exact resolved pattern text when the pattern came from a bounded
+    /// `.pattern` expansion.
+    source_pattern: Option<String>,
+    /// Root directory used for resolving the source pattern.
+    source_root: Option<PathBuf>,
+    /// Whether matching/enumeration uses the full pattern path instead of only
+    /// a filename relative to `dir`.
+    full_path_pattern: bool,
     /// Prefix before the first numeric block.
     pub prefix: String,
     /// Suffix after the last numeric block (including extension).
@@ -505,6 +647,8 @@ pub struct FilePattern {
 pub struct FilePatternBlock {
     /// Text between this block and the previous one (or start of name).
     pub separator: String,
+    /// Exact block token from an explicit bounded pattern or glob wildcard.
+    pub token: Option<String>,
     /// Number of digits (for zero-padding).
     pub width: usize,
     /// Range of values found.
@@ -512,6 +656,9 @@ pub struct FilePatternBlock {
     pub max: u64,
     /// All values found (sorted).
     pub values: Vec<u64>,
+    /// Exact explicit labels from `.pattern` blocks, including non-numeric
+    /// channel names. Numeric-only auto-discovered patterns leave this unset.
+    pub labels: Option<Vec<String>>,
 }
 
 impl FilePattern {
@@ -542,6 +689,9 @@ impl FilePattern {
         if runs.is_empty() {
             return Ok(FilePattern {
                 dir,
+                source_pattern: None,
+                source_root: None,
+                full_path_pattern: false,
                 prefix: filename.to_string(),
                 suffix: String::new(),
                 blocks: Vec::new(),
@@ -558,10 +708,12 @@ impl FilePattern {
             let val: u64 = val_str.parse().unwrap_or(0);
             blocks.push(FilePatternBlock {
                 separator,
+                token: None,
                 width,
                 min: val,
                 max: val,
                 values: vec![val],
+                labels: None,
             });
             last_end = end;
         }
@@ -571,12 +723,98 @@ impl FilePattern {
         // Scan directory to find all matching files and expand ranges
         let mut pattern = FilePattern {
             dir: dir.clone(),
+            source_pattern: None,
+            source_root: None,
+            full_path_pattern: false,
             prefix,
             suffix: suffix.clone(),
             blocks,
         };
         pattern.scan_directory()?;
         Ok(pattern)
+    }
+
+    /// Parse a file pattern from an explicit list of files.
+    ///
+    /// This is used by `.pattern` files: Java `FilePatternReader` expands the
+    /// requested pattern first, then stitches exactly that set. Directory-wide
+    /// scanning would accidentally pull unrelated files into an explicit
+    /// pattern, so keep the numeric value table bounded to the supplied list.
+    pub fn from_file_list(files: &[PathBuf]) -> Result<Self> {
+        let first = files
+            .first()
+            .ok_or_else(|| BioFormatsError::Format("Empty file list".into()))?;
+        let mut pattern = Self::from_file_shape(first)?;
+        pattern.scan_file_list(files)?;
+        Ok(pattern)
+    }
+
+    fn from_file_shape(path: &Path) -> Result<Self> {
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| BioFormatsError::Format("Invalid filename".into()))?;
+
+        // Find all numeric runs in the filename
+        let chars: Vec<char> = filename.chars().collect();
+        let mut runs: Vec<(usize, usize)> = Vec::new(); // (start, end) of each numeric run
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_ascii_digit() {
+                let start = i;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                runs.push((start, i));
+            } else {
+                i += 1;
+            }
+        }
+
+        if runs.is_empty() {
+            return Ok(FilePattern {
+                dir,
+                source_pattern: None,
+                source_root: None,
+                full_path_pattern: false,
+                prefix: filename.to_string(),
+                suffix: String::new(),
+                blocks: Vec::new(),
+            });
+        }
+
+        // Build blocks
+        let mut blocks = Vec::new();
+        let mut last_end = 0;
+        for &(start, end) in &runs {
+            let separator: String = chars[last_end..start].iter().collect();
+            let width = end - start;
+            let val_str: String = chars[start..end].iter().collect();
+            let val: u64 = val_str.parse().unwrap_or(0);
+            blocks.push(FilePatternBlock {
+                separator,
+                token: None,
+                width,
+                min: val,
+                max: val,
+                values: vec![val],
+                labels: None,
+            });
+            last_end = end;
+        }
+        let suffix: String = chars[last_end..].iter().collect();
+        let prefix = String::new(); // prefix is captured in first block's separator
+
+        Ok(FilePattern {
+            dir,
+            source_pattern: None,
+            source_root: None,
+            full_path_pattern: false,
+            prefix,
+            suffix,
+            blocks,
+        })
     }
 
     /// Scan the directory and expand block ranges based on found files.
@@ -595,6 +833,9 @@ impl FilePattern {
             if let Some(values) = self.match_filename(&name_str) {
                 for (i, val) in values.into_iter().enumerate() {
                     if i < self.blocks.len() {
+                        let Some(val) = val.parse::<u64>().ok() else {
+                            continue;
+                        };
                         let block = &mut self.blocks[i];
                         if val < block.min {
                             block.min = val;
@@ -617,8 +858,175 @@ impl FilePattern {
         Ok(())
     }
 
+    fn scan_file_list(&mut self, files: &[PathBuf]) -> Result<()> {
+        for block in &mut self.blocks {
+            if block.labels.is_none() {
+                block.values.clear();
+            }
+        }
+
+        for file in files {
+            let name = self
+                .match_text_for_path(file)
+                .ok_or_else(|| BioFormatsError::Format("Invalid filename".into()))?;
+            let values = self.match_filename(&name).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "FilePattern: explicit files do not share one numeric pattern: {name}"
+                ))
+            })?;
+            for (i, val) in values.into_iter().enumerate() {
+                let block = &mut self.blocks[i];
+                let Some(val) = val.parse::<u64>().ok() else {
+                    continue;
+                };
+                if block.values.is_empty() {
+                    block.min = val;
+                    block.max = val;
+                } else {
+                    block.min = block.min.min(val);
+                    block.max = block.max.max(val);
+                }
+                if !block.values.contains(&val) {
+                    block.values.push(val);
+                }
+            }
+        }
+
+        for block in &mut self.blocks {
+            block.values.sort();
+        }
+        Ok(())
+    }
+
+    /// Parse an explicit `.pattern` path containing one or more `<...>`,
+    /// `[...]`, or `{...}` blocks.
+    pub fn from_explicit_pattern(path: &Path) -> Result<Self> {
+        let text = path
+            .to_str()
+            .ok_or_else(|| BioFormatsError::Format("Invalid filename".into()))?;
+
+        let mut blocks = Vec::new();
+        let mut suffix_start = 0usize;
+        let mut rest = text;
+        while let Some((start_rel, open, close)) = find_next_explicit_pattern_block(rest) {
+            let start = suffix_start + start_rel;
+            let after_start = start + open.len_utf8();
+            let end = find_matching_explicit_pattern_block_end(text, start, open, close)?;
+            let separator = text[suffix_start..start].to_string();
+            let token = text[start..end + close.len_utf8()].to_string();
+            let labels = parse_explicit_pattern_block(&text[after_start..end])?;
+            let numeric_values: Vec<u64> = labels
+                .iter()
+                .filter_map(|label| label.parse::<u64>().ok())
+                .collect();
+            let width = labels.iter().map(|label| label.len()).max().unwrap_or(1);
+            blocks.push(FilePatternBlock {
+                separator,
+                token: Some(token),
+                width,
+                min: numeric_values.iter().copied().min().unwrap_or(0),
+                max: numeric_values.iter().copied().max().unwrap_or(0),
+                values: numeric_values,
+                labels: Some(labels),
+            });
+            suffix_start = end + close.len_utf8();
+            rest = &text[suffix_start..];
+        }
+
+        if blocks.is_empty() {
+            return Self::from_file_shape(path);
+        }
+
+        Ok(FilePattern {
+            dir: PathBuf::new(),
+            source_pattern: Some(text.to_string()),
+            source_root: source_pattern_root(Path::new(text)),
+            full_path_pattern: true,
+            prefix: String::new(),
+            suffix: text[suffix_start..].to_string(),
+            blocks,
+        })
+    }
+
+    /// Parse a simple `*`/`?` glob pattern after it has been expanded.
+    ///
+    /// Each contiguous wildcard run becomes one explicit-label block whose
+    /// values are bounded to the matched files. This is intentionally only used
+    /// for `.pattern` glob expansion, not for directory-wide auto-discovery.
+    pub(crate) fn from_expanded_glob(pattern: &Path, files: &[PathBuf]) -> Result<Self> {
+        let text = pattern
+            .to_str()
+            .ok_or_else(|| BioFormatsError::Format("Invalid filename".into()))?;
+        let glob_shape = GlobPatternShape::parse(text);
+        if glob_shape.wildcards.is_empty() {
+            return Self::from_file_list(files);
+        }
+
+        let mut labels: Vec<Vec<String>> = vec![Vec::new(); glob_shape.wildcards.len()];
+        for file in files {
+            let file_text = file
+                .to_str()
+                .ok_or_else(|| BioFormatsError::Format("Invalid filename".into()))?;
+            let captures = glob_shape.match_text(file_text).ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "FilePattern: expanded glob file does not match pattern: {file_text}"
+                ))
+            })?;
+            for (idx, capture) in captures.into_iter().enumerate() {
+                if !labels[idx].contains(&capture) {
+                    labels[idx].push(capture);
+                }
+            }
+        }
+        for block_labels in &mut labels {
+            block_labels.sort();
+        }
+
+        let blocks = glob_shape
+            .separators
+            .iter()
+            .zip(glob_shape.wildcards.iter())
+            .zip(labels)
+            .map(|((separator, wildcard), labels)| {
+                let numeric_values: Vec<u64> = labels
+                    .iter()
+                    .filter_map(|label| label.parse::<u64>().ok())
+                    .collect();
+                FilePatternBlock {
+                    separator: separator.clone(),
+                    token: Some(wildcard.clone()),
+                    width: labels.iter().map(|label| label.len()).max().unwrap_or(1),
+                    min: numeric_values.iter().copied().min().unwrap_or(0),
+                    max: numeric_values.iter().copied().max().unwrap_or(0),
+                    values: numeric_values,
+                    labels: Some(labels),
+                }
+            })
+            .collect();
+
+        Ok(FilePattern {
+            dir: PathBuf::new(),
+            source_pattern: Some(text.to_string()),
+            source_root: source_pattern_root(Path::new(text)),
+            full_path_pattern: true,
+            prefix: String::new(),
+            suffix: glob_shape.suffix,
+            blocks,
+        })
+    }
+
+    fn match_text_for_path(&self, path: &Path) -> Option<String> {
+        if self.full_path_pattern {
+            path.to_str().map(|text| text.to_string())
+        } else {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+        }
+    }
+
     /// Try to extract numeric values from a filename that matches this pattern.
-    fn match_filename(&self, name: &str) -> Option<Vec<u64>> {
+    fn match_filename(&self, name: &str) -> Option<Vec<String>> {
         let mut pos = 0;
         let mut values = Vec::new();
         for block in &self.blocks {
@@ -627,16 +1035,23 @@ impl FilePattern {
                 return None;
             }
             pos += block.separator.len();
-            // Extract digits
-            let digit_start = pos;
-            while pos < name.len() && name.as_bytes()[pos].is_ascii_digit() {
-                pos += 1;
+            if let Some(labels) = &block.labels {
+                let label = labels
+                    .iter()
+                    .find(|label| name[pos..].starts_with(label.as_str()))?;
+                pos += label.len();
+                values.push(label.clone());
+            } else {
+                // Extract digits
+                let digit_start = pos;
+                while pos < name.len() && name.as_bytes()[pos].is_ascii_digit() {
+                    pos += 1;
+                }
+                if pos == digit_start {
+                    return None;
+                }
+                values.push(name[digit_start..pos].to_string());
             }
-            if pos == digit_start {
-                return None;
-            }
-            let val: u64 = name[digit_start..pos].parse().ok()?;
-            values.push(val);
         }
         // Match suffix
         if &name[pos..] != self.suffix {
@@ -656,18 +1071,15 @@ impl FilePattern {
     fn enumerate_blocks(&self, block_idx: usize, current: String) -> Vec<PathBuf> {
         if block_idx >= self.blocks.len() {
             let name = format!("{}{}", current, self.suffix);
+            if self.full_path_pattern {
+                return vec![PathBuf::from(name)];
+            }
             return vec![self.dir.join(name)];
         }
         let block = &self.blocks[block_idx];
         let mut results = Vec::new();
-        for &val in &block.values {
-            let next = format!(
-                "{}{}{:0>width$}",
-                current,
-                block.separator,
-                val,
-                width = block.width
-            );
+        for value in block.value_labels() {
+            let next = format!("{}{}{}", current, block.separator, value);
             results.extend(self.enumerate_blocks(block_idx + 1, next));
         }
         results
@@ -677,10 +1089,450 @@ impl FilePattern {
     pub fn file_count(&self) -> usize {
         self.blocks
             .iter()
-            .map(|b| b.values.len())
+            .map(|b| b.value_labels().len())
             .product::<usize>()
             .max(1)
     }
+}
+
+impl FilePatternBlock {
+    fn value_labels(&self) -> Vec<String> {
+        self.labels.clone().unwrap_or_else(|| {
+            self.values
+                .iter()
+                .map(|value| format!("{value:0>width$}", width = self.width))
+                .collect()
+        })
+    }
+
+    fn position_of(&self, value: &str) -> Option<usize> {
+        self.value_labels()
+            .iter()
+            .position(|candidate| candidate == value)
+    }
+
+    fn has_non_numeric_labels(&self) -> bool {
+        self.labels
+            .as_ref()
+            .is_some_and(|labels| labels.iter().any(|label| label.parse::<u64>().is_err()))
+    }
+}
+
+struct GlobPatternShape {
+    separators: Vec<String>,
+    wildcards: Vec<String>,
+    suffix: String,
+}
+
+impl GlobPatternShape {
+    fn parse(pattern: &str) -> Self {
+        let mut separators = Vec::new();
+        let mut wildcards = Vec::new();
+        let mut literal_start = 0usize;
+        let mut iter = pattern.char_indices().peekable();
+        while let Some((idx, ch)) = iter.next() {
+            let Some(mut wildcard_end) = glob_atom_end(pattern, idx, ch) else {
+                continue;
+            };
+            separators.push(pattern[literal_start..idx].to_string());
+            while let Some(&(next_idx, next_ch)) = iter.peek() {
+                let Some(next_end) = glob_atom_end(pattern, next_idx, next_ch) else {
+                    break;
+                };
+                let _ = iter.next();
+                wildcard_end = next_end;
+            }
+            wildcards.push(pattern[idx..wildcard_end].to_string());
+            literal_start = wildcard_end;
+        }
+        let suffix = pattern[literal_start..].to_string();
+        Self {
+            separators,
+            wildcards,
+            suffix,
+        }
+    }
+
+    fn match_text(&self, text: &str) -> Option<Vec<String>> {
+        let mut pos = 0usize;
+        let mut captures = Vec::with_capacity(self.wildcards.len());
+        for idx in 0..self.wildcards.len() {
+            let separator = &self.separators[idx];
+            if !text[pos..].starts_with(separator) {
+                return None;
+            }
+            pos += separator.len();
+
+            let next_literal = self
+                .separators
+                .get(idx + 1)
+                .map(String::as_str)
+                .unwrap_or(self.suffix.as_str());
+            let capture_end = find_capture_end(&text[pos..], &self.wildcards[idx], next_literal)?;
+            let capture = &text[pos..pos + capture_end];
+            if !simple_glob_matches(&self.wildcards[idx], capture) {
+                return None;
+            }
+            captures.push(capture.to_string());
+            pos += capture_end;
+        }
+        if text[pos..] != self.suffix {
+            return None;
+        }
+        Some(captures)
+    }
+}
+
+fn glob_atom_end(pattern: &str, idx: usize, ch: char) -> Option<usize> {
+    match ch {
+        '*' | '?' => Some(idx + ch.len_utf8()),
+        '[' => pattern[idx + ch.len_utf8()..]
+            .find(']')
+            .map(|end_rel| idx + ch.len_utf8() + end_rel + 1),
+        _ => None,
+    }
+}
+
+fn find_capture_end(text: &str, wildcard: &str, next_literal: &str) -> Option<usize> {
+    if !wildcard.contains('*') {
+        let count = fixed_width_glob_atoms(wildcard)?;
+        let end = text
+            .char_indices()
+            .nth(count)
+            .map_or(text.len(), |(idx, _)| idx);
+        return text[end..].starts_with(next_literal).then_some(end);
+    }
+
+    if next_literal.is_empty() {
+        return Some(text.len());
+    }
+    text.match_indices(next_literal)
+        .map(|(idx, _)| idx)
+        .find(|idx| simple_glob_matches(wildcard, &text[..*idx]))
+}
+
+fn fixed_width_glob_atoms(wildcard: &str) -> Option<usize> {
+    let mut count = 0usize;
+    let mut iter = wildcard.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        match ch {
+            '?' => count += 1,
+            '[' => {
+                let end = glob_atom_end(wildcard, idx, ch)?;
+                while let Some(&(next_idx, _)) = iter.peek() {
+                    if next_idx >= end {
+                        break;
+                    }
+                    let _ = iter.next();
+                }
+                count += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(count)
+}
+
+fn simple_glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern_bytes = pattern.as_bytes();
+    let name = name.as_bytes();
+    let mut p = 0usize;
+    let mut n = 0usize;
+    let mut star = None;
+    let mut after_star_name = 0usize;
+
+    while n < name.len() {
+        if p < pattern_bytes.len() && (pattern_bytes[p] == b'?' || pattern_bytes[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern_bytes.len() && pattern_bytes[p] == b'[' {
+            let Some((end, matched)) = glob_bracket_class_matches(pattern_bytes, p, name[n]) else {
+                return false;
+            };
+            if matched {
+                p = end + 1;
+                n += 1;
+            } else if let Some(star_pos) = star {
+                p = star_pos + 1;
+                after_star_name += 1;
+                n = after_star_name;
+            } else {
+                return false;
+            }
+        } else if p < pattern_bytes.len() && pattern_bytes[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            after_star_name = n;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            after_star_name += 1;
+            n = after_star_name;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern_bytes.len() && pattern_bytes[p] == b'*' {
+        p += 1;
+    }
+    p == pattern_bytes.len()
+}
+
+fn glob_bracket_class_matches(pattern: &[u8], start: usize, byte: u8) -> Option<(usize, bool)> {
+    let mut idx = start + 1;
+    if idx >= pattern.len() {
+        return None;
+    }
+    let negated = pattern[idx] == b'!' || pattern[idx] == b'^';
+    if negated {
+        idx += 1;
+    }
+
+    let mut matched = false;
+    let mut saw_member = false;
+    while idx < pattern.len() {
+        if pattern[idx] == b']' && saw_member {
+            return Some((idx, if negated { !matched } else { matched }));
+        }
+
+        let first = pattern[idx];
+        saw_member = true;
+        if idx + 2 < pattern.len() && pattern[idx + 1] == b'-' && pattern[idx + 2] != b']' {
+            let last = pattern[idx + 2];
+            let (lo, hi) = if first <= last {
+                (first, last)
+            } else {
+                (last, first)
+            };
+            if lo <= byte && byte <= hi {
+                matched = true;
+            }
+            idx += 3;
+        } else {
+            if first == byte {
+                matched = true;
+            }
+            idx += 1;
+        }
+    }
+    None
+}
+
+fn find_next_explicit_pattern_block(pattern: &str) -> Option<(usize, char, char)> {
+    pattern.char_indices().find_map(|(idx, ch)| match ch {
+        '<' => Some((idx, '<', '>')),
+        '[' => Some((idx, '[', ']')),
+        '{' => Some((idx, '{', '}')),
+        _ => None,
+    })
+}
+
+fn find_matching_explicit_pattern_block_end(
+    pattern: &str,
+    start: usize,
+    open: char,
+    close: char,
+) -> Result<usize> {
+    let mut stack = vec![close];
+    for (rel_idx, ch) in pattern[start + open.len_utf8()..].char_indices() {
+        let idx = start + open.len_utf8() + rel_idx;
+        match ch {
+            '<' => stack.push('>'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            '>' | ']' | '}' => {
+                if stack.pop() != Some(ch) {
+                    return Err(BioFormatsError::Format(format!(
+                        "FilePattern: unmatched pattern block delimiter {ch}"
+                    )));
+                }
+                if stack.is_empty() {
+                    return Ok(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(BioFormatsError::Format(format!(
+        "FilePattern: unterminated {open}{close} pattern block"
+    )))
+}
+
+fn expand_explicit_pattern_text(pattern: &str, out: &mut Vec<String>) -> Result<()> {
+    let Some((start, open, close)) = find_next_explicit_pattern_block(pattern) else {
+        reject_explicit_pattern_value(pattern)?;
+        out.push(pattern.to_string());
+        return Ok(());
+    };
+    let end = find_matching_explicit_pattern_block_end(pattern, start, open, close)?;
+    let prefix = &pattern[..start];
+    let suffix = &pattern[end + close.len_utf8()..];
+    for value in parse_explicit_pattern_block(&pattern[start + open.len_utf8()..end])? {
+        let candidate = format!("{prefix}{value}{suffix}");
+        expand_explicit_pattern_text(&candidate, out)?;
+    }
+    Ok(())
+}
+
+fn parse_explicit_pattern_block(block: &str) -> Result<Vec<String>> {
+    if block.trim().is_empty() {
+        return Err(BioFormatsError::Format(
+            "FilePattern: empty pattern block".to_string(),
+        ));
+    }
+    let mut values = Vec::new();
+    for part in split_top_level_explicit_pattern_commas(block)? {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(BioFormatsError::Format(
+                "FilePattern: empty pattern list entry".to_string(),
+            ));
+        }
+        values.extend(parse_explicit_pattern_part(part)?);
+    }
+    Ok(values)
+}
+
+fn parse_explicit_pattern_part(part: &str) -> Result<Vec<String>> {
+    if find_next_explicit_pattern_block(part).is_some() {
+        let mut nested = Vec::new();
+        expand_explicit_pattern_text(part, &mut nested)?;
+        for value in &nested {
+            reject_explicit_pattern_value(value)?;
+        }
+        return Ok(nested);
+    }
+
+    let (range, step) = match part.split_once(':') {
+        Some((range, step)) => (
+            range,
+            step.parse::<i64>().map_err(|_| {
+                BioFormatsError::Format("FilePattern: invalid range step".to_string())
+            })?,
+        ),
+        None => (part, 1),
+    };
+    if step <= 0 {
+        return Err(BioFormatsError::Format(
+            "FilePattern: range step must be positive".to_string(),
+        ));
+    }
+
+    if let Some((first_text, last_text)) = range.split_once('-') {
+        if let (Ok(first), Ok(last)) = (first_text.parse::<i64>(), last_text.parse::<i64>()) {
+            let width = first_text.len().max(last_text.len());
+            let mut out = Vec::new();
+            let mut value = first;
+            if first <= last {
+                while value <= last {
+                    out.push(format!("{value:0width$}"));
+                    value += step;
+                }
+            } else {
+                while value >= last {
+                    out.push(format!("{value:0width$}"));
+                    value -= step;
+                }
+            }
+            return Ok(out);
+        }
+
+        if first_text.chars().count() == 1 && last_text.chars().count() == 1 {
+            let first = first_text.chars().next().unwrap();
+            let last = last_text.chars().next().unwrap();
+            if first.is_ascii_alphabetic() && last.is_ascii_alphabetic() {
+                let mut out = Vec::new();
+                let mut value = first as i64;
+                let last = last as i64;
+                if value <= last {
+                    while value <= last {
+                        out.push(char::from_u32(value as u32).unwrap().to_string());
+                        value += step;
+                    }
+                } else {
+                    while value >= last {
+                        out.push(char::from_u32(value as u32).unwrap().to_string());
+                        value -= step;
+                    }
+                }
+                return Ok(out);
+            }
+        }
+
+        return Err(BioFormatsError::Format(
+            "FilePattern: invalid range bounds".to_string(),
+        ));
+    }
+
+    reject_explicit_pattern_value(range)?;
+    Ok(vec![range.to_string()])
+}
+
+fn split_top_level_explicit_pattern_commas(block: &str) -> Result<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut stack = Vec::new();
+    for (idx, ch) in block.char_indices() {
+        match ch {
+            '<' => stack.push('>'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            '>' | ']' | '}' => {
+                if stack.pop() != Some(ch) {
+                    return Err(BioFormatsError::Format(format!(
+                        "FilePattern: unmatched pattern block delimiter {ch}"
+                    )));
+                }
+            }
+            ',' if stack.is_empty() => {
+                parts.push(&block[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if let Some(close) = stack.pop() {
+        return Err(BioFormatsError::Format(format!(
+            "FilePattern: unterminated pattern block delimiter {close}"
+        )));
+    }
+    parts.push(&block[start..]);
+    Ok(parts)
+}
+
+fn reject_explicit_pattern_value(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.contains('<')
+        || value.contains('>')
+        || value.contains('[')
+        || value.contains(']')
+        || value.contains('{')
+        || value.contains('}')
+        || value.contains('/')
+        || value.contains('\\')
+    {
+        return Err(BioFormatsError::Format(
+            "FilePattern: invalid value".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn source_pattern_root(path: &Path) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        let component_text = component.as_os_str().to_string_lossy();
+        if component_text.contains('<')
+            || component_text.contains('[')
+            || component_text.contains('{')
+            || component_text.contains('*')
+            || component_text.contains('?')
+        {
+            break;
+        }
+        root.push(component.as_os_str());
+    }
+    (!root.as_os_str().is_empty()).then_some(root)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -695,6 +1547,18 @@ pub enum AxisType {
     Time,
     Series,
     Unknown,
+}
+
+impl AxisType {
+    fn as_str(self) -> &'static str {
+        match self {
+            AxisType::Z => "Z",
+            AxisType::Channel => "C",
+            AxisType::Time => "T",
+            AxisType::Series => "S",
+            AxisType::Unknown => "unknown",
+        }
+    }
 }
 
 /// Result of running the axis guesser: the axis type for each pattern block,
@@ -765,7 +1629,14 @@ impl AxisGuesser {
         let mut axis_types: Vec<AxisType> = pattern
             .blocks
             .iter()
-            .map(|block| Self::guess_from_separator(&block.separator))
+            .map(|block| {
+                let axis = Self::guess_from_separator(&block.separator);
+                if axis == AxisType::Unknown && block.has_non_numeric_labels() {
+                    AxisType::Channel
+                } else {
+                    axis
+                }
+            })
             .collect();
 
         let found_z = axis_types.iter().any(|a| *a == AxisType::Z);
@@ -885,19 +1756,81 @@ mod tests {
     fn pattern(blocks: &[(&str, usize)]) -> FilePattern {
         FilePattern {
             dir: PathBuf::from("."),
+            source_pattern: None,
+            source_root: None,
+            full_path_pattern: false,
             prefix: String::new(),
             suffix: ".tif".into(),
             blocks: blocks
                 .iter()
                 .map(|(sep, n)| FilePatternBlock {
                     separator: (*sep).into(),
+                    token: None,
                     width: 3,
                     min: 0,
                     max: (*n as u64).saturating_sub(1),
                     values: (0..*n as u64).collect(),
+                    labels: None,
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn glob_bracket_classes_match_shell_style_members_ranges_and_negation() {
+        assert!(simple_glob_matches("img_[AB][0-2].fake", "img_A2.fake"));
+        assert!(simple_glob_matches("img_[!AB].fake", "img_C.fake"));
+        assert!(simple_glob_matches("img_[^0-2].fake", "img_9.fake"));
+        assert!(!simple_glob_matches("img_[AB].fake", "img_C.fake"));
+        assert!(!simple_glob_matches("img_[!AB].fake", "img_A.fake"));
+    }
+
+    #[test]
+    fn expanded_glob_uses_bracket_classes_as_captured_blocks() {
+        let pattern = PathBuf::from("/tmp/img_c[AB]_t?.fake");
+        let files = vec![
+            PathBuf::from("/tmp/img_cA_t0.fake"),
+            PathBuf::from("/tmp/img_cA_t1.fake"),
+            PathBuf::from("/tmp/img_cB_t0.fake"),
+            PathBuf::from("/tmp/img_cB_t1.fake"),
+        ];
+
+        let fp = FilePattern::from_expanded_glob(&pattern, &files).unwrap();
+        assert_eq!(fp.blocks.len(), 2);
+        assert_eq!(fp.blocks[0].value_labels(), vec!["A", "B"]);
+        assert_eq!(fp.blocks[1].value_labels(), vec!["0", "1"]);
+
+        let guess = AxisGuesser::guess(&fp);
+        assert_eq!(guess, vec![AxisType::Channel, AxisType::Time]);
+    }
+
+    #[test]
+    fn file_stitcher_ome_metadata_uses_filepattern_channel_names() {
+        let mut meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_c: 2,
+            image_count: 2,
+            ..ImageMetadata::default()
+        };
+        meta.series_metadata.insert(
+            "Channel 0 Name".into(),
+            MetadataValue::String("DAPI".into()),
+        );
+        meta.series_metadata.insert(
+            "Channel 1 Name".into(),
+            MetadataValue::String("FITC".into()),
+        );
+        let stitcher = FileStitcher {
+            files: Vec::new(),
+            meta: Some(meta),
+            plane_map: Vec::new(),
+            current_reader: None,
+        };
+
+        let ome = stitcher.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("FITC"));
     }
 
     #[test]

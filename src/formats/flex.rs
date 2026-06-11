@@ -978,12 +978,8 @@ impl FormatReader for FlexReader {
             flex_files[0].factors = factors;
 
             // populateCoreMetadata: compute sizeC/sizeZ/sizeT/imageCount/fieldCount.
-            let core = compute_core_metadata(
-                &image_names,
-                initial_field_count,
-                n_planes,
-                n_files as u32,
-            );
+            let core =
+                compute_core_metadata(&image_names, initial_field_count, n_planes, n_files as u32);
             let field_count = core.field_count.max(1);
             self.field_count = field_count;
             self.image_count = core.image_count.max(1);

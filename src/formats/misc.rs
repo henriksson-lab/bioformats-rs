@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -287,20 +287,16 @@ macro_rules! placeholder_reader {
 /// message instead of a generic "not yet implemented".
 pub struct QuickTimeReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    sample_offsets: Vec<u64>,
-    sample_sizes: Vec<u32>,
-    samples_per_pixel: usize,
+    series: Vec<QuickTimeParsed>,
+    current_series: usize,
 }
 
 impl QuickTimeReader {
     pub fn new() -> Self {
         QuickTimeReader {
             path: None,
-            meta: None,
-            sample_offsets: Vec::new(),
-            sample_sizes: Vec::new(),
-            samples_per_pixel: 1,
+            series: Vec::new(),
+            current_series: 0,
         }
     }
 }
@@ -328,30 +324,27 @@ impl FormatReader for QuickTimeReader {
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let parsed = parse_quicktime(&data)?;
         self.path = Some(path.to_path_buf());
-        self.sample_offsets = parsed.sample_offsets;
-        self.sample_sizes = parsed.sample_sizes;
-        self.samples_per_pixel = parsed.samples_per_pixel;
-        self.meta = Some(parsed.meta);
+        self.series = parsed;
+        self.current_series = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.sample_offsets.clear();
-        self.sample_sizes.clear();
-        self.samples_per_pixel = 1;
+        self.series.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.series.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
+        if self.series.is_empty() {
             Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
+        } else if s < self.series.len() {
+            self.current_series = s;
             Ok(())
         } else {
             Err(BioFormatsError::SeriesOutOfRange(s))
@@ -359,34 +352,28 @@ impl FormatReader for QuickTimeReader {
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.series
+            .get(self.current_series)
+            .map(|series| &series.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &series.meta;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let index = plane_index as usize;
-        let offset = self.sample_offsets[index];
-        let sample_size = self.sample_sizes[index] as usize;
-        let expected = meta
-            .size_x
-            .checked_mul(meta.size_y)
-            .and_then(|px| (px as usize).checked_mul(self.samples_per_pixel))
-            .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
-            .ok_or_else(|| BioFormatsError::Format("QuickTime plane size overflows".into()))?;
-        if sample_size != expected {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "QuickTime sample {plane_index} has {sample_size} bytes, expected {expected} for uncompressed pixels"
-            )));
-        }
+        let offset = series.sample_offsets[index];
+        let sample_size = series.sample_sizes[index] as usize;
         let data = std::fs::read(self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?)
             .map_err(BioFormatsError::Io)?;
         let start = offset as usize;
@@ -398,7 +385,51 @@ impl FormatReader for QuickTimeReader {
                 "QuickTime sample {plane_index} extends past end of file"
             )));
         }
-        Ok(data[start..end].to_vec())
+        let sample = &data[start..end];
+        match series.codec {
+            QuickTimeCodec::UncompressedRgb | QuickTimeCodec::UncompressedGray => {
+                let expected = meta
+                    .size_x
+                    .checked_mul(meta.size_y)
+                    .and_then(|px| (px as usize).checked_mul(series.samples_per_pixel))
+                    .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("QuickTime plane size overflows".into())
+                    })?;
+                if sample_size != expected {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "QuickTime sample {plane_index} has {sample_size} bytes, expected {expected} for uncompressed pixels"
+                    )));
+                }
+                Ok(sample.to_vec())
+            }
+            QuickTimeCodec::Jpeg => decode_quicktime_jpeg_sample(sample, meta, plane_index),
+            QuickTimeCodec::Png => decode_quicktime_png_sample(sample, meta, plane_index),
+            QuickTimeCodec::Cinepak { depth } => {
+                let mut previous = None;
+                for current in 0..=index {
+                    let offset = series.sample_offsets[current] as usize;
+                    let end = offset
+                        .checked_add(series.sample_sizes[current] as usize)
+                        .ok_or_else(|| {
+                            BioFormatsError::Format("QuickTime sample offset overflows".into())
+                        })?;
+                    if end > data.len() {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "QuickTime sample {current} extends past end of file"
+                        )));
+                    }
+                    previous = Some(decode_quicktime_cinepak_sample(
+                        &data[offset..end],
+                        meta,
+                        current as u32,
+                        depth,
+                        previous.as_deref(),
+                    )?);
+                }
+                previous.ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
+            }
+        }
     }
 
     fn open_bytes_region(
@@ -410,12 +441,28 @@ impl FormatReader for QuickTimeReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("QuickTime", &full, meta, self.samples_per_pixel, x, y, w, h)
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane(
+            "QuickTime",
+            &full,
+            &series.meta,
+            series.samples_per_pixel,
+            x,
+            y,
+            w,
+            h,
+        )
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?
+            .meta;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
@@ -429,6 +476,29 @@ struct QuickTimeParsed {
     sample_offsets: Vec<u64>,
     sample_sizes: Vec<u32>,
     samples_per_pixel: usize,
+    codec: QuickTimeCodec,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuickTimeCodec {
+    UncompressedRgb,
+    UncompressedGray,
+    Jpeg,
+    Png,
+    Cinepak { depth: u16 },
+}
+
+#[derive(Clone, Copy)]
+struct QuickTimeSttsEntry {
+    sample_count: u32,
+    sample_delta: u32,
+}
+
+#[derive(Clone, Copy)]
+struct QuickTimeEditEntry {
+    segment_duration: u64,
+    media_time: i64,
+    media_rate: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -446,6 +516,197 @@ fn be_u16_at(data: &[u8], offset: usize) -> Option<u16> {
 fn be_u32_at(data: &[u8], offset: usize) -> Option<u32> {
     data.get(offset..offset + 4)
         .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn be_i32_at(data: &[u8], offset: usize) -> Option<i32> {
+    data.get(offset..offset + 4)
+        .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn quicktime_codec_from_fourcc(fourcc: &[u8], depth: u16) -> Result<QuickTimeCodec> {
+    match fourcc {
+        b"raw " | b"RAW " | b"rgb " => Ok(QuickTimeCodec::UncompressedRgb),
+        b"gray" | b"GREY" | b"y800" => Ok(QuickTimeCodec::UncompressedGray),
+        b"jpeg" | b"mjpa" | b"mjpb" | b"mjpg" | b"MJPG" => Ok(QuickTimeCodec::Jpeg),
+        b"png " => Ok(QuickTimeCodec::Png),
+        b"cvid" => Ok(QuickTimeCodec::Cinepak {
+            depth: match depth {
+                0 | 24 => 24,
+                8 => 8,
+                other => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "QuickTime Cinepak depth {other} is unsupported"
+                    )))
+                }
+            },
+        }),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime codec {} is unsupported (family: {}); decoding this codec family requires an external video decoder",
+            String::from_utf8_lossy(other),
+            quicktime_codec_family(other)
+        ))),
+    }
+}
+
+fn quicktime_codec_family(fourcc: &[u8]) -> &'static str {
+    match fourcc {
+        b"raw " | b"RAW " | b"rgb " => "uncompressed RGB",
+        b"gray" | b"GREY" | b"y800" => "uncompressed grayscale",
+        b"jpeg" | b"mjpa" | b"mjpb" | b"mjpg" | b"MJPG" => "Motion JPEG",
+        b"png " => "PNG",
+        b"cvid" => "Cinepak",
+        b"avc1" | b"avc2" | b"avc3" | b"avc4" | b"h264" | b"H264" | b"x264" | b"X264" => {
+            "H.264/AVC"
+        }
+        b"hvc1" | b"hev1" => "H.265/HEVC",
+        b"apch" | b"apcn" | b"apcs" | b"apco" | b"ap4h" | b"ap4x" => "Apple ProRes",
+        b"mjp2" => "Motion JPEG 2000",
+        b"dv  " | b"dvc " | b"dvcp" | b"dvhq" | b"dvcpro" => "DV",
+        _ => "unknown codec family",
+    }
+}
+
+fn decode_quicktime_jpeg_sample(
+    sample: &[u8],
+    meta: &ImageMetadata,
+    plane_index: u32,
+) -> Result<Vec<u8>> {
+    let mut decoder = jpeg_decoder::Decoder::new(sample);
+    let decoded = decoder.decode().map_err(|err| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime JPEG sample {plane_index} failed to decode: {err}"
+        ))
+    })?;
+    let info = decoder.info().ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime JPEG sample {plane_index} has no image info"
+        ))
+    })?;
+    if u32::from(info.width) != meta.size_x || u32::from(info.height) != meta.size_y {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime JPEG sample {plane_index} is {}x{}, expected {}x{}",
+            info.width, info.height, meta.size_x, meta.size_y
+        )));
+    }
+    let samples_per_pixel = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => 1,
+        jpeg_decoder::PixelFormat::RGB24 => 3,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime JPEG sample {plane_index} pixel format {other:?} is unsupported"
+            )))
+        }
+    };
+    if samples_per_pixel as u32 != meta.size_c {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime JPEG sample {plane_index} has {samples_per_pixel} channel(s), expected {}",
+            meta.size_c
+        )));
+    }
+    Ok(decoded)
+}
+
+fn decode_quicktime_png_sample(
+    sample: &[u8],
+    meta: &ImageMetadata,
+    plane_index: u32,
+) -> Result<Vec<u8>> {
+    let image =
+        image::load_from_memory_with_format(sample, image::ImageFormat::Png).map_err(|err| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime PNG sample {plane_index} failed to decode: {err}"
+            ))
+        })?;
+    if image.width() != meta.size_x || image.height() != meta.size_y {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime PNG sample {plane_index} is {}x{}, expected {}x{}",
+            image.width(),
+            image.height(),
+            meta.size_x,
+            meta.size_y
+        )));
+    }
+    let (samples_per_pixel, decoded) = match image {
+        image::DynamicImage::ImageLuma8(buffer) => (1usize, buffer.into_raw()),
+        image::DynamicImage::ImageLumaA8(buffer) => (2usize, buffer.into_raw()),
+        image::DynamicImage::ImageRgb8(buffer) => (3usize, buffer.into_raw()),
+        image::DynamicImage::ImageRgba8(buffer) => (4usize, buffer.into_raw()),
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime PNG sample {plane_index} pixel format {:?} is unsupported",
+                other.color()
+            )))
+        }
+    };
+    if samples_per_pixel as u32 != meta.size_c {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime PNG sample {plane_index} has {samples_per_pixel} channel(s), expected {}",
+            meta.size_c
+        )));
+    }
+    Ok(decoded)
+}
+
+fn decode_quicktime_cinepak_sample(
+    sample: &[u8],
+    meta: &ImageMetadata,
+    plane_index: u32,
+    depth: u16,
+    previous: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let expected_channels = match depth {
+        8 => 1u32,
+        24 => 3u32,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime Cinepak sample {plane_index} depth {other} is unsupported"
+            )))
+        }
+    };
+    if meta.size_c != expected_channels || meta.pixel_type != PixelType::Uint8 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Cinepak sample {plane_index} only supports {expected_channels}-channel Uint8 output"
+        )));
+    }
+    if sample.len() < 10 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Cinepak sample {plane_index} is truncated"
+        )));
+    }
+    let expected = meta
+        .size_x
+        .checked_mul(meta.size_y)
+        .and_then(|px| (px as usize).checked_mul(expected_channels as usize))
+        .ok_or_else(|| BioFormatsError::Format("QuickTime Cinepak plane size overflows".into()))?;
+    let previous = match previous {
+        Some(previous) if previous.len() == expected => previous,
+        Some(previous) => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime Cinepak sample {plane_index} previous frame has {} bytes, expected {expected}",
+                previous.len()
+            )))
+        }
+        None if sample[0] == 0 => &[],
+        None => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime Cinepak sample {plane_index} is a delta frame without a previous frame"
+            )))
+        }
+    };
+    let decoded = crate::common::codec::decompress_cinepak(
+        sample,
+        meta.size_x,
+        meta.size_y,
+        depth as u32,
+        previous,
+    )?;
+    if decoded.len() != expected {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Cinepak sample {plane_index} decoded to {} bytes, expected {expected}",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
 }
 
 fn scan_atoms(data: &[u8], base: usize) -> Result<Vec<Atom<'_>>> {
@@ -515,28 +776,518 @@ fn first_descendant<'a>(data: &'a [u8], path: &[[u8; 4]]) -> Result<Option<Atom<
     Ok(current)
 }
 
-fn parse_quicktime(data: &[u8]) -> Result<QuickTimeParsed> {
+fn descendant<'a>(atom: Atom<'a>, path: &[[u8; 4]]) -> Result<Option<Atom<'a>>> {
+    let mut atoms = scan_atoms(atom.data, atom.start + 8)?;
+    let mut current = None;
+    for kind in path {
+        let atom = match find_child(&atoms, kind) {
+            Some(atom) => atom,
+            None => return Ok(None),
+        };
+        current = Some(atom);
+        atoms = scan_atoms(atom.data, atom.start + 8)?;
+    }
+    Ok(current)
+}
+
+fn parse_quicktime_time_header(atom: Atom<'_>, atom_name: &str) -> Result<(u32, u64)> {
+    if atom.data.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime {atom_name} atom is truncated"
+        )));
+    }
+    match atom.data[0] {
+        0 => {
+            if atom.data.len() < 24 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "QuickTime {atom_name} atom is truncated"
+                )));
+            }
+            Ok((
+                be_u32_at(atom.data, 12).unwrap(),
+                be_u32_at(atom.data, 16).unwrap() as u64,
+            ))
+        }
+        version => Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime {atom_name} version {version} is unsupported"
+        ))),
+    }
+}
+
+fn parse_quicktime_stts(
+    stts: Atom<'_>,
+    expected_samples: usize,
+) -> Result<Vec<QuickTimeSttsEntry>> {
+    if stts.data.len() < 8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stts atom is truncated".into(),
+        ));
+    }
+    let entry_count = be_u32_at(stts.data, 4).unwrap() as usize;
+    if stts.data.len() < 8 + entry_count * 8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stts table is truncated".into(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut total = 0usize;
+    for i in 0..entry_count {
+        let base = 8 + i * 8;
+        let sample_count = be_u32_at(stts.data, base).unwrap();
+        let sample_delta = be_u32_at(stts.data, base + 4).unwrap();
+        if sample_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime stts contains a zero sample count".into(),
+            ));
+        }
+        total += sample_count as usize;
+        entries.push(QuickTimeSttsEntry {
+            sample_count,
+            sample_delta,
+        });
+    }
+    if total != expected_samples {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime stts sample count {total} does not match stsz sample count {expected_samples}"
+        )));
+    }
+    Ok(entries)
+}
+
+fn parse_quicktime_elst(elst: Atom<'_>) -> Result<Vec<QuickTimeEditEntry>> {
+    if elst.data.len() < 8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime elst atom is truncated".into(),
+        ));
+    }
+    if elst.data[0] != 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime elst version {} is unsupported",
+            elst.data[0]
+        )));
+    }
+    let entry_count = be_u32_at(elst.data, 4).unwrap() as usize;
+    if elst.data.len() < 8 + entry_count * 12 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime elst table is truncated".into(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    for i in 0..entry_count {
+        let base = 8 + i * 12;
+        let rate = be_i32_at(elst.data, base + 8).unwrap();
+        entries.push(QuickTimeEditEntry {
+            segment_duration: be_u32_at(elst.data, base).unwrap() as u64,
+            media_time: be_i32_at(elst.data, base + 4).unwrap() as i64,
+            media_rate: f64::from(rate) / 65536.0,
+        });
+    }
+    Ok(entries)
+}
+
+fn quicktime_stts_total_duration(entries: &[QuickTimeSttsEntry]) -> Option<u64> {
+    entries.iter().try_fold(0u64, |total, entry| {
+        total.checked_add(u64::from(entry.sample_count) * u64::from(entry.sample_delta))
+    })
+}
+
+fn quicktime_sample_media_times(entries: &[QuickTimeSttsEntry]) -> Option<Vec<u64>> {
+    let sample_count = entries.iter().try_fold(0usize, |total, entry| {
+        total.checked_add(entry.sample_count as usize)
+    })?;
+    let mut times = Vec::with_capacity(sample_count);
+    let mut time = 0u64;
+    for entry in entries {
+        for _ in 0..entry.sample_count {
+            times.push(time);
+            time = time.checked_add(u64::from(entry.sample_delta))?;
+        }
+    }
+    Some(times)
+}
+
+fn quicktime_insert_u64_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    key: &str,
+    value: u64,
+) {
+    metadata.insert(
+        key.into(),
+        i64::try_from(value)
+            .map(MetadataValue::Int)
+            .unwrap_or_else(|_| MetadataValue::String(value.to_string())),
+    );
+}
+
+fn quicktime_insert_i64_list_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    key: &str,
+    values: &[i64],
+) {
+    metadata.insert(
+        key.into(),
+        MetadataValue::String(
+            values
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+}
+
+fn quicktime_insert_u64_list_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    key: &str,
+    values: &[u64],
+) {
+    metadata.insert(
+        key.into(),
+        MetadataValue::String(
+            values
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+}
+
+fn quicktime_insert_seconds_list_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    key: &str,
+    values: &[i64],
+    timescale: u32,
+) {
+    metadata.insert(
+        key.into(),
+        MetadataValue::String(
+            values
+                .iter()
+                .map(|value| format!("{}", *value as f64 / f64::from(timescale)))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+}
+
+fn quicktime_movie_ticks_to_media_ticks(
+    movie_ticks: u64,
+    media_timescale: Option<u32>,
+    movie_timescale: Option<u32>,
+) -> Option<u64> {
+    if movie_ticks == 0 {
+        return Some(0);
+    }
+    let (Some(media_timescale), Some(movie_timescale)) = (media_timescale, movie_timescale) else {
+        return None;
+    };
+    if movie_timescale == 0 {
+        return None;
+    }
+    let numerator = u128::from(movie_ticks) * u128::from(media_timescale);
+    let denominator = u128::from(movie_timescale);
+    if numerator % denominator == 0 {
+        u64::try_from(numerator / denominator).ok()
+    } else {
+        None
+    }
+}
+
+fn quicktime_multi_segment_presentation_times(
+    entries: &[QuickTimeEditEntry],
+    empty_duration_media_ticks: u64,
+    sample_media_times: &[u64],
+    media_duration_ticks: u64,
+    media_timescale: Option<u32>,
+    movie_timescale: Option<u32>,
+) -> std::result::Result<Vec<i64>, String> {
+    let mut out = vec![None; sample_media_times.len()];
+    let mut cursor = empty_duration_media_ticks;
+    for entry in entries {
+        let start =
+            u64::try_from(entry.media_time).map_err(|_| "negative media_time".to_string())?;
+        let duration = quicktime_movie_ticks_to_media_ticks(
+            entry.segment_duration,
+            media_timescale,
+            movie_timescale,
+        )
+        .ok_or_else(|| {
+            "media segment duration cannot be represented exactly in media ticks".to_string()
+        })?;
+        let end = start
+            .checked_add(duration)
+            .ok_or_else(|| "media segment duration overflows".to_string())?;
+        if end > media_duration_ticks {
+            return Err("media segment extends past media duration".into());
+        }
+        let start_index = sample_media_times
+            .binary_search(&start)
+            .map_err(|_| "media segment start is not sample-aligned".to_string())?;
+        let end_index = if end == media_duration_ticks {
+            sample_media_times.len()
+        } else {
+            sample_media_times
+                .binary_search(&end)
+                .map_err(|_| "media segment end is not sample-aligned".to_string())?
+        };
+        if start_index >= end_index {
+            return Err("media segment contains no complete samples".into());
+        }
+        for sample_index in start_index..end_index {
+            if out[sample_index].is_some() {
+                return Err("media segments overlap in sample space".into());
+            }
+            let t = cursor
+                .checked_add(sample_media_times[sample_index] - start)
+                .ok_or_else(|| "presentation time overflows".to_string())?;
+            out[sample_index] = Some(
+                i64::try_from(t).map_err(|_| "presentation time exceeds i64 range".to_string())?,
+            );
+        }
+        cursor = cursor
+            .checked_add(duration)
+            .ok_or_else(|| "presentation timeline duration overflows".to_string())?;
+    }
+    out.into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "edit list media segments do not cover every sample".into())
+}
+
+fn quicktime_edit_presentation_times(
+    entries: &[QuickTimeEditEntry],
+    media_timescale: Option<u32>,
+    movie_timescale: Option<u32>,
+    sample_media_times: &[u64],
+    media_duration_ticks: u64,
+    metadata: &mut HashMap<String, MetadataValue>,
+) -> Option<Vec<i64>> {
+    let mut empty_count = 0usize;
+    let mut empty_movie_ticks = 0u64;
+    let mut media_segments = Vec::new();
+    for entry in entries {
+        if (entry.media_rate - 1.0).abs() > f64::EPSILON {
+            metadata.insert(
+                "quicktime.edit_list.presentation_status".into(),
+                MetadataValue::String("not_applied_non_unit_rate".into()),
+            );
+            metadata.insert(
+                "quicktime.edit_list.presentation_diagnostic".into(),
+                MetadataValue::String(format!(
+                    "edit list contains media_rate {}",
+                    entry.media_rate
+                )),
+            );
+            metadata.insert(
+                "quicktime.edit_list.media_rate".into(),
+                MetadataValue::Float(entry.media_rate),
+            );
+            return None;
+        }
+        if entry.media_time < 0 {
+            if !media_segments.is_empty() {
+                metadata.insert(
+                    "quicktime.edit_list.presentation_status".into(),
+                    MetadataValue::String("not_applied_complex_edit_list".into()),
+                );
+                metadata.insert(
+                    "quicktime.edit_list.presentation_diagnostic".into(),
+                    MetadataValue::String("empty edit follows a media segment".into()),
+                );
+                return None;
+            }
+            empty_count += 1;
+            empty_movie_ticks = empty_movie_ticks.checked_add(entry.segment_duration)?;
+        } else {
+            media_segments.push(*entry);
+        }
+    }
+    metadata.insert(
+        "quicktime.edit_list.empty_edit_count".into(),
+        MetadataValue::Int(empty_count as i64),
+    );
+    quicktime_insert_u64_metadata(
+        metadata,
+        "quicktime.edit_list.empty_duration_movie_ticks",
+        empty_movie_ticks,
+    );
+    let first = media_segments.first()?;
+    metadata.insert(
+        "quicktime.edit_list.media_time_ticks".into(),
+        MetadataValue::Int(first.media_time),
+    );
+    metadata.insert(
+        "quicktime.edit_list.media_rate".into(),
+        MetadataValue::Float(first.media_rate),
+    );
+    let empty_media_ticks =
+        quicktime_movie_ticks_to_media_ticks(empty_movie_ticks, media_timescale, movie_timescale)?;
+    if media_segments.len() == 1 {
+        let offset = i64::try_from(empty_media_ticks)
+            .ok()?
+            .checked_sub(first.media_time)?;
+        metadata.insert(
+            "quicktime.edit_list.presentation_status".into(),
+            MetadataValue::String(if empty_count == 0 {
+                "applied_single_normal_speed_media_segment".into()
+            } else {
+                "applied_leading_empty_edits_single_normal_speed_media_segment".into()
+            }),
+        );
+        metadata.insert(
+            "quicktime.edit_list.presentation_diagnostic".into(),
+            MetadataValue::String(format!(
+                "media_time {} applied at normal speed",
+                first.media_time
+            )),
+        );
+        metadata.insert(
+            "quicktime.edit_list.presentation_offset_ticks".into(),
+            MetadataValue::Int(offset),
+        );
+        return sample_media_times
+            .iter()
+            .map(|time| i64::try_from(*time).ok()?.checked_add(offset))
+            .collect();
+    }
+    match quicktime_multi_segment_presentation_times(
+        &media_segments,
+        empty_media_ticks,
+        sample_media_times,
+        media_duration_ticks,
+        media_timescale,
+        movie_timescale,
+    ) {
+        Ok(times) => {
+            metadata.insert(
+                "quicktime.edit_list.presentation_status".into(),
+                MetadataValue::String(if empty_count == 0 {
+                    "applied_multiple_normal_speed_media_segments".into()
+                } else {
+                    "applied_leading_empty_edits_multiple_normal_speed_media_segments".into()
+                }),
+            );
+            metadata.insert(
+                "quicktime.edit_list.presentation_diagnostic".into(),
+                MetadataValue::String(format!(
+                    "{} media segments applied at normal speed with sample-aligned boundaries",
+                    media_segments.len()
+                )),
+            );
+            Some(times)
+        }
+        Err(diagnostic) => {
+            metadata.insert(
+                "quicktime.edit_list.presentation_status".into(),
+                MetadataValue::String("not_applied_complex_edit_list".into()),
+            );
+            metadata.insert(
+                "quicktime.edit_list.presentation_diagnostic".into(),
+                MetadataValue::String(format!("multiple media segments not applied: {diagnostic}")),
+            );
+            None
+        }
+    }
+}
+
+fn parse_quicktime(data: &[u8]) -> Result<Vec<QuickTimeParsed>> {
     if scan_atoms(data, 0)?.is_empty() {
         return Err(BioFormatsError::UnsupportedFormat(
             "QuickTime file has no atoms".into(),
         ));
     }
-    let stsd = first_descendant(
-        data,
-        &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd"],
-    )?
-    .ok_or_else(|| BioFormatsError::UnsupportedFormat("QuickTime missing stsd atom".into()))?;
-    let stsz = first_descendant(
-        data,
-        &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsz"],
-    )?
-    .ok_or_else(|| BioFormatsError::UnsupportedFormat("QuickTime missing stsz atom".into()))?;
-    let stco = first_descendant(
-        data,
-        &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stco"],
-    )?
-    .ok_or_else(|| BioFormatsError::UnsupportedFormat("QuickTime missing stco atom".into()))?;
+    let moov = first_descendant(data, &[*b"moov"])?
+        .ok_or_else(|| BioFormatsError::UnsupportedFormat("QuickTime missing moov atom".into()))?;
+    let tracks = scan_atoms(moov.data, moov.start + 8)?;
+    let video_tracks = tracks
+        .iter()
+        .copied()
+        .filter(|atom| atom.kind == *b"trak")
+        .filter_map(|trak| {
+            let stsd = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stsd"]).ok()??;
+            let stsz = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stsz"]).ok()??;
+            Some((trak, stsd, stsz))
+        })
+        .collect::<Vec<_>>();
+    if video_tracks.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime missing stsd atom".into(),
+        ));
+    }
 
+    let movie_header = first_descendant(data, &[*b"moov", *b"mvhd"])?
+        .map(|atom| parse_quicktime_time_header(atom, "mvhd"))
+        .transpose()?;
+    let mut parsed_tracks = Vec::with_capacity(video_tracks.len());
+    for (track_index, (trak, stsd, stsz)) in video_tracks.iter().copied().enumerate() {
+        parsed_tracks.push(parse_quicktime_track(
+            data,
+            trak,
+            stsd,
+            stsz,
+            movie_header,
+            video_tracks.len(),
+            track_index,
+        )?);
+    }
+
+    if parsed_tracks.len() > 1 && !quicktime_tracks_are_compatible(&parsed_tracks) {
+        let diagnostics = parsed_tracks
+            .iter()
+            .enumerate()
+            .map(|(index, parsed)| {
+                format!(
+                    "track {}: codec={} {}x{} samples={}",
+                    index + 1,
+                    parsed
+                        .meta
+                        .series_metadata
+                        .get("quicktime.codec")
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "unknown".into()),
+                    parsed.meta.size_x,
+                    parsed.meta.size_y,
+                    parsed.meta.image_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime files with multiple incompatible video tracks are unsupported ({diagnostics})"
+        )));
+    }
+
+    Ok(parsed_tracks)
+}
+
+fn quicktime_tracks_are_compatible(tracks: &[QuickTimeParsed]) -> bool {
+    let Some(first) = tracks.first() else {
+        return true;
+    };
+    tracks.iter().skip(1).all(|track| {
+        track.codec == first.codec
+            && track.samples_per_pixel == first.samples_per_pixel
+            && track.meta.size_x == first.meta.size_x
+            && track.meta.size_y == first.meta.size_y
+            && track.meta.size_c == first.meta.size_c
+            && track.meta.pixel_type == first.meta.pixel_type
+            && track.meta.bits_per_pixel == first.meta.bits_per_pixel
+            && track.meta.is_rgb == first.meta.is_rgb
+            && track.meta.is_interleaved == first.meta.is_interleaved
+    })
+}
+
+fn parse_quicktime_track(
+    data: &[u8],
+    trak: Atom<'_>,
+    stsd: Atom<'_>,
+    stsz: Atom<'_>,
+    movie_header: Option<(u32, u64)>,
+    video_track_count: usize,
+    video_track_index: usize,
+) -> Result<QuickTimeParsed> {
+    let stco = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stco"])?
+        .ok_or_else(|| BioFormatsError::UnsupportedFormat("QuickTime missing stco atom".into()))?;
     if stsd.data.len() < 44 || be_u32_at(stsd.data, 4) != Some(1) {
         return Err(BioFormatsError::UnsupportedFormat(
             "QuickTime stsd must contain exactly one video sample description".into(),
@@ -546,6 +1297,8 @@ fn parse_quicktime(data: &[u8]) -> Result<QuickTimeParsed> {
     let codec = entry.get(4..8).ok_or_else(|| {
         BioFormatsError::UnsupportedFormat("QuickTime stsd entry is truncated".into())
     })?;
+    let sample_depth = be_u16_at(entry, 82).unwrap_or(0);
+    let qt_codec = quicktime_codec_from_fourcc(codec, sample_depth)?;
     let width = be_u16_at(entry, 32).unwrap_or(0) as u32;
     let height = be_u16_at(entry, 34).unwrap_or(0) as u32;
     if width == 0 || height == 0 {
@@ -553,15 +1306,12 @@ fn parse_quicktime(data: &[u8]) -> Result<QuickTimeParsed> {
             "QuickTime video sample entry has non-positive dimensions".into(),
         ));
     }
-    let samples_per_pixel = match codec {
-        b"raw " | b"RAW " | b"rgb " => 3usize,
-        b"gray" | b"GREY" | b"y800" => 1usize,
-        other => {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "QuickTime codec {} is unsupported by the blind parser",
-                String::from_utf8_lossy(other)
-            )))
-        }
+    let mut samples_per_pixel = match qt_codec {
+        QuickTimeCodec::UncompressedRgb => 3usize,
+        QuickTimeCodec::UncompressedGray => 1usize,
+        QuickTimeCodec::Jpeg | QuickTimeCodec::Png => 3usize,
+        QuickTimeCodec::Cinepak { depth: 8 } => 1usize,
+        QuickTimeCodec::Cinepak { .. } => 3usize,
     };
 
     if stsz.data.len() < 12 {
@@ -613,13 +1363,178 @@ fn parse_quicktime(data: &[u8]) -> Result<QuickTimeParsed> {
             ));
         }
     }
+    let first_sample =
+        &data[sample_offsets[0] as usize..sample_offsets[0] as usize + sample_sizes[0] as usize];
+    match qt_codec {
+        QuickTimeCodec::Jpeg => {
+            let mut decoder = jpeg_decoder::Decoder::new(first_sample);
+            decoder.decode().map_err(|err| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "QuickTime JPEG sample 0 failed to decode: {err}"
+                ))
+            })?;
+            let info = decoder.info().ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "QuickTime JPEG sample 0 has no image info".into(),
+                )
+            })?;
+            samples_per_pixel = match info.pixel_format {
+                jpeg_decoder::PixelFormat::L8 => 1,
+                jpeg_decoder::PixelFormat::RGB24 => 3,
+                other => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "QuickTime JPEG sample 0 pixel format {other:?} is unsupported"
+                    )))
+                }
+            };
+        }
+        QuickTimeCodec::Png => {
+            let image = image::load_from_memory_with_format(first_sample, image::ImageFormat::Png)
+                .map_err(|err| {
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "QuickTime PNG sample 0 failed to decode: {err}"
+                    ))
+                })?;
+            samples_per_pixel = match image.color() {
+                image::ColorType::L8 => 1,
+                image::ColorType::La8 => 2,
+                image::ColorType::Rgb8 => 3,
+                image::ColorType::Rgba8 => 4,
+                other => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "QuickTime PNG sample 0 pixel format {other:?} is unsupported"
+                    )))
+                }
+            };
+        }
+        QuickTimeCodec::Cinepak { depth } => {
+            let probe_meta = ImageMetadata {
+                size_x: width,
+                size_y: height,
+                size_z: 1,
+                size_c: samples_per_pixel as u32,
+                size_t: sample_sizes.len() as u32,
+                pixel_type: PixelType::Uint8,
+                bits_per_pixel: 8,
+                image_count: sample_sizes.len() as u32,
+                dimension_order: DimensionOrder::XYZCT,
+                is_rgb: samples_per_pixel == 3,
+                is_interleaved: samples_per_pixel == 3,
+                is_indexed: false,
+                is_little_endian: false,
+                resolution_count: 1,
+                series_metadata: HashMap::new(),
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            };
+            decode_quicktime_cinepak_sample(first_sample, &probe_meta, 0, depth, None)?;
+        }
+        _ => {}
+    }
 
     let pixel_type = PixelType::Uint8;
     let mut metadata = HashMap::new();
     metadata.insert(
         "quicktime.codec".into(),
-        crate::common::metadata::MetadataValue::String(String::from_utf8_lossy(codec).into_owned()),
+        MetadataValue::String(String::from_utf8_lossy(codec).into_owned()),
     );
+    metadata.insert(
+        "quicktime.codec_family".into(),
+        MetadataValue::String(quicktime_codec_family(codec).into()),
+    );
+    metadata.insert(
+        "quicktime.video_track_count".into(),
+        MetadataValue::Int(video_track_count as i64),
+    );
+    metadata.insert(
+        "quicktime.video_track_index".into(),
+        MetadataValue::Int(video_track_index as i64),
+    );
+    quicktime_insert_u64_metadata(
+        &mut metadata,
+        "quicktime.sample_count",
+        sample_sizes.len() as u64,
+    );
+    if let QuickTimeCodec::Cinepak { depth } = qt_codec {
+        metadata.insert(
+            "quicktime.cinepak.depth".into(),
+            MetadataValue::Int(depth as i64),
+        );
+    }
+    let media_header = descendant(trak, &[*b"mdia", *b"mdhd"])?
+        .map(|atom| parse_quicktime_time_header(atom, "mdhd"))
+        .transpose()?;
+    let stts_entries = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stts"])?
+        .map(|atom| parse_quicktime_stts(atom, sample_sizes.len()))
+        .transpose()?;
+    let edit_entries = descendant(trak, &[*b"edts", *b"elst"])?
+        .map(parse_quicktime_elst)
+        .transpose()?;
+    if let Some((timescale, duration)) = media_header {
+        metadata.insert(
+            "quicktime.timescale".into(),
+            MetadataValue::Int(timescale as i64),
+        );
+        quicktime_insert_u64_metadata(&mut metadata, "quicktime.duration_ticks", duration);
+        metadata.insert(
+            "quicktime.duration_seconds".into(),
+            MetadataValue::Float(duration as f64 / f64::from(timescale)),
+        );
+    }
+    if let Some((timescale, duration)) = movie_header {
+        metadata.insert(
+            "quicktime.movie_timescale".into(),
+            MetadataValue::Int(timescale as i64),
+        );
+        quicktime_insert_u64_metadata(&mut metadata, "quicktime.movie_duration_ticks", duration);
+    }
+    if let Some(entries) = &stts_entries {
+        if let Some(sample_media_times) = quicktime_sample_media_times(entries) {
+            quicktime_insert_u64_list_metadata(
+                &mut metadata,
+                "quicktime.sample_media_time_ticks",
+                &sample_media_times,
+            );
+            let sample_presentation_times = if let Some(edit_entries) = &edit_entries {
+                quicktime_edit_presentation_times(
+                    edit_entries,
+                    media_header.map(|(timescale, _)| timescale),
+                    movie_header.map(|(timescale, _)| timescale),
+                    &sample_media_times,
+                    quicktime_stts_total_duration(entries).unwrap_or(0),
+                    &mut metadata,
+                )
+            } else {
+                sample_media_times
+                    .iter()
+                    .map(|time| i64::try_from(*time).ok())
+                    .collect::<Option<Vec<_>>>()
+            };
+            if let Some(sample_presentation_times) = sample_presentation_times {
+                quicktime_insert_i64_list_metadata(
+                    &mut metadata,
+                    "quicktime.sample_presentation_time_ticks",
+                    &sample_presentation_times,
+                );
+                if let Some((timescale, _)) = media_header {
+                    quicktime_insert_seconds_list_metadata(
+                        &mut metadata,
+                        "quicktime.sample_presentation_time_seconds",
+                        &sample_presentation_times,
+                        timescale,
+                    );
+                }
+            }
+        }
+    }
+    if let Some(entries) = &edit_entries {
+        metadata.insert(
+            "quicktime.edit_list.count".into(),
+            MetadataValue::Int(entries.len() as i64),
+        );
+    }
     let meta = ImageMetadata {
         size_x: width,
         size_y: height,
@@ -630,8 +1545,8 @@ fn parse_quicktime(data: &[u8]) -> Result<QuickTimeParsed> {
         bits_per_pixel: 8,
         image_count: sample_sizes.len() as u32,
         dimension_order: DimensionOrder::XYZCT,
-        is_rgb: samples_per_pixel == 3,
-        is_interleaved: samples_per_pixel == 3,
+        is_rgb: samples_per_pixel >= 3,
+        is_interleaved: samples_per_pixel > 1,
         is_indexed: false,
         is_little_endian: false,
         resolution_count: 1,
@@ -646,6 +1561,7 @@ fn parse_quicktime(data: &[u8]) -> Result<QuickTimeParsed> {
         sample_offsets,
         sample_sizes,
         samples_per_pixel,
+        codec: qt_codec,
     })
 }
 
@@ -1001,7 +1917,6 @@ impl FormatReader for MngReader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // 4. 3i SlideBook
@@ -2330,17 +3245,16 @@ impl FormatReader for MincReader {
 /// grouped into series by matching width/height/volume-type against previously
 /// seen "representative" planes, exactly as the Java reader does.
 ///
-/// Pixel reads cover the documented non-PICT cases:
+/// Pixel reads cover the documented cases:
 /// - **version 2**: raw uncompressed planes;
 /// - **version 5**: LZO-compressed planes (8-bit greyscale and 24-bit colour),
 ///   decoded with [`crate::common::codec::decompress_lzo`] and unpacked using
 ///   the same stride logic as Java's `openBytes`.
+/// - embedded Apple PICT bitmap/pixmap payloads through the shared PICT reader.
 ///
 /// MAC_256 greyscale/colour planes are bit-inverted as in Java.
 ///
-/// NOT PORTED: embedded Apple PICT planes (`planeInfo.pict`) require a PICT
-/// decoder and return `UnsupportedFormat`; the `parseImageNames` Z/C/T axis and
-/// special-plate-name inference and the OME stage/detector metadata are omitted.
+/// NOT PORTED: richer OME stage/detector metadata is omitted.
 const OPENLAB_LIFF_MAGIC: u64 = 0x0000_ffff_696d_7072;
 
 // Openlab image (volume) types.
@@ -2360,6 +3274,14 @@ const OL_IMAGE_TYPE_1: i32 = 67;
 const OL_IMAGE_TYPE_2: i32 = 68;
 const OL_CALIBRATION: i32 = 69;
 
+fn parse_axis_token(token: &str, axis: char) -> Option<u32> {
+    let mut chars = token.chars();
+    if chars.next()? != axis {
+        return None;
+    }
+    chars.as_str().parse::<u32>().ok().filter(|v| *v > 0)
+}
+
 #[derive(Clone)]
 struct OpenlabPlane {
     plane_offset: usize,
@@ -2367,6 +3289,7 @@ struct OpenlabPlane {
     pict: bool,
     width: u32,
     height: u32,
+    name: String,
     series: i32,
 }
 
@@ -2376,6 +3299,8 @@ pub struct OpenlabLiffReader {
     planes: Vec<OpenlabPlane>,
     /// Per-series list of indices into `planes`.
     plane_offsets: Vec<Vec<usize>>,
+    /// Optional per-series Z/C/T coordinates inferred from plane names.
+    plane_zct: Vec<Option<Vec<(u32, u32, u32)>>>,
     metas: Vec<ImageMetadata>,
     current: usize,
 }
@@ -2387,9 +3312,68 @@ impl OpenlabLiffReader {
             version: 0,
             planes: Vec::new(),
             plane_offsets: Vec::new(),
+            plane_zct: Vec::new(),
             metas: Vec::new(),
             current: 0,
         }
+    }
+
+    fn volume_type_name(volume_type: i32) -> &'static str {
+        match volume_type {
+            OL_MAC_1_BIT => "MAC_1_BIT",
+            OL_MAC_4_GREYS => "MAC_4_GREYS",
+            OL_MAC_16_GREYS => "MAC_16_GREYS",
+            OL_MAC_16_COLORS => "MAC_16_COLORS",
+            OL_MAC_256_GREYS => "MAC_256_GREYS",
+            OL_MAC_256_COLORS => "MAC_256_COLORS",
+            OL_MAC_16_BIT_COLOR => "MAC_16_BIT_COLOR",
+            OL_MAC_24_BIT_COLOR => "MAC_24_BIT_COLOR",
+            OL_DEEP_GREY_9 => "DEEP_GREY_9",
+            10 => "DEEP_GREY_10",
+            11 => "DEEP_GREY_11",
+            12 => "DEEP_GREY_12",
+            13 => "DEEP_GREY_13",
+            14 => "DEEP_GREY_14",
+            15 => "DEEP_GREY_15",
+            OL_DEEP_GREY_16 => "DEEP_GREY_16",
+            _ => "UNKNOWN",
+        }
+    }
+
+    fn infer_name_axes(names: &[String]) -> Option<(String, Vec<(u32, u32, u32)>, u32, u32, u32)> {
+        let mut coords = Vec::with_capacity(names.len());
+        let mut image_name: Option<String> = None;
+        let mut max_z = 0u32;
+        let mut max_c = 0u32;
+        let mut max_t = 0u32;
+
+        for name in names {
+            let tokens: Vec<&str> = name.split_whitespace().collect();
+            if tokens.len() < 4 {
+                return None;
+            }
+            let z = parse_axis_token(tokens[tokens.len() - 3], 'Z')?;
+            let c = parse_axis_token(tokens[tokens.len() - 2], 'C')?;
+            let t = parse_axis_token(tokens[tokens.len() - 1], 'T')?;
+            let prefix = tokens[..tokens.len() - 3].join(" ");
+            if prefix.is_empty() {
+                return None;
+            }
+            match &image_name {
+                Some(existing) if existing != &prefix => return None,
+                None => image_name = Some(prefix),
+                _ => {}
+            }
+            let z0 = z.checked_sub(1)?;
+            let c0 = c.checked_sub(1)?;
+            let t0 = t.checked_sub(1)?;
+            max_z = max_z.max(z);
+            max_c = max_c.max(c);
+            max_t = max_t.max(t);
+            coords.push((z0, c0, t0));
+        }
+
+        Some((image_name?, coords, max_z, max_c, max_t))
     }
 
     /// Read one tag header (Java `readTagHeader`). Returns
@@ -2496,6 +3480,7 @@ impl OpenlabLiffReader {
                     pict,
                     width,
                     height,
+                    name,
                     series,
                 });
             } else if tag == OL_CALIBRATION {
@@ -2532,6 +3517,7 @@ impl OpenlabLiffReader {
         }
 
         let mut metas = Vec::with_capacity(n_series);
+        let mut plane_zct = Vec::with_capacity(n_series);
         for (i, list) in plane_offsets.iter().enumerate() {
             if list.is_empty() {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
@@ -2589,16 +3575,58 @@ impl OpenlabLiffReader {
             meta.size_z = meta.image_count;
             meta.dimension_order = DimensionOrder::XYCZT;
             meta.is_little_endian = false;
+            meta.series_metadata
+                .insert("openlab.version".into(), MetadataValue::Int(version as i64));
+            meta.series_metadata.insert(
+                "openlab.volume_type".into(),
+                MetadataValue::Int(first.volume_type as i64),
+            );
+            meta.series_metadata.insert(
+                "openlab.volume_type_name".into(),
+                MetadataValue::String(Self::volume_type_name(first.volume_type).into()),
+            );
+            meta.series_metadata.insert(
+                "openlab.pixel_payload".into(),
+                MetadataValue::String(if first.pict {
+                    "pict".into()
+                } else if version == 5 {
+                    "lzo".into()
+                } else {
+                    "raw".into()
+                }),
+            );
             if i == 0 {
-                use crate::common::metadata::MetadataValue;
                 if xcal != 0.0 {
-                    meta.series_metadata
-                        .insert("openlab.physical_size_x".into(), MetadataValue::Float(xcal as f64));
+                    meta.series_metadata.insert(
+                        "openlab.physical_size_x".into(),
+                        MetadataValue::Float(xcal as f64),
+                    );
                 }
                 if ycal != 0.0 {
-                    meta.series_metadata
-                        .insert("openlab.physical_size_y".into(), MetadataValue::Float(ycal as f64));
+                    meta.series_metadata.insert(
+                        "openlab.physical_size_y".into(),
+                        MetadataValue::Float(ycal as f64),
+                    );
                 }
+            }
+            let names: Vec<String> = list.iter().map(|&idx| planes[idx].name.clone()).collect();
+            let inferred = Self::infer_name_axes(&names);
+            if let Some((image_name, coords, size_z, size_c, size_t)) = inferred {
+                meta.size_z = size_z;
+                meta.size_c = size_c;
+                meta.size_t = size_t;
+                meta.image_count = list.len() as u32;
+                meta.series_metadata.insert(
+                    "openlab.image_name".into(),
+                    MetadataValue::String(image_name),
+                );
+                meta.series_metadata.insert(
+                    "openlab.image_name_zct_inference".into(),
+                    MetadataValue::Bool(true),
+                );
+                plane_zct.push(Some(coords));
+            } else {
+                plane_zct.push(None);
             }
             metas.push(meta);
         }
@@ -2608,17 +3636,31 @@ impl OpenlabLiffReader {
             version,
             planes,
             plane_offsets,
+            plane_zct,
             metas,
             current: 0,
         })
     }
 
-    /// Read and decode a non-PICT plane (full image).
-    fn read_plane(&self, data: &[u8], plane: &OpenlabPlane, meta: &ImageMetadata) -> Result<Vec<u8>> {
+    /// Read and decode a plane (full image).
+    fn read_plane(
+        &self,
+        data: &[u8],
+        plane: &OpenlabPlane,
+        meta: &ImageMetadata,
+    ) -> Result<Vec<u8>> {
         if plane.pict {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Openlab LIFF: embedded PICT planes are not supported".into(),
-            ));
+            let start = plane
+                .plane_offset
+                .checked_add(10)
+                .ok_or_else(|| BioFormatsError::Format("Openlab PICT offset overflows".into()))?;
+            if start >= data.len() {
+                return Err(BioFormatsError::Format(
+                    "Openlab LIFF PICT payload is missing".into(),
+                ));
+            }
+            return crate::formats::legacy::parse_pict_bytes(&data[start..])
+                .map(|decoded| decoded.pixels);
         }
         let w = meta.size_x as usize;
         let h = meta.size_y as usize;
@@ -2716,6 +3758,7 @@ impl FormatReader for OpenlabLiffReader {
         self.version = 0;
         self.planes.clear();
         self.plane_offsets.clear();
+        self.plane_zct.clear();
         self.metas.clear();
         self.current = 0;
         Ok(())
@@ -2788,6 +3831,55 @@ impl FormatReader for OpenlabLiffReader {
         let tx = (sx - tw) / 2;
         let ty = (sy - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{create_lsid, OmeMetadata, OmePlane, OmePlate};
+
+        let meta = self.metas.get(self.current)?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.get_mut(0) {
+            if let Some(MetadataValue::String(name)) =
+                meta.series_metadata.get("openlab.image_name")
+            {
+                image.name = Some(name.clone());
+            }
+            if let Some(MetadataValue::Float(v)) =
+                meta.series_metadata.get("openlab.physical_size_x")
+            {
+                image.physical_size_x = Some(*v);
+            }
+            if let Some(MetadataValue::Float(v)) =
+                meta.series_metadata.get("openlab.physical_size_y")
+            {
+                image.physical_size_y = Some(*v);
+            }
+            if let Some(Some(coords)) = self.plane_zct.get(self.current) {
+                image.planes = coords
+                    .iter()
+                    .map(|&(the_z, the_c, the_t)| OmePlane {
+                        the_z,
+                        the_c,
+                        the_t,
+                        ..Default::default()
+                    })
+                    .collect();
+            }
+        }
+
+        if let Some(MetadataValue::String(name)) = meta.series_metadata.get("openlab.image_name") {
+            if let Some(plate_name) = name.split_whitespace().next() {
+                if !plate_name.is_empty() {
+                    ome.plates.push(OmePlate {
+                        id: Some(create_lsid("Plate", &[0])),
+                        name: Some(plate_name.to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        let _ = ome.add_original_metadata_annotations(meta, 0);
+        Some(ome)
     }
 }
 
@@ -2975,7 +4067,6 @@ impl FormatReader for Jpeg2000Reader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // 9. SM-Camera

@@ -93,9 +93,9 @@ fn avi_frame_layout(width: u32, height: u32, channels: usize) -> Result<(usize, 
     // bytes-per-pixel (here `channels`, since samples are 8-bit).
     let padded_width = {
         let npad = (4 - (width as usize) % 4) % 4;
-        (width as usize).checked_add(npad).ok_or_else(|| {
-            BioFormatsError::InvalidData("AVI: padded row width overflows".into())
-        })?
+        (width as usize)
+            .checked_add(npad)
+            .ok_or_else(|| BioFormatsError::InvalidData("AVI: padded row width overflows".into()))?
     };
     let stored_row = padded_width.checked_mul(channels).ok_or_else(|| {
         BioFormatsError::InvalidData("AVI: padded row byte count overflows".into())

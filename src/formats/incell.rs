@@ -639,8 +639,7 @@ impl InCellReader {
         } else {
             m.channels_per_timepoint.clone()
         };
-        let one_timepoint_per_series =
-            channels_per_timepoint.windows(2).any(|w| w[0] != w[1]);
+        let one_timepoint_per_series = channels_per_timepoint.windows(2).any(|w| w[0] != w[1]);
 
         // Number of (well, field) combinations.
         let well_field_count = plate_wells.len() * field_count;
@@ -703,25 +702,25 @@ impl InCellReader {
         for s in 0..series_count {
             // Map the series index to (well, field, timepoint range) following
             // Java getWellFromSeries / getFieldFromSeries / openBytes.
-            let (well_idx, field, series_size_c, series_size_t, t_base) = if one_timepoint_per_series
-            {
-                // Each timepoint is its own series: series order is well-major,
-                // then field, then timepoint (fastest). See Java lines 519-552,
-                // 807-829: getFieldFromSeries divides by channelsPerTimepoint.size().
-                let s2 = s / cpt_len;
-                let timepoint = s % cpt_len;
-                let (well, fld) =
-                    series_to_well_field(s2, &plate_wells, field_count, m.well_cols);
-                let c = channels_per_timepoint
-                    .get(timepoint)
-                    .copied()
-                    .unwrap_or(size_c);
-                (well, fld, c, 1u32, timepoint as u32)
-            } else {
-                let (well, fld) =
-                    series_to_well_field(s, &plate_wells, field_count, m.well_cols);
-                (well, fld, size_c, size_t, 0u32)
-            };
+            let (well_idx, field, series_size_c, series_size_t, t_base) =
+                if one_timepoint_per_series {
+                    // Each timepoint is its own series: series order is well-major,
+                    // then field, then timepoint (fastest). See Java lines 519-552,
+                    // 807-829: getFieldFromSeries divides by channelsPerTimepoint.size().
+                    let s2 = s / cpt_len;
+                    let timepoint = s % cpt_len;
+                    let (well, fld) =
+                        series_to_well_field(s2, &plate_wells, field_count, m.well_cols);
+                    let c = channels_per_timepoint
+                        .get(timepoint)
+                        .copied()
+                        .unwrap_or(size_c);
+                    (well, fld, c, 1u32, timepoint as u32)
+                } else {
+                    let (well, fld) =
+                        series_to_well_field(s, &plate_wells, field_count, m.well_cols);
+                    (well, fld, size_c, size_t, 0u32)
+                };
 
             let mut meta_map = HashMap::new();
             meta_map.insert(
@@ -764,8 +763,7 @@ impl InCellReader {
                         for c in 0..series_size_c {
                             for z in 0..size_z {
                                 let src_index = (z + c * size_z) as usize;
-                                let dst =
-                                    (z + c * size_z + t * size_z * series_size_c) as usize;
+                                let dst = (z + c * size_z + t * size_z * series_size_c) as usize;
                                 if let Some(Some(p)) =
                                     tp.and_then(|tp| tp.get(src_index)).map(|p| p.as_ref())
                                 {
@@ -1092,8 +1090,7 @@ impl FormatReader for InCellReader {
             let mut sample = 0usize;
             for field in 0..field_count {
                 for tp in 0..total_timepoints {
-                    let series =
-                        (well_ordinal * field_count + field) * total_timepoints + tp;
+                    let series = (well_ordinal * field_count + field) * total_timepoints + tp;
                     if series >= series_count {
                         continue;
                     }

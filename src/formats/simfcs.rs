@@ -12,7 +12,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -79,6 +79,19 @@ impl FormatReader for SimfcsReader {
             )));
         }
         let image_count = (file_size / frame_bytes) as u32;
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert("format".into(), MetadataValue::String("SimFCS".into()));
+        series_metadata.insert("simfcs.extension".into(), MetadataValue::String(ext));
+        series_metadata.insert("simfcs.width".into(), MetadataValue::Int(256));
+        series_metadata.insert("simfcs.height".into(), MetadataValue::Int(256));
+        series_metadata.insert(
+            "simfcs.frame_bytes".into(),
+            MetadataValue::Int(frame_bytes as i64),
+        );
+        series_metadata.insert(
+            "simfcs.payload_bytes".into(),
+            MetadataValue::Int(file_size as i64),
+        );
 
         let meta = ImageMetadata {
             size_x: 256,
@@ -95,7 +108,7 @@ impl FormatReader for SimfcsReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
-            series_metadata: HashMap::new(),
+            series_metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
@@ -173,5 +186,12 @@ impl FormatReader for SimfcsReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let _ = ome.add_original_metadata_annotations(meta, 0);
+        Some(ome)
     }
 }

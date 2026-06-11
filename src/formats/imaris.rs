@@ -29,8 +29,14 @@ pub struct ImarisReader {
     bytes_per_sample: usize,
     // Spatial extents from DataSetInfo/Image: [minX,minY,minZ,maxX,maxY,maxZ].
     extents: Option<[f64; 6]>,
+    // RecordingEntrySample/Line/PlaneSpacing from DataSetInfo/Image, in X/Y/Z order.
+    recording_spacing: [Option<f64>; 3],
+    image_description: Option<String>,
     // Per-channel names from DataSetInfo/Channel N.
     channel_names: Vec<Option<String>>,
+    channel_colors: Vec<Option<i32>>,
+    channel_emission_wavelengths: Vec<Option<f64>>,
+    channel_excitation_wavelengths: Vec<Option<f64>>,
     // Cache of the most recently decoded plane so that repeated reads of the
     // same plane do not re-read from disk. Keyed by (resolution, t, c, z).
     // Mirrors the per-Z-block buffer cache in ImarisHDFReader.java. The new
@@ -56,7 +62,12 @@ impl ImarisReader {
             current_resolution: 0,
             bytes_per_sample: 1,
             extents: None,
+            recording_spacing: [None; 3],
+            image_description: None,
             channel_names: Vec::new(),
+            channel_colors: Vec::new(),
+            channel_emission_wavelengths: Vec::new(),
+            channel_excitation_wavelengths: Vec::new(),
             cache: None,
         }
     }
@@ -101,7 +112,12 @@ struct ImsParse {
     resolutions: Vec<ImageMetadata>,
     bytes_per_sample: usize,
     extents: Option<[f64; 6]>,
+    recording_spacing: [Option<f64>; 3],
+    image_description: Option<String>,
     channel_names: Vec<Option<String>>,
+    channel_colors: Vec<Option<i32>>,
+    channel_emission_wavelengths: Vec<Option<f64>>,
+    channel_excitation_wavelengths: Vec<Option<f64>>,
 }
 
 fn parse_ims(path: &Path) -> Result<ImsParse> {
@@ -128,6 +144,12 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => Some([a, b, c, d, e, f]),
         _ => None,
     };
+    let recording_spacing = [
+        ext_val("RecordingEntrySampleSpacing"),
+        ext_val("RecordingEntryLineSpacing"),
+        ext_val("RecordingEntryPlaneSpacing"),
+    ];
+    let image_description = read_str_attr(&img_group, "Description");
 
     // The DataSetInfo/Image X/Y/Z attributes are advisory and unreliable — some
     // writers store 1/1/1 (observed in real .ims files). The authoritative pixel
@@ -136,27 +158,34 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     let (size_z, size_y, size_x) = ims_level_dims(&file, 0)?;
 
     // ── Count channels ──────────────────────────────────────────────────────
-    // Count groups named "Channel N" under DataSetInfo
+    // Count groups named "Channel N" or "Channel_N" under DataSetInfo.
     let ds_info = file
         .group("DataSetInfo")
         .map_err(|e| BioFormatsError::Format(format!("DataSetInfo missing: {e}")))?;
     let mut size_c: u32 = 0;
     if let Ok(members) = hdf5_group_members(&ds_info) {
-        size_c = members.iter().filter(|n| n.starts_with("Channel ")).count() as u32;
+        size_c = count_imaris_indexed_members(&members, "Channel ")?
+            .max(count_imaris_indexed_members(&members, "Channel_")?);
     }
     if size_c == 0 {
-        let tp0 = file
-            .group("DataSet/ResolutionLevel 0/TimePoint 0")
-            .map_err(|e| {
-                BioFormatsError::UnsupportedFormat(format!(
-                    "Imaris: no channel metadata and TimePoint 0 missing: {e}"
-                ))
-            })?;
+        let tp0_path = ims_timepoint_group_path(&file, 0, 0).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "Imaris: no channel metadata and TimePoint 0 missing".into(),
+            )
+        })?;
+        let tp0 = file.group(&tp0_path).map_err(|e| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "Imaris: no channel metadata and {tp0_path} missing: {e}"
+            ))
+        })?;
         size_c = hdf5_group_members(&tp0)
-            .unwrap_or_default()
-            .iter()
-            .filter(|n| n.starts_with("Channel "))
-            .count() as u32;
+            .map(|members| {
+                count_imaris_indexed_members(&members, "Channel ").and_then(|space_count| {
+                    count_imaris_indexed_members(&members, "Channel_")
+                        .map(|underscore_count| space_count.max(underscore_count))
+                })
+            })
+            .unwrap_or(Ok(0))?;
         if size_c == 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "Imaris: no channels found".into(),
@@ -165,13 +194,13 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     }
 
     // ── Count timepoints from DataSet/ResolutionLevel 0 ────────────────────
-    let size_t: u32 = if let Ok(rl0) = file.group("DataSet/ResolutionLevel 0") {
+    let size_t: u32 = if let Some(rl0_path) = ims_resolution_group_path(&file, 0) {
+        let rl0 = file
+            .group(&rl0_path)
+            .map_err(|e| BioFormatsError::Format(format!("Imaris: cannot open {rl0_path}: {e}")))?;
         if let Ok(members) = hdf5_group_members(&rl0) {
-            let n = members
-                .iter()
-                .filter(|n| n.starts_with("TimePoint "))
-                .count() as u32;
-            n
+            count_imaris_indexed_members(&members, "TimePoint ")?
+                .max(count_imaris_indexed_members(&members, "TimePoint_")?)
         } else {
             0
         }
@@ -187,11 +216,9 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     // ── Count resolution levels ─────────────────────────────────────────────
     let n_resolutions: usize = if let Ok(ds_group) = file.group("DataSet") {
         if let Ok(members) = hdf5_group_members(&ds_group) {
-            let n = members
-                .iter()
-                .filter(|n| n.starts_with("ResolutionLevel "))
-                .count();
-            n
+            count_imaris_indexed_members(&members, "ResolutionLevel ")?
+                .max(count_imaris_indexed_members(&members, "ResolutionLevel_")?)
+                as usize
         } else {
             0
         }
@@ -205,8 +232,12 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     }
 
     // ── Determine pixel type from first Data dataset ────────────────────────
-    let data_path = "DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Data";
-    let ds = file.dataset(data_path).map_err(|e| {
+    let data_path = ims_data_path(&file, 0, 0, 0).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(
+            "Imaris: missing DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Data or DataSet/ResolutionLevel_0/TimePoint_0/Channel_0/Data".into(),
+        )
+    })?;
+    let ds = file.dataset(&data_path).map_err(|e| {
         BioFormatsError::UnsupportedFormat(format!("Imaris: missing {data_path}: {e}"))
     })?;
     let (pixel_type, bytes_per_sample) = {
@@ -251,20 +282,82 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
             }
         }
     };
-    validate_ims_data_dataset(&file, data_path, size_x, size_y, size_z, bytes_per_sample)?;
+    validate_ims_data_dataset(&file, &data_path, size_x, size_y, size_z, bytes_per_sample)?;
 
     // ── Collect channel metadata ────────────────────────────────────────────
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
     meta_map.insert("format".into(), MetadataValue::String("Imaris IMS".into()));
+    copy_group_attrs(&file, "DataSetInfo/Image", "imaris.image", &mut meta_map);
+    copy_group_attrs(&file, "DataSetInfo/Imaris", "imaris.info", &mut meta_map);
+    copy_group_attrs(&file, "DataSetInfo/Log", "imaris.log", &mut meta_map);
+    copy_group_attrs(
+        &file,
+        "DataSetInfo/TimeInfo",
+        "imaris.time_info",
+        &mut meta_map,
+    );
+    insert_optional_float(
+        &mut meta_map,
+        "imaris.recording_spacing_x",
+        recording_spacing[0],
+    );
+    insert_optional_float(
+        &mut meta_map,
+        "imaris.recording_spacing_y",
+        recording_spacing[1],
+    );
+    insert_optional_float(
+        &mut meta_map,
+        "imaris.recording_spacing_z",
+        recording_spacing[2],
+    );
+    insert_ims_dataset_metadata(&file, &data_path, &mut meta_map);
     let mut channel_names: Vec<Option<String>> = vec![None; size_c as usize];
+    let mut channel_colors: Vec<Option<i32>> = vec![None; size_c as usize];
+    let mut channel_emission_wavelengths: Vec<Option<f64>> = vec![None; size_c as usize];
+    let mut channel_excitation_wavelengths: Vec<Option<f64>> = vec![None; size_c as usize];
     for c in 0..size_c {
-        if let Ok(ch_group) = file.group(&format!("DataSetInfo/Channel {c}")) {
+        if let Some(ch_path) = ims_dataset_info_channel_path(&file, c) {
+            let Ok(ch_group) = file.group(&ch_path) else {
+                continue;
+            };
+            copy_group_attrs(
+                &file,
+                &ch_path,
+                &format!("imaris.channel.{c}"),
+                &mut meta_map,
+            );
             if let Some(name) = read_str_attr(&ch_group, "Name") {
-                meta_map.insert(format!("channel_{c}_name"), MetadataValue::String(name.clone()));
+                meta_map.insert(
+                    format!("channel_{c}_name"),
+                    MetadataValue::String(name.clone()),
+                );
                 channel_names[c as usize] = Some(name);
             }
             if let Some(color) = read_str_attr(&ch_group, "Color") {
+                if let Some(parsed) = parse_imaris_channel_color(&color) {
+                    insert_imaris_channel_color_metadata(&mut meta_map, c, parsed);
+                    channel_colors[c as usize] = Some(pack_rgba_color(parsed));
+                }
                 meta_map.insert(format!("channel_{c}_color"), MetadataValue::String(color));
+            }
+            if let Some(emission) =
+                read_str_attr(&ch_group, "LSMEmissionWavelength").and_then(|v| parse_imaris_f64(&v))
+            {
+                meta_map.insert(
+                    format!("imaris.channel.{c}.emission_wavelength"),
+                    MetadataValue::Float(emission),
+                );
+                channel_emission_wavelengths[c as usize] = Some(emission);
+            }
+            if let Some(excitation) = read_str_attr(&ch_group, "LSMExcitationWavelength")
+                .and_then(|v| parse_imaris_f64(&v))
+            {
+                meta_map.insert(
+                    format!("imaris.channel.{c}.excitation_wavelength"),
+                    MetadataValue::Float(excitation),
+                );
+                channel_excitation_wavelengths[c as usize] = Some(excitation);
             }
         }
     }
@@ -300,18 +393,21 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     let mut resolutions = Vec::with_capacity(n_resolutions);
     resolutions.push(base_meta.clone());
     for level in 1..n_resolutions {
-        let group_path = format!("DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0");
         let mut lvl = base_meta.clone();
-        let _ = &group_path; // (kept for error context below)
         // Derive this level's dimensions from its own Data dataset shape rather
         // than the ImageSize* attributes (same rationale as level 0).
         let (lz, ly, lx) = ims_level_dims(&file, level)?;
         lvl.size_z = lz;
         lvl.size_y = ly;
         lvl.size_x = lx;
+        let level_data_path = ims_data_path(&file, level, 0, 0).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "Imaris: missing DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data or DataSet/ResolutionLevel_{level}/TimePoint_0/Channel_0/Data"
+            ))
+        })?;
         validate_ims_data_dataset(
             &file,
-            &format!("DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data"),
+            &level_data_path,
             lvl.size_x,
             lvl.size_y,
             lvl.size_z,
@@ -326,11 +422,209 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         resolutions,
         bytes_per_sample,
         extents,
+        recording_spacing,
+        image_description,
         channel_names,
+        channel_colors,
+        channel_emission_wavelengths,
+        channel_excitation_wavelengths,
     })
 }
 
 /// Read an integer attribute (string- or numeric-encoded) from an HDF5 group.
+
+fn insert_optional_float(
+    meta_map: &mut HashMap<String, MetadataValue>,
+    key: &str,
+    value: Option<f64>,
+) {
+    if let Some(v) = value.filter(|v| v.is_finite()) {
+        meta_map.insert(key.to_string(), MetadataValue::Float(v));
+    }
+}
+
+fn parse_imaris_channel_color(value: &str) -> Option<[u8; 4]> {
+    let mut components = Vec::new();
+    for part in value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',' || ch == ';')
+        .filter(|part| !part.is_empty())
+    {
+        components.push(part.parse::<f64>().ok()?);
+    }
+    if !(3..=4).contains(&components.len()) || components.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+
+    let normalized = components.iter().all(|v| (0.0..=1.0).contains(v));
+    let to_u8 = |v: f64| -> u8 {
+        let scaled = if normalized { v * 255.0 } else { v };
+        scaled.round().clamp(0.0, 255.0) as u8
+    };
+
+    Some([
+        to_u8(components[0]),
+        to_u8(components[1]),
+        to_u8(components[2]),
+        components.get(3).map(|v| to_u8(*v)).unwrap_or(255),
+    ])
+}
+
+fn parse_imaris_f64(value: &str) -> Option<f64> {
+    value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',' || ch == ';' || ch == '=')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<f64>().ok())
+        .next_back()
+        .filter(|v| v.is_finite())
+}
+
+fn pack_rgba_color([r, g, b, a]: [u8; 4]) -> i32 {
+    u32::from_be_bytes([r, g, b, a]) as i32
+}
+
+fn insert_imaris_channel_color_metadata(
+    meta_map: &mut HashMap<String, MetadataValue>,
+    channel: u32,
+    [r, g, b, a]: [u8; 4],
+) {
+    let prefix = format!("imaris.channel.{channel}.color");
+    meta_map.insert(format!("{prefix}.red"), MetadataValue::Int(r as i64));
+    meta_map.insert(format!("{prefix}.green"), MetadataValue::Int(g as i64));
+    meta_map.insert(format!("{prefix}.blue"), MetadataValue::Int(b as i64));
+    meta_map.insert(format!("{prefix}.alpha"), MetadataValue::Int(a as i64));
+    meta_map.insert(
+        format!("{prefix}.rgba"),
+        MetadataValue::Int(pack_rgba_color([r, g, b, a]) as i64),
+    );
+}
+
+fn copy_group_attrs(
+    file: &hdf5_pure_rust::File,
+    path: &str,
+    prefix: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    let Ok(group) = file.group(path) else {
+        return;
+    };
+    let Ok(names) = group.attr_names() else {
+        return;
+    };
+    for name in names {
+        let Ok(attr) = group.attr(&name) else {
+            continue;
+        };
+        if let Some(value) = attr_to_metadata_value(&attr) {
+            meta_map.insert(format!("{prefix}.{name}"), value);
+        }
+    }
+}
+
+fn insert_ims_dataset_metadata(
+    file: &hdf5_pure_rust::File,
+    path: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    let Ok(dataset) = file.dataset(path) else {
+        return;
+    };
+    copy_dataset_attrs(&dataset, "imaris.dataset.0", meta_map);
+    if let Ok(shape) = dataset.shape() {
+        meta_map.insert(
+            "imaris.dataset.0.shape".into(),
+            MetadataValue::String(join_u64s(&shape)),
+        );
+    }
+    if let Ok(dtype) = dataset.dtype() {
+        meta_map.insert(
+            "imaris.dataset.0.dtype_class".into(),
+            MetadataValue::String(format!("{:?}", dtype.class())),
+        );
+        meta_map.insert(
+            "imaris.dataset.0.dtype_size".into(),
+            MetadataValue::Int(dtype.size() as i64),
+        );
+    }
+    if let Ok(info) = dataset.info() {
+        meta_map.insert(
+            "imaris.dataset.0.layout_class".into(),
+            MetadataValue::String(format!("{:?}", info.layout.layout_class)),
+        );
+        if let Some(dims) = info.layout.chunk_dims {
+            meta_map.insert(
+                "imaris.dataset.0.chunk_dims".into(),
+                MetadataValue::String(join_u64s(&dims)),
+            );
+        }
+        if let Some(mask) = info.layout.single_chunk_filter_mask {
+            meta_map.insert(
+                "imaris.dataset.0.single_chunk_filter_mask".into(),
+                MetadataValue::Int(mask as i64),
+            );
+        }
+        if let Some(size) = info.layout.single_chunk_filtered_size {
+            meta_map.insert(
+                "imaris.dataset.0.single_chunk_filtered_size".into(),
+                MetadataValue::Int(size as i64),
+            );
+        }
+    }
+}
+
+fn copy_dataset_attrs(
+    dataset: &hdf5_pure_rust::Dataset,
+    prefix: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    let Ok(names) = dataset.attr_names() else {
+        return;
+    };
+    for name in names {
+        let Ok(attr) = dataset.attr(&name) else {
+            continue;
+        };
+        if let Some(value) = attr_to_metadata_value(&attr) {
+            meta_map.insert(format!("{prefix}.{name}"), value);
+        }
+    }
+}
+
+fn attr_to_metadata_value(attr: &hdf5_pure_rust::Attribute) -> Option<MetadataValue> {
+    if let Ok(v) = attr.read_strings() {
+        if !v.is_empty() {
+            let joined = v.concat();
+            let trimmed = joined.trim_matches('\0').trim();
+            if !trimmed.is_empty() {
+                return Some(MetadataValue::String(trimmed.to_string()));
+            }
+        }
+    }
+    let s = attr.read_string();
+    if !s.is_empty() {
+        let trimmed = s.trim_matches('\0').trim();
+        if !trimmed.is_empty() {
+            return Some(MetadataValue::String(trimmed.to_string()));
+        }
+    }
+    if let Some(i) = attr.read_scalar_i64() {
+        return Some(MetadataValue::Int(i));
+    }
+    if let Some(f) = attr.read_scalar_f64().filter(|v| v.is_finite()) {
+        return Some(MetadataValue::Float(f));
+    }
+    if let Ok(b) = attr.read_scalar_bool() {
+        return Some(MetadataValue::Bool(b));
+    }
+    None
+}
+
+fn join_u64s(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 fn checked_image_count(size_z: u32, size_c: u32, size_t: u32, label: &str) -> Result<u32> {
     size_z
@@ -339,24 +633,92 @@ fn checked_image_count(size_z: u32, size_c: u32, size_t: u32, label: &str) -> Re
         .ok_or_else(|| BioFormatsError::Format(format!("Imaris {label} image count overflows")))
 }
 
+fn count_imaris_indexed_members(members: &[String], prefix: &str) -> Result<u32> {
+    let mut max_count = 0u32;
+    for name in members {
+        if let Some(index) = imaris_indexed_member_number(name, prefix) {
+            max_count = max_count.max(index.checked_add(1).ok_or_else(|| {
+                BioFormatsError::Format(format!("Imaris {prefix} index overflows"))
+            })?);
+        }
+    }
+    Ok(max_count)
+}
+
+fn imaris_indexed_member_number(name: &str, prefix: &str) -> Option<u32> {
+    name.strip_prefix(prefix)?.parse::<u32>().ok()
+}
+
+fn ims_resolution_group_path(file: &hdf5_pure_rust::File, level: usize) -> Option<String> {
+    [
+        format!("DataSet/ResolutionLevel {level}"),
+        format!("DataSet/ResolutionLevel_{level}"),
+    ]
+    .into_iter()
+    .find(|path| file.group(path).is_ok())
+}
+
+fn ims_timepoint_group_path(
+    file: &hdf5_pure_rust::File,
+    level: usize,
+    timepoint: usize,
+) -> Option<String> {
+    let resolution = ims_resolution_group_path(file, level)?;
+    [
+        format!("{resolution}/TimePoint {timepoint}"),
+        format!("{resolution}/TimePoint_{timepoint}"),
+    ]
+    .into_iter()
+    .find(|path| file.group(path).is_ok())
+}
+
+fn ims_data_path(
+    file: &hdf5_pure_rust::File,
+    level: usize,
+    timepoint: usize,
+    channel: usize,
+) -> Option<String> {
+    let timepoint = ims_timepoint_group_path(file, level, timepoint)?;
+    [
+        format!("{timepoint}/Channel {channel}/Data"),
+        format!("{timepoint}/Channel_{channel}/Data"),
+    ]
+    .into_iter()
+    .find(|path| file.dataset(path).is_ok())
+}
+
+fn ims_dataset_info_channel_path(file: &hdf5_pure_rust::File, channel: u32) -> Option<String> {
+    [
+        format!("DataSetInfo/Channel {channel}"),
+        format!("DataSetInfo/Channel_{channel}"),
+    ]
+    .into_iter()
+    .find(|path| file.group(path).is_ok())
+}
+
 /// Read the (z, y, x) pixel dimensions of a resolution level from its
 /// full-resolution Channel-0 `Data` dataset shape (the authoritative source,
 /// vs. the unreliable DataSetInfo X/Y/Z and per-level ImageSize* attributes).
 fn ims_level_dims(file: &hdf5_pure_rust::File, level: usize) -> Result<(u32, u32, u32)> {
-    let path = format!("DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data");
+    let path = ims_data_path(file, level, 0, 0).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "Imaris: missing DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data or DataSet/ResolutionLevel_{level}/TimePoint_0/Channel_0/Data"
+        ))
+    })?;
     let ds = file
         .dataset(&path)
         .map_err(|e| BioFormatsError::UnsupportedFormat(format!("Imaris: missing {path}: {e}")))?;
-    let shape = ds
-        .shape()
-        .map_err(|e| BioFormatsError::Format(format!("Imaris: cannot read shape for {path}: {e}")))?;
+    let shape = ds.shape().map_err(|e| {
+        BioFormatsError::Format(format!("Imaris: cannot read shape for {path}: {e}"))
+    })?;
     if shape.len() != 3 || shape.iter().any(|&d| d == 0) {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "Imaris: unsupported Data shape {shape:?} for {path}"
         )));
     }
     let to_u32 = |d: u64| -> Result<u32> {
-        u32::try_from(d).map_err(|_| BioFormatsError::Format("Imaris dimension overflows u32".into()))
+        u32::try_from(d)
+            .map_err(|_| BioFormatsError::Format("Imaris dimension overflows u32".into()))
     };
     Ok((to_u32(shape[0])?, to_u32(shape[1])?, to_u32(shape[2])?))
 }
@@ -392,12 +754,9 @@ fn validate_ims_data_dataset(
             "Imaris: {path} shape {shape:?} does not match declared {declared:?}"
         )));
     }
-    let dtype_size = ds
-        .dtype()
-        .map(|dt| hdf5_dtype_size(&dt))
-        .map_err(|e| {
-            BioFormatsError::Format(format!("Imaris: cannot read dtype for {path}: {e}"))
-        })?;
+    let dtype_size = ds.dtype().map(|dt| hdf5_dtype_size(&dt)).map_err(|e| {
+        BioFormatsError::Format(format!("Imaris: cannot read dtype for {path}: {e}"))
+    })?;
     if dtype_size != bytes_per_sample {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "Imaris: {path} dtype size {dtype_size} does not match declared {bytes_per_sample}"
@@ -440,7 +799,12 @@ impl FormatReader for ImarisReader {
         self.current_resolution = 0;
         self.bytes_per_sample = parsed.bytes_per_sample;
         self.extents = parsed.extents;
+        self.recording_spacing = parsed.recording_spacing;
+        self.image_description = parsed.image_description;
         self.channel_names = parsed.channel_names;
+        self.channel_colors = parsed.channel_colors;
+        self.channel_emission_wavelengths = parsed.channel_emission_wavelengths;
+        self.channel_excitation_wavelengths = parsed.channel_excitation_wavelengths;
         Ok(())
     }
 
@@ -449,7 +813,12 @@ impl FormatReader for ImarisReader {
         self.resolutions.clear();
         self.current_resolution = 0;
         self.extents = None;
+        self.recording_spacing = [None; 3];
+        self.image_description = None;
         self.channel_names.clear();
+        self.channel_colors.clear();
+        self.channel_emission_wavelengths.clear();
+        self.channel_excitation_wavelengths.clear();
         self.cache = None;
         Ok(())
     }
@@ -517,13 +886,10 @@ impl FormatReader for ImarisReader {
 
         // Reuse the cached plane if it is for the same (resolution, t, c, z).
         let need_load = match &self.cache {
-            Some(cache) => {
-                cache.res != res || cache.t != t || cache.c != c || cache.z != z
-            }
+            Some(cache) => cache.res != res || cache.t != t || cache.c != c || cache.z != z,
             None => true,
         };
         if need_load {
-            let data_path = format!("DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data");
             let path = self
                 .path
                 .as_ref()
@@ -531,6 +897,11 @@ impl FormatReader for ImarisReader {
                 .clone();
             let file = hdf5_pure_rust::File::open(&path)
                 .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+            let data_path = ims_data_path(&file, res, t, c).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "Imaris: missing DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data or DataSet/ResolutionLevel_{res}/TimePoint_{t}/Channel_{c}/Data"
+                ))
+            })?;
             let ds = file
                 .dataset(&data_path)
                 .map_err(|e| BioFormatsError::Format(format!("dataset {data_path}: {e}")))?;
@@ -539,7 +910,7 @@ impl FormatReader for ImarisReader {
             // ONLY the requested z-plane. The returned vec is exactly that plane
             // (Y*X elements) indexed from 0, so it is cached and returned whole.
             let sel = Selection::Hyperslab(vec![
-                HyperslabDim::new(z as u64, 1, 1, 1), // single z slice
+                HyperslabDim::new(z as u64, 1, 1, 1),      // single z slice
                 HyperslabDim::new(0, 1, size_y as u64, 1), // all rows
                 HyperslabDim::new(0, 1, size_x as u64, 1), // all cols
             ]);
@@ -626,42 +997,66 @@ impl FormatReader for ImarisReader {
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         let meta = self.resolutions.get(self.current_resolution)?;
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
-        let img = ome.images.get_mut(0)?;
+        {
+            let img = ome.images.get_mut(0)?;
 
-        // Image name = "<basename> Resolution Level <level+1>" (Java
-        // ImarisHDFReader sets the name per series/resolution-level).
-        if let Some(path) = self.path.as_ref() {
-            let base = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            img.name = Some(format!(
-                "{base} Resolution Level {}",
-                self.current_resolution + 1
-            ));
-        }
+            // Image name = "<basename> Resolution Level <level+1>" (Java
+            // ImarisHDFReader sets the name per series/resolution-level).
+            if let Some(path) = self.path.as_ref() {
+                let base = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                img.name = Some(format!(
+                    "{base} Resolution Level {}",
+                    self.current_resolution + 1
+                ));
+            }
+            img.description = self.image_description.clone();
 
-        // Physical pixel size: Java uses RecordingEntry*Spacing when set,
-        // otherwise (ExtMax - ExtMin) / size. We only have the extents path.
-        if let Some(ext) = self.extents {
-            let span = |hi: f64, lo: f64, n: u32| {
-                if n > 0 {
-                    Some((hi - lo) / n as f64)
-                } else {
-                    None
-                }
+            // Physical pixel size: Java uses RecordingEntry*Spacing unless the
+            // value is the default 1, then falls back to (ExtMax - ExtMin) / size.
+            if let Some(ext) = self.extents {
+                let span = |hi: f64, lo: f64, n: u32| {
+                    if n > 0 {
+                        Some((hi - lo) / n as f64)
+                    } else {
+                        None
+                    }
+                };
+                img.physical_size_x = span(ext[3], ext[0], meta.size_x);
+                img.physical_size_y = span(ext[4], ext[1], meta.size_y);
+                img.physical_size_z = span(ext[5], ext[2], meta.size_z);
+            }
+            let spacing_or_existing = |spacing: Option<f64>, existing: Option<f64>| {
+                spacing
+                    .filter(|v| v.is_finite() && *v > 0.0 && (*v - 1.0).abs() > f64::EPSILON)
+                    .or(existing)
             };
-            img.physical_size_x = span(ext[3], ext[0], meta.size_x);
-            img.physical_size_y = span(ext[4], ext[1], meta.size_y);
-            img.physical_size_z = span(ext[5], ext[2], meta.size_z);
-        }
+            img.physical_size_x =
+                spacing_or_existing(self.recording_spacing[0], img.physical_size_x);
+            img.physical_size_y =
+                spacing_or_existing(self.recording_spacing[1], img.physical_size_y);
+            img.physical_size_z =
+                spacing_or_existing(self.recording_spacing[2], img.physical_size_z);
 
-        // Per-channel names.
-        for (ci, ch) in img.channels.iter_mut().enumerate() {
-            if let Some(Some(name)) = self.channel_names.get(ci) {
-                ch.name = Some(name.clone());
+            // Per-channel names.
+            for (ci, ch) in img.channels.iter_mut().enumerate() {
+                if let Some(Some(name)) = self.channel_names.get(ci) {
+                    ch.name = Some(name.clone());
+                }
+                if let Some(Some(color)) = self.channel_colors.get(ci) {
+                    ch.color = Some(*color);
+                }
+                if let Some(Some(emission)) = self.channel_emission_wavelengths.get(ci) {
+                    ch.emission_wavelength = Some(*emission);
+                }
+                if let Some(Some(excitation)) = self.channel_excitation_wavelengths.get(ci) {
+                    ch.excitation_wavelength = Some(*excitation);
+                }
             }
         }
+        let _ = ome.add_original_metadata_annotations(meta, 0);
 
         Some(ome)
     }

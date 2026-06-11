@@ -32,7 +32,9 @@ use zarrs::filesystem::FilesystemStore;
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
-use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata, OmePlate, OmeWell, OmeWellSample};
+use crate::common::ome_metadata::{
+    OmeChannel, OmeImage, OmeMetadata, OmePlate, OmeWell, OmeWellSample,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
@@ -147,10 +149,7 @@ impl OmeZarrReader {
         {
             return Ok(());
         }
-        let store = self
-            .store
-            .clone()
-            .ok_or(BioFormatsError::NotInitialized)?;
+        let store = self.store.clone().ok_or(BioFormatsError::NotInitialized)?;
         let key = format!("/{}", path.trim_start_matches('/'));
         let array = Array::open(store, &key)
             .map_err(|e| BioFormatsError::Format(format!("zarr array open {key}: {e}")))?;
@@ -338,7 +337,10 @@ fn dimension_order_from_axes(axis_names: &[String]) -> DimensionOrder {
         }
     }
     // Keep only the Z/C/T tail order; X and Y are always the last two axes.
-    let tail: String = order.chars().filter(|c| matches!(c, 'Z' | 'C' | 'T')).collect();
+    let tail: String = order
+        .chars()
+        .filter(|c| matches!(c, 'Z' | 'C' | 'T'))
+        .collect();
     match tail.as_str() {
         "CZT" => DimensionOrder::XYCZT,
         "CTZ" => DimensionOrder::XYCTZ,
@@ -390,10 +392,7 @@ fn parse_omero_channels(attrs: &serde_json::Map<String, Value>) -> Vec<OmeChanne
     channels
         .iter()
         .map(|ch| OmeChannel {
-            name: ch
-                .get("label")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            name: ch.get("label").and_then(Value::as_str).map(str::to_string),
             samples_per_pixel: 1,
             color: ch
                 .get("color")
@@ -406,10 +405,10 @@ fn parse_omero_channels(attrs: &serde_json::Map<String, Value>) -> Vec<OmeChanne
 
 impl OmeZarrReader {
     fn parse(&mut self, root: &Path) -> Result<()> {
-        let store = Arc::new(
-            FilesystemStore::new(root)
-                .map_err(|e| BioFormatsError::Format(format!("zarr store {}: {e}", root.display())))?,
-        );
+        let store =
+            Arc::new(FilesystemStore::new(root).map_err(|e| {
+                BioFormatsError::Format(format!("zarr store {}: {e}", root.display()))
+            })?);
 
         // Discover all multiscales image groups.
         let mut groups: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
@@ -472,18 +471,14 @@ fn build_series(
             .get("axes")
             .map(axis_names)
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                vec!["t".into(), "c".into(), "z".into(), "y".into(), "x".into()]
-            });
+            .unwrap_or_else(|| vec!["t".into(), "c".into(), "z".into(), "y".into(), "x".into()]);
         let dimension_order = dimension_order_from_axes(&names);
 
         // axis_index[logical] -> position in the array shape.
         let logical = ['t', 'c', 'z', 'y', 'x'];
         let mut axis_index = [None; 5];
         for (li, lc) in logical.iter().enumerate() {
-            axis_index[li] = names
-                .iter()
-                .position(|n| n.chars().next() == Some(*lc));
+            axis_index[li] = names.iter().position(|n| n.chars().next() == Some(*lc));
         }
 
         let datasets = ms
@@ -615,7 +610,10 @@ fn parse_plate(
     let rows = plate.get("rows").and_then(Value::as_array);
     let columns = plate.get("columns").and_then(Value::as_array);
     let wells = plate.get("wells").and_then(Value::as_array)?;
-    let name = plate.get("name").and_then(Value::as_str).map(str::to_string);
+    let name = plate
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     let row_count = rows.map(|r| r.len()).unwrap_or(0) as u32;
     let col_count = columns.map(|c| c.len()).unwrap_or(0) as u32;
@@ -642,9 +640,7 @@ fn parse_plate(
         // with the well path.
         let mut samples = Vec::new();
         for (si, s) in series.iter().enumerate() {
-            if s.group_path == well_path
-                || s.group_path.starts_with(&format!("{well_path}/"))
-            {
+            if s.group_path == well_path || s.group_path.starts_with(&format!("{well_path}/")) {
                 samples.push(OmeWellSample {
                     index: samples.len() as u32,
                     image_ref: Some(si),

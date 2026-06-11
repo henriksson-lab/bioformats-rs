@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::ole::{is_ole2_header, OleFile};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
@@ -271,10 +272,19 @@ pub struct TillVisionReader {
 
 #[derive(Clone)]
 struct TillVisionSeries {
-    pixel_path: PathBuf,
-    data_offset: u64,
+    pixel_source: TillVisionPixelSource,
+    plane_bytes: usize,
     meta: ImageMetadata,
 }
+
+#[derive(Clone)]
+enum TillVisionPixelSource {
+    File { path: PathBuf, data_offset: u64 },
+    EmbeddedContents { bytes: Vec<u8>, data_offset: usize },
+    EmbeddedDecoded { bytes: Vec<u8> },
+}
+
+const TILLVISION_DESCRIPTION_MARKER: &[u8; 6] = b"\0\0\0\0\0\xff";
 
 impl TillVisionReader {
     pub fn new() -> Self {
@@ -286,7 +296,7 @@ impl TillVisionReader {
 
     fn unsupported() -> BioFormatsError {
         BioFormatsError::UnsupportedFormat(
-            "TillVision embedded VWS native payload decoding is unsupported unless explicit BFTILLVISIONVWS1 strict raw data is present".to_string(),
+            "TillVision file contains no supported companion PST/INF pixels, strict raw BFTILLVISIONVWS1 payload, or OLE Root Entry/Contents CImage records".to_string(),
         )
     }
 }
@@ -360,19 +370,52 @@ impl FormatReader for TillVisionReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
-        let plane_bytes = tillvision_plane_bytes(meta)?;
+        let plane_bytes = series.plane_bytes;
         let plane_offset = (plane_index as u64)
             .checked_mul(plane_bytes as u64)
             .ok_or_else(|| BioFormatsError::Format("TillVision plane offset overflows".into()))?;
-        let offset = series
-            .data_offset
-            .checked_add(plane_offset)
-            .ok_or_else(|| BioFormatsError::Format("TillVision plane offset overflows".into()))?;
-        let mut f = std::fs::File::open(&series.pixel_path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(offset))
-            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        match &series.pixel_source {
+            TillVisionPixelSource::File { path, data_offset } => {
+                let offset = data_offset.checked_add(plane_offset).ok_or_else(|| {
+                    BioFormatsError::Format("TillVision plane offset overflows".into())
+                })?;
+                let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+                f.seek(SeekFrom::Start(offset))
+                    .map_err(BioFormatsError::Io)?;
+                f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+            }
+            TillVisionPixelSource::EmbeddedContents { bytes, data_offset } => {
+                let offset = (*data_offset)
+                    .checked_add(plane_offset as usize)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("TillVision plane offset overflows".into())
+                    })?;
+                let end = offset.checked_add(plane_bytes).ok_or_else(|| {
+                    BioFormatsError::Format("TillVision plane offset overflows".into())
+                })?;
+                if end > bytes.len() {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "TillVision embedded VWS CImage payload is shorter than declared ({end} > {})",
+                        bytes.len()
+                    )));
+                }
+                buf.copy_from_slice(&bytes[offset..end]);
+            }
+            TillVisionPixelSource::EmbeddedDecoded { bytes } => {
+                let offset = plane_offset as usize;
+                let end = offset.checked_add(plane_bytes).ok_or_else(|| {
+                    BioFormatsError::Format("TillVision plane offset overflows".into())
+                })?;
+                if end > bytes.len() {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "TillVision decoded embedded VWS CImage payload is shorter than declared ({end} > {})",
+                        bytes.len()
+                    )));
+                }
+                buf.copy_from_slice(&bytes[offset..end]);
+            }
+        }
         Ok(buf)
     }
 
@@ -387,7 +430,18 @@ impl FormatReader for TillVisionReader {
         let full = self.open_bytes(plane_index)?;
         let meta = self.metadata();
         validate_region(meta, x, y, w, h)?;
-        let bps = meta.pixel_type.bytes_per_sample() * meta.size_c as usize;
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let pixels = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .ok_or_else(|| BioFormatsError::Format("TillVision plane size overflows".into()))?;
+        let bps = series
+            .plane_bytes
+            .checked_div(pixels)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| BioFormatsError::Format("TillVision plane size is invalid".into()))?;
         let row_bytes = meta.size_x as usize * bps;
         let out_row = w as usize * bps;
         let mut out = Vec::with_capacity(h as usize * out_row);
@@ -406,6 +460,96 @@ impl FormatReader for TillVisionReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{create_lsid, OmeAnnotation, OmeMetadata, OmePlane};
+
+        let series = self.series.get(self.current_series)?;
+        let meta = &series.meta;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        let acquisition_date =
+            tillvision_metadata_text(meta, "tillvision.acquisition_datetime_iso8601")
+                .or_else(|| tillvision_metadata_text(meta, "tillvision.acquisition_datetime"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+
+        {
+            let image = ome.images.get_mut(0)?;
+
+            if image.name.is_none() {
+                if let Some(MetadataValue::String(name)) =
+                    meta.series_metadata.get("Info image_name")
+                {
+                    if !name.trim().is_empty() {
+                        image.name = Some(name.clone());
+                    }
+                }
+            }
+            if image.name.is_none() {
+                if let Some(name) = tillvision_metadata_text(meta, "tillvision.image_name") {
+                    if !name.trim().is_empty() {
+                        image.name = Some(name.trim().to_string());
+                    }
+                }
+            }
+
+            image.physical_size_x =
+                tillvision_positive_metadata_float(meta, "tillvision.physical_size_x_um");
+            image.physical_size_y =
+                tillvision_positive_metadata_float(meta, "tillvision.physical_size_y_um");
+            image.physical_size_z =
+                tillvision_positive_metadata_float(meta, "tillvision.physical_size_z_um");
+            image.time_increment =
+                tillvision_positive_metadata_float(meta, "tillvision.time_increment_seconds");
+
+            for (channel_index, channel) in image.channels.iter_mut().enumerate() {
+                let name_key = format!("tillvision.channel.{channel_index}.name");
+                if let Some(name) = tillvision_metadata_text(meta, &name_key) {
+                    if !name.trim().is_empty() {
+                        channel.name = Some(name.trim().to_string());
+                    }
+                }
+                let excitation_key =
+                    format!("tillvision.channel.{channel_index}.excitation_wavelength_nm");
+                channel.excitation_wavelength =
+                    tillvision_positive_metadata_float(meta, &excitation_key);
+                let emission_key =
+                    format!("tillvision.channel.{channel_index}.emission_wavelength_nm");
+                channel.emission_wavelength =
+                    tillvision_positive_metadata_float(meta, &emission_key);
+            }
+
+            let exposure_time = tillvision_metadata_float(meta, "tillvision.exposure_time_seconds");
+            if let Some(exposure_time) = exposure_time {
+                image.planes = (0..meta.image_count)
+                    .map(|plane| {
+                        let (z, c, t) = tillvision_plane_zct(meta, plane);
+                        OmePlane {
+                            the_z: z,
+                            the_c: c,
+                            the_t: t,
+                            exposure_time: Some(exposure_time),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+            }
+        }
+
+        if let Some(acquisition_date) = acquisition_date {
+            ome.annotations.push(OmeAnnotation::MapAnnotation {
+                id: Some(create_lsid("Annotation:TillVisionAcquisition", &[0])),
+                namespace: Some("openmicroscopy.org/bioformats/tillvision-acquisition".into()),
+                values: vec![
+                    ("Image".into(), create_lsid("Image", &[0])),
+                    ("AcquisitionDate".into(), acquisition_date),
+                ],
+            });
+        }
+
+        Some(ome)
     }
 }
 
@@ -470,14 +614,19 @@ fn load_tillvision_series(path: &Path) -> Result<Vec<TillVisionSeries>> {
             )));
         }
         series.push(TillVisionSeries {
-            pixel_path,
-            data_offset: 0,
+            pixel_source: TillVisionPixelSource::File {
+                path: pixel_path,
+                data_offset: 0,
+            },
+            plane_bytes,
             meta,
         });
     }
     if series.is_empty() && ext == "vws" {
         if let Some(embedded) = load_tillvision_embedded_strict_raw(path)? {
             series.push(embedded);
+        } else if let Some(mut embedded) = load_tillvision_embedded_native_vws(path)? {
+            series.append(&mut embedded);
         }
     }
     Ok(series)
@@ -524,6 +673,12 @@ fn load_tillvision_inf(path: &Path) -> Result<ImageMetadata> {
         .checked_mul(size_t)
         .ok_or_else(|| BioFormatsError::Format("TillVision image count overflows".into()))?;
 
+    let mut series_metadata: HashMap<String, MetadataValue> = values
+        .iter()
+        .map(|(k, v)| (format!("Info {k}"), MetadataValue::String(v.clone())))
+        .collect();
+    add_tillvision_normalized_metadata(&mut series_metadata, &values)?;
+
     Ok(ImageMetadata {
         size_x,
         size_y,
@@ -539,10 +694,7 @@ fn load_tillvision_inf(path: &Path) -> Result<ImageMetadata> {
         is_indexed: false,
         is_little_endian: true,
         resolution_count: 1,
-        series_metadata: values
-            .into_iter()
-            .map(|(k, v)| (format!("Info {k}"), MetadataValue::String(v)))
-            .collect(),
+        series_metadata,
         lookup_table: None,
         modulo_z: None,
         modulo_c: None,
@@ -708,8 +860,1246 @@ fn load_tillvision_embedded_strict_raw(path: &Path) -> Result<Option<TillVisionS
     };
 
     Ok(Some(TillVisionSeries {
-        pixel_path: path.to_path_buf(),
-        data_offset,
+        pixel_source: TillVisionPixelSource::File {
+            path: path.to_path_buf(),
+            data_offset,
+        },
+        plane_bytes,
         meta,
     }))
+}
+
+fn load_tillvision_embedded_native_vws(path: &Path) -> Result<Option<Vec<TillVisionSeries>>> {
+    let mut header = [0u8; 8];
+    let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+    let n = f.read(&mut header).map_err(BioFormatsError::Io)?;
+    if !is_ole2_header(&header[..n]) {
+        return Ok(None);
+    }
+
+    let mut ole = OleFile::open(path)?;
+    let documents = ole.document_list();
+    if !documents
+        .iter()
+        .any(|doc| doc.replace('\\', "/") == "Root Entry/Contents")
+    {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TillVision embedded VWS native file is OLE2 but lacks Root Entry/Contents".into(),
+        ));
+    }
+    let contents = ole.document_bytes("Root Entry/Contents")?;
+    let records = parse_tillvision_cimage_records(&contents)?;
+    if records.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TillVision embedded VWS native Root Entry/Contents contains no supported CImage records"
+                .into(),
+        ));
+    }
+    let descriptions = parse_tillvision_description_blocks(&contents);
+
+    let mut series = Vec::with_capacity(records.len());
+    for (series_index, record) in records.into_iter().enumerate() {
+        let pixel_type = tillvision_pixel_type(record.datatype)?;
+        let plane_bytes = (record.size_x as usize)
+            .checked_mul(record.size_y as usize)
+            .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample()))
+            .ok_or_else(|| {
+                BioFormatsError::Format("TillVision embedded CImage plane size overflows".into())
+            })?;
+        let image_count = record
+            .size_z
+            .checked_mul(record.size_c)
+            .and_then(|zc| zc.checked_mul(record.size_t))
+            .ok_or_else(|| {
+                BioFormatsError::Format("TillVision embedded CImage image count overflows".into())
+            })?;
+        if image_count == 0 || record.size_x == 0 || record.size_y == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "TillVision embedded CImage dimensions and counts must be positive".into(),
+            ));
+        }
+        let payload_bytes = plane_bytes
+            .checked_mul(image_count as usize)
+            .ok_or_else(|| {
+                BioFormatsError::Format("TillVision embedded CImage payload size overflows".into())
+            })?;
+        let description = descriptions.get(series_index);
+        let compression = tillvision_cimage_compression(description)?;
+        let mut fragment_table =
+            tillvision_cimage_fragment_table(description, record.data_offset, contents.len())?;
+        if fragment_table.is_none() && description.is_none() {
+            fragment_table = infer_tillvision_cimage_fragment_table_without_description(
+                &contents,
+                record.data_offset,
+                payload_bytes,
+            )?;
+        }
+        let data_offset = if fragment_table.is_none() {
+            tillvision_cimage_payload_offset(description, record.data_offset)?
+        } else {
+            record.data_offset
+        };
+        let encoded_payload = if let Some(fragments) = fragment_table.as_ref() {
+            let total = fragments.iter().try_fold(0usize, |sum, (_, len)| {
+                sum.checked_add(*len).ok_or_else(|| {
+                    BioFormatsError::Format(
+                        "TillVision embedded CImage fragment table size overflows".into(),
+                    )
+                })
+            })?;
+            let mut payload = Vec::with_capacity(total);
+            for &(offset, len) in fragments {
+                let end = offset.checked_add(len).ok_or_else(|| {
+                    BioFormatsError::Format(
+                        "TillVision embedded CImage fragment table size overflows".into(),
+                    )
+                })?;
+                if end > contents.len() {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "TillVision embedded CImage fragment {offset}:{len} exceeds Contents length {}",
+                        contents.len()
+                    )));
+                }
+                payload.extend_from_slice(&contents[offset..end]);
+            }
+            Some(payload)
+        } else {
+            None
+        };
+        let pixel_source = match compression {
+            TillVisionCImageCompression::Uncompressed => {
+                if let Some(payload) = encoded_payload {
+                    if payload.len() != payload_bytes {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "TillVision embedded CImage fragments assemble to {} bytes, expected {payload_bytes}",
+                            payload.len()
+                        )));
+                    }
+                    TillVisionPixelSource::EmbeddedDecoded { bytes: payload }
+                } else {
+                    let expected = data_offset.checked_add(payload_bytes).ok_or_else(|| {
+                        BioFormatsError::Format(
+                            "TillVision embedded CImage payload size overflows".into(),
+                        )
+                    })?;
+                    if expected > contents.len() {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "TillVision embedded VWS CImage payload is shorter than declared ({expected} > {})",
+                            contents.len()
+                        )));
+                    }
+                    TillVisionPixelSource::EmbeddedContents {
+                        bytes: contents.clone(),
+                        data_offset,
+                    }
+                }
+            }
+            TillVisionCImageCompression::Zlib => {
+                let decoded = if let Some(payload) = encoded_payload {
+                    crate::common::codec::decompress_deflate(&payload).map_err(|err| {
+                        BioFormatsError::UnsupportedFormat(format!(
+                            "TillVision embedded compressed CImage zlib payload could not be decompressed: {err}"
+                        ))
+                    })?
+                } else {
+                    if data_offset >= contents.len() {
+                        return Err(BioFormatsError::UnsupportedFormat(
+                            "TillVision embedded compressed CImage payload is missing".into(),
+                        ));
+                    }
+                    crate::common::codec::decompress_deflate(&contents[data_offset..]).map_err(
+                        |err| {
+                            BioFormatsError::UnsupportedFormat(format!(
+                                "TillVision embedded compressed CImage zlib payload could not be decompressed: {err}"
+                            ))
+                        },
+                    )?
+                };
+                if decoded.len() != payload_bytes {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "TillVision embedded compressed CImage decoded to {} bytes, expected {payload_bytes}",
+                        decoded.len()
+                    )));
+                }
+                TillVisionPixelSource::EmbeddedDecoded { bytes: decoded }
+            }
+            TillVisionCImageCompression::RawDeflate => {
+                let decoded = if let Some(payload) = encoded_payload {
+                    crate::common::codec::decompress_deflate_raw(&payload).map_err(|err| {
+                        BioFormatsError::UnsupportedFormat(format!(
+                            "TillVision embedded compressed CImage raw deflate payload could not be decompressed: {err}"
+                        ))
+                    })?
+                } else {
+                    if data_offset >= contents.len() {
+                        return Err(BioFormatsError::UnsupportedFormat(
+                            "TillVision embedded compressed CImage payload is missing".into(),
+                        ));
+                    }
+                    crate::common::codec::decompress_deflate_raw(&contents[data_offset..])
+                        .map_err(|err| {
+                            BioFormatsError::UnsupportedFormat(format!(
+                                "TillVision embedded compressed CImage raw deflate payload could not be decompressed: {err}"
+                            ))
+                        })?
+                };
+                if decoded.len() != payload_bytes {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "TillVision embedded compressed CImage decoded to {} bytes, expected {payload_bytes}",
+                        decoded.len()
+                    )));
+                }
+                TillVisionPixelSource::EmbeddedDecoded { bytes: decoded }
+            }
+        };
+
+        let mut series_metadata = HashMap::from([(
+            "Info embedded_vws".to_string(),
+            MetadataValue::String("Root Entry/Contents CImage".to_string()),
+        )]);
+        if !record.name.is_empty() {
+            series_metadata.insert(
+                "Info image_name".to_string(),
+                MetadataValue::String(record.name),
+            );
+        }
+        if let Some(description) = description {
+            add_tillvision_description_metadata(&mut series_metadata, description)?;
+        }
+        if let Some(fragments) = fragment_table.as_ref() {
+            if description.is_none() {
+                let value = fragments
+                    .iter()
+                    .map(|(offset, len)| format!("{offset}:{len}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                series_metadata.insert(
+                    "Info inferred_payload_fragments".to_string(),
+                    MetadataValue::String(value),
+                );
+            }
+        }
+
+        series.push(TillVisionSeries {
+            pixel_source,
+            plane_bytes,
+            meta: ImageMetadata {
+                size_x: record.size_x,
+                size_y: record.size_y,
+                size_z: record.size_z,
+                size_c: record.size_c,
+                size_t: record.size_t,
+                pixel_type,
+                bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+                image_count,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: true,
+                resolution_count: 1,
+                series_metadata,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            },
+        });
+    }
+    Ok(Some(series))
+}
+
+enum TillVisionCImageCompression {
+    Uncompressed,
+    Zlib,
+    RawDeflate,
+}
+
+fn tillvision_cimage_compression(
+    description: Option<&HashMap<String, String>>,
+) -> Result<TillVisionCImageCompression> {
+    let Some(description) = description else {
+        return Ok(TillVisionCImageCompression::Uncompressed);
+    };
+
+    let mut compressed_flag: Option<(&str, &str)> = None;
+    let mut supported_algorithm: Option<&str> = None;
+    let mut unsupported: Option<(&str, &str)> = None;
+
+    for (key, value) in description {
+        let normalized_key = key.trim().to_ascii_lowercase();
+        if normalized_key != "compressed" && !normalized_key.contains("compression") {
+            continue;
+        }
+
+        let value = value.trim();
+        let normalized_value = value.to_ascii_lowercase();
+        if normalized_value.is_empty()
+            || matches!(
+                normalized_value.as_str(),
+                "0" | "false" | "no" | "none" | "raw" | "uncompressed"
+            )
+        {
+            continue;
+        }
+        if normalized_value == "zlib" {
+            supported_algorithm = Some("zlib");
+        } else if normalized_value == "deflate" {
+            supported_algorithm = Some("deflate");
+        } else if normalized_key == "compressed"
+            && matches!(normalized_value.as_str(), "1" | "true" | "yes")
+        {
+            compressed_flag = Some((key.as_str(), value));
+        } else {
+            unsupported = Some((key.as_str(), value));
+        }
+    }
+
+    if let Some((key, value)) = unsupported {
+        Err(BioFormatsError::UnsupportedFormat(format!(
+            "TillVision embedded CImage declares unsupported compression {key}: {value}"
+        )))
+    } else if let Some(algorithm) = supported_algorithm {
+        if algorithm == "deflate" {
+            Ok(TillVisionCImageCompression::RawDeflate)
+        } else {
+            Ok(TillVisionCImageCompression::Zlib)
+        }
+    } else if let Some((key, value)) = compressed_flag {
+        Err(BioFormatsError::UnsupportedFormat(format!(
+            "TillVision embedded CImage declares compressed payload without a supported algorithm {key}: {value}"
+        )))
+    } else {
+        Ok(TillVisionCImageCompression::Uncompressed)
+    }
+}
+
+fn tillvision_cimage_payload_offset(
+    description: Option<&HashMap<String, String>>,
+    default_offset: usize,
+) -> Result<usize> {
+    let Some(description) = description else {
+        return Ok(default_offset);
+    };
+    let Some((key, value)) = description.iter().find(|(key, _)| {
+        let key = key.trim().to_ascii_lowercase();
+        key.contains("offset")
+            && (key.contains("payload") || key.contains("pixel") || key.contains("data"))
+    }) else {
+        return Ok(default_offset);
+    };
+    let offset = parse_tillvision_usize_value(value).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "TillVision embedded CImage has invalid payload offset {key}: {value}"
+        ))
+    })?;
+    if offset < default_offset {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "TillVision embedded CImage declares payload offset {offset} before parsed payload start {default_offset}"
+        )));
+    }
+    Ok(offset)
+}
+
+fn tillvision_cimage_fragment_table(
+    description: Option<&HashMap<String, String>>,
+    default_offset: usize,
+    contents_len: usize,
+) -> Result<Option<Vec<(usize, usize)>>> {
+    let Some(description) = description else {
+        return Ok(None);
+    };
+
+    let inline = description.iter().find(|(key, _)| {
+        let key = key.trim().to_ascii_lowercase();
+        key.contains("fragment") && key.contains("payload")
+    });
+    if let Some((key, value)) = inline {
+        let fragments = parse_tillvision_fragment_pairs(value).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "TillVision embedded CImage has invalid fragment table {key}: {value}"
+            ))
+        })?;
+        return validate_tillvision_fragments(fragments, default_offset, contents_len).map(Some);
+    }
+
+    let offsets = description.iter().find(|(key, _)| {
+        let key = key.trim().to_ascii_lowercase();
+        key.contains("fragment") && key.contains("offset")
+    });
+    let lengths = description.iter().find(|(key, _)| {
+        let key = key.trim().to_ascii_lowercase();
+        (key.contains("fragment") && tillvision_fragment_length_key(&key))
+            || ((key.contains("fragment") || key.contains("payload")) && key.contains("length"))
+    });
+    match (offsets, lengths) {
+        (Some((offset_key, offset_value)), Some((length_key, length_value))) => {
+            let offsets = parse_tillvision_usize_list(offset_value).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "TillVision embedded CImage has invalid fragment offsets {offset_key}: {offset_value}"
+                ))
+            })?;
+            let lengths = parse_tillvision_usize_list(length_value).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "TillVision embedded CImage has invalid fragment lengths {length_key}: {length_value}"
+                ))
+            })?;
+            if offsets.len() != lengths.len() {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "TillVision embedded CImage fragment offset/length count mismatch: {} offsets, {} lengths",
+                    offsets.len(),
+                    lengths.len()
+                )));
+            }
+            let fragments = offsets.into_iter().zip(lengths).collect();
+            validate_tillvision_fragments(fragments, default_offset, contents_len).map(Some)
+        }
+        (Some((key, _)), None) | (None, Some((key, _))) => Err(BioFormatsError::UnsupportedFormat(
+            format!("TillVision embedded CImage declares incomplete fragment table at {key}"),
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+fn tillvision_fragment_length_key(key: &str) -> bool {
+    key.contains("length")
+        || key.contains("size")
+        || key.contains("byte count")
+        || key.contains("bytes")
+}
+
+fn infer_tillvision_cimage_fragment_table_without_description(
+    contents: &[u8],
+    default_offset: usize,
+    payload_bytes: usize,
+) -> Result<Option<Vec<(usize, usize)>>> {
+    let default_end = default_offset.checked_add(payload_bytes).ok_or_else(|| {
+        BioFormatsError::Format("TillVision embedded CImage payload size overflows".into())
+    })?;
+    if default_end > contents.len() {
+        return Ok(None);
+    }
+    let default_payload = &contents[default_offset..default_end];
+    if default_payload.is_empty() || default_payload.iter().any(|byte| *byte != 0xaa) {
+        return Ok(None);
+    }
+
+    let mut fragments = Vec::new();
+    let mut offset = default_end;
+    while offset < contents.len() {
+        while offset < contents.len() && contents[offset] == 0xaa {
+            offset += 1;
+        }
+        if offset >= contents.len() {
+            break;
+        }
+        let start = offset;
+        while offset < contents.len() && contents[offset] != 0xaa {
+            offset += 1;
+        }
+        fragments.push((start, offset - start));
+    }
+    if fragments.is_empty() {
+        return Ok(None);
+    }
+
+    let total = fragments.iter().try_fold(0usize, |sum, (_, len)| {
+        sum.checked_add(*len).ok_or_else(|| {
+            BioFormatsError::Format(
+                "TillVision embedded CImage inferred fragment table size overflows".into(),
+            )
+        })
+    })?;
+    if total != payload_bytes {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "TillVision embedded CImage payload appears noncontiguous without description metadata, but inferred non-padding fragments assemble to {total} bytes, expected {payload_bytes}"
+        )));
+    }
+
+    validate_tillvision_fragments(fragments, default_offset, contents.len()).map(Some)
+}
+
+fn parse_tillvision_fragment_pairs(value: &str) -> Option<Vec<(usize, usize)>> {
+    let mut fragments = Vec::new();
+    for part in value
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_ascii_whitespace())
+        .filter(|part| !part.trim().is_empty())
+    {
+        let (offset, len) = part
+            .split_once(':')
+            .or_else(|| part.split_once('+'))
+            .or_else(|| part.split_once('@'))?;
+        fragments.push((
+            parse_tillvision_usize_token(offset)?,
+            parse_tillvision_usize_token(len)?,
+        ));
+    }
+    if fragments.is_empty() {
+        None
+    } else {
+        Some(fragments)
+    }
+}
+
+fn parse_tillvision_usize_list(value: &str) -> Option<Vec<usize>> {
+    let mut values = Vec::new();
+    for token in value
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_ascii_whitespace())
+        .filter(|part| !part.trim().is_empty())
+    {
+        values.push(parse_tillvision_usize_token(token)?);
+    }
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn parse_tillvision_usize_value(value: &str) -> Option<usize> {
+    let token = value
+        .trim()
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+        .find(|part| !part.is_empty())?;
+    parse_tillvision_usize_token(token)
+}
+
+fn parse_tillvision_usize_token(token: &str) -> Option<usize> {
+    let token = token.trim();
+    if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
+        usize::from_str_radix(hex, 16).ok()
+    } else {
+        token.parse().ok()
+    }
+}
+
+fn validate_tillvision_fragments(
+    fragments: Vec<(usize, usize)>,
+    default_offset: usize,
+    contents_len: usize,
+) -> Result<Vec<(usize, usize)>> {
+    if fragments.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TillVision embedded CImage fragment table is empty".into(),
+        ));
+    }
+    for &(offset, len) in &fragments {
+        if len == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "TillVision embedded CImage fragment table contains a zero-length fragment".into(),
+            ));
+        }
+        if offset < default_offset {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TillVision embedded CImage fragment offset {offset} before parsed payload start {default_offset}"
+            )));
+        }
+        let end = offset.checked_add(len).ok_or_else(|| {
+            BioFormatsError::Format("TillVision embedded CImage fragment end overflows".into())
+        })?;
+        if end > contents_len {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TillVision embedded CImage fragment {offset}:{len} exceeds Contents length {contents_len}"
+            )));
+        }
+    }
+    Ok(fragments)
+}
+
+#[derive(Debug)]
+struct TillVisionCImageRecord {
+    name: String,
+    size_x: u32,
+    size_y: u32,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    datatype: u32,
+    data_offset: usize,
+}
+
+fn parse_tillvision_cimage_records(contents: &[u8]) -> Result<Vec<TillVisionCImageRecord>> {
+    let offsets = find_tillvision_cimage_offsets(contents);
+    if !offsets.is_empty() {
+        let mut records = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            records.push(parse_tillvision_cimage_record(contents, offset, false)?);
+        }
+        return Ok(records);
+    }
+
+    if contents.len() >= 21 {
+        let len = read_le_u16(contents, 13) as usize;
+        let start = 15usize;
+        let end = start.saturating_add(len);
+        if end <= contents.len() && contents[start..end] == *b"CImage" {
+            let offset = end + 6;
+            return Ok(vec![parse_tillvision_cimage_record(
+                contents, offset, true,
+            )?]);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn parse_tillvision_cimage_record(
+    contents: &[u8],
+    offset: usize,
+    special: bool,
+) -> Result<TillVisionCImageRecord> {
+    if offset >= contents.len() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TillVision embedded CImage record offset is outside Contents".into(),
+        ));
+    }
+    let name_len = contents[offset] as usize;
+    let name_start = offset + 1;
+    let name_end = name_start.checked_add(name_len).ok_or_else(|| {
+        BioFormatsError::Format("TillVision embedded CImage name length overflows".into())
+    })?;
+    if name_end > contents.len() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TillVision embedded CImage name is truncated".into(),
+        ));
+    }
+    let name = String::from_utf8_lossy(&contents[name_start..name_end]).to_string();
+    let dims_start = if special {
+        1280usize + 20
+    } else {
+        let marker = find_bytes_from(contents, b"sB", name_end).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "TillVision embedded CImage record lacks sB dimension marker".into(),
+            )
+        })?;
+        marker + 2 + 20
+    };
+    let fields_end = dims_start.checked_add(24).ok_or_else(|| {
+        BioFormatsError::Format("TillVision embedded CImage dimensions overflow".into())
+    })?;
+    if fields_end > contents.len() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TillVision embedded CImage dimensions are truncated".into(),
+        ));
+    }
+    let size_x = read_le_u32(contents, dims_start);
+    let size_y = read_le_u32(contents, dims_start + 4);
+    let size_z = read_le_u32(contents, dims_start + 8);
+    let size_c = read_le_u32(contents, dims_start + 12);
+    let size_t = read_le_u32(contents, dims_start + 16);
+    let datatype = read_le_u32(contents, dims_start + 20);
+    let data_offset = fields_end
+        .checked_add(if special { 27 } else { 31 })
+        .ok_or_else(|| {
+            BioFormatsError::Format("TillVision embedded CImage data offset overflows".into())
+        })?;
+    Ok(TillVisionCImageRecord {
+        name,
+        size_x,
+        size_y,
+        size_z,
+        size_c,
+        size_t,
+        datatype,
+        data_offset,
+    })
+}
+
+fn find_tillvision_cimage_offsets(contents: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    if contents.len() < 32 {
+        return offsets;
+    }
+    for i in 0..=contents.len() - 32 {
+        let marker = (&contents[i..i + 4] == b"\xf0\x3f\xff\x00"
+            || &contents[i..i + 4] == b"\x00\xff\x3f\xf0")
+            && contents[i + 4..i + 12] == [0; 8]
+            && (&contents[i + 12..i + 16] == b"\x00\x00\xff\x00"
+                || &contents[i + 12..i + 16] == b"\x00\xff\x00\x00");
+        if !marker {
+            continue;
+        }
+
+        if let Some(offset) = find_tillvision_cimage_record_offset_after_marker(contents, i) {
+            let name_len = contents[offset] as usize;
+            let name_start = offset + 1;
+            let name_end = name_start.saturating_add(name_len);
+            if name_end <= contents.len() {
+                let name = String::from_utf8_lossy(&contents[name_start..name_end]);
+                if !name.contains("Palette") && !offsets.contains(&offset) {
+                    offsets.push(offset);
+                }
+            }
+        }
+    }
+    offsets
+}
+
+fn find_tillvision_cimage_record_offset_after_marker(
+    contents: &[u8],
+    marker_offset: usize,
+) -> Option<usize> {
+    let scan_start = marker_offset.checked_add(16)?;
+    let scan_end = marker_offset.checked_add(96)?.min(contents.len());
+    let mut pointer = scan_start;
+    while pointer + 5 <= scan_end {
+        if &contents[pointer..pointer + 4] == b"\x08\x00\x04\x00"
+            || &contents[pointer..pointer + 4] == b"\x00\x04\x00\x08"
+        {
+            return Some(pointer + 4);
+        }
+        pointer += 1;
+    }
+    None
+}
+
+fn find_bytes_from(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() || start >= haystack.len() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack[start..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|pos| start + pos)
+}
+
+fn parse_tillvision_description_blocks(contents: &[u8]) -> Vec<HashMap<String, String>> {
+    let mut blocks = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(marker) = find_bytes_from(contents, TILLVISION_DESCRIPTION_MARKER, search_from) {
+        let len_offset = marker + TILLVISION_DESCRIPTION_MARKER.len();
+        if len_offset + 2 > contents.len() {
+            break;
+        }
+        let len = read_le_u16(contents, len_offset) as usize;
+        let text_start = len_offset + 2;
+        let text_end = text_start.saturating_add(len);
+        search_from = len_offset + 1;
+        if len == 0 || len > 0x1000 || text_end > contents.len() {
+            continue;
+        }
+
+        let text = String::from_utf8_lossy(&contents[text_start..text_end]);
+        let mut parsed = HashMap::new();
+        for line in text.split(['\r', '\n']) {
+            let line = line.trim();
+            if line.starts_with(';') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            parsed.insert(key.to_string(), value.trim().to_string());
+        }
+        if !parsed.is_empty() {
+            blocks.push(parsed);
+        }
+    }
+    blocks
+}
+
+fn add_tillvision_description_metadata(
+    series_metadata: &mut HashMap<String, MetadataValue>,
+    description: &HashMap<String, String>,
+) -> Result<()> {
+    for (key, value) in description {
+        series_metadata.insert(format!("Info {key}"), MetadataValue::String(value.clone()));
+    }
+    add_tillvision_normalized_metadata(series_metadata, description)?;
+
+    if let Some(exposure_ms) = description.get("Exposure time [ms]") {
+        let seconds = exposure_ms.parse::<f64>().map_err(|_| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "TillVision embedded VWS description has invalid Exposure time [ms]: {exposure_ms}"
+            ))
+        })? / 1000.0;
+        series_metadata.insert(
+            "Info Exposure time [s]".to_string(),
+            MetadataValue::String(seconds.to_string()),
+        );
+    }
+
+    let date = description
+        .get("Date")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    let start = description
+        .get("Start time of experiment")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    if !date.is_empty() || !start.is_empty() {
+        let value = if date.is_empty() {
+            start.to_string()
+        } else if start.is_empty() {
+            date.to_string()
+        } else {
+            format!("{date} {start}")
+        };
+        series_metadata.insert(
+            "Info Acquisition date/time".to_string(),
+            MetadataValue::String(value),
+        );
+    }
+
+    Ok(())
+}
+
+fn add_tillvision_normalized_metadata(
+    series_metadata: &mut HashMap<String, MetadataValue>,
+    values: &HashMap<String, String>,
+) -> Result<()> {
+    if let Some((key, value, unit)) = find_tillvision_exposure_value(values) {
+        let raw = first_numeric_token(value).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "TillVision metadata has invalid {key}: {value}"
+            ))
+        })?;
+        let seconds = match unit {
+            TillVisionTimeUnit::Milliseconds => raw / 1000.0,
+            TillVisionTimeUnit::Seconds => raw,
+        };
+        series_metadata.insert(
+            "tillvision.exposure_time_seconds".to_string(),
+            MetadataValue::Float(seconds),
+        );
+    }
+
+    if let Some(image_type) = find_tillvision_text_value(values, &["image type", "imagetype"]) {
+        if !image_type.trim().is_empty() {
+            series_metadata.insert(
+                "tillvision.image_type".to_string(),
+                MetadataValue::String(image_type.trim().to_string()),
+            );
+        }
+    }
+
+    if let Some(image_name) =
+        find_tillvision_text_value(values, &["image name", "imagename", "name"])
+    {
+        if !image_name.trim().is_empty() {
+            series_metadata.insert(
+                "tillvision.image_name".to_string(),
+                MetadataValue::String(image_name.trim().to_string()),
+            );
+        }
+    }
+
+    add_tillvision_physical_size_metadata(series_metadata, values)?;
+    add_tillvision_time_increment_metadata(series_metadata, values)?;
+    add_tillvision_channel_metadata(series_metadata, values)?;
+
+    let date = find_tillvision_text_value(values, &["date"])
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let start =
+        find_tillvision_text_value(values, &["start time of experiment", "start time", "time"])
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+    if date.is_some() || start.is_some() {
+        let acquisition = match (date, start) {
+            (Some(date), Some(start)) => format!("{date} {start}"),
+            (Some(date), None) => date.to_string(),
+            (None, Some(start)) => start.to_string(),
+            (None, None) => String::new(),
+        };
+        if !acquisition.is_empty() {
+            series_metadata.insert(
+                "tillvision.acquisition_datetime".to_string(),
+                MetadataValue::String(acquisition),
+            );
+        }
+        if let Some(date) = date {
+            if let Some(normalized) = normalize_tillvision_acquisition_datetime(date, start) {
+                series_metadata.insert(
+                    "tillvision.acquisition_datetime_iso8601".to_string(),
+                    MetadataValue::String(normalized),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn add_tillvision_physical_size_metadata(
+    series_metadata: &mut HashMap<String, MetadataValue>,
+    values: &HashMap<String, String>,
+) -> Result<()> {
+    for &(axis, output_key) in &[
+        ("x", "tillvision.physical_size_x_um"),
+        ("y", "tillvision.physical_size_y_um"),
+        ("z", "tillvision.physical_size_z_um"),
+    ] {
+        if let Some((key, value)) = find_tillvision_physical_size_value(values, axis) {
+            let raw = first_numeric_token(value).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "TillVision metadata has invalid {key}: {value}"
+                ))
+            })?;
+            let microns = tillvision_length_to_microns(raw, key);
+            if microns.is_finite() && microns > 0.0 {
+                series_metadata.insert(output_key.to_string(), MetadataValue::Float(microns));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_tillvision_time_increment_metadata(
+    series_metadata: &mut HashMap<String, MetadataValue>,
+    values: &HashMap<String, String>,
+) -> Result<()> {
+    let Some((key, value, unit)) = find_tillvision_time_increment_value(values) else {
+        return Ok(());
+    };
+    let raw = first_numeric_token(value).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "TillVision metadata has invalid {key}: {value}"
+        ))
+    })?;
+    let seconds = match unit {
+        TillVisionTimeUnit::Milliseconds => raw / 1000.0,
+        TillVisionTimeUnit::Seconds => raw,
+    };
+    if seconds.is_finite() && seconds > 0.0 {
+        series_metadata.insert(
+            "tillvision.time_increment_seconds".to_string(),
+            MetadataValue::Float(seconds),
+        );
+    }
+    Ok(())
+}
+
+fn add_tillvision_channel_metadata(
+    series_metadata: &mut HashMap<String, MetadataValue>,
+    values: &HashMap<String, String>,
+) -> Result<()> {
+    for (key, value) in values {
+        let normalized = normalize_tillvision_key(key);
+        if !normalized.contains("channel") {
+            continue;
+        }
+        let Some(channel_index) = tillvision_channel_index_from_key(&normalized) else {
+            continue;
+        };
+        if normalized.contains("name") || normalized.contains("selection") {
+            if !value.trim().is_empty() {
+                series_metadata.insert(
+                    format!("tillvision.channel.{channel_index}.name"),
+                    MetadataValue::String(value.trim().to_string()),
+                );
+            }
+        } else if normalized.contains("excitation") && normalized.contains("wavelength") {
+            let wavelength = first_numeric_token(value).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "TillVision metadata has invalid {key}: {value}"
+                ))
+            })?;
+            if wavelength.is_finite() && wavelength > 0.0 {
+                series_metadata.insert(
+                    format!("tillvision.channel.{channel_index}.excitation_wavelength_nm"),
+                    MetadataValue::Float(tillvision_length_to_nanometres(wavelength, key)),
+                );
+            }
+        } else if normalized.contains("emission") && normalized.contains("wavelength") {
+            let wavelength = first_numeric_token(value).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "TillVision metadata has invalid {key}: {value}"
+                ))
+            })?;
+            if wavelength.is_finite() && wavelength > 0.0 {
+                series_metadata.insert(
+                    format!("tillvision.channel.{channel_index}.emission_wavelength_nm"),
+                    MetadataValue::Float(tillvision_length_to_nanometres(wavelength, key)),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_tillvision_acquisition_datetime(date: &str, start: Option<&str>) -> Option<String> {
+    let (year, month, day) = parse_tillvision_date(date)?;
+    let Some(start) = start else {
+        return Some(format!("{year:04}-{month:02}-{day:02}"));
+    };
+    let (hour, minute, second) = parse_tillvision_time(start)?;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
+    ))
+}
+
+fn parse_tillvision_date(date: &str) -> Option<(u32, u32, u32)> {
+    let parts = date
+        .trim()
+        .split(|ch: char| matches!(ch, '/' | '-' | '.'))
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return None;
+    }
+    let month = parts[0].trim().parse::<u32>().ok()?;
+    let day = parts[1].trim().parse::<u32>().ok()?;
+    let raw_year = parts[2].trim();
+    let mut year = raw_year.parse::<u32>().ok()?;
+    if raw_year.len() == 2 {
+        year = if year <= 69 { 2000 + year } else { 1900 + year };
+    }
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+fn parse_tillvision_time(time: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = time.split_whitespace();
+    let clock = parts.next()?;
+    let am_pm = parts.next().map(|value| value.to_ascii_lowercase());
+    let clock_parts = clock
+        .split(':')
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !(2..=3).contains(&clock_parts.len()) {
+        return None;
+    }
+    let mut hour = clock_parts[0].trim().parse::<u32>().ok()?;
+    let minute = clock_parts[1].trim().parse::<u32>().ok()?;
+    let second = if clock_parts.len() == 3 {
+        clock_parts[2].trim().parse::<u32>().ok()?
+    } else {
+        0
+    };
+    if minute > 59 || second > 59 {
+        return None;
+    }
+    match am_pm.as_deref() {
+        Some("am") => {
+            if hour == 12 {
+                hour = 0;
+            } else if hour == 0 || hour > 12 {
+                return None;
+            }
+        }
+        Some("pm") => {
+            if hour == 0 || hour > 12 {
+                return None;
+            }
+            if hour != 12 {
+                hour += 12;
+            }
+        }
+        Some(_) => return None,
+        None if hour > 23 => return None,
+        None => {}
+    }
+    Some((hour, minute, second))
+}
+
+#[derive(Clone, Copy)]
+enum TillVisionTimeUnit {
+    Milliseconds,
+    Seconds,
+}
+
+fn find_tillvision_exposure_value<'a>(
+    values: &'a HashMap<String, String>,
+) -> Option<(&'a str, &'a str, TillVisionTimeUnit)> {
+    for (key, value) in values {
+        let normalized = normalize_tillvision_key(key);
+        if !normalized.contains("exposure") {
+            continue;
+        }
+        let unit = if normalized.contains("ms")
+            || normalized.contains("millisecond")
+            || normalized == "exposuretime"
+        {
+            TillVisionTimeUnit::Milliseconds
+        } else if normalized.contains(" s") || normalized.contains("sec") {
+            TillVisionTimeUnit::Seconds
+        } else {
+            continue;
+        };
+        return Some((key.as_str(), value.as_str(), unit));
+    }
+    None
+}
+
+fn find_tillvision_physical_size_value<'a>(
+    values: &'a HashMap<String, String>,
+    axis: &str,
+) -> Option<(&'a str, &'a str)> {
+    values.iter().find_map(|(key, value)| {
+        let normalized = normalize_tillvision_key(key);
+        let compact = compact_tillvision_key(&normalized);
+        if axis == "x"
+            && (compact.contains("physicalsizex")
+                || compact.contains("pixelsizex")
+                || compact.contains("xpixelsize")
+                || compact.contains("pixelwidth"))
+        {
+            return Some((key.as_str(), value.as_str()));
+        }
+        if axis == "y"
+            && (compact.contains("physicalsizey")
+                || compact.contains("pixelsizey")
+                || compact.contains("ypixelsize")
+                || compact.contains("pixelheight"))
+        {
+            return Some((key.as_str(), value.as_str()));
+        }
+        if axis == "z"
+            && (compact.contains("physicalsizez")
+                || compact.contains("pixelsizez")
+                || compact.contains("zpixelsize")
+                || compact.contains("zstep")
+                || compact.contains("zspacing")
+                || compact.contains("slicethickness"))
+        {
+            return Some((key.as_str(), value.as_str()));
+        }
+        None
+    })
+}
+
+fn find_tillvision_time_increment_value<'a>(
+    values: &'a HashMap<String, String>,
+) -> Option<(&'a str, &'a str, TillVisionTimeUnit)> {
+    for (key, value) in values {
+        let normalized = normalize_tillvision_key(key);
+        let compact = compact_tillvision_key(&normalized);
+        if normalized.contains("exposure") || compact.contains("starttime") {
+            continue;
+        }
+        let is_time_increment = compact.contains("timeincrement")
+            || compact.contains("frameinterval")
+            || compact.contains("timestep")
+            || compact.contains("cycletime");
+        if !is_time_increment {
+            continue;
+        }
+        let unit = if normalized.contains("ms") || normalized.contains("millisecond") {
+            TillVisionTimeUnit::Milliseconds
+        } else {
+            TillVisionTimeUnit::Seconds
+        };
+        return Some((key.as_str(), value.as_str(), unit));
+    }
+    None
+}
+
+fn find_tillvision_text_value<'a>(
+    values: &'a HashMap<String, String>,
+    candidates: &[&str],
+) -> Option<&'a str> {
+    values.iter().find_map(|(key, value)| {
+        let normalized = normalize_tillvision_key(key);
+        candidates
+            .iter()
+            .any(|candidate| normalized == normalize_tillvision_key(candidate))
+            .then_some(value.as_str())
+    })
+}
+
+fn normalize_tillvision_key(key: &str) -> String {
+    key.trim()
+        .trim_matches(|ch: char| ch == '[' || ch == ']')
+        .to_ascii_lowercase()
+}
+
+fn compact_tillvision_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn first_numeric_token(value: &str) -> Option<f64> {
+    value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',' || ch == ';')
+        .find_map(|token| {
+            token
+                .trim_matches(|ch: char| ch == ':' || ch == '=')
+                .parse::<f64>()
+                .ok()
+        })
+}
+
+fn tillvision_length_to_microns(value: f64, key: &str) -> f64 {
+    let key = normalize_tillvision_key(key);
+    if key.contains("[nm]") || key.contains(" nm") || key.contains("nanometer") {
+        value / 1000.0
+    } else if key.contains("[mm]") || key.contains(" mm") || key.contains("millimeter") {
+        value * 1000.0
+    } else {
+        value
+    }
+}
+
+fn tillvision_length_to_nanometres(value: f64, key: &str) -> f64 {
+    let key = normalize_tillvision_key(key);
+    if key.contains("[um]")
+        || key.contains("[µm]")
+        || key.contains(" um")
+        || key.contains(" µm")
+        || key.contains("micrometer")
+    {
+        value * 1000.0
+    } else if key.contains("[mm]") || key.contains(" mm") || key.contains("millimeter") {
+        value * 1_000_000.0
+    } else {
+        value
+    }
+}
+
+fn tillvision_channel_index_from_key(key: &str) -> Option<usize> {
+    let digits: String = key
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    let parsed = digits.parse::<usize>().ok()?;
+    Some(parsed.saturating_sub(1))
+}
+
+fn tillvision_metadata_float(meta: &ImageMetadata, key: &str) -> Option<f64> {
+    match meta.series_metadata.get(key) {
+        Some(MetadataValue::Float(value)) => Some(*value),
+        Some(MetadataValue::String(value)) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn tillvision_positive_metadata_float(meta: &ImageMetadata, key: &str) -> Option<f64> {
+    tillvision_metadata_float(meta, key).filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn tillvision_metadata_text<'a>(meta: &'a ImageMetadata, key: &str) -> Option<&'a str> {
+    match meta.series_metadata.get(key) {
+        Some(MetadataValue::String(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn tillvision_plane_zct(meta: &ImageMetadata, plane: u32) -> (u32, u32, u32) {
+    let full_planes = meta
+        .size_z
+        .checked_mul(meta.size_c)
+        .and_then(|zc| zc.checked_mul(meta.size_t));
+    if full_planes == Some(meta.image_count) {
+        let c = plane % meta.size_c.max(1);
+        let z = (plane / meta.size_c.max(1)) % meta.size_z.max(1);
+        let t = plane / (meta.size_c.max(1) * meta.size_z.max(1));
+        (z, c, t)
+    } else {
+        let z = plane % meta.size_z.max(1);
+        let t = plane / meta.size_z.max(1);
+        (z, 0, t)
+    }
 }

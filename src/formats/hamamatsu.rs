@@ -434,8 +434,7 @@ impl FormatReader for DcimgReader {
             let n = (4 * bps).min(out_row);
             if line < size_y && n > 0 {
                 let mut corner = vec![0u8; n];
-                if f
-                    .seek(SeekFrom::Start(self.four_pixel_correction_offset))
+                if f.seek(SeekFrom::Start(self.four_pixel_correction_offset))
                     .is_ok()
                     && f.read_exact(&mut corner).is_ok()
                 {
@@ -466,5 +465,12 @@ impl FormatReader for DcimgReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let _ = ome.add_original_metadata_annotations(meta, 0);
+        Some(ome)
     }
 }

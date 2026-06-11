@@ -334,7 +334,8 @@ impl AmiraReader {
         f.seek(SeekFrom::Start(self.data_offset))
             .map_err(BioFormatsError::Io)?;
         let mut compressed = Vec::new();
-        f.read_to_end(&mut compressed).map_err(BioFormatsError::Io)?;
+        f.read_to_end(&mut compressed)
+            .map_err(BioFormatsError::Io)?;
 
         let decoded = match self.compression {
             AmiraCompression::HxZip => crate::common::codec::decompress_deflate(&compressed)?,

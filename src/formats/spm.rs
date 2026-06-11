@@ -24,6 +24,8 @@ use crate::common::region::{crop_full_plane, validate_region};
 pub struct PicoQuantReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    pixels: Option<Vec<u8>>,
+    reconstruction_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,27 @@ struct PicoQuantTag {
     index: i32,
     tag_type: u32,
     value: i64,
+    payload: Option<Vec<u8>>,
+}
+
+struct PicoQuantReconstruction {
+    pixels: Vec<u8>,
+    detector_channels: u32,
+    lifetime_bins: u32,
+    bidirectional: bool,
+    pixel_type: PixelType,
+    bits_per_pixel: u8,
+    histogram_layout: Option<&'static str>,
+    description: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PicoQuantRecordKind {
+    label: &'static str,
+    family: &'static str,
+    acquisition_mode: &'static str,
+    hydraharp_layout: bool,
+    marker_raster_layout: bool,
 }
 
 const PTU_HEADER_LEN: usize = 16;
@@ -43,11 +66,25 @@ const PTU_TAG_EMPTY8: u32 = 0xffff_0008;
 const PTU_TAG_ANSI_STRING: u32 = 0x4001_ffff;
 const PTU_TAG_WIDE_STRING: u32 = 0x4002_ffff;
 const PTU_TAG_BINARY_BLOB: u32 = 0xffff_ffff;
+const PTU_RECORD_PICOHARP_T2: i64 = 0x0001_0203;
+const PTU_RECORD_PICOHARP_T3: i64 = 0x0001_0303;
+const PTU_RECORD_HYDRAHARP_T2: i64 = 0x0001_0204;
+const PTU_RECORD_HYDRAHARP_T3: i64 = 0x0001_0304;
+const PTU_RECORD_TIMEHARP260N_T2: i64 = 0x0001_0205;
+const PTU_RECORD_TIMEHARP260N_T3: i64 = 0x0001_0305;
+const PTU_RECORD_TIMEHARP260P_T2: i64 = 0x0001_0206;
+const PTU_RECORD_TIMEHARP260P_T3: i64 = 0x0001_0306;
+const PTU_RECORD_MULTIHARP_T2: i64 = 0x0001_0207;
+const PTU_RECORD_MULTIHARP_T3: i64 = 0x0001_0307;
+const PTU_RECORD_HYDRAHARP2_T2: i64 = 0x0101_0204;
+const PTU_RECORD_HYDRAHARP2_T3: i64 = 0x0101_0304;
+const PTU_T2_SYNC_PERIOD: u64 = 1 << 25;
+const PTU_T3_SYNC_PERIOD: u64 = 1024;
 
-fn picoquant_event_stream_unsupported() -> BioFormatsError {
-    BioFormatsError::UnsupportedFormat(
-        "PicoQuant TCSPC event-stream image reconstruction is unsupported; native PTU/PQRES event streams require explicit image dimensions for metadata and are not decoded to image planes without a strict image-plane payload".into(),
-    )
+fn picoquant_event_stream_unsupported(reason: &str) -> BioFormatsError {
+    BioFormatsError::UnsupportedFormat(format!(
+        "PicoQuant TTTR image reconstruction unavailable: {reason}"
+    ))
 }
 
 impl PicoQuantReader {
@@ -55,6 +92,8 @@ impl PicoQuantReader {
         PicoQuantReader {
             path: None,
             meta: None,
+            pixels: None,
+            reconstruction_error: None,
         }
     }
 
@@ -88,7 +127,7 @@ impl PicoQuantReader {
             let value = i64::from_le_bytes(data[offset + 40..offset + 48].try_into().unwrap());
             offset = record_end;
 
-            if matches!(
+            let payload = if matches!(
                 tag_type,
                 PTU_TAG_ANSI_STRING | PTU_TAG_WIDE_STRING | PTU_TAG_BINARY_BLOB
             ) {
@@ -107,8 +146,12 @@ impl PicoQuantReader {
                         "PicoQuant PTU tag {ident} payload is truncated"
                     )));
                 }
+                let payload = data[offset..payload_end].to_vec();
                 offset = payload_end;
-            }
+                Some(payload)
+            } else {
+                None
+            };
 
             let is_end = ident == "Header_End";
             tags.push(PicoQuantTag {
@@ -116,6 +159,7 @@ impl PicoQuantReader {
                 index,
                 tag_type,
                 value,
+                payload,
             });
             if is_end {
                 return Ok((tags, offset));
@@ -129,6 +173,638 @@ impl PicoQuantReader {
                 tag.tag_type == PTU_TAG_INT8 && tag.index < 0 && names.contains(&tag.ident.as_str())
             })
             .map(|tag| tag.value)
+    }
+
+    fn float_tag(tags: &[PicoQuantTag], names: &[&str]) -> Option<f64> {
+        tags.iter()
+            .find(|tag| {
+                tag.tag_type == PTU_TAG_FLOAT8
+                    && tag.index < 0
+                    && names.contains(&tag.ident.as_str())
+            })
+            .map(|tag| f64::from_bits(tag.value as u64))
+    }
+
+    fn tttr_record_kind(record_type: i64) -> Option<PicoQuantRecordKind> {
+        let (label, family, acquisition_mode, hydraharp_layout, marker_raster_layout) =
+            match record_type {
+                PTU_RECORD_PICOHARP_T2 => ("PicoHarp T2", "PicoHarp", "tttr_t2", false, false),
+                PTU_RECORD_PICOHARP_T3 => ("PicoHarp T3", "PicoHarp", "tttr_t3", false, false),
+                PTU_RECORD_HYDRAHARP_T2 => ("HydraHarp T2", "HydraHarp", "tttr_t2", true, true),
+                PTU_RECORD_HYDRAHARP_T3 => ("HydraHarp T3", "HydraHarp", "tttr_t3", true, true),
+                PTU_RECORD_TIMEHARP260N_T2 => {
+                    ("TimeHarp 260N T2", "TimeHarp 260N", "tttr_t2", false, true)
+                }
+                PTU_RECORD_TIMEHARP260N_T3 => {
+                    ("TimeHarp 260N T3", "TimeHarp 260N", "tttr_t3", false, true)
+                }
+                PTU_RECORD_TIMEHARP260P_T2 => {
+                    ("TimeHarp 260P T2", "TimeHarp 260P", "tttr_t2", false, true)
+                }
+                PTU_RECORD_TIMEHARP260P_T3 => {
+                    ("TimeHarp 260P T3", "TimeHarp 260P", "tttr_t3", false, true)
+                }
+                PTU_RECORD_MULTIHARP_T2 => ("MultiHarp T2", "MultiHarp", "tttr_t2", false, true),
+                PTU_RECORD_MULTIHARP_T3 => ("MultiHarp T3", "MultiHarp", "tttr_t3", false, true),
+                PTU_RECORD_HYDRAHARP2_T2 => {
+                    ("HydraHarp 2 T2", "HydraHarp 2", "tttr_t2", true, true)
+                }
+                PTU_RECORD_HYDRAHARP2_T3 => {
+                    ("HydraHarp 2 T3", "HydraHarp 2", "tttr_t3", true, true)
+                }
+                _ => return None,
+            };
+        Some(PicoQuantRecordKind {
+            label,
+            family,
+            acquisition_mode,
+            hydraharp_layout,
+            marker_raster_layout,
+        })
+    }
+
+    fn annotate_tttr_acquisition_mode(
+        series_metadata: &mut HashMap<String, MetadataValue>,
+        tttr_record_type: Option<i64>,
+    ) -> Option<PicoQuantRecordKind> {
+        let Some(record_type) = tttr_record_type else {
+            series_metadata.insert(
+                "ptu.acquisition_mode".into(),
+                MetadataValue::String("unspecified".into()),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_ambiguous".into(),
+                MetadataValue::Bool(true),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_source".into(),
+                MetadataValue::String("missing TTResultFormat_TTTRRecType".into()),
+            );
+            return None;
+        };
+
+        series_metadata.insert(
+            "ptu.tttr_record_type_code_hex".into(),
+            MetadataValue::String(format!("0x{record_type:08x}")),
+        );
+
+        let record_kind = Self::tttr_record_kind(record_type);
+        if let Some(record_kind) = record_kind {
+            series_metadata.insert(
+                "ptu.acquisition_mode".into(),
+                MetadataValue::String(record_kind.acquisition_mode.into()),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_ambiguous".into(),
+                MetadataValue::Bool(false),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_source".into(),
+                MetadataValue::String("TTResultFormat_TTTRRecType".into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_type".into(),
+                MetadataValue::String(record_kind.label.into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_family".into(),
+                MetadataValue::String(record_kind.family.into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_hydraharp_layout".into(),
+                MetadataValue::Bool(record_kind.hydraharp_layout),
+            );
+            series_metadata.insert(
+                "ptu.tttr_marker_raster_layout".into(),
+                MetadataValue::Bool(record_kind.marker_raster_layout),
+            );
+        } else if let Some(mode) = Self::infer_tttr_acquisition_mode(record_type) {
+            series_metadata.insert(
+                "ptu.acquisition_mode".into(),
+                MetadataValue::String(mode.into()),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_ambiguous".into(),
+                MetadataValue::Bool(true),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_source".into(),
+                MetadataValue::String(
+                    "inferred from unrecognized TTResultFormat_TTTRRecType mode byte".into(),
+                ),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_type".into(),
+                MetadataValue::String(format!(
+                    "Unknown {} TTTR record type",
+                    if mode == "tttr_t2" { "T2" } else { "T3" }
+                )),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_family".into(),
+                MetadataValue::String("Unknown".into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_hydraharp_layout".into(),
+                MetadataValue::Bool(false),
+            );
+        } else {
+            series_metadata.insert(
+                "ptu.acquisition_mode".into(),
+                MetadataValue::String("tttr_unknown_record".into()),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_ambiguous".into(),
+                MetadataValue::Bool(true),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_source".into(),
+                MetadataValue::String("unrecognized TTResultFormat_TTTRRecType".into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_type".into(),
+                MetadataValue::String("Unknown TTTR record type".into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_family".into(),
+                MetadataValue::String("Unknown".into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_hydraharp_layout".into(),
+                MetadataValue::Bool(false),
+            );
+        }
+
+        record_kind
+    }
+
+    fn infer_tttr_acquisition_mode(record_type: i64) -> Option<&'static str> {
+        match ((record_type as u64) >> 8) & 0xff {
+            0x02 => Some("tttr_t2"),
+            0x03 => Some("tttr_t3"),
+            _ => None,
+        }
+    }
+
+    fn is_histogram_acquisition(tags: &[PicoQuantTag]) -> bool {
+        tags.iter().any(|tag| Self::is_histogram_tag(&tag.ident))
+    }
+
+    fn is_histogram_tag(ident: &str) -> bool {
+        ident.starts_with("HistResDscr_")
+            || ident.starts_with("HistoResult_")
+            || ident.starts_with("HistoResultFormat_")
+            || ident.to_ascii_lowercase().contains("histogram")
+    }
+
+    fn positive_int_tag_any_index(tags: &[PicoQuantTag], names: &[&str]) -> Option<u32> {
+        tags.iter()
+            .find(|tag| tag.tag_type == PTU_TAG_INT8 && names.contains(&tag.ident.as_str()))
+            .and_then(|tag| {
+                if tag.value > 0 {
+                    u32::try_from(tag.value).ok()
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn histogram_bins(tags: &[PicoQuantTag]) -> Option<u32> {
+        Self::positive_int_tag_any_index(
+            tags,
+            &[
+                "HistResDscr_HistogramBins",
+                "HistResDscr_Bins",
+                "HistResDscr_DataBins",
+                "HistoResult_NumberOfBins",
+                "HistoResult_HistogramBins",
+                "HistoResult_Bins",
+                "HistoResult_DataBins",
+            ],
+        )
+    }
+
+    fn histogram_curve_count(tags: &[PicoQuantTag]) -> u32 {
+        if let Some(curve_count) = Self::positive_int_tag_any_index(
+            tags,
+            &[
+                "HistResDscr_NumberOfCurves",
+                "HistResDscr_CurveCount",
+                "HistoResult_NumberOfCurves",
+                "HistoResult_CurveCount",
+            ],
+        ) {
+            return curve_count;
+        }
+        tags.iter()
+            .filter(|tag| Self::is_histogram_tag(&tag.ident) && tag.index >= 0)
+            .filter_map(|tag| u32::try_from(tag.index).ok())
+            .max()
+            .map_or(1, |max_index| max_index.saturating_add(1))
+    }
+
+    fn decode_histogram_payload(
+        data: &[u8],
+        data_offset: usize,
+        tags: &[PicoQuantTag],
+    ) -> Result<Option<PicoQuantReconstruction>> {
+        let Some(histogram_bins) = Self::histogram_bins(tags) else {
+            return Ok(None);
+        };
+        let curve_count = Self::histogram_curve_count(tags);
+        let expected_samples = (histogram_bins as usize)
+            .checked_mul(curve_count as usize)
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "PicoQuant histogram sample count overflows".into(),
+                )
+            })?;
+        let Some(payload) = data.get(data_offset..) else {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant histogram payload offset is outside file".into(),
+            ));
+        };
+
+        let mut matching_layouts = [
+            (1usize, PixelType::Uint8, 8u8, "uint8 bins"),
+            (2usize, PixelType::Uint16, 16u8, "little-endian uint16 bins"),
+            (4usize, PixelType::Uint32, 32u8, "little-endian uint32 bins"),
+        ]
+        .into_iter()
+        .filter(|(sample_bytes, _, _, _)| {
+            expected_samples
+                .checked_mul(*sample_bytes)
+                .is_some_and(|expected_bytes| expected_bytes == payload.len())
+        });
+        let Some((sample_bytes, pixel_type, bits_per_pixel, layout)) = matching_layouts.next()
+        else {
+            return Ok(None);
+        };
+        if matching_layouts.next().is_some() {
+            return Ok(None);
+        }
+
+        let expected_bytes = expected_samples.checked_mul(sample_bytes).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("PicoQuant histogram payload size overflows".into())
+        })?;
+        let mut pixels = Vec::with_capacity(expected_bytes);
+        for sample in payload.chunks_exact(sample_bytes) {
+            pixels.extend_from_slice(sample);
+        }
+        let description = if curve_count == 1 {
+            format!("PicoQuant histogram payload decoded as {histogram_bins} {layout}")
+        } else {
+            format!(
+                "PicoQuant histogram payload decoded as {curve_count} curves of {histogram_bins} {layout}"
+            )
+        };
+        Ok(Some(PicoQuantReconstruction {
+            pixels,
+            detector_channels: curve_count,
+            lifetime_bins: 1,
+            bidirectional: false,
+            pixel_type,
+            bits_per_pixel,
+            histogram_layout: Some(layout),
+            description,
+        }))
+    }
+
+    fn ptu_string_value(tag: &PicoQuantTag) -> Option<String> {
+        let payload = tag.payload.as_ref()?;
+        match tag.tag_type {
+            PTU_TAG_ANSI_STRING => {
+                let len = payload
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(payload.len());
+                Some(String::from_utf8_lossy(&payload[..len]).into_owned())
+            }
+            PTU_TAG_WIDE_STRING => {
+                let mut values = Vec::new();
+                for chunk in payload.chunks_exact(2) {
+                    let value = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    if value == 0 {
+                        break;
+                    }
+                    values.push(value);
+                }
+                Some(String::from_utf16_lossy(&values))
+            }
+            _ => None,
+        }
+    }
+
+    fn reconstruct_tttr_marker_raster(
+        data: &[u8],
+        data_offset: usize,
+        tags: &[PicoQuantTag],
+        width: u32,
+        height: u32,
+        frames: u32,
+    ) -> Result<PicoQuantReconstruction> {
+        let record_count = Self::int_tag(tags, &["TTResult_NumberOfRecords"]).ok_or_else(|| {
+            picoquant_event_stream_unsupported("missing TTResult_NumberOfRecords tag")
+        })?;
+        let record_type =
+            Self::int_tag(tags, &["TTResultFormat_TTTRRecType"]).ok_or_else(|| {
+                picoquant_event_stream_unsupported("missing TTResultFormat_TTTRRecType tag")
+            })?;
+        let Some(record_kind) = Self::tttr_record_kind(record_type) else {
+            return Err(picoquant_event_stream_unsupported(&format!(
+                "unsupported TTTR record type 0x{record_type:08x}"
+            )));
+        };
+        let record_label = record_kind.label;
+        if !record_kind.marker_raster_layout {
+            if record_kind.family == "PicoHarp" {
+                return Err(picoquant_event_stream_unsupported(&format!(
+                    "{record_label} record layout is recognized for metadata, but PicoHarp T2/T3 bit packing and marker encoding are not confirmed by local fixtures or specs; pixel reconstruction is fixture/spec-blocked"
+                )));
+            }
+            return Err(picoquant_event_stream_unsupported(&format!(
+                "{record_label} record layout is recognized for metadata but not supported for marker-rasterized image reconstruction"
+            )));
+        }
+        let is_t2 = record_kind.acquisition_mode == "tttr_t2";
+        let line_start_marker =
+            Self::int_tag(tags, &["ImgHdr_LineStart", "ImgHdr_LineStartMarker"]).ok_or_else(
+                || {
+                    picoquant_event_stream_unsupported(&format!(
+                        "{record_label} missing line-start marker tag"
+                    ))
+                },
+            )?;
+        let line_stop_marker = Self::int_tag(tags, &["ImgHdr_LineStop", "ImgHdr_LineStopMarker"])
+            .ok_or_else(|| {
+            picoquant_event_stream_unsupported(&format!(
+                "{record_label} missing line-stop marker tag"
+            ))
+        })?;
+        if record_count < 0 || line_start_marker <= 0 || line_stop_marker <= 0 {
+            return Err(picoquant_event_stream_unsupported(
+                "record count and line marker values must be positive",
+            ));
+        }
+        let explicit_detector_channels = Self::int_tag(
+            tags,
+            &[
+                "ImgHdr_DetectorChannels",
+                "ImgHdr_Channels",
+                "TTResult_NumberOfRoutingChannels",
+            ],
+        );
+        let detector_channels = if let Some(detector_channels) = explicit_detector_channels {
+            if detector_channels <= 0 {
+                return Err(picoquant_event_stream_unsupported(
+                    "detector channel count must be positive",
+                ));
+            }
+            u32::try_from(detector_channels).map_err(|_| {
+                picoquant_event_stream_unsupported("detector channel count is too large")
+            })?
+        } else {
+            1
+        };
+        let explicit_lifetime_bins = Self::int_tag(
+            tags,
+            &[
+                "ImgHdr_LifetimeBins",
+                "ImgHdr_TauBins",
+                "TTResult_NumberOfLifetimeBins",
+            ],
+        );
+        if is_t2 && explicit_lifetime_bins.is_some() {
+            return Err(picoquant_event_stream_unsupported(
+                "T2 records do not carry lifetime dtime values",
+            ));
+        }
+        let lifetime_bins = if let Some(lifetime_bins) = explicit_lifetime_bins {
+            if lifetime_bins <= 0 {
+                return Err(picoquant_event_stream_unsupported(
+                    "lifetime bin count must be positive",
+                ));
+            }
+            u32::try_from(lifetime_bins).map_err(|_| {
+                picoquant_event_stream_unsupported("lifetime bin count is too large")
+            })?
+        } else {
+            1
+        };
+        let lifetime_bin_width =
+            Self::int_tag(tags, &["ImgHdr_LifetimeBinWidth", "ImgHdr_TauBinWidth"]).unwrap_or(1);
+        if lifetime_bin_width <= 0 {
+            return Err(picoquant_event_stream_unsupported(
+                "lifetime bin width must be positive",
+            ));
+        }
+        let lifetime_bin_width = u32::try_from(lifetime_bin_width)
+            .map_err(|_| picoquant_event_stream_unsupported("lifetime bin width is too large"))?;
+        let bidirectional = Self::int_tag(
+            tags,
+            &[
+                "ImgHdr_BiDirectional",
+                "ImgHdr_Bidirectional",
+                "ImgHdr_Bidir",
+            ],
+        )
+        .unwrap_or(0);
+        let bidirectional = match bidirectional {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(picoquant_event_stream_unsupported(
+                    "bidirectional scan tag must be 0 or 1",
+                ));
+            }
+        };
+        let record_count = usize::try_from(record_count).map_err(|_| {
+            picoquant_event_stream_unsupported("TTTR record count is too large for this platform")
+        })?;
+        let record_bytes = record_count.checked_mul(4).ok_or_else(|| {
+            picoquant_event_stream_unsupported("TTTR record byte count overflows")
+        })?;
+        let records_end = data_offset.checked_add(record_bytes).ok_or_else(|| {
+            picoquant_event_stream_unsupported("TTTR record data offset overflows")
+        })?;
+        if records_end > data.len() {
+            return Err(picoquant_event_stream_unsupported(
+                "TTTR record stream is truncated",
+            ));
+        }
+
+        let pixel_count = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(frames as usize))
+            .and_then(|n| n.checked_mul(detector_channels as usize))
+            .and_then(|n| n.checked_mul(lifetime_bins as usize))
+            .ok_or_else(|| picoquant_event_stream_unsupported("output image size overflows"))?;
+        let mut counts = vec![0u32; pixel_count];
+        let mut sync_overflow = 0u64;
+        let mut line_start_sync: Option<u64> = None;
+        let mut line_photons: Vec<(u64, u32, u32)> = Vec::new();
+        let mut frame = 0u32;
+        let mut line = 0u32;
+
+        for record in data[data_offset..records_end].chunks_exact(4) {
+            let raw = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+            let (nsync, dtime, channel) = if is_t2 {
+                (u64::from(raw & 0x01ff_ffff), 0, ((raw >> 25) & 0x3f) as u8)
+            } else {
+                (
+                    u64::from(raw & 0x03ff),
+                    (raw >> 10) & 0x7fff,
+                    ((raw >> 25) & 0x3f) as u8,
+                )
+            };
+            let special = (raw & 0x8000_0000) != 0;
+            let absolute_sync = sync_overflow
+                .checked_add(nsync)
+                .ok_or_else(|| picoquant_event_stream_unsupported("TTTR sync time overflows"))?;
+
+            if special {
+                if channel == 0x3f {
+                    let overflow_count = if nsync == 0 { 1 } else { nsync };
+                    let overflow_period = if is_t2 {
+                        PTU_T2_SYNC_PERIOD
+                    } else {
+                        PTU_T3_SYNC_PERIOD
+                    };
+                    sync_overflow = sync_overflow
+                        .checked_add(overflow_count.checked_mul(overflow_period).ok_or_else(
+                            || picoquant_event_stream_unsupported("TTTR overflow count overflows"),
+                        )?)
+                        .ok_or_else(|| {
+                            picoquant_event_stream_unsupported("TTTR overflow overflows")
+                        })?;
+                    continue;
+                }
+
+                let marker = i64::from(channel);
+                if marker & line_start_marker != 0 {
+                    line_start_sync = Some(absolute_sync);
+                    line_photons.clear();
+                }
+                if marker & line_stop_marker != 0 {
+                    let Some(start_sync) = line_start_sync else {
+                        return Err(picoquant_event_stream_unsupported(
+                            "line-stop marker appeared before a line-start marker",
+                        ));
+                    };
+                    if absolute_sync <= start_sync {
+                        return Err(picoquant_event_stream_unsupported(
+                            "line-stop marker does not advance sync time",
+                        ));
+                    }
+                    if frame >= frames {
+                        return Err(picoquant_event_stream_unsupported(
+                            "TTTR stream contains more frames than declared",
+                        ));
+                    }
+                    if line >= height {
+                        return Err(picoquant_event_stream_unsupported(
+                            "TTTR stream contains more lines than declared",
+                        ));
+                    }
+                    let line_ticks = absolute_sync - start_sync;
+                    for (photon_sync, detector_channel, lifetime_bin) in line_photons.drain(..) {
+                        if photon_sync < start_sync || photon_sync >= absolute_sync {
+                            continue;
+                        }
+                        let x = ((photon_sync - start_sync) * u64::from(width)) / line_ticks;
+                        if x >= u64::from(width) {
+                            continue;
+                        }
+                        let x = if bidirectional && line % 2 == 1 {
+                            u64::from(width - 1) - x
+                        } else {
+                            x
+                        };
+                        let plane = (frame as usize)
+                            .checked_mul(detector_channels as usize)
+                            .and_then(|n| n.checked_add(detector_channel as usize))
+                            .and_then(|n| n.checked_mul(lifetime_bins as usize))
+                            .and_then(|n| n.checked_add(lifetime_bin as usize))
+                            .ok_or_else(|| {
+                                picoquant_event_stream_unsupported("output plane index overflows")
+                            })?;
+                        let idx = plane
+                            .checked_mul(height as usize)
+                            .and_then(|n| n.checked_add(line as usize))
+                            .and_then(|n| n.checked_mul(width as usize))
+                            .and_then(|n| n.checked_add(x as usize))
+                            .ok_or_else(|| {
+                                picoquant_event_stream_unsupported("output pixel index overflows")
+                            })?;
+                        counts[idx] = counts[idx].saturating_add(1);
+                    }
+                    line_start_sync = None;
+                    line += 1;
+                    if line == height {
+                        line = 0;
+                        frame += 1;
+                    }
+                }
+            } else if line_start_sync.is_some() {
+                let detector_channel = if explicit_detector_channels.is_some() {
+                    u32::from(channel)
+                } else {
+                    0
+                };
+                if explicit_detector_channels.is_some() && detector_channel >= detector_channels {
+                    return Err(picoquant_event_stream_unsupported(&format!(
+                        "photon detector channel {detector_channel} exceeds declared detector channel count {detector_channels}"
+                    )));
+                }
+                let lifetime_bin = if explicit_lifetime_bins.is_some() {
+                    dtime / lifetime_bin_width
+                } else {
+                    0
+                };
+                if explicit_lifetime_bins.is_some() && lifetime_bin >= lifetime_bins {
+                    return Err(picoquant_event_stream_unsupported(&format!(
+                        "photon lifetime bin {lifetime_bin} exceeds declared lifetime bin count {lifetime_bins}"
+                    )));
+                }
+                line_photons.push((absolute_sync, detector_channel, lifetime_bin));
+            }
+        }
+
+        if line_start_sync.is_some() {
+            return Err(picoquant_event_stream_unsupported(
+                "TTTR stream ended before the current line-stop marker",
+            ));
+        }
+
+        let mut out = Vec::with_capacity(pixel_count * 4);
+        for count in counts {
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        let mut description = match (detector_channels, lifetime_bins) {
+            (1, 1) => format!("{record_label} marker-rasterized photon counts"),
+            (_, 1) => format!(
+                "{record_label} marker-rasterized photon counts split into {detector_channels} detector channels"
+            ),
+            (1, _) => format!(
+                "{record_label} marker-rasterized photon counts split into {lifetime_bins} lifetime bins"
+            ),
+            _ => format!(
+                "{record_label} marker-rasterized photon counts split into {detector_channels} detector channels and {lifetime_bins} lifetime bins"
+            ),
+        };
+        if bidirectional {
+            description.push_str(" with bidirectional scan correction");
+        }
+        Ok(PicoQuantReconstruction {
+            pixels: out,
+            detector_channels,
+            lifetime_bins,
+            bidirectional,
+            pixel_type: PixelType::Uint32,
+            bits_per_pixel: 32,
+            histogram_layout: None,
+            description,
+        })
     }
 }
 
@@ -154,14 +830,42 @@ impl FormatReader for PicoQuantReader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.pixels = None;
+        self.reconstruction_error = None;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let (tags, data_offset) = Self::parse_unified_tags(&data)?;
-        let width = Self::int_tag(&tags, &["ImgHdr_PixX", "ImgHdr_Pixels"]).ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat("PicoQuant PTU missing explicit image width".into())
-        })?;
-        let height = Self::int_tag(&tags, &["ImgHdr_PixY", "ImgHdr_Lines"]).ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat("PicoQuant PTU missing explicit image height".into())
-        })?;
+        let histogram_acquisition = Self::is_histogram_acquisition(&tags);
+        let histogram_bins = if histogram_acquisition {
+            Self::histogram_bins(&tags)
+        } else {
+            None
+        };
+        let width = Self::int_tag(&tags, &["ImgHdr_PixX", "ImgHdr_Pixels"])
+            .or_else(|| {
+                if histogram_acquisition {
+                    histogram_bins.map(i64::from)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                if histogram_acquisition {
+                    BioFormatsError::UnsupportedFormat(
+                        "PicoQuant histogram acquisition missing bounded histogram bin descriptor or explicit image width".into(),
+                    )
+                } else {
+                    BioFormatsError::UnsupportedFormat(
+                        "PicoQuant PTU missing explicit image width".into(),
+                    )
+                }
+            })?;
+        let height = Self::int_tag(&tags, &["ImgHdr_PixY", "ImgHdr_Lines"])
+            .or_else(|| if histogram_acquisition { Some(1) } else { None })
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "PicoQuant PTU missing explicit image height".into(),
+                )
+            })?;
         let frames = Self::int_tag(&tags, &["ImgHdr_Frames", "ImgHdr_Frame"]).unwrap_or(1);
         if width <= 0 || height <= 0 || frames <= 0 {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -186,7 +890,13 @@ impl FormatReader for PicoQuantReader {
         for tag in &tags {
             if matches!(
                 tag.tag_type,
-                PTU_TAG_INT8 | PTU_TAG_BOOL8 | PTU_TAG_FLOAT8 | PTU_TAG_EMPTY8
+                PTU_TAG_INT8
+                    | PTU_TAG_BOOL8
+                    | PTU_TAG_FLOAT8
+                    | PTU_TAG_EMPTY8
+                    | PTU_TAG_ANSI_STRING
+                    | PTU_TAG_WIDE_STRING
+                    | PTU_TAG_BINARY_BLOB
             ) {
                 let key = if tag.index >= 0 {
                     format!("ptu.{}[{}]", tag.ident, tag.index)
@@ -196,22 +906,261 @@ impl FormatReader for PicoQuantReader {
                 let value = match tag.tag_type {
                     PTU_TAG_BOOL8 => MetadataValue::Bool(tag.value != 0),
                     PTU_TAG_FLOAT8 => MetadataValue::Float(f64::from_bits(tag.value as u64)),
+                    PTU_TAG_ANSI_STRING | PTU_TAG_WIDE_STRING => {
+                        MetadataValue::String(Self::ptu_string_value(tag).unwrap_or_default())
+                    }
+                    PTU_TAG_BINARY_BLOB => {
+                        MetadataValue::Bytes(tag.payload.clone().unwrap_or_default())
+                    }
                     _ => MetadataValue::Int(tag.value),
                 };
                 series_metadata.insert(key, value);
             }
         }
 
+        let mut detector_channels = 1u32;
+        let mut lifetime_bins = 1u32;
+        let mut pixel_type = PixelType::Uint32;
+        let mut bits_per_pixel = 32u8;
+        if histogram_acquisition {
+            series_metadata.insert(
+                "ptu.acquisition_mode".into(),
+                MetadataValue::String("histogram".into()),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_ambiguous".into(),
+                MetadataValue::Bool(false),
+            );
+            series_metadata.insert(
+                "ptu.acquisition_mode_source".into(),
+                MetadataValue::String("HistResDscr metadata".into()),
+            );
+            let histogram_curve_count = Self::histogram_curve_count(&tags);
+            series_metadata.insert(
+                "ptu.histogram_curves".into(),
+                MetadataValue::Int(i64::from(histogram_curve_count)),
+            );
+            let histogram_payload_actual_bytes = data
+                .get(data_offset..)
+                .map_or(0usize, |payload| payload.len());
+            let histogram_payload_actual_bytes_i64 = i64::try_from(histogram_payload_actual_bytes)
+                .map_err(|_| {
+                    BioFormatsError::UnsupportedFormat(
+                        "PicoQuant histogram payload byte count is too large".into(),
+                    )
+                })?;
+            series_metadata.insert(
+                "ptu.histogram_payload_actual_bytes".into(),
+                MetadataValue::Int(histogram_payload_actual_bytes_i64),
+            );
+            if let Some(histogram_bins) = histogram_bins {
+                series_metadata.insert(
+                    "ptu.histogram_bins".into(),
+                    MetadataValue::Int(i64::from(histogram_bins)),
+                );
+                let histogram_payload_expected_bytes = (histogram_bins as usize)
+                    .checked_mul(histogram_curve_count as usize)
+                    .and_then(|samples| samples.checked_mul(4))
+                    .ok_or_else(|| {
+                        BioFormatsError::UnsupportedFormat(
+                            "PicoQuant histogram payload size overflows".into(),
+                        )
+                    })?;
+                let histogram_payload_expected_bytes_i64 =
+                    i64::try_from(histogram_payload_expected_bytes).map_err(|_| {
+                        BioFormatsError::UnsupportedFormat(
+                            "PicoQuant histogram expected payload byte count is too large".into(),
+                        )
+                    })?;
+                series_metadata.insert(
+                    "ptu.histogram_payload_expected_bytes".into(),
+                    MetadataValue::Int(histogram_payload_expected_bytes_i64),
+                );
+            }
+            let reconstruction = Self::decode_histogram_payload(&data, data_offset, &tags)?;
+            if let Some(reconstruction) = reconstruction {
+                detector_channels = reconstruction.detector_channels;
+                lifetime_bins = reconstruction.lifetime_bins;
+                pixel_type = reconstruction.pixel_type;
+                bits_per_pixel = reconstruction.bits_per_pixel;
+                series_metadata.insert(
+                    "ptu.reconstruction".into(),
+                    MetadataValue::String(reconstruction.description),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_curves".into(),
+                    MetadataValue::Int(i64::from(detector_channels)),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_payload_ambiguous".into(),
+                    MetadataValue::Bool(false),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_payload_layout".into(),
+                    MetadataValue::String(
+                        reconstruction.histogram_layout.unwrap_or("unknown").into(),
+                    ),
+                );
+                let selected_histogram_payload_bytes =
+                    match i64::try_from(reconstruction.pixels.len()) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return Err(BioFormatsError::UnsupportedFormat(
+                                "PicoQuant histogram expected payload byte count is too large"
+                                    .into(),
+                            ));
+                        }
+                    };
+                series_metadata.insert(
+                    "ptu.histogram_payload_expected_bytes".into(),
+                    MetadataValue::Int(selected_histogram_payload_bytes),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_sample_bytes".into(),
+                    MetadataValue::Int(pixel_type.bytes_per_sample() as i64),
+                );
+                self.pixels = Some(reconstruction.pixels);
+            } else {
+                series_metadata.insert(
+                    "ptu.histogram_payload_ambiguous".into(),
+                    MetadataValue::Bool(true),
+                );
+                let message = if histogram_bins.is_some() {
+                    format!(
+                        "PicoQuant histogram acquisition image-plane decoding is unsupported; expected a complete u32 histogram payload matching descriptor bins and curves ({histogram_payload_actual_bytes} payload bytes found)"
+                    )
+                } else {
+                    "PicoQuant histogram acquisition image-plane decoding is unsupported; missing bounded histogram bin descriptor".to_string()
+                };
+                series_metadata.insert(
+                    "ptu.reconstruction_unsupported".into(),
+                    MetadataValue::String(message.clone()),
+                );
+                self.reconstruction_error = Some(message);
+            }
+        } else {
+            let tttr_record_type = Self::int_tag(&tags, &["TTResultFormat_TTTRRecType"]);
+            let tttr_record_kind =
+                Self::annotate_tttr_acquisition_mode(&mut series_metadata, tttr_record_type);
+            if let Some(sync_resolution) = Self::float_tag(
+                &tags,
+                &["MeasDesc_GlobalResolution", "MeasDesc_SyncResolution"],
+            ) {
+                if sync_resolution > 0.0 {
+                    series_metadata.insert(
+                        "ptu.sync_resolution_seconds".into(),
+                        MetadataValue::Float(sync_resolution),
+                    );
+                }
+            }
+            let reconstruction = Self::reconstruct_tttr_marker_raster(
+                &data,
+                data_offset,
+                &tags,
+                width,
+                height,
+                frames,
+            );
+            match reconstruction {
+                Ok(reconstruction) => {
+                    detector_channels = reconstruction.detector_channels;
+                    lifetime_bins = reconstruction.lifetime_bins;
+                    pixel_type = reconstruction.pixel_type;
+                    bits_per_pixel = reconstruction.bits_per_pixel;
+                    series_metadata.insert(
+                        "ptu.reconstruction".into(),
+                        MetadataValue::String(reconstruction.description),
+                    );
+                    series_metadata.insert(
+                        "ptu.detector_channels".into(),
+                        MetadataValue::Int(i64::from(detector_channels)),
+                    );
+                    series_metadata.insert(
+                        "ptu.lifetime_bins".into(),
+                        MetadataValue::Int(i64::from(lifetime_bins)),
+                    );
+                    series_metadata.insert(
+                        "ptu.bidirectional".into(),
+                        MetadataValue::Bool(reconstruction.bidirectional),
+                    );
+                    if matches!(
+                        tttr_record_kind,
+                        Some(PicoQuantRecordKind {
+                            acquisition_mode: "tttr_t3",
+                            ..
+                        })
+                    ) {
+                        if let Some(lifetime_resolution) = Self::float_tag(
+                            &tags,
+                            &["MeasDesc_Resolution", "MeasDesc_DTimeResolution"],
+                        ) {
+                            if lifetime_resolution > 0.0 {
+                                series_metadata.insert(
+                                    "ptu.lifetime_dtime_resolution_seconds".into(),
+                                    MetadataValue::Float(lifetime_resolution),
+                                );
+                                let lifetime_bin_width = Self::int_tag(
+                                    &tags,
+                                    &["ImgHdr_LifetimeBinWidth", "ImgHdr_TauBinWidth"],
+                                )
+                                .unwrap_or(1);
+                                if lifetime_bin_width > 0 {
+                                    series_metadata.insert(
+                                        "ptu.lifetime_bin_width_dtime".into(),
+                                        MetadataValue::Int(lifetime_bin_width),
+                                    );
+                                    let lifetime_bin_width_seconds =
+                                        lifetime_resolution * lifetime_bin_width as f64;
+                                    series_metadata.insert(
+                                        "ptu.lifetime_bin_width_seconds".into(),
+                                        MetadataValue::Float(lifetime_bin_width_seconds),
+                                    );
+                                    if lifetime_bins > 1 {
+                                        series_metadata.insert(
+                                            "ptu.lifetime_range_seconds".into(),
+                                            MetadataValue::Float(
+                                                lifetime_bin_width_seconds
+                                                    * f64::from(lifetime_bins),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.pixels = Some(reconstruction.pixels);
+                }
+                Err(BioFormatsError::UnsupportedFormat(message)) => {
+                    series_metadata.insert(
+                        "ptu.reconstruction_unsupported".into(),
+                        MetadataValue::String(message.clone()),
+                    );
+                    self.reconstruction_error = Some(message);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let size_c = detector_channels
+            .checked_mul(lifetime_bins)
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat("PicoQuant PTU channel count overflows".into())
+            })?;
+        let image_count = frames.checked_mul(size_c).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "PicoQuant PTU frame/channel plane count overflows".into(),
+            )
+        })?;
+
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x: width,
             size_y: height,
             size_z: 1,
-            size_c: 1,
+            size_c,
             size_t: frames,
-            pixel_type: PixelType::Uint32,
-            bits_per_pixel: 32,
-            image_count: frames,
+            pixel_type,
+            bits_per_pixel,
+            image_count,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb: false,
             is_interleaved: false,
@@ -230,6 +1179,8 @@ impl FormatReader for PicoQuantReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.pixels = None;
+        self.reconstruction_error = None;
         Ok(())
     }
 
@@ -262,7 +1213,34 @@ impl FormatReader for PicoQuantReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Err(picoquant_event_stream_unsupported())
+        let pixels = self
+            .pixels
+            .as_ref()
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    self.reconstruction_error
+                        .clone()
+                        .unwrap_or_else(|| {
+                            "PicoQuant TTTR image reconstruction unavailable: no supported TTTR reconstruction path was initialized".into()
+                        }),
+                )
+            })?;
+        let plane_bytes = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|n| n.checked_mul(meta.pixel_type.bytes_per_sample()))
+            .ok_or_else(|| BioFormatsError::Format("PicoQuant plane size overflows".into()))?;
+        let start = (plane_index as usize)
+            .checked_mul(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("PicoQuant plane offset overflows".into()))?;
+        let end = start
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("PicoQuant plane end overflows".into()))?;
+        pixels
+            .get(start..end)
+            .map(|plane| plane.to_vec())
+            .ok_or_else(|| {
+                BioFormatsError::InvalidData("PicoQuant cached plane is truncated".into())
+            })
     }
 
     fn open_bytes_region(
@@ -278,7 +1256,9 @@ impl FormatReader for PicoQuantReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         validate_region("PicoQuant", meta.size_x, meta.size_y, x, y, w, h)?;
-        Err(picoquant_event_stream_unsupported())
+        let meta = meta.clone();
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("PicoQuant", &full, &meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -850,15 +1830,15 @@ impl FormatReader for RhkReader {
 
 /// Quesant AFM reader (`.afm`).
 ///
-/// Strict raw subset only; native Quesant AFM layout is not decoded.
 pub struct QuesantReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    layout: Option<SpmStrictRawLayout>,
+    layout: Option<QuesantLayout>,
 }
 
 impl QuesantReader {
     const STRICT_RAW_MAGIC: &'static [u8] = b"BFQUESANTAFMRAW!";
+    const MAX_HEADER_SIZE: usize = 1024;
 
     pub fn new() -> Self {
         QuesantReader {
@@ -867,6 +1847,163 @@ impl QuesantReader {
             layout: None,
         }
     }
+
+    fn parse_native(path: &Path) -> Result<(ImageMetadata, QuesantLayout)> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < 10 {
+            return Err(unsupported_raw_spm("Quesant AFM"));
+        }
+
+        let header_len = data.len().min(Self::MAX_HEADER_SIZE);
+        let mut pixels_offset: Option<usize> = None;
+        let mut series_metadata = HashMap::new();
+        let mut pos = 0usize;
+        while pos + 8 <= header_len {
+            let code = &data[pos..pos + 4];
+            let offset = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            if offset == 0 || offset >= data.len() {
+                continue;
+            }
+
+            match code {
+                b"IMAG" => pixels_offset = Some(offset),
+                b"SDES" | b"DATE" => {
+                    let end = data[offset..]
+                        .iter()
+                        .position(|b| *b == 0)
+                        .map(|n| offset + n)
+                        .unwrap_or(data.len());
+                    let value = String::from_utf8_lossy(&data[offset..end])
+                        .trim()
+                        .to_string();
+                    let key = if code == b"SDES" {
+                        "Quesant description"
+                    } else {
+                        "Quesant acquisition date"
+                    };
+                    if !value.is_empty() {
+                        series_metadata.insert(key.into(), MetadataValue::String(value));
+                    }
+                }
+                b"DESC" if offset + 2 <= data.len() => {
+                    let len =
+                        u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                    if offset + 2 + len <= data.len() {
+                        let value = String::from_utf8_lossy(&data[offset + 2..offset + 2 + len])
+                            .trim()
+                            .to_string();
+                        if !value.is_empty() {
+                            series_metadata
+                                .insert("Quesant description".into(), MetadataValue::String(value));
+                        }
+                    }
+                }
+                b"HARD" if offset + 42 <= data.len() => {
+                    let x_size = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                    let scan_rate =
+                        f32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
+                    let tunnel_current =
+                        f32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap())
+                            * 10.0
+                            / 32768.0;
+                    let integral_gain =
+                        f32::from_le_bytes(data[offset + 24..offset + 28].try_into().unwrap());
+                    let proportional_gain =
+                        f32::from_le_bytes(data[offset + 28..offset + 32].try_into().unwrap());
+                    let is_stm =
+                        u16::from_le_bytes(data[offset + 32..offset + 34].try_into().unwrap())
+                            == 10;
+                    let dynamic_range =
+                        f32::from_le_bytes(data[offset + 34..offset + 38].try_into().unwrap());
+                    series_metadata.insert("Scan size".into(), MetadataValue::Float(x_size as f64));
+                    series_metadata.insert(
+                        "Scan rate (Hz)".into(),
+                        MetadataValue::Float(scan_rate as f64),
+                    );
+                    series_metadata.insert(
+                        "Tunnel current".into(),
+                        MetadataValue::Float(tunnel_current as f64),
+                    );
+                    series_metadata.insert("Is STM image".into(), MetadataValue::Bool(is_stm));
+                    series_metadata.insert(
+                        "Integral gain".into(),
+                        MetadataValue::Float(integral_gain as f64),
+                    );
+                    series_metadata.insert(
+                        "Proportional gain".into(),
+                        MetadataValue::Float(proportional_gain as f64),
+                    );
+                    series_metadata.insert(
+                        "Z dynamic range".into(),
+                        MetadataValue::Float(dynamic_range as f64),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let pixels_offset = pixels_offset.ok_or_else(|| unsupported_raw_spm("Quesant AFM"))?;
+        if pixels_offset + 2 > data.len() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Quesant AFM image header is truncated".into(),
+            ));
+        }
+        let size_x =
+            u16::from_le_bytes(data[pixels_offset..pixels_offset + 2].try_into().unwrap()) as u32;
+        if size_x == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Quesant AFM image dimension must be non-zero".into(),
+            ));
+        }
+        let data_offset = pixels_offset as u64 + 2;
+        let plane_bytes = (size_x as u64)
+            .checked_mul(size_x as u64)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| BioFormatsError::Format("Quesant AFM plane size overflows".into()))?;
+        let expected = data_offset
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("Quesant AFM file size overflows".into()))?;
+        if (data.len() as u64) < expected {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Quesant AFM pixel payload is shorter than declared dimensions".into(),
+            ));
+        }
+
+        Ok((
+            ImageMetadata {
+                size_x,
+                size_y: size_x,
+                size_z: 1,
+                size_c: 1,
+                size_t: 1,
+                pixel_type: PixelType::Uint16,
+                bits_per_pixel: 16,
+                image_count: 1,
+                dimension_order: DimensionOrder::XYZCT,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: true,
+                resolution_count: 1,
+                series_metadata,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            },
+            QuesantLayout::Native {
+                data_offset,
+                plane_bytes,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum QuesantLayout {
+    Strict(SpmStrictRawLayout),
+    Native { data_offset: u64, plane_bytes: u64 },
 }
 
 impl Default for QuesantReader {
@@ -888,13 +2025,22 @@ impl FormatReader for QuesantReader {
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
         _header.starts_with(Self::STRICT_RAW_MAGIC)
+            || _header[.._header.len().min(Self::MAX_HEADER_SIZE)]
+                .windows(8)
+                .any(|w| &w[..4] == b"IMAG")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.path = None;
         self.meta = None;
         self.layout = None;
-        let (meta, layout) = parse_strict_spm_raw(path, Self::STRICT_RAW_MAGIC, "Quesant AFM")?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let (meta, layout) = if data.starts_with(Self::STRICT_RAW_MAGIC) {
+            let (meta, layout) = parse_strict_spm_raw(path, Self::STRICT_RAW_MAGIC, "Quesant AFM")?;
+            (meta, QuesantLayout::Strict(layout))
+        } else {
+            Self::parse_native(path)?
+        };
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
         self.layout = Some(layout);
@@ -937,11 +2083,35 @@ impl FormatReader for QuesantReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        read_strict_spm_raw_plane(
-            self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
-            self.layout.ok_or(BioFormatsError::NotInitialized)?,
-            plane_index,
-        )
+        match self.layout.ok_or(BioFormatsError::NotInitialized)? {
+            QuesantLayout::Strict(layout) => read_strict_spm_raw_plane(
+                self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?,
+                layout,
+                plane_index,
+            ),
+            QuesantLayout::Native {
+                data_offset,
+                plane_bytes,
+            } => {
+                let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+                let offset = data_offset
+                    .checked_add(plane_bytes.checked_mul(plane_index as u64).ok_or_else(|| {
+                        BioFormatsError::Format("Quesant AFM plane offset overflows".into())
+                    })?)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("Quesant AFM plane offset overflows".into())
+                    })?;
+                let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+                f.seek(SeekFrom::Start(offset))
+                    .map_err(BioFormatsError::Io)?;
+                let n_bytes = usize::try_from(plane_bytes).map_err(|_| {
+                    BioFormatsError::Format("Quesant AFM plane size overflows".into())
+                })?;
+                let mut buf = vec![0; n_bytes];
+                f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+                Ok(buf)
+            }
+        }
     }
 
     fn open_bytes_region(
