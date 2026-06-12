@@ -29,7 +29,6 @@ use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
 
 use hdf5_pure_rust::{HyperslabDim, Selection};
 
@@ -50,6 +49,7 @@ struct SeriesInfo {
 
 pub struct BdvReader {
     path: Option<PathBuf>,
+    file: Option<hdf5_pure_rust::File>,
     series: Vec<SeriesInfo>,
     current_series: usize,
 }
@@ -58,6 +58,7 @@ impl BdvReader {
     pub fn new() -> Self {
         BdvReader {
             path: None,
+            file: None,
             series: Vec::new(),
             current_series: 0,
         }
@@ -121,6 +122,68 @@ fn inner_text(xml: &str, tag: &str) -> Option<String> {
     Some(xml[start..start + end].to_string())
 }
 
+/// Find inner text of `<tag ...>...</tag>`, allowing attributes on the opening tag.
+fn inner_text_with_attrs(xml: &str, tag: &str) -> Option<String> {
+    let open_prefix = format!("<{tag}");
+    let open = xml.find(&open_prefix)?;
+    let open_end = xml[open..].find('>')? + open + 1;
+    let close = format!("</{tag}>");
+    let end = xml[open_end..].find(&close)?;
+    Some(xml[open_end..open_end + end].to_string())
+}
+
+fn resolve_bdv_paths(path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<String>)> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if matches!(ext.as_deref(), Some("xml")) {
+        let xml = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+        if !xml.contains("<SpimData") || !xml.contains("bdv.hdf5") {
+            return Err(BioFormatsError::Format(
+                "BDV: not a SpimData HDF5 XML file".into(),
+            ));
+        }
+        let hdf5 = inner_text_with_attrs(&xml, "hdf5").ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("BDV XML: missing hdf5 path".into())
+        })?;
+        let base_path = inner_text_with_attrs(&xml, "BasePath").unwrap_or_else(|| ".".into());
+        let base = if base_path.trim().is_empty() || base_path.trim() == "." {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        } else {
+            let p = PathBuf::from(base_path.trim());
+            if p.is_absolute() {
+                p
+            } else {
+                path.parent().unwrap_or_else(|| Path::new(".")).join(p)
+            }
+        };
+        let h5_path = {
+            let p = PathBuf::from(hdf5.trim());
+            if p.is_absolute() {
+                p
+            } else {
+                base.join(p)
+            }
+        };
+        Ok((h5_path, Some(path.to_path_buf()), Some(xml)))
+    } else {
+        let xml_path = path.with_extension("xml");
+        let xml_str = if xml_path.exists() {
+            std::fs::read_to_string(&xml_path).ok()
+        } else {
+            None
+        };
+        Ok((
+            path.to_path_buf(),
+            xml_path.exists().then_some(xml_path),
+            xml_str,
+        ))
+    }
+}
+
 /// Parse the timepoint list from the SpimData `<Timepoints>` block.
 ///
 /// Supports `type="pattern"` with `<integerpattern>` of the forms:
@@ -173,18 +236,12 @@ fn pixel_type_for_size(size: usize) -> Result<(PixelType, usize)> {
     }
 }
 
-fn parse_bdv(path: &Path) -> Result<Vec<SeriesInfo>> {
-    let file = hdf5_pure_rust::File::open(path)
+fn parse_bdv(path: &Path) -> Result<(PathBuf, Vec<SeriesInfo>)> {
+    let (h5_path, xml_path, xml_str) = resolve_bdv_paths(path)?;
+    let file = hdf5_pure_rust::File::open(&h5_path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
 
     // ── Enumerate setups and timepoints (companion XML preferred) ────────────
-    let xml_path = path.with_extension("xml");
-    let xml_str = if xml_path.exists() {
-        std::fs::read_to_string(&xml_path).ok()
-    } else {
-        None
-    };
-
     // Setups: (id, voxelSize). Prefer the XML's ViewSetups; otherwise count the
     // sNN groups at the HDF5 root.
     let setups: Vec<ViewSetupXml> = match xml_str.as_deref().map(parse_view_setups) {
@@ -287,7 +344,7 @@ fn parse_bdv(path: &Path) -> Result<Vec<SeriesInfo>> {
                     "format".into(),
                     MetadataValue::String("BigDataViewer HDF5".into()),
                 );
-                if let Some(p) = xml_path.to_str() {
+                if let Some(p) = xml_path.as_ref().and_then(|p| p.to_str()) {
                     meta_map.insert("bdv_xml_path".into(), MetadataValue::String(p.into()));
                 }
                 meta_map.insert("bdv_setup".into(), MetadataValue::Int(setup.id as i64));
@@ -333,7 +390,7 @@ fn parse_bdv(path: &Path) -> Result<Vec<SeriesInfo>> {
         ));
     }
 
-    Ok(series)
+    Ok((h5_path, series))
 }
 
 fn hdf5_group_members(
@@ -359,7 +416,7 @@ impl FormatReader for BdvReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("h5"))
+        matches!(ext.as_deref(), Some("h5") | Some("xml"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -370,14 +427,19 @@ impl FormatReader for BdvReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        self.series = parse_bdv(path)?;
-        self.path = Some(path.to_path_buf());
+        let (h5_path, series) = parse_bdv(path)?;
+        let file = hdf5_pure_rust::File::open(&h5_path)
+            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+        self.series = series;
+        self.file = Some(file);
+        self.path = Some(h5_path);
         self.current_series = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
+        self.file = None;
         self.series.clear();
         self.current_series = 0;
         Ok(())
@@ -447,13 +509,7 @@ impl FormatReader for BdvReader {
         let bps = meta.pixel_type.bytes_per_sample() as usize;
         let plane_pixels = meta.size_x as usize * meta.size_y as usize;
 
-        let path = self
-            .path
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?
-            .clone();
-        let file = hdf5_pure_rust::File::open(&path)
-            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let ds = file
             .dataset(&ds_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
@@ -508,12 +564,75 @@ impl FormatReader for BdvReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
         let si = self
             .series
             .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("BDV", &full, &si.meta, 1, x, y, w, h)
+        let meta = &si.meta;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let x2 = x
+            .checked_add(w)
+            .ok_or_else(|| BioFormatsError::Format("BDV region width overflows".into()))?;
+        let y2 = y
+            .checked_add(h)
+            .ok_or_else(|| BioFormatsError::Format("BDV region height overflows".into()))?;
+        if x2 > meta.size_x || y2 > meta.size_y {
+            return Err(BioFormatsError::Format(
+                "BDV region is outside image bounds".into(),
+            ));
+        }
+
+        let z = plane_index as usize;
+        let ds_path = format!("t{:05}/s{:02}/{}/cells", si.timepoint, si.setup, si.level);
+        let bps = meta.pixel_type.bytes_per_sample() as usize;
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let ds = file
+            .dataset(&ds_path)
+            .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
+
+        let sel = Selection::Hyperslab(vec![
+            HyperslabDim::new(z as u64, 1, 1, 1),
+            HyperslabDim::new(y as u64, 1, h as u64, 1),
+            HyperslabDim::new(x as u64, 1, w as u64, 1),
+        ]);
+
+        let expected = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|v| v.checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::Format("BDV region byte count overflows".into()))?;
+        let raw: Vec<u8> = match bps {
+            1 => ds
+                .read_slice::<u8, _>(sel)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
+            2 => {
+                let words: Vec<u16> = ds
+                    .read_slice::<u16, _>(sel)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                words.iter().flat_map(|w| w.to_le_bytes()).collect()
+            }
+            4 => {
+                let words: Vec<u32> = ds
+                    .read_slice::<u32, _>(sel)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                words.iter().flat_map(|w| w.to_le_bytes()).collect()
+            }
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "BDV unsupported bytes-per-sample {other}"
+                )))
+            }
+        };
+        if raw.len() == expected {
+            Ok(raw)
+        } else {
+            Err(BioFormatsError::UnsupportedFormat(format!(
+                "BDV dataset {ds_path} region is shorter than declared plane {plane_index} \
+                 (need {expected} bytes, have {})",
+                raw.len()
+            )))
+        }
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

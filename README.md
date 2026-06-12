@@ -26,7 +26,7 @@ But:
 
 * **This approach should still be considered experimental**. The LLM technology is immature and has sharp corners. But there are opportunities to reap, and the genie is not going back into the bottle. This translation is as much aimed to learn how to improve the technology and get feedback on the results.
 * Translations are not endorsed by the original authors unless otherwise noted. **Do not send bug reports to the original developers**. Use our Github issues page instead.
-* **Do not trust the benchmarks on this page**. They are used to help evaluate the translation. If you want improved performance, you generally have to use this code as a library, and use the additional tricks it offers. We generally accept performance losses in order to reduce our dependency issues
+* **Do not overinterpret the benchmark reports**. They are used to help evaluate the translation. If you want improved performance, you generally have to use this code as a library, and use the additional tricks it offers. We generally accept performance losses in order to reduce our dependency issues
 * **Check the original Github pages for information about the package**. This README is kept sparse on purpose. It is not meant to be the primary source of information
 * **If you are the author of the original code and wish to move to Rust, you can obtain ownership of this repository and crate**. Until then, our commitment is to offer an as-faithful-as-possible translation of a snapshot of your code. If we find serious bugs, we will report them to you. Otherwise we will just replicate them, to ensure comparability across studies that claim to use package XYZ v.666. Think of this like a fancy Ubuntu .deb-package of your software - that is how we treat it
 
@@ -462,17 +462,31 @@ assert_eq!(plane.len(), meta.size_y as usize * row_bytes);
 
 ### Performance
 
-Reading all planes from each fixture, using one long-lived process per
-implementation with 5 warmup iterations and 20 measured iterations:
+For broad translation audits, use the subset comparison harness. It runs Java
+Bio-Formats and bioformats-rs against the same centered crop from the first N
+planes of each series, records average open+subset-read time, and captures peak
+RSS with `/usr/bin/time`:
 
-| Fixture | Java Bio-Formats | bioformats-rs | Ratio |
-|---------|-----------------:|--------------:|------:|
-| CZI, `672x512`, 63 planes, 43,352,064 pixel bytes | 177.342 ms | 51.438 ms | 3.45x |
-| OME-TIFF, `test/tubhiswt_C0.ome.tif` | 13.463 ms | 2.432 ms | 5.54x |
+```bash
+bench/compare_subset.sh --warmup 2 --measure 5 --planes 1 --region 256x256 \
+  --find-testdata
+```
 
-Reproduce by building the warmup harnesses and running `bench/BfBench.java` and
-`bench/bench_rust.rs` against the same fixture. This measures open + read all
-planes + close per iteration after warmup, not cold JVM startup.
+Outputs, including the Markdown result table, are written under `bench/target/`:
+
+- `bench/target/subset-comparison.csv`
+- `bench/target/subset-comparison.md`
+
+You can pass explicit files or a newline-delimited manifest instead of
+`--find-testdata`:
+
+```bash
+bench/compare_subset.sh --manifest fixtures-to-benchmark.txt
+bench/compare_subset.sh test/tubhiswt_C0.ome.tif testdata/nd2/BF007.nd2
+```
+
+The reported timing excludes process startup inside each harness. RSS is measured
+around the whole harness process, so Java RSS includes JVM overhead.
 
 
 

@@ -10,7 +10,8 @@
 //!   /Image/Item(N)/Tags/CONTENTS — per-plane z/c/t indices
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
@@ -21,6 +22,7 @@ use crate::common::region::crop_full_plane;
 
 pub struct ZviReader {
     path: Option<PathBuf>,
+    comp: Option<cfb::CompoundFile<File>>,
     meta: Option<ImageMetadata>,
     planes: Vec<ZviPlane>,
     bytes_per_pixel: usize,
@@ -358,6 +360,7 @@ impl ZviReader {
     pub fn new() -> Self {
         ZviReader {
             path: None,
+            comp: None,
             meta: None,
             planes: Vec::new(),
             bytes_per_pixel: 1,
@@ -481,9 +484,9 @@ struct ParsedItem {
 /// Parse one ZVI item ("/Image/Item(N)/CONTENTS") stream.
 ///
 /// Port of the per-image parsing in ZeissZVIReader.fillMetadataPass1.
-fn parse_zvi_item(data: &[u8]) -> Result<Option<ParsedItem>> {
+fn parse_zvi_item(data: &[u8], stream_len: usize) -> Result<Option<ParsedItem>> {
     // Image streams smaller than this are metadata-only and skipped by Java.
-    if data.len() <= 1024 {
+    if stream_len <= 1024 {
         return Ok(None);
     }
 
@@ -576,7 +579,7 @@ fn parse_zvi_item(data: &[u8]) -> Result<Option<ParsedItem>> {
             .checked_mul(size_y as usize)
             .and_then(|px| px.checked_mul(bpp as usize))
             .ok_or_else(|| BioFormatsError::Format("ZVI plane size overflows".into()))?;
-        if data_offset > data.len() {
+        if data_offset > stream_len {
             return Err(BioFormatsError::InvalidData(
                 "ZVI: pixel data offset is past end of stream".into(),
             ));
@@ -598,9 +601,40 @@ fn parse_zvi_item(data: &[u8]) -> Result<Option<ParsedItem>> {
     }))
 }
 
+fn parse_zvi_item_stream<R: Read + Seek>(stream: &mut R) -> Result<Option<ParsedItem>> {
+    let stream_len = stream.seek(SeekFrom::End(0)).map_err(BioFormatsError::Io)? as usize;
+    stream
+        .seek(SeekFrom::Start(0))
+        .map_err(BioFormatsError::Io)?;
+
+    let initial_len = stream_len.min(64 * 1024);
+    let mut data = vec![0u8; initial_len];
+    stream.read_exact(&mut data).map_err(BioFormatsError::Io)?;
+    match parse_zvi_item(&data, stream_len) {
+        Ok(Some(item)) => Ok(Some(item)),
+        Ok(None) if initial_len < stream_len => {
+            stream
+                .seek(SeekFrom::Start(0))
+                .map_err(BioFormatsError::Io)?;
+            data.resize(stream_len, 0);
+            stream.read_exact(&mut data).map_err(BioFormatsError::Io)?;
+            parse_zvi_item(&data, stream_len)
+        }
+        other => other,
+    }
+}
+
 fn parse_zvi(
     path: &Path,
-) -> Result<(ImageMetadata, Vec<ZviPlane>, usize, bool, usize, ZviOmeInfo)> {
+) -> Result<(
+    ImageMetadata,
+    Vec<ZviPlane>,
+    usize,
+    bool,
+    usize,
+    ZviOmeInfo,
+    cfb::CompoundFile<File>,
+)> {
     let mut comp =
         cfb::open(path).map_err(|e| BioFormatsError::Format(format!("ZVI CFB open error: {e}")))?;
 
@@ -669,14 +703,51 @@ fn parse_zvi(
             Ok(s) => s,
             Err(_) => continue,
         };
-        let mut data = Vec::new();
-        if stream.read_to_end(&mut data).is_err() {
+        let item = match parse_zvi_item_stream(&mut stream) {
+            Ok(Some(item)) => item,
+            Ok(None) => continue,
+            Err(_) => {
+                let mut stream = match comp.open_stream(&stream_path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let mut data = Vec::new();
+                if stream.read_to_end(&mut data).is_err() {
+                    continue;
+                }
+                match parse_zvi_item(&data, data.len())? {
+                    Some(item) => item,
+                    None => continue,
+                }
+            }
+        };
+        if item.data_offset > 64 * 1024 {
+            // Extremely large item headers are rare; reopen and parse the whole
+            // stream so the result is still derived from the same bytes as the
+            // original full-read implementation.
+            let mut stream = match comp.open_stream(&stream_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut data = Vec::new();
+            if stream.read_to_end(&mut data).is_err() {
+                continue;
+            }
+            let Some(item) = parse_zvi_item(&data, data.len())? else {
+                continue;
+            };
+            planes.push(ZviPlane {
+                stream_path,
+                z: item.z,
+                c: item.c,
+                t: item.t,
+                tile: item.tile,
+                data_offset: item.data_offset,
+                is_zlib: item.is_zlib,
+                is_jpeg: item.is_jpeg,
+            });
             continue;
         }
-
-        let Some(item) = parse_zvi_item(&data)? else {
-            continue;
-        };
 
         // bpp / sizeX / sizeY are taken from the first valid image stream.
         if bpp == 0 {
@@ -862,7 +933,15 @@ fn parse_zvi(
         modulo_t: None,
     };
 
-    Ok((meta, planes, bytes_per_pixel, is_rgb, tile_count, ome_info))
+    Ok((
+        meta,
+        planes,
+        bytes_per_pixel,
+        is_rgb,
+        tile_count,
+        ome_info,
+        comp,
+    ))
 }
 
 /// Decode pixel data from a ZVI plane stream starting at `data_offset`.
@@ -923,9 +1002,10 @@ impl FormatReader for ZviReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, planes, bpp, is_rgb, tile_count, ome_info) = parse_zvi(path)?;
+        let (meta, planes, bpp, is_rgb, tile_count, ome_info, comp) = parse_zvi(path)?;
         self.meta = Some(meta);
         self.planes = planes;
+        self.comp = Some(comp);
         self.path = Some(path.to_path_buf());
         self.bytes_per_pixel = bpp;
         self.is_rgb = is_rgb;
@@ -937,6 +1017,7 @@ impl FormatReader for ZviReader {
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
+        self.comp = None;
         self.meta = None;
         self.planes.clear();
         self.tile_count = 1;
@@ -986,7 +1067,11 @@ impl FormatReader for ZviReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
@@ -1017,14 +1102,7 @@ impl FormatReader for ZviReader {
             is_jpeg: plane.is_jpeg,
         };
 
-        let path = self
-            .path
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?
-            .clone();
-        let mut comp =
-            cfb::open(&path).map_err(|e| BioFormatsError::Format(format!("ZVI CFB open: {e}")))?;
-
+        let comp = self.comp.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         let mut stream = comp
             .open_stream(&stream_path)
             .map_err(|e| BioFormatsError::Format(format!("ZVI stream {stream_path}: {e}")))?;
@@ -1073,8 +1151,14 @@ impl FormatReader for ZviReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
         let bps = meta.pixel_type.bytes_per_sample();
         let samples_per_pixel = self
             .bytes_per_pixel
@@ -1083,7 +1167,76 @@ impl FormatReader for ZviReader {
                 *samples > 0 && samples.checked_mul(bps) == Some(self.bytes_per_pixel)
             })
             .ok_or_else(|| BioFormatsError::Format("ZVI pixel size is inconsistent".into()))?;
-        crop_full_plane("ZVI", &full, meta, samples_per_pixel, x, y, w, h)
+        let x2 = x
+            .checked_add(w)
+            .ok_or_else(|| BioFormatsError::Format("ZVI region width overflows".into()))?;
+        let y2 = y
+            .checked_add(h)
+            .ok_or_else(|| BioFormatsError::Format("ZVI region height overflows".into()))?;
+        if w == 0 || h == 0 || x2 > meta.size_x || y2 > meta.size_y {
+            return Err(BioFormatsError::Format(
+                "ZVI region is outside image bounds".into(),
+            ));
+        }
+
+        let image_count = meta.image_count;
+        let global_index = (self.current_series as u32)
+            .checked_mul(image_count)
+            .and_then(|base| base.checked_add(plane_index))
+            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let plane = self
+            .planes
+            .get(global_index as usize)
+            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
+
+        if !plane.is_jpeg && !plane.is_zlib {
+            let comp = self.comp.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+            let mut stream = comp.open_stream(&plane.stream_path).map_err(|e| {
+                BioFormatsError::Format(format!("ZVI stream {}: {e}", plane.stream_path))
+            })?;
+
+            let src_row_bytes = meta.size_x as usize * self.bytes_per_pixel;
+            let dst_row_bytes = w as usize * self.bytes_per_pixel;
+            let plane_bytes = src_row_bytes
+                .checked_mul(meta.size_y as usize)
+                .ok_or_else(|| BioFormatsError::Format("ZVI plane byte count overflows".into()))?;
+            let mut out = vec![0u8; dst_row_bytes * h as usize];
+
+            for row in 0..h as usize {
+                let src = plane
+                    .data_offset
+                    .checked_add((y as usize + row) * src_row_bytes)
+                    .and_then(|off| off.checked_add(x as usize * self.bytes_per_pixel))
+                    .ok_or_else(|| BioFormatsError::Format("ZVI region offset overflows".into()))?;
+                if src < plane.data_offset + plane_bytes {
+                    let remaining = plane.data_offset + plane_bytes - src;
+                    let to_read = dst_row_bytes.min(remaining);
+                    stream
+                        .seek(SeekFrom::Start(src as u64))
+                        .map_err(BioFormatsError::Io)?;
+                    let dst = row * dst_row_bytes;
+                    stream
+                        .read_exact(&mut out[dst..dst + to_read])
+                        .map_err(BioFormatsError::Io)?;
+                }
+            }
+
+            if self.is_rgb && self.bytes_per_pixel >= 3 {
+                let bpp = self.bytes_per_pixel;
+                let bytes = bpp / 3;
+                let mut i = 0;
+                while i + bpp <= out.len() {
+                    for k in 0..bytes {
+                        out.swap(i + k, i + 2 * bytes + k);
+                    }
+                    i += bpp;
+                }
+            }
+            return Ok(out);
+        }
+
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("ZVI", &full, &meta, samples_per_pixel, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

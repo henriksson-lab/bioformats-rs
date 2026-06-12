@@ -9,6 +9,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
+use crate::common::io::read_bytes_at;
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
@@ -96,7 +97,7 @@ enum DmValue {
     Str(String),
     Group(Vec<(String, DmValue)>),
     Array(Vec<DmValue>),
-    Bytes(Vec<u8>), // raw image data
+    Bytes { offset: u64, len: u64 }, // raw image data location
 }
 
 impl DmValue {
@@ -447,9 +448,12 @@ impl<R: Read + Seek> DmReader<R> {
                 }
 
                 if label == "Data" {
-                    let mut data = vec![0u8; total_bytes as usize];
-                    self.r.read_exact(&mut data)?;
-                    Ok(DmValue::Bytes(data))
+                    let offset = self.r.stream_position()?;
+                    self.skip_bytes(total_bytes)?;
+                    Ok(DmValue::Bytes {
+                        offset,
+                        len: total_bytes,
+                    })
                 } else {
                     self.skip_bytes(total_bytes)?;
                     Ok(DmValue::Int(0))
@@ -614,7 +618,8 @@ struct DmImage {
     height: u32,
     depth: u32, // Z planes
     dm_data_type: i32,
-    pixel_data: Vec<u8>,
+    pixel_data_offset: u64,
+    pixel_data_len: u64,
     name: String,
 }
 
@@ -700,8 +705,8 @@ fn extract_image(entry: &DmValue) -> Result<Option<DmImage>> {
     let data_tag = img_data.get("Data").ok_or_else(|| {
         BioFormatsError::UnsupportedFormat("Gatan DM ImageData has no Data".into())
     })?;
-    let pixel_data = match data_tag {
-        DmValue::Bytes(b) => b.clone(),
+    let (pixel_data_offset, pixel_data_len) = match data_tag {
+        DmValue::Bytes { offset, len } => (*offset, *len),
         _ => return Ok(None),
     };
 
@@ -722,7 +727,8 @@ fn extract_image(entry: &DmValue) -> Result<Option<DmImage>> {
         height,
         depth,
         dm_data_type,
-        pixel_data,
+        pixel_data_offset,
+        pixel_data_len,
         name,
     }))
 }
@@ -768,7 +774,8 @@ fn select_physical_sizes(
 pub struct GatanReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    pixel_data: Option<Vec<u8>>,
+    pixel_data_offset: u64,
+    pixel_data_len: u64,
     dm_data_type: i32,
     /// OME PhysicalSize{X,Y,Z} derived from the "Scale" tags (micrometres value).
     physical_size_x: Option<f64>,
@@ -781,7 +788,8 @@ impl GatanReader {
         GatanReader {
             path: None,
             meta: None,
-            pixel_data: None,
+            pixel_data_offset: 0,
+            pixel_data_len: 0,
             dm_data_type: 23,
             physical_size_x: None,
             physical_size_y: None,
@@ -898,7 +906,7 @@ impl FormatReader for GatanReader {
                 "Gatan DM image has zero pixels".into(),
             ));
         }
-        let derived_bytes = img.pixel_data.len() / pixel_count;
+        let derived_bytes = img.pixel_data_len as usize / pixel_count;
         if derived_bytes != bytes_per_pixel {
             // Java sources `signed` from the LowLimit tag; gatan.rs does not
             // capture it, so fall back to the DataType's own signedness.
@@ -911,10 +919,10 @@ impl FormatReader for GatanReader {
         let expected_len = pixel_count
             .checked_mul(bytes_per_pixel)
             .ok_or_else(|| BioFormatsError::Format("Gatan DM pixel payload overflows".into()))?;
-        if img.pixel_data.len() < expected_len {
+        if img.pixel_data_len < expected_len as u64 {
             return Err(BioFormatsError::UnsupportedFormat(format!(
                 "Gatan DM pixel payload is shorter than declared ({} < {expected_len})",
-                img.pixel_data.len()
+                img.pixel_data_len
             )));
         }
 
@@ -957,7 +965,8 @@ impl FormatReader for GatanReader {
         let _ = units; // units only affect the OME unit, not the reported value
 
         self.meta = Some(meta);
-        self.pixel_data = Some(img.pixel_data);
+        self.pixel_data_offset = img.pixel_data_offset;
+        self.pixel_data_len = img.pixel_data_len;
         self.dm_data_type = img.dm_data_type;
         self.path = Some(path.to_path_buf());
         self.physical_size_x = psx;
@@ -969,7 +978,8 @@ impl FormatReader for GatanReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
-        self.pixel_data = None;
+        self.pixel_data_offset = 0;
+        self.pixel_data_len = 0;
         self.physical_size_x = None;
         self.physical_size_y = None;
         self.physical_size_z = None;
@@ -1006,20 +1016,22 @@ impl FormatReader for GatanReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let data = self
-            .pixel_data
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;
         let start = plane_index as usize * plane_bytes;
         let end = start + plane_bytes;
-        if end > data.len() {
+        if end as u64 > self.pixel_data_len {
             return Err(BioFormatsError::InvalidData(
                 "DM plane out of range in data".into(),
             ));
         }
-        Ok(data[start..end].to_vec())
+        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+        read_bytes_at(
+            &mut file,
+            self.pixel_data_offset + start as u64,
+            plane_bytes,
+        )
     }
 
     fn open_bytes_region(
@@ -1030,9 +1042,54 @@ impl FormatReader for GatanReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("Gatan", &full, meta, 1, x, y, w, h)
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let x2 = x
+            .checked_add(w)
+            .ok_or_else(|| BioFormatsError::Format("Gatan region width overflows".into()))?;
+        let y2 = y
+            .checked_add(h)
+            .ok_or_else(|| BioFormatsError::Format("Gatan region height overflows".into()))?;
+        if x2 > meta.size_x || y2 > meta.size_y {
+            return Err(BioFormatsError::Format(
+                "Gatan region is outside image bounds".into(),
+            ));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let bps = meta.pixel_type.bytes_per_sample();
+        let src_row_bytes = meta.size_x as usize * bps;
+        let dst_row_bytes = w as usize * bps;
+        let plane_bytes = src_row_bytes
+            .checked_mul(meta.size_y as usize)
+            .ok_or_else(|| BioFormatsError::Format("Gatan plane byte count overflows".into()))?;
+        let plane_start = (plane_index as usize)
+            .checked_mul(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("Gatan plane offset overflows".into()))?;
+        if plane_start as u64 + plane_bytes as u64 > self.pixel_data_len {
+            return Err(BioFormatsError::InvalidData(
+                "DM plane out of range in data".into(),
+            ));
+        }
+        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+        let mut out = vec![0u8; dst_row_bytes * h as usize];
+        for row in 0..h as usize {
+            let src = plane_start + (y as usize + row) * src_row_bytes + x as usize * bps;
+            let dst = row * dst_row_bytes;
+            if src as u64 + dst_row_bytes as u64 > self.pixel_data_len {
+                return Err(BioFormatsError::InvalidData(
+                    "DM region out of range in data".into(),
+                ));
+            }
+            let row_data = read_bytes_at(
+                &mut file,
+                self.pixel_data_offset + src as u64,
+                dst_row_bytes,
+            )?;
+            out[dst..dst + dst_row_bytes].copy_from_slice(&row_data);
+        }
+        Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

@@ -7,5 +7,9 @@ edition = "2021"
 name = "bench_rust"
 path = "bench_rust.rs"
 
+[[bin]]
+name = "bench_subset_rust"
+path = "bench_subset_rust.rs"
+
 [dependencies]
 bioformats = { path = ".." }

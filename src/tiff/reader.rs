@@ -1277,6 +1277,48 @@ impl TiffReader {
                 );
                 if let Some(result) = decoded {
                     let band = result?;
+                    let channels = band
+                        .pixels
+                        .len()
+                        .checked_div(band.band_width as usize * band.band_height.max(1) as usize)
+                        .filter(|&c| c > 0)
+                        .unwrap_or(effective_spp as usize);
+                    if info.bits_per_sample == 8
+                        && !packed_row_layout
+                        && !subbyte_samples
+                        && !matches!(
+                            info.photometric,
+                            Photometric::MinIsWhite | Photometric::Cmyk
+                        )
+                        && x >= band.band_x0
+                        && x.checked_add(w)
+                            .is_some_and(|end| end <= band.band_x0 + band.band_width)
+                        && y >= band.band_y0
+                        && y_end <= band.band_y0 + band.band_height
+                    {
+                        let src_x = (x - band.band_x0) as usize;
+                        let src_y = (y - band.band_y0) as usize;
+                        let band_stride = band.band_width as usize * channels;
+                        let row_len = w as usize * channels;
+                        let mut out = checked_vec_with_capacity(
+                            h as usize * row_len,
+                            "TIFF NDPI cropped band",
+                        )?;
+                        for row in 0..h as usize {
+                            let src = (src_y + row) * band_stride + src_x * channels;
+                            let end = src.checked_add(row_len).ok_or_else(|| {
+                                BioFormatsError::Format(
+                                    "TIFF NDPI cropped band row overflows".into(),
+                                )
+                            })?;
+                            out.extend_from_slice(band.pixels.get(src..end).ok_or_else(|| {
+                                BioFormatsError::InvalidData(
+                                    "TIFF NDPI cropped band row is outside decoded data".into(),
+                                )
+                            })?);
+                        }
+                        return Ok(out);
+                    }
                     // The band is a sub-rectangle [band_x0, band_x0+band_width) ×
                     // [band_y0, band_y0+band_height) that fully contains the
                     // requested [x,x+w) columns. Emit `h` FULL-WIDTH rows (with the
@@ -1284,12 +1326,6 @@ impl TiffReader {
                     // shared apply_photometric + column-crop below produce exactly
                     // the same output as the generic path. Only the [x,x+w) columns
                     // — which lie inside the band — survive the crop.
-                    let channels = band
-                        .pixels
-                        .len()
-                        .checked_div(band.band_width as usize * band.band_height.max(1) as usize)
-                        .filter(|&c| c > 0)
-                        .unwrap_or(effective_spp as usize);
                     let band_stride = band.band_width as usize * channels;
                     let dst_off = band.band_x0 as usize * channels;
                     let copy_len = band_stride.min(row_bytes.saturating_sub(dst_off));
@@ -1350,6 +1386,46 @@ impl TiffReader {
                 }
                 if let Some(result) = decoded {
                     let band = result?;
+                    let channels = band
+                        .pixels
+                        .len()
+                        .checked_div(band.band_width as usize * band.band_height.max(1) as usize)
+                        .filter(|&c| c > 0)
+                        .unwrap_or(effective_spp as usize);
+                    if info.bits_per_sample == 8
+                        && !packed_row_layout
+                        && !subbyte_samples
+                        && !matches!(
+                            info.photometric,
+                            Photometric::MinIsWhite | Photometric::Cmyk
+                        )
+                        && x.checked_add(w).is_some_and(|end| end <= band.band_width)
+                        && y >= band.band_y0
+                        && y_end <= band.band_y0 + band.band_height
+                    {
+                        let src_y = (y - band.band_y0) as usize;
+                        let src_x = x as usize;
+                        let band_stride = band.band_width as usize * channels;
+                        let row_len = w as usize * channels;
+                        let mut out = checked_vec_with_capacity(
+                            h as usize * row_len,
+                            "TIFF JPEG cropped band",
+                        )?;
+                        for row in 0..h as usize {
+                            let src = (src_y + row) * band_stride + src_x * channels;
+                            let end = src.checked_add(row_len).ok_or_else(|| {
+                                BioFormatsError::Format(
+                                    "TIFF JPEG cropped band row overflows".into(),
+                                )
+                            })?;
+                            out.extend_from_slice(band.pixels.get(src..end).ok_or_else(|| {
+                                BioFormatsError::InvalidData(
+                                    "TIFF JPEG cropped band row is outside decoded data".into(),
+                                )
+                            })?);
+                        }
+                        return Ok(out);
+                    }
                     // Crop [y, y_end) rows from the band, exactly like the generic
                     // path crops within a strip (band_y0 plays strip_start_row).
                     let row_start = y.saturating_sub(band.band_y0) as usize;

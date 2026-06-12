@@ -7060,6 +7060,113 @@ impl EtsVolume {
         Ok(out)
     }
 
+    /// Assemble only a rectangular region from the ETS tile grid. This mirrors
+    /// the same tile-origin/intersection math as `assemble_plane`, but copies
+    /// directly into the requested output rectangle instead of materialising the
+    /// full image. Missing tiles still decode through `decode_tile`, preserving
+    /// Java's background-fill behavior.
+    fn assemble_region(
+        &self,
+        resolution: usize,
+        z: i32,
+        c: i32,
+        t: i32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let level = self
+            .levels
+            .get(resolution)
+            .ok_or(BioFormatsError::PlaneOutOfRange(0))?;
+        let x2 = x
+            .checked_add(w)
+            .ok_or_else(|| BioFormatsError::Format("cellSens ETS region width overflows".into()))?;
+        let y2 = y.checked_add(h).ok_or_else(|| {
+            BioFormatsError::Format("cellSens ETS region height overflows".into())
+        })?;
+        if x2 > level.size_x || y2 > level.size_y {
+            return Err(BioFormatsError::Format(
+                "cellSens ETS region is outside image bounds".into(),
+            ));
+        }
+
+        let bpp = self.pixel_type()?.bytes_per_sample();
+        let channels = self.rgb_channels() as usize;
+        let pixel = bpp * channels;
+        let out_w = w as usize;
+        let out_h = h as usize;
+        let out_row_len = out_w * pixel;
+        let mut out = vec![0u8; out_row_len * out_h];
+
+        if w == 0 || h == 0 {
+            return Ok(out);
+        }
+
+        let tile_w = self.tile_x as i64;
+        let tile_h = self.tile_y as i64;
+        let img = (0i64, 0i64, level.size_x as i64, level.size_y as i64);
+        let req = (x as i64, y as i64, w as i64, h as i64);
+        let res_scale = 1i64 << resolution;
+        let origin_x = self.tile_origin_x.map_or(0, |v| v as i64) / res_scale;
+        let origin_y = self.tile_origin_y.map_or(0, |v| v as i64) / res_scale;
+
+        let mut output_row: usize = 0;
+        let mut output_col: usize = 0;
+        for row in 0..level.rows {
+            let mut last_height: Option<i64> = None;
+            for col in 0..level.cols {
+                let tx = col as i64 * tile_w + origin_x;
+                let ty = row as i64 * tile_h + origin_y;
+                let ix0 = tx.max(img.0);
+                let iy0 = ty.max(img.1);
+                let ix1 = (tx + tile_w).min(img.0 + img.2);
+                let iy1 = (ty + tile_h).min(img.1 + img.3);
+                if ix1 <= ix0 || iy1 <= iy0 {
+                    continue;
+                }
+
+                let inter_w = ix1 - ix0;
+                let inter_h = iy1 - iy0;
+                let dst_full_x0 = (output_col / pixel) as i64;
+                let dst_full_y0 = output_row as i64;
+                let dst_full_x1 = dst_full_x0 + inter_w;
+                let dst_full_y1 = dst_full_y0 + inter_h;
+                let ox0 = dst_full_x0.max(req.0);
+                let oy0 = dst_full_y0.max(req.1);
+                let ox1 = dst_full_x1.min(req.0 + req.2);
+                let oy1 = dst_full_y1.min(req.1 + req.3);
+                if ox1 > ox0 && oy1 > oy0 {
+                    let tile = self.decode_tile(resolution, row as i32, col as i32, z, c, t)?;
+                    let src_inter_x = if tx < img.0 { (img.0 - tx) as usize } else { 0 };
+                    let src_inter_y = (iy0 - ty) as usize;
+                    let src_x = src_inter_x + (ox0 - dst_full_x0) as usize;
+                    let src_y = src_inter_y + (oy0 - dst_full_y0) as usize;
+                    let dst_x = (ox0 - req.0) as usize;
+                    let dst_y = (oy0 - req.1) as usize;
+                    let copy_w = (ox1 - ox0) as usize;
+                    let copy_len = copy_w * pixel;
+                    let src_stride = self.tile_x as usize * pixel;
+                    for copy_row in 0..(oy1 - oy0) as usize {
+                        let src = (src_y + copy_row) * src_stride + src_x * pixel;
+                        let dst = (dst_y + copy_row) * out_row_len + dst_x * pixel;
+                        if src + copy_len <= tile.len() && dst + copy_len <= out.len() {
+                            out[dst..dst + copy_len].copy_from_slice(&tile[src..src + copy_len]);
+                        }
+                    }
+                }
+                output_col += pixel * inter_w.min(tile_w) as usize;
+                last_height = Some(inter_h);
+            }
+            if let Some(height) = last_height {
+                output_row += height as usize;
+                output_col = 0;
+            }
+        }
+        Ok(out)
+    }
+
     /// Per-level image metadata.
     fn level_metadata(&self, resolution: usize) -> Result<ImageMetadata> {
         let level = self
@@ -7843,6 +7950,15 @@ impl CellSensReader {
         out
     }
 
+    fn sibling_vsi_for_ets(ets_path: &Path) -> Option<PathBuf> {
+        let stack_dir = ets_path.parent()?;
+        let pixels_dir = stack_dir.parent()?;
+        let pixels_name = pixels_dir.file_name()?.to_str()?;
+        let stem = pixels_name.strip_prefix('_')?.strip_suffix('_')?;
+        let vsi = pixels_dir.parent()?.join(format!("{stem}.vsi"));
+        vsi.exists().then_some(vsi)
+    }
+
     /// Parse one ETS file's volume header and tile index. Mirrors `parseETSFile`.
     /// ETS is always little-endian.
     fn parse_ets(path: &Path) -> Result<EtsVolume> {
@@ -8418,7 +8534,7 @@ impl FormatReader for CellSensReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("vsi"))
+        matches!(ext.as_deref(), Some("vsi") | Some("ets"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -8427,6 +8543,38 @@ impl FormatReader for CellSensReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let _ = self.close();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if matches!(ext.as_deref(), Some("ets")) {
+            if let Some(vsi) = Self::sibling_vsi_for_ets(path) {
+                return self.set_id(&vsi);
+            }
+            let vol = Self::parse_ets(path)?;
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("image")
+                .to_string();
+            self.ets.push(vol);
+            for res in 0..self.ets[0].levels.len() {
+                self.series_map.push(CellSensTarget::Ets {
+                    volume: 0,
+                    resolution: res,
+                });
+                self.series_names.push(if res == 0 {
+                    filename.clone()
+                } else {
+                    format!("{filename} #{}", res + 1)
+                });
+                self.series_phys.push(None);
+            }
+            if !self.series_map.is_empty() {
+                let _ = self.set_series(0);
+            }
+            return Ok(());
+        }
         self.inner.set_id(path).map_err(|_| {
             BioFormatsError::UnsupportedFormat(
                 "Olympus cellSens VSI: could not parse as TIFF (may require ETS companion files)"
@@ -8604,12 +8752,22 @@ impl FormatReader for CellSensReader {
                 }
                 Ok(buf)
             }
-            CellSensTarget::Ets { volume, .. } => {
-                // ETS tiles interleave all channels into one plane.
-                let spp = self.ets[volume].rgb_channels() as usize;
-                let full = self.open_bytes(p)?;
-                let meta = self.metadata();
-                crate::common::region::crop_full_plane("cellSens ETS", &full, meta, spp, x, y, w, h)
+            CellSensTarget::Ets { volume, resolution } => {
+                let vol = &self.ets[volume];
+                let level = vol
+                    .levels
+                    .get(resolution)
+                    .ok_or(BioFormatsError::PlaneOutOfRange(p))?;
+                let n_c = (level.size_c / vol.rgb_channels().max(1)).max(1);
+                let n_z = level.size_z.max(1);
+                let count = n_c * n_z * level.size_t.max(1);
+                if p >= count {
+                    return Err(BioFormatsError::PlaneOutOfRange(p));
+                }
+                let c = (p % n_c) as i32;
+                let z = ((p / n_c) % n_z) as i32;
+                let t = (p / (n_c * n_z)) as i32;
+                vol.assemble_region(resolution, z, c, t, x, y, w, h)
             }
         }
     }
@@ -11839,6 +11997,14 @@ mod tests {
         // Output buffer is 3x3; untouched cells stay 0.
         // row band starts at output_row 0: out[0..2]=[0,1], out[3..5]=[4,5].
         assert_eq!(plane, vec![0, 1, 0, 4, 5, 0, 0, 0, 0]);
+        assert_eq!(
+            vol.assemble_region(0, 0, 0, 0, 0, 0, 2, 2).unwrap(),
+            vec![0, 1, 4, 5]
+        );
+        assert_eq!(
+            vol.assemble_region(0, 0, 0, 0, 1, 0, 2, 2).unwrap(),
+            vec![1, 0, 5, 0]
+        );
 
         let _ = std::fs::remove_file(path);
     }

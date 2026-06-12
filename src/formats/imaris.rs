@@ -16,12 +16,12 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
 use hdf5_pure_rust::format::messages::datatype::DatatypeClass;
 use hdf5_pure_rust::{HyperslabDim, Selection};
 
 pub struct ImarisReader {
     path: Option<PathBuf>,
+    file: Option<hdf5_pure_rust::File>,
     // One ImageMetadata per resolution level. Index 0 is full-resolution.
     resolutions: Vec<ImageMetadata>,
     current_resolution: usize,
@@ -58,6 +58,7 @@ impl ImarisReader {
     pub fn new() -> Self {
         ImarisReader {
             path: None,
+            file: None,
             resolutions: Vec::new(),
             current_resolution: 0,
             bytes_per_sample: 1,
@@ -794,7 +795,10 @@ impl FormatReader for ImarisReader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let parsed = parse_ims(path)?;
+        let file = hdf5_pure_rust::File::open(path)
+            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
         self.resolutions = parsed.resolutions;
+        self.file = Some(file);
         self.path = Some(path.to_path_buf());
         self.current_resolution = 0;
         self.bytes_per_sample = parsed.bytes_per_sample;
@@ -810,6 +814,7 @@ impl FormatReader for ImarisReader {
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
+        self.file = None;
         self.resolutions.clear();
         self.current_resolution = 0;
         self.extents = None;
@@ -890,13 +895,7 @@ impl FormatReader for ImarisReader {
             None => true,
         };
         if need_load {
-            let path = self
-                .path
-                .as_ref()
-                .ok_or(BioFormatsError::NotInitialized)?
-                .clone();
-            let file = hdf5_pure_rust::File::open(&path)
-                .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+            let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
             let data_path = ims_data_path(&file, res, t, c).ok_or_else(|| {
                 BioFormatsError::UnsupportedFormat(format!(
                     "Imaris: missing DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data or DataSet/ResolutionLevel_{res}/TimePoint_{t}/Channel_{c}/Data"
@@ -960,22 +959,87 @@ impl FormatReader for ImarisReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
+        let res = self.current_resolution;
         let meta = self
             .resolutions
-            .get(self.current_resolution)
+            .get(res)
             .ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("Imaris", &full, meta, 1, x, y, w, h)
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let x2 = x
+            .checked_add(w)
+            .ok_or_else(|| BioFormatsError::Format("Imaris region width overflows".into()))?;
+        let y2 = y
+            .checked_add(h)
+            .ok_or_else(|| BioFormatsError::Format("Imaris region height overflows".into()))?;
+        if x2 > meta.size_x || y2 > meta.size_y {
+            return Err(BioFormatsError::Format(
+                "Imaris region is outside image bounds".into(),
+            ));
+        }
+
+        let sz = meta.size_z as usize;
+        let sc = meta.size_c as usize;
+        let z = (plane_index as usize) % sz;
+        let c = (plane_index as usize / sz) % sc;
+        let t = (plane_index as usize) / (sz * sc);
+        let bps = self.bytes_per_sample;
+        let expected = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|v| v.checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::Format("Imaris region byte count overflows".into()))?;
+
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let data_path = ims_data_path(&file, res, t, c).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "Imaris: missing DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data or DataSet/ResolutionLevel_{res}/TimePoint_{t}/Channel_{c}/Data"
+            ))
+        })?;
+        let ds = file
+            .dataset(&data_path)
+            .map_err(|e| BioFormatsError::Format(format!("dataset {data_path}: {e}")))?;
+        let sel = Selection::Hyperslab(vec![
+            HyperslabDim::new(z as u64, 1, 1, 1),
+            HyperslabDim::new(y as u64, 1, h as u64, 1),
+            HyperslabDim::new(x as u64, 1, w as u64, 1),
+        ]);
+
+        let raw: Vec<u8> = match bps {
+            1 => ds
+                .read_slice::<u8, _>(sel)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
+            2 => {
+                let words: Vec<u16> = ds
+                    .read_slice::<u16, _>(sel)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                words.iter().flat_map(|w| w.to_le_bytes()).collect()
+            }
+            4 => {
+                let dwords: Vec<u32> = ds
+                    .read_slice::<u32, _>(sel)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
+            }
+            _ => ds
+                .read_slice::<u8, _>(sel)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
+        };
+
+        if raw.len() == expected {
+            Ok(raw)
+        } else {
+            Err(BioFormatsError::UnsupportedFormat(format!(
+                "Imaris ResolutionLevel {res}/TimePoint {t}/Channel {c} plane {plane_index} \
+                 region is shorter than declared (need {expected} bytes, have {})",
+                raw.len()
+            )))
+        }
     }
 
     fn open_thumb_bytes(&mut self, _plane_index: u32) -> Result<Vec<u8>> {
         // Try to read the Imaris built-in thumbnail
-        let path = self
-            .path
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?
-            .clone();
-        if let Ok(file) = hdf5_pure_rust::File::open(&path) {
+        if let Some(file) = self.file.as_ref() {
             if let Ok(ds) = file.dataset("Thumbnail/Data") {
                 if let Ok(data) = ds.read::<u8>() {
                     return Ok(data);

@@ -338,6 +338,18 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
         }
     }
 
+    // ZVI is an OLE/CFB container whose magic bytes are shared with many other
+    // formats. Java's ZeissZVIReader is extension-driven for this case; routing
+    // `.zvi` directly avoids probing unrelated OLE readers that may parse large
+    // streams before rejecting the file.
+    if has_zvi_extension(path) {
+        let mut r = boxed_reader(crate::formats::zvi::ZviReader::new());
+        match r.set_id(path) {
+            Ok(()) => return Ok(r),
+            Err(err) => remember_set_id_error(&mut best_error, err),
+        }
+    }
+
     // TIFF-based vendor wrappers often have no magic beyond TIFF itself.
     // Give non-generic TIFF extensions a chance before the broad TiffReader
     // byte signature accepts the file.
@@ -395,6 +407,13 @@ fn has_fake_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("fake"))
+        .unwrap_or(false)
+}
+
+fn has_zvi_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("zvi"))
         .unwrap_or(false)
 }
 
