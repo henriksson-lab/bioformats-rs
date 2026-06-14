@@ -577,4 +577,7 @@ doi: 10.1083/jcb.201004104
 
 ## License
 
-GPL v2
+GPL v2 or later (`GPL-2.0-or-later`), matching the upstream Bio-Formats
+`formats-gpl` grant ("either version 2 of the License, or (at your option) any
+later version"). Bio-Formats' `formats-bsd`/`formats-api` components are BSD-2-Clause;
+because this crate also translates GPL readers, the combined work is GPL-2.0-or-later.

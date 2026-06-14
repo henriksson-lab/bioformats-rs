@@ -3,7 +3,7 @@ name = "bioformats"
 version = "0.1.4"
 edition = "2021"
 description = "Pure Rust translation of Bio-Formats — read/write scientific image formats"
-license-file = "LICENSE.txt"
+license = "GPL-2.0-or-later"
 homepage = "https://www.openmicroscopy.org/bio-formats/"
 repository = "https://github.com/henriksson-lab/bioformats-rs"
 readme = "README.md"
@@ -11,9 +11,6 @@ keywords = ["microscopy", "bioformats", "image", "tiff", "ome"]
 categories = ["science", "multimedia::images", "parser-implementations"]
 include = [
     "/src/**/*.rs",
-    "/benches/read_ome_tiff.rs",
-    "/examples/**/*.rs",
-    "/tests/**/*.rs",
     "/README.md",
     "/LICENSE.txt",
 ]
