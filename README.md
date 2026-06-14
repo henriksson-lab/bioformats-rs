@@ -79,6 +79,12 @@ ImageWriter::save(Path::new("output.tif"), &meta, &planes)?;
 | NRRD | `.nrrd` `.nhdr` | Raw and gzip encodings |
 | MetaImage | `.mha` `.mhd` | ITK/VTK; inline and detached data file |
 | JPEG 2000 | `.jp2` `.j2k` `.j2c` `.jpc` | Read via `jpeg2k`; lossless write via `openjp2` (default-on `jpeg2000-write` feature; single 2D plane, 1/3 integer components) |
+| DICOM | `.dcm` | Read: RLE/JPEG/JP2 encapsulation + multi-series companions; write: unencapsulated planes |
+| PNM / PGM / PPM | `.pnm` `.pgm` `.ppm` `.pbm` `.pfm` | Read via `image` crate; write to the matching PNM subtype |
+
+Additional write-capable formats (read support listed elsewhere): OME-XML
+(`.ome.xml`), APNG (`.apng`), AVI (`.avi`), EPS (`.eps`), QuickTime RAW (`.mov`),
+CellH5 (`.ch5`), and Vaa3D V3DRAW (`.v3draw`).
 
 ### Read only
 
@@ -90,11 +96,9 @@ ImageWriter::save(Path::new("output.tif"), &meta, &planes)?;
 | HDR / RGBE | `.hdr` `.rgbe` | Radiance HDR |
 | DDS | `.dds` | DirectDraw Surface |
 | Farbfeld | `.ff` | |
-| PNM / PGM / PPM | `.pnm` `.pgm` `.ppm` `.pbm` `.pfm` | Via `image` crate |
 | Leica LIF | `.lif` | Binary container with UTF-16 XML metadata; bounded simple uncompressed pixels |
 | Nikon ND2 | `.nd2` | Chunk-based; raw, zlib, and JPEG2000 frames |
 | Zeiss CZI | `.czi` | ZISRAWFILE segments; scene/mosaic/pyramid support; uncompressed, JPEG, LZW, Zstd |
-| DICOM | `.dcm` | Unencapsulated pixel data; uint8/16, int16 |
 | NIfTI-1 / Analyze 7.5 | `.nii` `.nii.gz` `.hdr` `.img` | gzip supported |
 | Zeiss LSM | `.lsm` | TIFF-based with CZ_LSMInfo metadata |
 | Applied Precision DeltaVision | `.dv` `.r3d` | Binary header + raw planes |
@@ -457,7 +461,7 @@ assert_eq!(plane.len(), meta.size_y as usize * row_bytes);
 
 - **ND2**: full coverage of modern structured `ImageDataSeq` variants and richer per-plane metadata (raw/zlib/JPEG2000 frames already decode; see status table)
 - **CZI**: broader vendor metadata enrichment beyond the implemented scene/acquisition/angle series, pyramid handling, and feature-gated JPEG-XR path
-- **Write support** for LIF, ND2, CZI, PNM
+- **Write support** for LIF, ND2, CZI
 - **OME metadata**: `reader.ome_metadata()` returns baseline OME metadata for all readers and enriches it with structured physical sizes, channel names, and plane positions where supported; richer parsing (instrument, experimenter) is partial
 - **Pyramid writing** for tiled multi-resolution TIFF
 
