@@ -74,7 +74,10 @@ impl Default for BdvReader {
 /// One parsed ViewSetup from the companion XML.
 struct ViewSetupXml {
     id: u32,
+    name: Option<String>,
     voxel_size: Option<(f64, f64, f64)>,
+    voxel_unit: Option<String>,
+    attributes: Vec<(String, String)>,
 }
 
 /// Parse the `<ViewSetup>` blocks from the SpimData XML, extracting each
@@ -93,7 +96,9 @@ fn parse_view_setups(xml: &str) -> Vec<ViewSetupXml> {
         // <id>N</id>
         let id = inner_text(block, "id").and_then(|s| s.trim().parse::<u32>().ok());
         // <voxelSize><size>X Y Z</size></voxelSize>
-        let voxel_size = inner_text(block, "voxelSize").and_then(|vs| {
+        let name = inner_text(block, "name").map(|s| s.trim().to_string());
+        let voxel_block = inner_text(block, "voxelSize");
+        let voxel_size = voxel_block.as_deref().and_then(|vs| {
             inner_text(&vs, "size").and_then(|s| {
                 let parts: Vec<f64> = s
                     .split_whitespace()
@@ -106,11 +111,83 @@ fn parse_view_setups(xml: &str) -> Vec<ViewSetupXml> {
                 }
             })
         });
+        let voxel_unit = voxel_block
+            .as_deref()
+            .and_then(|vs| inner_text(vs, "unit"))
+            .map(|s| s.trim().to_string());
+        let attributes = parse_view_setup_attributes(block);
         if let Some(id) = id {
-            out.push(ViewSetupXml { id, voxel_size });
+            out.push(ViewSetupXml {
+                id,
+                name,
+                voxel_size,
+                voxel_unit,
+                attributes,
+            });
         }
     }
     out
+}
+
+fn parse_view_setup_attributes(block: &str) -> Vec<(String, String)> {
+    let Some(attributes_block) = inner_text(block, "attributes") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let bytes = attributes_block.as_bytes();
+    let mut pos = 0usize;
+    while out.len() < 64 {
+        let Some(open_rel) = attributes_block[pos..].find('<') else {
+            break;
+        };
+        let open = pos + open_rel;
+        if bytes.get(open + 1).is_some_and(|b| *b == b'/') {
+            pos = open + 2;
+            continue;
+        }
+        let Some(gt_rel) = attributes_block[open..].find('>') else {
+            break;
+        };
+        let gt = open + gt_rel;
+        let raw_tag = attributes_block[open + 1..gt].trim();
+        let tag = raw_tag
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
+        if tag.is_empty() || raw_tag.ends_with('/') {
+            pos = gt + 1;
+            continue;
+        }
+        let close = format!("</{tag}>");
+        let Some(close_rel) = attributes_block[gt + 1..].find(&close) else {
+            pos = gt + 1;
+            continue;
+        };
+        let value = attributes_block[gt + 1..gt + 1 + close_rel].trim();
+        if !value.is_empty()
+            && !value.contains('<')
+            && tag
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        {
+            out.push((bdv_metadata_key(tag), value.to_string()));
+        }
+        pos = gt + 1 + close_rel + close.len();
+    }
+    out
+}
+
+fn bdv_metadata_key(name: &str) -> String {
+    let mut key = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            key.push(ch.to_ascii_lowercase());
+        } else if !key.ends_with('_') {
+            key.push('_');
+        }
+    }
+    key.trim_matches('_').to_string()
 }
 
 /// Find the inner text of the first `<tag>...</tag>` in `xml`.
@@ -257,7 +334,10 @@ fn parse_bdv(path: &Path) -> Result<(PathBuf, Vec<SeriesInfo>)> {
                 .filter_map(|n| n[1..].parse::<u32>().ok())
                 .map(|id| ViewSetupXml {
                     id,
+                    name: None,
                     voxel_size: None,
+                    voxel_unit: None,
+                    attributes: Vec::new(),
                 })
                 .collect()
         }
@@ -350,6 +430,32 @@ fn parse_bdv(path: &Path) -> Result<(PathBuf, Vec<SeriesInfo>)> {
                 meta_map.insert("bdv_setup".into(), MetadataValue::Int(setup.id as i64));
                 meta_map.insert("bdv_timepoint".into(), MetadataValue::Int(tp as i64));
                 meta_map.insert("bdv_level".into(), MetadataValue::Int(level as i64));
+                if let Some(name) = setup.name.as_ref().filter(|s| !s.is_empty()) {
+                    meta_map.insert(
+                        "bdv_view_setup_name".into(),
+                        MetadataValue::String(name.clone()),
+                    );
+                }
+                if let Some(unit) = setup.voxel_unit.as_ref().filter(|s| !s.is_empty()) {
+                    meta_map.insert("bdv_voxel_unit".into(), MetadataValue::String(unit.clone()));
+                }
+                if !setup.attributes.is_empty() {
+                    meta_map.insert(
+                        "bdv_view_setup_attribute_count".into(),
+                        MetadataValue::Int(setup.attributes.len() as i64),
+                    );
+                    for (key, value) in &setup.attributes {
+                        meta_map.insert(
+                            format!("bdv_view_setup_attribute.{key}"),
+                            MetadataValue::String(value.clone()),
+                        );
+                    }
+                }
+                if let Some((x, y, z)) = setup.voxel_size {
+                    meta_map.insert("bdv_voxel_size_x".into(), MetadataValue::Float(x));
+                    meta_map.insert("bdv_voxel_size_y".into(), MetadataValue::Float(y));
+                    meta_map.insert("bdv_voxel_size_z".into(), MetadataValue::Float(z));
+                }
 
                 let meta = ImageMetadata {
                     size_x,
@@ -677,5 +783,53 @@ impl FormatReader for BdvReader {
             let _ = ome.add_original_metadata_annotations(&si.meta, image_index);
         }
         Some(ome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bdv_view_setup_attributes_are_preserved_as_bounded_scalars() {
+        let xml = r#"<SpimData>
+  <SequenceDescription>
+    <ViewSetups>
+      <ViewSetup>
+        <id>2</id>
+        <name>view A</name>
+        <voxelSize><unit>micrometer</unit><size>0.3 0.4 1.5</size></voxelSize>
+        <attributes>
+          <illumination>0</illumination>
+          <channel-name>DAPI</channel-name>
+          <angle>45</angle>
+          <nested><ignored>yes</ignored></nested>
+        </attributes>
+      </ViewSetup>
+    </ViewSetups>
+  </SequenceDescription>
+</SpimData>"#;
+
+        let setups = parse_view_setups(xml);
+
+        assert_eq!(setups.len(), 1);
+        assert_eq!(setups[0].id, 2);
+        assert_eq!(setups[0].name.as_deref(), Some("view A"));
+        assert_eq!(setups[0].voxel_size, Some((0.3_f64, 0.4_f64, 1.5_f64)));
+        assert_eq!(
+            setups[0].attributes,
+            vec![
+                ("illumination".into(), "0".into()),
+                ("channel_name".into(), "DAPI".into()),
+                ("angle".into(), "45".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn bdv_metadata_key_normalizes_attribute_names() {
+        assert_eq!(bdv_metadata_key("channel-name"), "channel_name");
+        assert_eq!(bdv_metadata_key("ViewSetup.Id"), "viewsetup_id");
+        assert_eq!(bdv_metadata_key(" angle "), "angle");
     }
 }

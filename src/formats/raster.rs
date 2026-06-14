@@ -518,3 +518,173 @@ impl FormatWriter for TgaWriter {
         false
     }
 }
+
+// ---- PNM writer (via image crate) -------------------------------------------
+
+pub struct PnmWriter {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    wrote: bool,
+}
+
+impl PnmWriter {
+    pub fn new() -> Self {
+        PnmWriter {
+            path: None,
+            meta: None,
+            wrote: false,
+        }
+    }
+}
+
+impl Default for PnmWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatWriter for PnmWriter {
+    fn is_this_type(&self, path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                matches!(
+                    e.to_ascii_lowercase().as_str(),
+                    "pnm" | "pgm" | "ppm" | "pbm"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        let logical_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+        let required_planes = meta
+            .size_z
+            .max(1)
+            .checked_mul(logical_c)
+            .and_then(|v| v.checked_mul(meta.size_t.max(1)))
+            .ok_or_else(|| BioFormatsError::Format("PNM writer plane count overflow".into()))?;
+        if required_planes > 1 || meta.image_count > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PNM writer supports only one plane".into(),
+            ));
+        }
+        if !matches!(meta.pixel_type, PixelType::Uint8 | PixelType::Uint16) {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "PNM writer only supports Uint8/Uint16 data, got {:?}",
+                meta.pixel_type
+            )));
+        }
+        if meta.size_c != 1 && !(meta.is_rgb && meta.size_c == 3) {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "PNM writer supports grayscale or RGB data, got {} channels",
+                meta.size_c
+            )));
+        }
+        self.meta = Some(meta.clone());
+        self.wrote = false;
+        Ok(())
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.meta
+            .as_ref()
+            .ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
+        self.path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if self.path.is_some() && !self.wrote {
+            return Err(BioFormatsError::Format(
+                "PNM writer closed before plane 0 was written".into(),
+            ));
+        }
+        self.path = None;
+        self.meta = None;
+        self.wrote = false;
+        Ok(())
+    }
+
+    fn save_bytes(&mut self, idx: u32, data: &[u8]) -> Result<()> {
+        if idx != 0 {
+            return Err(BioFormatsError::Format(
+                "PNM writer supports only one plane".into(),
+            ));
+        }
+        if self.wrote {
+            return Err(BioFormatsError::Format(
+                "PNM writer already wrote plane 0".into(),
+            ));
+        }
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let expected = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|px| px.checked_mul(meta.size_c as usize))
+            .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
+            .ok_or_else(|| BioFormatsError::Format("PNM writer image plane is too large".into()))?;
+        if data.len() != expected {
+            return Err(BioFormatsError::InvalidData(format!(
+                "PNM writer: plane 0 has {} bytes, expected {}",
+                data.len(),
+                expected
+            )));
+        }
+
+        let (w, h) = (meta.size_x, meta.size_y);
+        let spp = meta.size_c as usize;
+        let img: image::DynamicImage = match (meta.pixel_type, spp) {
+            (PixelType::Uint8, 1) => image::GrayImage::from_raw(w, h, data.to_vec())
+                .map(image::DynamicImage::ImageLuma8)
+                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
+            (PixelType::Uint8, 3) => image::RgbImage::from_raw(w, h, data.to_vec())
+                .map(image::DynamicImage::ImageRgb8)
+                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
+            (PixelType::Uint16, 1) => {
+                let pixels: Vec<u16> = data
+                    .chunks_exact(2)
+                    .map(|c| {
+                        if meta.is_little_endian {
+                            u16::from_le_bytes([c[0], c[1]])
+                        } else {
+                            u16::from_be_bytes([c[0], c[1]])
+                        }
+                    })
+                    .collect();
+                image::ImageBuffer::<image::Luma<u16>, _>::from_raw(w, h, pixels)
+                    .map(image::DynamicImage::ImageLuma16)
+                    .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?
+            }
+            (PixelType::Uint16, 3) => {
+                let pixels: Vec<u16> = data
+                    .chunks_exact(2)
+                    .map(|c| {
+                        if meta.is_little_endian {
+                            u16::from_le_bytes([c[0], c[1]])
+                        } else {
+                            u16::from_be_bytes([c[0], c[1]])
+                        }
+                    })
+                    .collect();
+                image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(w, h, pixels)
+                    .map(image::DynamicImage::ImageRgb16)
+                    .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?
+            }
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "PNM writer: unsupported {:?} spp={}",
+                    meta.pixel_type, spp
+                )));
+            }
+        };
+        img.save(path)
+            .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+        self.wrote = true;
+        Ok(())
+    }
+
+    fn can_do_stacks(&self) -> bool {
+        false
+    }
+}

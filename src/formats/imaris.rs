@@ -14,10 +14,17 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::ome_metadata::{
+    create_lsid, OmeDetector, OmeInstrument, OmeLightSource, OmeObjective, OmeROI, OmeShape,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use hdf5_pure_rust::format::messages::datatype::DatatypeClass;
 use hdf5_pure_rust::{HyperslabDim, Selection};
+
+const IMARIS_SURPASS_METADATA_NODE_LIMIT: usize = 1024;
+const IMARIS_SURPASS_DATASET_VALUE_LIMIT: u64 = 32;
+const IMARIS_SURPASS_STATISTICS_TABLE_VALUE_LIMIT: u64 = 4096;
 
 pub struct ImarisReader {
     path: Option<PathBuf>,
@@ -37,6 +44,7 @@ pub struct ImarisReader {
     channel_colors: Vec<Option<i32>>,
     channel_emission_wavelengths: Vec<Option<f64>>,
     channel_excitation_wavelengths: Vec<Option<f64>>,
+    instrument: ImarisInstrumentMetadata,
     // Cache of the most recently decoded plane so that repeated reads of the
     // same plane do not re-read from disk. Keyed by (resolution, t, c, z).
     // Mirrors the per-Z-block buffer cache in ImarisHDFReader.java. The new
@@ -69,8 +77,459 @@ impl ImarisReader {
             channel_colors: Vec::new(),
             channel_emission_wavelengths: Vec::new(),
             channel_excitation_wavelengths: Vec::new(),
+            instrument: ImarisInstrumentMetadata::default(),
             cache: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_ims_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_rs_{label}_{unique}.ims"))
+    }
+
+    fn make_statistics_file<F>(label: &str, build_statistics: F) -> PathBuf
+    where
+        F: FnOnce(&mut hdf5_pure_rust::hl::writable_file::WritableGroup<'_>),
+    {
+        let path = tmp_ims_path(label);
+        let mut writable = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+        {
+            let mut scene = writable.create_group("Scene").unwrap();
+            let mut surface = scene.create_group("Surfaces 0").unwrap();
+            let mut statistics = surface.create_group("Statistics").unwrap();
+            build_statistics(&mut statistics);
+        }
+        writable.flush().unwrap();
+        path
+    }
+
+    #[test]
+    fn imaris_channel_value_delimiter_stripping_mirrors_java() {
+        // Mirrors ImarisHDFReader.parseAttributes()'s DELIMITERS loop: for each
+        // of {" ", "-", "."} in turn, keep the substring after its first match.
+        assert_eq!(strip_imaris_channel_value_delimiters("Gain 7"), "7");
+        assert_eq!(
+            strip_imaris_channel_value_delimiters("Channel-1.5"),
+            "5"
+        );
+        assert_eq!(strip_imaris_channel_value_delimiters("488"), "488");
+    }
+
+    #[test]
+    fn imaris_channel_parsed_attributes_translate_gain_pinhole_min_max_mode() {
+        let path = tmp_ims_path("channel_parsed_attributes");
+        let mut writable = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+        {
+            let mut info = writable.create_group("DataSetInfo").unwrap();
+            let mut channel = info.create_group("Channel 0").unwrap();
+            channel.add_fixed_ascii_attr("Gain", "7", 8).unwrap();
+            channel.add_fixed_ascii_attr("Pinhole", "1.2", 8).unwrap();
+            channel.add_fixed_ascii_attr("Min", "0", 8).unwrap();
+            channel.add_fixed_ascii_attr("Max", "255", 8).unwrap();
+            channel
+                .add_fixed_ascii_attr("MicroscopyMode", "Confocal", 16)
+                .unwrap();
+        }
+        writable.flush().unwrap();
+
+        let file = hdf5_pure_rust::File::open(&path).unwrap();
+        let ch_group = file.group("DataSetInfo/Channel 0").unwrap();
+        let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
+        let c = 0u32;
+        if let Some(gain) = read_str_attr(&ch_group, "Gain")
+            .map(|v| strip_imaris_channel_value_delimiters(&v))
+            .and_then(|v| parse_imaris_f64(&v))
+        {
+            meta_map.insert(
+                format!("imaris.channel.{c}.gain"),
+                MetadataValue::Float(gain),
+            );
+        }
+        if let Some(pinhole) = read_str_attr(&ch_group, "Pinhole")
+            .map(|v| strip_imaris_channel_value_delimiters(&v))
+            .and_then(|v| parse_imaris_f64(&v))
+        {
+            meta_map.insert(
+                format!("imaris.channel.{c}.pinhole"),
+                MetadataValue::Float(pinhole),
+            );
+        }
+        if let Some(min) = read_str_attr(&ch_group, "Min")
+            .map(|v| strip_imaris_channel_value_delimiters(&v))
+            .and_then(|v| parse_imaris_f64(&v))
+        {
+            meta_map.insert(format!("imaris.channel.{c}.min"), MetadataValue::Float(min));
+        }
+        if let Some(max) = read_str_attr(&ch_group, "Max")
+            .map(|v| strip_imaris_channel_value_delimiters(&v))
+            .and_then(|v| parse_imaris_f64(&v))
+        {
+            meta_map.insert(format!("imaris.channel.{c}.max"), MetadataValue::Float(max));
+        }
+        if let Some(mode) = read_str_attr(&ch_group, "MicroscopyMode")
+            .map(|v| strip_imaris_channel_value_delimiters(&v))
+            .filter(|v| !v.is_empty())
+        {
+            meta_map.insert(
+                format!("imaris.channel.{c}.microscopy_mode"),
+                MetadataValue::String(mode),
+            );
+        }
+
+        assert!(matches!(
+            meta_map.get("imaris.channel.0.gain"),
+            Some(MetadataValue::Float(v)) if *v == 7.0
+        ));
+        assert!(matches!(
+            meta_map.get("imaris.channel.0.pinhole"),
+            Some(MetadataValue::Float(v)) if *v == 2.0
+        ));
+        assert!(matches!(
+            meta_map.get("imaris.channel.0.min"),
+            Some(MetadataValue::Float(v)) if *v == 0.0
+        ));
+        assert!(matches!(
+            meta_map.get("imaris.channel.0.max"),
+            Some(MetadataValue::Float(v)) if *v == 255.0
+        ));
+        assert!(matches!(
+            meta_map.get("imaris.channel.0.microscopy_mode"),
+            Some(MetadataValue::String(v)) if v == "Confocal"
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imaris_surpass_bounded_larger_statistics_table_translates_values() {
+        let path = make_statistics_file("larger_statistics", |statistics| {
+            let names = (0..12)
+                .map(|index| format!("Stat {index}"))
+                .collect::<Vec<_>>();
+            let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+            statistics
+                .new_dataset_builder("Names")
+                .shape(&[12])
+                .write_fixed_ascii_strings(&name_refs, 12)
+                .unwrap();
+            let values = (1..=36).map(|value| value as f64).collect::<Vec<_>>();
+            statistics
+                .new_dataset_builder("Values")
+                .shape(&[12, 3])
+                .write::<f64>(&values)
+                .unwrap();
+        });
+        let file = hdf5_pure_rust::File::open(&path).unwrap();
+        let mut metadata = HashMap::new();
+
+        collect_imaris_surpass_statistics_table(
+            &file,
+            "Scene/Surfaces 0/Statistics",
+            "imaris.surpass.Scene.Surfaces_0.Statistics",
+            &mut metadata,
+        );
+
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.names_shape"),
+            Some(MetadataValue::String(value)) if value == "12"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.value_shape"),
+            Some(MetadataValue::String(value)) if value == "12 3"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.value_count"),
+            Some(MetadataValue::Int(36))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.layout"),
+            Some(MetadataValue::String(value)) if value == "stat_rows"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.Stat_0"),
+            Some(MetadataValue::String(value)) if value == "1 2 3"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.Stat_11"),
+            Some(MetadataValue::String(value)) if value == "34 35 36"
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imaris_surpass_oversized_statistics_table_remains_diagnostic_only() {
+        let path = make_statistics_file("oversized_statistics", |statistics| {
+            statistics
+                .new_dataset_builder("Names")
+                .shape(&[2])
+                .write_fixed_ascii_strings(&["Area", "Volume"], 12)
+                .unwrap();
+            statistics
+                .new_dataset_builder("Values")
+                .shape(&[2049, 2])
+                .write::<f64>(&vec![1.0; 4098])
+                .unwrap();
+        });
+        let file = hdf5_pure_rust::File::open(&path).unwrap();
+        let mut metadata = HashMap::new();
+
+        collect_imaris_surpass_statistics_table(
+            &file,
+            "Scene/Surfaces 0/Statistics",
+            "imaris.surpass.Scene.Surfaces_0.Statistics",
+            &mut metadata,
+        );
+
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.value_shape"),
+            Some(MetadataValue::String(value)) if value == "2049 2"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.value_count"),
+            Some(MetadataValue::Int(4098))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.value_status"),
+            Some(MetadataValue::String(value)) if value == "not_read_large_statistics_table"
+        ));
+        assert!(!metadata.contains_key("imaris.surpass.Scene.Surfaces_0.Statistics.table.layout"));
+        assert!(!metadata.contains_key("imaris.surpass.Scene.Surfaces_0.Statistics.table.Area"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imaris_surpass_singleton_axis_statistics_table_translates_values() {
+        let path = make_statistics_file("singleton_axis_statistics", |statistics| {
+            statistics
+                .new_dataset_builder("Names")
+                .shape(&[2])
+                .write_fixed_ascii_strings(&["Area", "Volume"], 12)
+                .unwrap();
+            statistics
+                .new_dataset_builder("Values")
+                .shape(&[1, 2, 3])
+                .write::<f64>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap();
+        });
+        let file = hdf5_pure_rust::File::open(&path).unwrap();
+        let mut metadata = HashMap::new();
+
+        collect_imaris_surpass_statistics_table(
+            &file,
+            "Scene/Surfaces 0/Statistics",
+            "imaris.surpass.Scene.Surfaces_0.Statistics",
+            &mut metadata,
+        );
+
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.value_shape"),
+            Some(MetadataValue::String(value)) if value == "1 2 3"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.effective_value_shape"),
+            Some(MetadataValue::String(value)) if value == "2 3"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.layout"),
+            Some(MetadataValue::String(value)) if value == "stat_rows"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.Area"),
+            Some(MetadataValue::String(value)) if value == "1 2 3"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.Volume"),
+            Some(MetadataValue::String(value)) if value == "4 5 6"
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imaris_surpass_complex_statistics_table_reports_unsupported_layout() {
+        let path = make_statistics_file("complex_statistics_layout", |statistics| {
+            statistics
+                .new_dataset_builder("Names")
+                .shape(&[2])
+                .write_fixed_ascii_strings(&["Area", "Volume"], 12)
+                .unwrap();
+            statistics
+                .new_dataset_builder("Values")
+                .shape(&[3, 3])
+                .write::<f64>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+                .unwrap();
+        });
+        let file = hdf5_pure_rust::File::open(&path).unwrap();
+        let mut metadata = HashMap::new();
+
+        collect_imaris_surpass_statistics_table(
+            &file,
+            "Scene/Surfaces 0/Statistics",
+            "imaris.surpass.Scene.Surfaces_0.Statistics",
+            &mut metadata,
+        );
+
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.stat_count"),
+            Some(MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.row_count"),
+            Some(MetadataValue::Int(3))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.column_count"),
+            Some(MetadataValue::Int(3))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.layout_status"),
+            Some(MetadataValue::String(value)) if value == "unsupported_statistics_layout"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.layout_reason"),
+            Some(MetadataValue::String(value)) if value == "statistic_name_count_mismatch"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.supported_layouts"),
+            Some(MetadataValue::String(value)) if value == "stat_rows,stat_columns"
+        ));
+        assert!(!metadata.contains_key("imaris.surpass.Scene.Surfaces_0.Statistics.table.Area"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imaris_surpass_higher_rank_statistics_table_reports_unsupported_rank() {
+        let path = make_statistics_file("higher_rank_statistics_layout", |statistics| {
+            statistics
+                .new_dataset_builder("Names")
+                .shape(&[2])
+                .write_fixed_ascii_strings(&["Area", "Volume"], 12)
+                .unwrap();
+            statistics
+                .new_dataset_builder("Values")
+                .shape(&[2, 2, 2])
+                .write::<f64>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+                .unwrap();
+        });
+        let file = hdf5_pure_rust::File::open(&path).unwrap();
+        let mut metadata = HashMap::new();
+
+        collect_imaris_surpass_statistics_table(
+            &file,
+            "Scene/Surfaces 0/Statistics",
+            "imaris.surpass.Scene.Surfaces_0.Statistics",
+            &mut metadata,
+        );
+
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.value_shape"),
+            Some(MetadataValue::String(value)) if value == "2 2 2"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.layout_status"),
+            Some(MetadataValue::String(value)) if value == "unsupported_statistics_layout"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.layout_reason"),
+            Some(MetadataValue::String(value)) if value == "unsupported_statistics_rank"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.Statistics.table.supported_layouts"),
+            Some(MetadataValue::String(value)) if value == "stat_rows,stat_columns"
+        ));
+        assert!(!metadata.contains_key("imaris.surpass.Scene.Surfaces_0.Statistics.table.Area"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imaris_surpass_group_provenance_preserves_object_graph_shape() {
+        let path = tmp_ims_path("surpass_group_provenance");
+        let mut writable = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+        {
+            let mut scene = writable.create_group("Scene").unwrap();
+            let mut surface = scene.create_group("Surfaces 0").unwrap();
+            surface
+                .add_fixed_ascii_attr("Name", "Membranes", 16)
+                .unwrap();
+            surface
+                .new_dataset_builder("Vertices")
+                .shape(&[2, 3])
+                .write::<f64>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap();
+            surface.create_group("Statistics").unwrap();
+            let mut spots = scene.create_group("Spots_2").unwrap();
+            spots.add_fixed_ascii_attr("Name", "Seeds", 16).unwrap();
+            spots
+                .new_dataset_builder("TrackIds")
+                .shape(&[2])
+                .write::<i64>(&[10, 11])
+                .unwrap();
+        }
+        writable.flush().unwrap();
+
+        let file = hdf5_pure_rust::File::open(&path).unwrap();
+        let mut metadata = HashMap::new();
+        collect_imaris_surpass_metadata(&file, &mut metadata);
+
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.hdf5_path"),
+            Some(MetadataValue::String(value)) if value == "Scene"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.member_count"),
+            Some(MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.child_group_count"),
+            Some(MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.dataset_count"),
+            Some(MetadataValue::Int(0))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.parent_key"),
+            Some(MetadataValue::String(value)) if value == "imaris.surpass.Scene"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.object_kind"),
+            Some(MetadataValue::String(value)) if value == "Surfaces"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.object_index"),
+            Some(MetadataValue::Int(0))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.child_group_count"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Surfaces_0.dataset_count"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Spots_2.object_kind"),
+            Some(MetadataValue::String(value)) if value == "Spots"
+        ));
+        assert!(matches!(
+            metadata.get("imaris.surpass.Scene.Spots_2.object_index"),
+            Some(MetadataValue::Int(2))
+        ));
+
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -119,6 +578,30 @@ struct ImsParse {
     channel_colors: Vec<Option<i32>>,
     channel_emission_wavelengths: Vec<Option<f64>>,
     channel_excitation_wavelengths: Vec<Option<f64>>,
+    instrument: ImarisInstrumentMetadata,
+}
+
+#[derive(Clone, Default)]
+struct ImarisInstrumentMetadata {
+    microscope_model: Option<String>,
+    microscope_manufacturer: Option<String>,
+    objective_model: Option<String>,
+    objective_manufacturer: Option<String>,
+    objective_nominal_magnification: Option<f64>,
+    objective_calibrated_magnification: Option<f64>,
+    objective_lens_na: Option<f64>,
+    objective_immersion: Option<String>,
+    objective_correction: Option<String>,
+    objective_working_distance: Option<f64>,
+    detector_model: Option<String>,
+    detector_manufacturer: Option<String>,
+    detector_type: Option<String>,
+    detector_gain: Option<f64>,
+    detector_offset: Option<f64>,
+    light_source_model: Option<String>,
+    light_source_manufacturer: Option<String>,
+    light_source_type: Option<String>,
+    light_source_power: Option<f64>,
 }
 
 fn parse_ims(path: &Path) -> Result<ImsParse> {
@@ -297,6 +780,8 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         "imaris.time_info",
         &mut meta_map,
     );
+    collect_imaris_surpass_metadata(&file, &mut meta_map);
+    let instrument = collect_imaris_instrument_metadata(&file, &mut meta_map);
     insert_optional_float(
         &mut meta_map,
         "imaris.recording_spacing_x",
@@ -359,6 +844,50 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
                     MetadataValue::Float(excitation),
                 );
                 channel_excitation_wavelengths[c as usize] = Some(excitation);
+            }
+            // ImarisHDFReader.parseAttributes() additionally parses the per-
+            // channel Gain, Min, Max, Pinhole and MicroscopyMode attributes
+            // into typed channel lists (after the DELIMITERS value stripping it
+            // applies to every DataSetInfo/Channel_ value). Translate the same
+            // branches into parsed metadata keys here.
+            if let Some(gain) = read_str_attr(&ch_group, "Gain")
+                .map(|v| strip_imaris_channel_value_delimiters(&v))
+                .and_then(|v| parse_imaris_f64(&v))
+            {
+                meta_map.insert(
+                    format!("imaris.channel.{c}.gain"),
+                    MetadataValue::Float(gain),
+                );
+            }
+            if let Some(pinhole) = read_str_attr(&ch_group, "Pinhole")
+                .map(|v| strip_imaris_channel_value_delimiters(&v))
+                .and_then(|v| parse_imaris_f64(&v))
+            {
+                meta_map.insert(
+                    format!("imaris.channel.{c}.pinhole"),
+                    MetadataValue::Float(pinhole),
+                );
+            }
+            if let Some(min) = read_str_attr(&ch_group, "Min")
+                .map(|v| strip_imaris_channel_value_delimiters(&v))
+                .and_then(|v| parse_imaris_f64(&v))
+            {
+                meta_map.insert(format!("imaris.channel.{c}.min"), MetadataValue::Float(min));
+            }
+            if let Some(max) = read_str_attr(&ch_group, "Max")
+                .map(|v| strip_imaris_channel_value_delimiters(&v))
+                .and_then(|v| parse_imaris_f64(&v))
+            {
+                meta_map.insert(format!("imaris.channel.{c}.max"), MetadataValue::Float(max));
+            }
+            if let Some(mode) = read_str_attr(&ch_group, "MicroscopyMode")
+                .map(|v| strip_imaris_channel_value_delimiters(&v))
+                .filter(|v| !v.is_empty())
+            {
+                meta_map.insert(
+                    format!("imaris.channel.{c}.microscopy_mode"),
+                    MetadataValue::String(mode),
+                );
             }
         }
     }
@@ -429,6 +958,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         channel_colors,
         channel_emission_wavelengths,
         channel_excitation_wavelengths,
+        instrument,
     })
 }
 
@@ -477,6 +1007,21 @@ fn parse_imaris_f64(value: &str) -> Option<f64> {
         .filter_map(|part| part.parse::<f64>().ok())
         .next_back()
         .filter(|v| v.is_finite())
+}
+
+/// Imaris DataSetInfo/Channel attribute-value normalisation, mirroring the
+/// `DELIMITERS` loop in ImarisHDFReader.parseAttributes(): for each delimiter
+/// in {" ", "-", "."} in turn, if it occurs in the value, keep only the
+/// substring following its first occurrence.
+fn strip_imaris_channel_value_delimiters(value: &str) -> String {
+    const DELIMITERS: [char; 3] = [' ', '-', '.'];
+    let mut value = value.to_string();
+    for delimiter in DELIMITERS {
+        if let Some(index) = value.find(delimiter) {
+            value = value[index + delimiter.len_utf8()..].to_string();
+        }
+    }
+    value
 }
 
 fn pack_rgba_color([r, g, b, a]: [u8; 4]) -> i32 {
@@ -617,6 +1162,1209 @@ fn attr_to_metadata_value(attr: &hdf5_pure_rust::Attribute) -> Option<MetadataVa
         return Some(MetadataValue::Bool(b));
     }
     None
+}
+
+fn collect_imaris_surpass_metadata(
+    file: &hdf5_pure_rust::File,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    let roots = [
+        "DataSetInfo/Scene",
+        "DataSetInfo/Scene8",
+        "DataSetInfo/Surpass",
+        "Scene",
+        "Scene8",
+        "Surpass",
+    ];
+    let mut found = Vec::new();
+    let mut visited = 0usize;
+    for root in roots {
+        if file.group(root).is_err() {
+            continue;
+        }
+        found.push(root.to_string());
+        let key_root = format!("imaris.surpass.{}", imaris_metadata_path_key(root));
+        collect_imaris_hdf5_metadata_tree(file, root, &key_root, meta_map, &mut visited);
+        if visited >= IMARIS_SURPASS_METADATA_NODE_LIMIT {
+            break;
+        }
+    }
+    if !found.is_empty() {
+        meta_map.insert(
+            "imaris.surpass.roots".into(),
+            MetadataValue::String(found.join(",")),
+        );
+        meta_map.insert(
+            "imaris.surpass.node_count".into(),
+            MetadataValue::Int(visited as i64),
+        );
+        if visited >= IMARIS_SURPASS_METADATA_NODE_LIMIT {
+            meta_map.insert("imaris.surpass.truncated".into(), MetadataValue::Bool(true));
+        }
+    }
+}
+
+fn collect_imaris_hdf5_metadata_tree(
+    file: &hdf5_pure_rust::File,
+    path: &str,
+    key_prefix: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+    visited: &mut usize,
+) {
+    if *visited >= IMARIS_SURPASS_METADATA_NODE_LIMIT {
+        return;
+    }
+    let Ok(group) = file.group(path) else {
+        return;
+    };
+    *visited += 1;
+
+    copy_group_attrs_from_group(&group, key_prefix, meta_map);
+    let Ok(members) = hdf5_group_members(&group) else {
+        return;
+    };
+    collect_imaris_surpass_group_provenance(file, path, key_prefix, &members, meta_map);
+    for member in members {
+        if *visited >= IMARIS_SURPASS_METADATA_NODE_LIMIT {
+            return;
+        }
+        let child_path = format!("{path}/{member}");
+        let child_key = format!("{key_prefix}.{}", imaris_metadata_path_key(&member));
+        if let Ok(dataset) = file.dataset(&child_path) {
+            *visited += 1;
+            collect_imaris_dataset_node_metadata(&dataset, &child_key, meta_map);
+        } else if file.group(&child_path).is_ok() {
+            collect_imaris_hdf5_metadata_tree(file, &child_path, &child_key, meta_map, visited);
+        }
+    }
+    collect_imaris_surpass_statistics_table(file, path, key_prefix, meta_map);
+}
+
+fn collect_imaris_surpass_group_provenance(
+    file: &hdf5_pure_rust::File,
+    path: &str,
+    key_prefix: &str,
+    members: &[String],
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    let mut group_count = 0i64;
+    let mut dataset_count = 0i64;
+    for member in members {
+        let child_path = format!("{path}/{member}");
+        if file.dataset(&child_path).is_ok() {
+            dataset_count += 1;
+        } else if file.group(&child_path).is_ok() {
+            group_count += 1;
+        }
+    }
+
+    meta_map.insert(
+        format!("{key_prefix}.hdf5_path"),
+        MetadataValue::String(path.to_string()),
+    );
+    meta_map.insert(
+        format!("{key_prefix}.member_count"),
+        MetadataValue::Int(members.len().min(i64::MAX as usize) as i64),
+    );
+    meta_map.insert(
+        format!("{key_prefix}.child_group_count"),
+        MetadataValue::Int(group_count),
+    );
+    meta_map.insert(
+        format!("{key_prefix}.dataset_count"),
+        MetadataValue::Int(dataset_count),
+    );
+    if let Some((parent, _)) = key_prefix.rsplit_once('.') {
+        meta_map.insert(
+            format!("{key_prefix}.parent_key"),
+            MetadataValue::String(parent.to_string()),
+        );
+    }
+    if let Some(name) = path.rsplit('/').next() {
+        if let Some((kind, index)) = imaris_surpass_indexed_object_name(name) {
+            meta_map.insert(
+                format!("{key_prefix}.object_kind"),
+                MetadataValue::String(kind),
+            );
+            meta_map.insert(
+                format!("{key_prefix}.object_index"),
+                MetadataValue::Int(index as i64),
+            );
+        }
+    }
+}
+
+fn imaris_surpass_indexed_object_name(name: &str) -> Option<(String, u32)> {
+    let (kind, index) = name.rsplit_once([' ', '_'])?;
+    let index = index.parse::<u32>().ok()?;
+    let compact = kind
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .collect::<String>();
+    match compact.as_str() {
+        "Surfaces" | "Spots" | "Cells" | "Filaments" | "MeasurementPoints" => {
+            Some((compact, index))
+        }
+        _ => None,
+    }
+}
+
+fn copy_group_attrs_from_group(
+    group: &hdf5_pure_rust::Group,
+    prefix: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    let Ok(names) = group.attr_names() else {
+        return;
+    };
+    for name in names {
+        let Ok(attr) = group.attr(&name) else {
+            continue;
+        };
+        if let Some(value) = attr_to_metadata_value(&attr) {
+            meta_map.insert(
+                format!("{prefix}.{}", imaris_metadata_path_key(&name)),
+                value,
+            );
+        }
+    }
+}
+
+fn collect_imaris_dataset_node_metadata(
+    dataset: &hdf5_pure_rust::Dataset,
+    prefix: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    copy_dataset_attrs(dataset, prefix, meta_map);
+    let shape = dataset.shape().unwrap_or_default();
+    meta_map.insert(
+        format!("{prefix}.shape"),
+        MetadataValue::String(join_u64s(&shape)),
+    );
+    if let Ok(dtype) = dataset.dtype() {
+        meta_map.insert(
+            format!("{prefix}.dtype_class"),
+            MetadataValue::String(format!("{:?}", dtype.class())),
+        );
+        meta_map.insert(
+            format!("{prefix}.dtype_size"),
+            MetadataValue::Int(dtype.size() as i64),
+        );
+    }
+
+    let n_values = shape.iter().copied().product::<u64>().max(1);
+    collect_imaris_surpass_geometry_diagnostics(prefix, &shape, n_values, meta_map);
+    if n_values > IMARIS_SURPASS_DATASET_VALUE_LIMIT {
+        meta_map.insert(
+            format!("{prefix}.value_status"),
+            MetadataValue::String("not_read_large_dataset".into()),
+        );
+        return;
+    }
+    if let Some(value) = imaris_dataset_value(dataset) {
+        meta_map.insert(format!("{prefix}.value"), value);
+    }
+}
+
+fn collect_imaris_surpass_geometry_diagnostics(
+    prefix: &str,
+    shape: &[u64],
+    value_count: u64,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    let Some(role) = imaris_surpass_geometry_role(prefix) else {
+        return;
+    };
+    let component_count = imaris_surpass_geometry_component_count(shape, role.default_components());
+    let element_count = component_count
+        .filter(|components| *components > 0 && value_count % *components == 0)
+        .map(|components| value_count / components)
+        .unwrap_or(value_count);
+
+    meta_map.insert(
+        format!("{prefix}.geometry_role"),
+        MetadataValue::String(role.metadata_value().into()),
+    );
+    meta_map.insert(
+        format!("{prefix}.geometry_value_count"),
+        MetadataValue::Int(value_count.min(i64::MAX as u64) as i64),
+    );
+    meta_map.insert(
+        format!("{prefix}.geometry_element_count"),
+        MetadataValue::Int(element_count.min(i64::MAX as u64) as i64),
+    );
+    if let Some(component_count) = component_count {
+        meta_map.insert(
+            format!("{prefix}.geometry_component_count"),
+            MetadataValue::Int(component_count.min(i64::MAX as u64) as i64),
+        );
+    }
+    if value_count > IMARIS_SURPASS_DATASET_VALUE_LIMIT {
+        meta_map.insert(
+            format!("{prefix}.geometry_status"),
+            MetadataValue::String("not_read_large_geometry".into()),
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ImarisSurpassGeometryRole {
+    Vertices,
+    Normals,
+    Triangles,
+    Edges,
+}
+
+impl ImarisSurpassGeometryRole {
+    fn metadata_value(self) -> &'static str {
+        match self {
+            Self::Vertices => "vertices",
+            Self::Normals => "normals",
+            Self::Triangles => "triangles",
+            Self::Edges => "edges",
+        }
+    }
+
+    fn default_components(self) -> Option<u64> {
+        match self {
+            Self::Vertices | Self::Normals | Self::Triangles => Some(3),
+            Self::Edges => Some(2),
+        }
+    }
+}
+
+fn imaris_surpass_geometry_role(prefix: &str) -> Option<ImarisSurpassGeometryRole> {
+    let name = prefix.rsplit('.').next()?.to_ascii_lowercase();
+    let compact = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    match compact.as_str() {
+        "vertices" | "vertexpositions" | "positions" | "points" => {
+            Some(ImarisSurpassGeometryRole::Vertices)
+        }
+        "normals" | "vertexnormals" => Some(ImarisSurpassGeometryRole::Normals),
+        "triangles" | "triangleindices" | "faces" | "faceindices" => {
+            Some(ImarisSurpassGeometryRole::Triangles)
+        }
+        "edges" | "edgeindices" | "lines" | "lineindices" => Some(ImarisSurpassGeometryRole::Edges),
+        _ => None,
+    }
+}
+
+fn imaris_surpass_geometry_component_count(shape: &[u64], default: Option<u64>) -> Option<u64> {
+    if let Some(last) = shape
+        .last()
+        .copied()
+        .filter(|value| (2..=4).contains(value))
+    {
+        return Some(last);
+    }
+    default
+}
+
+fn imaris_dataset_value(dataset: &hdf5_pure_rust::Dataset) -> Option<MetadataValue> {
+    let dtype = dataset.dtype().ok()?;
+    match dtype.class() {
+        DatatypeClass::String | DatatypeClass::VarLen => {
+            let strings = dataset.read_strings().ok()?;
+            let joined = strings.join(",");
+            let trimmed = joined.trim_matches('\0').trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(MetadataValue::String(trimmed.to_string()))
+            }
+        }
+        DatatypeClass::FloatingPoint => {
+            let values = match dtype.size() {
+                4 => dataset
+                    .read::<f32>()
+                    .ok()?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>(),
+                8 => dataset.read::<f64>().ok()?,
+                _ => return None,
+            };
+            if values.iter().all(|v| v.is_finite()) {
+                imaris_float_values_to_metadata(values)
+            } else {
+                None
+            }
+        }
+        DatatypeClass::FixedPoint => {
+            let signed = dtype.is_signed().unwrap_or(true);
+            if signed {
+                let values = match dtype.size() {
+                    1 => dataset
+                        .read::<i8>()
+                        .ok()?
+                        .into_iter()
+                        .map(i64::from)
+                        .collect::<Vec<_>>(),
+                    2 => dataset
+                        .read::<i16>()
+                        .ok()?
+                        .into_iter()
+                        .map(i64::from)
+                        .collect::<Vec<_>>(),
+                    4 => dataset
+                        .read::<i32>()
+                        .ok()?
+                        .into_iter()
+                        .map(i64::from)
+                        .collect::<Vec<_>>(),
+                    8 => dataset.read::<i64>().ok()?,
+                    _ => return None,
+                };
+                imaris_i64_values_to_metadata(values)
+            } else {
+                let values = match dtype.size() {
+                    1 => dataset
+                        .read::<u8>()
+                        .ok()?
+                        .into_iter()
+                        .map(u64::from)
+                        .collect::<Vec<_>>(),
+                    2 => dataset
+                        .read::<u16>()
+                        .ok()?
+                        .into_iter()
+                        .map(u64::from)
+                        .collect::<Vec<_>>(),
+                    4 => dataset
+                        .read::<u32>()
+                        .ok()?
+                        .into_iter()
+                        .map(u64::from)
+                        .collect::<Vec<_>>(),
+                    8 => dataset.read::<u64>().ok()?,
+                    _ => return None,
+                };
+                imaris_u64_values_to_metadata(values)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn imaris_float_values_to_metadata(values: Vec<f64>) -> Option<MetadataValue> {
+    if values.len() == 1 {
+        values.first().copied().map(MetadataValue::Float)
+    } else {
+        Some(MetadataValue::String(
+            values
+                .iter()
+                .map(f64::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ))
+    }
+}
+
+fn imaris_i64_values_to_metadata(values: Vec<i64>) -> Option<MetadataValue> {
+    if values.len() == 1 {
+        values.first().copied().map(MetadataValue::Int)
+    } else {
+        Some(MetadataValue::String(
+            values
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ))
+    }
+}
+
+fn imaris_u64_values_to_metadata(values: Vec<u64>) -> Option<MetadataValue> {
+    if values.len() == 1 && values[0] <= i64::MAX as u64 {
+        Some(MetadataValue::Int(values[0] as i64))
+    } else {
+        Some(MetadataValue::String(
+            values
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ))
+    }
+}
+
+fn collect_imaris_surpass_statistics_table(
+    file: &hdf5_pure_rust::File,
+    path: &str,
+    key_prefix: &str,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) {
+    if !key_prefix.ends_with(".Statistics") && !key_prefix.contains(".Statistics.") {
+        return;
+    }
+    let table_prefix = format!("{key_prefix}.table");
+    let Some(names_dataset) = first_existing_dataset(file, path, &["Names", "StatisticNames"])
+    else {
+        return;
+    };
+    let Some(values_dataset) = first_existing_dataset(file, path, &["Values", "StatisticValues"])
+    else {
+        return;
+    };
+    let Ok(name_shape) = names_dataset.shape() else {
+        meta_map.insert(
+            format!("{table_prefix}.names_status"),
+            MetadataValue::String("unreadable_statistics_names".into()),
+        );
+        return;
+    };
+    let name_count = hdf5_shape_value_count(&name_shape);
+    meta_map.insert(
+        format!("{table_prefix}.names_shape"),
+        MetadataValue::String(join_u64s(&name_shape)),
+    );
+    meta_map.insert(
+        format!("{table_prefix}.name_count"),
+        MetadataValue::Int(name_count.min(i64::MAX as u64) as i64),
+    );
+    if name_count > IMARIS_SURPASS_STATISTICS_TABLE_VALUE_LIMIT {
+        meta_map.insert(
+            format!("{table_prefix}.names_status"),
+            MetadataValue::String("not_read_large_statistics_names".into()),
+        );
+        return;
+    }
+
+    let Some(names) = imaris_dataset_string_values(&names_dataset) else {
+        meta_map.insert(
+            format!("{table_prefix}.names_status"),
+            MetadataValue::String("unsupported_statistics_names".into()),
+        );
+        return;
+    };
+    if names.is_empty() {
+        meta_map.insert(
+            format!("{table_prefix}.names_status"),
+            MetadataValue::String("empty_statistics_names".into()),
+        );
+        return;
+    }
+    let Ok(value_shape) = values_dataset.shape() else {
+        meta_map.insert(
+            format!("{table_prefix}.value_status"),
+            MetadataValue::String("unreadable_statistics_values".into()),
+        );
+        return;
+    };
+    let value_count = hdf5_shape_value_count(&value_shape);
+    meta_map.insert(
+        format!("{table_prefix}.stat_count"),
+        MetadataValue::Int(names.len() as i64),
+    );
+    meta_map.insert(
+        format!("{table_prefix}.value_shape"),
+        MetadataValue::String(join_u64s(&value_shape)),
+    );
+    meta_map.insert(
+        format!("{table_prefix}.value_count"),
+        MetadataValue::Int(value_count.min(i64::MAX as u64) as i64),
+    );
+    if value_count > IMARIS_SURPASS_STATISTICS_TABLE_VALUE_LIMIT {
+        meta_map.insert(
+            format!("{table_prefix}.value_status"),
+            MetadataValue::String("not_read_large_statistics_table".into()),
+        );
+        return;
+    }
+    let Some(values) = imaris_dataset_numeric_f64_values(&values_dataset) else {
+        meta_map.insert(
+            format!("{table_prefix}.value_status"),
+            MetadataValue::String("unsupported_statistics_values".into()),
+        );
+        return;
+    };
+    let Some((rows, columns, effective_shape)) =
+        imaris_statistics_matrix_shape(&value_shape, values.len())
+    else {
+        meta_map.insert(
+            format!("{table_prefix}.layout_status"),
+            MetadataValue::String("unsupported_statistics_layout".into()),
+        );
+        meta_map.insert(
+            format!("{table_prefix}.layout_reason"),
+            MetadataValue::String(
+                imaris_statistics_unsupported_layout_reason(
+                    &value_shape,
+                    names.len(),
+                    values.len(),
+                )
+                .into(),
+            ),
+        );
+        meta_map.insert(
+            format!("{table_prefix}.supported_layouts"),
+            MetadataValue::String("stat_rows,stat_columns".into()),
+        );
+        return;
+    };
+    if effective_shape.as_slice() != value_shape.as_slice() {
+        meta_map.insert(
+            format!("{table_prefix}.effective_value_shape"),
+            MetadataValue::String(join_u64s(&effective_shape)),
+        );
+    }
+    meta_map.insert(
+        format!("{table_prefix}.row_count"),
+        MetadataValue::Int(rows.min(i64::MAX as usize) as i64),
+    );
+    meta_map.insert(
+        format!("{table_prefix}.column_count"),
+        MetadataValue::Int(columns.min(i64::MAX as usize) as i64),
+    );
+    let layout = if rows == names.len() {
+        ImarisStatisticsTableLayout::StatRows
+    } else if columns == names.len() {
+        ImarisStatisticsTableLayout::StatColumns
+    } else {
+        meta_map.insert(
+            format!("{table_prefix}.layout_status"),
+            MetadataValue::String("unsupported_statistics_layout".into()),
+        );
+        meta_map.insert(
+            format!("{table_prefix}.layout_reason"),
+            MetadataValue::String("statistic_name_count_mismatch".into()),
+        );
+        meta_map.insert(
+            format!("{table_prefix}.supported_layouts"),
+            MetadataValue::String("stat_rows,stat_columns".into()),
+        );
+        return;
+    };
+
+    meta_map.insert(
+        format!("{table_prefix}.layout"),
+        MetadataValue::String(layout.metadata_value().into()),
+    );
+    for (row, name) in names.iter().enumerate() {
+        let key_name = imaris_metadata_path_key(name);
+        if key_name.is_empty() {
+            continue;
+        }
+        let stat_values = match layout {
+            ImarisStatisticsTableLayout::StatRows => {
+                values[row * columns..(row + 1) * columns].to_vec()
+            }
+            ImarisStatisticsTableLayout::StatColumns => (0..rows)
+                .map(|value_row| values[value_row * columns + row])
+                .collect(),
+        };
+        let value = imaris_float_values_to_metadata(stat_values);
+        if let Some(value) = value {
+            meta_map.insert(format!("{table_prefix}.{key_name}"), value);
+        }
+    }
+}
+
+fn imaris_statistics_matrix_shape(
+    shape: &[u64],
+    value_len: usize,
+) -> Option<(usize, usize, Vec<u64>)> {
+    if value_len == 0 {
+        return None;
+    }
+    let mut axes = if shape.len() <= 2 {
+        shape.to_vec()
+    } else {
+        shape
+            .iter()
+            .copied()
+            .filter(|axis| *axis > 1)
+            .collect::<Vec<_>>()
+    };
+    if axes.is_empty() {
+        axes.push(value_len as u64);
+    }
+
+    let (rows, columns) = match axes.as_slice() {
+        [rows] => {
+            let rows = usize::try_from(*rows).ok()?;
+            if rows == 0 || value_len % rows != 0 {
+                return None;
+            }
+            (rows, value_len / rows)
+        }
+        [rows, columns] => {
+            let rows = usize::try_from(*rows).ok()?;
+            let columns = usize::try_from(*columns).ok()?;
+            if rows == 0 || columns == 0 || rows.checked_mul(columns)? != value_len {
+                return None;
+            }
+            (rows, columns)
+        }
+        _ => return None,
+    };
+    Some((rows, columns, axes))
+}
+
+fn imaris_statistics_effective_axes(shape: &[u64], value_len: usize) -> Vec<u64> {
+    let mut axes = if shape.len() <= 2 {
+        shape.to_vec()
+    } else {
+        shape
+            .iter()
+            .copied()
+            .filter(|axis| *axis > 1)
+            .collect::<Vec<_>>()
+    };
+    if axes.is_empty() {
+        axes.push(value_len as u64);
+    }
+    axes
+}
+
+fn imaris_statistics_unsupported_layout_reason(
+    shape: &[u64],
+    name_count: usize,
+    value_len: usize,
+) -> &'static str {
+    if value_len == 0 {
+        return "empty_statistics_values";
+    }
+    let axes = imaris_statistics_effective_axes(shape, value_len);
+    match axes.as_slice() {
+        [rows] => {
+            let Ok(rows) = usize::try_from(*rows) else {
+                return "statistics_axis_overflow";
+            };
+            if rows == 0 || value_len % rows != 0 {
+                "inconsistent_statistics_value_count"
+            } else if rows != name_count && value_len / rows != name_count {
+                "statistic_name_count_mismatch"
+            } else {
+                "unsupported_statistics_layout"
+            }
+        }
+        [rows, columns] => {
+            let (Ok(rows), Ok(columns)) = (usize::try_from(*rows), usize::try_from(*columns))
+            else {
+                return "statistics_axis_overflow";
+            };
+            if rows == 0
+                || columns == 0
+                || rows
+                    .checked_mul(columns)
+                    .is_none_or(|count| count != value_len)
+            {
+                "inconsistent_statistics_value_count"
+            } else if rows != name_count && columns != name_count {
+                "statistic_name_count_mismatch"
+            } else {
+                "unsupported_statistics_layout"
+            }
+        }
+        _ => "unsupported_statistics_rank",
+    }
+}
+
+fn hdf5_shape_value_count(shape: &[u64]) -> u64 {
+    shape
+        .iter()
+        .copied()
+        .fold(1u64, |count, axis| count.saturating_mul(axis))
+        .max(1)
+}
+
+#[derive(Clone, Copy)]
+enum ImarisStatisticsTableLayout {
+    StatRows,
+    StatColumns,
+}
+
+impl ImarisStatisticsTableLayout {
+    fn metadata_value(self) -> &'static str {
+        match self {
+            Self::StatRows => "stat_rows",
+            Self::StatColumns => "stat_columns",
+        }
+    }
+}
+
+fn first_existing_dataset(
+    file: &hdf5_pure_rust::File,
+    group_path: &str,
+    names: &[&str],
+) -> Option<hdf5_pure_rust::Dataset> {
+    names
+        .iter()
+        .find_map(|name| file.dataset(&format!("{group_path}/{name}")).ok())
+}
+
+fn imaris_dataset_string_values(dataset: &hdf5_pure_rust::Dataset) -> Option<Vec<String>> {
+    let shape = dataset.shape().ok()?;
+    let n_values = shape.iter().copied().product::<u64>().max(1);
+    if n_values > IMARIS_SURPASS_STATISTICS_TABLE_VALUE_LIMIT {
+        return None;
+    }
+    let dtype = dataset.dtype().ok()?;
+    if !matches!(dtype.class(), DatatypeClass::String | DatatypeClass::VarLen) {
+        return None;
+    }
+    let values = dataset
+        .read_strings()
+        .ok()?
+        .into_iter()
+        .map(|value| value.trim_matches('\0').trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn imaris_dataset_numeric_f64_values(dataset: &hdf5_pure_rust::Dataset) -> Option<Vec<f64>> {
+    let dtype = dataset.dtype().ok()?;
+    let values = match dtype.class() {
+        DatatypeClass::FloatingPoint => match dtype.size() {
+            4 => dataset
+                .read::<f32>()
+                .ok()?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            8 => dataset.read::<f64>().ok()?,
+            _ => return None,
+        },
+        DatatypeClass::FixedPoint => {
+            if dtype.is_signed().unwrap_or(true) {
+                match dtype.size() {
+                    1 => dataset
+                        .read::<i8>()
+                        .ok()?
+                        .into_iter()
+                        .map(|value| value as f64)
+                        .collect::<Vec<_>>(),
+                    2 => dataset
+                        .read::<i16>()
+                        .ok()?
+                        .into_iter()
+                        .map(|value| value as f64)
+                        .collect::<Vec<_>>(),
+                    4 => dataset
+                        .read::<i32>()
+                        .ok()?
+                        .into_iter()
+                        .map(|value| value as f64)
+                        .collect::<Vec<_>>(),
+                    8 => dataset
+                        .read::<i64>()
+                        .ok()?
+                        .into_iter()
+                        .map(|value| value as f64)
+                        .collect::<Vec<_>>(),
+                    _ => return None,
+                }
+            } else {
+                match dtype.size() {
+                    1 => dataset
+                        .read::<u8>()
+                        .ok()?
+                        .into_iter()
+                        .map(|value| value as f64)
+                        .collect::<Vec<_>>(),
+                    2 => dataset
+                        .read::<u16>()
+                        .ok()?
+                        .into_iter()
+                        .map(|value| value as f64)
+                        .collect::<Vec<_>>(),
+                    4 => dataset
+                        .read::<u32>()
+                        .ok()?
+                        .into_iter()
+                        .map(|value| value as f64)
+                        .collect::<Vec<_>>(),
+                    8 => dataset
+                        .read::<u64>()
+                        .ok()?
+                        .into_iter()
+                        .map(|value| value as f64)
+                        .collect::<Vec<_>>(),
+                    _ => return None,
+                }
+            }
+        }
+        _ => return None,
+    };
+    if values.iter().all(|value| value.is_finite()) {
+        Some(values)
+    } else {
+        None
+    }
+}
+
+fn imaris_metadata_path_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn imaris_ome_rois_from_metadata(meta: &ImageMetadata) -> Vec<OmeROI> {
+    let mut bases = meta
+        .series_metadata
+        .keys()
+        .filter_map(|key| key.strip_suffix(".Statistics.Center.value"))
+        .filter(|base| imaris_surpass_object_base(base))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    bases.sort();
+    bases.dedup();
+
+    let mut rois = Vec::new();
+    for base in bases {
+        let Some(center) = imaris_metadata_float_list(
+            meta.series_metadata
+                .get(&format!("{base}.Statistics.Center.value")),
+        )
+        .filter(|values| values.len() >= 2) else {
+            continue;
+        };
+        let x = center[0];
+        let y = center[1];
+        let z = center
+            .get(2)
+            .and_then(|value| imaris_nonnegative_plane_index(*value));
+        let t = imaris_surpass_roi_index(meta, &base, ImarisSurpassRoiAxis::T);
+        let c = imaris_surpass_roi_index(meta, &base, ImarisSurpassRoiAxis::C);
+        let radius = imaris_metadata_float_list(
+            meta.series_metadata
+                .get(&format!("{base}.Statistics.RadiusXYZ.value")),
+        );
+        let shape = match radius.filter(|values| values.len() >= 2) {
+            Some(radius) if radius[0] >= 0.0 && radius[1] >= 0.0 => OmeShape::Ellipse {
+                x,
+                y,
+                radius_x: radius[0],
+                radius_y: radius[1],
+                the_z: z,
+                the_t: t,
+                the_c: c,
+            },
+            _ => OmeShape::Point {
+                x,
+                y,
+                the_z: z,
+                the_t: t,
+                the_c: c,
+            },
+        };
+        let name = imaris_metadata_string(meta.series_metadata.get(&format!("{base}.Name")))
+            .or_else(|| imaris_metadata_string(meta.series_metadata.get(&format!("{base}.Type"))));
+        rois.push(OmeROI {
+            id: Some(create_lsid("ROI", &[rois.len()])),
+            name,
+            shapes: vec![shape],
+        });
+    }
+    rois
+}
+
+#[derive(Clone, Copy)]
+enum ImarisSurpassRoiAxis {
+    T,
+    C,
+}
+
+fn imaris_surpass_roi_index(
+    meta: &ImageMetadata,
+    base: &str,
+    axis: ImarisSurpassRoiAxis,
+) -> Option<u32> {
+    let names: &[&str] = match axis {
+        ImarisSurpassRoiAxis::T => &["IndexT", "TimeIndex", "Time_Index", "TheT", "T"],
+        ImarisSurpassRoiAxis::C => &["IndexC", "ChannelIndex", "Channel_Index", "TheC", "C"],
+    };
+
+    names.iter().find_map(|name| {
+        let dataset_key = format!("{base}.Statistics.{name}.value");
+        let table_key = format!("{base}.Statistics.table.{name}");
+        imaris_metadata_float_list(meta.series_metadata.get(&dataset_key))
+            .or_else(|| imaris_metadata_float_list(meta.series_metadata.get(&table_key)))
+            .and_then(|values| values.first().copied())
+            .and_then(imaris_nonnegative_plane_index)
+    })
+}
+
+fn imaris_surpass_object_base(base: &str) -> bool {
+    base.contains(".Surfaces_")
+        || base.contains(".Spots_")
+        || base.contains(".Cells_")
+        || base.contains(".Filaments_")
+        || base.contains(".MeasurementPoints_")
+}
+
+fn imaris_metadata_float_list(value: Option<&MetadataValue>) -> Option<Vec<f64>> {
+    match value? {
+        MetadataValue::Float(value) if value.is_finite() => Some(vec![*value]),
+        MetadataValue::Int(value) => Some(vec![*value as f64]),
+        MetadataValue::String(value) => {
+            let values = value
+                .split(|ch: char| ch.is_ascii_whitespace() || ch == ',' || ch == ';')
+                .filter(|part| !part.is_empty())
+                .map(str::parse::<f64>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()?;
+            if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+                None
+            } else {
+                Some(values)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn imaris_metadata_string(value: Option<&MetadataValue>) -> Option<String> {
+    match value? {
+        MetadataValue::String(value) if !value.is_empty() => Some(value.clone()),
+        MetadataValue::Int(value) => Some(value.to_string()),
+        MetadataValue::Float(value) if value.is_finite() => Some(value.to_string()),
+        MetadataValue::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn imaris_nonnegative_plane_index(value: f64) -> Option<u32> {
+    if value.is_finite() && value >= 0.0 && value.fract().abs() <= f64::EPSILON {
+        Some(value as u32)
+    } else {
+        None
+    }
+}
+
+fn collect_imaris_instrument_metadata(
+    file: &hdf5_pure_rust::File,
+    meta_map: &mut HashMap<String, MetadataValue>,
+) -> ImarisInstrumentMetadata {
+    let microscope = first_existing_group(file, &["DataSetInfo/Microscope"]);
+    let objective = first_existing_group(
+        file,
+        &[
+            "DataSetInfo/Objective",
+            "DataSetInfo/Objective 0",
+            "DataSetInfo/Objective_0",
+            "DataSetInfo/Lens",
+        ],
+    );
+    let detector = first_existing_group(
+        file,
+        &[
+            "DataSetInfo/Detector",
+            "DataSetInfo/Detector 0",
+            "DataSetInfo/Detector_0",
+        ],
+    );
+    let light_source = first_existing_group(
+        file,
+        &[
+            "DataSetInfo/LightSource",
+            "DataSetInfo/LightSource 0",
+            "DataSetInfo/LightSource_0",
+            "DataSetInfo/Laser",
+            "DataSetInfo/Laser 0",
+            "DataSetInfo/Laser_0",
+        ],
+    );
+
+    if let Some((path, _)) = microscope.as_ref() {
+        copy_group_attrs(file, path, "imaris.microscope", meta_map);
+    }
+    if let Some((path, _)) = objective.as_ref() {
+        copy_group_attrs(file, path, "imaris.objective", meta_map);
+    }
+    if let Some((path, _)) = detector.as_ref() {
+        copy_group_attrs(file, path, "imaris.detector", meta_map);
+    }
+    if let Some((path, _)) = light_source.as_ref() {
+        copy_group_attrs(file, path, "imaris.light_source", meta_map);
+    }
+
+    ImarisInstrumentMetadata {
+        microscope_model: microscope
+            .as_ref()
+            .and_then(|(_, group)| first_str_attr(group, &["Model", "Name", "MicroscopeModel"])),
+        microscope_manufacturer: microscope.as_ref().and_then(|(_, group)| {
+            first_str_attr(group, &["Manufacturer", "MicroscopeManufacturer"])
+        }),
+        objective_model: objective
+            .as_ref()
+            .and_then(|(_, group)| first_str_attr(group, &["Model", "Name", "ObjectiveName"])),
+        objective_manufacturer: objective.as_ref().and_then(|(_, group)| {
+            first_str_attr(group, &["Manufacturer", "ObjectiveManufacturer"])
+        }),
+        objective_nominal_magnification: objective.as_ref().and_then(|(_, group)| {
+            first_float_attr(
+                group,
+                &[
+                    "NominalMagnification",
+                    "Magnification",
+                    "ObjectiveMagnification",
+                ],
+            )
+        }),
+        objective_calibrated_magnification: objective
+            .as_ref()
+            .and_then(|(_, group)| first_float_attr(group, &["CalibratedMagnification"])),
+        objective_lens_na: objective
+            .as_ref()
+            .and_then(|(_, group)| first_float_attr(group, &["LensNA", "NumericalAperture", "NA"])),
+        objective_immersion: objective
+            .as_ref()
+            .and_then(|(_, group)| first_str_attr(group, &["Immersion"])),
+        objective_correction: objective
+            .as_ref()
+            .and_then(|(_, group)| first_str_attr(group, &["Correction"])),
+        objective_working_distance: objective
+            .as_ref()
+            .and_then(|(_, group)| first_float_attr(group, &["WorkingDistance"])),
+        detector_model: detector
+            .as_ref()
+            .and_then(|(_, group)| first_str_attr(group, &["Model", "Name", "DetectorName"])),
+        detector_manufacturer: detector
+            .as_ref()
+            .and_then(|(_, group)| first_str_attr(group, &["Manufacturer"])),
+        detector_type: detector
+            .as_ref()
+            .and_then(|(_, group)| first_str_attr(group, &["Type", "DetectorType"])),
+        detector_gain: detector
+            .as_ref()
+            .and_then(|(_, group)| first_float_attr(group, &["Gain", "DetectorGain"])),
+        detector_offset: detector
+            .as_ref()
+            .and_then(|(_, group)| first_float_attr(group, &["Offset", "DetectorOffset"])),
+        light_source_model: light_source
+            .as_ref()
+            .and_then(|(_, group)| first_str_attr(group, &["Model", "Name", "LightSourceName"])),
+        light_source_manufacturer: light_source.as_ref().and_then(|(_, group)| {
+            first_str_attr(group, &["Manufacturer", "LightSourceManufacturer"])
+        }),
+        light_source_type: light_source
+            .as_ref()
+            .and_then(|(_, group)| first_str_attr(group, &["Type", "LightSourceType"]))
+            .or_else(|| {
+                light_source.as_ref().map(|(path, _)| {
+                    if path.contains("Laser") {
+                        "Laser".to_string()
+                    } else {
+                        "GenericExcitationSource".to_string()
+                    }
+                })
+            }),
+        light_source_power: light_source.as_ref().and_then(|(_, group)| {
+            first_float_attr(group, &["Power", "PowerMilliWatts", "LaserPower"])
+        }),
+    }
+}
+
+fn first_existing_group(
+    file: &hdf5_pure_rust::File,
+    paths: &[&str],
+) -> Option<(String, hdf5_pure_rust::Group)> {
+    paths.iter().find_map(|path| {
+        file.group(path)
+            .ok()
+            .map(|group| ((*path).to_string(), group))
+    })
+}
+
+fn first_str_attr(group: &hdf5_pure_rust::Group, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| read_str_attr(group, name))
+}
+
+fn first_float_attr(group: &hdf5_pure_rust::Group, names: &[&str]) -> Option<f64> {
+    names
+        .iter()
+        .find_map(|name| read_str_attr(group, name).and_then(|value| parse_imaris_f64(&value)))
+}
+
+fn imaris_ome_instrument(instrument: &ImarisInstrumentMetadata) -> Option<OmeInstrument> {
+    let mut ome_instrument = OmeInstrument {
+        id: Some(create_lsid("Instrument", &[0])),
+        microscope_model: instrument.microscope_model.clone(),
+        microscope_manufacturer: instrument.microscope_manufacturer.clone(),
+        ..OmeInstrument::default()
+    };
+
+    if instrument.objective_model.is_some()
+        || instrument.objective_manufacturer.is_some()
+        || instrument.objective_nominal_magnification.is_some()
+        || instrument.objective_calibrated_magnification.is_some()
+        || instrument.objective_lens_na.is_some()
+        || instrument.objective_immersion.is_some()
+        || instrument.objective_correction.is_some()
+        || instrument.objective_working_distance.is_some()
+    {
+        ome_instrument.objectives.push(OmeObjective {
+            id: Some(create_lsid("Objective", &[0, 0])),
+            model: instrument.objective_model.clone(),
+            manufacturer: instrument.objective_manufacturer.clone(),
+            nominal_magnification: instrument.objective_nominal_magnification,
+            calibrated_magnification: instrument.objective_calibrated_magnification,
+            lens_na: instrument.objective_lens_na,
+            immersion: instrument.objective_immersion.clone(),
+            correction: instrument.objective_correction.clone(),
+            working_distance: instrument.objective_working_distance,
+        });
+    }
+
+    if instrument.detector_model.is_some()
+        || instrument.detector_manufacturer.is_some()
+        || instrument.detector_type.is_some()
+        || instrument.detector_gain.is_some()
+        || instrument.detector_offset.is_some()
+    {
+        ome_instrument.detectors.push(OmeDetector {
+            id: Some(create_lsid("Detector", &[0, 0])),
+            model: instrument.detector_model.clone(),
+            manufacturer: instrument.detector_manufacturer.clone(),
+            detector_type: instrument.detector_type.clone(),
+            gain: instrument.detector_gain,
+            offset: instrument.detector_offset,
+        });
+    }
+
+    if instrument.light_source_model.is_some()
+        || instrument.light_source_manufacturer.is_some()
+        || instrument.light_source_type.is_some()
+        || instrument.light_source_power.is_some()
+    {
+        ome_instrument.light_sources.push(OmeLightSource {
+            id: Some(create_lsid("LightSource", &[0, 0])),
+            model: instrument.light_source_model.clone(),
+            manufacturer: instrument.light_source_manufacturer.clone(),
+            light_source_type: instrument.light_source_type.clone(),
+            power: instrument.light_source_power,
+        });
+    }
+
+    if ome_instrument.microscope_model.is_some()
+        || ome_instrument.microscope_manufacturer.is_some()
+        || !ome_instrument.objectives.is_empty()
+        || !ome_instrument.detectors.is_empty()
+        || !ome_instrument.light_sources.is_empty()
+    {
+        Some(ome_instrument)
+    } else {
+        None
+    }
 }
 
 fn join_u64s(values: &[u64]) -> String {
@@ -809,6 +2557,7 @@ impl FormatReader for ImarisReader {
         self.channel_colors = parsed.channel_colors;
         self.channel_emission_wavelengths = parsed.channel_emission_wavelengths;
         self.channel_excitation_wavelengths = parsed.channel_excitation_wavelengths;
+        self.instrument = parsed.instrument;
         Ok(())
     }
 
@@ -824,6 +2573,7 @@ impl FormatReader for ImarisReader {
         self.channel_colors.clear();
         self.channel_emission_wavelengths.clear();
         self.channel_excitation_wavelengths.clear();
+        self.instrument = ImarisInstrumentMetadata::default();
         self.cache = None;
         Ok(())
     }
@@ -1061,6 +2811,9 @@ impl FormatReader for ImarisReader {
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         let meta = self.resolutions.get(self.current_resolution)?;
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(instrument) = imaris_ome_instrument(&self.instrument) {
+            ome.instruments.push(instrument);
+        }
         {
             let img = ome.images.get_mut(0)?;
 
@@ -1119,7 +2872,14 @@ impl FormatReader for ImarisReader {
                     ch.excitation_wavelength = Some(*excitation);
                 }
             }
+            if !ome.instruments.is_empty() {
+                img.instrument_ref = Some(0);
+                if !ome.instruments[0].objectives.is_empty() {
+                    img.objective_ref = Some(0);
+                }
+            }
         }
+        ome.rois.extend(imaris_ome_rois_from_metadata(meta));
         let _ = ome.add_original_metadata_annotations(meta, 0);
 
         Some(ome)

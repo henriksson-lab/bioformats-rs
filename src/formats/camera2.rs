@@ -318,6 +318,7 @@ pub(crate) mod cfa {
 // ---------------------------------------------------------------------------
 // Macro for TIFF wrapper readers
 // ---------------------------------------------------------------------------
+#[allow(unused_macros)]
 macro_rules! tiff_wrapper {
     (
         $(#[$attr:meta])*
@@ -1955,10 +1956,351 @@ impl FormatReader for IpwReader {
 // ---------------------------------------------------------------------------
 // 8. Photoshop-annotated TIFF — TIFF wrapper
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Photoshop-annotated TIFF format (`.tif`).
-    pub struct PhotoshopTiffReader;
-    extensions: ["tif"];
+
+/// IFD tag carrying the Photoshop `IMAGE_SOURCE_DATA` layer payload.
+///
+/// Mirrors `PhotoshopTiffReader.IMAGE_SOURCE_DATA` (37724) in the Java reader.
+const PHOTOSHOP_IMAGE_SOURCE_DATA: u16 = 37724;
+
+/// Endianness-aware byte cursor over the `IMAGE_SOURCE_DATA` payload.
+///
+/// Mirrors the `tag` `RandomAccessInputStream` of the Java reader, whose byte
+/// order is taken from the host TIFF (`tag.order(isLittleEndian())`). Reads that
+/// run past the end clamp to zero / empty, never panic.
+struct PsTag<'a> {
+    d: &'a [u8],
+    p: usize,
+    little_endian: bool,
+}
+
+impl<'a> PsTag<'a> {
+    fn new(d: &'a [u8], little_endian: bool) -> Self {
+        PsTag {
+            d,
+            p: 0,
+            little_endian,
+        }
+    }
+    fn fp(&self) -> usize {
+        self.p
+    }
+    fn len(&self) -> usize {
+        self.d.len()
+    }
+    fn seek(&mut self, p: usize) {
+        self.p = p.min(self.d.len());
+    }
+    fn skip_bytes(&mut self, n: usize) {
+        self.p = self.p.saturating_add(n).min(self.d.len());
+    }
+    /// Read one byte (Java `read()`), returning 0 past the end.
+    fn read(&mut self) -> u8 {
+        let v = self.d.get(self.p).copied().unwrap_or(0);
+        if self.p < self.d.len() {
+            self.p += 1;
+        }
+        v
+    }
+    fn read_short(&mut self) -> i16 {
+        let v = if self.p + 2 <= self.d.len() {
+            let b = [self.d[self.p], self.d[self.p + 1]];
+            if self.little_endian {
+                i16::from_le_bytes(b)
+            } else {
+                i16::from_be_bytes(b)
+            }
+        } else {
+            0
+        };
+        self.skip_bytes(2);
+        v
+    }
+    fn read_int(&mut self) -> i32 {
+        let v = if self.p + 4 <= self.d.len() {
+            let b = [
+                self.d[self.p],
+                self.d[self.p + 1],
+                self.d[self.p + 2],
+                self.d[self.p + 3],
+            ];
+            if self.little_endian {
+                i32::from_le_bytes(b)
+            } else {
+                i32::from_be_bytes(b)
+            }
+        } else {
+            0
+        };
+        self.skip_bytes(4);
+        v
+    }
+    /// Read `n` raw bytes (Java `readString(n)` body), clamping at the end.
+    fn read_string(&mut self, n: usize) -> &'a [u8] {
+        let end = self.p.saturating_add(n).min(self.d.len());
+        let s = &self.d[self.p..end];
+        self.p = end;
+        s
+    }
+    /// Read a NUL-terminated ASCII string (Java `readCString()`).
+    fn read_cstring(&mut self) {
+        while self.p < self.d.len() && self.d[self.p] != 0 {
+            self.p += 1;
+        }
+        if self.p < self.d.len() {
+            self.p += 1; // consume the terminator
+        }
+    }
+}
+
+/// Strip non-ASCII bytes and trim, mirroring Java's
+/// `replaceAll("[^\\p{ASCII}]", "").trim()` on decoded layer names.
+fn photoshop_clean_layer_name(bytes: &[u8]) -> String {
+    let ascii: String = bytes
+        .iter()
+        .filter(|&&b| b.is_ascii())
+        .map(|&b| b as char)
+        .collect();
+    // Java String.trim() removes any leading/trailing char <= ' ' (0x20),
+    // which includes the NUL padding bytes appended to layer names.
+    ascii
+        .trim_matches(|c: char| (c as u32) <= 0x20)
+        .to_string()
+}
+
+/// Adobe Photoshop TIFF reader.
+///
+/// Port of `loci.formats.in.PhotoshopTiffReader`. Pixel data and the merged
+/// (series 0) dimensions are served by the inner [`crate::tiff::TiffReader`];
+/// the `IMAGE_SOURCE_DATA` tag (37724) is additionally parsed for per-layer
+/// metadata — layer names recorded as `"Layer name"` global-metadata entries
+/// and the layer count, mirroring the Java reader's `initFile` layer loop.
+pub struct PhotoshopTiffReader {
+    inner: crate::tiff::TiffReader,
+    meta: Option<ImageMetadata>,
+    /// Decoded, ASCII-cleaned layer names (Java `layerNames`, filtered).
+    layer_names: Vec<String>,
+}
+
+impl PhotoshopTiffReader {
+    pub fn new() -> Self {
+        PhotoshopTiffReader {
+            inner: crate::tiff::TiffReader::new(),
+            meta: None,
+            layer_names: Vec::new(),
+        }
+    }
+
+    /// Mirror of Java `openPixelTag()`: fetch the raw `IMAGE_SOURCE_DATA` bytes.
+    ///
+    /// Returns `None` when the tag is absent (a plain TIFF), exactly as the Java
+    /// reader leaves `tag` null.
+    fn open_pixel_tag(&self) -> Option<Vec<u8>> {
+        let ifd = self.inner.ifd(0)?;
+        match ifd.get(PHOTOSHOP_IMAGE_SOURCE_DATA) {
+            Some(crate::tiff::ifd::IfdValue::Undefined(b))
+            | Some(crate::tiff::ifd::IfdValue::Byte(b)) => Some(b.clone()),
+            _ => None,
+        }
+    }
+
+    /// Mirror of Java `initFile()`'s `IMAGE_SOURCE_DATA` layer loop.
+    ///
+    /// Walks the signature/type/length blocks; for the `"ryaL"` (`Layr`
+    /// reversed) block it decodes each layer's bounds, channel table, and name,
+    /// applying Java's name-acceptance filter. Accepted names become `layer_names`
+    /// and `"Layer name"` global-metadata list entries.
+    fn init_file(&mut self, source_data: &[u8]) {
+        let little_endian = self.inner.is_little_endian();
+        let mut tag = PsTag::new(source_data, little_endian);
+
+        // Java: String checkString = tag.readCString();
+        tag.read_cstring();
+
+        // Series 0 ("Merged") is the inner TIFF; further series are layers.
+        let mut series_count: usize = 1;
+
+        while tag.fp() < tag.len().saturating_sub(12) && tag.fp() > 0 {
+            let _signature = tag.read_string(4);
+            let block_type = tag.read_string(4).to_vec();
+            let length = tag.read_int();
+            let mut skip = (length as i64).rem_euclid(4);
+            if skip != 0 {
+                skip = 4 - skip;
+            }
+
+            if block_type == b"ryaL" {
+                let n_layers = (tag.read_short() as i32).unsigned_abs() as usize;
+
+                for layer in 0..n_layers {
+                    let top = tag.read_int();
+                    let left = tag.read_int();
+                    let bottom = tag.read_int();
+                    let right = tag.read_int();
+
+                    let layer_size_x = right.wrapping_sub(left);
+                    let layer_size_y = bottom.wrapping_sub(top);
+                    let layer_size_c = tag.read_short() as i32;
+
+                    // Java: if sizeX==0 || sizeY==0 || (sizeC>1 && !RGB) -> reset
+                    // to a single series and break. The merged image is not RGB
+                    // in this port's metadata, so multi-channel layers abort.
+                    let is_rgb = self.inner.metadata().is_rgb;
+                    if layer_size_x == 0
+                        || layer_size_y == 0
+                        || (layer_size_c > 1 && !is_rgb)
+                    {
+                        series_count = 1;
+                        self.layer_names.clear();
+                        break;
+                    }
+
+                    let channel_count = layer_size_c.max(0) as usize;
+                    for _c in 0..channel_count {
+                        let _channel_id = tag.read_short();
+                        let _data_size = tag.read_int();
+                    }
+
+                    tag.skip_bytes(12);
+
+                    let len = tag.read_int();
+                    let fp = tag.fp();
+
+                    let mask = tag.read_int();
+                    if mask != 0 {
+                        tag.skip_bytes(mask.max(0) as usize);
+                    }
+                    let blending = tag.read_int();
+                    tag.skip_bytes(blending.max(0) as usize);
+
+                    let name_length = tag.read() as usize;
+                    let mut pad = name_length % 4;
+                    if pad != 0 {
+                        pad = 4 - pad;
+                    }
+                    let raw_name = tag.read_string(name_length + pad);
+                    let raw_len = raw_name.len();
+                    let layer_name = photoshop_clean_layer_name(raw_name);
+
+                    // Java: accept the name only when it fully decoded (length
+                    // matches nameLength+pad) and is not the synthetic mask name
+                    // "Layer <n>M".
+                    let synthetic = format!("Layer {layer}M");
+                    if raw_len == name_length + pad
+                        && !layer_name.eq_ignore_ascii_case(&synthetic)
+                    {
+                        self.layer_names.push(layer_name);
+                        series_count += 1;
+                    }
+
+                    // Java: tag.skipBytes(fp + len - tag.getFilePointer());
+                    let target = fp.saturating_add(len.max(0) as usize);
+                    if target > tag.fp() {
+                        tag.skip_bytes(target - tag.fp());
+                    } else {
+                        tag.seek(target);
+                    }
+                }
+            } else {
+                // Java: tag.skipBytes((long) length + skip);
+                let advance = (length.max(0) as usize).saturating_add(skip as usize);
+                tag.skip_bytes(advance);
+            }
+        }
+
+        // Java: store.setImageName("Merged", 0) and per-layer names; expose the
+        // accepted layer names as a "Layer name" global-metadata list.
+        let mut meta = self.inner.metadata().clone();
+        for (i, name) in self.layer_names.iter().enumerate() {
+            meta.series_metadata
+                .insert(format!("Layer name #{}", i + 1), MetadataValue::String(name.clone()));
+        }
+        meta.series_metadata.insert(
+            "Photoshop layer count".to_string(),
+            MetadataValue::Int(self.layer_names.len() as i64),
+        );
+        let _ = series_count;
+        self.meta = Some(meta);
+    }
+}
+
+impl Default for PhotoshopTiffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for PhotoshopTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        matches!(
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("tif") | Some("tiff")
+        )
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // Java isThisType requires the first IFD to contain IMAGE_SOURCE_DATA,
+        // which lives past the header window; detection happens in set_id.
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)?;
+        self.layer_names.clear();
+        // Mirror Java openPixelTag()/initFile(): parse the layer payload when
+        // the IMAGE_SOURCE_DATA tag is present, else fall back to plain TIFF.
+        match self.open_pixel_tag() {
+            Some(source_data) => self.init_file(&source_data),
+            None => self.meta = Some(self.inner.metadata().clone()),
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.layer_names.clear();
+        self.meta = None;
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
 }
 
 #[cfg(test)]
@@ -2171,6 +2513,114 @@ mod tests {
         // horizontal branch: col==0 so only the right neighbour R(0,1)=20 is
         // summed (ncomps==1) -> 20.
         assert_eq!(px(&buf, 0, 0, 0), 20);
+    }
+
+    // -----------------------------------------------------------------------
+    // Photoshop IMAGE_SOURCE_DATA layer-block parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn photoshop_clean_layer_name_strips_non_ascii_and_trims() {
+        // Mirrors Java replaceAll("[^\\p{ASCII}]", "").trim().
+        assert_eq!(photoshop_clean_layer_name(b"  Layer 1  "), "Layer 1");
+        let mixed = [b'A', 0xC3, 0xA9, b'B', b' '];
+        assert_eq!(photoshop_clean_layer_name(&mixed), "AB");
+        assert_eq!(photoshop_clean_layer_name(b""), "");
+    }
+
+    #[test]
+    fn ps_tag_reads_respect_endianness_and_clamp() {
+        let data = [0x01, 0x02, 0x03, 0x04, b'A', b'B'];
+        let mut le = PsTag::new(&data, true);
+        assert_eq!(le.read_int(), 0x04030201);
+        assert_eq!(le.read_string(2), b"AB");
+        // Past the end yields zero / empty, never panics.
+        assert_eq!(le.read_short(), 0);
+        assert_eq!(le.read_string(4), b"");
+
+        let mut be = PsTag::new(&data, false);
+        assert_eq!(be.read_int(), 0x01020304);
+        assert_eq!(be.read(), b'A');
+        be.skip_bytes(100);
+        assert_eq!(be.fp(), be.len());
+    }
+
+    #[test]
+    fn ps_tag_read_cstring_consumes_terminator() {
+        let data = [b'P', b'h', b'o', b't', 0, b'X', b'Y'];
+        let mut tag = PsTag::new(&data, false);
+        tag.read_cstring();
+        // Positioned just past the NUL terminator.
+        assert_eq!(tag.read_string(2), b"XY");
+    }
+
+    #[test]
+    fn photoshop_layer_block_yields_named_layer_metadata() {
+        // Hand-build a little-endian IMAGE_SOURCE_DATA payload (matching an
+        // uninitialised TiffReader's default endianness) with one Layr block
+        // carrying a single-channel layer named "Backgrnd". The name length is
+        // a multiple of 4 (pad == 0) so it survives Java's acceptance check
+        // `cleanedLength == nameLength + pad` (trim removes NUL padding, so a
+        // padded name would fail that length comparison and be skipped).
+        let name = b"Backgrnd";
+        let name_len = name.len(); // 8
+        let pad = (4 - (name_len % 4)) % 4; // 0
+
+        let mut layer = Vec::new();
+        // bounds: top, left, bottom, right -> 4 x 4
+        layer.extend_from_slice(&0i32.to_le_bytes());
+        layer.extend_from_slice(&0i32.to_le_bytes());
+        layer.extend_from_slice(&4i32.to_le_bytes());
+        layer.extend_from_slice(&4i32.to_le_bytes());
+        // sizeC = 1 (single channel passes the !RGB guard)
+        layer.extend_from_slice(&1i16.to_le_bytes());
+        // one channel: channelID + dataSize
+        layer.extend_from_slice(&0i16.to_le_bytes());
+        layer.extend_from_slice(&16i32.to_le_bytes());
+        // skip 12 (blend mode signature + key + opacity/clipping/flags/filler)
+        layer.extend_from_slice(&[0u8; 12]);
+        // extra-data: build the name section first to size `len`.
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0i32.to_le_bytes()); // mask == 0
+        extra.extend_from_slice(&0i32.to_le_bytes()); // blending == 0
+        extra.push(name_len as u8);
+        extra.extend_from_slice(name);
+        extra.extend_from_slice(&vec![0u8; pad]);
+        layer.extend_from_slice(&(extra.len() as i32).to_le_bytes());
+        layer.extend_from_slice(&extra);
+
+        let mut block = Vec::new();
+        block.extend_from_slice(b"8BIM"); // signature
+        block.extend_from_slice(b"ryaL"); // type ("Layr" reversed)
+        let body = {
+            let mut body = Vec::new();
+            body.extend_from_slice(&1i16.to_le_bytes()); // nLayers = 1
+            body.extend_from_slice(&layer);
+            body
+        };
+        block.extend_from_slice(&(body.len() as i32).to_le_bytes());
+        block.extend_from_slice(&body);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"8BPS\0"); // leading C-string
+        payload.extend_from_slice(&block);
+        // trailing slack so the while-loop terminates cleanly past the block.
+        payload.extend_from_slice(&[0u8; 16]);
+
+        let mut reader = PhotoshopTiffReader::new();
+        // Drive init_file directly against the synthetic payload (little-endian).
+        reader.init_file(&payload);
+
+        assert_eq!(reader.layer_names, vec!["Backgrnd".to_string()]);
+        let meta = reader.metadata();
+        match meta.series_metadata.get("Layer name #1") {
+            Some(MetadataValue::String(value)) => assert_eq!(value, "Backgrnd"),
+            other => panic!("unexpected Layer name #1 metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("Photoshop layer count") {
+            Some(MetadataValue::Int(value)) => assert_eq!(*value, 1),
+            other => panic!("unexpected layer-count metadata: {other:?}"),
+        }
     }
 
     #[test]

@@ -574,6 +574,24 @@ impl TiffReader {
                     );
                 }
 
+                // ImageJ-style TIFF comment parsing (Java TiffReader.parseCommentImageJ
+                // + populateMetadataStoreImageJ). Java checks both the first and last
+                // IFD's comment; mirror that here. Strictly metadata-only: this does
+                // not alter dimensions, ordering, or pixel decoding.
+                let comment = info
+                    .image_description
+                    .as_deref()
+                    .filter(|c| check_comment_imagej(c))
+                    .or_else(|| {
+                        group
+                            .last()
+                            .and_then(|(_, last)| last.image_description.as_deref())
+                            .filter(|c| check_comment_imagej(c))
+                    });
+                if let Some(comment) = comment {
+                    parse_comment_imagej(comment, &mut meta.series_metadata);
+                }
+
                 TiffSeries {
                     ifd_indices,
                     plane_ifd_indices: Vec::new(),
@@ -2947,6 +2965,101 @@ fn is_ome_xml_description(xml: &str) -> bool {
         .is_some()
 }
 
+/// Java TiffReader.checkCommentImageJ: an ImageDescription comment is ImageJ-style
+/// if it begins with `ImageJ=`.
+fn check_comment_imagej(comment: &str) -> bool {
+    comment.starts_with("ImageJ=")
+}
+
+/// Mirror of Java TiffReader.parseCommentImageJ + populateMetadataStoreImageJ,
+/// restricted to the *metadata* it produces (no dimension/order changes). Parses
+/// the ImageJ newline-delimited key=value comment and records the standard fields
+/// Java's BaseTiffReader/TiffReader surface:
+///   - `description`        (the comment, newlines joined with "; " as in
+///     initMetadataStore -> setImageDescription)
+///   - `Unit`               (calibrationUnit, from `unit=`)
+///   - `Spacing` / PhysicalSizeZ      (from `spacing=`)
+///   - `Frame Interval` / TimeIncrement (seconds, from `finterval=`)
+///   - `X Origin` / `Y Origin`        (plane stage origin, from `xorigin=`/`yorigin=`)
+///   - `Color mode`         (from `mode=`)
+/// plus any other `key=value` token as an original-metadata entry.
+///
+/// Java keys are preserved verbatim so downstream consumers match the reference.
+/// Dimension sizes (channels/slices/frames/images) are intentionally NOT applied:
+/// this port keeps the existing TIFF dimension/series logic unchanged.
+fn parse_comment_imagej(
+    comment: &str,
+    out: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    use crate::common::metadata::MetadataValue;
+
+    // put("ImageJ", first line after the "ImageJ=" prefix)
+    let after_prefix = &comment[7..];
+    let imagej_value = match after_prefix.find('\n') {
+        Some(nl) => &after_prefix[..nl],
+        None => after_prefix,
+    };
+    out.insert(
+        "ImageJ".into(),
+        MetadataValue::String(imagej_value.to_string()),
+    );
+
+    let mut physical_size_z: Option<f64> = None;
+    let mut time_increment: Option<f64> = None;
+
+    for token in comment.split('\n') {
+        let eq = token.find('=');
+        let value = eq.map(|i| &token[i + 1..]);
+
+        if let Some(value) = token.strip_prefix("mode=") {
+            out.insert("Color mode".into(), MetadataValue::String(value.to_string()));
+        } else if let Some(value) = token.strip_prefix("unit=") {
+            out.insert("Unit".into(), MetadataValue::String(value.to_string()));
+        } else if let Some(value) = token.strip_prefix("finterval=") {
+            if let Ok(v) = value.trim().parse::<f64>() {
+                time_increment = Some(v);
+                // Java stores a Time(seconds) object; surface the numeric value.
+                out.insert("Frame Interval".into(), MetadataValue::Float(v));
+            }
+        } else if let Some(value) = token.strip_prefix("spacing=") {
+            if let Ok(v) = value.trim().parse::<f64>() {
+                physical_size_z = Some(v);
+                out.insert("Spacing".into(), MetadataValue::Float(v));
+            }
+        } else if let Some(value) = token.strip_prefix("xorigin=") {
+            if let Ok(v) = value.trim().parse::<i64>() {
+                out.insert("X Origin".into(), MetadataValue::Int(v));
+            }
+        } else if let Some(value) = token.strip_prefix("yorigin=") {
+            if let Ok(v) = value.trim().parse::<i64>() {
+                out.insert("Y Origin".into(), MetadataValue::Int(v));
+            }
+        } else if let (Some(eq), Some(value)) = (eq, value) {
+            if eq > 0 {
+                let key = token[..eq].trim();
+                if !key.is_empty() {
+                    out.insert(key.to_string(), MetadataValue::String(value.to_string()));
+                }
+            }
+        }
+    }
+
+    // populateMetadataStoreImageJ: PhysicalSizeZ uses the absolute value; Java
+    // stores it on Pixels. We surface it under the OME-style key as well so it is
+    // discoverable alongside the original "Spacing" entry.
+    if let Some(z) = physical_size_z {
+        let z = z.abs();
+        out.insert("PhysicalSizeZ".into(), MetadataValue::Float(z));
+    }
+    if let Some(t) = time_increment {
+        out.insert("TimeIncrement".into(), MetadataValue::Float(t));
+    }
+
+    // initMetadataStore: description = comment with newlines replaced by "; ".
+    let description = comment.replace('\n', "; ");
+    out.insert("description".into(), MetadataValue::String(description));
+}
+
 /// True if `path` ends with the OME companion-metadata suffix `companion.ome`
 /// (Java OMETiffReader.checkSuffix). Case-insensitive.
 fn has_companion_ome_suffix(path: &Path) -> bool {
@@ -4283,5 +4396,53 @@ mod tests {
         let wb = reader.dng_white_balance();
         let _ = fs::remove_file(&path);
         assert!(wb.is_none());
+    }
+
+    #[test]
+    fn imagej_comment_populates_standard_metadata() {
+        use crate::common::metadata::MetadataValue;
+
+        let comment = "ImageJ=1.53c\nimages=10\nslices=5\nframes=2\nunit=micron\n\
+                       spacing=-0.5\nfinterval=1.25\nxorigin=12\nyorigin=34\nmode=color";
+        let mut out: HashMap<String, MetadataValue> = HashMap::new();
+
+        assert!(check_comment_imagej(comment));
+        parse_comment_imagej(comment, &mut out);
+
+        let str_val = |out: &HashMap<String, MetadataValue>, k: &str| match out.get(k) {
+            Some(MetadataValue::String(s)) => s.clone(),
+            other => panic!("expected String for {k}, got {other:?}"),
+        };
+        let float_val = |out: &HashMap<String, MetadataValue>, k: &str| match out.get(k) {
+            Some(MetadataValue::Float(v)) => *v,
+            other => panic!("expected Float for {k}, got {other:?}"),
+        };
+        let int_val = |out: &HashMap<String, MetadataValue>, k: &str| match out.get(k) {
+            Some(MetadataValue::Int(v)) => *v,
+            other => panic!("expected Int for {k}, got {other:?}"),
+        };
+
+        assert_eq!(str_val(&out, "ImageJ"), "1.53c");
+        assert_eq!(str_val(&out, "Unit"), "micron");
+        assert_eq!(float_val(&out, "Spacing"), -0.5);
+        // PhysicalSizeZ uses the absolute value (Java populateMetadataStoreImageJ).
+        assert_eq!(float_val(&out, "PhysicalSizeZ"), 0.5);
+        assert_eq!(float_val(&out, "Frame Interval"), 1.25);
+        assert_eq!(float_val(&out, "TimeIncrement"), 1.25);
+        assert_eq!(int_val(&out, "X Origin"), 12);
+        assert_eq!(int_val(&out, "Y Origin"), 34);
+        assert_eq!(str_val(&out, "Color mode"), "color");
+        // Generic key=value tokens are preserved as original metadata.
+        assert_eq!(str_val(&out, "images"), "10");
+        // description joins the comment lines with "; " (Java initMetadataStore).
+        let desc = str_val(&out, "description");
+        assert!(desc.starts_with("ImageJ=1.53c; "));
+        assert!(!desc.contains('\n'));
+    }
+
+    #[test]
+    fn non_imagej_comment_is_not_treated_as_imagej() {
+        assert!(!check_comment_imagej("MetaMorph foo"));
+        assert!(!check_comment_imagej("<OME ...>"));
     }
 }

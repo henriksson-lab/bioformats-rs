@@ -78,6 +78,11 @@ pub struct CellWorxReader {
     n_timepoints: u32,
     z_steps: u32,
     do_channels: bool,
+    /// Microscope serial number parsed from the `Scanner SN` line of the plate
+    /// `scan.log` file, if present.
+    serial_number: Option<String>,
+    /// Resolved `Z Map File` path parsed from the plate `scan.log`, if present.
+    z_map_file: Option<PathBuf>,
     tiff_reader: crate::tiff::TiffReader,
     tiff_loaded: bool,
 }
@@ -95,9 +100,24 @@ impl CellWorxReader {
             n_timepoints: 1,
             z_steps: 1,
             do_channels: false,
+            serial_number: None,
+            z_map_file: None,
             tiff_reader: crate::tiff::TiffReader::new(),
             tiff_loaded: false,
         }
+    }
+
+    /// Microscope serial number parsed from the plate `scan.log` (`Scanner SN`),
+    /// or `None` if the log was absent or did not contain the key. Mirrors the
+    /// value Java stores via `setMicroscopeSerialNumber`.
+    pub fn serial_number(&self) -> Option<&str> {
+        self.serial_number.as_deref()
+    }
+
+    /// Resolved `Z Map File` companion path parsed from the plate `scan.log`, or
+    /// `None`. Java appends this to `getSeriesUsedFiles`.
+    pub fn z_map_file(&self) -> Option<&Path> {
+        self.z_map_file.as_deref()
     }
 
     /// Resolve the .pnl/.tif file backing the given series + plane index,
@@ -362,6 +382,77 @@ fn build_well_files(
     files
 }
 
+/// Scalars parsed from the plate-level `<plate>_scan.log` file, following the
+/// instrument-metadata branch of Java `CellWorxReader.populateMetadata`.
+struct PlateLogInfo {
+    /// `Scanner SN` value (becomes the microscope serial number).
+    serial_number: Option<String>,
+    /// Resolved `Z Map File` path (relative segment resolved against the HTD's
+    /// parent directory, matching the Java logic).
+    z_map_file: Option<PathBuf>,
+}
+
+/// Parse the plate-level `scan.log` file for the `Scanner SN` and `Z Map File`
+/// instrument scalars. Faithful port of the loop at the top of Java
+/// `CellWorxReader.populateMetadata`. `htd` is the dataset id used to resolve a
+/// relative `Z Map File` path against its parent directory.
+fn parse_plate_log(plate_log: &Path, htd: &Path) -> PlateLogInfo {
+    let mut serial_number = None;
+    let mut z_map_file = None;
+
+    if let Ok(content) = std::fs::read_to_string(plate_log) {
+        for line in content.split('\n') {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Z Map File") {
+                // Java: substring after ':', then last path segment after '/'.
+                if let Some(colon) = line.find(':') {
+                    let after = &line[colon + 1..];
+                    let segment = after.rsplit('/').next().unwrap_or(after).trim();
+                    if !segment.is_empty() {
+                        let parent = htd.parent().unwrap_or_else(|| Path::new(""));
+                        z_map_file = Some(parent.join(segment));
+                    }
+                }
+            } else if trimmed.starts_with("Scanner SN") {
+                if let Some(colon) = line.find(':') {
+                    let value = line[colon + 1..].trim();
+                    if !value.is_empty() {
+                        serial_number = Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    PlateLogInfo {
+        serial_number,
+        z_map_file,
+    }
+}
+
+/// Parse a per-well `<well>_scan.log` file, capturing every `key: value` line as
+/// series metadata. Faithful to the `addSeriesMeta(key, value)` call applied to
+/// each colon-delimited line in Java `CellWorxReader.parseWellLogFile`.
+fn parse_well_log(log_file: &Path, md: &mut HashMap<String, MetadataValue>) {
+    let content = match std::fs::read_to_string(log_file) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for line in content.split('\n') {
+        let line = line.trim();
+        let separator = match line.find(':') {
+            Some(s) => s,
+            None => continue,
+        };
+        let key = line[..separator].trim();
+        let value = line[separator + 1..].trim();
+        if key.is_empty() {
+            continue;
+        }
+        md.insert(key.to_string(), MetadataValue::String(value.to_string()));
+    }
+}
+
 /// Z coordinate of a plane index under an `XYCZT` dimension order.
 fn z_coord(meta: &ImageMetadata, no: u32) -> u32 {
     let sc = meta.size_c.max(1);
@@ -476,6 +567,15 @@ impl FormatReader for CellWorxReader {
         let interleaved = tm.is_interleaved;
         let _ = self.tiff_reader.close();
 
+        // Parse the plate-level scan.log for instrument scalars (Scanner SN,
+        // Z Map File), following the head of Java populateMetadata. The plate
+        // log is "<plate>scan.log" (plate_base already ends with '_').
+        let plate_log = PathBuf::from(format!("{}scan.log", plate));
+        let htd_path = self.htd_path.clone().unwrap_or_else(|| PathBuf::from(&plate));
+        let plate_info = parse_plate_log(&plate_log, &htd_path);
+        self.serial_number = plate_info.serial_number.clone();
+        self.z_map_file = plate_info.z_map_file.clone();
+
         let image_count = info.z_steps * channels as u32 * info.n_timepoints;
         let mut series = Vec::with_capacity(series_count);
         for s in 0..series_count {
@@ -494,6 +594,25 @@ impl FormatReader for CellWorxReader {
                     );
                 }
             }
+            // Plate-wide instrument scalars (Java sets MicroscopeSerialNumber on
+            // the single instrument; we surface it on each series' metadata).
+            if let Some(sn) = &plate_info.serial_number {
+                md.insert(
+                    "Microscope Serial Number".into(),
+                    MetadataValue::String(sn.clone()),
+                );
+            }
+            if let Some(zmap) = &plate_info.z_map_file {
+                md.insert(
+                    "Z Map File".into(),
+                    MetadataValue::String(zmap.to_string_lossy().into_owned()),
+                );
+            }
+            // Per-well scan.log: capture every "key: value" line as series
+            // metadata (Java parseWellLogFile -> addSeriesMeta). The log file is
+            // "<plate><well>_scan.log".
+            let well_log = PathBuf::from(format!("{}{}_scan.log", plate, well_name(row, col)));
+            parse_well_log(&well_log, &mut md);
             series.push(ImageMetadata {
                 size_x,
                 size_y,
@@ -534,6 +653,8 @@ impl FormatReader for CellWorxReader {
         self.n_timepoints = 1;
         self.z_steps = 1;
         self.do_channels = false;
+        self.serial_number = None;
+        self.z_map_file = None;
         if self.tiff_loaded {
             let _ = self.tiff_reader.close();
             self.tiff_loaded = false;
@@ -1854,5 +1975,89 @@ impl FormatReader for MiasReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod cellworx_log_tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "bf_cellworx_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn plate_log_scanner_sn_and_z_map_file() {
+        let dir = tmp_dir("plate");
+        let htd = dir.join("Plate1.HTD");
+        let log = dir.join("Plate1_scan.log");
+        std::fs::write(
+            &log,
+            "Some Header\n\
+             Scanner SN : ABC-12345\n\
+             Z Map File: C:/data/maps/zmap_001.zmp\n\
+             Other: ignored\n",
+        )
+        .unwrap();
+
+        let info = parse_plate_log(&log, &htd);
+        assert_eq!(info.serial_number.as_deref(), Some("ABC-12345"));
+        let zmap = info.z_map_file.expect("Z Map File parsed");
+        // Last path segment resolved against the HTD's parent directory.
+        assert_eq!(zmap, dir.join("zmap_001.zmp"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plate_log_missing_keys_yield_none() {
+        let dir = tmp_dir("plate_empty");
+        let htd = dir.join("Plate2.HTD");
+        let log = dir.join("Plate2_scan.log");
+        std::fs::write(&log, "Header only\nNothing: here\n").unwrap();
+
+        let info = parse_plate_log(&log, &htd);
+        assert!(info.serial_number.is_none());
+        assert!(info.z_map_file.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn well_log_captures_key_value_scalars() {
+        let dir = tmp_dir("well");
+        let log = dir.join("Plate1_A01_scan.log");
+        std::fs::write(
+            &log,
+            "Date: Mon Jan 02 13:45:30 2017\n\
+             Scan Area: 10.5 x 8.0 mm\n\
+             Channel 1: gain 1.5, EX 488/EM 525\n\
+             NoColonLineSkipped\n",
+        )
+        .unwrap();
+
+        let mut md = HashMap::new();
+        parse_well_log(&log, &mut md);
+
+        assert_eq!(
+            md.get("Date").map(|v| v.to_string()).as_deref(),
+            Some("Mon Jan 02 13:45:30 2017")
+        );
+        assert!(md.contains_key("Scan Area"));
+        assert!(md.contains_key("Channel 1"));
+        assert!(!md.contains_key("NoColonLineSkipped"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

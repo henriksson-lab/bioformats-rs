@@ -154,6 +154,35 @@ struct DmReader<R: Read + Seek> {
     // GatanReader.parseTags. Used to derive OME PhysicalSize{X,Y,Z}.
     pixel_sizes: Vec<f64>,
     units: Vec<String>,
+    // Scalar data fields captured from named leaf tags, mirroring the
+    // `addGlobalMeta`/special-case dispatch in GatanReader.parseTags. Each
+    // corresponds to a Java member variable; populated where Java populates it.
+    /// `signed` — derived from the "LowLimit" tag (`LowLimit < 0`).
+    signed: bool,
+    /// `gamma` — "Gamma" tag.
+    gamma: Option<f64>,
+    /// `mag` — "Indicated Magnification" tag (objective nominal magnification).
+    mag: Option<f64>,
+    /// `voltage` — "Voltage" tag (detector settings voltage, volts).
+    voltage: Option<f64>,
+    /// `info` — "Microscope Info" tag (used to derive acquisition mode).
+    info: Option<String>,
+    /// `posX`/`posY`/`posZ` — "xPos*"/"yPos*"/"Specimen position*" tags
+    /// (plane stage positions, reference-frame units).
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    pos_z: Option<f64>,
+    /// `sampleTime` — "Sample Time" tag (plane exposure time, seconds).
+    sample_time: Option<f64>,
+    /// `timestamp` — "Acquisition Start Time (epoch)" tag.
+    timestamp: Option<i64>,
+    /// `foundMontage` — set when a "Montage" group is encountered.
+    found_montage: bool,
+    /// `stageX`/`stageY`/`stageZ` — per-tile "Stage X/Y/Z" leaves collected
+    /// under a "Stage Position" group while inside a montage.
+    stage_x: Vec<f64>,
+    stage_y: Vec<f64>,
+    stage_z: Vec<f64>,
 }
 
 impl<R: Read + Seek> DmReader<R> {
@@ -526,6 +555,11 @@ impl<R: Read + Seek> DmReader<R> {
         if depth > 20 {
             return Ok(DmValue::Group(vec![]));
         }
+        // Java GatanReader.parseTags: a group whose parent is "Montage" marks the
+        // file as a montage (foundMontage = true).
+        if parent == "Montage" {
+            self.found_montage = true;
+        }
         let _is_sorted = self.read_u8()?;
         let _is_open = self.read_u8()?;
         self.skip_dm4_padding()?;
@@ -585,6 +619,12 @@ impl<R: Read + Seek> DmReader<R> {
                 _ => DmValue::Int(0),
             };
 
+            // Capture named scalar/string leaf data fields, mirroring the
+            // special-case label dispatch in GatanReader.parseTags
+            // (GatanReader.java:719-749, 689-704). Java keys off the leaf's
+            // stringified `value`; we read the typed DmValue directly.
+            self.capture_named_field(parent, &name, &val);
+
             // Physical pixel sizes: GatanReader collects "Scale" leaves whose
             // parent group is "Dimension" (validPhysicalSize), then "Units"
             // leaves, keeping units no longer than the size list. The OME value
@@ -609,6 +649,91 @@ impl<R: Read + Seek> DmReader<R> {
             i += 1;
         }
         Ok(DmValue::Group(entries))
+    }
+
+    /// Stringify a leaf value the way GatanReader does before `addGlobalMeta`
+    /// (NUL characters stripped). Used for the string-valued tags ("Microscope
+    /// Info") and as a uniform source for numeric parsing.
+    fn leaf_string(val: &DmValue) -> Option<String> {
+        match val {
+            DmValue::Str(s) => Some(s.replace('\0', "")),
+            DmValue::Int(v) => Some(v.to_string()),
+            DmValue::Uint(v) => Some(v.to_string()),
+            DmValue::Float(v) => Some(v.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Mirror of the named-label dispatch in GatanReader.parseTags
+    /// (GatanReader.java:719-749 and the montage Stage Position block at
+    /// 689-704). One Rust branch per Java `else if` branch; field names match
+    /// the Java member variables.
+    fn capture_named_field(&mut self, parent: &str, label: &str, val: &DmValue) {
+        // Montage stage positions: "Stage X/Y/Z" leaves under a "Stage Position"
+        // group, only while a montage has been detected.
+        if self.found_montage && parent == "Stage Position" {
+            if let Some(v) = val.as_f64() {
+                match label {
+                    "Stage X" => self.stage_x.push(v),
+                    "Stage Y" => self.stage_y.push(v),
+                    "Stage Z" => self.stage_z.push(v),
+                    _ => {}
+                }
+            }
+            return;
+        }
+
+        match label {
+            "LowLimit" => {
+                if let Some(v) = val.as_f64() {
+                    self.signed = v < 0.0;
+                }
+            }
+            "Acquisition Start Time (epoch)" => {
+                if let Some(v) = val.as_f64() {
+                    self.timestamp = Some(v as i64);
+                }
+            }
+            "Voltage" => {
+                if let Some(v) = val.as_f64() {
+                    self.voltage = Some(v);
+                }
+            }
+            "Microscope Info" => {
+                self.info = Self::leaf_string(val);
+            }
+            "Indicated Magnification" => {
+                if let Some(v) = val.as_f64() {
+                    self.mag = Some(v);
+                }
+            }
+            "Gamma" => {
+                if let Some(v) = val.as_f64() {
+                    self.gamma = Some(v);
+                }
+            }
+            "Sample Time" => {
+                if let Some(v) = val.as_f64() {
+                    self.sample_time = Some(v);
+                }
+            }
+            _ => {
+                // Java uses startsWith for the position tags.
+                if label.starts_with("xPos") {
+                    if let Some(v) = val.as_f64() {
+                        self.pos_x = Some(v);
+                    }
+                } else if label.starts_with("yPos") {
+                    if let Some(v) = val.as_f64() {
+                        self.pos_y = Some(v);
+                    }
+                } else if label.starts_with("Specimen position") {
+                    if let Some(v) = val.as_f64() {
+                        self.pos_z = Some(v);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -769,6 +894,32 @@ fn select_physical_sizes(
     (psx, psy, psz)
 }
 
+/// Derive the channel acquisition mode from the "Microscope Info" string,
+/// porting GatanReader.initFile (GatanReader.java:344-361). The info string is
+/// split on '(' and the token starting with "Mode" yields the mode word; "TEM"
+/// is remapped to "Other". Returns `None` when no Mode token is present.
+fn acquisition_mode_from_info(info: Option<&str>) -> Option<String> {
+    let info = info.unwrap_or("");
+    for token in info.split('(') {
+        let token = token.trim();
+        if token.starts_with("Mode") {
+            // strip leading "Mode" word
+            let mut mode = match token.find(' ') {
+                Some(sp) => token[sp..].trim().to_string(),
+                None => token.to_string(),
+            };
+            if let Some(sp) = mode.find(' ') {
+                mode = mode[..sp].trim().to_string();
+            }
+            if mode == "TEM" {
+                mode = "Other".to_string();
+            }
+            return Some(mode);
+        }
+    }
+    None
+}
+
 // ── Reader ────────────────────────────────────────────────────────────────────
 
 pub struct GatanReader {
@@ -781,6 +932,33 @@ pub struct GatanReader {
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
     physical_size_z: Option<f64>,
+    // ── Data fields mirroring GatanReader's Java member variables ──
+    /// DM file `version` (3 or 4), from the header.
+    version: i32,
+    /// `mag` — objective nominal magnification ("Indicated Magnification").
+    mag: Option<f64>,
+    /// `voltage` — detector settings voltage in volts ("Voltage").
+    voltage: Option<f64>,
+    /// `gamma` — display gamma ("Gamma").
+    gamma: Option<f64>,
+    /// `timestamp` — acquisition start time, epoch seconds.
+    timestamp: Option<i64>,
+    /// `signed` — whether pixels are signed (from "LowLimit").
+    signed: bool,
+    /// `sampleTime` — plane exposure time in seconds ("Sample Time").
+    sample_time: Option<f64>,
+    /// `posX`/`posY`/`posZ` — single-image plane stage positions.
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    pos_z: Option<f64>,
+    /// `foundMontage` — whether a "Montage" group was present.
+    found_montage: bool,
+    /// `stageX`/`stageY`/`stageZ` — per-tile montage stage positions.
+    stage_x: Vec<f64>,
+    stage_y: Vec<f64>,
+    stage_z: Vec<f64>,
+    /// Acquisition mode derived from `info` ("Microscope Info"), per Java.
+    acquisition_mode: Option<String>,
 }
 
 impl GatanReader {
@@ -794,7 +972,69 @@ impl GatanReader {
             physical_size_x: None,
             physical_size_y: None,
             physical_size_z: None,
+            version: 0,
+            mag: None,
+            voltage: None,
+            gamma: None,
+            timestamp: None,
+            signed: false,
+            sample_time: None,
+            pos_x: None,
+            pos_y: None,
+            pos_z: None,
+            found_montage: false,
+            stage_x: Vec::new(),
+            stage_y: Vec::new(),
+            stage_z: Vec::new(),
+            acquisition_mode: None,
         }
+    }
+}
+
+impl GatanReader {
+    /// DM file format version (3 or 4), from the header.
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+    /// Objective nominal magnification ("Indicated Magnification" tag).
+    pub fn magnification(&self) -> Option<f64> {
+        self.mag
+    }
+    /// Detector voltage in volts ("Voltage" tag).
+    pub fn voltage(&self) -> Option<f64> {
+        self.voltage
+    }
+    /// Display gamma ("Gamma" tag).
+    pub fn gamma(&self) -> Option<f64> {
+        self.gamma
+    }
+    /// Acquisition start time, epoch seconds ("Acquisition Start Time (epoch)").
+    pub fn timestamp(&self) -> Option<i64> {
+        self.timestamp
+    }
+    /// Whether the pixel data is signed (from the "LowLimit" tag).
+    pub fn is_signed(&self) -> bool {
+        self.signed
+    }
+    /// Plane exposure / sample time in seconds ("Sample Time" tag).
+    pub fn sample_time(&self) -> Option<f64> {
+        self.sample_time
+    }
+    /// Single-image stage position (reference-frame units).
+    pub fn position(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
+        (self.pos_x, self.pos_y, self.pos_z)
+    }
+    /// Whether a "Montage" tag group was present.
+    pub fn found_montage(&self) -> bool {
+        self.found_montage
+    }
+    /// Per-tile montage stage positions (X, Y, Z lists).
+    pub fn stage_positions(&self) -> (&[f64], &[f64], &[f64]) {
+        (&self.stage_x, &self.stage_y, &self.stage_z)
+    }
+    /// Channel acquisition mode derived from "Microscope Info".
+    pub fn acquisition_mode(&self) -> Option<&str> {
+        self.acquisition_mode.as_deref()
     }
 }
 
@@ -870,6 +1110,20 @@ impl FormatReader for GatanReader {
             adjust_endianness: true,
             pixel_sizes: Vec::new(),
             units: Vec::new(),
+            signed: false,
+            gamma: None,
+            mag: None,
+            voltage: None,
+            info: None,
+            pos_x: None,
+            pos_y: None,
+            pos_z: None,
+            sample_time: None,
+            timestamp: None,
+            found_montage: false,
+            stage_x: Vec::new(),
+            stage_y: Vec::new(),
+            stage_z: Vec::new(),
         };
 
         // Seek past the file header to the root tag group
@@ -884,6 +1138,21 @@ impl FormatReader for GatanReader {
         let root = dm.parse_tag_group(0, "").map_err(BioFormatsError::Io)?;
         let pixel_sizes = std::mem::take(&mut dm.pixel_sizes);
         let units = std::mem::take(&mut dm.units);
+        // Captured data fields (mirroring GatanReader member variables).
+        let captured_signed = dm.signed;
+        let gamma = dm.gamma;
+        let mag = dm.mag;
+        let voltage = dm.voltage;
+        let info = dm.info.take();
+        let pos_x = dm.pos_x;
+        let pos_y = dm.pos_y;
+        let pos_z = dm.pos_z;
+        let sample_time = dm.sample_time;
+        let timestamp = dm.timestamp;
+        let found_montage = dm.found_montage;
+        let stage_x = std::mem::take(&mut dm.stage_x);
+        let stage_y = std::mem::take(&mut dm.stage_y);
+        let stage_z = std::mem::take(&mut dm.stage_z);
 
         let img = find_image_data(&root)?;
 
@@ -908,9 +1177,10 @@ impl FormatReader for GatanReader {
         }
         let derived_bytes = img.pixel_data_len as usize / pixel_count;
         if derived_bytes != bytes_per_pixel {
-            // Java sources `signed` from the LowLimit tag; gatan.rs does not
-            // capture it, so fall back to the DataType's own signedness.
-            let signed = dm_data_type_is_signed(img.dm_data_type);
+            // Java sources `signed` from the LowLimit tag (GatanReader.java:258).
+            // We now capture that tag; fall back to the DataType's own
+            // signedness when LowLimit was absent (e.g. RGB DataType 23).
+            let signed = captured_signed || dm_data_type_is_signed(img.dm_data_type);
             pixel_type = dm_pixel_type_from_bytes(derived_bytes, signed)?;
             bytes_per_pixel = derived_bytes;
         }
@@ -935,6 +1205,39 @@ impl FormatReader for GatanReader {
             "dm_data_type".into(),
             MetadataValue::Int(img.dm_data_type as i64),
         );
+        // Surface the captured scalar data fields into series metadata, mirroring
+        // GatanReader's addGlobalMeta of these named tags. Keys use the Java tag
+        // label so downstream consumers see the same names.
+        if let Some(v) = gamma {
+            meta_map.insert("Gamma".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = mag {
+            meta_map.insert("Indicated Magnification".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = voltage {
+            meta_map.insert("Voltage".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = sample_time {
+            meta_map.insert("Sample Time".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = timestamp {
+            meta_map.insert(
+                "Acquisition Start Time (epoch)".into(),
+                MetadataValue::Int(v),
+            );
+        }
+        if let Some(s) = &info {
+            meta_map.insert("Microscope Info".into(), MetadataValue::String(s.clone()));
+        }
+        if let Some(v) = pos_x {
+            meta_map.insert("xPos".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = pos_y {
+            meta_map.insert("yPos".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = pos_z {
+            meta_map.insert("Specimen position".into(), MetadataValue::Float(v));
+        }
 
         let meta = ImageMetadata {
             size_x: img.width,
@@ -972,6 +1275,21 @@ impl FormatReader for GatanReader {
         self.physical_size_x = psx;
         self.physical_size_y = psy;
         self.physical_size_z = psz;
+        self.version = version as i32;
+        self.mag = mag;
+        self.voltage = voltage;
+        self.gamma = gamma;
+        self.timestamp = timestamp;
+        self.signed = captured_signed;
+        self.sample_time = sample_time;
+        self.pos_x = pos_x;
+        self.pos_y = pos_y;
+        self.pos_z = pos_z;
+        self.found_montage = found_montage;
+        self.stage_x = stage_x;
+        self.stage_y = stage_y;
+        self.stage_z = stage_z;
+        self.acquisition_mode = acquisition_mode_from_info(info.as_deref());
         Ok(())
     }
 
@@ -983,6 +1301,21 @@ impl FormatReader for GatanReader {
         self.physical_size_x = None;
         self.physical_size_y = None;
         self.physical_size_z = None;
+        self.version = 0;
+        self.mag = None;
+        self.voltage = None;
+        self.gamma = None;
+        self.timestamp = None;
+        self.signed = false;
+        self.sample_time = None;
+        self.pos_x = None;
+        self.pos_y = None;
+        self.pos_z = None;
+        self.found_montage = false;
+        self.stage_x.clear();
+        self.stage_y.clear();
+        self.stage_z.clear();
+        self.acquisition_mode = None;
         Ok(())
     }
 
@@ -1100,9 +1433,32 @@ impl FormatReader for GatanReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{
+            create_lsid, OmeChannel, OmeDetector, OmeInstrument, OmeObjective, OmePlane,
+        };
         use crate::common::ome_metadata::OmeMetadata;
         let meta = self.meta.as_ref()?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
+
+        // Instrument with one objective (nominal magnification = `mag`) and one
+        // detector, mirroring GatanReader.initFile (GatanReader.java:332-343).
+        let instrument = OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            objectives: vec![OmeObjective {
+                id: Some(create_lsid("Objective", &[0, 0])),
+                correction: Some("Unknown".to_string()),
+                immersion: Some("Unknown".to_string()),
+                nominal_magnification: self.mag,
+                ..Default::default()
+            }],
+            detectors: vec![OmeDetector {
+                id: Some(create_lsid("Detector", &[0, 0])),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ome.instruments = vec![instrument];
+
         let img = ome.images.get_mut(0)?;
 
         // Image name: GatanReader only sets an explicit name ("Tile #N") for
@@ -1118,6 +1474,60 @@ impl FormatReader for GatanReader {
         img.physical_size_x = self.physical_size_x;
         img.physical_size_y = self.physical_size_y;
         img.physical_size_z = self.physical_size_z;
+
+        // Link instrument + objective, and attach detector settings voltage and
+        // the derived acquisition mode to the single channel (Java sets these per
+        // series; we have one series, GatanReader.java:369-378).
+        img.instrument_ref = Some(0);
+        img.objective_ref = Some(0);
+        if img.channels.is_empty() {
+            img.channels.push(OmeChannel {
+                samples_per_pixel: 1,
+                ..Default::default()
+            });
+        }
+        if let Some(ch) = img.channels.get_mut(0) {
+            ch.detector_ref = Some(create_lsid("Detector", &[0, 0]));
+            ch.detector_settings_voltage = self.voltage;
+            if let Some(mode) = &self.acquisition_mode {
+                ch.acquisition_mode = Some(mode.clone());
+            }
+        }
+
+        // Plane positions and exposure time. Java sets montage stage positions
+        // per series when found (GatanReader.java:380-389); with one series we
+        // use the first montage tile if present, else the single posX/Y/Z. Every
+        // plane gets the "Sample Time" exposure (GatanReader.java:391-393).
+        let (px, py, pz) = if self.found_montage && !self.stage_x.is_empty() {
+            (
+                self.stage_x.first().copied(),
+                self.stage_y.first().copied(),
+                self.stage_z.first().copied(),
+            )
+        } else {
+            (self.pos_x, self.pos_y, self.pos_z)
+        };
+        if px.is_some()
+            || py.is_some()
+            || pz.is_some()
+            || self.sample_time.is_some()
+        {
+            let c_size = meta.size_c.max(1);
+            let z_size = meta.size_z.max(1);
+            img.planes = (0..meta.image_count)
+                .map(|p| OmePlane {
+                    the_z: (p / c_size) % z_size,
+                    the_c: p % c_size,
+                    the_t: p / (c_size * z_size),
+                    delta_t: None,
+                    exposure_time: self.sample_time,
+                    position_x: px,
+                    position_y: py,
+                    position_z: pz,
+                })
+                .collect();
+        }
+
         Some(ome)
     }
 }
@@ -1638,5 +2048,115 @@ impl FormatReader for Dm2Reader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::reader::FormatReader;
+    use std::path::PathBuf;
+
+    fn testdata(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(rel)
+    }
+
+    // Pure-logic port of GatanReader's "Microscope Info" → acquisition mode
+    // derivation (GatanReader.java:344-361).
+    #[test]
+    fn acquisition_mode_parsing() {
+        assert_eq!(acquisition_mode_from_info(None), None);
+        assert_eq!(acquisition_mode_from_info(Some("")), None);
+        // "(Mode <value> ...)" → first word after "Mode" (info is split on '(',
+        // matching Java info.split("\\("), so the '(' is consumed).
+        assert_eq!(
+            acquisition_mode_from_info(Some("Microscope (Mode STEM stuff")).as_deref(),
+            Some("STEM")
+        );
+        // A "Mode TEM <more>" token reduces to exactly "TEM", which Java remaps
+        // to "Other" (GatanReader.java:359).
+        assert_eq!(
+            acquisition_mode_from_info(Some("(Mode TEM more")).as_deref(),
+            Some("Other")
+        );
+    }
+
+    // Real DM3 file: confirms the newly-captured scalar data fields (version,
+    // mag, voltage, gamma, signed) are parsed, and that mag/voltage are surfaced
+    // into OME (objective magnification, detector settings voltage).
+    #[test]
+    fn real_dm3_captured_fields() {
+        let path = testdata("dm3/clem_fig3b.dm3");
+        if !path.exists() {
+            eprintln!("SKIP real_dm3_captured_fields: {} absent", path.display());
+            return;
+        }
+        let mut r = GatanReader::new();
+        r.set_id(&path).expect("set_id dm3");
+
+        assert_eq!(r.version(), 3);
+        assert_eq!(r.magnification(), Some(3000.0));
+        assert_eq!(r.voltage(), Some(100000.0));
+        assert_eq!(r.gamma(), Some(0.5));
+        assert!(!r.is_signed());
+        assert!(!r.found_montage());
+
+        // Series metadata surfaces the captured tags under their Java labels.
+        let meta = r.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("Indicated Magnification"),
+            Some(MetadataValue::Float(v)) if (*v - 3000.0).abs() < 1e-9
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("Voltage"),
+            Some(MetadataValue::Float(v)) if (*v - 100000.0).abs() < 1e-9
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("Gamma"),
+            Some(MetadataValue::Float(v)) if (*v - 0.5).abs() < 1e-9
+        ));
+
+        // OME: objective nominal magnification = mag; detector voltage = voltage.
+        let ome = r.ome_metadata().expect("ome");
+        let obj = &ome.instruments[0].objectives[0];
+        assert_eq!(obj.nominal_magnification, Some(3000.0));
+        let ch = &ome.images[0].channels[0];
+        assert_eq!(ch.detector_settings_voltage, Some(100000.0));
+    }
+
+    // Real DM4 montage file: confirms montage detection, per-tile stage
+    // positions, signedness from LowLimit, and OME plane positions.
+    #[test]
+    fn real_dm4_montage_fields() {
+        let path = testdata("gatan/SmallMontage0000.dm4");
+        if !path.exists() {
+            eprintln!("SKIP real_dm4_montage_fields: {} absent", path.display());
+            return;
+        }
+        let mut r = GatanReader::new();
+        r.set_id(&path).expect("set_id dm4");
+
+        assert_eq!(r.version(), 4);
+        assert_eq!(r.magnification(), Some(1900.0));
+        assert_eq!(r.voltage(), Some(120000.0));
+        assert!(r.is_signed(), "DM4 file has negative LowLimit → signed");
+        assert!(r.found_montage());
+
+        let (sx, sy, sz) = r.stage_positions();
+        assert_eq!(sx.len(), 1);
+        assert_eq!(sy.len(), 1);
+        assert_eq!(sz.len(), 1);
+
+        // OME: the montage tile's stage position is used as the plane position.
+        let ome = r.ome_metadata().expect("ome");
+        let plane = ome.images[0]
+            .planes
+            .first()
+            .expect("at least one plane with positions");
+        assert_eq!(plane.position_x, Some(sx[0]));
+        assert_eq!(plane.position_y, Some(sy[0]));
+        assert_eq!(plane.position_z, Some(sz[0]));
     }
 }

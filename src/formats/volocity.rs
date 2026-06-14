@@ -21,6 +21,11 @@ const VOLOCITY_SUFFIXES: &[&str] = &["mvd2", "aisf", "aiix", "dat", "atsf"];
 const VOLOCITY_BLIND_MAGIC: &[u8; 16] = b"BFVOLOCITYMVD2\0\0";
 const VOLOCITY_BLIND_HEADER_LEN: usize = 48;
 const VOLOCITY_METAKIT_MAX_STRUCTURE: usize = 64 * 1024;
+const VOLOCITY_METAKIT_MAX_PREVIEW_BYTES: usize = 96;
+const VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS: usize = 512;
+const VOLOCITY_METAKIT_MAX_DIAGNOSTIC_VALUE_BYTES: usize = 4096;
+const VOLOCITY_MAX_COMPANION_SCAN_ENTRIES: usize = 4096;
+const VOLOCITY_MAX_COMPANION_SCAN_DEPTH: usize = 6;
 
 #[derive(Debug, Clone, Copy)]
 struct VolocityBlindLayout {
@@ -29,18 +34,119 @@ struct VolocityBlindLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct VolocityMetakitTable {
+struct VolocityMetakitColumn {
     name: String,
-    row_count: Option<usize>,
+    type_string: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct VolocityMetakitTable {
+    name: String,
+    row_count: Option<usize>,
+    columns: Vec<VolocityMetakitColumn>,
+    scalar_values: Vec<(String, String)>,
+    first_row_values: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct VolocityMetakitProbe {
     little_endian: bool,
     footer_offset: usize,
     toc_offset: usize,
     structure_len: usize,
     tables: Vec<VolocityMetakitTable>,
+    stack_candidates: Vec<VolocityStackCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VolocityStackCandidate {
+    sample_id: i32,
+    stack_name: String,
+    parent_id: i32,
+    name_link: Option<i32>,
+    file_link: Option<i32>,
+    resolved_file: Option<VolocityFileLink>,
+    pixels_dat: Option<String>,
+    channel_child_sample_id: Option<i32>,
+    channel_count: Option<usize>,
+    channel_links: Vec<VolocityChannelLink>,
+    inline_data_len: usize,
+    native_stream_clue: Option<VolocityNativeStreamClue>,
+    external_data: Option<i32>,
+    metadata: VolocityStackMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct VolocityStackMetadata {
+    timestamp_atsf_id: Option<i32>,
+    physical_x: Option<f64>,
+    physical_y: Option<f64>,
+    physical_z: Option<f64>,
+    magnification: Option<f64>,
+    detector: Option<String>,
+    description: Option<String>,
+    x_location: Option<f64>,
+    y_location: Option<f64>,
+    z_location: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VolocityChannelLink {
+    sample_id: i32,
+    name: String,
+    aisf_id: Option<i32>,
+    pixels_dat: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VolocityFileLink {
+    file_id: i32,
+    name: Option<String>,
+    spec_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VolocityNativeStreamClue {
+    little_endian: bool,
+    size_x: i32,
+    size_y: i32,
+    size_z: i32,
+    stream_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum VolocityMetakitValue {
+    String(String),
+    Integer(i32),
+    Float(f32),
+    Double(f64),
+    Bytes(Vec<u8>),
+    Long(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VolocitySampleRow {
+    id: i32,
+    parent: i32,
+    child_type: i32,
+    file_link: Option<i32>,
+    name_link: Option<i32>,
+    inline_data_len: usize,
+    inline_data: Option<Vec<u8>>,
+    external_data: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VolocityStringRow {
+    id: i32,
+    value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VolocityFileRow {
+    id: i32,
+    name: Option<String>,
+    spec: Option<Vec<u8>>,
 }
 
 fn ext_lower(path: &Path) -> Option<String> {
@@ -82,21 +188,487 @@ fn volocity_native_error(path: &Path, probe: &VolocityMetakitProbe) -> BioFormat
         probe
             .tables
             .iter()
-            .map(|table| match table.row_count {
-                Some(rows) => format!("{}({rows})", table.name),
-                None => format!("{}(?)", table.name),
+            .map(|table| {
+                let columns = if table.columns.is_empty() {
+                    "no columns".to_string()
+                } else {
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| format!("{}:{}", column.name, column.type_string))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                };
+                match table.row_count {
+                    Some(rows) => format!("{}({rows})[{columns}]", table.name),
+                    None => format!("{}(?)[{columns}]", table.name),
+                }
             })
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let scalars = probe
+        .tables
+        .iter()
+        .flat_map(|table| {
+            table
+                .scalar_values
+                .iter()
+                .map(move |(column, value)| format!("{}.{}={value}", table.name, column))
+        })
+        .collect::<Vec<_>>();
+    let scalar_summary = if scalars.is_empty() {
+        " no single-row scalar values decoded".to_string()
+    } else {
+        format!(" single-row scalars: {}", scalars.join(", "))
+    };
+    let semantic_summary = volocity_native_semantic_summary(probe)
+        .map(|summary| format!(" Java metadata roles: {summary}"))
+        .unwrap_or_default();
+    let companion_summary = volocity_companion_provenance_summary(path, probe)
+        .map(|summary| format!(" companion provenance: {summary};"))
+        .unwrap_or_default();
     BioFormatsError::UnsupportedFormat(format!(
-        "{VOLOCITY_UNSUPPORTED}; detected native Metakit {endian} footer={} toc={} structure={}B table_count={} tables: {tables}: {}",
+        "{VOLOCITY_UNSUPPORTED}; detected native Metakit {endian} footer={} toc={} structure={}B table_count={} tables: {tables};{scalar_summary};{semantic_summary};{companion_summary}: {}",
         probe.footer_offset,
         probe.toc_offset,
         probe.structure_len,
         probe.tables.len(),
         path.display()
     ))
+}
+
+fn volocity_native_semantic_summary(probe: &VolocityMetakitProbe) -> Option<String> {
+    const ROLE_TABLES: &[(&str, &str)] = &[
+        ("variables", "variablesView"),
+        ("samples", "samplesViewR"),
+        ("strings", "stringsViewR"),
+        ("files", "filesViewR"),
+    ];
+    const VARIABLE_ALIASES: &[(&str, &str)] = &[
+        ("varVersion", "version"),
+        ("varNextSampleID", "next_sample_id"),
+        ("varNextStringID", "next_string_id"),
+        ("varNextFileID", "next_file_id"),
+        ("varDemoKey", "demo_key"),
+    ];
+
+    let mut parts = Vec::new();
+    let mut roles = Vec::new();
+    for (role, table_name) in ROLE_TABLES {
+        if let Some(table) = probe.tables.iter().find(|table| table.name == *table_name) {
+            let rows = table
+                .row_count
+                .map(|rows| rows.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            roles.push(format!("{role}={table_name}({rows})"));
+        }
+    }
+    if !roles.is_empty() {
+        parts.push(roles.join(", "));
+    }
+
+    if let Some(variables) = probe
+        .tables
+        .iter()
+        .find(|table| table.name == "variablesView")
+    {
+        let mut aliases = Vec::new();
+        for (source, alias) in VARIABLE_ALIASES {
+            if let Some((_, value)) = variables
+                .scalar_values
+                .iter()
+                .find(|(column, _)| column == source)
+            {
+                aliases.push(format!("{alias}={value}"));
+            }
+        }
+        if !aliases.is_empty() {
+            parts.push(format!("variables {}", aliases.join(", ")));
+        }
+    }
+
+    if let Some(samples) = probe
+        .tables
+        .iter()
+        .find(|table| table.name == "samplesViewR")
+    {
+        let hierarchy_columns = [
+            ("sampleID", "id"),
+            ("sampleParent", "parent"),
+            ("sampleChildType", "child_type"),
+            ("sampleChildPos", "child_pos"),
+            ("sampleOrigChildPos", "original_child_pos"),
+            ("sampleFileLink", "file_link"),
+            ("sampleNameLink", "name_link"),
+            ("sampleData", "inline_data"),
+            ("sampleExternalData", "external_data"),
+        ];
+        let roles = hierarchy_columns
+            .iter()
+            .filter_map(|(column_name, role)| {
+                samples
+                    .columns
+                    .iter()
+                    .any(|column| column.name == *column_name)
+                    .then(|| format!("{role}={column_name}"))
+            })
+            .collect::<Vec<_>>();
+        if !roles.is_empty() {
+            parts.push(format!("sample hierarchy {}", roles.join(", ")));
+        }
+        if !samples.first_row_values.is_empty() {
+            parts.push(format!(
+                "first sample row {}",
+                volocity_sample_row_summary(&samples.first_row_values)
+            ));
+        }
+    }
+
+    for (table_name, label, expected_columns) in [
+        (
+            "stringsViewR",
+            "string links",
+            &["stringID", "stringString", "stringRefCount"][..],
+        ),
+        (
+            "filesViewR",
+            "file links",
+            &["fileID", "fileName", "fileSpec", "fileRefCount"][..],
+        ),
+    ] {
+        if let Some(table) = probe.tables.iter().find(|table| table.name == table_name) {
+            let columns = expected_columns
+                .iter()
+                .filter(|column_name| {
+                    table
+                        .columns
+                        .iter()
+                        .any(|column| column.name == **column_name)
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if !columns.is_empty() {
+                parts.push(format!("{label} {table_name}[{}]", columns.join(", ")));
+            }
+            if !table.first_row_values.is_empty() {
+                parts.push(format!(
+                    "first {label} row {}",
+                    volocity_metakit_row_summary(&table.first_row_values)
+                ));
+            }
+        }
+    }
+
+    if !probe.stack_candidates.is_empty() {
+        let candidates = probe
+            .stack_candidates
+            .iter()
+            .take(8)
+            .map(|candidate| {
+                let mut details = vec![
+                    format!("sampleID={}", candidate.sample_id),
+                    format!("name=\"{}\"", candidate.stack_name.escape_debug()),
+                    format!("parent={}", candidate.parent_id),
+                    format!("inline_data={}B", candidate.inline_data_len),
+                ];
+                if let Some(name_link) = candidate.name_link {
+                    details.push(format!("name_link={name_link}"));
+                }
+                if let Some(file_link) = candidate.file_link {
+                    details.push(format!("file_link={file_link}"));
+                }
+                if let Some(file) = &candidate.resolved_file {
+                    let mut file_details = vec![format!("fileID={}", file.file_id)];
+                    if let Some(name) = &file.name {
+                        file_details.push(format!("name=\"{}\"", name.escape_debug()));
+                    }
+                    if let Some(spec_preview) = &file.spec_preview {
+                        file_details.push(format!("spec={spec_preview}"));
+                    }
+                    details.push(format!("file=[{}]", file_details.join(" ")));
+                }
+                if let Some(pixels_dat) = &candidate.pixels_dat {
+                    details.push(format!("pixels_dat={pixels_dat}"));
+                }
+                if let Some(channel_child) = candidate.channel_child_sample_id {
+                    details.push(format!("channels_child={channel_child}"));
+                }
+                if let Some(channel_count) = candidate.channel_count {
+                    details.push(format!("channels={channel_count}"));
+                }
+                if !candidate.channel_links.is_empty() {
+                    let channel_links = candidate
+                        .channel_links
+                        .iter()
+                        .take(8)
+                        .map(|channel| {
+                            let mut channel_details = vec![
+                                format!("sampleID={}", channel.sample_id),
+                                format!("name=\"{}\"", channel.name.escape_debug()),
+                            ];
+                            if let Some(aisf_id) = channel.aisf_id {
+                                channel_details.push(format!("aisf_id={aisf_id}"));
+                            }
+                            if let Some(pixels_dat) = &channel.pixels_dat {
+                                channel_details.push(format!("pixels_dat={pixels_dat}"));
+                            }
+                            channel_details.join(" ")
+                        })
+                        .collect::<Vec<_>>();
+                    let suffix = if candidate.channel_links.len() > channel_links.len() {
+                        format!(
+                            ", ... {} more",
+                            candidate.channel_links.len() - channel_links.len()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    details.push(format!(
+                        "channel_links=[{}{}]",
+                        channel_links.join(", "),
+                        suffix
+                    ));
+                }
+                if let Some(clue) = &candidate.native_stream_clue {
+                    let endian = if clue.little_endian { "LE" } else { "BE" };
+                    details.push(format!(
+                        "native_stream={}x{}x{} {endian} len={}B",
+                        clue.size_x, clue.size_y, clue.size_z, clue.stream_len
+                    ));
+                }
+                if let Some(external_data) = candidate.external_data {
+                    details.push(format!("external_data={external_data}"));
+                }
+                let metadata = &candidate.metadata;
+                if let Some(timestamp_atsf_id) = metadata.timestamp_atsf_id {
+                    details.push(format!("timestamp_atsf={timestamp_atsf_id}.atsf"));
+                }
+                if let Some(physical_x) = metadata.physical_x {
+                    details.push(format!("physicalX={physical_x}"));
+                }
+                if let Some(physical_y) = metadata.physical_y {
+                    details.push(format!("physicalY={physical_y}"));
+                }
+                if let Some(physical_z) = metadata.physical_z {
+                    details.push(format!("physicalZ={physical_z}"));
+                }
+                if let Some(magnification) = metadata.magnification {
+                    details.push(format!("magnification={magnification}"));
+                }
+                if let Some(detector) = &metadata.detector {
+                    details.push(format!("detector=\"{}\"", detector.escape_debug()));
+                }
+                if let Some(description) = &metadata.description {
+                    details.push(format!("description=\"{}\"", description.escape_debug()));
+                }
+                if let Some(x_location) = metadata.x_location {
+                    details.push(format!("xLocation={x_location}"));
+                }
+                if let Some(y_location) = metadata.y_location {
+                    details.push(format!("yLocation={y_location}"));
+                }
+                if let Some(z_location) = metadata.z_location {
+                    details.push(format!("zLocation={z_location}"));
+                }
+                details.join(", ")
+            })
+            .collect::<Vec<_>>();
+        let suffix = if probe.stack_candidates.len() > candidates.len() {
+            format!(
+                ", ... {} more",
+                probe.stack_candidates.len() - candidates.len()
+            )
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "Java stack candidates {}: {}{}",
+            probe.stack_candidates.len(),
+            candidates.join("; "),
+            suffix
+        ));
+    }
+
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+fn volocity_companion_provenance_summary(
+    library_root: &Path,
+    probe: &VolocityMetakitProbe,
+) -> Option<String> {
+    let data_dir = library_root.parent()?.join("Data");
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "Data directory {}",
+        if data_dir.is_dir() {
+            "present"
+        } else {
+            "missing"
+        }
+    ));
+
+    let mut requests = Vec::new();
+    for candidate in &probe.stack_candidates {
+        if let Some(external_data) = candidate.external_data {
+            requests.push((
+                format!(
+                    "stack sampleID={} external_data={external_data}",
+                    candidate.sample_id
+                ),
+                format!("{external_data}.aisf"),
+            ));
+            requests.push((
+                format!(
+                    "stack sampleID={} external_data={external_data}",
+                    candidate.sample_id
+                ),
+                format!("{external_data}.aiix"),
+            ));
+            requests.push((
+                format!(
+                    "stack sampleID={} external_data={external_data}",
+                    candidate.sample_id
+                ),
+                format!("{external_data}.dat"),
+            ));
+            requests.push((
+                format!(
+                    "stack sampleID={} external_data={external_data}",
+                    candidate.sample_id
+                ),
+                format!("{external_data}.atsf"),
+            ));
+        }
+        if let Some(timestamp_atsf_id) = candidate.metadata.timestamp_atsf_id {
+            requests.push((
+                format!(
+                    "stack sampleID={} timestamp_atsf={timestamp_atsf_id}",
+                    candidate.sample_id
+                ),
+                format!("{timestamp_atsf_id}.atsf"),
+            ));
+        }
+        if let Some(pixels_dat) = &candidate.pixels_dat {
+            requests.push((
+                format!("stack sampleID={} pixels_dat", candidate.sample_id),
+                pixels_dat.clone(),
+            ));
+        }
+        for channel in &candidate.channel_links {
+            if let Some(aisf_id) = channel.aisf_id {
+                requests.push((
+                    format!("channel sampleID={} aisf_id={aisf_id}", channel.sample_id),
+                    format!("{aisf_id}.aisf"),
+                ));
+            }
+            if let Some(pixels_dat) = &channel.pixels_dat {
+                requests.push((
+                    format!("channel sampleID={} pixels_dat", channel.sample_id),
+                    pixels_dat.clone(),
+                ));
+            }
+        }
+    }
+
+    if requests.is_empty() {
+        return None;
+    }
+
+    let mut scan_budget = VOLOCITY_MAX_COMPANION_SCAN_ENTRIES;
+    for (label, filename) in requests.into_iter().take(16) {
+        let found = if data_dir.is_dir() {
+            volocity_find_companion_file(
+                &data_dir,
+                &filename,
+                VOLOCITY_MAX_COMPANION_SCAN_DEPTH,
+                &mut scan_budget,
+            )
+        } else {
+            None
+        };
+        let status = found
+            .as_ref()
+            .map(|path| volocity_relative_display(library_root, path))
+            .unwrap_or_else(|| "missing".to_string());
+        parts.push(format!("{label} {filename}={status}"));
+    }
+
+    Some(parts.join(", "))
+}
+
+fn volocity_relative_display(library_root: &Path, path: &Path) -> String {
+    let base = library_root.parent().unwrap_or_else(|| Path::new(""));
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn volocity_find_companion_file(
+    dir: &Path,
+    filename: &str,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<PathBuf> {
+    if depth == 0 || *budget == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut paths = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    for path in &paths {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        if path.file_name().and_then(|name| name.to_str()) == Some(filename) {
+            return Some(path.clone());
+        }
+    }
+    for path in paths {
+        if path.is_dir() {
+            if let Some(found) = volocity_find_companion_file(&path, filename, depth - 1, budget) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn volocity_sample_row_summary(values: &[(String, String)]) -> String {
+    volocity_metakit_row_summary_with_child_type(values, true)
+}
+
+fn volocity_metakit_row_summary(values: &[(String, String)]) -> String {
+    volocity_metakit_row_summary_with_child_type(values, false)
+}
+
+fn volocity_metakit_row_summary_with_child_type(
+    values: &[(String, String)],
+    annotate_child_type: bool,
+) -> String {
+    values
+        .iter()
+        .map(|(column, value)| {
+            if annotate_child_type && column == "sampleChildType" {
+                format!("{column}={value} ({})", volocity_sample_child_type(value))
+            } else {
+                format!("{column}={value}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn volocity_sample_child_type(value: &str) -> &'static str {
+    match value.parse::<i32>().ok() {
+        Some(1) => "Java stack-candidate branch",
+        _ => "unknown Java sample child type",
+    }
 }
 
 fn volocity_metakit_probe_error(path: &Path, reason: &str) -> BioFormatsError {
@@ -197,7 +769,82 @@ fn metakit_row_count_at(bytes: &[u8], pointer: i32) -> Option<usize> {
     usize::try_from(metakit_read_bp_int(bytes, &mut offset).ok()?).ok()
 }
 
-fn parse_metakit_table_defs(structure: &str) -> std::result::Result<Vec<(String, bool)>, String> {
+fn metakit_checked_offset(pointer: i32, add: i32) -> std::result::Result<usize, String> {
+    let offset = pointer
+        .checked_add(add)
+        .ok_or_else(|| "Metakit pointer offset overflows".to_string())?;
+    usize::try_from(offset).map_err(|_| format!("negative Metakit pointer: {offset}"))
+}
+
+fn metakit_bytes_at<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    len: usize,
+) -> std::result::Result<&'a [u8], String> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| "Metakit vector read overflows".to_string())?;
+    bytes
+        .get(offset..end)
+        .ok_or_else(|| format!("truncated Metakit vector at offset {offset}"))
+}
+
+fn metakit_read_i16_at(
+    bytes: &[u8],
+    offset: usize,
+    little_endian: bool,
+) -> std::result::Result<i16, String> {
+    let data = metakit_bytes_at(bytes, offset, 2)?;
+    Ok(if little_endian {
+        i16::from_le_bytes([data[0], data[1]])
+    } else {
+        i16::from_be_bytes([data[0], data[1]])
+    })
+}
+
+fn metakit_read_i32_at(
+    bytes: &[u8],
+    offset: usize,
+    little_endian: bool,
+) -> std::result::Result<i32, String> {
+    let data = metakit_bytes_at(bytes, offset, 4)?;
+    Ok(if little_endian {
+        i32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    } else {
+        i32::from_be_bytes([data[0], data[1], data[2], data[3]])
+    })
+}
+
+fn metakit_read_i64_at(
+    bytes: &[u8],
+    offset: usize,
+    little_endian: bool,
+) -> std::result::Result<i64, String> {
+    let data = metakit_bytes_at(bytes, offset, 8)?;
+    Ok(if little_endian {
+        i64::from_le_bytes([
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+        ])
+    } else {
+        i64::from_be_bytes([
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+        ])
+    })
+}
+
+fn parse_metakit_column_def(column: &str) -> std::result::Result<VolocityMetakitColumn, String> {
+    let separator = column
+        .find(':')
+        .ok_or_else(|| format!("invalid column definition: {column}"))?;
+    Ok(VolocityMetakitColumn {
+        name: column[..separator].to_string(),
+        type_string: column[separator + 1..].trim_end_matches(']').to_string(),
+    })
+}
+
+fn parse_metakit_table_defs(
+    structure: &str,
+) -> std::result::Result<Vec<(String, Vec<VolocityMetakitColumn>, bool)>, String> {
     structure
         .split("],")
         .map(|table_def| {
@@ -209,7 +856,1048 @@ fn parse_metakit_table_defs(structure: &str) -> std::result::Result<Vec<(String,
                 return Err("empty table name in structure definition".to_string());
             }
             let column_list = &table_def[open + 1..];
-            Ok((name.to_string(), column_list.contains('[')))
+            let has_subviews = column_list.contains('[');
+            let column_start = column_list.find('[').map_or(0, |index| index + 1);
+            let columns = column_list[column_start..]
+                .split(',')
+                .filter(|column| !column.is_empty())
+                .map(parse_metakit_column_def)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok((name.to_string(), columns, has_subviews))
+        })
+        .collect()
+}
+
+fn metakit_skip_column_map(
+    bytes: &[u8],
+    offset: &mut usize,
+    column: &VolocityMetakitColumn,
+) -> std::result::Result<(), String> {
+    let fixed_map = !matches!(column.type_string.as_bytes().first(), Some(b'S' | b'B'));
+    let ivec_size = metakit_read_bp_int(bytes, offset)?;
+    if fixed_map {
+        if ivec_size > 0 {
+            let _ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+        }
+    } else {
+        let _ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+        let _map_ivec_size = metakit_read_bp_int(bytes, offset)?;
+        let _map_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+        let catalog_ivec_size = metakit_read_bp_int(bytes, offset)?;
+        if catalog_ivec_size > 0 {
+            let _catalog_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+        }
+    }
+    Ok(())
+}
+
+fn metakit_read_first_packed_int(
+    bytes: &[u8],
+    vector_pointer: i32,
+    vector_size: i32,
+    row_count: usize,
+    little_endian: bool,
+) -> std::result::Result<i32, String> {
+    if vector_size <= 0 || row_count == 0 {
+        return Err("empty Metakit integer vector".to_string());
+    }
+    let vector_size =
+        usize::try_from(vector_size).map_err(|_| "negative integer vector size".to_string())?;
+    let bits = vector_size
+        .checked_mul(8)
+        .ok_or_else(|| "integer vector bit width overflows".to_string())?
+        / row_count;
+    let offset = metakit_checked_offset(vector_pointer, 0)?;
+
+    match bits {
+        1 | 2 | 4 => {
+            let byte = i32::from(*metakit_bytes_at(bytes, offset, 1)?.first().unwrap());
+            Ok(byte & ((1i32 << bits) - 1))
+        }
+        8 => Ok(i32::from(
+            *metakit_bytes_at(bytes, offset, 1)?.first().unwrap(),
+        )),
+        16 => Ok(i32::from(metakit_read_i16_at(
+            bytes,
+            offset,
+            little_endian,
+        )?)),
+        32 => metakit_read_i32_at(bytes, offset, little_endian),
+        _ => metakit_read_i32_at(bytes, offset, little_endian),
+    }
+}
+
+fn metakit_read_packed_int_at(
+    bytes: &[u8],
+    vector_pointer: i32,
+    vector_size: usize,
+    row_count: usize,
+    index: usize,
+    little_endian: bool,
+) -> std::result::Result<i32, String> {
+    if row_count == 0 || index >= row_count {
+        return Err("Metakit packed integer index is out of range".to_string());
+    }
+    let bits = vector_size
+        .checked_mul(8)
+        .ok_or_else(|| "integer vector bit width overflows".to_string())?
+        / row_count;
+    let vector_offset = metakit_checked_offset(vector_pointer, 0)?;
+
+    match bits {
+        1 | 2 | 4 => {
+            let byte_offset = vector_offset
+                .checked_add(index * bits / 8)
+                .ok_or_else(|| "packed integer byte offset overflows".to_string())?;
+            let byte = i32::from(*metakit_bytes_at(bytes, byte_offset, 1)?.first().unwrap());
+            let mask = (1i32 << bits) - 1;
+            let bit_index = index % (8 / bits);
+            Ok((byte & (mask << (bit_index * bits))) >> ((8 - (bit_index * bits)) % 8))
+        }
+        8 => {
+            let offset = vector_offset
+                .checked_add(index)
+                .ok_or_else(|| "8-bit integer offset overflows".to_string())?;
+            Ok(i32::from(
+                *metakit_bytes_at(bytes, offset, 1)?.first().unwrap(),
+            ))
+        }
+        16 => {
+            let offset = vector_offset
+                .checked_add(index * 2)
+                .ok_or_else(|| "16-bit integer offset overflows".to_string())?;
+            Ok(i32::from(metakit_read_i16_at(
+                bytes,
+                offset,
+                little_endian,
+            )?))
+        }
+        _ => {
+            let offset = vector_offset
+                .checked_add(index * 4)
+                .ok_or_else(|| "32-bit integer offset overflows".to_string())?;
+            metakit_read_i32_at(bytes, offset, little_endian)
+        }
+    }
+}
+
+fn metakit_read_first_fixed_scalar(
+    bytes: &[u8],
+    offset: &mut usize,
+    column: &VolocityMetakitColumn,
+    row_count: usize,
+    little_endian: bool,
+) -> std::result::Result<Option<String>, String> {
+    let fixed_map = !matches!(column.type_string.as_bytes().first(), Some(b'S' | b'B'));
+    let ivec_size = metakit_read_bp_int(bytes, offset)?;
+    if !fixed_map {
+        let _ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+        let _map_ivec_size = metakit_read_bp_int(bytes, offset)?;
+        let _map_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+        let catalog_ivec_size = metakit_read_bp_int(bytes, offset)?;
+        if catalog_ivec_size > 0 {
+            let _catalog_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+        }
+        return Ok(None);
+    }
+    if ivec_size <= 0 {
+        return Ok(None);
+    }
+    let ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+    let value_offset = metakit_checked_offset(ivec_pointer, 0)?;
+
+    match column.type_string.as_bytes().first().copied() {
+        Some(b'I') => Ok(Some(
+            metakit_read_first_packed_int(
+                bytes,
+                ivec_pointer,
+                ivec_size,
+                row_count,
+                little_endian,
+            )?
+            .to_string(),
+        )),
+        Some(b'L') => Ok(Some(
+            metakit_read_i64_at(bytes, value_offset, little_endian)?.to_string(),
+        )),
+        Some(b'F') => Ok(Some(
+            f32::from_bits(metakit_read_i32_at(bytes, value_offset, little_endian)? as u32)
+                .to_string(),
+        )),
+        Some(b'D') => Ok(Some(
+            f64::from_bits(metakit_read_i64_at(bytes, value_offset, little_endian)? as u64)
+                .to_string(),
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn metakit_read_fixed_value_at(
+    bytes: &[u8],
+    column: &VolocityMetakitColumn,
+    vector_pointer: i32,
+    vector_size: usize,
+    row_count: usize,
+    index: usize,
+    little_endian: bool,
+) -> std::result::Result<Option<VolocityMetakitValue>, String> {
+    let value_offset = metakit_checked_offset(vector_pointer, 0)?;
+    match column.type_string.as_bytes().first().copied() {
+        Some(b'I') => Ok(Some(VolocityMetakitValue::Integer(
+            metakit_read_packed_int_at(
+                bytes,
+                vector_pointer,
+                vector_size,
+                row_count,
+                index,
+                little_endian,
+            )?,
+        ))),
+        Some(b'L') => {
+            let offset = value_offset
+                .checked_add(index * 8)
+                .ok_or_else(|| "64-bit integer offset overflows".to_string())?;
+            Ok(Some(VolocityMetakitValue::Long(metakit_read_i64_at(
+                bytes,
+                offset,
+                little_endian,
+            )?)))
+        }
+        Some(b'F') => {
+            let offset = value_offset
+                .checked_add(index * 4)
+                .ok_or_else(|| "float offset overflows".to_string())?;
+            Ok(Some(VolocityMetakitValue::Float(f32::from_bits(
+                metakit_read_i32_at(bytes, offset, little_endian)? as u32,
+            ))))
+        }
+        Some(b'D') => {
+            let offset = value_offset
+                .checked_add(index * 8)
+                .ok_or_else(|| "double offset overflows".to_string())?;
+            Ok(Some(VolocityMetakitValue::Double(f64::from_bits(
+                metakit_read_i64_at(bytes, offset, little_endian)? as u64,
+            ))))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn metakit_read_column_values(
+    bytes: &[u8],
+    offset: &mut usize,
+    column: &VolocityMetakitColumn,
+    row_count: usize,
+    little_endian: bool,
+) -> std::result::Result<Vec<Option<VolocityMetakitValue>>, String> {
+    if row_count > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS {
+        return Err(format!(
+            "Metakit diagnostic row count {row_count} exceeds safety limit"
+        ));
+    }
+
+    let fixed_map = !matches!(column.type_string.as_bytes().first(), Some(b'S' | b'B'));
+    let ivec_size = metakit_read_bp_int(bytes, offset)?;
+    if fixed_map {
+        if ivec_size <= 0 {
+            return Ok(vec![None; row_count]);
+        }
+        let ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+        let vector_size =
+            usize::try_from(ivec_size).map_err(|_| "negative vector size".to_string())?;
+        return (0..row_count)
+            .map(|index| {
+                metakit_read_fixed_value_at(
+                    bytes,
+                    column,
+                    ivec_pointer,
+                    vector_size,
+                    row_count,
+                    index,
+                    little_endian,
+                )
+            })
+            .collect();
+    }
+
+    let _ivec_size = ivec_size;
+    let ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+    let map_ivec_size = metakit_read_bp_int(bytes, offset)?;
+    let map_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+    let catalog_ivec_size = metakit_read_bp_int(bytes, offset)?;
+    if catalog_ivec_size > 0 {
+        let _catalog_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+    }
+    if row_count == 0 || map_ivec_size <= 0 {
+        return Ok(vec![None; row_count]);
+    }
+    let map_ivec_size =
+        usize::try_from(map_ivec_size).map_err(|_| "negative map vector size".to_string())?;
+    let mut byte_counts = Vec::with_capacity(row_count);
+    for index in 0..row_count {
+        let count = metakit_read_packed_int_at(
+            bytes,
+            map_ivec_pointer,
+            map_ivec_size,
+            row_count,
+            index,
+            little_endian,
+        )?;
+        byte_counts.push(usize::try_from(count).map_err(|_| {
+            format!(
+                "negative variable-length byte count in column {}",
+                column.name
+            )
+        })?);
+    }
+
+    let mut value_offset = metakit_checked_offset(ivec_pointer, 0)?;
+    let mut values = Vec::with_capacity(row_count);
+    for byte_count in byte_counts {
+        let value_end = value_offset
+            .checked_add(byte_count)
+            .ok_or_else(|| "variable-length value offset overflows".to_string())?;
+        if byte_count > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_VALUE_BYTES {
+            let _ = metakit_bytes_at(bytes, value_offset, byte_count)?;
+            values.push(None);
+            value_offset = value_end;
+            continue;
+        }
+        let value_bytes = metakit_bytes_at(bytes, value_offset, byte_count)?;
+        value_offset = value_end;
+        match column.type_string.as_bytes().first().copied() {
+            Some(b'S') => values.push(Some(VolocityMetakitValue::String(
+                std::str::from_utf8(value_bytes)
+                    .map_err(|err| format!("Metakit string value is not UTF-8: {err}"))?
+                    .to_string(),
+            ))),
+            Some(b'B') => values.push(Some(VolocityMetakitValue::Bytes(value_bytes.to_vec()))),
+            _ => values.push(None),
+        }
+    }
+
+    Ok(values)
+}
+
+fn metakit_rows_from_columns(
+    columns: Vec<Vec<Option<VolocityMetakitValue>>>,
+    row_count: usize,
+) -> Vec<Vec<Option<VolocityMetakitValue>>> {
+    (0..row_count)
+        .map(|row| {
+            columns
+                .iter()
+                .map(|column| column.get(row).cloned().flatten())
+                .collect()
+        })
+        .collect()
+}
+
+fn metakit_rows_at(
+    bytes: &[u8],
+    pointer: i32,
+    row_count: Option<usize>,
+    columns: &[VolocityMetakitColumn],
+    little_endian: bool,
+) -> std::result::Result<Vec<Vec<Option<VolocityMetakitValue>>>, String> {
+    let Some(row_count) = row_count else {
+        return Ok(Vec::new());
+    };
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+    if row_count > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS {
+        return Err(format!(
+            "Metakit diagnostic row count {row_count} exceeds safety limit"
+        ));
+    }
+
+    let mut offset = metakit_checked_offset(pointer, 1)?;
+    let declared_count = usize::try_from(metakit_read_bp_int(bytes, &mut offset)?)
+        .map_err(|_| "negative Metakit row count".to_string())?;
+    if declared_count != row_count {
+        return Err(format!(
+            "Metakit row count changed from {row_count} to {declared_count}"
+        ));
+    }
+
+    let mut column_values = Vec::with_capacity(columns.len());
+    for column in columns {
+        column_values.push(metakit_read_column_values(
+            bytes,
+            &mut offset,
+            column,
+            row_count,
+            little_endian,
+        )?);
+    }
+    Ok(metakit_rows_from_columns(column_values, row_count))
+}
+
+fn metakit_subview_rows_at(
+    bytes: &[u8],
+    pointer: i32,
+    columns: &[VolocityMetakitColumn],
+    little_endian: bool,
+) -> std::result::Result<Vec<Vec<Option<VolocityMetakitValue>>>, String> {
+    let mut offset = metakit_checked_offset(pointer, 1)?;
+    let subview_count = usize::try_from(metakit_read_bp_int(bytes, &mut offset)?)
+        .map_err(|_| "negative Metakit subview count".to_string())?;
+    if subview_count > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS {
+        return Err(format!(
+            "Metakit diagnostic subview count {subview_count} exceeds safety limit"
+        ));
+    }
+
+    let mut rows = Vec::new();
+    for subview in 0..subview_count {
+        if subview == 0 {
+            let _size = metakit_read_bp_int(bytes, &mut offset)?;
+            let subview_pointer = metakit_read_bp_int(bytes, &mut offset)?;
+            offset = metakit_checked_offset(subview_pointer, 0)?;
+        }
+
+        let _marker = metakit_read_bp_int(bytes, &mut offset)?;
+        let count = usize::try_from(metakit_read_bp_int(bytes, &mut offset)?)
+            .map_err(|_| "negative Metakit subview row count".to_string())?;
+        if count > 1 {
+            if rows.len().saturating_add(count) > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS {
+                return Err("Metakit diagnostic flattened row count exceeds safety limit".into());
+            }
+            let mut column_values = Vec::with_capacity(columns.len());
+            for column in columns {
+                column_values.push(metakit_read_column_values(
+                    bytes,
+                    &mut offset,
+                    column,
+                    count,
+                    little_endian,
+                )?);
+            }
+            rows.extend(metakit_rows_from_columns(column_values, count));
+        }
+    }
+
+    Ok(rows)
+}
+
+fn metakit_format_string_preview(bytes: &[u8]) -> std::result::Result<String, String> {
+    let mut value = std::str::from_utf8(bytes)
+        .map_err(|err| format!("Metakit string value is not UTF-8: {err}"))?
+        .escape_debug()
+        .to_string();
+    if bytes.len() > VOLOCITY_METAKIT_MAX_PREVIEW_BYTES {
+        value.push_str("...");
+    }
+    Ok(format!("\"{value}\""))
+}
+
+fn metakit_format_bytes_preview(bytes: &[u8], total_len: usize) -> String {
+    let preview = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("");
+    if total_len > bytes.len() {
+        format!("{total_len} bytes hex={preview}...")
+    } else {
+        format!("{total_len} bytes hex={preview}")
+    }
+}
+
+fn metakit_read_first_scalar_preview(
+    bytes: &[u8],
+    offset: &mut usize,
+    column: &VolocityMetakitColumn,
+    row_count: usize,
+    little_endian: bool,
+) -> std::result::Result<Option<String>, String> {
+    let fixed_map = !matches!(column.type_string.as_bytes().first(), Some(b'S' | b'B'));
+    if fixed_map {
+        return metakit_read_first_fixed_scalar(bytes, offset, column, row_count, little_endian);
+    }
+
+    let _ivec_size = metakit_read_bp_int(bytes, offset)?;
+    let ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+    let map_ivec_size = metakit_read_bp_int(bytes, offset)?;
+    let map_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+    let catalog_ivec_size = metakit_read_bp_int(bytes, offset)?;
+    if catalog_ivec_size > 0 {
+        let _catalog_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
+    }
+    if row_count == 0 || map_ivec_size <= 0 {
+        return Ok(None);
+    }
+
+    let first_len = metakit_read_first_packed_int(
+        bytes,
+        map_ivec_pointer,
+        map_ivec_size,
+        row_count,
+        little_endian,
+    )?;
+    if first_len <= 0 {
+        return Ok(None);
+    }
+    let first_len =
+        usize::try_from(first_len).map_err(|_| "negative Metakit value length".to_string())?;
+    let preview_len = first_len.min(VOLOCITY_METAKIT_MAX_PREVIEW_BYTES);
+    let value_offset = metakit_checked_offset(ivec_pointer, 0)?;
+    let value_bytes = metakit_bytes_at(bytes, value_offset, preview_len)?;
+
+    match column.type_string.as_bytes().first().copied() {
+        Some(b'S') => Ok(Some(metakit_format_string_preview(value_bytes)?)),
+        Some(b'B') => Ok(Some(metakit_format_bytes_preview(value_bytes, first_len))),
+        _ => Ok(None),
+    }
+}
+
+fn metakit_first_row_values_at(
+    bytes: &[u8],
+    pointer: i32,
+    row_count: Option<usize>,
+    columns: &[VolocityMetakitColumn],
+    little_endian: bool,
+) -> Vec<(String, String)> {
+    let Some(row_count) = row_count else {
+        return Vec::new();
+    };
+    if row_count == 0 {
+        return Vec::new();
+    }
+    let mut offset = match metakit_checked_offset(pointer, 1) {
+        Ok(offset) => offset,
+        Err(_) => return Vec::new(),
+    };
+    if usize::try_from(metakit_read_bp_int(bytes, &mut offset).unwrap_or(-1)).ok()
+        != Some(row_count)
+    {
+        return Vec::new();
+    }
+
+    columns
+        .iter()
+        .filter_map(|column| {
+            let value = metakit_read_first_scalar_preview(
+                bytes,
+                &mut offset,
+                column,
+                row_count,
+                little_endian,
+            )
+            .ok()
+            .flatten()?;
+            Some((column.name.clone(), value))
+        })
+        .collect()
+}
+
+fn metakit_single_row_scalars_at(
+    bytes: &[u8],
+    pointer: i32,
+    row_count: Option<usize>,
+    columns: &[VolocityMetakitColumn],
+    little_endian: bool,
+) -> Vec<(String, String)> {
+    if row_count != Some(1) {
+        return Vec::new();
+    }
+    let mut offset = match metakit_checked_offset(pointer, 1) {
+        Ok(offset) => offset,
+        Err(_) => return Vec::new(),
+    };
+    if metakit_read_bp_int(bytes, &mut offset).ok() != Some(1) {
+        return Vec::new();
+    }
+
+    columns
+        .iter()
+        .filter_map(|column| {
+            let value =
+                metakit_read_first_fixed_scalar(bytes, &mut offset, column, 1, little_endian)
+                    .ok()
+                    .flatten()?;
+            Some((column.name.clone(), value))
+        })
+        .collect()
+}
+
+fn metakit_subview_row_count_at(
+    bytes: &[u8],
+    pointer: i32,
+    columns: &[VolocityMetakitColumn],
+) -> Option<usize> {
+    let mut offset = usize::try_from(pointer.checked_add(1)?).ok()?;
+    let subview_count = usize::try_from(metakit_read_bp_int(bytes, &mut offset).ok()?).ok()?;
+    let mut total = 0usize;
+
+    for subview in 0..subview_count {
+        if subview == 0 {
+            let _size = metakit_read_bp_int(bytes, &mut offset).ok()?;
+            let subview_pointer = metakit_read_bp_int(bytes, &mut offset).ok()?;
+            offset = usize::try_from(subview_pointer).ok()?;
+        }
+
+        let _marker = metakit_read_bp_int(bytes, &mut offset).ok()?;
+        let count = usize::try_from(metakit_read_bp_int(bytes, &mut offset).ok()?).ok()?;
+        if count > 1 {
+            total = total.checked_add(count)?;
+            for column in columns {
+                metakit_skip_column_map(bytes, &mut offset, column).ok()?;
+            }
+        }
+    }
+
+    Some(total)
+}
+
+fn metakit_first_subview_row_scalars_at(
+    bytes: &[u8],
+    pointer: i32,
+    columns: &[VolocityMetakitColumn],
+    little_endian: bool,
+) -> Vec<(String, String)> {
+    let mut offset = match usize::try_from(pointer.checked_add(1).unwrap_or(-1)) {
+        Ok(offset) => offset,
+        Err(_) => return Vec::new(),
+    };
+    let subview_count = match usize::try_from(match metakit_read_bp_int(bytes, &mut offset) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    }) {
+        Ok(count) => count,
+        Err(_) => return Vec::new(),
+    };
+
+    for subview in 0..subview_count {
+        if subview == 0 {
+            if metakit_read_bp_int(bytes, &mut offset).is_err() {
+                return Vec::new();
+            }
+            let subview_pointer = match metakit_read_bp_int(bytes, &mut offset) {
+                Ok(pointer) => pointer,
+                Err(_) => return Vec::new(),
+            };
+            offset = match usize::try_from(subview_pointer) {
+                Ok(offset) => offset,
+                Err(_) => return Vec::new(),
+            };
+        }
+
+        if metakit_read_bp_int(bytes, &mut offset).is_err() {
+            return Vec::new();
+        }
+        let count = match usize::try_from(match metakit_read_bp_int(bytes, &mut offset) {
+            Ok(value) => value,
+            Err(_) => return Vec::new(),
+        }) {
+            Ok(count) => count,
+            Err(_) => return Vec::new(),
+        };
+        if count > 1 {
+            return columns
+                .iter()
+                .filter_map(|column| {
+                    let value = metakit_read_first_scalar_preview(
+                        bytes,
+                        &mut offset,
+                        column,
+                        count,
+                        little_endian,
+                    )
+                    .ok()
+                    .flatten()?;
+                    Some((column.name.clone(), value))
+                })
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
+
+fn volocity_value_i32(value: &Option<VolocityMetakitValue>) -> Option<i32> {
+    match value {
+        Some(VolocityMetakitValue::Integer(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn volocity_column_index(columns: &[VolocityMetakitColumn], name: &str) -> Option<usize> {
+    columns.iter().position(|column| column.name == name)
+}
+
+fn volocity_i32_column(
+    row: &[Option<VolocityMetakitValue>],
+    columns: &[VolocityMetakitColumn],
+    name: &str,
+) -> Option<i32> {
+    volocity_column_index(columns, name)
+        .and_then(|index| row.get(index).and_then(volocity_value_i32))
+}
+
+fn volocity_bytes_column(
+    row: &[Option<VolocityMetakitValue>],
+    columns: &[VolocityMetakitColumn],
+    name: &str,
+) -> Option<Vec<u8>> {
+    volocity_column_index(columns, name).and_then(|index| match row.get(index) {
+        Some(Some(VolocityMetakitValue::Bytes(bytes))) => Some(bytes.clone()),
+        _ => None,
+    })
+}
+
+fn volocity_string_column(
+    row: &[Option<VolocityMetakitValue>],
+    columns: &[VolocityMetakitColumn],
+    name: &str,
+) -> Option<String> {
+    volocity_column_index(columns, name).and_then(|index| match row.get(index) {
+        Some(Some(VolocityMetakitValue::String(value))) => Some(value.clone()),
+        _ => None,
+    })
+}
+
+fn volocity_sample_rows_from_metakit(
+    rows: &[Vec<Option<VolocityMetakitValue>>],
+    columns: &[VolocityMetakitColumn],
+) -> Vec<VolocitySampleRow> {
+    rows.iter()
+        .filter_map(|row| {
+            let inline_data = volocity_bytes_column(row, columns, "sampleData");
+            Some(VolocitySampleRow {
+                id: volocity_i32_column(row, columns, "sampleID")?,
+                parent: volocity_i32_column(row, columns, "sampleParent")?,
+                child_type: volocity_i32_column(row, columns, "sampleChildType")?,
+                file_link: volocity_i32_column(row, columns, "sampleFileLink"),
+                name_link: volocity_i32_column(row, columns, "sampleNameLink"),
+                inline_data_len: inline_data.as_ref().map_or(0, Vec::len),
+                inline_data,
+                external_data: volocity_i32_column(row, columns, "sampleExternalData"),
+            })
+        })
+        .collect()
+}
+
+fn volocity_file_rows_from_metakit(
+    rows: &[Vec<Option<VolocityMetakitValue>>],
+    columns: &[VolocityMetakitColumn],
+) -> Vec<VolocityFileRow> {
+    rows.iter()
+        .filter_map(|row| {
+            Some(VolocityFileRow {
+                id: volocity_i32_column(row, columns, "fileID")?,
+                name: volocity_string_column(row, columns, "fileName"),
+                spec: volocity_bytes_column(row, columns, "fileSpec"),
+            })
+        })
+        .collect()
+}
+
+fn volocity_string_rows_from_metakit(
+    rows: &[Vec<Option<VolocityMetakitValue>>],
+    columns: &[VolocityMetakitColumn],
+) -> Vec<VolocityStringRow> {
+    rows.iter()
+        .filter_map(|row| {
+            Some(VolocityStringRow {
+                id: volocity_i32_column(row, columns, "stringID")?,
+                value: volocity_string_column(row, columns, "stringString")?,
+            })
+        })
+        .collect()
+}
+
+fn volocity_java_trim(value: &str) -> String {
+    value.trim_matches(|c: char| c <= ' ').to_string()
+}
+
+fn volocity_lookup_string(strings: &[VolocityStringRow], string_id: Option<i32>) -> Option<String> {
+    let string_id = string_id?;
+    strings
+        .iter()
+        .find(|row| row.id == string_id)
+        .map(|row| volocity_java_trim(&row.value))
+}
+
+fn volocity_resolve_file_link(
+    files: &[VolocityFileRow],
+    file_id: Option<i32>,
+) -> Option<VolocityFileLink> {
+    let file_id = file_id?;
+    let row = files.iter().find(|row| row.id == file_id)?;
+    let spec_preview = row.spec.as_deref().map(|bytes| {
+        let preview_len = bytes.len().min(VOLOCITY_METAKIT_MAX_PREVIEW_BYTES);
+        metakit_format_bytes_preview(&bytes[..preview_len], bytes.len())
+    });
+    Some(VolocityFileLink {
+        file_id: row.id,
+        name: row.name.as_deref().map(volocity_java_trim),
+        spec_preview,
+    })
+}
+
+fn volocity_get_file(samples: &[VolocitySampleRow], parent: i32) -> Option<String> {
+    // Java getFile(parent, dir): the sample whose ID matches `parent` has its
+    // file link (sampleTable[row][14]) resolved as "<fileLink>.dat" beneath the
+    // Data directory. We surface the bare "<fileLink>.dat" leaf name as a clue;
+    // the Java reader joins it with the Data directory.
+    for row in samples {
+        if row.id == parent {
+            if let Some(file_link) = row.file_link {
+                return Some(format!("{file_link}.dat"));
+            }
+        }
+    }
+    None
+}
+
+fn volocity_get_child<'a>(
+    samples: &'a [VolocitySampleRow],
+    strings: &[VolocityStringRow],
+    parent_id: i32,
+    child_name: &str,
+) -> Option<&'a VolocitySampleRow> {
+    samples.iter().find(|row| {
+        row.parent == parent_id
+            && volocity_lookup_string(strings, row.name_link).as_deref() == Some(child_name)
+    })
+}
+
+fn volocity_child_count(samples: &[VolocitySampleRow], parent_id: i32) -> usize {
+    samples.iter().filter(|row| row.parent == parent_id).count()
+}
+
+fn volocity_children<'a>(
+    samples: &'a [VolocitySampleRow],
+    parent_id: i32,
+) -> impl Iterator<Item = &'a VolocitySampleRow> {
+    samples.iter().filter(move |row| row.parent == parent_id)
+}
+
+fn volocity_read_stream_i32(bytes: &[u8], offset: usize, little_endian: bool) -> Option<i32> {
+    let data = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(if little_endian {
+        i32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    } else {
+        i32::from_be_bytes([data[0], data[1], data[2], data[3]])
+    })
+}
+
+fn volocity_read_stream_f64(bytes: &[u8], offset: usize, little_endian: bool) -> Option<f64> {
+    let data = bytes.get(offset..offset.checked_add(8)?)?;
+    let array = [
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+    ];
+    Some(if little_endian {
+        f64::from_le_bytes(array)
+    } else {
+        f64::from_be_bytes(array)
+    })
+}
+
+fn volocity_read_stream_string(bytes: &[u8], offset: usize, little_endian: bool) -> Option<String> {
+    let len = volocity_read_stream_i32(bytes, offset, little_endian)?;
+    if len < 0 {
+        return None;
+    }
+    let len = usize::try_from(len).ok()?;
+    let start = offset.checked_add(4)?;
+    let end = start.checked_add(len)?;
+    let data = bytes.get(start..end)?;
+    Some(volocity_java_trim(&String::from_utf8_lossy(data)))
+}
+
+fn volocity_native_stream_clue(bytes: &[u8]) -> Option<VolocityNativeStreamClue> {
+    let little_endian = bytes.first().copied() == Some(b'I');
+    let size_x = volocity_read_stream_i32(bytes, 22, little_endian)?;
+    let size_y = volocity_read_stream_i32(bytes, 26, little_endian)?;
+    let size_z = volocity_read_stream_i32(bytes, 30, little_endian)?;
+    let pixels = i64::from(size_x)
+        .checked_mul(i64::from(size_y))?
+        .checked_mul(i64::from(size_z))?;
+    if pixels <= 0 || pixels >= (bytes.len() as i64).checked_mul(3)? {
+        return None;
+    }
+    Some(VolocityNativeStreamClue {
+        little_endian,
+        size_x,
+        size_y,
+        size_z,
+        stream_len: bytes.len(),
+    })
+}
+
+fn volocity_channel_aisf_id(bytes: Option<&[u8]>) -> Option<i32> {
+    // Java getStream(channel).seek(22).readInt() maps this ID to <id>.aisf.
+    volocity_read_stream_i32(bytes?, 22, true)
+}
+
+fn volocity_parent_name(
+    samples: &[VolocitySampleRow],
+    strings: &[VolocityStringRow],
+    mut parent_id: i32,
+) -> String {
+    let mut parent_name = String::new();
+    let mut guard = 0usize;
+    while parent_id != 1 && guard < samples.len() {
+        guard += 1;
+        let original_id = parent_id;
+        if let Some(row) = samples.iter().find(|row| row.id == parent_id) {
+            if let Some(name) = volocity_lookup_string(strings, row.name_link) {
+                parent_name = format!("{name}/{parent_name}");
+            }
+            parent_id = row.parent;
+        }
+        if parent_id == original_id {
+            break;
+        }
+    }
+    parent_name
+}
+
+fn volocity_stack_candidates(
+    samples: &[VolocitySampleRow],
+    strings: &[VolocityStringRow],
+    files: &[VolocityFileRow],
+) -> Vec<VolocityStackCandidate> {
+    samples
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            if index == 0 || row.child_type != 1 {
+                return None;
+            }
+
+            let channel_child = volocity_get_child(samples, strings, row.id, "Channels");
+            let has_external_data = row.external_data.is_some_and(|value| value != 0);
+            let native_stream_clue = row
+                .inline_data
+                .as_deref()
+                .and_then(volocity_native_stream_clue);
+            if channel_child.is_none() && !has_external_data && native_stream_clue.is_none() {
+                return None;
+            }
+
+            let parent_name = volocity_parent_name(samples, strings, row.parent);
+            let name = volocity_lookup_string(strings, row.name_link).unwrap_or_default();
+            // Java initFile per-channel pixels-file resolution: when the channel
+            // stream is longer than 22 bytes the .aisf id is read at offset 22,
+            // otherwise the pixels file falls back to getFile(firstChild, dir).
+            let channel_links = channel_child
+                .into_iter()
+                .flat_map(|child| volocity_children(samples, child.id))
+                .map(|child| {
+                    let stream_len = child.inline_data.as_ref().map_or(0, Vec::len);
+                    let (aisf_id, pixels_dat) = if stream_len > 22 {
+                        (volocity_channel_aisf_id(child.inline_data.as_deref()), None)
+                    } else {
+                        let first_child =
+                            volocity_children(samples, child.id).next().map(|c| c.id);
+                        (None, first_child.and_then(|id| volocity_get_file(samples, id)))
+                    };
+                    VolocityChannelLink {
+                        sample_id: child.id,
+                        name: volocity_lookup_string(strings, child.name_link).unwrap_or_default(),
+                        aisf_id,
+                        pixels_dat,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            // Java initFile non-channel pixels file: getFile(parent, dir) → <link>.dat.
+            let pixels_dat = if channel_child.is_none() {
+                volocity_get_file(samples, row.id)
+            } else {
+                None
+            };
+
+            // Java initFile named-child metadata streams (seek(SIGNATURE_SIZE)).
+            const SIGNATURE_SIZE: usize = 13;
+            let mut metadata = VolocityStackMetadata::default();
+            if let Some(child) =
+                volocity_get_child(samples, strings, row.id, "Timepoint times stream")
+            {
+                metadata.timestamp_atsf_id = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_i32(data, 22, true));
+            }
+            if let Some(child) = volocity_get_child(samples, strings, row.id, "um/pixel (X)") {
+                metadata.physical_x = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_f64(data, SIGNATURE_SIZE, true));
+            }
+            if let Some(child) = volocity_get_child(samples, strings, row.id, "um/pixel (Y)") {
+                metadata.physical_y = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_f64(data, SIGNATURE_SIZE, true));
+            }
+            if let Some(child) = volocity_get_child(samples, strings, row.id, "um/pixel (Z)") {
+                metadata.physical_z = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_f64(data, SIGNATURE_SIZE, true));
+            }
+            if let Some(child) =
+                volocity_get_child(samples, strings, row.id, "Microscope Objective")
+            {
+                metadata.magnification = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_f64(data, SIGNATURE_SIZE, true));
+            }
+            if let Some(child) = volocity_get_child(samples, strings, row.id, "Camera/Detector") {
+                metadata.detector = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_string(data, SIGNATURE_SIZE, true));
+            }
+            if let Some(child) =
+                volocity_get_child(samples, strings, row.id, "Experiment Description")
+            {
+                metadata.description = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_string(data, SIGNATURE_SIZE, true));
+            }
+            if let Some(child) = volocity_get_child(samples, strings, row.id, "X Location") {
+                metadata.x_location = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_f64(data, SIGNATURE_SIZE, true));
+            }
+            if let Some(child) = volocity_get_child(samples, strings, row.id, "Y Location") {
+                metadata.y_location = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_f64(data, SIGNATURE_SIZE, true));
+            }
+            if let Some(child) = volocity_get_child(samples, strings, row.id, "Z Location") {
+                metadata.z_location = child
+                    .inline_data
+                    .as_deref()
+                    .and_then(|data| volocity_read_stream_f64(data, SIGNATURE_SIZE, true));
+            }
+
+            Some(VolocityStackCandidate {
+                sample_id: row.id,
+                stack_name: format!("{parent_name}{name}"),
+                parent_id: row.parent,
+                name_link: row.name_link,
+                file_link: row.file_link,
+                resolved_file: volocity_resolve_file_link(files, row.file_link),
+                pixels_dat,
+                channel_child_sample_id: channel_child.map(|child| child.id),
+                channel_count: channel_child.map(|child| volocity_child_count(samples, child.id)),
+                channel_links,
+                inline_data_len: row.inline_data_len,
+                native_stream_clue,
+                external_data: row.external_data.filter(|value| *value != 0),
+                metadata,
+            })
         })
         .collect()
 }
@@ -263,16 +1951,61 @@ fn probe_volocity_metakit(
     let _row_count_marker = metakit_read_bp_int(bytes, &mut offset)?;
 
     let mut tables = Vec::with_capacity(table_defs.len());
-    for (name, has_subviews) in table_defs {
+    let mut sample_rows = Vec::new();
+    let mut string_rows = Vec::new();
+    let mut file_rows = Vec::new();
+    for (name, columns, has_subviews) in table_defs {
         let _table_marker = metakit_read_bp_int(bytes, &mut offset)?;
         let pointer = metakit_read_bp_int(bytes, &mut offset)?;
+        let row_count = if has_subviews {
+            metakit_subview_row_count_at(bytes, pointer, &columns)
+        } else {
+            metakit_row_count_at(bytes, pointer)
+        };
+        let scalar_values = if has_subviews {
+            Vec::new()
+        } else {
+            metakit_single_row_scalars_at(bytes, pointer, row_count, &columns, little_endian)
+        };
+        let first_row_values = if has_subviews {
+            metakit_first_subview_row_scalars_at(bytes, pointer, &columns, little_endian)
+        } else {
+            metakit_first_row_values_at(bytes, pointer, row_count, &columns, little_endian)
+        };
+        if name == "samplesViewR" {
+            let rows = if has_subviews {
+                metakit_subview_rows_at(bytes, pointer, &columns, little_endian)
+            } else {
+                metakit_rows_at(bytes, pointer, row_count, &columns, little_endian)
+            };
+            if let Ok(rows) = rows {
+                sample_rows = volocity_sample_rows_from_metakit(&rows, &columns);
+            }
+        } else if name == "stringsViewR" {
+            let rows = if has_subviews {
+                metakit_subview_rows_at(bytes, pointer, &columns, little_endian)
+            } else {
+                metakit_rows_at(bytes, pointer, row_count, &columns, little_endian)
+            };
+            if let Ok(rows) = rows {
+                string_rows = volocity_string_rows_from_metakit(&rows, &columns);
+            }
+        } else if name == "filesViewR" {
+            let rows = if has_subviews {
+                metakit_subview_rows_at(bytes, pointer, &columns, little_endian)
+            } else {
+                metakit_rows_at(bytes, pointer, row_count, &columns, little_endian)
+            };
+            if let Ok(rows) = rows {
+                file_rows = volocity_file_rows_from_metakit(&rows, &columns);
+            }
+        }
         tables.push(VolocityMetakitTable {
             name,
-            row_count: if has_subviews {
-                None
-            } else {
-                metakit_row_count_at(bytes, pointer)
-            },
+            row_count,
+            columns,
+            scalar_values,
+            first_row_values,
         });
     }
 
@@ -282,6 +2015,7 @@ fn probe_volocity_metakit(
         toc_offset,
         structure_len,
         tables,
+        stack_candidates: volocity_stack_candidates(&sample_rows, &string_rows, &file_rows),
     }))
 }
 
@@ -570,26 +2304,392 @@ mod tests {
         assert_eq!(probe.toc_offset, 1496);
         assert_eq!(probe.structure_len, 488);
         assert_eq!(
-            probe.tables,
+            probe
+                .tables
+                .iter()
+                .map(|table| (table.name.as_str(), table.row_count))
+                .collect::<Vec<_>>(),
             vec![
-                VolocityMetakitTable {
-                    name: "variablesView".to_string(),
-                    row_count: Some(1),
+                ("variablesView", Some(1)),
+                ("samplesViewR", Some(29)),
+                ("stringsViewR", Some(23)),
+                ("filesViewR", Some(0)),
+            ]
+        );
+        assert_eq!(
+            probe.tables[0]
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.type_string.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("varVersion", "I"),
+                ("varNextSampleID", "I"),
+                ("varNextStringID", "I"),
+                ("varNextFileID", "I"),
+                ("varDemoKey", "I"),
+            ]
+        );
+        assert_eq!(
+            probe.tables[0]
+                .scalar_values
+                .iter()
+                .map(|(column, value)| (column.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("varVersion", "2"),
+                ("varNextSampleID", "30"),
+                ("varNextStringID", "24"),
+                ("varNextFileID", "2"),
+            ]
+        );
+        assert_eq!(
+            probe.tables[1]
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "sampleID",
+                "sampleParent",
+                "sampleChildType",
+                "sampleChildPos",
+                "sampleOrigChildPos",
+                "sampleIsLinked",
+                "sampleIsCloaked",
+                "sampleIsDeleted",
+                "sampleDataVersion",
+                "sampleDataRevision",
+                "sampleFileLink",
+                "sampleNameLink",
+                "sampleChangeTime",
+                "sampleData",
+                "sampleExternalData",
+            ]
+        );
+        assert_eq!(
+            probe.tables[1]
+                .first_row_values
+                .iter()
+                .map(|(column, value)| (column.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("sampleID", "1"),
+                ("sampleParent", "0"),
+                ("sampleChildType", "1"),
+                ("sampleChildPos", "1"),
+                ("sampleOrigChildPos", "1"),
+                ("sampleDataVersion", "503"),
+                ("sampleDataRevision", "0"),
+                ("sampleNameLink", "1"),
+                ("sampleChangeTime", "3391447735797000"),
+                (
+                    "sampleData",
+                    "21 bytes hex=493100020058020000f501020064000000f7010000",
+                ),
+                ("sampleExternalData", "0"),
+            ]
+        );
+        assert_eq!(
+            probe.tables[2]
+                .first_row_values
+                .iter()
+                .map(|(column, value)| (column.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("stringID", "1"),
+                ("stringString", "\"clipping-test.mvd2\\0\""),
+                ("stringRefCount", "1"),
+            ]
+        );
+        assert_eq!(
+            probe.stack_candidates,
+            vec![VolocityStackCandidate {
+                sample_id: 5,
+                stack_name: "Tx red 2".to_string(),
+                parent_id: 1,
+                name_link: Some(5),
+                file_link: None,
+                resolved_file: None,
+                pixels_dat: None,
+                channel_child_sample_id: None,
+                channel_count: None,
+                channel_links: Vec::new(),
+                inline_data_len: 0,
+                native_stream_clue: None,
+                external_data: Some(1),
+                metadata: VolocityStackMetadata {
+                    timestamp_atsf_id: None,
+                    physical_x: Some(0.10320283208969615),
+                    physical_y: Some(0.10320283208969615),
+                    physical_z: Some(1.0),
+                    magnification: Some(20.0),
+                    detector: Some("HAMAMATSU C4742-80-12AG".to_string()),
+                    description: Some(String::new()),
+                    x_location: None,
+                    y_location: None,
+                    z_location: None,
                 },
-                VolocityMetakitTable {
-                    name: "samplesViewR".to_string(),
-                    row_count: None,
+            }]
+        );
+        assert_eq!(
+            volocity_native_semantic_summary(&probe).as_deref(),
+            Some(
+                "variables=variablesView(1), samples=samplesViewR(29), strings=stringsViewR(23), files=filesViewR(0); variables version=2, next_sample_id=30, next_string_id=24, next_file_id=2; sample hierarchy id=sampleID, parent=sampleParent, child_type=sampleChildType, child_pos=sampleChildPos, original_child_pos=sampleOrigChildPos, file_link=sampleFileLink, name_link=sampleNameLink, inline_data=sampleData, external_data=sampleExternalData; first sample row sampleID=1, sampleParent=0, sampleChildType=1 (Java stack-candidate branch), sampleChildPos=1, sampleOrigChildPos=1, sampleDataVersion=503, sampleDataRevision=0, sampleNameLink=1, sampleChangeTime=3391447735797000, sampleData=21 bytes hex=493100020058020000f501020064000000f7010000, sampleExternalData=0; string links stringsViewR[stringID, stringString, stringRefCount]; first string links row stringID=1, stringString=\"clipping-test.mvd2\\0\", stringRefCount=1; file links filesViewR[fileID, fileName, fileSpec, fileRefCount]; Java stack candidates 1: sampleID=5, name=\"Tx red 2\", parent=1, inline_data=0B, name_link=5, external_data=1, physicalX=0.10320283208969615, physicalY=0.10320283208969615, physicalZ=1, magnification=20, detector=\"HAMAMATSU C4742-80-12AG\", description=\"\""
+            )
+        );
+    }
+
+    fn volocity_test_sample(
+        id: i32,
+        parent: i32,
+        child_type: i32,
+        name_link: i32,
+        inline_data: Option<Vec<u8>>,
+        external_data: Option<i32>,
+    ) -> VolocitySampleRow {
+        VolocitySampleRow {
+            id,
+            parent,
+            child_type,
+            file_link: None,
+            name_link: Some(name_link),
+            inline_data_len: inline_data.as_ref().map_or(0, Vec::len),
+            inline_data,
+            external_data,
+        }
+    }
+
+    fn volocity_test_inline_stream(width: i32, height: i32, depth: i32) -> Vec<u8> {
+        let mut bytes = vec![0; 96];
+        bytes[0] = b'I';
+        bytes[22..26].copy_from_slice(&width.to_le_bytes());
+        bytes[26..30].copy_from_slice(&height.to_le_bytes());
+        bytes[30..34].copy_from_slice(&depth.to_le_bytes());
+        bytes
+    }
+
+    fn volocity_test_channel_stream(aisf_id: i32) -> Vec<u8> {
+        let mut bytes = vec![0; 32];
+        bytes[22..26].copy_from_slice(&aisf_id.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn volocity_stack_candidates_validate_inline_stream_and_channels() {
+        let strings = vec![
+            VolocityStringRow {
+                id: 1,
+                value: "Library".to_string(),
+            },
+            VolocityStringRow {
+                id: 2,
+                value: "Invalid inline".to_string(),
+            },
+            VolocityStringRow {
+                id: 3,
+                value: "Inline stack".to_string(),
+            },
+            VolocityStringRow {
+                id: 4,
+                value: "Channel stack".to_string(),
+            },
+            VolocityStringRow {
+                id: 5,
+                value: "Channels".to_string(),
+            },
+            VolocityStringRow {
+                id: 6,
+                value: "DAPI".to_string(),
+            },
+            VolocityStringRow {
+                id: 7,
+                value: "FITC".to_string(),
+            },
+        ];
+        let samples = vec![
+            volocity_test_sample(1, 0, 1, 1, None, None),
+            volocity_test_sample(2, 1, 1, 2, Some(vec![0; 96]), None),
+            volocity_test_sample(3, 1, 1, 3, Some(volocity_test_inline_stream(4, 5, 2)), None),
+            volocity_test_sample(4, 1, 1, 4, None, None),
+            volocity_test_sample(5, 4, 0, 5, None, None),
+            volocity_test_sample(6, 5, 0, 6, Some(volocity_test_channel_stream(101)), None),
+            volocity_test_sample(7, 5, 0, 7, Some(volocity_test_channel_stream(202)), None),
+        ];
+
+        let candidates = volocity_stack_candidates(&samples, &strings, &[]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].sample_id, 3);
+        assert_eq!(candidates[0].stack_name, "Inline stack");
+        assert_eq!(
+            candidates[0].native_stream_clue,
+            Some(VolocityNativeStreamClue {
+                little_endian: true,
+                size_x: 4,
+                size_y: 5,
+                size_z: 2,
+                stream_len: 96,
+            })
+        );
+        assert_eq!(candidates[1].sample_id, 4);
+        assert_eq!(candidates[1].channel_child_sample_id, Some(5));
+        assert_eq!(candidates[1].channel_count, Some(2));
+        assert_eq!(
+            candidates[1].channel_links,
+            vec![
+                VolocityChannelLink {
+                    sample_id: 6,
+                    name: "DAPI".to_string(),
+                    aisf_id: Some(101),
+                    pixels_dat: None,
                 },
-                VolocityMetakitTable {
-                    name: "stringsViewR".to_string(),
-                    row_count: Some(23),
-                },
-                VolocityMetakitTable {
-                    name: "filesViewR".to_string(),
-                    row_count: Some(0),
+                VolocityChannelLink {
+                    sample_id: 7,
+                    name: "FITC".to_string(),
+                    aisf_id: Some(202),
+                    pixels_dat: None,
                 },
             ]
         );
+        assert_eq!(candidates[1].native_stream_clue, None);
+
+        let probe = VolocityMetakitProbe {
+            little_endian: true,
+            footer_offset: 0,
+            toc_offset: 0,
+            structure_len: 0,
+            tables: Vec::new(),
+            stack_candidates: candidates,
+        };
+        let summary = volocity_native_semantic_summary(&probe).unwrap();
+        assert!(summary.contains("native_stream=4x5x2 LE len=96B"));
+        assert!(summary.contains("channels_child=5, channels=2"));
+        assert!(summary.contains(
+            "channel_links=[sampleID=6 name=\"DAPI\" aisf_id=101, sampleID=7 name=\"FITC\" aisf_id=202]"
+        ));
+    }
+
+    #[test]
+    fn volocity_stack_candidates_resolve_sample_file_links() {
+        let strings = vec![
+            VolocityStringRow {
+                id: 1,
+                value: "Library".to_string(),
+            },
+            VolocityStringRow {
+                id: 2,
+                value: "File-backed stack".to_string(),
+            },
+        ];
+        let mut stack = volocity_test_sample(2, 1, 1, 2, None, Some(42));
+        stack.file_link = Some(7);
+        let samples = vec![volocity_test_sample(1, 0, 1, 1, None, None), stack];
+        let files = vec![VolocityFileRow {
+            id: 7,
+            name: Some("plane-data.dat\0".to_string()),
+            spec: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+        }];
+
+        let candidates = volocity_stack_candidates(&samples, &strings, &files);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].file_link, Some(7));
+        assert_eq!(
+            candidates[0].resolved_file,
+            Some(VolocityFileLink {
+                file_id: 7,
+                name: Some("plane-data.dat".to_string()),
+                spec_preview: Some("4 bytes hex=deadbeef".to_string()),
+            })
+        );
+        // Java getFile(parent, dir) maps the stack's own file link to <link>.dat.
+        assert_eq!(candidates[0].pixels_dat.as_deref(), Some("7.dat"));
+
+        let probe = VolocityMetakitProbe {
+            little_endian: true,
+            footer_offset: 0,
+            toc_offset: 0,
+            structure_len: 0,
+            tables: Vec::new(),
+            stack_candidates: candidates,
+        };
+        let summary = volocity_native_semantic_summary(&probe).unwrap();
+        assert!(summary.contains("file_link=7"));
+        assert!(
+            summary.contains("file=[fileID=7 name=\"plane-data.dat\" spec=4 bytes hex=deadbeef]")
+        );
+        assert!(summary.contains("pixels_dat=7.dat"));
+    }
+
+    #[test]
+    fn volocity_stack_candidates_extract_named_child_metadata() {
+        let strings = vec![
+            VolocityStringRow {
+                id: 1,
+                value: "Library".to_string(),
+            },
+            VolocityStringRow {
+                id: 2,
+                value: "Metadata stack".to_string(),
+            },
+            VolocityStringRow {
+                id: 3,
+                value: "um/pixel (X)".to_string(),
+            },
+            VolocityStringRow {
+                id: 4,
+                value: "Microscope Objective".to_string(),
+            },
+            VolocityStringRow {
+                id: 5,
+                value: "Camera/Detector".to_string(),
+            },
+            VolocityStringRow {
+                id: 6,
+                value: "Timepoint times stream".to_string(),
+            },
+        ];
+
+        // Child streams: SIGNATURE_SIZE = 13 bytes header, then payload.
+        let mut x_stream = vec![0u8; 13];
+        x_stream.extend_from_slice(&0.25f64.to_le_bytes());
+        let mut objective_stream = vec![0u8; 13];
+        objective_stream.extend_from_slice(&63.0f64.to_le_bytes());
+        let mut detector_stream = vec![0u8; 13];
+        detector_stream.extend_from_slice(&4i32.to_le_bytes());
+        detector_stream.extend_from_slice(b"CCD1");
+        let mut timestamp_stream = vec![0u8; 22];
+        timestamp_stream.extend_from_slice(&777i32.to_le_bytes());
+
+        let samples = vec![
+            volocity_test_sample(1, 0, 1, 1, None, None),
+            volocity_test_sample(2, 1, 1, 2, Some(volocity_test_inline_stream(4, 5, 2)), None),
+            volocity_test_sample(3, 2, 0, 3, Some(x_stream), None),
+            volocity_test_sample(4, 2, 0, 4, Some(objective_stream), None),
+            volocity_test_sample(5, 2, 0, 5, Some(detector_stream), None),
+            volocity_test_sample(6, 2, 0, 6, Some(timestamp_stream), None),
+        ];
+
+        let candidates = volocity_stack_candidates(&samples, &strings, &[]);
+        assert_eq!(candidates.len(), 1);
+        let metadata = &candidates[0].metadata;
+        assert_eq!(metadata.physical_x, Some(0.25));
+        assert_eq!(metadata.magnification, Some(63.0));
+        assert_eq!(metadata.detector.as_deref(), Some("CCD1"));
+        assert_eq!(metadata.timestamp_atsf_id, Some(777));
+
+        let probe = VolocityMetakitProbe {
+            little_endian: true,
+            footer_offset: 0,
+            toc_offset: 0,
+            structure_len: 0,
+            tables: Vec::new(),
+            stack_candidates: candidates,
+        };
+        let summary = volocity_native_semantic_summary(&probe).unwrap();
+        assert!(summary.contains("physicalX=0.25"));
+        assert!(summary.contains("magnification=63"));
+        assert!(summary.contains("detector=\"CCD1\""));
+        assert!(summary.contains("timestamp_atsf=777.atsf"));
     }
 
     #[test]
@@ -606,14 +2706,51 @@ mod tests {
                     && message.contains("toc=1496")
                     && message.contains("structure=488B")
                     && message.contains("table_count=4")
-                    && message.contains("variablesView(1)")
-                    && message.contains("samplesViewR(?)")
-                    && message.contains("stringsViewR(23)")
-                    && message.contains("filesViewR(0)")
+                    && message.contains("variablesView(1)[varVersion:I")
+                    && message.contains("samplesViewR(29)[sampleID:I")
+                    && message.contains("stringsViewR(23)[stringID:I|stringString:S|stringRefCount:I]")
+                    && message.contains("filesViewR(0)[fileID:I|fileName:S|fileSpec:B|fileRefCount:I]")
+                    && message.contains("single-row scalars: variablesView.varVersion=2")
+                    && message.contains("variablesView.varNextStringID=24")
+                    && message.contains("Java metadata roles: variables=variablesView(1), samples=samplesViewR(29), strings=stringsViewR(23), files=filesViewR(0)")
+                    && message.contains("variables version=2, next_sample_id=30, next_string_id=24, next_file_id=2")
+                    && message.contains("sample hierarchy id=sampleID, parent=sampleParent")
+                    && message.contains("file_link=sampleFileLink, name_link=sampleNameLink")
+                    && message.contains("first sample row sampleID=1, sampleParent=0")
+                    && message.contains("sampleChildType=1 (Java stack-candidate branch)")
+                    && message.contains("sampleData=21 bytes hex=493100020058020000f501020064000000f7010000")
+                    && message.contains("string links stringsViewR[stringID, stringString, stringRefCount]")
+                    && message.contains("first string links row stringID=1, stringString=\"clipping-test.mvd2\\0\"")
+                    && message.contains("file links filesViewR[fileID, fileName, fileSpec, fileRefCount]")
+                    && message.contains("Java stack candidates 1: sampleID=5, name=\"Tx red 2\"")
+                    && message.contains("external_data=1")
                     && message.contains("native.mvd2")
         ));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn volocity_native_error_reports_bounded_companion_provenance() {
+        let root = temp_dir("native-companions");
+        let stack_dir = root.join("Data").join("Stack");
+        std::fs::create_dir_all(&stack_dir).unwrap();
+        std::fs::write(stack_dir.join("1.aisf"), b"aisf").unwrap();
+        let path = root.join("Library.mvd2");
+        std::fs::write(&path, include_bytes!("../ome-metakit/tests/data/test.mk")).unwrap();
+
+        let err = VolocityReader::new().set_id(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::UnsupportedFormat(message)
+                if message.contains("companion provenance: Data directory present")
+                    && message.contains("stack sampleID=5 external_data=1 1.aisf=Data/Stack/1.aisf")
+                    && message.contains("stack sampleID=5 external_data=1 1.aiix=missing")
+                    && message.contains("stack sampleID=5 external_data=1 1.dat=missing")
+                    && message.contains("stack sampleID=5 external_data=1 1.atsf=missing")
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use bioformats::{
     BioFormatsError, DimensionOrder, FormatReader, FormatWriter, ImageMetadata, ImageReader,
-    ImageWriter, MetadataValue, OmeAnnotation, PixelType,
+    ImageWriter, MetadataValue, OmeAnnotation, OmeShape, PixelType,
 };
 use std::path::Path;
 
@@ -1438,6 +1438,128 @@ fn picoquant_ptu_reconstructs_timeharp_t2_marker_raster() {
 }
 
 #[test]
+fn picoquant_ptu_reconstructs_multiharp_t3_marker_raster() {
+    let path = tmp("multiharp_t3_marker_raster.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 2);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_Frame", 1);
+        append_ptu_int_tag(out, "ImgHdr_DetectorChannels", 2);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 5);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0307);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t3_marker(&mut data, 1, 0);
+    append_ptu_t3_photon(&mut data, 0, 1);
+    append_ptu_t3_photon(&mut data, 1, 3);
+    append_ptu_t3_photon(&mut data, 1, 3);
+    append_ptu_t3_marker(&mut data, 2, 4);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.image_count, 2);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_record_type"),
+        Some(MetadataValue::String(value)) if value == "MultiHarp T3"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_record_layout"),
+        Some(MetadataValue::String(value)) if value == "hydraharp-compatible"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_marker_raster_layout"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_hydraharp_layout"),
+        Some(MetadataValue::Bool(false))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("MultiHarp T3")
+    ));
+
+    let channel_0: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    let channel_1: Vec<u32> = reader
+        .open_bytes(1)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(channel_0, vec![1, 0]);
+    assert_eq!(channel_1, vec![0, 2]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_reconstructs_multiharp_t2_marker_raster() {
+    let path = tmp("multiharp_t2_marker_raster.ptu");
+    let mut data = minimal_ptu_header(|out| {
+        append_ptu_int_tag(out, "ImgHdr_PixX", 2);
+        append_ptu_int_tag(out, "ImgHdr_PixY", 1);
+        append_ptu_int_tag(out, "ImgHdr_Frame", 1);
+        append_ptu_int_tag(out, "ImgHdr_DetectorChannels", 2);
+        append_ptu_int_tag(out, "TTResult_NumberOfRecords", 5);
+        append_ptu_int_tag(out, "TTResultFormat_TTTRRecType", 0x0001_0207);
+        append_ptu_int_tag(out, "ImgHdr_LineStart", 1);
+        append_ptu_int_tag(out, "ImgHdr_LineStop", 2);
+    });
+    append_ptu_t2_marker(&mut data, 1, 0);
+    append_ptu_t2_photon(&mut data, 0, 1);
+    append_ptu_t2_photon(&mut data, 1, 2);
+    append_ptu_t2_photon(&mut data, 1, 3);
+    append_ptu_t2_marker(&mut data, 2, 4);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.image_count, 2);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_record_type"),
+        Some(MetadataValue::String(value)) if value == "MultiHarp T2"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_record_layout"),
+        Some(MetadataValue::String(value)) if value == "hydraharp-compatible"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction"),
+        Some(MetadataValue::String(value)) if value.contains("MultiHarp T2")
+    ));
+
+    let channel_0: Vec<u32> = reader
+        .open_bytes(0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    let channel_1: Vec<u32> = reader
+        .open_bytes(1)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(channel_0, vec![1, 0]);
+    assert_eq!(channel_1, vec![0, 2]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn picoquant_ptu_splits_hydraharp_t3_detector_channels() {
     let path = tmp("minimal_detector_channels.ptu");
     let mut data = minimal_ptu_header(|out| {
@@ -2310,6 +2432,177 @@ fn build_gel_tiff(w: u16, h: u16, pixels_le: &[u8], extra: &[(u16, u16, u32)]) -
 }
 
 #[test]
+fn qptiff_preserves_description_key_value_metadata_and_pixels() {
+    let path = tmp("metadata_slice.qptiff");
+    write_tiny_flex_tiff(
+        &path,
+        "ImageType=FullResolution\nChannelName=DAPI\nExposureTime=12.5",
+        7,
+    );
+
+    let mut reader = bioformats::formats::extended::QptiffReader::new();
+    reader.set_id(&path).unwrap();
+
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![7]);
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("qptiff.ifd_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.series_ifds"),
+        Some(MetadataValue::String(value)) if value == "0"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.description.0.ImageType"),
+        Some(MetadataValue::String(value)) if value == "FullResolution"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.description.1.ChannelName"),
+        Some(MetadataValue::String(value)) if value == "DAPI"
+    ));
+    assert!(metadata.contains_key("qptiff.ifd.0.tag.65200.Private"));
+
+    let ome = reader.ome_metadata().expect("QPTIFF OME metadata");
+    let original_metadata = ome
+        .annotations
+        .iter()
+        .find_map(|annotation| match annotation {
+            OmeAnnotation::MapAnnotation {
+                namespace: Some(ns),
+                values,
+                ..
+            } if ns == "openmicroscopy.org/bioformats/original-metadata" => Some(values),
+            _ => None,
+        })
+        .expect("QPTIFF original metadata annotation");
+    assert!(original_metadata
+        .iter()
+        .any(|(key, value)| key == "qptiff.ifd.0.description.1.ChannelName" && value == "DAPI"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn qptiff_flattens_bounded_vendor_json_object_metadata() {
+    let path = tmp("metadata_json_object.qptiff");
+    write_tiny_flex_tiff(
+        &path,
+        r#"{"ImageType":"FullResolution","ScanProfile":{"Name":"PKI","ExposureTime":12.5},"Channels":[{"Name":"DAPI","Enabled":true,"ExcitationWavelength":405,"EmissionWavelength":460}],"ObjectiveName":"20x Plan Apo"}"#,
+        11,
+    );
+
+    let mut reader = bioformats::formats::extended::QptiffReader::new();
+    reader.set_id(&path).unwrap();
+
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.format"),
+        Some(MetadataValue::String(value)) if value == "json"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.ImageType"),
+        Some(MetadataValue::String(value)) if value == "FullResolution"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.ScanProfile.Name"),
+        Some(MetadataValue::String(value)) if value == "PKI"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.ScanProfile.ExposureTime"),
+        Some(MetadataValue::Float(value)) if (*value - 12.5).abs() < f64::EPSILON
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.Channels.0.Name"),
+        Some(MetadataValue::String(value)) if value == "DAPI"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.Channels.0.Enabled"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.semantic.acquisition.exposure_time"),
+        Some(MetadataValue::Float(value)) if (*value - 12.5).abs() < f64::EPSILON
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.semantic.channel.0.name"),
+        Some(MetadataValue::String(value)) if value == "DAPI"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.semantic.channel.0.excitation_wavelength"),
+        Some(MetadataValue::Int(405))
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.semantic.channel.0.emission_wavelength"),
+        Some(MetadataValue::Int(460))
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.semantic.instrument.objective"),
+        Some(MetadataValue::String(value)) if value == "20x Plan Apo"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.node_count"),
+        Some(MetadataValue::Int(4))
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.0.path"),
+        Some(MetadataValue::String(value)) if value == "$"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.0.type"),
+        Some(MetadataValue::String(value)) if value == "object"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.0.child_count"),
+        Some(MetadataValue::Int(4))
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.0.container_child_count"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.1.path"),
+        Some(MetadataValue::String(value)) if value == "ScanProfile"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.1.scalar_child_count"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.2.path"),
+        Some(MetadataValue::String(value)) if value == "Channels"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.2.type"),
+        Some(MetadataValue::String(value)) if value == "array"
+    ));
+    assert!(matches!(
+        metadata.get("qptiff.ifd.0.vendor_object.graph.3.path"),
+        Some(MetadataValue::String(value)) if value == "Channels.0"
+    ));
+
+    let ome = reader.ome_metadata().expect("QPTIFF OME metadata");
+    let original_metadata = ome
+        .annotations
+        .iter()
+        .find_map(|annotation| match annotation {
+            OmeAnnotation::MapAnnotation {
+                namespace: Some(ns),
+                values,
+                ..
+            } if ns == "openmicroscopy.org/bioformats/original-metadata" => Some(values),
+            _ => None,
+        })
+        .expect("QPTIFF original metadata annotation");
+    assert!(original_metadata.iter().any(|(key, value)| {
+        key == "qptiff.ifd.0.vendor_object.Channels.0.Name" && value == "DAPI"
+    }));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn gel_linear_reads_tiff_pixels() {
     // A GEL is a TIFF carrying the MD_FILETAG (33445). With LINEAR format (128),
     // pixels pass through as the underlying 16-bit TIFF samples.
@@ -2802,6 +3095,236 @@ fn cellomics_legacy_payload_crops_real_pixels() {
 }
 
 #[test]
+fn cellomics_dib_records_safe_header_and_filename_metadata() {
+    let dir = isolated_tmp_dir("cellomics_metadata");
+    let path = dir.join("AS_09125_050118150001_A03f00d1.DIB");
+    let mut data = vec![0u8; 52];
+    data[0..4].copy_from_slice(&40u32.to_le_bytes());
+    data[4..8].copy_from_slice(&2i32.to_le_bytes());
+    data[8..12].copy_from_slice(&(-2i32).to_le_bytes());
+    data[12..14].copy_from_slice(&1u16.to_le_bytes());
+    data[14..16].copy_from_slice(&8u16.to_le_bytes());
+    data[16..20].copy_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&[1, 2, 3, 4]);
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::extended::CellomicsReader::new();
+    reader.set_id(&path).unwrap();
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("cellomics.file_name"),
+        Some(MetadataValue::String(value)) if value == "AS_09125_050118150001_A03f00d1.DIB"
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.plate"),
+        Some(MetadataValue::String(value)) if value == "AS_09125_050118150001"
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.well"),
+        Some(MetadataValue::String(value)) if value == "A03"
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.field_index"),
+        Some(MetadataValue::Int(0))
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.filename_channel_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.dib.header_size"),
+        Some(MetadataValue::Int(40))
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.dib.top_down"),
+        Some(MetadataValue::String(value)) if value == "true"
+    ));
+
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(
+        ome.images[0].name.as_deref(),
+        Some("AS_09125_050118150001 A03")
+    );
+    assert!(ome.annotations.iter().any(|annotation| {
+        matches!(
+            annotation,
+            OmeAnnotation::MapAnnotation { values, .. }
+                if values.iter().any(|(key, value)| key == "cellomics.well" && value == "A03")
+        )
+    }));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cellomics_dib_assembles_matching_sibling_channel_files() {
+    let dir = isolated_tmp_dir("cellomics_assembly");
+    let path_d0 = dir.join("AS_09125_050118150001_A03f00d0.DIB");
+    let path_d1 = dir.join("AS_09125_050118150001_A03f00d1.DIB");
+    let path_other_field = dir.join("AS_09125_050118150001_A03f01d2.DIB");
+
+    for (path, pixels) in [
+        (&path_d0, [1u8, 2, 3, 4]),
+        (&path_d1, [5u8, 6, 7, 8]),
+        (&path_other_field, [9u8, 10, 11, 12]),
+    ] {
+        let mut data = vec![0u8; 52];
+        data[0..4].copy_from_slice(&40u32.to_le_bytes());
+        data[4..8].copy_from_slice(&2i32.to_le_bytes());
+        data[8..12].copy_from_slice(&2i32.to_le_bytes());
+        data[12..14].copy_from_slice(&1u16.to_le_bytes());
+        data[14..16].copy_from_slice(&8u16.to_le_bytes());
+        data[16..20].copy_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&pixels);
+        std::fs::write(path, data).unwrap();
+    }
+
+    let mut reader = bioformats::formats::extended::CellomicsReader::new();
+    reader.set_id(&path_d1).unwrap();
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("cellomics.assembly"),
+        Some(MetadataValue::String(value)) if value == "sibling_filename_channels"
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.assembled_channel_indices"),
+        Some(MetadataValue::String(value)) if value == "0,1"
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.assembled_files"),
+        Some(MetadataValue::String(value))
+            if value == "AS_09125_050118150001_A03f00d0.DIB,AS_09125_050118150001_A03f00d1.DIB"
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cellomics_dib_assembles_java_o_channel_sibling_files() {
+    let dir = isolated_tmp_dir("cellomics_o_assembly");
+    let path_o1 = dir.join("WHICA-VTI1_090915160001_A01f00o1.DIB");
+    let path_o2 = dir.join("WHICA-VTI1_090915160001_A01f00o2.DIB");
+    let path_other_field = dir.join("WHICA-VTI1_090915160001_A01f01o3.DIB");
+
+    for (path, pixels) in [
+        (&path_o1, [11u8, 12, 13, 14]),
+        (&path_o2, [21u8, 22, 23, 24]),
+        (&path_other_field, [31u8, 32, 33, 34]),
+    ] {
+        let mut data = vec![0u8; 52];
+        data[0..4].copy_from_slice(&40u32.to_le_bytes());
+        data[4..8].copy_from_slice(&2i32.to_le_bytes());
+        data[8..12].copy_from_slice(&2i32.to_le_bytes());
+        data[12..14].copy_from_slice(&1u16.to_le_bytes());
+        data[14..16].copy_from_slice(&8u16.to_le_bytes());
+        data[16..20].copy_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&pixels);
+        std::fs::write(path, data).unwrap();
+    }
+
+    let mut reader = bioformats::formats::extended::CellomicsReader::new();
+    reader.set_id(&path_o2).unwrap();
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![11, 12, 13, 14]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![21, 22, 23, 24]);
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("cellomics.assembly"),
+        Some(MetadataValue::String(value)) if value == "sibling_filename_channels"
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.assembled_channel_indices"),
+        Some(MetadataValue::String(value)) if value == "1,2"
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.assembled_files"),
+        Some(MetadataValue::String(value))
+            if value == "WHICA-VTI1_090915160001_A01f00o1.DIB,WHICA-VTI1_090915160001_A01f00o2.DIB"
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cellomics_dib_groups_same_plate_well_fields_as_series() {
+    let dir = isolated_tmp_dir("cellomics_plate_series");
+    let path_f00_d0 = dir.join("AS_09125_050118150001_A03f00d0.DIB");
+    let path_f00_d1 = dir.join("AS_09125_050118150001_A03f00d1.DIB");
+    let path_f01_d0 = dir.join("AS_09125_050118150001_A03f01d0.DIB");
+    let path_f01_d1 = dir.join("AS_09125_050118150001_A03f01d1.DIB");
+
+    for (path, pixels) in [
+        (&path_f00_d0, [1u8, 2, 3, 4]),
+        (&path_f00_d1, [5u8, 6, 7, 8]),
+        (&path_f01_d0, [11u8, 12, 13, 14]),
+        (&path_f01_d1, [15u8, 16, 17, 18]),
+    ] {
+        let mut data = vec![0u8; 52];
+        data[0..4].copy_from_slice(&40u32.to_le_bytes());
+        data[4..8].copy_from_slice(&2i32.to_le_bytes());
+        data[8..12].copy_from_slice(&2i32.to_le_bytes());
+        data[12..14].copy_from_slice(&1u16.to_le_bytes());
+        data[14..16].copy_from_slice(&8u16.to_le_bytes());
+        data[16..20].copy_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&pixels);
+        std::fs::write(path, data).unwrap();
+    }
+
+    let mut reader = bioformats::formats::extended::CellomicsReader::new();
+    reader.set_id(&path_f01_d1).unwrap();
+    assert_eq!(reader.series_count(), 2);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("cellomics.plate_assembly"),
+        Some(MetadataValue::String(value)) if value == "plate_well_field_filename_series"
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.assembled_series_count"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.field_index"),
+        Some(MetadataValue::Int(0))
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.assembled_channel_indices"),
+        Some(MetadataValue::String(value)) if value == "0,1"
+    ));
+
+    reader.set_series(1).unwrap();
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![11, 12, 13, 14]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![15, 16, 17, 18]);
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("cellomics.series_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.field_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("cellomics.assembled_files"),
+        Some(MetadataValue::String(value))
+            if value == "AS_09125_050118150001_A03f01d0.DIB,AS_09125_050118150001_A03f01d1.DIB"
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn perkinelmer_tolerates_truncated_trailing_tiff_metadata() {
     // PerkinElmer .htm layout: an .htm header plus a matching TIFF pixel file.
     // The TiffWriter lays out pixel strips first and IFD metadata last, so
@@ -2835,6 +3358,103 @@ fn perkinelmer_tolerates_truncated_trailing_tiff_metadata() {
         .expect("trailing-metadata truncation should be tolerated, not rejected");
     assert_eq!(pe.open_bytes(0).unwrap(), vec![1u8, 2, 3, 4, 5, 6]);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+fn append_openlab_liff_v2_tag_header(
+    out: &mut Vec<u8>,
+    tag: i16,
+    sub_tag: i16,
+    next_offset: i32,
+    format: &str,
+) {
+    out.extend_from_slice(&tag.to_be_bytes());
+    out.extend_from_slice(&sub_tag.to_be_bytes());
+    out.extend_from_slice(&next_offset.to_be_bytes());
+    let mut fmt = [0u8; 4];
+    let bytes = format.as_bytes();
+    fmt[..bytes.len().min(4)].copy_from_slice(&bytes[..bytes.len().min(4)]);
+    out.extend_from_slice(&fmt);
+    out.extend_from_slice(&0u32.to_be_bytes());
+}
+
+fn minimal_openlab_liff_with_non_image_tag() -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&[0, 0, 0xff, 0xff]);
+    data.extend_from_slice(b"impr");
+    data.extend_from_slice(&2i32.to_be_bytes());
+    data.extend_from_slice(&1i16.to_be_bytes());
+    data.extend_from_slice(&0i16.to_be_bytes());
+    data.extend_from_slice(&20i32.to_be_bytes());
+
+    append_openlab_liff_v2_tag_header(&mut data, 70, 9, 36, "META");
+    append_openlab_liff_v2_tag_header(&mut data, 67, 3, 0, "RAW ");
+    data.extend_from_slice(&[0u8; 24]);
+    data.extend_from_slice(&1i16.to_be_bytes());
+    data.extend_from_slice(&[0u8; 16]);
+    let name_start = data.len();
+    data.extend_from_slice(b"Well A1 Z1 C1 T1\0");
+    data.resize(name_start + 256, 0);
+    data.extend_from_slice(&0i16.to_be_bytes());
+    data.extend_from_slice(&0i16.to_be_bytes());
+    data.extend_from_slice(&0i16.to_be_bytes());
+    data.extend_from_slice(&1i16.to_be_bytes());
+    data.extend_from_slice(&1i16.to_be_bytes());
+    data.push(7);
+    data
+}
+
+#[test]
+fn openlab_liff_preserves_non_image_tag_headers_as_original_metadata() {
+    let path = tmp("tag_headers.liff");
+    std::fs::write(&path, minimal_openlab_liff_with_non_image_tag()).unwrap();
+
+    let mut reader = bioformats::formats::misc::OpenlabLiffReader::new();
+    reader.set_id(&path).unwrap();
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("openlab.tag_header.count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("openlab.tag_header.0.tag"),
+        Some(MetadataValue::Int(70))
+    ));
+    assert!(matches!(
+        metadata.get("openlab.tag_header.0.sub_tag"),
+        Some(MetadataValue::Int(9))
+    ));
+    assert!(matches!(
+        metadata.get("openlab.tag_header.0.format"),
+        Some(MetadataValue::String(value)) if value == "META"
+    ));
+    assert!(matches!(
+        metadata.get("openlab.tag_header.0.offset"),
+        Some(MetadataValue::Int(20))
+    ));
+    assert!(matches!(
+        metadata.get("openlab.tag_header.0.next_offset"),
+        Some(MetadataValue::Int(36))
+    ));
+
+    let ome = reader.ome_metadata().unwrap();
+    let original_metadata = ome
+        .annotations
+        .iter()
+        .find_map(|annotation| match annotation {
+            OmeAnnotation::MapAnnotation { id, values, .. }
+                if id.as_deref() == Some("Annotation:OriginalMetadata:0") =>
+            {
+                Some(values)
+            }
+            _ => None,
+        });
+    assert!(
+        original_metadata.is_some_and(|values| values
+            .iter()
+            .any(|(key, value)| { key == "openlab.tag_header.0.format" && value == "META" })),
+        "Openlab LIFF tag header should be preserved in OME original metadata"
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -7156,7 +7776,10 @@ fn dicom_metadata_uses_dictionary_names_and_decodes_value_representations() {
 
     dicom_elem_implicit(&mut bytes, 0x0010, 0x0010, b"Doe^Jane");
     dicom_elem_implicit(&mut bytes, 0x0008, 0x103E, b"Metadata parity");
+    // SliceThickness (0018,0050) is NOT used by Java for the physical Z size;
+    // SpacingBetweenSlices (0018,0088) drives DicomReader.pixelSizeZ instead.
     dicom_elem_implicit(&mut bytes, 0x0018, 0x0050, b"0.75");
+    dicom_elem_implicit(&mut bytes, 0x0018, 0x0088, b"0.75");
     dicom_elem_implicit(&mut bytes, 0x0028, 0x0030, b"0.5\\0.25");
     dicom_elem_implicit(&mut bytes, 0x0028, 0x0002, &1u16.to_le_bytes());
     dicom_elem_implicit(&mut bytes, 0x0028, 0x0010, &2u16.to_le_bytes());
@@ -7195,9 +7818,10 @@ fn dicom_metadata_uses_dictionary_names_and_decodes_value_representations() {
         image.name.as_deref(),
         Some("bioformats_fmt_metadata_dictionary.dcm")
     );
-    // PixelSpacing/SliceThickness are stored as raw millimetre OME Length values
-    // to match Java (FormatTools.getPhysicalSizeX(value, UNITS.MILLIMETER)), not
-    // rescaled to micrometres. PixelSpacing is "row\col" so X=col=0.25, Y=row=0.5.
+    // PixelSpacing/SpacingBetweenSlices are stored as raw millimetre OME Length
+    // values to match Java (FormatTools.getPhysicalSizeX(value, UNITS.MILLIMETER)),
+    // not rescaled to micrometres. PixelSpacing is "row\col" so X=col=0.25,
+    // Y=row=0.5; physical Z comes from SpacingBetweenSlices (0018,0088) = 0.75.
     assert_eq!(image.physical_size_x, Some(0.25));
     assert_eq!(image.physical_size_y, Some(0.5));
     assert_eq!(image.physical_size_z, Some(0.75));
@@ -7261,7 +7885,12 @@ fn bdv_preserves_companion_xml_original_metadata() {
     let xml = r#"<SpimData>
   <SequenceDescription>
     <ViewSetups>
-      <ViewSetup><id>0</id><size>3 2 1</size></ViewSetup>
+      <ViewSetup>
+        <id>0</id>
+        <name>sample angle A</name>
+        <size>3 2 1</size>
+        <voxelSize><unit>micrometer</unit><size>0.5 0.6 1.25</size></voxelSize>
+      </ViewSetup>
       <ViewSetup><id>1</id><size>3 2 1</size></ViewSetup>
     </ViewSetups>
     <Timepoints type="range"><first>2</first><last>4</last></Timepoints>
@@ -7297,7 +7926,30 @@ fn bdv_preserves_companion_xml_original_metadata() {
         metadata.get("bdv_level"),
         Some(MetadataValue::Int(0))
     ));
+    assert!(matches!(
+        metadata.get("bdv_view_setup_name"),
+        Some(MetadataValue::String(value)) if value == "sample angle A"
+    ));
+    assert!(matches!(
+        metadata.get("bdv_voxel_unit"),
+        Some(MetadataValue::String(value)) if value == "micrometer"
+    ));
+    assert!(matches!(
+        metadata.get("bdv_voxel_size_x"),
+        Some(MetadataValue::Float(value)) if *value == 0.5
+    ));
+    assert!(matches!(
+        metadata.get("bdv_voxel_size_y"),
+        Some(MetadataValue::Float(value)) if *value == 0.6
+    ));
+    assert!(matches!(
+        metadata.get("bdv_voxel_size_z"),
+        Some(MetadataValue::Float(value)) if *value == 1.25
+    ));
     let ome = reader.ome_metadata().expect("OME metadata");
+    assert_eq!(ome.images[0].physical_size_x, Some(0.5));
+    assert_eq!(ome.images[0].physical_size_y, Some(0.6));
+    assert_eq!(ome.images[0].physical_size_z, Some(1.25));
     let original = ome
         .annotations
         .iter()
@@ -7313,6 +7965,12 @@ fn bdv_preserves_companion_xml_original_metadata() {
     assert!(original
         .iter()
         .any(|(key, value)| key == "bdv_timepoint" && value == "2"));
+    assert!(original
+        .iter()
+        .any(|(key, value)| key == "bdv_view_setup_name" && value == "sample angle A"));
+    assert!(original
+        .iter()
+        .any(|(key, value)| key == "bdv_voxel_size_z" && value == "1.25"));
     let err = reader.open_bytes_region(0, 2, 0, 2, 1).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::Format(ref message) if message.contains("outside image bounds")),
@@ -7547,6 +8205,40 @@ fn imaris_preserves_recording_spacing_and_dataset_metadata() {
         imaris
             .add_fixed_ascii_attr("Version", "9.9.0-test", 32)
             .unwrap();
+        let mut microscope = info.create_group("Microscope").unwrap();
+        microscope
+            .add_fixed_ascii_attr("Model", "Imaris Scope", 32)
+            .unwrap();
+        microscope
+            .add_fixed_ascii_attr("Manufacturer", "Bitplane", 32)
+            .unwrap();
+        let mut objective = info.create_group("Objective_0").unwrap();
+        objective
+            .add_fixed_ascii_attr("Name", "Plan-Apochromat 63x", 32)
+            .unwrap();
+        objective
+            .add_fixed_ascii_attr("Manufacturer", "Zeiss", 32)
+            .unwrap();
+        objective
+            .add_fixed_ascii_attr("Magnification", "63", 16)
+            .unwrap();
+        objective
+            .add_fixed_ascii_attr("NumericalAperture", "1.4", 16)
+            .unwrap();
+        objective
+            .add_fixed_ascii_attr("Immersion", "Oil", 16)
+            .unwrap();
+        objective
+            .add_fixed_ascii_attr("WorkingDistance", "190", 16)
+            .unwrap();
+        let mut detector = info.create_group("Detector").unwrap();
+        detector.add_fixed_ascii_attr("Name", "HyD 1", 16).unwrap();
+        detector.add_fixed_ascii_attr("Type", "PMT", 16).unwrap();
+        detector.add_fixed_ascii_attr("Gain", "2.5", 16).unwrap();
+        detector.add_fixed_ascii_attr("Offset", "1.5", 16).unwrap();
+        let mut laser = info.create_group("Laser_0").unwrap();
+        laser.add_fixed_ascii_attr("Name", "Argon 488", 16).unwrap();
+        laser.add_fixed_ascii_attr("Power", "12.5", 16).unwrap();
         let mut time = info.create_group("TimeInfo").unwrap();
         time.add_attr("FileTimePoints", 1i64).unwrap();
         let mut channel_info = info.create_group("Channel 0").unwrap();
@@ -7614,6 +8306,22 @@ fn imaris_preserves_recording_spacing_and_dataset_metadata() {
         Some(MetadataValue::String(v)) if v == "9.9.0-test"
     ));
     assert!(matches!(
+        meta.series_metadata.get("imaris.microscope.Model"),
+        Some(MetadataValue::String(v)) if v == "Imaris Scope"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.objective.NumericalAperture"),
+        Some(MetadataValue::String(v)) if v == "1.4"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.detector.Gain"),
+        Some(MetadataValue::String(v)) if v == "2.5"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.light_source.Power"),
+        Some(MetadataValue::String(v)) if v == "12.5"
+    ));
+    assert!(matches!(
         meta.series_metadata
             .get("imaris.channel.0.emission_wavelength"),
         Some(MetadataValue::Float(v)) if *v == 520.0
@@ -7644,6 +8352,46 @@ fn imaris_preserves_recording_spacing_and_dataset_metadata() {
     );
     assert_eq!(image.channels[0].emission_wavelength, Some(520.0));
     assert_eq!(image.channels[0].excitation_wavelength, Some(405.0));
+    assert_eq!(image.instrument_ref, Some(0));
+    assert_eq!(image.objective_ref, Some(0));
+    assert_eq!(ome.instruments.len(), 1);
+    let instrument = &ome.instruments[0];
+    assert_eq!(instrument.microscope_model.as_deref(), Some("Imaris Scope"));
+    assert_eq!(
+        instrument.microscope_manufacturer.as_deref(),
+        Some("Bitplane")
+    );
+    assert_eq!(instrument.objectives.len(), 1);
+    assert_eq!(
+        instrument.objectives[0].model.as_deref(),
+        Some("Plan-Apochromat 63x")
+    );
+    assert_eq!(
+        instrument.objectives[0].manufacturer.as_deref(),
+        Some("Zeiss")
+    );
+    assert_eq!(instrument.objectives[0].nominal_magnification, Some(63.0));
+    assert_eq!(instrument.objectives[0].lens_na, Some(1.4));
+    assert_eq!(instrument.objectives[0].immersion.as_deref(), Some("Oil"));
+    assert_eq!(instrument.objectives[0].working_distance, Some(190.0));
+    assert_eq!(instrument.detectors.len(), 1);
+    assert_eq!(instrument.detectors[0].model.as_deref(), Some("HyD 1"));
+    assert_eq!(
+        instrument.detectors[0].detector_type.as_deref(),
+        Some("PMT")
+    );
+    assert_eq!(instrument.detectors[0].gain, Some(2.5));
+    assert_eq!(instrument.detectors[0].offset, Some(1.5));
+    assert_eq!(instrument.light_sources.len(), 1);
+    assert_eq!(
+        instrument.light_sources[0].model.as_deref(),
+        Some("Argon 488")
+    );
+    assert_eq!(
+        instrument.light_sources[0].light_source_type.as_deref(),
+        Some("Laser")
+    );
+    assert_eq!(instrument.light_sources[0].power, Some(12.5));
     let original = ome
         .annotations
         .iter()
@@ -7663,6 +8411,380 @@ fn imaris_preserves_recording_spacing_and_dataset_metadata() {
         key == "imaris.channel.0.color.rgba"
             && value == &(u32::from_be_bytes([26, 51, 77, 255]) as i32).to_string()
     }));
+    assert!(original
+        .iter()
+        .any(|(key, value)| key == "imaris.objective.Name" && value == "Plan-Apochromat 63x"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn imaris_preserves_surpass_object_graph_metadata_without_reading_large_payloads() {
+    let path = tmp("surpass_metadata_ims.ims");
+    let _ = std::fs::remove_file(&path);
+
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut info = file.create_group("DataSetInfo").unwrap();
+        let mut image = info.create_group("Image").unwrap();
+        image.add_fixed_ascii_attr("X", "1", 8).unwrap();
+        image.add_fixed_ascii_attr("Y", "1", 8).unwrap();
+        image.add_fixed_ascii_attr("Z", "1", 8).unwrap();
+    }
+    {
+        let mut scene = file.create_group("Scene").unwrap();
+        scene
+            .add_fixed_ascii_attr("Name", "Root Surpass Scene", 32)
+            .unwrap();
+        let mut surface = scene.create_group("Surfaces 0").unwrap();
+        surface.add_fixed_ascii_attr("Name", "Nuclei", 32).unwrap();
+        surface
+            .add_fixed_ascii_attr("Type", "Surfaces", 32)
+            .unwrap();
+        surface.add_attr("Visible", 1i64).unwrap();
+        let mut statistics = surface.create_group("Statistics").unwrap();
+        statistics
+            .new_dataset_builder("NumberOfSurfaces")
+            .shape(&[1])
+            .write::<i64>(&[3])
+            .unwrap();
+        statistics
+            .new_dataset_builder("Center")
+            .shape(&[3])
+            .write::<f64>(&[1.0, 2.0, 3.0])
+            .unwrap();
+        statistics
+            .new_dataset_builder("RadiusXYZ")
+            .shape(&[3])
+            .write::<f64>(&[4.0, 5.0, 6.0])
+            .unwrap();
+        statistics
+            .new_dataset_builder("IndexT")
+            .shape(&[1])
+            .write::<i64>(&[1])
+            .unwrap();
+        statistics
+            .new_dataset_builder("IndexC")
+            .shape(&[1])
+            .write::<i64>(&[2])
+            .unwrap();
+        statistics
+            .new_dataset_builder("Names")
+            .shape(&[2])
+            .write_fixed_ascii_strings(&["Mean Intensity", "Volume"], 16)
+            .unwrap();
+        statistics
+            .new_dataset_builder("Values")
+            .shape(&[2, 2])
+            .write::<f64>(&[12.5, 13.5, 44.0, 45.0])
+            .unwrap();
+        statistics
+            .new_dataset_builder("LargeMask")
+            .shape(&[33])
+            .write::<u8>(&[7u8; 33])
+            .unwrap();
+    }
+    {
+        let mut dataset = file.create_group("DataSet").unwrap();
+        let mut res = dataset.create_group("ResolutionLevel 0").unwrap();
+        let mut time = res.create_group("TimePoint 0").unwrap();
+        let mut channel = time.create_group("Channel 0").unwrap();
+        channel
+            .new_dataset_builder("Data")
+            .shape(&[1, 1, 1])
+            .write::<u8>(&[42])
+            .unwrap();
+    }
+    file.flush().unwrap();
+
+    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata.get("imaris.surpass.roots"),
+        Some(MetadataValue::String(value)) if value == "Scene"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("imaris.surpass.Scene.Name"),
+        Some(MetadataValue::String(value)) if value == "Root Surpass Scene"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Name"),
+        Some(MetadataValue::String(value)) if value == "Nuclei"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Visible"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.NumberOfSurfaces.value"),
+        Some(MetadataValue::Int(3))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.Center.value"),
+        Some(MetadataValue::String(value)) if value == "1 2 3"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.RadiusXYZ.value"),
+        Some(MetadataValue::String(value)) if value == "4 5 6"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.IndexT.value"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.IndexC.value"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.LargeMask.value_status"),
+        Some(MetadataValue::String(value)) if value == "not_read_large_dataset"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.stat_count"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.value_shape"),
+        Some(MetadataValue::String(value)) if value == "2 2"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.layout"),
+        Some(MetadataValue::String(value)) if value == "stat_rows"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.Mean_Intensity"),
+        Some(MetadataValue::String(value)) if value == "12.5 13.5"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.Volume"),
+        Some(MetadataValue::String(value)) if value == "44 45"
+    ));
+
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(ome.rois.len(), 1);
+    assert_eq!(ome.rois[0].name.as_deref(), Some("Nuclei"));
+    assert!(matches!(
+        ome.rois[0].shapes.first(),
+        Some(OmeShape::Ellipse {
+            x,
+            y,
+            radius_x,
+            radius_y,
+            the_z: Some(3),
+            the_t: Some(1),
+            the_c: Some(2),
+        }) if *x == 1.0 && *y == 2.0 && *radius_x == 4.0 && *radius_y == 5.0
+    ));
+
+    let original = ome
+        .annotations
+        .into_iter()
+        .find_map(|annotation| match annotation {
+            bioformats::OmeAnnotation::MapAnnotation {
+                id: Some(id),
+                values,
+                ..
+            } if id == "Annotation:OriginalMetadata:0" => Some(values),
+            _ => None,
+        })
+        .expect("Imaris original metadata annotation");
+    assert!(original.iter().any(|(key, value)| {
+        key == "imaris.surpass.Scene.Surfaces_0.Statistics.NumberOfSurfaces.value" && value == "3"
+    }));
+    assert!(original.iter().any(|(key, value)| {
+        key == "imaris.surpass.Scene.Surfaces_0.Statistics.LargeMask.value_status"
+            && value == "not_read_large_dataset"
+    }));
+    assert!(original.iter().any(|(key, value)| {
+        key == "imaris.surpass.Scene.Surfaces_0.Statistics.table.Mean_Intensity"
+            && value == "12.5 13.5"
+    }));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![42]);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn imaris_preserves_column_oriented_surpass_statistics_table() {
+    let path = tmp("surpass_column_statistics_ims.ims");
+    let _ = std::fs::remove_file(&path);
+
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut info = file.create_group("DataSetInfo").unwrap();
+        let mut image = info.create_group("Image").unwrap();
+        image.add_fixed_ascii_attr("X", "1", 8).unwrap();
+        image.add_fixed_ascii_attr("Y", "1", 8).unwrap();
+        image.add_fixed_ascii_attr("Z", "1", 8).unwrap();
+    }
+    {
+        let mut scene = file.create_group("Scene").unwrap();
+        let mut surface = scene.create_group("Surfaces 0").unwrap();
+        surface
+            .add_fixed_ascii_attr("Name", "Membranes", 32)
+            .unwrap();
+        let mut statistics = surface.create_group("Statistics").unwrap();
+        statistics
+            .new_dataset_builder("Names")
+            .shape(&[3])
+            .write_fixed_ascii_strings(&["Area", "Volume", "Intensity Mean"], 16)
+            .unwrap();
+        statistics
+            .new_dataset_builder("Values")
+            .shape(&[2, 3])
+            .write::<f64>(&[1.0, 10.0, 100.0, 2.0, 20.0, 200.0])
+            .unwrap();
+    }
+    {
+        let mut dataset = file.create_group("DataSet").unwrap();
+        let mut res = dataset.create_group("ResolutionLevel 0").unwrap();
+        let mut time = res.create_group("TimePoint 0").unwrap();
+        let mut channel = time.create_group("Channel 0").unwrap();
+        channel
+            .new_dataset_builder("Data")
+            .shape(&[1, 1, 1])
+            .write::<u8>(&[9])
+            .unwrap();
+    }
+    file.flush().unwrap();
+
+    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.stat_count"),
+        Some(MetadataValue::Int(3))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.value_shape"),
+        Some(MetadataValue::String(value)) if value == "2 3"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.layout"),
+        Some(MetadataValue::String(value)) if value == "stat_columns"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.Area"),
+        Some(MetadataValue::String(value)) if value == "1 2"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.Volume"),
+        Some(MetadataValue::String(value)) if value == "10 20"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Statistics.table.Intensity_Mean"),
+        Some(MetadataValue::String(value)) if value == "100 200"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![9]);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn imaris_reports_large_surpass_geometry_without_reading_payloads() {
+    let path = tmp("surpass_large_geometry_ims.ims");
+    let _ = std::fs::remove_file(&path);
+
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut info = file.create_group("DataSetInfo").unwrap();
+        let mut image = info.create_group("Image").unwrap();
+        image.add_fixed_ascii_attr("X", "1", 8).unwrap();
+        image.add_fixed_ascii_attr("Y", "1", 8).unwrap();
+        image.add_fixed_ascii_attr("Z", "1", 8).unwrap();
+    }
+    {
+        let mut scene = file.create_group("Scene").unwrap();
+        let mut surface = scene.create_group("Surfaces 0").unwrap();
+        surface.add_fixed_ascii_attr("Name", "Mesh", 16).unwrap();
+        surface
+            .new_dataset_builder("Vertices")
+            .shape(&[12, 3])
+            .write::<f64>(&[1.0; 36])
+            .unwrap();
+        surface
+            .new_dataset_builder("Triangles")
+            .shape(&[12, 3])
+            .write::<i64>(&[0; 36])
+            .unwrap();
+    }
+    {
+        let mut dataset = file.create_group("DataSet").unwrap();
+        let mut res = dataset.create_group("ResolutionLevel 0").unwrap();
+        let mut time = res.create_group("TimePoint 0").unwrap();
+        let mut channel = time.create_group("Channel 0").unwrap();
+        channel
+            .new_dataset_builder("Data")
+            .shape(&[1, 1, 1])
+            .write::<u8>(&[5])
+            .unwrap();
+    }
+    file.flush().unwrap();
+
+    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Vertices.geometry_role"),
+        Some(MetadataValue::String(value)) if value == "vertices"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Vertices.geometry_value_count"),
+        Some(MetadataValue::Int(36))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Vertices.geometry_element_count"),
+        Some(MetadataValue::Int(12))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Vertices.geometry_component_count"),
+        Some(MetadataValue::Int(3))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Vertices.geometry_status"),
+        Some(MetadataValue::String(value)) if value == "not_read_large_geometry"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Vertices.value_status"),
+        Some(MetadataValue::String(value)) if value == "not_read_large_dataset"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Triangles.geometry_role"),
+        Some(MetadataValue::String(value)) if value == "triangles"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("imaris.surpass.Scene.Surfaces_0.Triangles.geometry_element_count"),
+        Some(MetadataValue::Int(12))
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![5]);
+
     let _ = std::fs::remove_file(&path);
 }
 
@@ -7927,6 +9049,46 @@ fn minimal_psd(version: u16, width: u32, height: u32, channels: u16, depth: u16)
     data
 }
 
+fn psd_with_text_resource(tag: u16, payload: &[u8]) -> Vec<u8> {
+    let mut resource = Vec::new();
+    resource.extend_from_slice(b"8BIM");
+    resource.extend_from_slice(&tag.to_be_bytes());
+    resource.push(0); // empty Pascal string name
+    resource.push(0); // pad Pascal name to even length
+    resource.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    resource.extend_from_slice(payload);
+    if payload.len() % 2 == 1 {
+        resource.push(0);
+    }
+
+    let mut data = Vec::new();
+    data.extend_from_slice(b"8BPS");
+    data.extend_from_slice(&1u16.to_be_bytes());
+    data.extend_from_slice(&[0; 6]);
+    data.extend_from_slice(&3u16.to_be_bytes());
+    data.extend_from_slice(&1u32.to_be_bytes());
+    data.extend_from_slice(&1u32.to_be_bytes());
+    data.extend_from_slice(&8u16.to_be_bytes());
+    data.extend_from_slice(&3u16.to_be_bytes());
+    data.extend_from_slice(&0u32.to_be_bytes()); // color mode data
+    data.extend_from_slice(&(resource.len() as u32).to_be_bytes());
+    data.extend_from_slice(&resource);
+    data.extend_from_slice(&0u32.to_be_bytes()); // layer/mask block
+    data.extend_from_slice(&0u16.to_be_bytes()); // raw composite pixels
+    data.extend_from_slice(&[1, 2, 3]);
+    data
+}
+
+fn psd_utf16be_string(text: &str) -> Vec<u8> {
+    let units = text.encode_utf16().collect::<Vec<_>>();
+    let mut data = Vec::new();
+    data.extend_from_slice(&(units.len() as u32).to_be_bytes());
+    for unit in units {
+        data.extend_from_slice(&unit.to_be_bytes());
+    }
+    data
+}
+
 #[test]
 fn photoshop_rejects_unknown_header_values_and_short_payload() {
     let version = tmp("bad_version.psd");
@@ -7974,6 +9136,452 @@ fn photoshop_rejects_unknown_header_values_and_short_payload() {
         .unwrap_err();
     assert!(err.to_string().contains("failed to fill whole buffer"));
     let _ = std::fs::remove_file(short);
+}
+
+#[test]
+fn photoshop_preserves_header_and_image_resource_metadata() {
+    let path = tmp("metadata_resource.psd");
+    std::fs::write(
+        &path,
+        psd_with_text_resource(1035, b"https://example.invalid/image"),
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3]);
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.version"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.color_mode"),
+        Some(MetadataValue::String(value)) if value == "RGB"
+    ));
+    assert!(matches!(
+        metadata.get("psd.compression"),
+        Some(MetadataValue::String(value)) if value == "Raw"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resources.count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1035.type"),
+        Some(MetadataValue::String(value)) if value == "Url"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1035.text"),
+        Some(MetadataValue::String(value)) if value == "https://example.invalid/image"
+    ));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn photoshop_decodes_pixel_aspect_ratio_image_resource() {
+    let path = tmp("pixel_aspect_ratio_resource.psd");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_be_bytes());
+    payload.extend_from_slice(&1.25f64.to_bits().to_be_bytes());
+    std::fs::write(&path, psd_with_text_resource(1064, &payload)).unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.image_resource.1064.type"),
+        Some(MetadataValue::String(value)) if value == "PixelAspectRatio"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1064.bytes"),
+        Some(MetadataValue::Int(12))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1064.version"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1064.aspect_ratio"),
+        Some(MetadataValue::Float(value)) if (*value - 1.25).abs() < 1.0e-12
+    ));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn photoshop_decodes_resolution_info_image_resource() {
+    let path = tmp("resolution_info_resource.psd");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(300u32 << 16).to_be_bytes());
+    payload.extend_from_slice(&1u16.to_be_bytes());
+    payload.extend_from_slice(&1u16.to_be_bytes());
+    payload.extend_from_slice(&(150u32 << 16).to_be_bytes());
+    payload.extend_from_slice(&2u16.to_be_bytes());
+    payload.extend_from_slice(&3u16.to_be_bytes());
+    std::fs::write(&path, psd_with_text_resource(1005, &payload)).unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.image_resource.1005.type"),
+        Some(MetadataValue::String(value)) if value == "ResolutionInfo"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1005.bytes"),
+        Some(MetadataValue::Int(16))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1005.horizontal_resolution"),
+        Some(MetadataValue::Float(value)) if (*value - 300.0).abs() < 1.0e-12
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1005.horizontal_resolution_unit"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1005.width_unit"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1005.vertical_resolution"),
+        Some(MetadataValue::Float(value)) if (*value - 150.0).abs() < 1.0e-12
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1005.vertical_resolution_unit"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1005.height_unit"),
+        Some(MetadataValue::Int(3))
+    ));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn photoshop_decodes_display_info_image_resource() {
+    let path = tmp("display_info_resource.psd");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u16.to_be_bytes());
+    payload.extend_from_slice(&65535u16.to_be_bytes());
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    payload.extend_from_slice(&80u16.to_be_bytes());
+    payload.push(2);
+    payload.push(0);
+    std::fs::write(&path, psd_with_text_resource(1007, &payload)).unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.image_resource.1007.type"),
+        Some(MetadataValue::String(value)) if value == "DisplayInfo"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1007.display_info_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1007.display_info.0.color_space"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1007.display_info.0.color_components"),
+        Some(MetadataValue::String(value)) if value == "65535,0,0,0"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1007.display_info.0.opacity"),
+        Some(MetadataValue::Int(80))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1007.display_info.0.kind"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(!metadata.contains_key("psd.image_resource.1007.parse_status"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn photoshop_decodes_print_flags_image_resource() {
+    let path = tmp("print_flags_resource.psd");
+    std::fs::write(
+        &path,
+        psd_with_text_resource(1011, &[1, 0, 1, 1, 0, 0, 1, 0, 1]),
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.image_resource.1011.type"),
+        Some(MetadataValue::String(value)) if value == "PrintFlags"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1011.labels"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1011.crop_marks"),
+        Some(MetadataValue::Bool(false))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1011.color_bars"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1011.registration_marks"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1011.interpolate"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1011.print_flags"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(!metadata.contains_key("psd.image_resource.1011.parse_status"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn photoshop_decodes_print_flags_information_image_resource() {
+    let path = tmp("print_flags_information_resource.psd");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u16.to_be_bytes());
+    payload.push(1);
+    payload.push(0);
+    payload.extend_from_slice(&144u32.to_be_bytes());
+    payload.extend_from_slice(&72u16.to_be_bytes());
+    std::fs::write(&path, psd_with_text_resource(10000, &payload)).unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.image_resource.10000.type"),
+        Some(MetadataValue::String(value)) if value == "PrintFlagsInformation"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.10000.version"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.10000.center_crop_marks"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.10000.reserved"),
+        Some(MetadataValue::Int(0))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.10000.bleed_width"),
+        Some(MetadataValue::Int(144))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.10000.bleed_width_scale"),
+        Some(MetadataValue::Int(72))
+    ));
+    assert!(!metadata.contains_key("psd.image_resource.10000.parse_status"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn photoshop_print_flags_information_records_malformed_payloads() {
+    let short = tmp("short_print_flags_information_resource.psd");
+    std::fs::write(&short, psd_with_text_resource(10000, &[0, 1, 1])).unwrap();
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&short).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("psd.image_resource.10000.parse_status"),
+        Some(MetadataValue::String(value)) if value == "truncated"
+    ));
+    let _ = std::fs::remove_file(short);
+
+    let trailing = tmp("trailing_print_flags_information_resource.psd");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u16.to_be_bytes());
+    payload.push(0);
+    payload.push(0);
+    payload.extend_from_slice(&144u32.to_be_bytes());
+    payload.extend_from_slice(&72u16.to_be_bytes());
+    payload.extend_from_slice(&[9, 10]);
+    std::fs::write(&trailing, psd_with_text_resource(10000, &payload)).unwrap();
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&trailing).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("psd.image_resource.10000.parse_status"),
+        Some(MetadataValue::String(value)) if value == "trailing_2_bytes"
+    ));
+    let _ = std::fs::remove_file(trailing);
+}
+
+#[test]
+fn photoshop_decodes_version_info_image_resource() {
+    let path = tmp("version_info_resource.psd");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_be_bytes());
+    payload.push(1);
+    payload.extend_from_slice(&psd_utf16be_string("Writer"));
+    payload.extend_from_slice(&psd_utf16be_string("Reader"));
+    payload.extend_from_slice(&2u32.to_be_bytes());
+    std::fs::write(&path, psd_with_text_resource(1057, &payload)).unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.image_resource.1057.type"),
+        Some(MetadataValue::String(value)) if value == "VersionInfo"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1057.version"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1057.has_real_merged_data"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1057.writer_name"),
+        Some(MetadataValue::String(value)) if value == "Writer"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1057.reader_name"),
+        Some(MetadataValue::String(value)) if value == "Reader"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1057.file_version"),
+        Some(MetadataValue::Int(2))
+    ));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn photoshop_decodes_copyright_flag_image_resource() {
+    let path = tmp("copyright_flag_resource.psd");
+    std::fs::write(&path, psd_with_text_resource(1034, &[1])).unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.image_resource.1034.type"),
+        Some(MetadataValue::String(value)) if value == "CopyrightFlag"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1034.bytes"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1034.copyrighted"),
+        Some(MetadataValue::Bool(true))
+    ));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn photoshop_decodes_global_angle_image_resource() {
+    let path = tmp("global_angle_resource.psd");
+    std::fs::write(&path, psd_with_text_resource(1037, &120i32.to_be_bytes())).unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.image_resource.1037.type"),
+        Some(MetadataValue::String(value)) if value == "GlobalAngle"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1037.bytes"),
+        Some(MetadataValue::Int(4))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1037.angle"),
+        Some(MetadataValue::Int(120))
+    ));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn photoshop_decodes_icc_profile_image_resource_metadata() {
+    let path = tmp("icc_profile_resource.psd");
+    let mut payload = vec![0u8; 128];
+    payload[0..4].copy_from_slice(&128u32.to_be_bytes());
+    payload[8] = 4;
+    payload[9] = 0x30;
+    payload[12..16].copy_from_slice(b"mntr");
+    payload[16..20].copy_from_slice(b"RGB ");
+    payload[20..24].copy_from_slice(b"XYZ ");
+    payload[36..40].copy_from_slice(b"acsp");
+    std::fs::write(&path, psd_with_text_resource(1039, &payload)).unwrap();
+
+    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    reader.set_id(&path).unwrap();
+
+    let metadata = &reader.metadata().series_metadata;
+    assert!(matches!(
+        metadata.get("psd.image_resource.1039.type"),
+        Some(MetadataValue::String(value)) if value == "ICCProfile"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1039.profile_bytes"),
+        Some(MetadataValue::Int(128))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1039.profile_applied"),
+        Some(MetadataValue::Bool(false))
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1039.version"),
+        Some(MetadataValue::String(value)) if value == "4.3"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1039.profile_class"),
+        Some(MetadataValue::String(value)) if value == "mntr"
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1039.color_space"),
+        Some(MetadataValue::String(value)) if value == "RGB "
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1039.pcs"),
+        Some(MetadataValue::String(value)) if value == "XYZ "
+    ));
+    assert!(matches!(
+        metadata.get("psd.image_resource.1039.signature"),
+        Some(MetadataValue::String(value)) if value == "acsp"
+    ));
+    assert!(!metadata.contains_key("psd.image_resource.1039.parse_status"));
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -8341,6 +9949,301 @@ fn nd2_uses_modern_loop_counts_for_z_and_t_dimensions() {
 }
 
 #[test]
+fn nd2_records_modern_loop_order_evidence_from_xml() {
+    let path = tmp("loop_order_evidence.nd2");
+    let mut bytes = Vec::new();
+    let attr_xml = br#"<?xml version="1.0"?>
+<variant>
+  <uiWidth value="1"/>
+  <uiHeight value="1"/>
+  <uiComp value="1"/>
+  <uiBpc value="8"/>
+  <uiCount runtype="CLxXYPosLoop" value="1"/>
+  <uiCount runtype="CLxTimeLoop" value="3"/>
+  <uiCount runtype="CLxZStackLoop" value="2"/>
+</variant>"#;
+    push_nd2_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
+    for i in 0..6u8 {
+        push_nd2_chunk(&mut bytes, &format!("ImageDataSeq|{}!", i), &[30 + i, 0]);
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_z, 2);
+    assert_eq!(reader.metadata().size_t, 3);
+    assert_eq!(reader.metadata().image_count, 6);
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_loop_order"),
+        Some(MetadataValue::String(value)) if value == "XYPosLoop,TimeLoop,ZStackLoop"
+    ));
+    assert!(matches!(
+        md.get("nd2_loop_count_evidence"),
+        Some(MetadataValue::String(value)) if value == "XYPosLoop=1,TimeLoop=3,ZStackLoop=2"
+    ));
+    assert_eq!(reader.open_bytes(5).unwrap(), vec![35]);
+}
+
+#[test]
+fn nd2_uses_unambiguous_xml_loop_order_for_contiguous_xy_position_series() {
+    let path = tmp("xml_loop_order_contiguous_xy_positions.nd2");
+    let mut bytes = Vec::new();
+    let attr_xml = br#"<?xml version="1.0"?>
+<variant>
+  <uiWidth value="1"/>
+  <uiHeight value="1"/>
+  <uiComp value="1"/>
+  <uiBpc value="8"/>
+  <uiCount runtype="CLxXYPosLoop" value="2"/>
+  <uiCount runtype="CLxZStackLoop" value="2"/>
+</variant>"#;
+    push_nd2_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
+    for (index, value) in [10u8, 11, 20, 21].into_iter().enumerate() {
+        push_nd2_chunk(&mut bytes, &format!("ImageDataSeq|{}!", index), &[value, 0]);
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.series_count(), 2);
+    assert_eq!(reader.metadata().size_z, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_loop_series_handling"),
+        Some(MetadataValue::String(value)) if value == "split_xy_positions_contiguous_full_series"
+    ));
+    assert!(matches!(
+        md.get("nd2_loop_series_assumed_layout"),
+        Some(MetadataValue::String(value)) if value == "contiguous"
+    ));
+    assert!(matches!(
+        md.get("nd2_loop_series_layout_source"),
+        Some(MetadataValue::String(value)) if value == "xml_loop_order_outer_to_inner"
+    ));
+    assert!(matches!(
+        md.get("nd2_series_source_planes"),
+        Some(MetadataValue::String(value)) if value == "0,1"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![10]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![11]);
+
+    reader.set_series(1).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_series_source_planes"),
+        Some(MetadataValue::String(value)) if value == "2,3"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![20]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![21]);
+}
+
+#[test]
+fn nd2_splits_simple_xy_position_loop_into_series() {
+    let path = tmp("xy_position_series.nd2");
+    let mut bytes = Vec::new();
+    let attr_xml = br#"<?xml version="1.0"?>
+<variant>
+  <uiWidth value="1"/>
+  <uiHeight value="1"/>
+  <uiComp value="1"/>
+  <uiBpc value="8"/>
+  <uiCount runtype="CLxXYPosLoop" value="2"/>
+</variant>"#;
+    push_nd2_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
+    push_nd2_chunk(&mut bytes, "ImageDataSeq|0!", &[21, 0]);
+    push_nd2_chunk(&mut bytes, "ImageDataSeq|1!", &[37, 0]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.series_count(), 2);
+    assert_eq!(reader.metadata().image_count, 1);
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_loop_series_handling"),
+        Some(MetadataValue::String(value)) if value == "split_xy_positions_one_plane_each"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![21]);
+
+    reader.set_series(1).unwrap();
+    assert_eq!(reader.metadata().image_count, 1);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("nd2_series_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![37]);
+}
+
+#[test]
+fn nd2_splits_interleaved_xy_position_full_series() {
+    let path = tmp("xy_position_full_series.nd2");
+    let mut bytes = Vec::new();
+    let attr_xml = br#"<?xml version="1.0"?>
+<variant>
+  <uiWidth value="1"/>
+  <uiHeight value="1"/>
+  <uiComp value="1"/>
+  <uiBpc value="8"/>
+  <uiCount runtype="CLxXYPosLoop" value="2"/>
+  <uiCount runtype="CLxZStackLoop" value="2"/>
+</variant>"#;
+    push_nd2_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
+    for (index, value) in [10u8, 20, 11, 21].into_iter().enumerate() {
+        push_nd2_chunk(&mut bytes, &format!("ImageDataSeq|{}!", index), &[value, 0]);
+        push_nd2_chunk(
+            &mut bytes,
+            &format!("ImageMetadataSeqLV|{}!", index),
+            format!(
+                r#"<dTimeMSec value="{}"/><dZPos value="{}"/>"#,
+                index * 100,
+                index
+            )
+            .as_bytes(),
+        );
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.series_count(), 2);
+    assert_eq!(reader.metadata().size_z, 2);
+    assert_eq!(reader.metadata().size_t, 1);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_loop_series_handling"),
+        Some(MetadataValue::String(value)) if value == "split_xy_positions_interleaved_full_series"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_loop_series_candidate_layouts"),
+        Some(MetadataValue::String(value)) if value == "interleaved,contiguous"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_loop_series_assumed_layout"),
+        Some(MetadataValue::String(value)) if value == "interleaved"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_series_source_planes"),
+        Some(MetadataValue::String(value)) if value == "0,2"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![10]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![11]);
+    let ome0 = reader.ome_metadata().unwrap();
+    assert_eq!(ome0.images[0].planes[0].position_z, Some(0.0));
+    assert_eq!(ome0.images[0].planes[1].position_z, Some(2.0));
+    assert_eq!(ome0.images[0].planes[1].delta_t, Some(0.2));
+
+    reader.set_series(1).unwrap();
+    assert_eq!(reader.metadata().size_z, 2);
+    assert_eq!(reader.metadata().size_t, 1);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_series_source_planes"),
+        Some(MetadataValue::String(value)) if value == "1,3"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![20]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![21]);
+    let ome1 = reader.ome_metadata().unwrap();
+    assert_eq!(ome1.images[0].planes[0].position_z, Some(1.0));
+    assert_eq!(ome1.images[0].planes[1].position_z, Some(3.0));
+    assert_eq!(ome1.images[0].planes[1].delta_t, Some(0.3));
+}
+
+#[test]
+fn nd2_splits_contiguous_xy_position_full_series_when_z_metadata_disambiguates() {
+    let path = tmp("xy_position_contiguous_full_series.nd2");
+    let mut bytes = Vec::new();
+    let attr_xml = br#"<?xml version="1.0"?>
+<variant>
+  <uiWidth value="1"/>
+  <uiHeight value="1"/>
+  <uiComp value="1"/>
+  <uiBpc value="8"/>
+  <uiCount runtype="CLxXYPosLoop" value="2"/>
+  <uiCount runtype="CLxZStackLoop" value="2"/>
+</variant>"#;
+    push_nd2_chunk(&mut bytes, "ImageAttributesLV!", attr_xml);
+    for (index, (value, z)) in [(10u8, 0.0), (11, 1.0), (20, 0.0), (21, 1.0)]
+        .into_iter()
+        .enumerate()
+    {
+        push_nd2_chunk(&mut bytes, &format!("ImageDataSeq|{}!", index), &[value, 0]);
+        push_nd2_chunk(
+            &mut bytes,
+            &format!("ImageMetadataSeqLV|{}!", index),
+            format!(
+                r#"<dTimeMSec value="{}"/><dZPos value="{}"/>"#,
+                index * 100,
+                z
+            )
+            .as_bytes(),
+        );
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.series_count(), 2);
+    assert_eq!(reader.metadata().size_z, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_loop_series_handling"),
+        Some(MetadataValue::String(value)) if value == "split_xy_positions_contiguous_full_series"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_loop_series_assumed_layout"),
+        Some(MetadataValue::String(value)) if value == "contiguous"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_series_source_planes"),
+        Some(MetadataValue::String(value)) if value == "0,1"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![10]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![11]);
+    let ome0 = reader.ome_metadata().unwrap();
+    assert_eq!(ome0.images[0].planes[0].position_z, Some(0.0));
+    assert_eq!(ome0.images[0].planes[1].position_z, Some(1.0));
+
+    reader.set_series(1).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_series_source_planes"),
+        Some(MetadataValue::String(value)) if value == "2,3"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![20]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![21]);
+    let ome1 = reader.ome_metadata().unwrap();
+    assert_eq!(ome1.images[0].planes[0].position_z, Some(0.0));
+    assert_eq!(ome1.images[0].planes[1].position_z, Some(1.0));
+}
+
+#[test]
 fn nd2_decodes_raw_frame_with_eight_byte_prefix() {
     let path = tmp("raw_frame_prefix.nd2");
     let mut frame = b"ND2FRAME".to_vec();
@@ -8348,6 +10251,39 @@ fn nd2_decodes_raw_frame_with_eight_byte_prefix() {
     write_synthetic_nd2(&path, &frame);
 
     let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![17, 23]);
+}
+
+#[test]
+fn nd2_decodes_java_style_raw_frame_with_trailing_structured_bytes() {
+    let path = tmp("raw_frame_prefix_trailer.nd2");
+    let mut frame = 1.25f64.to_le_bytes().to_vec();
+    frame.extend_from_slice(&[17, 23]);
+    frame.extend_from_slice(b"TAIL");
+    write_synthetic_nd2(&path, &frame);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "raw_with_8_byte_prefix_and_trailer"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_image_data_payload_offsets"),
+        Some(MetadataValue::String(value)) if value == "8"
+    ));
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_image_data_timestamps"),
+        Some(MetadataValue::String(value)) if value == "1.25"
+    ));
     assert_eq!(reader.open_bytes(0).unwrap(), vec![17, 23]);
 }
 
@@ -8399,6 +10335,290 @@ fn nd2_rejects_unrecognized_oversized_frame_prefix() {
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(msg) if msg.contains("ImageDataSeq|0!") && msg.contains("length 5") && msg.contains("unsupported structured frame encoding"))
     );
+}
+
+#[test]
+fn nd2_decodes_raw_frame_from_little_endian_chunk_table() {
+    let path = tmp("chunk_table_frame.nd2");
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&2u32.to_le_bytes());
+    frame.extend_from_slice(&24u32.to_le_bytes());
+    frame.extend_from_slice(&1u32.to_le_bytes());
+    frame.extend_from_slice(&26u32.to_le_bytes());
+    frame.extend_from_slice(&1u32.to_le_bytes());
+    frame.extend_from_slice(b"gap!");
+    frame.push(17);
+    frame.push(0);
+    frame.push(23);
+    write_synthetic_nd2(&path, &frame);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le32"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_encodings"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le32"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_tables"),
+        Some(MetadataValue::String(value))
+            if value == "plane=0:offset=0,entry_width=4,count=2,first_payload=24,payload_bytes=2"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_table_ranges"),
+        Some(MetadataValue::String(value)) if value == "plane=0:24..25,26..27"
+    ));
+
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![17, 23]);
+}
+
+#[test]
+fn nd2_decodes_timestamp_prefixed_raw_frame_from_little_endian_chunk_table() {
+    let path = tmp("timestamp_prefixed_chunk_table_frame.nd2");
+    let mut frame = 2.5f64.to_le_bytes().to_vec();
+    frame.extend_from_slice(&2u32.to_le_bytes());
+    frame.extend_from_slice(&32u32.to_le_bytes());
+    frame.extend_from_slice(&1u32.to_le_bytes());
+    frame.extend_from_slice(&35u32.to_le_bytes());
+    frame.extend_from_slice(&1u32.to_le_bytes());
+    frame.resize(32, 0);
+    frame.push(17);
+    frame.resize(35, 0);
+    frame.push(23);
+    write_synthetic_nd2(&path, &frame);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le32"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_payload_offsets"),
+        Some(MetadataValue::String(value)) if value == "8"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_timestamps"),
+        Some(MetadataValue::String(value)) if value == "2.5"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_tables"),
+        Some(MetadataValue::String(value))
+            if value == "plane=0:offset=8,entry_width=4,count=2,first_payload=32,payload_bytes=2"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_table_ranges"),
+        Some(MetadataValue::String(value)) if value == "plane=0:32..33,35..36"
+    ));
+
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![17, 23]);
+}
+
+#[test]
+fn nd2_decodes_raw_frame_from_little_endian_u64_chunk_table() {
+    let path = tmp("chunk_table_u64_frame.nd2");
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&2u32.to_le_bytes());
+    frame.extend_from_slice(&40u64.to_le_bytes());
+    frame.extend_from_slice(&1u64.to_le_bytes());
+    frame.extend_from_slice(&42u64.to_le_bytes());
+    frame.extend_from_slice(&1u64.to_le_bytes());
+    frame.extend_from_slice(b"gap!");
+    frame.push(17);
+    frame.push(0);
+    frame.push(23);
+    write_synthetic_nd2(&path, &frame);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le64"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_encodings"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le64"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_tables"),
+        Some(MetadataValue::String(value))
+            if value == "plane=0:offset=0,entry_width=8,count=2,first_payload=40,payload_bytes=2"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_table_ranges"),
+        Some(MetadataValue::String(value)) if value == "plane=0:40..41,42..43"
+    ));
+
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![17, 23]);
+}
+
+#[test]
+fn nd2_decodes_raw_frame_from_4096_prefixed_little_endian_chunk_table() {
+    let path = tmp("chunk_table_after_4096_prefix_frame.nd2");
+    let mut frame = vec![0u8; 4096];
+    frame.extend_from_slice(&2u32.to_le_bytes());
+    frame.extend_from_slice(&4120u32.to_le_bytes());
+    frame.extend_from_slice(&1u32.to_le_bytes());
+    frame.extend_from_slice(&4123u32.to_le_bytes());
+    frame.extend_from_slice(&1u32.to_le_bytes());
+    frame.resize(4120, 0);
+    frame.push(17);
+    frame.resize(4123, 0);
+    frame.push(23);
+    write_synthetic_nd2(&path, &frame);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le32"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_payload_offsets"),
+        Some(MetadataValue::String(value)) if value == "4096"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_tables"),
+        Some(MetadataValue::String(value))
+            if value == "plane=0:offset=4096,entry_width=4,count=2,first_payload=4120,payload_bytes=2"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_table_ranges"),
+        Some(MetadataValue::String(value)) if value == "plane=0:4120..4121,4123..4124"
+    ));
+
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![17, 23]);
+}
+
+#[test]
+fn nd2_routes_zlib_frame_from_little_endian_u64_chunk_table() {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let path = tmp("chunk_table_u64_zlib_frame.nd2");
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[31, 47]).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let split = compressed.len() / 2;
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&2u32.to_le_bytes());
+    let first_offset = 40u64;
+    let second_offset = first_offset + split as u64 + 3;
+    frame.extend_from_slice(&first_offset.to_le_bytes());
+    frame.extend_from_slice(&(split as u64).to_le_bytes());
+    frame.extend_from_slice(&second_offset.to_le_bytes());
+    frame.extend_from_slice(&((compressed.len() - split) as u64).to_le_bytes());
+    frame.extend_from_slice(b"gap!");
+    frame.extend_from_slice(&compressed[..split]);
+    frame.extend_from_slice(b"pad");
+    frame.extend_from_slice(&compressed[split..]);
+    write_synthetic_nd2(&path, &frame);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert!(matches!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le64_zlib"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![31, 47]);
+}
+
+#[test]
+fn nd2_routes_zlib_frame_from_4096_prefixed_little_endian_chunk_table() {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let path = tmp("chunk_table_after_4096_prefix_zlib_frame.nd2");
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[31, 47]).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let split = compressed.len() / 2;
+
+    let mut frame = vec![0u8; 4096];
+    frame.extend_from_slice(&2u32.to_le_bytes());
+    let first_offset = 4120u32;
+    let second_offset = first_offset + split as u32 + 3;
+    frame.extend_from_slice(&first_offset.to_le_bytes());
+    frame.extend_from_slice(&(split as u32).to_le_bytes());
+    frame.extend_from_slice(&second_offset.to_le_bytes());
+    frame.extend_from_slice(&((compressed.len() - split) as u32).to_le_bytes());
+    frame.resize(first_offset as usize, 0);
+    frame.extend_from_slice(&compressed[..split]);
+    frame.extend_from_slice(b"pad");
+    frame.extend_from_slice(&compressed[split..]);
+    write_synthetic_nd2(&path, &frame);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le32_zlib"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_payload_offsets"),
+        Some(MetadataValue::String(value)) if value == "4096"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_tables"),
+        Some(MetadataValue::String(value))
+            if value.contains("plane=0:offset=4096,entry_width=4,count=2,first_payload=4120,payload_bytes=")
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![31, 47]);
+}
+
+#[test]
+fn nd2_decodes_per_chunk_zlib_chunk_table() {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let path = tmp("chunk_table_per_chunk_zlib.nd2");
+    let compress = |value: u8| {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&[value]).unwrap();
+        encoder.finish().unwrap()
+    };
+    let first = compress(17);
+    let second = compress(23);
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&2u32.to_le_bytes());
+    let first_offset = 20u32;
+    let second_offset = first_offset + first.len() as u32 + 3;
+    frame.extend_from_slice(&first_offset.to_le_bytes());
+    frame.extend_from_slice(&(first.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&second_offset.to_le_bytes());
+    frame.extend_from_slice(&(second.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&first);
+    frame.extend_from_slice(b"pad");
+    frame.extend_from_slice(&second);
+    write_synthetic_nd2(&path, &frame);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("nd2_first_image_data_encoding"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le32_per_chunk_zlib"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_encodings"),
+        Some(MetadataValue::String(value)) if value == "chunk_table_le32_per_chunk_zlib"
+    ));
+    assert!(matches!(
+        md.get("nd2_image_data_chunk_tables"),
+        Some(MetadataValue::String(value))
+            if value.contains("plane=0:offset=0,entry_width=4,count=2,first_payload=20,payload_bytes=")
+    ));
+
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![17, 23]);
 }
 
 #[test]
@@ -9507,6 +11727,16 @@ fn quicktime_stts_atom(entries: &[(u32, u32)]) -> Vec<u8> {
     quicktime_full_atom(b"stts", 0, &payload)
 }
 
+fn quicktime_ctts_atom(entries: &[(u32, u32)]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for &(sample_count, sample_offset) in entries {
+        payload.extend_from_slice(&sample_count.to_be_bytes());
+        payload.extend_from_slice(&sample_offset.to_be_bytes());
+    }
+    quicktime_full_atom(b"ctts", 0, &payload)
+}
+
 fn quicktime_elst_atom(entries: &[(u32, i32, i32)]) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
@@ -9521,6 +11751,7 @@ fn quicktime_elst_atom(entries: &[(u32, i32, i32)]) -> Vec<u8> {
 struct QuickTimeTimingAtoms {
     mdhd: Option<Vec<u8>>,
     stts: Option<Vec<u8>>,
+    ctts: Option<Vec<u8>>,
     elst: Option<Vec<u8>>,
 }
 
@@ -9605,6 +11836,9 @@ fn quicktime_video_track_atom_with_timing(
     if let Some(timing) = timing {
         if let Some(stts) = &timing.stts {
             stbl_payload.extend_from_slice(stts);
+        }
+        if let Some(ctts) = &timing.ctts {
+            stbl_payload.extend_from_slice(ctts);
         }
     }
 
@@ -9795,6 +12029,7 @@ fn quicktime_records_media_timescale_and_sample_durations() {
     let timing = QuickTimeTimingAtoms {
         mdhd: Some(quicktime_mdhd_atom(600, 160)),
         stts: Some(quicktime_stts_atom(&[(2, 40), (1, 80)])),
+        ctts: None,
         elst: None,
     };
     let mov = quicktime_test_movie_with_timing(
@@ -9894,6 +12129,7 @@ fn quicktime_records_edit_list_metadata() {
     let timing = QuickTimeTimingAtoms {
         mdhd: Some(quicktime_mdhd_atom(1000, 2000)),
         stts: Some(quicktime_stts_atom(&[(2, 1000)])),
+        ctts: None,
         elst: Some(quicktime_elst_atom(&[
             (500, -1, 1 << 16),
             (1500, 1000, 1 << 16),
@@ -9947,12 +12183,65 @@ fn quicktime_records_edit_list_metadata() {
 }
 
 #[test]
+fn quicktime_applies_composition_time_offsets() {
+    let path = tmp("composition_offsets.mov");
+    let sample0 = [1u8, 2, 3];
+    let sample1 = [4u8, 5, 6];
+    let sample2 = [7u8, 8, 9];
+    let timing = QuickTimeTimingAtoms {
+        mdhd: Some(quicktime_mdhd_atom(1000, 3000)),
+        stts: Some(quicktime_stts_atom(&[(3, 1000)])),
+        ctts: Some(quicktime_ctts_atom(&[(1, 500), (2, 0)])),
+        elst: None,
+    };
+    let mov = quicktime_test_movie_with_timing(
+        b"raw ",
+        1,
+        1,
+        &[&sample0, &sample1, &sample2],
+        false,
+        0,
+        Some(&timing),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.ctts.entries"),
+        Some(MetadataValue::String(value)) if value == "1x500,2x0"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_composition_offset_ticks"),
+        Some(MetadataValue::String(value)) if value == "500,0,0"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.ctts.presentation_status"),
+        Some(MetadataValue::String(value)) if value == "applied"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_presentation_time_ticks"),
+        Some(MetadataValue::String(value)) if value == "500,1000,2000"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_presentation_time_seconds"),
+        Some(MetadataValue::String(value)) if value == "0.5,1,2"
+    ));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn quicktime_rejects_stts_sample_count_mismatch() {
     let path = tmp("bad_stts_count.mov");
     let sample = [1u8, 2, 3];
     let timing = QuickTimeTimingAtoms {
         mdhd: Some(quicktime_mdhd_atom(1000, 1000)),
         stts: Some(quicktime_stts_atom(&[(2, 1000)])),
+        ctts: None,
         elst: None,
     };
     let mov = quicktime_test_movie_with_timing(b"raw ", 1, 1, &[&sample], false, 0, Some(&timing));
@@ -9965,6 +12254,30 @@ fn quicktime_rejects_stts_sample_count_mismatch() {
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("stts sample count 2 does not match stsz sample count 1")),
         "unexpected QuickTime stts mismatch error: {err}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_rejects_ctts_sample_count_mismatch() {
+    let path = tmp("bad_ctts_count.mov");
+    let sample = [1u8, 2, 3];
+    let timing = QuickTimeTimingAtoms {
+        mdhd: Some(quicktime_mdhd_atom(1000, 1000)),
+        stts: Some(quicktime_stts_atom(&[(1, 1000)])),
+        ctts: Some(quicktime_ctts_atom(&[(2, 0)])),
+        elst: None,
+    };
+    let mov = quicktime_test_movie_with_timing(b"raw ", 1, 1, &[&sample], false, 0, Some(&timing));
+    std::fs::write(&path, mov).unwrap();
+
+    let err = match ImageReader::open(&path) {
+        Ok(_) => panic!("QuickTime with mismatched ctts sample count unexpectedly opened"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("ctts sample count 2 does not match stsz sample count 1")),
+        "unexpected QuickTime ctts mismatch error: {err}"
     );
     let _ = std::fs::remove_file(path);
 }

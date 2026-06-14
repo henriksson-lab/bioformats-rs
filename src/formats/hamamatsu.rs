@@ -44,6 +44,19 @@ fn positive_u32_dim(value: u32, label: &str) -> Result<u32> {
     Ok(value)
 }
 
+/// Values a version header parser produces that Java's `parseDCAMVersionXHeader`
+/// writes into `CoreMetadata` (sizeT/sizeX/sizeY) and the local `pixelType`
+/// field. The remaining parsed fields (dataOffset, bytesPerRow, bytesPerImage,
+/// frameFooterSize) are stored on `DcimgReader` directly, mirroring how Java's
+/// parsers mutate instance fields.
+struct DcamHeader {
+    header_size: u64,
+    n_frames: u32,
+    width: u32,
+    height: u32,
+    pixel_type_code: u32,
+}
+
 pub struct DcimgReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -84,6 +97,123 @@ impl Default for DcimgReader {
     }
 }
 
+impl DcimgReader {
+    /// Java `DCIMGReader.parseDCAMVersion1Header` (DCIMGReader.java:322-342).
+    ///
+    /// Seeks to `headerSize` and reads the version-1 frame-format fields,
+    /// storing `dataOffset`/`bytesPerImage`/`frameFooterSize` on `self` and
+    /// returning the dimensions / pixel-type that `set_id` copies into the
+    /// core metadata. Java reads from `headerSize` via the stream; we already
+    /// hold the leading bytes in `hdr`, so the version-1 fields live at
+    /// `headerSize + {60, 64, 72, ...}`.
+    fn parse_dcam_version1_header(&mut self, hdr: &[u8]) -> Result<DcamHeader> {
+        let header_size = r_u32_le(hdr, 40) as u64;
+        let header_start = header_size as usize;
+        if hdr.len() < header_start + 124 {
+            return Err(BioFormatsError::Format(
+                "DCIMG version 1 header is truncated".into(),
+            ));
+        }
+
+        let n_frames = positive_u32_dim(r_u32_le(hdr, header_start + 60), "frame count")?;
+        let pixel_type_code = r_u32_le(hdr, header_start + 64);
+        let width = positive_u32_dim(r_u32_le(hdr, header_start + 72), "width")?;
+        let height = positive_u32_dim(r_u32_le(hdr, header_start + 76), "height")?;
+        let bytes_per_row = r_u32_le(hdr, header_start + 80) as usize;
+        let bytes_per_image = r_u32_le(hdr, header_start + 84) as u64;
+        let data_offset = header_size + r_u64_le(hdr, header_start + 96);
+        let frame_footer_size = r_u32_le(hdr, header_start + 120) as u64;
+
+        self.bytes_per_row = bytes_per_row;
+        self.bytes_per_image = bytes_per_image;
+        self.data_offset = data_offset;
+        self.frame_footer_size = frame_footer_size;
+        Ok(DcamHeader {
+            header_size,
+            n_frames,
+            width,
+            height,
+            pixel_type_code,
+        })
+    }
+
+    /// Java `DCIMGReader.parseDCAMVersion0Header` (DCIMGReader.java:301-320).
+    ///
+    /// `headerSize` comes from offset 40 (initFile:196-197); the version-0
+    /// fields then live at `headerSize + {32, 36, ...}`:
+    ///
+    /// ```text
+    ///   seek(headerSize); skip 32
+    ///   sizeT   = readInt()        @ headerSize + 32
+    ///   pixelType = readInt()      @ headerSize + 36
+    ///   skip 4
+    ///   sizeX   = readInt()        @ headerSize + 44 (num columns)
+    ///   bytesPerRow = readUInt()   @ headerSize + 48
+    ///   sizeY   = readInt()        @ headerSize + 52 (num rows)
+    ///   bytesPerImage = readUInt() @ headerSize + 56
+    ///   skip 8
+    ///   dataOffset = readInt()     @ headerSize + 68
+    ///   offsetToFooter = readLong()@ headerSize + 72
+    /// ```
+    ///
+    /// NOTE: the version-0 footer parsing (Java `parseDCAMVersion0Footer`,
+    /// 344-388) that populates `offsetToFourPixels` / `fourPixelOffsetInFrame`
+    /// is intentionally not performed here, so the version-0 four-pixel
+    /// correction stays disabled (see the four-pixel setup in `set_id`).
+    fn parse_dcam_version0_header(&mut self, f: &mut File, hdr: &[u8]) -> Result<DcamHeader> {
+        let header_size = r_u32_le(hdr, 40) as u64;
+        let mut v0 = [0u8; 80];
+        f.seek(SeekFrom::Start(header_size))
+            .map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut v0)
+            .map_err(|_| BioFormatsError::Format("DCIMG version 0 header is truncated".into()))?;
+        // n_frames is sizeT for version 0 (single-file => size_t = frames).
+        let n_frames = positive_u32_dim(r_u32_le(&v0, 32), "frame count")?;
+        let pixel_type_code = r_u32_le(&v0, 36);
+        let width = positive_u32_dim(r_u32_le(&v0, 44), "width")?;
+        let bytes_per_row = r_u32_le(&v0, 48) as usize;
+        let height = positive_u32_dim(r_u32_le(&v0, 52), "height")?;
+        let bytes_per_image = r_u32_le(&v0, 56) as u64;
+        let data_offset = header_size + r_u32_le(&v0, 68) as u64;
+
+        self.bytes_per_row = bytes_per_row;
+        self.bytes_per_image = bytes_per_image;
+        self.data_offset = data_offset;
+        self.frame_footer_size = 0;
+        Ok(DcamHeader {
+            header_size,
+            n_frames,
+            width,
+            height,
+            pixel_type_code,
+        })
+    }
+
+    /// Rust-only fallback for older synthetic fixtures (no Java counterpart).
+    /// Kept separate from the version-0/1 parsers so they faithfully mirror the
+    /// Java helpers; this legacy layout predates the Bio-Formats offsets.
+    fn parse_legacy_header(&mut self, hdr: &[u8]) -> Result<DcamHeader> {
+        let header_size = r_u32_le(hdr, 16) as u64;
+        let n_frames = positive_u32_dim(r_u32_le(hdr, 20), "frame count")?;
+        let width = positive_u32_dim(r_u32_le(hdr, 32), "width")?;
+        let height = positive_u32_dim(r_u32_le(hdr, 36), "height")?;
+        let bit_depth = r_u32_le(hdr, 40);
+        let bytes_per_row = r_u32_le(hdr, 48) as usize;
+
+        self.bytes_per_row = bytes_per_row;
+        self.bytes_per_image = 0;
+        self.data_offset = if header_size > 64 { header_size } else { 64 };
+        self.frame_footer_size = 0;
+        Ok(DcamHeader {
+            header_size,
+            n_frames,
+            width,
+            height,
+            pixel_type_code: bit_depth,
+        })
+    }
+}
+
 impl FormatReader for DcimgReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
@@ -109,111 +239,27 @@ impl FormatReader for DcimgReader {
         }
 
         let version = r_u32_le(&hdr, 8);
-        let (
+        // Mirror Java initFile (221-226): dispatch to the version-specific
+        // header parser, which (like Java's helpers) writes dataOffset /
+        // bytesPerRow / bytesPerImage / frameFooterSize onto `self` and returns
+        // the dimensions / pixel-type for the core metadata.
+        let DcamHeader {
             header_size,
             n_frames,
             width,
             height,
             pixel_type_code,
-            bytes_per_row,
-            data_offset,
-            bytes_per_image,
-            frame_footer_size,
-        ) = if version >= 0x0100_0000 {
-            let header_size = r_u32_le(&hdr, 40) as u64;
-            let header_start = header_size as usize;
-            if hdr.len() < header_start + 124 {
-                return Err(BioFormatsError::Format(
-                    "DCIMG version 1 header is truncated".into(),
-                ));
-            }
-
-            let n_frames = positive_u32_dim(r_u32_le(&hdr, header_start + 60), "frame count")?;
-            let pixel_type_code = r_u32_le(&hdr, header_start + 64);
-            let width = positive_u32_dim(r_u32_le(&hdr, header_start + 72), "width")?;
-            let height = positive_u32_dim(r_u32_le(&hdr, header_start + 76), "height")?;
-            let bytes_per_row = r_u32_le(&hdr, header_start + 80) as usize;
-            let bytes_per_image = r_u32_le(&hdr, header_start + 84) as u64;
-            let data_offset = header_size + r_u64_le(&hdr, header_start + 96);
-            let frame_footer_size = r_u32_le(&hdr, header_start + 120) as u64;
-            (
-                header_size,
-                n_frames,
-                width,
-                height,
-                pixel_type_code,
-                bytes_per_row,
-                data_offset,
-                bytes_per_image,
-                frame_footer_size,
-            )
+        } = if version >= 0x0100_0000 {
+            self.parse_dcam_version1_header(&hdr)?
         } else if version == 0x7 {
-            // DCIMG_VERSION_0. Mirrors Java parseDCAMVersion0Header (301-320):
-            // headerSize comes from offset 40 (initFile 196-197), then the
-            // version-0 fields live at headerSize + {32, 36, ...}.
-            //
-            //   seek(headerSize); skip 32
-            //   sizeT   = readInt()        @ headerSize + 32
-            //   pixelType = readInt()      @ headerSize + 36
-            //   skip 4
-            //   sizeX   = readInt()        @ headerSize + 44 (num columns)
-            //   bytesPerRow = readUInt()   @ headerSize + 48
-            //   sizeY   = readInt()        @ headerSize + 52 (num rows)
-            //   bytesPerImage = readUInt() @ headerSize + 56
-            //   skip 8
-            //   dataOffset = readInt()     @ headerSize + 68
-            //   offsetToFooter = readLong()@ headerSize + 72
-            //
-            // NOTE: the version-0 footer parsing (parseDCAMVersion0Footer,
-            // 344-388) that populates offsetToFourPixels / fourPixelOffsetInFrame
-            // is NOT implemented here; the version-0 four-pixel correction is
-            // therefore disabled (see four_pixel_correction setup below). This is
-            // an intentional, flagged simplification.
-            let header_size = r_u32_le(&hdr, 40) as u64;
-            let mut v0 = [0u8; 80];
-            f.seek(SeekFrom::Start(header_size))
-                .map_err(BioFormatsError::Io)?;
-            f.read_exact(&mut v0).map_err(|_| {
-                BioFormatsError::Format("DCIMG version 0 header is truncated".into())
-            })?;
-            // n_frames is sizeT for version 0 (single-file => size_t = frames).
-            let n_frames = positive_u32_dim(r_u32_le(&v0, 32), "frame count")?;
-            let pixel_type_code = r_u32_le(&v0, 36);
-            let width = positive_u32_dim(r_u32_le(&v0, 44), "width")?;
-            let bytes_per_row = r_u32_le(&v0, 48) as usize;
-            let height = positive_u32_dim(r_u32_le(&v0, 52), "height")?;
-            let bytes_per_image = r_u32_le(&v0, 56) as u64;
-            let data_offset = header_size + r_u32_le(&v0, 68) as u64;
-            (
-                header_size,
-                n_frames,
-                width,
-                height,
-                pixel_type_code,
-                bytes_per_row,
-                data_offset,
-                bytes_per_image,
-                0,
-            )
+            self.parse_dcam_version0_header(&mut f, &hdr)?
         } else {
-            let header_size = r_u32_le(&hdr, 16) as u64;
-            let n_frames = positive_u32_dim(r_u32_le(&hdr, 20), "frame count")?;
-            let width = positive_u32_dim(r_u32_le(&hdr, 32), "width")?;
-            let height = positive_u32_dim(r_u32_le(&hdr, 36), "height")?;
-            let bit_depth = r_u32_le(&hdr, 40);
-            let bytes_per_row = r_u32_le(&hdr, 48) as usize;
-            (
-                header_size,
-                n_frames,
-                width,
-                height,
-                bit_depth,
-                bytes_per_row,
-                if header_size > 64 { header_size } else { 64 },
-                0,
-                0,
-            )
+            self.parse_legacy_header(&hdr)?
         };
+        let bytes_per_row = self.bytes_per_row;
+        let data_offset = self.data_offset;
+        let bytes_per_image = self.bytes_per_image;
+        let frame_footer_size = self.frame_footer_size;
 
         let (pixel_type, bpp): (PixelType, u8) = if version >= 0x0100_0000 || version == 0x7 {
             // Java initFile (228-234): MONO8 = 1, MONO16 = 2 for both versions.

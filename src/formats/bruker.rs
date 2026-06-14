@@ -98,11 +98,8 @@ struct SeriesParse {
     size_t: i64,
     // Companion strings surfaced to OME / metadata.
     image_name: Option<String>,
-    #[allow(dead_code)]
     timestamp: Option<String>,
-    #[allow(dead_code)]
     institution: Option<String>,
-    #[allow(dead_code)]
     user: Option<String>,
     // Original "##$KEY" metadata (keys stripped of the leading "##$").
     meta: std::collections::HashMap<String, MetadataValue>,
@@ -196,6 +193,15 @@ pub struct BrukerReader {
     metas: Vec<ImageMetadata>,
     /// Per-series image name (from `##$ACQ_scan_name`).
     image_names: Vec<Option<String>>,
+    /// Per-series acquisition institution (from `##$ACQ_institution`).
+    /// Java: `String[] institutions` -> `setExperimenterInstitution`.
+    institutions: Vec<Option<String>>,
+    /// Per-series operator/user (from `##$ACQ_operator`).
+    /// Java: `String[] users` -> `setExperimenterLastName`.
+    users: Vec<Option<String>>,
+    /// Per-series acquisition time string (from `##$ACQ_time`).
+    /// Java: `String[] timestamps` -> `setImageAcquisitionDate`.
+    timestamps: Vec<Option<String>>,
     current: usize,
 }
 
@@ -205,6 +211,9 @@ impl BrukerReader {
             pixels_files: Vec::new(),
             metas: Vec::new(),
             image_names: Vec::new(),
+            institutions: Vec::new(),
+            users: Vec::new(),
+            timestamps: Vec::new(),
             current: 0,
         }
     }
@@ -346,7 +355,11 @@ impl BrukerReader {
         }
 
         let series_count = self.pixels_files.len();
+        // Java allocates these per-series arrays up front in initFile.
         self.image_names = vec![None; series_count];
+        self.institutions = vec![None; series_count];
+        self.users = vec![None; series_count];
+        self.timestamps = vec![None; series_count];
 
         for series in 0..series_count {
             let mut p = SeriesParse::default();
@@ -373,6 +386,9 @@ impl BrukerReader {
 
             let meta = build_metadata(&mut p, parsed_proc_file)?;
             self.image_names[series] = p.image_name.clone();
+            self.institutions[series] = p.institution.clone();
+            self.users[series] = p.user.clone();
+            self.timestamps[series] = p.timestamp.clone();
             self.metas.push(meta);
         }
 
@@ -517,6 +533,9 @@ impl FormatReader for BrukerReader {
         self.pixels_files.clear();
         self.metas.clear();
         self.image_names.clear();
+        self.institutions.clear();
+        self.users.clear();
+        self.timestamps.clear();
         self.current = 0;
         Ok(())
     }
@@ -583,24 +602,629 @@ impl FormatReader for BrukerReader {
         if self.metas.is_empty() {
             return None;
         }
-        use crate::common::ome_metadata::{OmeImage, OmeMetadata};
+        use crate::common::ome_metadata::{OmeExperimenter, OmeImage, OmeMetadata};
+        // Mirror Java initFile's per-series MetadataStore loop:
+        //   setImageName, setImageAcquisitionDate, setExperimenterLastName,
+        //   setExperimenterInstitution.
         let images = self
             .image_names
             .iter()
             .enumerate()
             .map(|(i, name)| {
                 let base = name.clone().unwrap_or_default();
+                let acquisition_date = self
+                    .timestamps
+                    .get(i)
+                    .and_then(|t| t.as_deref())
+                    .and_then(format_bruker_date);
                 OmeImage {
                     name: Some(format!("{} #{}", base, i + 1)),
+                    acquisition_date,
                     ..Default::default()
                 }
             })
             .collect();
+        let experimenters = (0..self.image_names.len())
+            .map(|i| OmeExperimenter {
+                id: Some(format!("Experimenter:{i}")),
+                last_name: self.users.get(i).and_then(|u| u.clone()),
+                institution: self.institutions.get(i).and_then(|n| n.clone()),
+                ..Default::default()
+            })
+            .collect();
         Some(OmeMetadata {
             images,
+            experimenters,
             ..Default::default()
         })
     }
+}
+
+// ===========================================================================
+// MicroCTReader — faithful Rust port of the Java Bio-Formats `MicroCTReader`
+// (`loci.formats.in.MicroCTReader`).
+//
+// Despite the "Bruker MicroCT" / SkyScan association in the project TODO, the
+// upstream Java `MicroCTReader` is the reader for **GE MicroCT VFF** datasets:
+// a directory holding one `.vff` file per Z slice (grouped via a FilePattern)
+// plus several companion metadata files (`.log`, `.protocol`, `Parameters.txt`,
+// `Description.txt`, and assorted single-value files). Each `.vff` begins with
+// the ASCII magic `ncaa`, followed by an LF-terminated text header of
+// `key=value;` lines (terminated by a `0x0c 0x0a` line), then raw big-endian
+// pixel data stored with the origin in the **lower-left** corner.
+//
+// This port lives alongside the Bruker MRI reader because both are Bruker /
+// medical-domain microscopy companion-file readers; it is a separate public
+// type (`MicroCtVffReader`) and does not collide with the unrelated `.ctf`
+// TIFF-delegating `MicroCtReader` in `formats::flim2`.
+
+/// `EEE, MMM dd, yyyy HH:mm:ss a` — the Java `MicroCTReader.DATE_FORMAT`.
+/// Mirrored as a named constant for parity; the parse in `format_microct_date`
+/// implements exactly this pattern.
+#[allow(dead_code)]
+const MICROCT_DATE_FORMAT: &str = "EEE, MMM dd, yyyy HH:mm:ss a";
+
+/// VFF header magic (`MicroCTReader.VFF_MAGIC`).
+const VFF_MAGIC: &[u8] = b"ncaa";
+
+/// `DataTools.parseDouble` — locale-tolerant double parse (returns `None` like
+/// the Java helper does for unparseable input).
+fn parse_double(value: &str) -> Option<f64> {
+    value.trim().replace(',', ".").parse::<f64>().ok()
+}
+
+/// Port of `DateTools.formatDate(date + " " + time, DATE_FORMAT)` for the
+/// MicroCT `EEE, MMM dd, yyyy HH:mm:ss a` pattern, e.g.
+/// `"Mon, Jan 05, 2015 03:14:00 PM"` → `"2015-01-05T15:14:00"`. Returns `None`
+/// if unparseable (Java returns null and the date is then skipped).
+fn format_microct_date(date: &str, time: &str) -> Option<String> {
+    let combined = format!("{date} {time}");
+    // Tokens: <weekday,> <month> <day,> <year> <HH:mm:ss> <AM|PM>
+    let tokens: Vec<&str> = combined.split_whitespace().collect();
+    if tokens.len() != 6 {
+        return None;
+    }
+    let month = match tokens[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: u32 = tokens[2].trim_end_matches(',').parse().ok()?;
+    let year: i32 = tokens[3].parse().ok()?;
+    let time_parts: Vec<&str> = tokens[4].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let mut hour: u32 = time_parts[0].parse().ok()?;
+    let minute: u32 = time_parts[1].parse().ok()?;
+    let second: u32 = time_parts[2].parse().ok()?;
+    match tokens[5].to_ascii_uppercase().as_str() {
+        "PM" => {
+            if hour != 12 {
+                hour += 12;
+            }
+        }
+        "AM" => {
+            if hour == 12 {
+                hour = 0;
+            }
+        }
+        _ => return None,
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
+    ))
+}
+
+/// Convert a Bruker `##$ACQ_time` string into an OME ISO-8601 timestamp.
+///
+/// Java `BrukerReader.DATE_FORMAT = "HH:mm:ss  d MMM yyyy"`, e.g.
+/// `"15:14:00  5 Jan 2015"` -> `"2015-01-05T15:14:00"`. Returns `None` when the
+/// string does not match (mirrors `DateTools.formatDate` returning null).
+fn format_bruker_date(raw: &str) -> Option<String> {
+    // Tokens: <HH:mm:ss> <day> <month> <year>. Collapsing whitespace handles the
+    // double-space the Java pattern uses between seconds and the day.
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    if tokens.len() != 4 {
+        return None;
+    }
+    let time_parts: Vec<&str> = tokens[0].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let minute: u32 = time_parts[1].parse().ok()?;
+    let second: u32 = time_parts[2].parse().ok()?;
+    let day: u32 = tokens[1].parse().ok()?;
+    let month = match tokens[2] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i32 = tokens[3].parse().ok()?;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
+    ))
+}
+
+/// GE MicroCT VFF reader (`.vff` datasets). Faithful port of Java
+/// `loci.formats.in.MicroCTReader`.
+pub struct MicroCtVffReader {
+    /// One `.vff` file per Z slice, in FilePattern order (Java `vffs`).
+    vffs: Vec<PathBuf>,
+    /// Cached header size per VFF, computed lazily (Java `headerSize`).
+    header_size: Vec<u64>,
+    /// Non-`.vff` companion metadata files in the parent dir (Java `metadataFiles`).
+    metadata_files: Vec<PathBuf>,
+    /// Parsed core metadata (single series).
+    meta: ImageMetadata,
+    /// `Date` companion key (Java `date`).
+    date: Option<String>,
+    /// `Time` companion key (Java `time`).
+    time: Option<String>,
+    /// `Description.txt` companion key (Java `imageDescription`).
+    image_description: Option<String>,
+    /// `Exposure Time (ms)` companion key, in seconds (Java `exposureTime`).
+    exposure_time: Option<f64>,
+    /// Physical pixel size in micrometres (Java `physicalSize`).
+    physical_size: Option<f64>,
+    initialized: bool,
+}
+
+impl MicroCtVffReader {
+    pub fn new() -> Self {
+        MicroCtVffReader {
+            vffs: Vec::new(),
+            header_size: Vec::new(),
+            metadata_files: Vec::new(),
+            meta: ImageMetadata::default(),
+            date: None,
+            time: None,
+            image_description: None,
+            exposure_time: None,
+            physical_size: None,
+            initialized: false,
+        }
+    }
+
+    /// Port of `MicroCTReader.processKey`: stash into the original metadata
+    /// table and, for the recognised keys, the appropriate field.
+    fn process_key(&mut self, key: &str, value: &str) {
+        // addGlobalMeta(key, value)
+        self.meta
+            .series_metadata
+            .insert(key.to_string(), MetadataValue::String(value.to_string()));
+
+        match key {
+            "Exposure Time (ms)" => {
+                self.exposure_time = parse_double(value).map(|v| v / 1000.0);
+            }
+            "Description.txt" => self.image_description = Some(value.to_string()),
+            "Date" => self.date = Some(value.to_string()),
+            "Time" => self.time = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    /// Port of `MicroCTReader.skipHeader`: advance past the LF-terminated header
+    /// lines (the final header line is `0x0c0a`, i.e. blank after trimming).
+    /// Returns the byte offset of the first pixel.
+    fn skip_header(file: &mut fs::File) -> Result<u64> {
+        let mut reader = std::io::BufReader::new(file);
+        loop {
+            let mut line = Vec::new();
+            let n = read_line_bytes(&mut reader, &mut line)?;
+            if n == 0 {
+                break;
+            }
+            // Java: while (readLine().trim().length() > 0)
+            let trimmed = String::from_utf8_lossy(&line);
+            if trimmed.trim().is_empty() {
+                break;
+            }
+        }
+        Ok(reader.stream_position()?)
+    }
+
+    /// Port of `MicroCTReader.initFile`.
+    fn init_file(&mut self, id: &Path) -> Result<()> {
+        let original = abs(id);
+
+        // FilePattern: find any other .vff files in the same dataset.
+        self.vffs = match crate::stitcher::FilePattern::from_file(&original) {
+            Ok(p) => {
+                let names = p.filenames();
+                if names.is_empty() {
+                    vec![original.clone()]
+                } else {
+                    names
+                }
+            }
+            Err(_) => vec![original.clone()],
+        };
+        self.header_size = vec![0u64; self.vffs.len()];
+
+        // Find all non-vff metadata files in the same directory.
+        let parent = original
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Ok(rd) = fs::read_dir(&parent) {
+            let mut entries: Vec<String> = rd
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            entries.sort();
+            for file in entries {
+                if !has_suffix(&file, "vff") {
+                    let metadata = parent.join(&file);
+                    if !metadata.is_dir() {
+                        self.metadata_files.push(metadata);
+                    }
+                }
+            }
+        }
+
+        // sizeZ starts at the number of VFF files.
+        self.meta.size_z = self.vffs.len() as u32;
+
+        // Parse the VFF header of the opened file.
+        let header = read_text(&original)?;
+        let mut dim_count = 0i64;
+        for raw in header.split('\n') {
+            let line = raw.trim();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(eq) = line.find('=') {
+                let key = &line[..eq];
+                // Java: value = line.substring(eq + 1, line.length() - 1)
+                // (drops the trailing ';'). Use the trimmed line so the dropped
+                // character is the ';' rather than a stray '\r'.
+                let after = &line[eq + 1..];
+                let value = if after.is_empty() {
+                    after
+                } else {
+                    &after[..after.len() - 1]
+                };
+
+                self.process_key(key, value);
+
+                match key {
+                    "rank" => dim_count = parse_i64(value),
+                    "size" => {
+                        let dims: Vec<&str> = value.split(' ').collect();
+                        if dim_count > 0 {
+                            if let Some(d) = dims.first() {
+                                self.meta.size_x = parse_i64(d).max(0) as u32;
+                            }
+                        }
+                        if dim_count > 1 {
+                            if let Some(d) = dims.get(1) {
+                                self.meta.size_y = parse_i64(d).max(0) as u32;
+                            }
+                        }
+                        if dim_count > 2 {
+                            if let Some(d) = dims.get(2) {
+                                self.meta.size_z =
+                                    self.meta.size_z.saturating_mul(parse_i64(d).max(0) as u32);
+                            }
+                        }
+                    }
+                    "bits" => {
+                        let bits = parse_i64(value);
+                        self.meta.pixel_type = pixel_type_from_bytes(bits / 8, true, false);
+                    }
+                    "elementsize" => {
+                        // physical size is stored in mm, not um.
+                        if let Some(size) = parse_double(value) {
+                            self.physical_size = Some(size * 1000.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.meta.size_t = 1;
+        self.meta.size_c = 1;
+        self.meta.image_count = self.meta.size_z * self.meta.size_t * self.meta.size_c;
+        self.meta.dimension_order = DimensionOrder::XYZCT;
+        self.meta.is_rgb = false;
+        self.meta.is_interleaved = false;
+        // VFF pixel data is big-endian.
+        self.meta.is_little_endian = false;
+        self.meta.bits_per_pixel = (self.meta.pixel_type.bytes_per_sample() * 8) as u8;
+        self.meta.resolution_count = 1;
+
+        // Parse extra values from metadata files.
+        let metadata_files = std::mem::take(&mut self.metadata_files);
+        for file in &metadata_files {
+            let name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let data = read_text(file)?;
+            let data = data.trim();
+            if has_suffix(&name, "protocol") || has_suffix(&name, "log") || name == "Parameters.txt"
+            {
+                // key/value pairs separated by '=' or ':'.
+                let separator = if name == "Parameters.txt" { ':' } else { '=' };
+                for pair in data.split("\r\n") {
+                    if let Some(sep) = pair.find(separator) {
+                        let k = pair[..sep].trim().to_string();
+                        let v = pair[sep + 1..].trim().to_string();
+                        self.process_key(&k, &v);
+                    }
+                }
+            } else {
+                // assume a single value; the file name is the key.
+                self.process_key(&name, data);
+            }
+        }
+        self.metadata_files = metadata_files;
+
+        self.initialized = true;
+        Ok(())
+    }
+
+    /// Port of `MicroCTReader.openBytes` for a full plane: select the VFF, skip
+    /// its header, seek to the slice, read the raw plane, then reverse rows
+    /// (data is stored origin-lower-left).
+    fn read_plane(&mut self, no: u32) -> Result<Vec<u8>> {
+        if self.vffs.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        let n = self.vffs.len();
+        let vff_index = (no as usize) % n;
+
+        let path = self.vffs[vff_index].clone();
+        let mut file = fs::File::open(&path)?;
+
+        if self.header_size[vff_index] == 0 {
+            self.header_size[vff_index] = Self::skip_header(&mut file)?;
+        }
+        let header = self.header_size[vff_index];
+
+        let bpp = self.meta.pixel_type.bytes_per_sample();
+        let sx = self.meta.size_x as usize;
+        let sy = self.meta.size_y as usize;
+        let plane_size = sx * sy * bpp;
+
+        let mut buf = vec![0u8; plane_size];
+        let offset = header + plane_size as u64 * (no as usize / n) as u64;
+        file.seek(SeekFrom::Start(offset))?;
+        let len = file.metadata()?.len();
+        if offset < len {
+            let avail = ((len - offset) as usize).min(plane_size);
+            file.read_exact(&mut buf[..avail])?;
+        }
+
+        // Reverse the rows: origin is in the lower-left corner.
+        if sy > 0 {
+            let row_bytes = sx * bpp;
+            if row_bytes > 0 {
+                for yy in 0..sy / 2 {
+                    let top = (sy - 1 - yy) * row_bytes;
+                    let bottom = yy * row_bytes;
+                    for b in 0..row_bytes {
+                        buf.swap(bottom + b, top + b);
+                    }
+                }
+            }
+        }
+        Ok(buf)
+    }
+}
+
+impl Default for MicroCtVffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for MicroCtVffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // Java suffix "vff".
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some(e) if e.eq_ignore_ascii_case("vff")
+        )
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Java: stream.readString(4).equals(VFF_MAGIC)
+        header.len() >= VFF_MAGIC.len() && &header[..VFF_MAGIC.len()] == VFF_MAGIC
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        self.init_file(path)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.vffs.clear();
+        self.header_size.clear();
+        self.metadata_files.clear();
+        self.meta = ImageMetadata::default();
+        self.date = None;
+        self.time = None;
+        self.image_description = None;
+        self.exposure_time = None;
+        self.physical_size = None;
+        self.initialized = false;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        if self.initialized {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn set_series(&mut self, series: usize) -> Result<()> {
+        if series == 0 && self.initialized {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(series))
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        if self.initialized {
+            &self.meta
+        } else {
+            uninitialized_metadata()
+        }
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        if !self.initialized {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        if plane_index >= self.meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        self.read_plane(plane_index)
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        if !self.initialized {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        if plane_index >= self.meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        crate::common::region::validate_region(
+            "MicroCT",
+            self.meta.size_x,
+            self.meta.size_y,
+            x,
+            y,
+            w,
+            h,
+        )?;
+        // Crop the (row-reversed) full plane.
+        let full = self.read_plane(plane_index)?;
+        let bpp = self.meta.pixel_type.bytes_per_sample();
+        let sx = self.meta.size_x as usize;
+        let row_bytes = w as usize * bpp;
+        let mut out = vec![0u8; h as usize * row_bytes];
+        for row in 0..h as usize {
+            let src = ((y as usize + row) * sx + x as usize) * bpp;
+            if src + row_bytes <= full.len() {
+                out[row * row_bytes..(row + 1) * row_bytes]
+                    .copy_from_slice(&full[src..src + row_bytes]);
+            }
+        }
+        Ok(out)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.open_bytes(plane_index)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if !self.initialized {
+            return None;
+        }
+        use crate::common::ome_metadata::{OmeImage, OmeMetadata, OmePlane};
+
+        let acquisition_date = match (&self.date, &self.time) {
+            (Some(d), Some(t)) => format_microct_date(d, t),
+            _ => None,
+        };
+
+        // Per-plane exposure time (Java setPlaneExposureTime for all planes).
+        let planes: Vec<OmePlane> = if let Some(exp) = self.exposure_time {
+            (0..self.meta.image_count)
+                .map(|_| OmePlane {
+                    exposure_time: Some(exp),
+                    ..Default::default()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let image = OmeImage {
+            description: self.image_description.clone(),
+            acquisition_date,
+            physical_size_x: self.physical_size,
+            physical_size_y: self.physical_size,
+            physical_size_z: self.physical_size,
+            planes,
+            ..Default::default()
+        };
+
+        Some(OmeMetadata {
+            images: vec![image],
+            ..Default::default()
+        })
+    }
+}
+
+/// `loci.common.RandomAccessInputStream.readLine` analogue: read up to and
+/// including the next `\n`, appending bytes (sans the trailing `\n`) to `out`.
+/// Returns the number of bytes consumed from the stream.
+fn read_line_bytes<R: Read>(reader: &mut R, out: &mut Vec<u8>) -> Result<usize> {
+    let mut consumed = 0usize;
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                consumed += 1;
+                if byte[0] == b'\n' {
+                    break;
+                }
+                out.push(byte[0]);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(consumed)
+}
+
+/// `loci.formats.FormatReader.checkSuffix(name, suffix)` — case-insensitive
+/// extension test.
+fn has_suffix(name: &str, suffix: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
@@ -638,6 +1262,9 @@ mod tests {
         fs::create_dir_all(&pdata1).unwrap();
 
         let acqp = "##$NI=1\n##$NR=1\n##$ACQ_ns_list_size=1\n##$BYTORDA=little\n\
+                    ##$ACQ_time=15:14:00  5 Jan 2015\n\
+                    ##$ACQ_institution=( 60 )\n<My Institute>\n\
+                    ##$ACQ_operator=( 60 )\n<Jane Doe>\n\
                     ##$ACQ_scan_name=( 32 )\n<my scan>\n";
         fs::write(acq_dir.join("acqp"), acqp).unwrap();
 
@@ -667,6 +1294,13 @@ mod tests {
         assert!(m.is_little_endian);
         assert_eq!(m.image_count, 1);
         assert_eq!(m.dimension_order, DimensionOrder::XYCTZ);
+        // series_metadata retains the raw Bruker keys (stripped of "##$").
+        assert_eq!(
+            m.series_metadata
+                .get("ACQ_institution")
+                .map(|v| v.to_string()),
+            Some("My Institute".to_string())
+        );
 
         let bytes = reader.open_bytes(0).unwrap();
         assert_eq!(bytes.len(), 128 * 128 * 2);
@@ -680,6 +1314,139 @@ mod tests {
         let ome = reader.ome_metadata().unwrap();
         assert_eq!(ome.images.len(), 1);
         assert_eq!(ome.images[0].name.as_deref(), Some("my scan #1"));
+        // Acquisition date from ##$ACQ_time (Java setImageAcquisitionDate).
+        assert_eq!(
+            ome.images[0].acquisition_date.as_deref(),
+            Some("2015-01-05T15:14:00")
+        );
+        // Experimenter institution/last name from ##$ACQ_institution / ##$ACQ_operator.
+        assert_eq!(ome.experimenters.len(), 1);
+        assert_eq!(
+            ome.experimenters[0].institution.as_deref(),
+            Some("My Institute")
+        );
+        assert_eq!(ome.experimenters[0].last_name.as_deref(), Some("Jane Doe"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bruker_date_parsing() {
+        // Java DATE_FORMAT "HH:mm:ss  d MMM yyyy" (double space collapses).
+        assert_eq!(
+            format_bruker_date("15:14:00  5 Jan 2015").as_deref(),
+            Some("2015-01-05T15:14:00")
+        );
+        assert_eq!(
+            format_bruker_date("09:05:01 12 Dec 1999").as_deref(),
+            Some("1999-12-12T09:05:01")
+        );
+        // Malformed strings yield None (DateTools.formatDate returns null).
+        assert_eq!(format_bruker_date("garbage"), None);
+        assert_eq!(format_bruker_date("15:14:00 5 Foo 2015"), None);
+    }
+
+    // -- MicroCT (GE VFF) reader tests --
+
+    #[test]
+    fn microct_detects_vff() {
+        let r = MicroCtVffReader::new();
+        assert!(r.is_this_type_by_name(Path::new("/data/scan/slice0001.vff")));
+        assert!(r.is_this_type_by_name(Path::new("/data/scan/slice.VFF")));
+        assert!(!r.is_this_type_by_name(Path::new("/data/scan/slice.tif")));
+        assert!(r.is_this_type_by_bytes(b"ncaa\nrank=2;\n"));
+        assert!(!r.is_this_type_by_bytes(b"II*\0"));
+    }
+
+    #[test]
+    fn microct_date_format() {
+        assert_eq!(
+            format_microct_date("Mon, Jan 05, 2015", "03:14:00 PM"),
+            Some("2015-01-05T15:14:00".to_string())
+        );
+        assert_eq!(
+            format_microct_date("Tue, Dec 31, 2019", "12:00:00 AM"),
+            Some("2019-12-31T00:00:00".to_string())
+        );
+        assert_eq!(
+            format_microct_date("Tue, Dec 31, 2019", "12:00:00 PM"),
+            Some("2019-12-31T12:00:00".to_string())
+        );
+        assert_eq!(format_microct_date("garbage", "x"), None);
+    }
+
+    #[test]
+    fn microct_reads_synthetic_vff_and_companion_metadata() {
+        let root = unique_dir();
+        let vff = root.join("scan0001.vff");
+
+        // 4x3 unsigned-byte plane (bits=8); rows stored origin lower-left.
+        let sx = 4usize;
+        let sy = 3usize;
+        let header = "ncaa\nrank=2;\nsize=4 3;\nbits=8;\nelementsize=0.025;\n\u{0c}\n";
+        // pixel value = row index, so we can verify row reversal.
+        let mut pixels = Vec::new();
+        for row in 0..sy {
+            for _ in 0..sx {
+                pixels.push(row as u8);
+            }
+        }
+        {
+            let mut f = fs::File::create(&vff).unwrap();
+            f.write_all(header.as_bytes()).unwrap();
+            f.write_all(&pixels).unwrap();
+        }
+
+        // Companion metadata files.
+        fs::write(
+            root.join("scan.log"),
+            "Exposure Time (ms)=500\r\nGantry=A\r\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("scan.protocol"),
+            "Date=Mon, Jan 05, 2015\r\nTime=03:14:00 PM\r\n",
+        )
+        .unwrap();
+        fs::write(root.join("Parameters.txt"), "Voltage:80\r\nCurrent:200\r\n").unwrap();
+        fs::write(root.join("Description.txt"), "test microCT scan").unwrap();
+
+        let mut reader = MicroCtVffReader::new();
+        reader.set_id(&vff).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        let m = reader.metadata();
+        assert_eq!(m.size_x, 4);
+        assert_eq!(m.size_y, 3);
+        assert_eq!(m.size_z, 1);
+        assert_eq!(m.size_t, 1);
+        assert_eq!(m.size_c, 1);
+        assert_eq!(m.pixel_type, PixelType::Int8);
+        assert!(!m.is_little_endian);
+        assert_eq!(m.dimension_order, DimensionOrder::XYZCT);
+
+        // Original metadata captured the VFF header + companion keys.
+        assert!(m.series_metadata.contains_key("rank"));
+        assert!(m.series_metadata.contains_key("Gantry"));
+        assert!(m.series_metadata.contains_key("Voltage"));
+        assert!(m.series_metadata.contains_key("Description.txt"));
+
+        // Row reversal: stored rows are [0,0,0,0][1,1,1,1][2,2,2,2];
+        // after reversal the first row should be the last (value 2).
+        let bytes = reader.open_bytes(0).unwrap();
+        assert_eq!(bytes.len(), sx * sy);
+        assert_eq!(&bytes[0..sx], &[2u8, 2, 2, 2]);
+        assert_eq!(&bytes[2 * sx..3 * sx], &[0u8, 0, 0, 0]);
+
+        // OME metadata: description, physical size (mm -> um), exposure, date.
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 1);
+        let img = &ome.images[0];
+        assert_eq!(img.description.as_deref(), Some("test microCT scan"));
+        assert_eq!(img.physical_size_x, Some(25.0)); // 0.025 mm * 1000
+        assert_eq!(img.acquisition_date.as_deref(), Some("2015-01-05T15:14:00"));
+        assert!(!img.planes.is_empty());
+        assert_eq!(img.planes[0].exposure_time, Some(0.5)); // 500 ms -> 0.5 s
 
         let _ = fs::remove_dir_all(&root);
     }

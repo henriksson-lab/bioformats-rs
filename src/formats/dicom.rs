@@ -80,6 +80,26 @@ struct DicomAttrs {
     max_pixel_range: i32,
     /// Window Center (0028,1050); -1 when absent/empty (DicomReader.centerPixelValue).
     center_pixel_value: i32,
+    /// (0008,0008) Image Type, first occurrence only (DicomReader.imageType).
+    image_type: Option<String>,
+    /// (0008,0023) Content Date (DicomReader.date).
+    content_date: Option<String>,
+    /// (0008,0033) Content Time (DicomReader.time).
+    content_time: Option<String>,
+    /// (0028,0030) Pixel Spacing column value, in mm (DicomReader.pixelSizeX).
+    pixel_size_x: Option<f64>,
+    /// (0028,0030) Pixel Spacing row value, in mm (DicomReader.pixelSizeY).
+    pixel_size_y: Option<f64>,
+    /// (0018,0088) Spacing Between Slices, in mm (DicomReader.pixelSizeZ).
+    pixel_size_z: Option<f64>,
+    /// One per (0020,0032) Image Position (Patient), x component in mm.
+    position_x: Vec<Option<f64>>,
+    /// One per (0020,0032) Image Position (Patient), y component in mm.
+    position_y: Vec<Option<f64>>,
+    /// One per (0020,0032) Image Position (Patient), z component in mm.
+    position_z: Vec<Option<f64>>,
+    /// (0048,0107) Optical Path Description values (DicomReader.channelNames).
+    channel_names: Vec<String>,
     extra: HashMap<String, String>,
 }
 
@@ -224,6 +244,9 @@ fn dicom_tag_info(group: u16, element: u16) -> Option<(&'static str, &'static st
         (0x0028, 0x1201) => ("RedPaletteColorLookupTableData", "OW"),
         (0x0028, 0x1202) => ("GreenPaletteColorLookupTableData", "OW"),
         (0x0028, 0x1203) => ("BluePaletteColorLookupTableData", "OW"),
+        (0x0048, 0x0105) => ("OpticalPathSequence", "SQ"),
+        (0x0048, 0x0106) => ("OpticalPathIdentifier", "SH"),
+        (0x0048, 0x0107) => ("OpticalPathDescription", "ST"),
         _ => return None,
     })
 }
@@ -331,6 +354,104 @@ fn store_dicom_metadata(
     attrs.extra.insert(key, decoded.clone());
     if let Some((name, _)) = dicom_tag_info(group, element) {
         attrs.extra.insert(name.to_string(), decoded);
+    }
+}
+
+/// Parse a Pixel Spacing (0028,0030) DS value "rowSpacing\colSpacing", mirroring
+/// DicomReader.parsePixelSpacing: pixelSizeY = first component, pixelSizeX = last.
+/// Returns (pixel_size_x, pixel_size_y) in millimetres.
+fn parse_pixel_spacing(value: &str) -> (Option<f64>, Option<f64>) {
+    let Some(sep) = value.find('\\') else {
+        return (None, None);
+    };
+    let y = value[..sep].trim().parse::<f64>().ok();
+    let last = value.rfind('\\').unwrap_or(sep);
+    let x = value[last + 1..].trim().parse::<f64>().ok();
+    (x, y)
+}
+
+/// Parse an Image Position (Patient) (0020,0032) DS value "x\y\z" into three
+/// optional doubles, mirroring DicomReader.addInfo IMAGE_POSITION_PATIENT. A
+/// missing or non-numeric component yields None for that axis.
+fn parse_image_position(value: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
+    // Java replaces '\\' with '_' then splits on '_'.
+    let parts: Vec<&str> = value.split('\\').collect();
+    let x = parts.first().and_then(|s| s.trim().parse::<f64>().ok());
+    let y = parts.get(1).and_then(|s| s.trim().parse::<f64>().ok());
+    let z = parts.get(2).and_then(|s| s.trim().parse::<f64>().ok());
+    (
+        if parts.is_empty() { None } else { x },
+        if parts.len() > 1 { y } else { None },
+        if parts.len() > 2 { z } else { None },
+    )
+}
+
+/// Combine Content Date (0008,0023) and Content Time (0008,0033) into an OME
+/// timestamp "yyyy-mm-ddThh:mm:ss", mirroring DicomReader.getTimestamp (which
+/// formats "yyyy.MM.dd HH:mm:ss" from the raw DICOM DA "yyyymmdd" + TM
+/// "hhmmss[.ffffff]"). Returns None when either component is missing/unparseable.
+fn dicom_content_timestamp(date: Option<&str>, time: Option<&str>) -> Option<String> {
+    let date = date?.trim();
+    let time = time?.trim();
+    if date.len() < 8 || time.len() < 6 {
+        return None;
+    }
+    let (y, mo, d) = (&date[0..4], &date[4..6], &date[6..8]);
+    if !date[0..8].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let time_digits: String = time.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if time_digits.len() < 6 {
+        return None;
+    }
+    let (h, mi, s) = (
+        &time_digits[0..2],
+        &time_digits[2..4],
+        &time_digits[4..6],
+    );
+    Some(format!("{y}-{mo}-{d}T{h}:{mi}:{s}"))
+}
+
+/// Scan a sequence (SQ) value blob for the first occurrence of a nested data
+/// element with the given group/element, returning its trimmed string value.
+/// Used to read Optical Path Description (0048,0107) out of the Optical Path
+/// Sequence (0048,0105) blob, mirroring DicomReader's child lookup. Items are
+/// delimited by (FFFE,E000)/(FFFE,E00D); the implicit/explicit VR convention of
+/// the enclosing dataset is honoured.
+fn find_nested_string(
+    blob: &[u8],
+    explicit_vr: bool,
+    little_endian: bool,
+    target: (u16, u16),
+) -> Option<String> {
+    let mut cur = std::io::Cursor::new(blob);
+    loop {
+        let (group, element) = read_tag(&mut cur, little_endian).ok()?;
+        if (group, element) == (0xFFFE, 0xE000)
+            || (group, element) == (0xFFFE, 0xE00D)
+            || (group, element) == (0xFFFE, 0xE0DD)
+        {
+            // Item / delimiter: 4-byte length, then continue scanning items.
+            let _len = read_u32(&mut cur, little_endian).ok()?;
+            continue;
+        }
+        let (vr, length) =
+            read_element_length_after_tag(&mut cur, explicit_vr, little_endian).ok()?;
+        if length == 0xFFFF_FFFF {
+            // Undefined-length nested sequence: bail out (rare for optical paths).
+            return None;
+        }
+        let start = cur.position() as usize;
+        let end = start.checked_add(length as usize)?;
+        if end > blob.len() {
+            return None;
+        }
+        if (group, element) == target {
+            let v = &blob[start..end];
+            return Some(decode_dicom_metadata_value(&vr, group, element, v, little_endian)
+                .unwrap_or_else(|| ascii_trim(v)));
+        }
+        cur.set_position(end as u64);
     }
 }
 
@@ -835,6 +956,44 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
             (0x0028, 0x1203) => {
                 let (entries, _, bits) = palette_descriptors[2].unwrap_or((value.len() / 2, 0, 16));
                 palette_data[2] = Some(parse_lut_data(&value, entries, bits, attrs.little_endian));
+            }
+            (0x0008, 0x0008) => {
+                // Image Type (CS): keep only the first occurrence (DicomReader.imageType).
+                if attrs.image_type.is_none() {
+                    attrs.image_type = Some(ascii_trim(&value));
+                }
+            }
+            (0x0008, 0x0023) => attrs.content_date = Some(ascii_trim(&value)), // Content Date
+            (0x0008, 0x0033) => attrs.content_time = Some(ascii_trim(&value)), // Content Time
+            (0x0028, 0x0030) => {
+                // Pixel Spacing (DS): "rowSpacing\colSpacing".
+                let (x, y) = parse_pixel_spacing(&ascii_trim(&value));
+                attrs.pixel_size_x = x;
+                attrs.pixel_size_y = y;
+            }
+            (0x0018, 0x0088) => {
+                // Spacing Between Slices (DS) → pixelSizeZ (DicomReader.SLICE_SPACING).
+                attrs.pixel_size_z = ascii_trim(&value).trim().parse::<f64>().ok();
+            }
+            (0x0020, 0x0032) => {
+                // Image Position (Patient) (DS): "x\y\z".
+                let (x, y, z) = parse_image_position(&ascii_trim(&value));
+                attrs.position_x.push(x);
+                attrs.position_y.push(y);
+                attrs.position_z.push(z);
+            }
+            (0x0048, 0x0105) => {
+                // Optical Path Sequence: collect each item's Optical Path
+                // Description (0048,0107) as a channel name. The Rust parser does
+                // not iterate SQ items, so scan the value blob directly.
+                if let Some(desc) = find_nested_string(
+                    &value,
+                    attrs.explicit_vr,
+                    attrs.little_endian,
+                    (0x0048, 0x0107),
+                ) {
+                    attrs.channel_names.push(desc);
+                }
             }
             _ => {}
         }
@@ -1694,6 +1853,22 @@ pub struct DicomReader {
     max_pixel_range: i32,
     center_pixel_value: i32,
     palette: PaletteLut,
+    /// (0008,0008) Image Type (DicomReader.imageType).
+    image_type: Option<String>,
+    /// (0008,0023)/(0008,0033) Content Date/Time (DicomReader.date/time).
+    content_date: Option<String>,
+    content_time: Option<String>,
+    /// (0028,0030) Pixel Spacing column/row, in mm (DicomReader.pixelSizeX/Y).
+    pixel_size_x: Option<f64>,
+    pixel_size_y: Option<f64>,
+    /// (0018,0088) Spacing Between Slices, in mm (DicomReader.pixelSizeZ).
+    pixel_size_z: Option<f64>,
+    /// Per-plane positions from (0020,0032) (DicomReader.positionX/Y/Z).
+    position_x: Vec<Option<f64>>,
+    position_y: Vec<Option<f64>>,
+    position_z: Vec<Option<f64>>,
+    /// (0048,0107) Optical Path Description channel names (DicomReader.channelNames).
+    channel_names: Vec<String>,
     /// Per-series ordered file lists, in series order. When grouping finds only
     /// the selected file (or grouping is disabled) this holds a single entry.
     series_files: Vec<Vec<PathBuf>>,
@@ -1721,6 +1896,16 @@ impl DicomReader {
             max_pixel_range: 0,
             center_pixel_value: 0,
             palette: PaletteLut::default(),
+            image_type: None,
+            content_date: None,
+            content_time: None,
+            pixel_size_x: None,
+            pixel_size_y: None,
+            pixel_size_z: None,
+            position_x: Vec::new(),
+            position_y: Vec::new(),
+            position_z: Vec::new(),
+            channel_names: Vec::new(),
             series_files: Vec::new(),
             current_series: 0,
         }
@@ -1777,6 +1962,16 @@ impl DicomReader {
         self.max_pixel_range = attrs.max_pixel_range;
         self.center_pixel_value = attrs.center_pixel_value;
         self.palette = attrs.palette;
+        self.image_type = attrs.image_type;
+        self.content_date = attrs.content_date;
+        self.content_time = attrs.content_time;
+        self.pixel_size_x = attrs.pixel_size_x;
+        self.pixel_size_y = attrs.pixel_size_y;
+        self.pixel_size_z = attrs.pixel_size_z;
+        self.position_x = attrs.position_x;
+        self.position_y = attrs.position_y;
+        self.position_z = attrs.position_z;
+        self.channel_names = attrs.channel_names;
         self.path = Some(rep);
         self.current_series = series_index;
         Ok(())
@@ -1903,6 +2098,16 @@ impl FormatReader for DicomReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.image_type = None;
+        self.content_date = None;
+        self.content_time = None;
+        self.pixel_size_x = None;
+        self.pixel_size_y = None;
+        self.pixel_size_z = None;
+        self.position_x.clear();
+        self.position_y.clear();
+        self.position_z.clear();
+        self.channel_names.clear();
         self.series_files.clear();
         self.current_series = 0;
         Ok(())
@@ -2127,32 +2332,35 @@ impl FormatReader for DicomReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::metadata::MetadataValue;
-        use crate::common::ome_metadata::OmeMetadata;
+        use crate::common::ome_metadata::{OmeChannel, OmeMetadata, OmePlane};
         let meta = self.meta.as_ref()?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
         let img = &mut ome.images[0];
-        // DICOM tag (0028,0030) PixelSpacing: "row_spacing\col_spacing".
-        // Java stores these via FormatTools.getPhysicalSizeX(value, UNITS.MILLIMETER),
-        // i.e. the OME Length keeps the raw millimetre value (no µm conversion).
-        if let Some(MetadataValue::String(s)) = meta.series_metadata.get("(0028,0030)") {
-            let parts: Vec<&str> = s.splitn(2, |c| c == '\\' || c == '/').collect();
-            if let (Some(row), Some(col)) = (
-                parts.first().and_then(|v| v.trim().parse::<f64>().ok()),
-                parts.get(1).and_then(|v| v.trim().parse::<f64>().ok()),
-            ) {
-                img.physical_size_x = Some(col);
-                img.physical_size_y = Some(row);
-            }
+        // DICOM tag (0028,0030) PixelSpacing → pixelSizeX/Y; (0018,0088)
+        // SpacingBetweenSlices → pixelSizeZ. Java stores these via
+        // FormatTools.getPhysicalSize*(value, UNITS.MILLIMETER), i.e. the OME
+        // Length keeps the raw millimetre value (DicomReader.getPixelSize*).
+        if self.pixel_size_x.is_some() {
+            img.physical_size_x = self.pixel_size_x;
         }
-        // DICOM tag (0018,0050) SliceThickness, also reported in millimetres.
-        if let Some(MetadataValue::String(s)) = meta.series_metadata.get("(0018,0050)") {
-            img.physical_size_z = s.trim().parse::<f64>().ok();
+        if self.pixel_size_y.is_some() {
+            img.physical_size_y = self.pixel_size_y;
         }
-        // Image name: Java uses the (0008,0008) ImageType value split on '\',
-        // taking token index 2 (or the last token if fewer than three). When
+        if self.pixel_size_z.is_some() {
+            img.physical_size_z = self.pixel_size_z;
+        }
+        // Acquisition date: Content Date (0008,0023) + Content Time (0008,0033),
+        // combined as DicomReader.getTimestamp does.
+        if let Some(stamp) =
+            dicom_content_timestamp(self.content_date.as_deref(), self.content_time.as_deref())
+        {
+            img.acquisition_date = Some(stamp);
+        }
+        // Image name + description: Java uses the (0008,0008) ImageType value
+        // split on '\', taking token index 2 (or the last token if fewer than
+        // three) for the name and the full string for the description. When
         // ImageType is absent it leaves the default name (the file name).
-        if let Some(MetadataValue::String(s)) = meta.series_metadata.get("(0008,0008)") {
+        if let Some(s) = self.image_type.as_deref() {
             let tokens: Vec<&str> = s.split('\\').collect();
             let idx = if tokens.len() > 2 {
                 2
@@ -2162,11 +2370,56 @@ impl FormatReader for DicomReader {
             if let Some(tok) = tokens.get(idx) {
                 img.name = Some(tok.trim().to_string());
             }
+            img.description = Some(s.to_string());
         } else if let Some(p) = self.path.as_ref() {
             img.name = p
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string());
+        }
+        // Channel names from Optical Path Description (0048,0107).
+        for (c, name) in self.channel_names.iter().enumerate() {
+            if c >= img.channels.len() {
+                img.channels.push(OmeChannel {
+                    samples_per_pixel: 1,
+                    ..Default::default()
+                });
+            }
+            img.channels[c].name = Some(name.clone());
+        }
+        // Per-plane positions from Image Position (Patient) (0020,0032), in mm.
+        // Java sets store.setPlanePosition*(value, series, plane) for each plane
+        // index p < positionX.size(). Mirror that with one OmePlane per plane.
+        let plane_count = meta.image_count as usize;
+        let has_positions = !self.position_x.is_empty()
+            || !self.position_y.is_empty()
+            || !self.position_z.is_empty();
+        if has_positions && plane_count > 0 {
+            // Ensure a plane entry exists for every image plane, with ZCT
+            // coordinates from the XYCZT ordering DICOM uses.
+            if img.planes.len() < plane_count {
+                let size_c = meta.size_c.max(1);
+                let size_z = meta.size_z.max(1);
+                img.planes = (0..plane_count as u32)
+                    .map(|p| OmePlane {
+                        the_c: p % size_c,
+                        the_z: (p / size_c) % size_z,
+                        the_t: p / (size_c * size_z),
+                        ..Default::default()
+                    })
+                    .collect();
+            }
+            for p in 0..plane_count {
+                if p < self.position_x.len() {
+                    img.planes[p].position_x = self.position_x[p];
+                }
+                if p < self.position_y.len() {
+                    img.planes[p].position_y = self.position_y[p];
+                }
+                if p < self.position_z.len() {
+                    img.planes[p].position_z = self.position_z[p];
+                }
+            }
         }
         Some(ome)
     }
@@ -2508,6 +2761,111 @@ mod tests {
         let input = vec![0xff, 0xd8, 0xff, 0xd9, 0x11, 0x22, 0x33, 0x44];
         let out = trim_dicom_jpeg(input);
         assert_eq!(out, vec![0xff, 0xd8, 0xff, 0xd9]);
+    }
+
+    #[test]
+    fn parse_pixel_spacing_splits_row_then_col() {
+        // DicomReader.parsePixelSpacing: pixelSizeY = first, pixelSizeX = last.
+        let (x, y) = parse_pixel_spacing("0.5\\0.25");
+        assert_eq!(x, Some(0.25));
+        assert_eq!(y, Some(0.5));
+        // No separator → nothing parsed.
+        assert_eq!(parse_pixel_spacing("0.5"), (None, None));
+    }
+
+    #[test]
+    fn parse_image_position_splits_three_axes() {
+        let (x, y, z) = parse_image_position("1.5\\2.5\\3.5");
+        assert_eq!((x, y, z), (Some(1.5), Some(2.5), Some(3.5)));
+        // Missing z component.
+        let (x, y, z) = parse_image_position("1.5\\2.5");
+        assert_eq!((x, y, z), (Some(1.5), Some(2.5), None));
+        // Non-numeric component yields None for that axis only.
+        let (x, y, z) = parse_image_position("abc\\2.5\\3.5");
+        assert_eq!((x, y, z), (None, Some(2.5), Some(3.5)));
+    }
+
+    #[test]
+    fn content_timestamp_combines_date_and_time() {
+        assert_eq!(
+            dicom_content_timestamp(Some("20240115"), Some("131415")),
+            Some("2024-01-15T13:14:15".to_string())
+        );
+        // Fractional-second TM is truncated to whole seconds.
+        assert_eq!(
+            dicom_content_timestamp(Some("20240115"), Some("131415.500000")),
+            Some("2024-01-15T13:14:15".to_string())
+        );
+        // Missing component → no timestamp.
+        assert_eq!(dicom_content_timestamp(None, Some("131415")), None);
+        assert_eq!(dicom_content_timestamp(Some("2024"), Some("13")), None);
+    }
+
+    #[test]
+    fn find_nested_string_reads_optical_path_description() {
+        // Build an Optical Path Sequence value blob (implicit VR LE) containing a
+        // single item with an Optical Path Description (0048,0107) element.
+        let mut blob = Vec::new();
+        // Item start (FFFE,E000) with undefined-ish defined length covering child.
+        let mut child = Vec::new();
+        // (0048,0107) implicit VR: 4-byte length + value "DAPI".
+        child.extend_from_slice(&0x0048u16.to_le_bytes());
+        child.extend_from_slice(&0x0107u16.to_le_bytes());
+        child.extend_from_slice(&4u32.to_le_bytes());
+        child.extend_from_slice(b"DAPI");
+        blob.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        blob.extend_from_slice(&0xE000u16.to_le_bytes());
+        blob.extend_from_slice(&(child.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&child);
+
+        let got = find_nested_string(&blob, false, true, (0x0048, 0x0107));
+        assert_eq!(got.as_deref(), Some("DAPI"));
+        // Absent tag → None.
+        assert_eq!(find_nested_string(&blob, false, true, (0x0048, 0x0106)), None);
+    }
+
+    #[test]
+    fn parse_dicom_captures_data_fields() {
+        // Minimal implicit-VR-LE dataset exercising the newly captured fields.
+        fn elem(out: &mut Vec<u8>, g: u16, e: u16, v: &[u8]) {
+            out.extend_from_slice(&g.to_le_bytes());
+            out.extend_from_slice(&e.to_le_bytes());
+            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            out.extend_from_slice(v);
+        }
+        let mut bytes = Vec::new();
+        elem(&mut bytes, 0x0008, 0x0008, b"DERIVED\\SECONDARY\\VOLUME ");
+        elem(&mut bytes, 0x0008, 0x0023, b"20240115");
+        elem(&mut bytes, 0x0008, 0x0033, b"131415");
+        elem(&mut bytes, 0x0018, 0x0088, b"0.75");
+        elem(&mut bytes, 0x0020, 0x0032, b"1.5\\2.5\\3.5");
+        elem(&mut bytes, 0x0028, 0x0030, b"0.5\\0.25");
+        elem(&mut bytes, 0x0028, 0x0002, &1u16.to_le_bytes());
+        elem(&mut bytes, 0x0028, 0x0010, &2u16.to_le_bytes());
+        elem(&mut bytes, 0x0028, 0x0011, &2u16.to_le_bytes());
+        elem(&mut bytes, 0x0028, 0x0100, &8u16.to_le_bytes());
+        elem(&mut bytes, 0x0028, 0x0101, &8u16.to_le_bytes());
+        elem(&mut bytes, 0x0028, 0x0103, &0u16.to_le_bytes());
+        elem(&mut bytes, 0x7FE0, 0x0010, &[1, 2, 3, 4]);
+
+        let dir = std::env::temp_dir().join(format!("bf_dicom_fields_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fields.dcm");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let attrs = parse_dicom(&path).unwrap();
+        assert_eq!(attrs.image_type.as_deref(), Some("DERIVED\\SECONDARY\\VOLUME"));
+        assert_eq!(attrs.content_date.as_deref(), Some("20240115"));
+        assert_eq!(attrs.content_time.as_deref(), Some("131415"));
+        assert_eq!(attrs.pixel_size_x, Some(0.25));
+        assert_eq!(attrs.pixel_size_y, Some(0.5));
+        assert_eq!(attrs.pixel_size_z, Some(0.75));
+        assert_eq!(attrs.position_x, vec![Some(1.5)]);
+        assert_eq!(attrs.position_y, vec![Some(2.5)]);
+        assert_eq!(attrs.position_z, vec![Some(3.5)]);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

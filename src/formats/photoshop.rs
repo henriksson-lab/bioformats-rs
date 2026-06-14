@@ -15,6 +15,15 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::validate_region;
 
+const PSD_RESOURCE_TEXT_MAX: usize = 4096;
+const PSD_ALPHA_CHANNEL_NAMES_MAX: usize = 256;
+const PSD_DISPLAY_INFO_RECORD_BYTES: usize = 14;
+const PSD_DISPLAY_INFO_MAX_RECORDS: usize = 64;
+const PSD_XMP_MAX_BYTES: usize = 65_536;
+const PSD_XMP_MAX_SCALARS: usize = 128;
+const PSD_XMP_MAX_DEPTH: usize = 16;
+const PSD_XMP_MAX_VALUE_CHARS: usize = 1024;
+
 pub struct PsdReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -165,6 +174,721 @@ impl<'a> Cur<'a> {
     }
 }
 
+fn psd_color_mode_name(mode: u16) -> &'static str {
+    match mode {
+        0 => "Bitmap",
+        1 => "Grayscale",
+        2 => "Indexed",
+        3 => "RGB",
+        4 => "CMYK",
+        7 => "Multichannel",
+        8 => "Duotone",
+        9 => "Lab",
+        _ => "Unknown",
+    }
+}
+
+fn psd_resource_name(id: u16) -> &'static str {
+    match id {
+        1005 => "ResolutionInfo",
+        1006 => "AlphaChannelNames",
+        1007 => "DisplayInfo",
+        1011 => "PrintFlags",
+        1034 => "CopyrightFlag",
+        1035 => "Url",
+        1037 => "GlobalAngle",
+        1039 => "ICCProfile",
+        1057 => "VersionInfo",
+        1060 => "XmpMetadata",
+        1064 => "PixelAspectRatio",
+        1065 => "LayerComps",
+        2999 => "ClippingPathName",
+        7000 => "ImageReadyVariables",
+        7001 => "ImageReadyDataSets",
+        10000 => "PrintFlagsInformation",
+        _ => "Unknown",
+    }
+}
+
+fn psd_clean_resource_text(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() || bytes.len() > PSD_RESOURCE_TEXT_MAX {
+        return None;
+    }
+    let text = String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|ch| if ch == '\0' { ' ' } else { ch })
+        .collect::<String>();
+    let cleaned = text.trim().to_string();
+    if cleaned.is_empty()
+        || cleaned
+            .chars()
+            .any(|ch| ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t')
+    {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn psd_read_be_u32(payload: &[u8], offset: &mut usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let bytes = payload.get(*offset..end)?;
+    *offset = end;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn psd_read_be_u16(payload: &[u8], offset: &mut usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let bytes = payload.get(*offset..end)?;
+    *offset = end;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn psd_read_unicode_string(payload: &[u8], offset: &mut usize) -> Option<String> {
+    let length = psd_read_be_u32(payload, offset)? as usize;
+    if length > 1024 {
+        return None;
+    }
+    let byte_len = length.checked_mul(2)?;
+    let end = offset.checked_add(byte_len)?;
+    let bytes = payload.get(*offset..end)?;
+    *offset = end;
+
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).ok()
+}
+
+fn decode_psd_display_info(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    let available_records = payload.len() / PSD_DISPLAY_INFO_RECORD_BYTES;
+    let record_count = available_records.min(PSD_DISPLAY_INFO_MAX_RECORDS);
+    metadata.insert(
+        "psd.image_resource.1007.display_info_count".into(),
+        crate::common::metadata::MetadataValue::Int(record_count as i64),
+    );
+
+    let mut offset = 0usize;
+    for index in 0..record_count {
+        let Some(color_space) = psd_read_be_u16(payload, &mut offset) else {
+            break;
+        };
+        let Some(color0) = psd_read_be_u16(payload, &mut offset) else {
+            break;
+        };
+        let Some(color1) = psd_read_be_u16(payload, &mut offset) else {
+            break;
+        };
+        let Some(color2) = psd_read_be_u16(payload, &mut offset) else {
+            break;
+        };
+        let Some(color3) = psd_read_be_u16(payload, &mut offset) else {
+            break;
+        };
+        let Some(opacity) = psd_read_be_u16(payload, &mut offset) else {
+            break;
+        };
+        let Some(&kind) = payload.get(offset) else {
+            break;
+        };
+        offset += 2; // kind byte plus reserved padding byte
+
+        let prefix = format!("psd.image_resource.1007.display_info.{index}");
+        metadata.insert(
+            format!("{prefix}.color_space"),
+            crate::common::metadata::MetadataValue::Int(color_space as i64),
+        );
+        metadata.insert(
+            format!("{prefix}.color_components"),
+            crate::common::metadata::MetadataValue::String(format!(
+                "{color0},{color1},{color2},{color3}"
+            )),
+        );
+        metadata.insert(
+            format!("{prefix}.opacity"),
+            crate::common::metadata::MetadataValue::Int(opacity as i64),
+        );
+        metadata.insert(
+            format!("{prefix}.kind"),
+            crate::common::metadata::MetadataValue::Int(kind as i64),
+        );
+    }
+
+    let trailing = payload.len() % PSD_DISPLAY_INFO_RECORD_BYTES;
+    if trailing != 0 {
+        metadata.insert(
+            "psd.image_resource.1007.parse_status".into(),
+            crate::common::metadata::MetadataValue::String(format!("trailing_{trailing}_bytes")),
+        );
+    } else if available_records > PSD_DISPLAY_INFO_MAX_RECORDS {
+        metadata.insert(
+            "psd.image_resource.1007.parse_status".into(),
+            crate::common::metadata::MetadataValue::String("too_many_records".into()),
+        );
+    }
+}
+
+fn decode_psd_print_flags(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    const FLAG_NAMES: [&str; 9] = [
+        "labels",
+        "crop_marks",
+        "color_bars",
+        "registration_marks",
+        "negative",
+        "flip",
+        "interpolate",
+        "caption",
+        "print_flags",
+    ];
+
+    for (index, name) in FLAG_NAMES.iter().enumerate() {
+        let Some(&flag) = payload.get(index) else {
+            metadata.insert(
+                "psd.image_resource.1011.parse_status".into(),
+                crate::common::metadata::MetadataValue::String("truncated".into()),
+            );
+            return;
+        };
+        metadata.insert(
+            format!("psd.image_resource.1011.{name}"),
+            crate::common::metadata::MetadataValue::Bool(flag != 0),
+        );
+    }
+
+    if payload.len() > FLAG_NAMES.len() {
+        metadata.insert(
+            "psd.image_resource.1011.parse_status".into(),
+            crate::common::metadata::MetadataValue::String(format!(
+                "trailing_{}_bytes",
+                payload.len() - FLAG_NAMES.len()
+            )),
+        );
+    }
+}
+
+fn decode_psd_print_flags_information(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    if payload.len() < 10 {
+        metadata.insert(
+            "psd.image_resource.10000.parse_status".into(),
+            crate::common::metadata::MetadataValue::String("truncated".into()),
+        );
+        return;
+    }
+
+    let version = u16::from_be_bytes([payload[0], payload[1]]);
+    let center_crop_marks = payload[2] != 0;
+    let reserved = payload[3];
+    let bleed_width = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let bleed_width_scale = u16::from_be_bytes([payload[8], payload[9]]);
+
+    metadata.insert(
+        "psd.image_resource.10000.version".into(),
+        crate::common::metadata::MetadataValue::Int(version as i64),
+    );
+    metadata.insert(
+        "psd.image_resource.10000.center_crop_marks".into(),
+        crate::common::metadata::MetadataValue::Bool(center_crop_marks),
+    );
+    metadata.insert(
+        "psd.image_resource.10000.reserved".into(),
+        crate::common::metadata::MetadataValue::Int(reserved as i64),
+    );
+    metadata.insert(
+        "psd.image_resource.10000.bleed_width".into(),
+        crate::common::metadata::MetadataValue::Int(bleed_width as i64),
+    );
+    metadata.insert(
+        "psd.image_resource.10000.bleed_width_scale".into(),
+        crate::common::metadata::MetadataValue::Int(bleed_width_scale as i64),
+    );
+
+    if payload.len() > 10 {
+        metadata.insert(
+            "psd.image_resource.10000.parse_status".into(),
+            crate::common::metadata::MetadataValue::String(format!(
+                "trailing_{}_bytes",
+                payload.len() - 10
+            )),
+        );
+    }
+}
+
+fn decode_psd_version_info(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    let mut offset = 0usize;
+    let Some(version) = psd_read_be_u32(payload, &mut offset) else {
+        return;
+    };
+    let Some(&has_real_merged_data) = payload.get(offset) else {
+        return;
+    };
+    offset += 1;
+    let Some(writer_name) = psd_read_unicode_string(payload, &mut offset) else {
+        return;
+    };
+    let Some(reader_name) = psd_read_unicode_string(payload, &mut offset) else {
+        return;
+    };
+    let Some(file_version) = psd_read_be_u32(payload, &mut offset) else {
+        return;
+    };
+
+    metadata.insert(
+        "psd.image_resource.1057.version".into(),
+        crate::common::metadata::MetadataValue::Int(version as i64),
+    );
+    metadata.insert(
+        "psd.image_resource.1057.has_real_merged_data".into(),
+        crate::common::metadata::MetadataValue::Bool(has_real_merged_data != 0),
+    );
+    if !writer_name.is_empty() {
+        metadata.insert(
+            "psd.image_resource.1057.writer_name".into(),
+            crate::common::metadata::MetadataValue::String(writer_name),
+        );
+    }
+    if !reader_name.is_empty() {
+        metadata.insert(
+            "psd.image_resource.1057.reader_name".into(),
+            crate::common::metadata::MetadataValue::String(reader_name),
+        );
+    }
+    metadata.insert(
+        "psd.image_resource.1057.file_version".into(),
+        crate::common::metadata::MetadataValue::Int(file_version as i64),
+    );
+}
+
+fn decode_psd_pixel_aspect_ratio(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    if payload.len() < 12 {
+        return;
+    }
+
+    let version = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let ratio = f64::from_bits(u64::from_be_bytes([
+        payload[4],
+        payload[5],
+        payload[6],
+        payload[7],
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
+    ]));
+    if !ratio.is_finite() {
+        return;
+    }
+
+    metadata.insert(
+        "psd.image_resource.1064.version".into(),
+        crate::common::metadata::MetadataValue::Int(version as i64),
+    );
+    metadata.insert(
+        "psd.image_resource.1064.aspect_ratio".into(),
+        crate::common::metadata::MetadataValue::Float(ratio),
+    );
+}
+
+fn decode_psd_resolution_info(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    if payload.len() < 16 {
+        return;
+    }
+
+    let fixed_16_16 = |offset: usize| -> f64 {
+        let raw = u32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]);
+        raw as f64 / 65536.0
+    };
+    let u16_at = |offset: usize| -> i64 {
+        u16::from_be_bytes([payload[offset], payload[offset + 1]]) as i64
+    };
+
+    let horizontal_resolution = fixed_16_16(0);
+    let vertical_resolution = fixed_16_16(8);
+    if !horizontal_resolution.is_finite() || !vertical_resolution.is_finite() {
+        return;
+    }
+
+    metadata.insert(
+        "psd.image_resource.1005.horizontal_resolution".into(),
+        crate::common::metadata::MetadataValue::Float(horizontal_resolution),
+    );
+    metadata.insert(
+        "psd.image_resource.1005.horizontal_resolution_unit".into(),
+        crate::common::metadata::MetadataValue::Int(u16_at(4)),
+    );
+    metadata.insert(
+        "psd.image_resource.1005.width_unit".into(),
+        crate::common::metadata::MetadataValue::Int(u16_at(6)),
+    );
+    metadata.insert(
+        "psd.image_resource.1005.vertical_resolution".into(),
+        crate::common::metadata::MetadataValue::Float(vertical_resolution),
+    );
+    metadata.insert(
+        "psd.image_resource.1005.vertical_resolution_unit".into(),
+        crate::common::metadata::MetadataValue::Int(u16_at(12)),
+    );
+    metadata.insert(
+        "psd.image_resource.1005.height_unit".into(),
+        crate::common::metadata::MetadataValue::Int(u16_at(14)),
+    );
+}
+
+fn decode_psd_alpha_channel_names(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    let mut offset = 0usize;
+    let mut names = Vec::new();
+    let mut status = "ok";
+
+    while offset < payload.len() {
+        if names.len() >= PSD_ALPHA_CHANNEL_NAMES_MAX {
+            status = "too_many_names";
+            break;
+        }
+
+        let name_len = payload[offset] as usize;
+        offset += 1;
+        let Some(end) = offset.checked_add(name_len) else {
+            status = "truncated";
+            break;
+        };
+        let Some(name_bytes) = payload.get(offset..end) else {
+            status = "truncated";
+            break;
+        };
+        offset = end;
+
+        if let Some(name) = psd_clean_resource_text(name_bytes) {
+            names.push(name);
+        }
+    }
+
+    metadata.insert(
+        "psd.image_resource.1006.alpha_channel_count".into(),
+        crate::common::metadata::MetadataValue::Int(names.len() as i64),
+    );
+    if !names.is_empty() {
+        metadata.insert(
+            "psd.image_resource.1006.alpha_channel_names".into(),
+            crate::common::metadata::MetadataValue::String(names.join("|")),
+        );
+    }
+    if status != "ok" {
+        metadata.insert(
+            "psd.image_resource.1006.parse_status".into(),
+            crate::common::metadata::MetadataValue::String(status.into()),
+        );
+    }
+}
+
+fn decode_psd_copyright_flag(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    let Some(&flag) = payload.first() else {
+        return;
+    };
+
+    metadata.insert(
+        "psd.image_resource.1034.copyrighted".into(),
+        crate::common::metadata::MetadataValue::Bool(flag != 0),
+    );
+}
+
+fn decode_psd_global_angle(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    if payload.len() < 4 {
+        return;
+    }
+
+    let angle = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    metadata.insert(
+        "psd.image_resource.1037.angle".into(),
+        crate::common::metadata::MetadataValue::Int(angle as i64),
+    );
+}
+
+fn decode_psd_icc_profile(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    metadata.insert(
+        "psd.image_resource.1039.profile_bytes".into(),
+        crate::common::metadata::MetadataValue::Int(payload.len() as i64),
+    );
+    metadata.insert(
+        "psd.image_resource.1039.profile_applied".into(),
+        crate::common::metadata::MetadataValue::Bool(false),
+    );
+
+    if payload.len() < 128 {
+        metadata.insert(
+            "psd.image_resource.1039.parse_status".into(),
+            crate::common::metadata::MetadataValue::String("truncated_header".into()),
+        );
+        return;
+    }
+
+    let declared_size = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let version_major = payload[8];
+    let version_minor = payload[9] >> 4;
+    let profile_class = String::from_utf8_lossy(&payload[12..16]).to_string();
+    let color_space = String::from_utf8_lossy(&payload[16..20]).to_string();
+    let pcs = String::from_utf8_lossy(&payload[20..24]).to_string();
+    let signature = String::from_utf8_lossy(&payload[36..40]).to_string();
+
+    metadata.insert(
+        "psd.image_resource.1039.declared_size".into(),
+        crate::common::metadata::MetadataValue::Int(declared_size as i64),
+    );
+    metadata.insert(
+        "psd.image_resource.1039.version".into(),
+        crate::common::metadata::MetadataValue::String(format!("{version_major}.{version_minor}")),
+    );
+    metadata.insert(
+        "psd.image_resource.1039.profile_class".into(),
+        crate::common::metadata::MetadataValue::String(profile_class),
+    );
+    metadata.insert(
+        "psd.image_resource.1039.color_space".into(),
+        crate::common::metadata::MetadataValue::String(color_space),
+    );
+    metadata.insert(
+        "psd.image_resource.1039.pcs".into(),
+        crate::common::metadata::MetadataValue::String(pcs),
+    );
+    metadata.insert(
+        "psd.image_resource.1039.signature".into(),
+        crate::common::metadata::MetadataValue::String(signature),
+    );
+
+    if declared_size as usize != payload.len() {
+        metadata.insert(
+            "psd.image_resource.1039.parse_status".into(),
+            crate::common::metadata::MetadataValue::String("declared_size_mismatch".into()),
+        );
+    }
+}
+
+fn psd_xmp_name(name: &[u8]) -> String {
+    String::from_utf8_lossy(name)
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch
+            } else if ch == ':' || ch == '-' || ch == '_' {
+                '.'
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .to_string()
+}
+
+fn psd_clean_xmp_text(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() || bytes.len() > PSD_XMP_MAX_BYTES {
+        return None;
+    }
+    let text = String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|ch| if ch == '\0' { ' ' } else { ch })
+        .collect::<String>();
+    let cleaned = text.trim().to_string();
+    if cleaned.is_empty()
+        || cleaned
+            .chars()
+            .any(|ch| ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t')
+    {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn psd_xmp_is_container(name: &str) -> bool {
+    matches!(
+        name.rsplit('.').next().unwrap_or(name),
+        "xmpmeta" | "RDF" | "Description" | "Alt" | "Seq" | "Bag" | "li"
+    )
+}
+
+fn psd_xmp_text_key(stack: &[String]) -> Option<&str> {
+    stack
+        .iter()
+        .rev()
+        .find(|name| !psd_xmp_is_container(name.as_str()))
+        .map(String::as_str)
+}
+
+fn psd_xmp_insert_scalar(
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+    key: &str,
+    value: &str,
+    inserted: &mut usize,
+) {
+    if *inserted >= PSD_XMP_MAX_SCALARS {
+        return;
+    }
+    let value = value.trim_matches(char::from(0)).trim();
+    if key.is_empty()
+        || value.is_empty()
+        || value.chars().count() > PSD_XMP_MAX_VALUE_CHARS
+        || value
+            .chars()
+            .any(|ch| ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t')
+    {
+        return;
+    }
+
+    metadata.insert(
+        format!("psd.image_resource.1060.xmp.{key}"),
+        crate::common::metadata::MetadataValue::String(value.to_string()),
+    );
+    *inserted += 1;
+}
+
+fn decode_psd_xmp_metadata(
+    payload: &[u8],
+    metadata: &mut HashMap<String, crate::common::metadata::MetadataValue>,
+) {
+    if payload.is_empty() || payload.len() > PSD_XMP_MAX_BYTES {
+        return;
+    }
+    let Some(xml) = psd_clean_xmp_text(payload) else {
+        return;
+    };
+    if !(xml.contains("<x:xmpmeta") || xml.contains("<rdf:RDF") || xml.contains("<xmpmeta")) {
+        return;
+    }
+
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    reader.config_mut().trim_text(false);
+    let mut stack = Vec::new();
+    let mut text = String::new();
+    let mut inserted = 0usize;
+    let mut parse_error = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(element)) => {
+                if stack.len() >= PSD_XMP_MAX_DEPTH {
+                    parse_error = true;
+                    break;
+                }
+                stack.push(psd_xmp_name(element.name().as_ref()));
+                text.clear();
+                for attr in element.attributes().flatten() {
+                    if inserted >= PSD_XMP_MAX_SCALARS {
+                        break;
+                    }
+                    let key = psd_xmp_name(attr.key.as_ref());
+                    if key.is_empty()
+                        || key == "rdf.about"
+                        || key == "about"
+                        || key.starts_with("xml.")
+                        || key.starts_with("xmlns")
+                    {
+                        continue;
+                    }
+                    let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+                        continue;
+                    };
+                    psd_xmp_insert_scalar(metadata, &key, value.as_ref(), &mut inserted);
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(element)) => {
+                if stack.len() >= PSD_XMP_MAX_DEPTH {
+                    parse_error = true;
+                    break;
+                }
+                for attr in element.attributes().flatten() {
+                    if inserted >= PSD_XMP_MAX_SCALARS {
+                        break;
+                    }
+                    let key = psd_xmp_name(attr.key.as_ref());
+                    if key.is_empty()
+                        || key == "rdf.about"
+                        || key == "about"
+                        || key.starts_with("xml.")
+                        || key.starts_with("xmlns")
+                    {
+                        continue;
+                    }
+                    let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+                        continue;
+                    };
+                    psd_xmp_insert_scalar(metadata, &key, value.as_ref(), &mut inserted);
+                }
+            }
+            Ok(quick_xml::events::Event::Text(event)) => {
+                if let Ok(value) = event.unescape() {
+                    if text.chars().count() < PSD_XMP_MAX_VALUE_CHARS {
+                        text.push_str(&value);
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                if let Some(key) = psd_xmp_text_key(&stack) {
+                    psd_xmp_insert_scalar(metadata, key, &text, &mut inserted);
+                }
+                text.clear();
+                stack.pop();
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => {
+                parse_error = true;
+                break;
+            }
+            _ => {}
+        }
+        if inserted >= PSD_XMP_MAX_SCALARS {
+            break;
+        }
+    }
+
+    if inserted > 0 {
+        metadata.insert(
+            "psd.image_resource.1060.xmp.scalar_count".into(),
+            crate::common::metadata::MetadataValue::Int(inserted as i64),
+        );
+    }
+    if parse_error {
+        metadata.insert(
+            "psd.image_resource.1060.xmp.parse_status".into(),
+            crate::common::metadata::MetadataValue::String("parse_error".into()),
+        );
+    }
+}
+
 fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     let mut f = File::open(path).map_err(BioFormatsError::Io)?;
     let mut data = Vec::new();
@@ -234,25 +958,88 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         r.seek((fp as i64 + mode_data_len).max(0) as usize);
     }
 
-    // Image Resources section: Java skips the 4-byte length, then walks "8BIM"
-    // resource blocks one at a time.
-    r.skip(4);
-    while r.read_bytes(4) == b"8BIM" {
-        let _tag = r.read_i16();
-        let mut read = 1;
-        while r.read_u8() != 0 {
-            read += 1;
-        }
-        if read % 2 == 1 {
+    // Image Resources section: capture a bounded directory of resource IDs and
+    // short textual payloads while keeping Java's final offset semantics.
+    let image_resources_len = r.read_u32() as usize;
+    let image_resources_start = r.fp();
+    let image_resources_end = image_resources_start.saturating_add(image_resources_len);
+    let mut image_resource_count = 0usize;
+    let mut image_resource_ids = Vec::new();
+    let mut image_resource_metadata = HashMap::new();
+    while r.fp().saturating_add(12) <= image_resources_end && r.read_bytes(4) == b"8BIM" {
+        let tag = r.read_u16();
+        image_resource_count += 1;
+        image_resource_ids.push(tag.to_string());
+
+        let name_len = r.read_u8() as usize;
+        let name = r.read_bytes(name_len);
+        if (1 + name_len) % 2 == 1 {
             r.skip(1);
         }
-        let mut size = r.read_i32();
-        if size % 2 == 1 {
-            size += 1;
+        let resource_name = String::from_utf8_lossy(name).trim().to_string();
+        if !resource_name.is_empty() {
+            image_resource_metadata.insert(
+                format!("psd.image_resource.{tag}.name"),
+                crate::common::metadata::MetadataValue::String(resource_name),
+            );
         }
-        r.skip(size.max(0) as usize);
+
+        let size = r.read_i32().max(0) as usize;
+        let payload = r.read_bytes(size).to_vec();
+        if size % 2 == 1 {
+            r.skip(1);
+        }
+        image_resource_metadata.insert(
+            format!("psd.image_resource.{tag}.type"),
+            crate::common::metadata::MetadataValue::String(psd_resource_name(tag).into()),
+        );
+        image_resource_metadata.insert(
+            format!("psd.image_resource.{tag}.bytes"),
+            crate::common::metadata::MetadataValue::Int(size as i64),
+        );
+        if matches!(tag, 1035 | 1060 | 7000 | 7001) {
+            if let Some(text) = psd_clean_resource_text(&payload) {
+                image_resource_metadata.insert(
+                    format!("psd.image_resource.{tag}.text"),
+                    crate::common::metadata::MetadataValue::String(text),
+                );
+            }
+        }
+        if tag == 1034 {
+            decode_psd_copyright_flag(&payload, &mut image_resource_metadata);
+        }
+        if tag == 1037 {
+            decode_psd_global_angle(&payload, &mut image_resource_metadata);
+        }
+        if tag == 1039 {
+            decode_psd_icc_profile(&payload, &mut image_resource_metadata);
+        }
+        if tag == 1007 {
+            decode_psd_display_info(&payload, &mut image_resource_metadata);
+        }
+        if tag == 1011 {
+            decode_psd_print_flags(&payload, &mut image_resource_metadata);
+        }
+        if tag == 10000 {
+            decode_psd_print_flags_information(&payload, &mut image_resource_metadata);
+        }
+        if tag == 1064 {
+            decode_psd_pixel_aspect_ratio(&payload, &mut image_resource_metadata);
+        }
+        if tag == 1005 {
+            decode_psd_resolution_info(&payload, &mut image_resource_metadata);
+        }
+        if tag == 1006 {
+            decode_psd_alpha_channel_names(&payload, &mut image_resource_metadata);
+        }
+        if tag == 1057 {
+            decode_psd_version_info(&payload, &mut image_resource_metadata);
+        }
+        if tag == 1060 {
+            decode_psd_xmp_metadata(&payload, &mut image_resource_metadata);
+        }
     }
-    r.seek(r.fp().saturating_sub(4));
+    r.seek(image_resources_end);
 
     // Layer and Mask Info section. Java derives the image-data offset through a
     // sequence of heuristics; we mirror them byte-for-byte so the resulting
@@ -277,6 +1064,7 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
                 &data,
                 &mut r,
                 offset,
+                version,
                 channels,
                 height,
                 width,
@@ -284,6 +1072,10 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
                 color_mode,
                 pixel_type,
                 lookup_table,
+                image_resources_len,
+                image_resource_count,
+                image_resource_ids,
+                image_resource_metadata,
             );
         }
         if layer_len == 0 && layer_count == 0 {
@@ -364,6 +1156,7 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         &data,
         &mut r,
         offset,
+        version,
         channels,
         height,
         width,
@@ -371,6 +1164,10 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         color_mode,
         pixel_type,
         lookup_table,
+        image_resources_len,
+        image_resource_count,
+        image_resource_ids,
+        image_resource_metadata,
     )
 }
 
@@ -381,6 +1178,7 @@ fn finish_psd(
     data: &[u8],
     r: &mut Cur,
     mut offset: usize,
+    version: u16,
     channels: u32,
     height: u32,
     width: u32,
@@ -388,6 +1186,10 @@ fn finish_psd(
     color_mode: u16,
     pixel_type: PixelType,
     lookup_table: Option<crate::common::metadata::LookupTable>,
+    image_resources_len: usize,
+    image_resource_count: usize,
+    image_resource_ids: Vec<String>,
+    image_resource_metadata: HashMap<String, crate::common::metadata::MetadataValue>,
 ) -> Result<(ImageMetadata, Vec<u8>)> {
     // Image Data section. Java reads the compression word at `offset`, then sets
     // `offset = filePointer` (just past the word).
@@ -467,6 +1269,49 @@ fn finish_psd(
     // Java: imageCount = sizeC / (isRGB ? 3 : 1).
     let image_count = (output_channels as u32 / if is_rgb { 3 } else { 1 }).max(1);
 
+    let mut series_metadata = image_resource_metadata;
+    series_metadata.insert(
+        "psd.version".into(),
+        crate::common::metadata::MetadataValue::Int(version as i64),
+    );
+    series_metadata.insert(
+        "psd.channels".into(),
+        crate::common::metadata::MetadataValue::Int(channels as i64),
+    );
+    series_metadata.insert(
+        "psd.depth".into(),
+        crate::common::metadata::MetadataValue::Int(depth as i64),
+    );
+    series_metadata.insert(
+        "psd.color_mode".into(),
+        crate::common::metadata::MetadataValue::String(psd_color_mode_name(color_mode).into()),
+    );
+    series_metadata.insert(
+        "psd.compression".into(),
+        crate::common::metadata::MetadataValue::String(
+            match compression {
+                0 => "Raw",
+                1 => "PackBits",
+                _ => "Unsupported",
+            }
+            .into(),
+        ),
+    );
+    series_metadata.insert(
+        "psd.image_resources.bytes".into(),
+        crate::common::metadata::MetadataValue::Int(image_resources_len as i64),
+    );
+    series_metadata.insert(
+        "psd.image_resources.count".into(),
+        crate::common::metadata::MetadataValue::Int(image_resource_count as i64),
+    );
+    if !image_resource_ids.is_empty() {
+        series_metadata.insert(
+            "psd.image_resources.ids".into(),
+            crate::common::metadata::MetadataValue::String(image_resource_ids.join(",")),
+        );
+    }
+
     let meta = ImageMetadata {
         size_x: width,
         size_y: height,
@@ -482,7 +1327,7 @@ fn finish_psd(
         is_indexed,
         is_little_endian: false, // PSD is big-endian
         resolution_count: 1,
-        series_metadata: HashMap::new(),
+        series_metadata,
         lookup_table,
         modulo_z: None,
         modulo_c: None,
@@ -495,6 +1340,7 @@ fn finish_psd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::metadata::MetadataValue;
 
     #[test]
     fn packbits_rejects_truncated_literal_payload() {
@@ -511,6 +1357,159 @@ mod tests {
         assert!(
             matches!(err, BioFormatsError::InvalidData(message) if message.contains("shorter"))
         );
+    }
+
+    #[test]
+    fn alpha_channel_names_resource_decodes_pascal_strings() {
+        let mut metadata = HashMap::new();
+        decode_psd_alpha_channel_names(
+            &[
+                4, b'M', b'a', b's', b'k', 6, b'M', b'a', b't', b't', b'e', b'1',
+            ],
+            &mut metadata,
+        );
+
+        assert!(matches!(
+            metadata.get("psd.image_resource.1006.alpha_channel_count"),
+            Some(MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1006.alpha_channel_names"),
+            Some(MetadataValue::String(value)) if value == "Mask|Matte1"
+        ));
+        assert!(!metadata.contains_key("psd.image_resource.1006.parse_status"));
+    }
+
+    #[test]
+    fn alpha_channel_names_resource_records_truncated_payload() {
+        let mut metadata = HashMap::new();
+        decode_psd_alpha_channel_names(&[5, b'M', b'a'], &mut metadata);
+
+        assert!(matches!(
+            metadata.get("psd.image_resource.1006.alpha_channel_count"),
+            Some(MetadataValue::Int(0))
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1006.parse_status"),
+            Some(MetadataValue::String(value)) if value == "truncated"
+        ));
+    }
+
+    #[test]
+    fn display_info_resource_records_trailing_payload() {
+        let mut metadata = HashMap::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u16.to_be_bytes());
+        payload.extend_from_slice(&65535u16.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes());
+        payload.extend_from_slice(&75u16.to_be_bytes());
+        payload.push(2);
+        payload.push(0);
+        payload.push(99);
+
+        decode_psd_display_info(&payload, &mut metadata);
+
+        assert!(matches!(
+            metadata.get("psd.image_resource.1007.display_info_count"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1007.display_info.0.color_space"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1007.display_info.0.color_components"),
+            Some(MetadataValue::String(value)) if value == "65535,0,0,0"
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1007.display_info.0.opacity"),
+            Some(MetadataValue::Int(75))
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1007.display_info.0.kind"),
+            Some(MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1007.parse_status"),
+            Some(MetadataValue::String(value)) if value == "trailing_1_bytes"
+        ));
+    }
+
+    #[test]
+    fn print_flags_resource_records_truncated_payload() {
+        let mut metadata = HashMap::new();
+        decode_psd_print_flags(&[1, 0, 1], &mut metadata);
+
+        assert!(matches!(
+            metadata.get("psd.image_resource.1011.labels"),
+            Some(MetadataValue::Bool(true))
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1011.crop_marks"),
+            Some(MetadataValue::Bool(false))
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1011.color_bars"),
+            Some(MetadataValue::Bool(true))
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1011.parse_status"),
+            Some(MetadataValue::String(value)) if value == "truncated"
+        ));
+    }
+
+    #[test]
+    fn xmp_resource_extracts_bounded_semantic_scalars() {
+        let mut metadata = HashMap::new();
+        let payload = br#"<?xpacket begin=''?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+           xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+           xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+           xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <rdf:Description rdf:about=""
+        xmp:CreatorTool="Photoshop 2026"
+        photoshop:DateCreated="2026-05-04">
+      <dc:creator><rdf:Seq><rdf:li>Ada Lovelace</rdf:li></rdf:Seq></dc:creator>
+      <dc:title><rdf:Alt><rdf:li xml:lang="x-default">Specimen A</rdf:li></rdf:Alt></dc:title>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+
+        decode_psd_xmp_metadata(payload, &mut metadata);
+
+        assert!(matches!(
+            metadata.get("psd.image_resource.1060.xmp.xmp.CreatorTool"),
+            Some(MetadataValue::String(value)) if value == "Photoshop 2026"
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1060.xmp.photoshop.DateCreated"),
+            Some(MetadataValue::String(value)) if value == "2026-05-04"
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1060.xmp.dc.creator"),
+            Some(MetadataValue::String(value)) if value == "Ada Lovelace"
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1060.xmp.dc.title"),
+            Some(MetadataValue::String(value)) if value == "Specimen A"
+        ));
+        assert!(matches!(
+            metadata.get("psd.image_resource.1060.xmp.scalar_count"),
+            Some(MetadataValue::Int(4))
+        ));
+    }
+
+    #[test]
+    fn xmp_resource_ignores_non_xmp_text_payloads() {
+        let mut metadata = HashMap::new();
+        decode_psd_xmp_metadata(b"CreatorTool=not xml", &mut metadata);
+
+        assert!(!metadata
+            .keys()
+            .any(|key| key.starts_with("psd.image_resource.1060.xmp.")));
     }
 }
 
@@ -636,6 +1635,7 @@ impl FormatReader for PsdReader {
                 image.name = Some(name.to_string());
             }
         }
+        let _ = ome.add_original_metadata_annotations(meta, 0);
         Some(ome)
     }
 }

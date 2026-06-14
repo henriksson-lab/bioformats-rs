@@ -14,8 +14,8 @@ use quick_xml::Reader as XmlReader;
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::ome_metadata::{
-    create_lsid, OmeChannel, OmeImage, OmeInstrument, OmeMetadata, OmeObjective, OmePlate, OmeWell,
-    OmeWellSample,
+    create_lsid, OmeChannel, OmeDetector, OmeImage, OmeInstrument, OmeMetadata, OmeObjective,
+    OmePlate, OmeWell, OmeWellSample,
 };
 use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
@@ -65,8 +65,17 @@ struct HcsMeta {
     ex_waves: Vec<f64>,
     nominal_magnification: Option<f64>,
     lens_na: Option<f64>,
+    // Objective immersion/correction/manufacturer parsed from objective_name.
+    objective_manufacturer: Option<String>,
+    objective_correction: Option<String>,
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
+    // Detector model (Camera name) plus per-channel detector settings.
+    detector_model: Option<String>,
+    bin: Option<String>,
+    gain: Option<f64>,
+    // Acquisition date (Creation date + "T" + time).
+    creation_date: Option<String>,
     pos_x: HashMap<usize, f64>,
     pos_y: HashMap<usize, f64>,
 }
@@ -125,10 +134,26 @@ struct InCellMeta {
     channel_names: Vec<String>,
     em_waves: Vec<f64>,
     ex_waves: Vec<f64>,
+    // Excitation/emission filter *names* (Java exFilters/emFilters), collected
+    // from the <ExcitationFilter>/<EmissionFilter> name attributes.
+    ex_filters: Vec<String>,
+    em_filters: Vec<String>,
     nominal_magnification: Option<f64>,
     lens_na: Option<f64>,
+    objective_manufacturer: Option<String>,
+    objective_correction: Option<String>,
+    refractive: Option<f64>,
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
+    detector_model: Option<String>,
+    bin: Option<String>,
+    gain: Option<f64>,
+    temperature: Option<f64>,
+    creation_date: Option<String>,
+    total_channels: u32,
+    // True when channels were acquired with differing imaging modes ("3-D"
+    // vs "2-D"); Java uses this to keep the series count from being collapsed.
+    variable_z: bool,
     // posX/posY keyed by field index (offset_point), in reference-frame units.
     pos_x: HashMap<usize, f64>,
     pos_y: HashMap<usize, f64>,
@@ -333,6 +358,11 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                         if let Some(mode) = attr_val(e, "imaging_mode") {
                             let is_3d = mode == "3-D";
+                            // Java MinimalInCellHandler: record when different
+                            // imaging modes are encountered across channels.
+                            if !m.variable_z && is_3d != m.do_z && m.size_c > 1 {
+                                m.variable_z = true;
+                            }
                             if m.size_c == 1 || !m.do_z {
                                 m.do_z = is_3d;
                             }
@@ -401,10 +431,27 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         m.lens_na = attr_f64(e, "numerical_aperture");
                         m.physical_size_x = attr_f64(e, "pixel_width");
                         m.physical_size_y = attr_f64(e, "pixel_height");
+                        // Java InCellHandler: refractive index plus the objective
+                        // manufacturer/correction parsed from objective_name
+                        // (tokens split on '_'; tokens[0] -> manufacturer,
+                        // tokens[2] if present else "Other" -> correction).
+                        m.refractive = attr_f64(e, "refractive_index");
+                        if let Some(objective) = attr_val(e, "objective_name") {
+                            let tokens: Vec<&str> = objective.split('_').collect();
+                            m.objective_manufacturer =
+                                tokens.first().map(|s| s.to_string());
+                            m.objective_correction = Some(
+                                tokens.get(2).map(|s| s.to_string()).unwrap_or_else(|| "Other".to_string()),
+                            );
+                        }
                     }
                     b"ExcitationFilter" => {
                         if let Some(w) = attr_f64(e, "wavelength") {
                             m.ex_waves.push(w);
+                        }
+                        // Java MinimalInCellHandler: exFilters.add(name).
+                        if let Some(name) = attr_val(e, "name") {
+                            m.ex_filters.push(name);
                         }
                     }
                     b"EmissionFilter" => {
@@ -412,11 +459,38 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                             m.em_waves.push(w);
                         }
                         if let Some(name) = attr_val(e, "name") {
-                            m.channel_names.push(name);
+                            // Java InCellHandler: channelNames.add(name);
+                            // Java MinimalInCellHandler: emFilters.add(name).
+                            m.channel_names.push(name.clone());
+                            m.em_filters.push(name);
                         }
                     }
                     b"TimeSchedule" => {
                         m.do_t = attr_val(e, "enabled").map(|v| v == "true").unwrap_or(true);
+                    }
+                    b"Creation" => {
+                        // Java InCellHandler: creationDate = date + "T" + time.
+                        let date = attr_val(e, "date"); // yyyy-mm-dd
+                        let time = attr_val(e, "time"); // hh:mm:ss
+                        if let (Some(date), Some(time)) = (date, time) {
+                            m.creation_date = Some(format!("{date}T{time}"));
+                        }
+                    }
+                    b"Camera" => {
+                        // Java InCellHandler: store.setDetectorModel(name, 0, 0).
+                        m.detector_model = attr_val(e, "name");
+                    }
+                    b"Binning" => {
+                        // Java InCellHandler: bin = getBinning(value).
+                        m.bin = attr_val(e, "value");
+                    }
+                    b"Gain" => {
+                        // Java InCellHandler: gain = parseDouble(value).
+                        m.gain = attr_f64(e, "value");
+                    }
+                    b"PlateTemperature" => {
+                        // Java InCellHandler: temperature = parseDouble(value).
+                        m.temperature = attr_f64(e, "value");
                     }
                     _ => {}
                 }
@@ -478,6 +552,8 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
         channels_per_timepoint.push(m.size_c.max(1));
     }
     m.channels_per_timepoint = channels_per_timepoint;
+    // Java initFile: totalChannels = getSizeC().
+    m.total_channels = m.size_c.max(1);
 
     Ok(m)
 }
@@ -696,6 +772,44 @@ impl InCellReader {
             ));
         }
 
+        // Captured scalar metadata surfaced into each series' series_metadata.
+        // These mirror the Java InCellHandler additions that have no dedicated
+        // OmeMetadata field (refractive index, temperature, detector model,
+        // binning/gain, acquisition date, total channels, variable-Z flag, and
+        // the excitation/emission filter names).
+        use crate::common::metadata::MetadataValue;
+        let mut common_meta: Vec<(String, MetadataValue)> = Vec::new();
+        common_meta.push(("format".to_string(), MetadataValue::String("InCell".into())));
+        common_meta.push((
+            "totalChannels".to_string(),
+            MetadataValue::Int(m.total_channels as i64),
+        ));
+        common_meta.push(("variableZ".to_string(), MetadataValue::String(m.variable_z.to_string())));
+        if let Some(v) = m.refractive {
+            common_meta.push(("refractiveIndex".to_string(), MetadataValue::Float(v)));
+        }
+        if let Some(v) = m.temperature {
+            common_meta.push(("plateTemperature".to_string(), MetadataValue::Float(v)));
+        }
+        if let Some(v) = m.gain {
+            common_meta.push(("gain".to_string(), MetadataValue::Float(v)));
+        }
+        if let Some(s) = &m.bin {
+            common_meta.push(("binning".to_string(), MetadataValue::String(s.clone())));
+        }
+        if let Some(s) = &m.detector_model {
+            common_meta.push(("detectorModel".to_string(), MetadataValue::String(s.clone())));
+        }
+        if let Some(s) = &m.creation_date {
+            common_meta.push(("creationDate".to_string(), MetadataValue::String(s.clone())));
+        }
+        for (i, f) in m.ex_filters.iter().enumerate() {
+            common_meta.push((format!("excitationFilter {i}"), MetadataValue::String(f.clone())));
+        }
+        for (i, f) in m.em_filters.iter().enumerate() {
+            common_meta.push((format!("emissionFilter {i}"), MetadataValue::String(f.clone())));
+        }
+
         // Build per-series metadata and the flat plane lookup.
         let mut series = Vec::with_capacity(series_count);
         let mut image_files = Vec::with_capacity(series_count);
@@ -722,11 +836,7 @@ impl InCellReader {
                     (well, fld, size_c, size_t, 0u32)
                 };
 
-            let mut meta_map = HashMap::new();
-            meta_map.insert(
-                "format".to_string(),
-                crate::common::metadata::MetadataValue::String("InCell".into()),
-            );
+            let meta_map: HashMap<String, MetadataValue> = common_meta.iter().cloned().collect();
             let meta = ImageMetadata {
                 size_x,
                 size_y,
@@ -788,8 +898,14 @@ impl InCellReader {
             ex_waves: m.ex_waves.clone(),
             nominal_magnification: m.nominal_magnification,
             lens_na: m.lens_na,
+            objective_manufacturer: m.objective_manufacturer.clone(),
+            objective_correction: m.objective_correction.clone(),
             physical_size_x: m.physical_size_x,
             physical_size_y: m.physical_size_y,
+            detector_model: m.detector_model.clone(),
+            bin: m.bin.clone(),
+            gain: m.gain,
+            creation_date: m.creation_date.clone(),
             pos_x: m.pos_x.clone(),
             pos_y: m.pos_y.clone(),
         };
@@ -1020,15 +1136,42 @@ impl FormatReader for InCellReader {
         // A single instrument with one objective is shared by all images when
         // the objective calibration was present (mirrors Java InCellReader).
         let has_objective = h.nominal_magnification.is_some() || h.lens_na.is_some();
-        let instruments = if has_objective {
-            vec![OmeInstrument {
-                id: Some(create_lsid("Instrument", &[0])),
-                objectives: vec![OmeObjective {
+        // Java always creates a Detector and sets DetectorSettings (gain/binning)
+        // per channel; surface a detector when any detector data is present.
+        let has_detector =
+            h.detector_model.is_some() || h.gain.is_some() || h.bin.is_some();
+        let has_instrument = has_objective || has_detector;
+        let instruments = if has_instrument {
+            let objectives = if has_objective {
+                vec![OmeObjective {
                     id: Some(create_lsid("Objective", &[0, 0])),
                     nominal_magnification: h.nominal_magnification,
                     lens_na: h.lens_na,
+                    // Java sets immersion "Other" plus manufacturer/correction
+                    // parsed from objective_name.
+                    immersion: Some("Other".to_string()),
+                    manufacturer: h.objective_manufacturer.clone(),
+                    correction: h.objective_correction.clone(),
                     ..Default::default()
-                }],
+                }]
+            } else {
+                Vec::new()
+            };
+            let detectors = if has_detector {
+                vec![OmeDetector {
+                    id: Some(create_lsid("Detector", &[0, 0])),
+                    model: h.detector_model.clone(),
+                    // Java sets detector type "Other".
+                    detector_type: Some("Other".to_string()),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            };
+            vec![OmeInstrument {
+                id: Some(create_lsid("Instrument", &[0])),
+                objectives,
+                detectors,
                 ..Default::default()
             }]
         } else {
@@ -1066,15 +1209,27 @@ impl FormatReader for InCellReader {
                     color: None,
                     emission_wavelength: h.em_waves.get(q).copied(),
                     excitation_wavelength: h.ex_waves.get(q).copied(),
+                    // Java sets DetectorSettings (ID + optional gain/binning) on
+                    // every channel when a detector exists.
+                    detector_ref: if has_detector {
+                        Some(create_lsid("Detector", &[0, 0]))
+                    } else {
+                        None
+                    },
+                    detector_settings_gain: if has_detector { h.gain } else { None },
+                    detector_settings_binning: if has_detector { h.bin.clone() } else { None },
+                    ..Default::default()
                 });
             }
 
             images.push(OmeImage {
                 name: Some(name),
+                // Java: store.setImageAcquisitionDate(creationDate).
+                acquisition_date: h.creation_date.clone(),
                 physical_size_x: h.physical_size_x.filter(|&v| v > 0.0),
                 physical_size_y: h.physical_size_y.filter(|&v| v > 0.0),
                 channels,
-                instrument_ref: if has_objective { Some(0) } else { None },
+                instrument_ref: if has_instrument { Some(0) } else { None },
                 objective_ref: if has_objective { Some(0) } else { None },
                 ..Default::default()
             });
@@ -1297,5 +1452,86 @@ mod tests {
         // Only the second well (1-indexed row=1,col=2) is excluded.
         assert!(!m.exclude[0][0]);
         assert!(m.exclude[0][1]);
+    }
+
+    #[test]
+    fn incell_parses_acquisition_environment_and_detector_fields() {
+        // Mirrors the Java InCellHandler element parsing for the newly captured
+        // data fields: Creation date, ObjectiveCalibration (refractive index +
+        // objective_name -> manufacturer/correction), Camera, Binning, Gain,
+        // PlateTemperature, and the excitation/emission filter names.
+        let xml = r#"<InCell>
+            <Plate rows="1" columns="1"/>
+            <Creation date="2017-01-02" time="03:04:05"/>
+            <ObjectiveCalibration magnification="40" numerical_aperture="0.95"
+                pixel_width="0.25" pixel_height="0.25" refractive_index="1.33"
+                objective_name="Nikon_40x_PlanApo"/>
+            <Camera name="ORCA"/>
+            <Binning value="2x2"/>
+            <Gain value="1.5"/>
+            <PlateTemperature value="37.0"/>
+            <ExcitationFilter name="Ex1" wavelength="488"/>
+            <EmissionFilter name="Em1" wavelength="525"/>
+            <Row number="1"><Column number="1"/></Row>
+        </InCell>"#;
+        let m = {
+            let dir = temp_dir("acq_env");
+            let path = dir.join("plate.xdce");
+            std::fs::write(&path, xml).unwrap();
+            parse_incell_xml(&path).unwrap()
+        };
+        assert_eq!(m.creation_date.as_deref(), Some("2017-01-02T03:04:05"));
+        assert_eq!(m.refractive, Some(1.33));
+        assert_eq!(m.objective_manufacturer.as_deref(), Some("Nikon"));
+        assert_eq!(m.objective_correction.as_deref(), Some("PlanApo"));
+        assert_eq!(m.detector_model.as_deref(), Some("ORCA"));
+        assert_eq!(m.bin.as_deref(), Some("2x2"));
+        assert_eq!(m.gain, Some(1.5));
+        assert_eq!(m.temperature, Some(37.0));
+        assert_eq!(m.total_channels, 1);
+        // Filter names captured separately from wavelengths and channel names.
+        assert_eq!(m.ex_filters, vec!["Ex1".to_string()]);
+        assert_eq!(m.em_filters, vec!["Em1".to_string()]);
+        assert_eq!(m.channel_names, vec!["Em1".to_string()]);
+        assert_eq!(m.ex_waves, vec![488.0]);
+        assert_eq!(m.em_waves, vec![525.0]);
+    }
+
+    #[test]
+    fn incell_objective_correction_defaults_to_other_when_name_has_few_tokens() {
+        // Java: correction = tokens.length > 2 ? tokens[2] : "Other".
+        let xml = r#"<InCell>
+            <Plate rows="1" columns="1"/>
+            <ObjectiveCalibration magnification="20" numerical_aperture="0.5"
+                objective_name="Leica"/>
+            <Row number="1"><Column number="1"/></Row>
+        </InCell>"#;
+        let m = {
+            let dir = temp_dir("obj_other");
+            let path = dir.join("plate.xdce");
+            std::fs::write(&path, xml).unwrap();
+            parse_incell_xml(&path).unwrap()
+        };
+        assert_eq!(m.objective_manufacturer.as_deref(), Some("Leica"));
+        assert_eq!(m.objective_correction.as_deref(), Some("Other"));
+    }
+
+    #[test]
+    fn incell_variable_z_set_for_mixed_imaging_modes() {
+        // Two channels with different imaging modes -> variableZ true
+        // (Java MinimalInCellHandler: is3D != doZ && sizeC > 1).
+        let xml = r#"<InCell>
+            <Plate rows="1" columns="1"/>
+            <Wavelength fusion_wave="false" imaging_mode="3-D"/>
+            <Wavelength fusion_wave="false" imaging_mode="2-D"/>
+            <Row number="1"><Column number="1"/></Row>
+        </InCell>"#;
+        let m = {
+            let dir = temp_dir("variable_z");
+            let path = dir.join("plate.xdce");
+            std::fs::write(&path, xml).unwrap();
+            parse_incell_xml(&path).unwrap()
+        };
+        assert!(m.variable_z);
     }
 }

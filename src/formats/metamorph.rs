@@ -270,6 +270,450 @@ fn read_metamorph_physical_sizes(path: &Path) -> (Option<f64>, Option<f64>, Opti
     (phys_x, phys_y, phys_z)
 }
 
+/// Per-file data fields extracted from the UIC1/UIC2/UIC4 proprietary tables,
+/// mirroring the instance fields Java `MetamorphReader` carries. These describe
+/// the acquisition (camera/stage/timing) for a single STK file.
+#[derive(Default, Clone)]
+struct MetamorphData {
+    /// Display name (UIC1 field 7; Java `imageName`).
+    image_name: Option<String>,
+    /// Acquisition date/time string (UIC1 field 17 `LastSavedTime`; Java
+    /// `imageCreationDate`).
+    image_creation_date: Option<String>,
+    /// Camera binning, e.g. `"2x2"` (UIC1 field 46 `CameraBin`; Java `binning`).
+    binning: Option<String>,
+    /// Per-plane stage X positions in reference-frame units (UIC1/UIC4 field 28;
+    /// Java `stageX`).
+    stage_x: Vec<f64>,
+    /// Per-plane stage Y positions (UIC1/UIC4 field 28; Java `stageY`).
+    stage_y: Vec<f64>,
+    /// Per-plane absolute Z positions accumulated into stage Z (UIC1 field 40 /
+    /// UIC4 field 40 `AbsoluteZ`; Java `zDistances`/`zStart` feed planePositionZ).
+    /// We store the raw per-plane absolute-Z list here.
+    absolute_z: Vec<f64>,
+    /// Per-plane stage labels (UIC4 field 37 `readStageLabels`; Java
+    /// `stageLabels`).
+    stage_labels: Vec<String>,
+    /// Per-plane z-distances (UIC2; Java `zDistances`).
+    z_distances: Vec<f64>,
+    /// Per-plane creation timestamps in ms since epoch (UIC2; Java
+    /// `internalStamps`).
+    internal_stamps: Vec<i64>,
+    /// Emission wavelengths from UIC3 (Java `emWavelength` / `wave`).
+    em_wavelength: Vec<f64>,
+    /// Z step size, `zDistances[0]` (Java `stepSize`).
+    step_size: Option<f64>,
+    /// Whether UIC field 28 (stage positions) was present (Java
+    /// `hasStagePositions`).
+    has_stage_positions: bool,
+    /// Whether UIC field 40 (absolute Z) was present (Java `hasAbsoluteZ`).
+    has_absolute_z: bool,
+    /// First absolute-Z value when valid (Java `tempZ`).
+    temp_z: f64,
+    /// Whether the first plane's absolute-Z is valid (Java `validZ`).
+    valid_z: bool,
+}
+
+/// Read a UIC1/UIC4 stage-position table (`mmPlanes` pairs of rationals) at
+/// `off`, returning (stageX, stageY). Mirrors Java `readStagePositions`.
+fn read_stage_positions(data: &[u8], off: usize, le: bool, mm_planes: u32) -> (Vec<f64>, Vec<f64>) {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut o = off;
+    for _ in 0..mm_planes {
+        let (Some(x), Some(y)) = (read_rational_at(data, o, le), read_rational_at(data, o + 8, le))
+        else {
+            break;
+        };
+        xs.push(x);
+        ys.push(y);
+        o += 16;
+    }
+    (xs, ys)
+}
+
+/// Read a UIC absolute-Z rational table (`mmPlanes` rationals) at `off`,
+/// returning the per-plane values. Mirrors Java `readRationals(["..absoluteZ"])`.
+fn read_absolute_z(data: &[u8], off: usize, le: bool, mm_planes: u32) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut o = off;
+    for _ in 0..mm_planes {
+        let Some(v) = read_rational_at(data, o, le) else {
+            break;
+        };
+        out.push(v);
+        o += 8;
+    }
+    out
+}
+
+/// Read the UIC4 stage-label table (`mmPlanes` length-prefixed C-strings) at
+/// `off`. Mirrors Java `readStageLabels` / `readCString`.
+fn read_stage_labels(data: &[u8], off: usize, le: bool, mm_planes: u32) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut o = off;
+    for _ in 0..mm_planes {
+        let Some(len) = rd_i32_at(data, o, le) else {
+            break;
+        };
+        o += 4;
+        if len < 0 {
+            break;
+        }
+        let len = len as usize;
+        if o + len > data.len() {
+            break;
+        }
+        let bytes = &data[o..o + len];
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        out.push(String::from_utf8_lossy(&bytes[..end]).into_owned());
+        o += len;
+    }
+    out
+}
+
+/// Read a length-prefixed string at `off` (Java `in.readInt(); in.readString`).
+fn read_len_prefixed_string(data: &[u8], off: usize, le: bool) -> Option<String> {
+    let n = rd_i32_at(data, off, le)?;
+    if n < 0 {
+        return None;
+    }
+    let n = n as usize;
+    let start = off + 4;
+    if start + n > data.len() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&data[start..start + n]).into_owned())
+}
+
+/// Read a Julian date + ms-of-day pair at `off` and format `dd/mm/yyyy hh:mm:ss:SSS`
+/// (Java UIC1 field 16/17 handling: `decodeDate + " " + decodeTime`).
+fn read_uic1_datetime(data: &[u8], off: usize, le: bool) -> Option<String> {
+    let date_raw = rd_i32_at(data, off, le)?;
+    let time_raw = rd_i32_at(data, off + 4, le)?;
+    Some(format!("{} {}", decode_date(date_raw), decode_time(time_raw)))
+}
+
+/// Parse the UIC4 binary id-list table (Java `parseUIC4Tags`), extracting the
+/// stage positions (id 28), absolute Z (id 40) and stage labels (id 37). The
+/// table is a sequence of 16-bit ids terminated by id 0; each known id is
+/// followed by `mmPlanes` records, unknown ids by a single 4-byte value.
+fn parse_uic4_data_fields(data: &[u8], off: usize, le: bool, mm_planes: u32, out: &mut MetamorphData) {
+    let rd_i16 = |o: usize| -> Option<i16> {
+        if o + 2 > data.len() {
+            return None;
+        }
+        Some(if le {
+            i16::from_le_bytes([data[o], data[o + 1]])
+        } else {
+            i16::from_be_bytes([data[o], data[o + 1]])
+        })
+    };
+    let mut o = off;
+    loop {
+        let Some(id) = rd_i16(o) else { break };
+        o += 2;
+        if id == 0 {
+            break;
+        }
+        match id {
+            28 => {
+                let (xs, ys) = read_stage_positions(data, o, le, mm_planes);
+                let n = xs.len();
+                if !xs.is_empty() {
+                    out.stage_x = xs;
+                    out.stage_y = ys;
+                    out.has_stage_positions = true;
+                }
+                o += n * 16;
+            }
+            29 => {
+                // cameraX/Y chip offsets: 2 rationals per plane (skip values).
+                o += mm_planes as usize * 16;
+            }
+            37 => {
+                let labels = read_stage_labels(data, o, le, mm_planes);
+                // Advance past the table: re-walk to compute byte length.
+                let mut adv = 0usize;
+                for _ in 0..labels.len() {
+                    if let Some(len) = rd_i32_at(data, o + adv, le) {
+                        adv += 4 + len.max(0) as usize;
+                    }
+                }
+                o += adv;
+                if !labels.is_empty() {
+                    out.stage_labels = labels;
+                }
+            }
+            40 => {
+                let zs = read_absolute_z(data, o, le, mm_planes);
+                let n = zs.len();
+                if !zs.is_empty() {
+                    out.has_absolute_z = true;
+                    if let Some(first) = zs.first() {
+                        out.temp_z = *first;
+                    }
+                    out.absolute_z = zs;
+                }
+                o += n * 8;
+            }
+            41 => {
+                // absoluteZValid: one int per plane.
+                if let Some(v) = rd_i32_at(data, o, le) {
+                    out.valid_z = v == 1;
+                }
+                o += mm_planes as usize * 4;
+            }
+            46 => {
+                o += mm_planes as usize * 8;
+            }
+            _ => {
+                o += 4;
+            }
+        }
+        if o >= data.len() {
+            break;
+        }
+    }
+    if out.valid_z {
+        // zStart = tempZ (Java parseUIC4Tags tail).
+    }
+}
+
+/// Parse the UIC1 `(id, valueOrOffset)` table (Java `parseUIC1Tags`), extracting
+/// the data fields Java keeps as instance variables: image name (7), image
+/// creation date (17), binning (46), stage positions (28), absolute Z (40).
+fn parse_uic1_data_fields(
+    data: &[u8],
+    off: usize,
+    le: bool,
+    count: u32,
+    mm_planes: u32,
+    out: &mut MetamorphData,
+) {
+    let mut o = off;
+    for _ in 0..count {
+        let (Some(id), Some(val)) = (rd_i32_at(data, o, le), rd_i32_at(data, o + 4, le)) else {
+            break;
+        };
+        let val_off = (val as u32) as usize;
+        match id {
+            7 => {
+                if val_off < data.len() {
+                    if let Some(name) = read_len_prefixed_string(data, val_off, le) {
+                        out.image_name = Some(name);
+                    }
+                }
+            }
+            17 => {
+                if val_off < data.len() {
+                    out.image_creation_date = read_uic1_datetime(data, val_off, le);
+                }
+            }
+            28 => {
+                if val_off < data.len() && !out.has_stage_positions {
+                    let (xs, ys) = read_stage_positions(data, val_off, le, mm_planes);
+                    if !xs.is_empty() {
+                        out.stage_x = xs;
+                        out.stage_y = ys;
+                        out.has_stage_positions = true;
+                    }
+                }
+            }
+            40 => {
+                if val != 0 && val_off < data.len() && !out.has_absolute_z {
+                    let zs = read_absolute_z(data, val_off, le, mm_planes);
+                    if !zs.is_empty() {
+                        out.has_absolute_z = true;
+                        if let Some(first) = zs.first() {
+                            out.temp_z = *first;
+                        }
+                        out.absolute_z = zs;
+                    }
+                }
+            }
+            46 => {
+                if val_off + 8 <= data.len() {
+                    if let (Some(xb), Some(yb)) =
+                        (rd_i32_at(data, val_off, le), rd_i32_at(data, val_off + 4, le))
+                    {
+                        out.binning = Some(format!("{xb}x{yb}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+        o += 8;
+    }
+}
+
+/// Parse all per-file UIC data fields (UIC1 + UIC4 + UIC2/UIC3) into a
+/// [`MetamorphData`], mirroring Java `initStandardMetadata`'s
+/// `parseUIC2Tags`/`parseUIC4Tags`/`parseUIC1Tags` sequence.
+fn read_metamorph_data(path: &Path, ifd: &Ifd, mm_planes: u32) -> MetamorphData {
+    let mut out = MetamorphData::default();
+    let Ok(data) = std::fs::read(path) else {
+        return out;
+    };
+
+    // UIC2: z-distances + internal timestamps (Java parseUIC2Tags).
+    if let Some((le, uic2_offset, _)) = read_tag_value_offset(&data, UIC2_TAG) {
+        let mut o = uic2_offset as usize;
+        for _ in 0..mm_planes {
+            let (Some(num), Some(den)) = (rd_i32_at(&data, o, le), rd_i32_at(&data, o + 4, le))
+            else {
+                break;
+            };
+            let z = if den != 0 { num as f64 / den as f64 } else { num as f64 };
+            out.z_distances.push(z);
+            // creation date (4B) + time (4B) -> ms timestamp.
+            if let (Some(d_raw), Some(t_raw)) =
+                (rd_i32_at(&data, o + 8, le), rd_i32_at(&data, o + 12, le))
+            {
+                out.internal_stamps
+                    .push(julian_ms_timestamp(d_raw, t_raw));
+            }
+            o += 24;
+        }
+    }
+    if let Some(first) = out.z_distances.first() {
+        out.step_size = Some(*first);
+    }
+
+    // UIC3: emission wavelengths (Java `emWavelength`/`wave`).
+    if let Some(IfdValue::Rational(waves)) = ifd.get(UIC3_TAG) {
+        for (n, d) in waves {
+            let v = if *d != 0 { *n as f64 / *d as f64 } else { *n as f64 };
+            out.em_wavelength.push(v);
+        }
+    }
+
+    // UIC4 binary table (stage positions, absolute Z, stage labels).
+    if let Some((le, uic4_offset, _)) = read_tag_value_offset(&data, UIC4_TAG) {
+        parse_uic4_data_fields(&data, uic4_offset as usize, le, mm_planes, &mut out);
+    }
+
+    // UIC1 (id, value) table (image name/date, binning, stage positions, abs Z).
+    if let Some((le, uic1_offset, count)) = read_tag_value_offset(&data, UIC1_TAG) {
+        parse_uic1_data_fields(&data, uic1_offset as usize, le, count, mm_planes, &mut out);
+    }
+
+    out
+}
+
+/// Compose a ms-since-epoch timestamp from a Julian date int and ms-of-day int,
+/// approximating Java `DateTools.getTime(decodeDate + " " + decodeTime)`. We
+/// compute days from the Julian date (the same epoch Java uses) directly.
+fn julian_ms_timestamp(julian: i32, ms_of_day: i32) -> i64 {
+    // Julian day number 2440588 == Unix epoch (1970-01-01). Metamorph stores the
+    // Julian Day Number; convert to ms since epoch + ms-of-day.
+    let days = julian as i64 - 2_440_588;
+    days * 86_400_000 + ms_of_day.max(0) as i64
+}
+
+/// Emit the parsed [`MetamorphData`] both as Java's named series-metadata keys
+/// (`Name`, `binning`, `stageX[..]`, `stageY[..]`, `stageLabel[..]`, …) and as
+/// the generic OME keys the [`crate::common::ome_metadata::OmeMetadata`] builder
+/// consumes, mirroring where Java's `MetadataStore` calls surface each datum:
+///   stage X/Y/Z  → plane positions (setPlanePositionX/Y/Z)
+///   exposure     → plane exposure  (setPlaneExposureTime)
+///   binning/gain → DetectorSettings (setDetectorSettingsBinning/Gain)
+///   emWavelength → channel emission (setChannelEmissionWavelength)
+fn emit_metamorph_data_metadata(
+    mm: &MetamorphData,
+    mm_planes: u32,
+    image_count: u32,
+    size_c: u32,
+    out: &mut HashMap<String, MetadataValue>,
+) {
+    if let Some(name) = &mm.image_name {
+        out.insert("Name".into(), MetadataValue::String(name.clone()));
+    }
+    if let Some(date) = &mm.image_creation_date {
+        out.insert("imageCreationDate".into(), MetadataValue::String(date.clone()));
+    }
+    if let Some(binning) = &mm.binning {
+        out.insert("binning".into(), MetadataValue::String(binning.clone()));
+    }
+
+    // Stage X/Y per plane (Java readStagePositions addSeriesMeta + planePositionX/Y).
+    for (i, x) in mm.stage_x.iter().enumerate() {
+        let label = int_format_max(i as u32, mm_planes);
+        out.insert(format!("stageX[{label}]"), MetadataValue::Float(*x));
+        if (i as u32) < image_count {
+            out.insert(format!("plane.{i}.position_x"), MetadataValue::Float(*x));
+        }
+    }
+    for (i, y) in mm.stage_y.iter().enumerate() {
+        let label = int_format_max(i as u32, mm_planes);
+        out.insert(format!("stageY[{label}]"), MetadataValue::Float(*y));
+        if (i as u32) < image_count {
+            out.insert(format!("plane.{i}.position_y"), MetadataValue::Float(*y));
+        }
+    }
+
+    // Stage Z: Java accumulates zDistances into planePositionZ from zStart, but
+    // when absolute-Z is present it provides per-plane Z directly. Mirror Java's
+    // zDistances accumulation: distance starts at zStart (validZ ? tempZ : 0),
+    // then adds zDistances[p] (or zDistances[0] when 0) for p>0.
+    if !mm.z_distances.is_empty() {
+        let z_start = if mm.valid_z { mm.temp_z } else { 0.0 };
+        let mut distance = z_start;
+        for p in 0..image_count.min(mm.z_distances.len() as u32) {
+            let pi = p as usize;
+            if p > 0 {
+                let d = mm.z_distances[pi];
+                distance += if d != 0.0 { d } else { mm.z_distances[0] };
+            }
+            out.insert(format!("plane.{p}.position_z"), MetadataValue::Float(distance));
+        }
+    } else if !mm.absolute_z.is_empty() {
+        for (i, z) in mm.absolute_z.iter().enumerate() {
+            if (i as u32) < image_count {
+                out.insert(format!("plane.{i}.position_z"), MetadataValue::Float(*z));
+            }
+        }
+    }
+
+    // Stage labels (Java readStageLabels addSeriesMeta "stageLabel[..]").
+    for (i, label) in mm.stage_labels.iter().enumerate() {
+        let key = int_format_max(i as u32, mm_planes);
+        out.insert(
+            format!("stageLabel[{key}]"),
+            MetadataValue::String(label.clone()),
+        );
+    }
+
+    // Emission wavelengths → per-channel emission (Java setChannelEmissionWavelength,
+    // gated on >= 1 like Java's `(int) wave[waveIndex] >= 1`).
+    for c in 0..size_c {
+        if let Some(w) = mm.em_wavelength.get(c as usize) {
+            if *w >= 1.0 {
+                out.insert(
+                    format!("channel.{c}.emission_wavelength"),
+                    MetadataValue::Float(*w),
+                );
+            }
+        }
+    }
+
+    // Binning → DetectorSettings per channel (Java setDetectorSettingsBinning).
+    if let Some(binning) = &mm.binning {
+        for c in 0..size_c {
+            out.insert(
+                format!("channel.{c}.detector_settings_binning"),
+                MetadataValue::String(binning.clone()),
+            );
+        }
+    }
+
+    // Step size (Java stepSize = zDistances[0]; surfaced as physicalSizeZ via the
+    // existing read_metamorph_physical_sizes path — record the raw value too).
+    if let Some(step) = mm.step_size {
+        out.insert("stepSize".into(), MetadataValue::Float(step));
+    }
+}
+
 // ── Per-plane UIC metadata (UIC1/UIC2/UIC3), ported from Java MetamorphReader ──
 
 /// Convert a Julian date int into a `dd/mm/yyyy` string (Java `decodeDate`).
@@ -460,6 +904,10 @@ pub struct MetamorphReader {
     phys_x: Option<f64>,
     phys_y: Option<f64>,
     phys_z: Option<f64>,
+    /// Per-file acquisition data parsed from the UIC1/UIC2/UIC4 tables of the
+    /// selected (first) STK, mirroring Java `MetamorphReader`'s data fields
+    /// (stage X/Y/Z, binning, image name/date, emission wavelengths, …).
+    data: MetamorphData,
 }
 
 impl MetamorphReader {
@@ -478,6 +926,7 @@ impl MetamorphReader {
             phys_x: None,
             phys_y: None,
             phys_z: None,
+            data: MetamorphData::default(),
         }
     }
 }
@@ -1106,6 +1555,7 @@ impl FormatReader for MetamorphReader {
         self.phys_x = None;
         self.phys_y = None;
         self.phys_z = None;
+        self.data = MetamorphData::default();
         let _ = self.inner.close();
         Ok(())
     }
@@ -1229,6 +1679,18 @@ impl FormatReader for MetamorphReader {
             }
             if image.physical_size_z.is_none() {
                 image.physical_size_z = self.phys_z;
+            }
+            // Java sets DetectorSettings binning (and gain) per channel from the
+            // UIC1 CameraBin field / comment Gain (store.setDetectorSettingsBinning
+            // / setDetectorSettingsGain). The generic OME builder only surfaces
+            // channel name/wavelengths from series_metadata, so apply binning/gain
+            // here directly.
+            for ch in image.channels.iter_mut() {
+                if ch.detector_settings_binning.is_none() {
+                    if let Some(binning) = &self.data.binning {
+                        ch.detector_settings_binning = Some(binning.clone());
+                    }
+                }
             }
         }
         Some(ome)
@@ -1481,6 +1943,15 @@ impl MetamorphReader {
         ) {
             let (ifd, _) = file;
             meta_map.extend(parse_uic_per_plane_metadata(&data, &ifd, mm_planes));
+            // Parse the per-file UIC1/UIC4 data fields (image name/date, binning,
+            // stage positions, absolute Z, stage labels, emission wavelengths),
+            // mirroring Java parseUIC1Tags / parseUIC4Tags. Surface them both as
+            // Java's named series-metadata keys and as the generic OME keys the
+            // OmeMetadata builder consumes (plane positions/exposure, channel
+            // emission/detector settings).
+            let mut mm = read_metamorph_data(path, &ifd, mm_planes);
+            emit_metamorph_data_metadata(&mm, mm_planes, image_count, size_c, &mut meta_map);
+            self.data = std::mem::take(&mut mm);
         }
         if let Some(n) = uic_planes {
             meta_map.insert("uic_plane_count".into(), MetadataValue::Int(n as i64));
@@ -1812,5 +2283,143 @@ mod tests {
             "solo.STK"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── UIC1/UIC4 data-field parsing tests (Java parseUIC1Tags/parseUIC4Tags) ──
+
+    fn le_i32(v: i32) -> [u8; 4] {
+        v.to_le_bytes()
+    }
+
+    fn metadata_f64(metadata: &HashMap<String, MetadataValue>, key: &str) -> Option<f64> {
+        match metadata.get(key) {
+            Some(MetadataValue::Float(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn metamorph_parse_uic1_extracts_binning_name_and_date() {
+        // Build a synthetic UIC1 (id, valueOrOffset) table plus referenced data
+        // at known offsets, mirroring Java parseUIC1Tags fields 7/17/46.
+        // Layout: [data region][uic1 table]. The table holds 8-byte (id, off)
+        // pairs; offsets point into the data region (absolute file offsets).
+        let mut buf = vec![0u8; 0];
+        // data region:
+        // off 0: CameraBin (field 46): xBin=2, yBin=2
+        buf.extend_from_slice(&le_i32(2));
+        buf.extend_from_slice(&le_i32(2));
+        // off 8: Name (field 7): len-prefixed "CELL"
+        let name = b"CELL";
+        buf.extend_from_slice(&le_i32(name.len() as i32));
+        buf.extend_from_slice(name);
+        // off 16: LastSavedTime (field 17): Julian date + ms-of-day
+        // Julian 2451544 -> 01/01/2000; time 0 -> 00:00:00:000.
+        buf.extend_from_slice(&le_i32(2451544));
+        buf.extend_from_slice(&le_i32(0));
+        // Now the UIC1 table (id, valueOrOffset pairs).
+        let table_off = buf.len();
+        let pairs: &[(i32, i32)] = &[(46, 0), (7, 8), (17, 16)];
+        for (id, off) in pairs {
+            buf.extend_from_slice(&le_i32(*id));
+            buf.extend_from_slice(&le_i32(*off));
+        }
+
+        let mut out = MetamorphData::default();
+        parse_uic1_data_fields(&buf, table_off, true, pairs.len() as u32, 1, &mut out);
+
+        assert_eq!(out.binning.as_deref(), Some("2x2"));
+        assert_eq!(out.image_name.as_deref(), Some("CELL"));
+        assert_eq!(
+            out.image_creation_date.as_deref(),
+            Some("01/01/2000 00:00:00:000")
+        );
+    }
+
+    #[test]
+    fn metamorph_read_stage_positions_reads_rational_pairs() {
+        // Two planes, each (stageX, stageY) as TIFF rationals (num/den i32s).
+        let mut buf = Vec::new();
+        // plane 0: x = 10/1, y = 20/1
+        for v in [10, 1, 20, 1] {
+            buf.extend_from_slice(&le_i32(v));
+        }
+        // plane 1: x = -5/1, y = 30/2 = 15
+        for v in [-5, 1, 30, 2] {
+            buf.extend_from_slice(&le_i32(v));
+        }
+        let (xs, ys) = read_stage_positions(&buf, 0, true, 2);
+        assert_eq!(xs, vec![10.0, -5.0]);
+        assert_eq!(ys, vec![20.0, 15.0]);
+    }
+
+    #[test]
+    fn metamorph_emit_metadata_surfaces_plane_positions_and_channel_binning() {
+        let mm = MetamorphData {
+            binning: Some("2x2".into()),
+            image_name: Some("img".into()),
+            stage_x: vec![1.0, 2.0],
+            stage_y: vec![3.0, 4.0],
+            em_wavelength: vec![488.0, 561.0],
+            z_distances: vec![0.5, 0.5],
+            valid_z: false,
+            ..Default::default()
+        };
+        let mut out = HashMap::new();
+        // image_count = 2, size_c = 2.
+        emit_metamorph_data_metadata(&mm, 2, 2, 2, &mut out);
+
+        // Plane positions surfaced as generic OME keys.
+        assert_eq!(metadata_f64(&out, "plane.0.position_x"), Some(1.0));
+        assert_eq!(metadata_f64(&out, "plane.1.position_y"), Some(4.0));
+        // Z accumulates from zStart=0: plane0=0, plane1=0+0.5=0.5.
+        assert_eq!(metadata_f64(&out, "plane.0.position_z"), Some(0.0));
+        assert_eq!(metadata_f64(&out, "plane.1.position_z"), Some(0.5));
+        // Emission wavelengths surfaced per channel (>= 1).
+        assert_eq!(metadata_f64(&out, "channel.0.emission_wavelength"), Some(488.0));
+        assert_eq!(metadata_f64(&out, "channel.1.emission_wavelength"), Some(561.0));
+        // Binning surfaced both as Java key and per-channel detector settings.
+        assert_eq!(metadata_str(&out, "binning"), Some("2x2"));
+        assert_eq!(metadata_str(&out, "Name"), Some("img"));
+        assert_eq!(
+            metadata_str(&out, "channel.0.detector_settings_binning"),
+            Some("2x2")
+        );
+    }
+
+    /// Integration test against the real `testdata/stk/C0.stk` fixture (skipped
+    /// when absent). Verifies the UIC1/UIC4 data fields land in series metadata
+    /// and OME.
+    #[test]
+    fn metamorph_real_stk_captures_uic1_data_fields() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("stk")
+            .join("C0.stk");
+        if !path.exists() {
+            eprintln!("SKIP metamorph_real_stk_captures_uic1_data_fields (no fixture)");
+            return;
+        }
+        let mut reader = MetamorphReader::new();
+        reader.set_id(&path).expect("set_id");
+        let meta = reader.metadata();
+        // Image name from UIC1 field 7 (Java reads the stored byte count, which
+        // here includes a trailing NUL, matching DataTools/readString behaviour).
+        assert!(metadata_str(&meta.series_metadata, "Name")
+            .is_some_and(|n| n.starts_with("CT32_VR_FNK_2012APR20_0005_CY5_C004Z")));
+        // Binning from UIC1 field 46 (CameraBin 1x1).
+        assert_eq!(metadata_str(&meta.series_metadata, "binning"), Some("1x1"));
+        // Creation date from UIC1 field 17 (LastSavedTime).
+        assert!(metadata_str(&meta.series_metadata, "imageCreationDate")
+            .is_some_and(|d| d.contains("/2012 ")));
+        // Stage positions parsed (field 28 present in this file).
+        assert!(reader.data.has_stage_positions);
+        assert!(!reader.data.stage_x.is_empty());
+        // Per-plane position keys surfaced for OME.
+        assert!(meta.series_metadata.contains_key("plane.0.position_x"));
+        // OME carries the binning as a detector setting.
+        let ome = reader.ome_metadata().expect("ome");
+        let ch0 = &ome.images[0].channels[0];
+        assert_eq!(ch0.detector_settings_binning.as_deref(), Some("1x1"));
     }
 }

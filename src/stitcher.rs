@@ -403,15 +403,36 @@ fn annotate_file_pattern_metadata(
             "FilePattern pattern".to_string(),
             MetadataValue::String(source_pattern.clone()),
         );
+        meta.series_metadata.insert(
+            "FilePattern Pattern".to_string(),
+            MetadataValue::String(source_pattern.clone()),
+        );
+        meta.series_metadata.insert(
+            "File pattern".to_string(),
+            MetadataValue::String(source_pattern.clone()),
+        );
+        meta.series_metadata.insert(
+            "FilePattern".to_string(),
+            MetadataValue::String(source_pattern.clone()),
+        );
     }
     if let Some(source_root) = &pattern.source_root {
+        let source_root = source_root.display().to_string();
         meta.series_metadata.insert(
             "FilePattern root".to_string(),
-            MetadataValue::String(source_root.display().to_string()),
+            MetadataValue::String(source_root.clone()),
+        );
+        meta.series_metadata.insert(
+            "FilePattern Root".to_string(),
+            MetadataValue::String(source_root),
         );
     }
     meta.series_metadata.insert(
         "FilePattern file count".to_string(),
+        MetadataValue::Int(file_axes.file_coords.len() as i64),
+    );
+    meta.series_metadata.insert(
+        "FilePattern File Count".to_string(),
         MetadataValue::Int(file_axes.file_coords.len() as i64),
     );
 
@@ -421,8 +442,20 @@ fn annotate_file_pattern_metadata(
         .map(|axis| axis.as_str())
         .collect::<Vec<_>>()
         .join(",");
+    meta.series_metadata.insert(
+        "FilePattern axes".to_string(),
+        MetadataValue::String(axes.clone()),
+    );
     meta.series_metadata
-        .insert("FilePattern axes".to_string(), MetadataValue::String(axes));
+        .insert("FilePattern Axes".to_string(), MetadataValue::String(axes));
+    meta.series_metadata.insert(
+        "FilePattern block count".to_string(),
+        MetadataValue::Int(pattern.blocks.len() as i64),
+    );
+    meta.series_metadata.insert(
+        "FilePattern Block Count".to_string(),
+        MetadataValue::Int(pattern.blocks.len() as i64),
+    );
 
     for (idx, block) in pattern.blocks.iter().enumerate() {
         let axis = file_axes
@@ -435,16 +468,66 @@ fn annotate_file_pattern_metadata(
             format!("FilePattern block {idx} axis"),
             MetadataValue::String(axis.to_string()),
         );
+        meta.series_metadata.insert(
+            format!("FilePattern Block {idx} Axis"),
+            MetadataValue::String(axis.to_string()),
+        );
+        meta.series_metadata.insert(
+            format!("FilePattern Axis {idx} Type"),
+            MetadataValue::String(axis.to_string()),
+        );
+        meta.series_metadata.insert(
+            format!("Axis {idx} Type"),
+            MetadataValue::String(axis.to_string()),
+        );
         if let Some(token) = &block.token {
             meta.series_metadata.insert(
                 format!("FilePattern block {idx} token"),
                 MetadataValue::String(token.clone()),
             );
+            meta.series_metadata.insert(
+                format!("FilePattern Block {idx} Token"),
+                MetadataValue::String(token.clone()),
+            );
+            meta.series_metadata.insert(
+                format!("FilePattern Axis {idx} Token"),
+                MetadataValue::String(token.clone()),
+            );
+            meta.series_metadata.insert(
+                format!("Axis {idx} Token"),
+                MetadataValue::String(token.clone()),
+            );
         }
+        let values = block.value_labels().join(",");
         meta.series_metadata.insert(
             format!("FilePattern block {idx} values"),
-            MetadataValue::String(block.value_labels().join(",")),
+            MetadataValue::String(values.clone()),
         );
+        meta.series_metadata.insert(
+            format!("FilePattern Block {idx} Values"),
+            MetadataValue::String(values.clone()),
+        );
+        meta.series_metadata.insert(
+            format!("FilePattern Axis {idx} Values"),
+            MetadataValue::String(values.clone()),
+        );
+        meta.series_metadata
+            .insert(format!("Axis {idx} Values"), MetadataValue::String(values));
+        let value_count = block.value_labels().len() as i64;
+        meta.series_metadata.insert(
+            format!("FilePattern block {idx} count"),
+            MetadataValue::Int(value_count),
+        );
+        meta.series_metadata.insert(
+            format!("FilePattern Block {idx} Count"),
+            MetadataValue::Int(value_count),
+        );
+        meta.series_metadata.insert(
+            format!("FilePattern Axis {idx} Size"),
+            MetadataValue::Int(value_count),
+        );
+        meta.series_metadata
+            .insert(format!("Axis {idx} Size"), MetadataValue::Int(value_count));
     }
 
     for (block_idx, block) in pattern.blocks.iter().enumerate() {
@@ -457,7 +540,19 @@ fn annotate_file_pattern_metadata(
                 MetadataValue::String(label.clone()),
             );
             meta.series_metadata.insert(
+                format!("FilePattern Channel {channel_idx} Name"),
+                MetadataValue::String(label.clone()),
+            );
+            meta.series_metadata.insert(
                 format!("Channel {channel_idx} Name"),
+                MetadataValue::String(label.clone()),
+            );
+            meta.series_metadata.insert(
+                format!("Channel:{channel_idx}:Name"),
+                MetadataValue::String(label.clone()),
+            );
+            meta.series_metadata.insert(
+                format!("FilePattern Channel {channel_idx} Label"),
                 MetadataValue::String(label.clone()),
             );
         }
@@ -1029,19 +1124,28 @@ impl FilePattern {
     fn match_filename(&self, name: &str) -> Option<Vec<String>> {
         let mut pos = 0;
         let mut values = Vec::new();
+        let mut recursive_empty_consumed_separator = false;
         for block in &self.blocks {
             // Match separator
-            if !name[pos..].starts_with(&block.separator) {
+            let mut separator = block.separator.as_str();
+            if recursive_empty_consumed_separator && separator.starts_with('/') {
+                separator = &separator[1..];
+            }
+            if !name[pos..].starts_with(separator) {
                 return None;
             }
-            pos += block.separator.len();
+            pos += separator.len();
             if let Some(labels) = &block.labels {
                 let label = labels
                     .iter()
-                    .find(|label| name[pos..].starts_with(label.as_str()))?;
+                    .filter(|label| name[pos..].starts_with(label.as_str()))
+                    .max_by_key(|label| label.len())?;
                 pos += label.len();
+                recursive_empty_consumed_separator =
+                    block.token.as_deref() == Some("**") && label.is_empty();
                 values.push(label.clone());
             } else {
+                recursive_empty_consumed_separator = false;
                 // Extract digits
                 let digit_start = pos;
                 while pos < name.len() && name.as_bytes()[pos].is_ascii_digit() {
@@ -1156,8 +1260,12 @@ impl GlobPatternShape {
     fn match_text(&self, text: &str) -> Option<Vec<String>> {
         let mut pos = 0usize;
         let mut captures = Vec::with_capacity(self.wildcards.len());
+        let mut recursive_empty_consumed_separator = false;
         for idx in 0..self.wildcards.len() {
-            let separator = &self.separators[idx];
+            let mut separator = self.separators[idx].as_str();
+            if recursive_empty_consumed_separator && separator.starts_with('/') {
+                separator = &separator[1..];
+            }
             if !text[pos..].starts_with(separator) {
                 return None;
             }
@@ -1173,6 +1281,7 @@ impl GlobPatternShape {
             if !simple_glob_matches(&self.wildcards[idx], capture) {
                 return None;
             }
+            recursive_empty_consumed_separator = self.wildcards[idx] == "**" && capture.is_empty();
             captures.push(capture.to_string());
             pos += capture_end;
         }
@@ -1194,6 +1303,13 @@ fn glob_atom_end(pattern: &str, idx: usize, ch: char) -> Option<usize> {
 }
 
 fn find_capture_end(text: &str, wildcard: &str, next_literal: &str) -> Option<usize> {
+    if wildcard == "**" {
+        if let Some(trimmed) = next_literal.strip_prefix('/') {
+            if text.starts_with(trimmed) {
+                return Some(0);
+            }
+        }
+    }
     if !wildcard.contains('*') {
         let count = fixed_width_glob_atoms(wildcard)?;
         let end = text

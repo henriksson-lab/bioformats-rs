@@ -131,6 +131,8 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::flex::FlexReader::new()),
         // Bruker MRI / ParaVision (filename "fid"/"acqp", 2dseq pixel blocks)
         Box::new(crate::formats::bruker::BrukerReader::new()),
+        // GE MicroCT VFF (magic "ncaa", `.vff` slice datasets)
+        Box::new(crate::formats::bruker::MicroCtVffReader::new()),
         // Extension-only readers
         Box::new(crate::formats::volocity::VolocityReader::new()),
         Box::new(crate::formats::volocity::NikonNisReader::new()),
@@ -1171,7 +1173,7 @@ mod tests {
             ("sample.ptu", "PicoQuant PTU missing PQTTTR magic"),
             (
                 "sample.vws",
-                "TillVision embedded VWS native payload decoding is unsupported",
+                "TillVision file contains no supported companion PST/INF pixels",
             ),
             // NOTE: Bruker OPUS (.abs/.0) and ISS Vista FLIM (.iss) were removed
             // entirely — they were fabricated readers for formats Bio-Formats has

@@ -39,6 +39,10 @@ fn wrapper_ome_metadata(
                 excitation_wavelength: existing_channels
                     .get(i as usize)
                     .and_then(|ch| ch.excitation_wavelength),
+                ..existing_channels
+                    .get(i as usize)
+                    .cloned()
+                    .unwrap_or_default()
             })
             .collect();
     }

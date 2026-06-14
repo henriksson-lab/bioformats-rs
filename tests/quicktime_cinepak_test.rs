@@ -85,6 +85,51 @@ fn quicktime_movie_samples_with_timing(
     mov
 }
 
+fn quicktime_movie_samples_with_co64(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    depth: u16,
+    samples: &[&[u8]],
+) -> Vec<u8> {
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(b"qt  ");
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(b"qt  ");
+    let ftyp = atom(b"ftyp", &ftyp);
+
+    let mut mdat_payload = Vec::new();
+    for sample in samples {
+        mdat_payload.extend_from_slice(sample);
+    }
+    let mdat = atom(b"mdat", &mdat_payload);
+
+    let mut sample_offsets = Vec::with_capacity(samples.len());
+    let mut sample_offset = (ftyp.len() + 8) as u64;
+    for sample in samples {
+        sample_offsets.push(sample_offset);
+        sample_offset += sample.len() as u64;
+    }
+    let trak = quicktime_track_with_timing_u64_offsets(
+        codec,
+        width,
+        height,
+        depth,
+        samples,
+        &sample_offsets,
+        true,
+        None,
+        None,
+    );
+    let moov = atom(b"moov", &trak);
+
+    let mut mov = Vec::new();
+    mov.extend_from_slice(&ftyp);
+    mov.extend_from_slice(&mdat);
+    mov.extend_from_slice(&moov);
+    mov
+}
+
 fn quicktime_track(
     codec: &[u8; 4],
     width: u16,
@@ -115,6 +160,35 @@ fn quicktime_track_with_timing(
     timing: Option<(u32, u32)>,
     edit_list: Option<&[(u32, i32, i32)]>,
 ) -> Vec<u8> {
+    let sample_offsets = sample_offsets
+        .iter()
+        .copied()
+        .map(u64::from)
+        .collect::<Vec<_>>();
+    quicktime_track_with_timing_u64_offsets(
+        codec,
+        width,
+        height,
+        depth,
+        samples,
+        &sample_offsets,
+        false,
+        timing,
+        edit_list,
+    )
+}
+
+fn quicktime_track_with_timing_u64_offsets(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    depth: u16,
+    samples: &[&[u8]],
+    sample_offsets: &[u64],
+    use_co64: bool,
+    timing: Option<(u32, u32)>,
+    edit_list: Option<&[(u32, i32, i32)]>,
+) -> Vec<u8> {
     assert_eq!(samples.len(), sample_offsets.len());
     let mut sample_entry = vec![0u8; 86];
     sample_entry[..4].copy_from_slice(&86u32.to_be_bytes());
@@ -139,18 +213,22 @@ fn quicktime_track_with_timing(
     }
     let stsz = atom(b"stsz", &stsz_payload);
 
-    let mut stco_payload = Vec::new();
-    stco_payload.extend_from_slice(&0u32.to_be_bytes());
-    stco_payload.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+    let mut offset_payload = Vec::new();
+    offset_payload.extend_from_slice(&0u32.to_be_bytes());
+    offset_payload.extend_from_slice(&(samples.len() as u32).to_be_bytes());
     for sample_offset in sample_offsets {
-        stco_payload.extend_from_slice(&sample_offset.to_be_bytes());
+        if use_co64 {
+            offset_payload.extend_from_slice(&sample_offset.to_be_bytes());
+        } else {
+            offset_payload.extend_from_slice(&(*sample_offset as u32).to_be_bytes());
+        }
     }
-    let stco = atom(b"stco", &stco_payload);
+    let offset_table = atom(if use_co64 { b"co64" } else { b"stco" }, &offset_payload);
 
     let mut stbl_payload = Vec::new();
     stbl_payload.extend_from_slice(&stsd);
     stbl_payload.extend_from_slice(&stsz);
-    stbl_payload.extend_from_slice(&stco);
+    stbl_payload.extend_from_slice(&offset_table);
     if let Some((_, sample_delta)) = timing {
         stbl_payload.extend_from_slice(&quicktime_stts(samples.len() as u32, sample_delta));
     }
@@ -524,6 +602,16 @@ fn quicktime_edit_list_applies_nonzero_media_time_metadata() {
             .get("quicktime.sample_presentation_time_ticks"),
         Some(MetadataValue::String(times)) if times == "-10,0"
     ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_source_media_time_ticks"),
+        Some(MetadataValue::String(times)) if times == "0,10"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_media_segment_index"),
+        Some(MetadataValue::String(indices)) if indices == "0,0"
+    ));
     let _ = std::fs::remove_file(path);
 }
 
@@ -601,9 +689,163 @@ fn quicktime_edit_list_reports_non_unit_rate_without_presentation_times() {
             .get("quicktime.edit_list.presentation_diagnostic"),
         Some(MetadataValue::String(diagnostic)) if diagnostic.contains("media_rate 0.5")
     ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.pixel_order_status"),
+        Some(MetadataValue::String(status)) if status == "not_reordered_non_unit_rate"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.unsupported_reason"),
+        Some(MetadataValue::String(reason)) if reason == "non_unit_rate"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.first_problem_segment_index"),
+        Some(MetadataValue::Int(0))
+    ));
     assert!(!meta
         .series_metadata
         .contains_key("quicktime.sample_presentation_time_ticks"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_reports_empty_edit_after_media_metadata() {
+    let path = tmp("edit_empty_after_media.mov");
+    let keyframe = cinepak_keyframe_4x4();
+    let delta = cinepak_frame(4, 4, 1, &[(0x3100, vec![0, 0, 0, 0])]);
+    let mov = quicktime_movie_samples_with_timing(
+        b"cvid",
+        4,
+        4,
+        24,
+        &[&keyframe, &delta],
+        Some((10, 10)),
+        Some(&[(20, 0, 65536), (5, -1, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_status"),
+        Some(MetadataValue::String(status))
+            if status == "applied_trailing_empty_edits_single_normal_speed_media_segment"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.empty_edit_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.empty_duration_movie_ticks"),
+        Some(MetadataValue::Int(5))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.empty_after_media_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.empty_after_media_duration_movie_ticks"),
+        Some(MetadataValue::Int(5))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.first_empty_after_media_segment_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_diagnostic"),
+        Some(MetadataValue::String(diagnostic)) if diagnostic.contains("applied at normal speed")
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.pixel_order_status"),
+        Some(MetadataValue::String(status)) if status == "metadata_only_sample_table_order"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_presentation_time_ticks"),
+        Some(MetadataValue::String(times)) if times == "0,10"
+    ));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_applies_internal_empty_edit_between_media_segments() {
+    let path = tmp("edit_internal_empty.mov");
+    let first = [1u8, 2, 3, 4, 5, 6];
+    let second = [11u8, 12, 13, 14, 15, 16];
+    let mov = quicktime_movie_samples_with_timing(
+        b"raw ",
+        2,
+        1,
+        24,
+        &[&first, &second],
+        Some((10, 10)),
+        Some(&[(10, 10, 65536), (5, -1, 65536), (10, 0, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(meta.size_t, 2);
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_status"),
+        Some(MetadataValue::String(status))
+            if status == "applied_internal_empty_edits_multiple_normal_speed_media_segments"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.empty_after_media_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.first_empty_after_media_segment_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.pixel_order_status"),
+        Some(MetadataValue::String(status)) if status == "reordered_sample_aligned_normal_speed"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.pixel_order_diagnostic"),
+        Some(MetadataValue::String(diagnostic))
+            if diagnostic.contains("skips empty edits")
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_presentation_time_ticks"),
+        Some(MetadataValue::String(times)) if times == "15,0"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_source_media_time_ticks"),
+        Some(MetadataValue::String(times)) if times == "0,10"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_media_segment_index"),
+        Some(MetadataValue::String(indices)) if indices == "1,0"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_read_order"),
+        Some(MetadataValue::String(order)) if order == "1,0"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), second);
+    assert_eq!(reader.open_bytes(1).unwrap(), first);
     let _ = std::fs::remove_file(path);
 }
 
@@ -634,6 +876,11 @@ fn quicktime_edit_list_reports_complex_multiple_media_segments() {
             .get("quicktime.edit_list.presentation_diagnostic"),
         Some(MetadataValue::String(diagnostic))
             if diagnostic.contains("multiple media segments")
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.pixel_order_status"),
+        Some(MetadataValue::String(status)) if status == "not_reordered_complex_edit_list"
     ));
     assert!(!meta
         .series_metadata
@@ -669,9 +916,445 @@ fn quicktime_edit_list_applies_sample_aligned_multiple_media_segments() {
             .get("quicktime.sample_presentation_time_ticks"),
         Some(MetadataValue::String(times)) if times == "10,0"
     ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_source_media_time_ticks"),
+        Some(MetadataValue::String(times)) if times == "0,10"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_media_segment_index"),
+        Some(MetadataValue::String(indices)) if indices == "1,0"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.pixel_order_status"),
+        Some(MetadataValue::String(status)) if status == "reordered_sample_aligned_normal_speed"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.pixel_order_diagnostic"),
+        Some(MetadataValue::String(diagnostic))
+            if diagnostic.contains("open_bytes uses edit-list presentation order")
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_read_order"),
+        Some(MetadataValue::String(order)) if order == "1,0"
+    ));
     assert!(!meta
         .series_metadata
         .contains_key("quicktime.edit_list.presentation_offset_ticks"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_reorders_sample_aligned_raw_reads() {
+    let path = tmp("edit_segments_raw_reordered.mov");
+    let first = [1u8, 2, 3, 4, 5, 6];
+    let second = [11u8, 12, 13, 14, 15, 16];
+    let mov = quicktime_movie_samples_with_timing(
+        b"raw ",
+        2,
+        1,
+        24,
+        &[&first, &second],
+        Some((10, 10)),
+        Some(&[(10, 10, 65536), (10, 0, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_read_order"),
+        Some(MetadataValue::String(order)) if order == "1,0"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), second);
+    assert_eq!(reader.open_bytes(1).unwrap(), first);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_applies_trailing_empty_edit_raw_reads() {
+    let path = tmp("edit_trailing_empty_raw.mov");
+    let first = [1u8, 2, 3, 4, 5, 6];
+    let second = [11u8, 12, 13, 14, 15, 16];
+    let mov = quicktime_movie_samples_with_timing(
+        b"raw ",
+        2,
+        1,
+        24,
+        &[&first, &second],
+        Some((10, 10)),
+        Some(&[(20, 0, 65536), (10, -1, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(meta.size_t, 2);
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_status"),
+        Some(MetadataValue::String(status))
+            if status == "applied_trailing_empty_edits_single_normal_speed_media_segment"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.empty_after_media_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.sample_presentation_time_ticks"),
+        Some(MetadataValue::String(times)) if times == "0,10"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), first);
+    assert_eq!(reader.open_bytes(1).unwrap(), second);
+    assert!(reader.open_bytes(2).is_err());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_clips_sample_aligned_raw_reads() {
+    let path = tmp("edit_segments_raw_clipped.mov");
+    let first = [1u8, 2, 3, 4, 5, 6];
+    let second = [11u8, 12, 13, 14, 15, 16];
+    let third = [21u8, 22, 23, 24, 25, 26];
+    let mov = quicktime_movie_samples_with_timing(
+        b"raw ",
+        2,
+        1,
+        24,
+        &[&first, &second, &third],
+        Some((10, 10)),
+        Some(&[(10, 10, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 1);
+    assert_eq!(meta.size_t, 1);
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_status"),
+        Some(MetadataValue::String(status)) if status == "applied_clipped_normal_speed_media_segments"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.pixel_order_status"),
+        Some(MetadataValue::String(status)) if status == "clipped_sample_aligned_normal_speed"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_read_order"),
+        Some(MetadataValue::String(order)) if order == "1"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_sample_indices"),
+        Some(MetadataValue::String(order)) if order == "1"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_sample_range_start_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_sample_range_end_index_exclusive"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_sample_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_before_sample_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_after_sample_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_source_start_media_time_ticks"),
+        Some(MetadataValue::Int(10))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_source_end_media_time_ticks"),
+        Some(MetadataValue::Int(20))
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), second);
+    assert!(reader.open_bytes(1).is_err());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_records_clipped_range_for_reordered_segments() {
+    let path = tmp("edit_segments_raw_reordered_clipped.mov");
+    let first = [1u8, 2, 3, 4, 5, 6];
+    let second = [11u8, 12, 13, 14, 15, 16];
+    let third = [21u8, 22, 23, 24, 25, 26];
+    let fourth = [31u8, 32, 33, 34, 35, 36];
+    let mov = quicktime_movie_samples_with_timing(
+        b"raw ",
+        2,
+        1,
+        24,
+        &[&first, &second, &third, &fourth],
+        Some((10, 10)),
+        Some(&[(10, 20, 65536), (10, 10, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(meta.size_t, 2);
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.pixel_order_status"),
+        Some(MetadataValue::String(status)) if status == "clipped_sample_aligned_normal_speed"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.sample_read_order"),
+        Some(MetadataValue::String(order)) if order == "2,1"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_sample_indices"),
+        Some(MetadataValue::String(order)) if order == "1,2"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_sample_range_start_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_sample_range_end_index_exclusive"),
+        Some(MetadataValue::Int(3))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_before_sample_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_after_sample_count"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_source_start_media_time_ticks"),
+        Some(MetadataValue::Int(10))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.clipped_source_end_media_time_ticks"),
+        Some(MetadataValue::Int(30))
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), third);
+    assert_eq!(reader.open_bytes(1).unwrap(), second);
+    assert!(reader.open_bytes(2).is_err());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_reports_non_sample_aligned_start() {
+    let path = tmp("edit_non_sample_start.mov");
+    let keyframe = cinepak_keyframe_4x4();
+    let delta = cinepak_frame(4, 4, 1, &[(0x3100, vec![0, 0, 0, 0])]);
+    let mov = quicktime_movie_samples_with_timing(
+        b"cvid",
+        4,
+        4,
+        24,
+        &[&keyframe, &delta],
+        Some((10, 10)),
+        Some(&[(10, 5, 65536), (10, 0, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_status"),
+        Some(MetadataValue::String(status)) if status == "not_applied_complex_edit_list"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_diagnostic"),
+        Some(MetadataValue::String(diagnostic))
+            if diagnostic.contains("media segment start is not sample-aligned")
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.unsupported_reason"),
+        Some(MetadataValue::String(reason)) if reason == "non_sample_aligned_start"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.first_problem_segment_index"),
+        Some(MetadataValue::Int(0))
+    ));
+    assert!(!meta
+        .series_metadata
+        .contains_key("quicktime.edit_list.sample_media_segment_index"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_reports_single_segment_non_sample_aligned_end() {
+    let path = tmp("edit_single_non_sample_end.mov");
+    let first = [1u8, 2, 3, 4, 5, 6];
+    let second = [11u8, 12, 13, 14, 15, 16];
+    let mov = quicktime_movie_samples_with_timing(
+        b"raw ",
+        2,
+        1,
+        24,
+        &[&first, &second],
+        Some((10, 10)),
+        Some(&[(5, 0, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_status"),
+        Some(MetadataValue::String(status)) if status == "not_applied_complex_edit_list"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_diagnostic"),
+        Some(MetadataValue::String(diagnostic))
+            if diagnostic.contains("media segment end is not sample-aligned")
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.unsupported_reason"),
+        Some(MetadataValue::String(reason)) if reason == "non_sample_aligned_end"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.first_problem_segment_index"),
+        Some(MetadataValue::Int(0))
+    ));
+    assert!(!meta
+        .series_metadata
+        .contains_key("quicktime.edit_list.sample_media_segment_index"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_reports_sample_gaps() {
+    let path = tmp("edit_gap.mov");
+    let keyframe = cinepak_keyframe_4x4();
+    let delta = cinepak_frame(4, 4, 1, &[(0x3100, vec![0, 0, 0, 0])]);
+    let delta2 = cinepak_frame(4, 4, 1, &[(0x3100, vec![0, 0, 0, 0])]);
+    let mov = quicktime_movie_samples_with_timing(
+        b"cvid",
+        4,
+        4,
+        24,
+        &[&keyframe, &delta, &delta2],
+        Some((10, 10)),
+        Some(&[(10, 0, 65536), (10, 20, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_status"),
+        Some(MetadataValue::String(status)) if status == "not_applied_complex_edit_list"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_diagnostic"),
+        Some(MetadataValue::String(diagnostic))
+            if diagnostic.contains("edit list media segments do not cover every sample")
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.unsupported_reason"),
+        Some(MetadataValue::String(reason)) if reason == "gapped_media_segments"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.first_problem_sample_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(!meta
+        .series_metadata
+        .contains_key("quicktime.edit_list.sample_media_segment_index"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_edit_list_reports_overlapping_segments() {
+    let path = tmp("edit_overlap.mov");
+    let keyframe = cinepak_keyframe_4x4();
+    let delta = cinepak_frame(4, 4, 1, &[(0x3100, vec![0, 0, 0, 0])]);
+    let mov = quicktime_movie_samples_with_timing(
+        b"cvid",
+        4,
+        4,
+        24,
+        &[&keyframe, &delta],
+        Some((10, 10)),
+        Some(&[(20, 0, 65536), (10, 10, 65536)]),
+    );
+    std::fs::write(&path, mov).unwrap();
+
+    let reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_status"),
+        Some(MetadataValue::String(status)) if status == "not_applied_complex_edit_list"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.presentation_diagnostic"),
+        Some(MetadataValue::String(diagnostic))
+            if diagnostic.contains("media segments overlap in sample space")
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.unsupported_reason"),
+        Some(MetadataValue::String(reason)) if reason == "overlapping_media_segments"
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.first_problem_segment_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.edit_list.first_problem_sample_index"),
+        Some(MetadataValue::Int(1))
+    ));
+    assert!(!meta
+        .series_metadata
+        .contains_key("quicktime.edit_list.sample_media_segment_index"));
     let _ = std::fs::remove_file(path);
 }
 
@@ -697,6 +1380,30 @@ fn quicktime_multi_track_rejection_reports_track_diagnostics() {
 }
 
 #[test]
+fn quicktime_reads_co64_chunk_offsets() {
+    let path = tmp("co64_offsets.mov");
+    let first = [1u8, 2, 3, 4, 5, 6];
+    let second = [11u8, 12, 13, 14, 15, 16];
+    let mov = quicktime_movie_samples_with_co64(b"raw ", 2, 1, 24, &[&first, &second]);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata
+            .get("quicktime.chunk_offset_table_type"),
+        Some(MetadataValue::String(table_type)) if table_type == "co64"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.sample_offsets"),
+        Some(MetadataValue::String(offsets)) if offsets == "28,34"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), first);
+    assert_eq!(reader.open_bytes(1).unwrap(), second);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn quicktime_records_supported_codec_family_metadata() {
     let path = tmp("codec_family_raw.mov");
     let sample = [1u8, 2, 3, 4, 5, 6];
@@ -714,7 +1421,13 @@ fn quicktime_records_supported_codec_family_metadata() {
 
 #[test]
 fn quicktime_reports_known_unsupported_codec_families() {
-    for (fourcc, family) in [(b"avc1", "H.264/AVC"), (b"apch", "Apple ProRes")] {
+    for (fourcc, family) in [
+        (b"avc1", "H.264/AVC"),
+        (b"hvc1", "H.265/HEVC"),
+        (b"apch", "Apple ProRes"),
+        (b"mjp2", "Motion JPEG 2000"),
+        (b"dv50", "DV"),
+    ] {
         let path = tmp(&format!(
             "unsupported_{}.mov",
             String::from_utf8_lossy(fourcc)
@@ -734,7 +1447,8 @@ fn quicktime_reports_known_unsupported_codec_families() {
             "QuickTime codec {} is unsupported (family: {family})",
             String::from_utf8_lossy(fourcc)
         )));
-        assert!(message.contains("requires an external video decoder"));
+        assert!(message.contains("Bio-Formats Java delegates this codec family"));
+        assert!(message.contains("no external video decoder backend"));
         let _ = std::fs::remove_file(path);
     }
 }

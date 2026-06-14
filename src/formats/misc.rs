@@ -7,8 +7,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::common::codec::{decompress_qtrle, decompress_rpza};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::ome_metadata::{OmeMetadata, OmePlane};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -127,6 +129,10 @@ impl<'a> Cursor<'a> {
 
     fn read_float(&mut self) -> f32 {
         f32::from_bits(self.read_u32())
+    }
+
+    fn read_double(&mut self) -> f64 {
+        f64::from_bits(self.read_u64())
     }
 
     /// Read exactly `n` bytes and interpret them as a (lossy UTF-8) string.
@@ -372,8 +378,13 @@ impl FormatReader for QuickTimeReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let index = plane_index as usize;
-        let offset = series.sample_offsets[index];
-        let sample_size = series.sample_sizes[index] as usize;
+        let sample_index = series
+            .sample_read_order
+            .as_ref()
+            .and_then(|order| order.get(index).copied())
+            .unwrap_or(index);
+        let offset = series.sample_offsets[sample_index];
+        let sample_size = series.sample_sizes[sample_index] as usize;
         let data = std::fs::read(self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?)
             .map_err(BioFormatsError::Io)?;
         let start = offset as usize;
@@ -382,7 +393,7 @@ impl FormatReader for QuickTimeReader {
             .ok_or_else(|| BioFormatsError::Format("QuickTime sample offset overflows".into()))?;
         if end > data.len() {
             return Err(BioFormatsError::UnsupportedFormat(format!(
-                "QuickTime sample {plane_index} extends past end of file"
+                "QuickTime sample {sample_index} extends past end of file"
             )));
         }
         let sample = &data[start..end];
@@ -398,16 +409,41 @@ impl FormatReader for QuickTimeReader {
                     })?;
                 if sample_size != expected {
                     return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "QuickTime sample {plane_index} has {sample_size} bytes, expected {expected} for uncompressed pixels"
+                        "QuickTime sample {sample_index} has {sample_size} bytes, expected {expected} for uncompressed pixels"
                     )));
                 }
                 Ok(sample.to_vec())
             }
-            QuickTimeCodec::Jpeg => decode_quicktime_jpeg_sample(sample, meta, plane_index),
-            QuickTimeCodec::Png => decode_quicktime_png_sample(sample, meta, plane_index),
+            QuickTimeCodec::Jpeg => decode_quicktime_jpeg_sample(sample, meta, sample_index as u32),
+            QuickTimeCodec::Png => decode_quicktime_png_sample(sample, meta, sample_index as u32),
+            QuickTimeCodec::Rpza => decode_quicktime_rpza_sample(sample, meta, sample_index as u32),
+            QuickTimeCodec::AnimationRle { depth } => {
+                let mut previous = None;
+                for current in 0..=sample_index {
+                    let offset = series.sample_offsets[current] as usize;
+                    let end = offset
+                        .checked_add(series.sample_sizes[current] as usize)
+                        .ok_or_else(|| {
+                            BioFormatsError::Format("QuickTime sample offset overflows".into())
+                        })?;
+                    if end > data.len() {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "QuickTime sample {current} extends past end of file"
+                        )));
+                    }
+                    previous = Some(decode_quicktime_rle_sample(
+                        &data[offset..end],
+                        meta,
+                        current as u32,
+                        depth,
+                        previous.as_deref(),
+                    )?);
+                }
+                previous.ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
+            }
             QuickTimeCodec::Cinepak { depth } => {
                 let mut previous = None;
-                for current in 0..=index {
+                for current in 0..=sample_index {
                     let offset = series.sample_offsets[current] as usize;
                     let end = offset
                         .checked_add(series.sample_sizes[current] as usize)
@@ -469,12 +505,45 @@ impl FormatReader for QuickTimeReader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(_plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        let meta = &self.series.get(self.current_series)?.meta;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.get_mut(0) {
+            let delta_t = match meta
+                .series_metadata
+                .get("quicktime.sample_presentation_time_seconds")
+            {
+                Some(MetadataValue::String(values)) => values
+                    .split(',')
+                    .map(|value| value.parse::<f64>().ok())
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            image.planes = (0..meta.image_count)
+                .map(|plane| OmePlane {
+                    the_z: 0,
+                    the_c: 0,
+                    the_t: plane,
+                    delta_t: delta_t.get(plane as usize).copied(),
+                    exposure_time: None,
+                    position_x: None,
+                    position_y: None,
+                    position_z: None,
+                })
+                .collect();
+        }
+        let _ = ome.add_original_metadata_annotations(meta, 0);
+        Some(ome)
+    }
 }
 
 struct QuickTimeParsed {
     meta: ImageMetadata,
     sample_offsets: Vec<u64>,
     sample_sizes: Vec<u32>,
+    sample_read_order: Option<Vec<usize>>,
     samples_per_pixel: usize,
     codec: QuickTimeCodec,
 }
@@ -486,6 +555,8 @@ enum QuickTimeCodec {
     Jpeg,
     Png,
     Cinepak { depth: u16 },
+    Rpza,
+    AnimationRle { depth: u16 },
 }
 
 #[derive(Clone, Copy)]
@@ -495,10 +566,63 @@ struct QuickTimeSttsEntry {
 }
 
 #[derive(Clone, Copy)]
+struct QuickTimeCttsEntry {
+    sample_count: u32,
+    sample_offset: i64,
+}
+
+#[derive(Clone, Copy)]
+struct QuickTimeStscEntry {
+    first_chunk: u32,
+    samples_per_chunk: u32,
+    sample_description_index: u32,
+}
+
+#[derive(Clone, Copy)]
 struct QuickTimeEditEntry {
     segment_duration: u64,
     media_time: i64,
     media_rate: f64,
+}
+
+struct QuickTimeEditPresentationMap {
+    presentation_times: Vec<i64>,
+    media_times: Vec<u64>,
+    segment_indices: Vec<u32>,
+    sample_indices: Vec<usize>,
+}
+
+struct QuickTimeEditPresentationResult {
+    presentation_times: Vec<i64>,
+    sample_read_order: Option<Vec<usize>>,
+}
+
+struct QuickTimeEditListDiagnostic {
+    reason: &'static str,
+    message: String,
+    segment_index: Option<usize>,
+    sample_index: Option<usize>,
+}
+
+impl QuickTimeEditListDiagnostic {
+    fn new(reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+            segment_index: None,
+            sample_index: None,
+        }
+    }
+
+    fn with_segment(mut self, segment_index: usize) -> Self {
+        self.segment_index = Some(segment_index);
+        self
+    }
+
+    fn with_sample(mut self, sample_index: usize) -> Self {
+        self.sample_index = Some(sample_index);
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -529,6 +653,19 @@ fn quicktime_codec_from_fourcc(fourcc: &[u8], depth: u16) -> Result<QuickTimeCod
         b"gray" | b"GREY" | b"y800" => Ok(QuickTimeCodec::UncompressedGray),
         b"jpeg" | b"mjpa" | b"mjpb" | b"mjpg" | b"MJPG" => Ok(QuickTimeCodec::Jpeg),
         b"png " => Ok(QuickTimeCodec::Png),
+        b"rpza" => Ok(QuickTimeCodec::Rpza),
+        b"rle " => {
+            let depth = match depth {
+                0 | 24 => 24,
+                16 | 32 => depth,
+                other => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "QuickTime Animation RLE depth {other} is unsupported"
+                    )))
+                }
+            };
+            Ok(QuickTimeCodec::AnimationRle { depth })
+        }
         b"cvid" => Ok(QuickTimeCodec::Cinepak {
             depth: match depth {
                 0 | 24 => 24,
@@ -540,12 +677,21 @@ fn quicktime_codec_from_fourcc(fourcc: &[u8], depth: u16) -> Result<QuickTimeCod
                 }
             },
         }),
-        other => Err(BioFormatsError::UnsupportedFormat(format!(
-            "QuickTime codec {} is unsupported (family: {}); decoding this codec family requires an external video decoder",
-            String::from_utf8_lossy(other),
-            quicktime_codec_family(other)
-        ))),
+        other => Err(quicktime_unsupported_codec_error(other)),
     }
+}
+
+fn quicktime_unsupported_codec_error(fourcc: &[u8]) -> BioFormatsError {
+    let family = quicktime_codec_family(fourcc);
+    let decoder_note = if quicktime_codec_family_requires_external_decoder(fourcc) {
+        "Bio-Formats Java delegates this codec family to QuickTime/platform video decoders; bioformats-rs has no external video decoder backend"
+    } else {
+        "no native bioformats-rs decoder is available"
+    };
+    BioFormatsError::UnsupportedFormat(format!(
+        "QuickTime codec {} is unsupported (family: {family}); {decoder_note}",
+        String::from_utf8_lossy(fourcc),
+    ))
 }
 
 fn quicktime_codec_family(fourcc: &[u8]) -> &'static str {
@@ -555,15 +701,64 @@ fn quicktime_codec_family(fourcc: &[u8]) -> &'static str {
         b"jpeg" | b"mjpa" | b"mjpb" | b"mjpg" | b"MJPG" => "Motion JPEG",
         b"png " => "PNG",
         b"cvid" => "Cinepak",
+        b"rpza" => "Apple Video",
+        b"rle " => "Animation RLE",
         b"avc1" | b"avc2" | b"avc3" | b"avc4" | b"h264" | b"H264" | b"x264" | b"X264" => {
             "H.264/AVC"
         }
         b"hvc1" | b"hev1" => "H.265/HEVC",
         b"apch" | b"apcn" | b"apcs" | b"apco" | b"ap4h" | b"ap4x" => "Apple ProRes",
-        b"mjp2" => "Motion JPEG 2000",
-        b"dv  " | b"dvc " | b"dvcp" | b"dvhq" | b"dvcpro" => "DV",
+        b"mjp2" | b"mj2k" => "Motion JPEG 2000",
+        b"dv  " | b"dvc " | b"dvcp" | b"dvhq" | b"dv25" | b"dv50" | b"dv5n" | b"dv5p" => "DV",
         _ => "unknown codec family",
     }
+}
+
+fn quicktime_codec_family_requires_external_decoder(fourcc: &[u8]) -> bool {
+    matches!(
+        fourcc,
+        b"avc1"
+            | b"avc2"
+            | b"avc3"
+            | b"avc4"
+            | b"h264"
+            | b"H264"
+            | b"x264"
+            | b"X264"
+            | b"hvc1"
+            | b"hev1"
+            | b"apch"
+            | b"apcn"
+            | b"apcs"
+            | b"apco"
+            | b"ap4h"
+            | b"ap4x"
+            | b"mjp2"
+            | b"mj2k"
+            | b"dv  "
+            | b"dvc "
+            | b"dvcp"
+            | b"dvhq"
+            | b"dv25"
+            | b"dv50"
+            | b"dv5n"
+            | b"dv5p"
+    )
+}
+
+fn quicktime_insert_edit_list_pixel_order_diagnostic(
+    metadata: &mut HashMap<String, MetadataValue>,
+    status: &str,
+    diagnostic: &str,
+) {
+    metadata.insert(
+        "quicktime.edit_list.pixel_order_status".into(),
+        MetadataValue::String(status.into()),
+    );
+    metadata.insert(
+        "quicktime.edit_list.pixel_order_diagnostic".into(),
+        MetadataValue::String(diagnostic.into()),
+    );
 }
 
 fn decode_quicktime_jpeg_sample(
@@ -645,6 +840,318 @@ fn decode_quicktime_png_sample(
         )));
     }
     Ok(decoded)
+}
+
+fn decode_quicktime_rpza_sample(
+    sample: &[u8],
+    meta: &ImageMetadata,
+    plane_index: u32,
+) -> Result<Vec<u8>> {
+    if meta.size_c != 3 || meta.pixel_type != PixelType::Uint8 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime RPZA sample {plane_index} only supports 3-channel Uint8 output"
+        )));
+    }
+    decompress_rpza(sample, meta.size_x, meta.size_y).map_err(|err| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime RPZA sample {plane_index} failed to decode: {err}"
+        ))
+    })
+}
+
+fn decode_quicktime_rle_sample(
+    sample: &[u8],
+    meta: &ImageMetadata,
+    plane_index: u32,
+    depth: u16,
+    previous: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    if meta.size_c != 3 || meta.pixel_type != PixelType::Uint8 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Animation RLE sample {plane_index} only supports RGB Uint8 output"
+        )));
+    }
+    let expected = meta
+        .size_x
+        .checked_mul(meta.size_y)
+        .and_then(|px| (px as usize).checked_mul(3))
+        .ok_or_else(|| {
+            BioFormatsError::Format("QuickTime Animation RLE plane size overflows".into())
+        })?;
+    let is_delta = quicktime_rle_is_delta(sample)?;
+    let previous = if is_delta {
+        let previous = previous.ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime Animation RLE sample {plane_index} is a partial/delta frame without a previous frame"
+            ))
+        })?;
+        if previous.len() != expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime Animation RLE sample {plane_index} previous frame has {} bytes, expected {expected}",
+                previous.len()
+            )));
+        }
+        Some(previous)
+    } else {
+        None
+    };
+    match depth {
+        24 if !is_delta => {
+            let decoded =
+                decompress_qtrle(sample, meta.size_x, meta.size_y, 24).map_err(|err| {
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "QuickTime Animation RLE sample {plane_index} failed to decode: {err}"
+                    ))
+                })?;
+            if decoded.len() != expected {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "QuickTime Animation RLE sample {plane_index} decoded to {} bytes, expected {expected}",
+                    decoded.len()
+                )));
+            }
+            Ok(decoded)
+        }
+        16 | 24 | 32 => decode_quicktime_rle_rgb_sample(sample, meta, depth, plane_index, previous),
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Animation RLE depth {other} is unsupported"
+        ))),
+    }
+}
+
+fn quicktime_rle_is_delta(sample: &[u8]) -> Result<bool> {
+    if sample.len() < 6 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime Animation RLE sample is truncated".into(),
+        ));
+    }
+    let chunk_size = u32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]]) as usize;
+    if chunk_size < 6 || chunk_size > sample.len() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime Animation RLE sample has invalid chunk size".into(),
+        ));
+    }
+    let header = u16::from_be_bytes([sample[4], sample[5]]);
+    Ok(header & 0x0008 != 0)
+}
+
+fn decode_quicktime_rle_rgb_sample(
+    sample: &[u8],
+    meta: &ImageMetadata,
+    depth: u16,
+    plane_index: u32,
+    previous: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    if !matches!(depth, 16 | 24 | 32) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Animation RLE depth {depth} is unsupported"
+        )));
+    }
+    let width = meta.size_x as usize;
+    let height = meta.size_y as usize;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|px| px.checked_mul(3))
+        .ok_or_else(|| {
+            BioFormatsError::Format("QuickTime Animation RLE plane size overflows".into())
+        })?;
+    let mut out = if let Some(previous) = previous {
+        if previous.len() != expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime Animation RLE sample {plane_index} previous frame has {} bytes, expected {expected}",
+                previous.len()
+            )));
+        }
+        previous.to_vec()
+    } else {
+        vec![0u8; expected]
+    };
+    if sample.len() < 6 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Animation RLE sample {plane_index} is truncated"
+        )));
+    }
+    let chunk_size = u32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]]) as usize;
+    if chunk_size < 6 || chunk_size > sample.len() {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Animation RLE sample {plane_index} has invalid chunk size"
+        )));
+    }
+    let mut i = 4usize;
+    let header = quicktime_rle_read_u16(sample, &mut i, chunk_size)?;
+    if header & !0x0008 != 0 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Animation RLE sample {plane_index} has unsupported header flags 0x{header:04x}"
+        )));
+    }
+    let (start_line, changed_lines) = if header & 0x0008 != 0 {
+        let start_line = quicktime_rle_read_u16(sample, &mut i, chunk_size)? as usize;
+        quicktime_rle_skip(sample, &mut i, chunk_size, 2)?;
+        let changed_lines = quicktime_rle_read_u16(sample, &mut i, chunk_size)? as usize;
+        quicktime_rle_skip(sample, &mut i, chunk_size, 2)?;
+        (start_line, changed_lines)
+    } else {
+        (0, height)
+    };
+    let end_line = start_line.checked_add(changed_lines).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Animation RLE sample {plane_index} changed-line range overflows"
+        ))
+    })?;
+    if end_line > height {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Animation RLE sample {plane_index} changed-line range exceeds image height"
+        )));
+    }
+    for y in start_line..end_line {
+        let initial_skip = quicktime_rle_read_u8(sample, &mut i, chunk_size)? as usize;
+        if initial_skip == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime Animation RLE sample {plane_index} line skip underflows"
+            )));
+        }
+        let mut x = initial_skip - 1;
+        loop {
+            let opcode = quicktime_rle_read_i8(sample, &mut i, chunk_size)?;
+            match opcode {
+                -1 => break,
+                0 => {
+                    let skip = quicktime_rle_read_u8(sample, &mut i, chunk_size)? as usize;
+                    if skip == 0 {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "QuickTime Animation RLE sample {plane_index} skip underflows"
+                        )));
+                    }
+                    x = x.checked_add(skip - 1).ok_or_else(|| {
+                        BioFormatsError::UnsupportedFormat(format!(
+                            "QuickTime Animation RLE sample {plane_index} skip overflows"
+                        ))
+                    })?;
+                    if x > width {
+                        return Err(BioFormatsError::UnsupportedFormat(format!(
+                            "QuickTime Animation RLE sample {plane_index} skip exceeds row width"
+                        )));
+                    }
+                }
+                n if n < 0 => {
+                    let count = (-n) as usize;
+                    let pixel = quicktime_rle_read_pixel(sample, &mut i, chunk_size, depth)?;
+                    quicktime_rle_write_pixels(&mut out, width, y, &mut x, count, pixel)?;
+                }
+                n => {
+                    for _ in 0..n as usize {
+                        let pixel = quicktime_rle_read_pixel(sample, &mut i, chunk_size, depth)?;
+                        quicktime_rle_write_pixels(&mut out, width, y, &mut x, 1, pixel)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn quicktime_rle_read_u16(sample: &[u8], i: &mut usize, limit: usize) -> Result<u16> {
+    if *i + 2 > limit {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime Animation RLE sample is truncated".into(),
+        ));
+    }
+    let value = u16::from_be_bytes([sample[*i], sample[*i + 1]]);
+    *i += 2;
+    Ok(value)
+}
+
+fn quicktime_rle_read_u8(sample: &[u8], i: &mut usize, limit: usize) -> Result<u8> {
+    if *i >= limit {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime Animation RLE sample is truncated".into(),
+        ));
+    }
+    let value = sample[*i];
+    *i += 1;
+    Ok(value)
+}
+
+fn quicktime_rle_read_i8(sample: &[u8], i: &mut usize, limit: usize) -> Result<i8> {
+    Ok(quicktime_rle_read_u8(sample, i, limit)? as i8)
+}
+
+fn quicktime_rle_skip(sample: &[u8], i: &mut usize, limit: usize, count: usize) -> Result<()> {
+    if *i + count > limit || limit > sample.len() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime Animation RLE sample is truncated".into(),
+        ));
+    }
+    *i += count;
+    Ok(())
+}
+
+fn quicktime_rle_read_pixel(
+    sample: &[u8],
+    i: &mut usize,
+    limit: usize,
+    depth: u16,
+) -> Result<[u8; 3]> {
+    match depth {
+        16 => {
+            let value = quicktime_rle_read_u16(sample, i, limit)?;
+            Ok(quicktime_rgb555_to_rgb24(value))
+        }
+        24 => {
+            if *i + 3 > limit {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "QuickTime Animation RLE sample is truncated".into(),
+                ));
+            }
+            let rgb = [sample[*i], sample[*i + 1], sample[*i + 2]];
+            *i += 3;
+            Ok(rgb)
+        }
+        32 => {
+            if *i + 4 > limit {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "QuickTime Animation RLE sample is truncated".into(),
+                ));
+            }
+            let rgb = [sample[*i + 1], sample[*i + 2], sample[*i + 3]];
+            *i += 4;
+            Ok(rgb)
+        }
+        other => Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Animation RLE depth {other} is unsupported"
+        ))),
+    }
+}
+
+fn quicktime_rle_write_pixels(
+    out: &mut [u8],
+    width: usize,
+    y: usize,
+    x: &mut usize,
+    count: usize,
+    pixel: [u8; 3],
+) -> Result<()> {
+    if *x + count > width {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime Animation RLE repeat run exceeds row width".into(),
+        ));
+    }
+    for _ in 0..count {
+        let dst = (y * width + *x) * 3;
+        out[dst..dst + 3].copy_from_slice(&pixel);
+        *x += 1;
+    }
+    Ok(())
+}
+
+fn quicktime_rgb555_to_rgb24(color: u16) -> [u8; 3] {
+    let r = ((color >> 10) & 0x1f) as u8;
+    let g = ((color >> 5) & 0x1f) as u8;
+    let b = (color & 0x1f) as u8;
+    [
+        (r << 3) | (r >> 2),
+        (g << 3) | (g >> 2),
+        (b << 3) | (b >> 2),
+    ]
 }
 
 fn decode_quicktime_cinepak_sample(
@@ -854,6 +1361,80 @@ fn parse_quicktime_stts(
     Ok(entries)
 }
 
+fn parse_quicktime_ctts(
+    ctts: Atom<'_>,
+    expected_samples: usize,
+) -> Result<Vec<QuickTimeCttsEntry>> {
+    if ctts.data.len() < 8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime ctts atom is truncated".into(),
+        ));
+    }
+    let version = ctts.data[0];
+    if version > 1 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime ctts version {version} is unsupported"
+        )));
+    }
+    let entry_count = be_u32_at(ctts.data, 4).unwrap() as usize;
+    if ctts.data.len() < 8 + entry_count * 8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime ctts table is truncated".into(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut total = 0usize;
+    for i in 0..entry_count {
+        let base = 8 + i * 8;
+        let sample_count = be_u32_at(ctts.data, base).unwrap();
+        let sample_offset = if version == 0 {
+            i64::from(be_u32_at(ctts.data, base + 4).unwrap())
+        } else {
+            i64::from(be_i32_at(ctts.data, base + 4).unwrap())
+        };
+        if sample_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime ctts contains a zero sample count".into(),
+            ));
+        }
+        total += sample_count as usize;
+        entries.push(QuickTimeCttsEntry {
+            sample_count,
+            sample_offset,
+        });
+    }
+    if total != expected_samples {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime ctts sample count {total} does not match stsz sample count {expected_samples}"
+        )));
+    }
+    Ok(entries)
+}
+
+fn parse_quicktime_stsc(stsc: Atom<'_>) -> Result<Vec<QuickTimeStscEntry>> {
+    if stsc.data.len() < 8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsc atom is truncated".into(),
+        ));
+    }
+    let entry_count = be_u32_at(stsc.data, 4).unwrap() as usize;
+    if stsc.data.len() < 8 + entry_count * 12 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsc table is truncated".into(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    for i in 0..entry_count {
+        let base = 8 + i * 12;
+        entries.push(QuickTimeStscEntry {
+            first_chunk: be_u32_at(stsc.data, base).unwrap(),
+            samples_per_chunk: be_u32_at(stsc.data, base + 4).unwrap(),
+            sample_description_index: be_u32_at(stsc.data, base + 8).unwrap(),
+        });
+    }
+    Ok(entries)
+}
+
 fn parse_quicktime_elst(elst: Atom<'_>) -> Result<Vec<QuickTimeEditEntry>> {
     if elst.data.len() < 8 {
         return Err(BioFormatsError::UnsupportedFormat(
@@ -906,6 +1487,33 @@ fn quicktime_sample_media_times(entries: &[QuickTimeSttsEntry]) -> Option<Vec<u6
     Some(times)
 }
 
+fn quicktime_sample_composition_offsets(entries: &[QuickTimeCttsEntry]) -> Option<Vec<i64>> {
+    let sample_count = entries.iter().try_fold(0usize, |total, entry| {
+        total.checked_add(entry.sample_count as usize)
+    })?;
+    let mut offsets = Vec::with_capacity(sample_count);
+    for entry in entries {
+        for _ in 0..entry.sample_count {
+            offsets.push(entry.sample_offset);
+        }
+    }
+    Some(offsets)
+}
+
+fn quicktime_apply_composition_offsets(
+    presentation_times: &[i64],
+    composition_offsets: &[i64],
+) -> Option<Vec<i64>> {
+    if presentation_times.len() != composition_offsets.len() {
+        return None;
+    }
+    presentation_times
+        .iter()
+        .zip(composition_offsets)
+        .map(|(time, offset)| time.checked_add(*offset))
+        .collect()
+}
+
 fn quicktime_insert_u64_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     key: &str,
@@ -953,6 +1561,84 @@ fn quicktime_insert_u64_list_metadata(
     );
 }
 
+fn quicktime_insert_u32_list_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    key: &str,
+    values: &[u32],
+) {
+    metadata.insert(
+        key.into(),
+        MetadataValue::String(
+            values
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+}
+
+fn quicktime_insert_clipped_sample_range_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    sample_indices: &[usize],
+    sample_media_times: &[u64],
+    media_duration_ticks: u64,
+) -> Option<()> {
+    let first_index = *sample_indices.first()?;
+    let last_index = *sample_indices.last()?;
+    if last_index < first_index || last_index >= sample_media_times.len() {
+        return None;
+    }
+    if sample_indices
+        .windows(2)
+        .any(|window| window[1] != window[0] + 1)
+    {
+        return None;
+    }
+    let retained_count = last_index.checked_sub(first_index)?.checked_add(1)?;
+    let after_count = sample_media_times.len().checked_sub(last_index + 1)?;
+    quicktime_insert_u64_metadata(
+        metadata,
+        "quicktime.edit_list.clipped_sample_range_start_index",
+        u64::try_from(first_index).ok()?,
+    );
+    quicktime_insert_u64_metadata(
+        metadata,
+        "quicktime.edit_list.clipped_sample_range_end_index_exclusive",
+        u64::try_from(last_index + 1).ok()?,
+    );
+    quicktime_insert_u64_metadata(
+        metadata,
+        "quicktime.edit_list.clipped_sample_count",
+        u64::try_from(retained_count).ok()?,
+    );
+    quicktime_insert_u64_metadata(
+        metadata,
+        "quicktime.edit_list.clipped_before_sample_count",
+        u64::try_from(first_index).ok()?,
+    );
+    quicktime_insert_u64_metadata(
+        metadata,
+        "quicktime.edit_list.clipped_after_sample_count",
+        u64::try_from(after_count).ok()?,
+    );
+    quicktime_insert_u64_metadata(
+        metadata,
+        "quicktime.edit_list.clipped_source_start_media_time_ticks",
+        sample_media_times[first_index],
+    );
+    let end_media_time = sample_media_times
+        .get(last_index + 1)
+        .copied()
+        .unwrap_or(media_duration_ticks);
+    quicktime_insert_u64_metadata(
+        metadata,
+        "quicktime.edit_list.clipped_source_end_media_time_ticks",
+        end_media_time,
+    );
+    Some(())
+}
+
 fn quicktime_insert_seconds_list_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     key: &str,
@@ -980,7 +1666,7 @@ fn quicktime_movie_ticks_to_media_ticks(
         return Some(0);
     }
     let (Some(media_timescale), Some(movie_timescale)) = (media_timescale, movie_timescale) else {
-        return None;
+        return Some(0);
     };
     if movie_timescale == 0 {
         return None;
@@ -996,62 +1682,204 @@ fn quicktime_movie_ticks_to_media_ticks(
 
 fn quicktime_multi_segment_presentation_times(
     entries: &[QuickTimeEditEntry],
-    empty_duration_media_ticks: u64,
     sample_media_times: &[u64],
     media_duration_ticks: u64,
     media_timescale: Option<u32>,
     movie_timescale: Option<u32>,
-) -> std::result::Result<Vec<i64>, String> {
+) -> std::result::Result<QuickTimeEditPresentationMap, QuickTimeEditListDiagnostic> {
     let mut out = vec![None; sample_media_times.len()];
-    let mut cursor = empty_duration_media_ticks;
-    for entry in entries {
-        let start =
-            u64::try_from(entry.media_time).map_err(|_| "negative media_time".to_string())?;
+    let mut source_times = vec![None; sample_media_times.len()];
+    let mut segment_indices = vec![None; sample_media_times.len()];
+    let mut cursor = 0u64;
+    let mut media_segment_index = 0usize;
+    for (entry_index, entry) in entries.iter().enumerate() {
         let duration = quicktime_movie_ticks_to_media_ticks(
             entry.segment_duration,
             media_timescale,
             movie_timescale,
         )
         .ok_or_else(|| {
-            "media segment duration cannot be represented exactly in media ticks".to_string()
+            QuickTimeEditListDiagnostic::new(
+                "non_integral_segment_duration",
+                "media segment duration cannot be represented exactly in media ticks",
+            )
+            .with_segment(entry_index)
         })?;
-        let end = start
-            .checked_add(duration)
-            .ok_or_else(|| "media segment duration overflows".to_string())?;
-        if end > media_duration_ticks {
-            return Err("media segment extends past media duration".into());
+        if entry.media_time < 0 {
+            cursor = cursor.checked_add(duration).ok_or_else(|| {
+                QuickTimeEditListDiagnostic::new(
+                    "presentation_timeline_overflow",
+                    "presentation timeline duration overflows",
+                )
+                .with_segment(entry_index)
+            })?;
+            continue;
         }
-        let start_index = sample_media_times
-            .binary_search(&start)
-            .map_err(|_| "media segment start is not sample-aligned".to_string())?;
+        let segment_index = media_segment_index;
+        media_segment_index += 1;
+        let start = u64::try_from(entry.media_time).map_err(|_| {
+            QuickTimeEditListDiagnostic::new("negative_media_time", "negative media_time")
+                .with_segment(segment_index)
+        })?;
+        let end = start.checked_add(duration).ok_or_else(|| {
+            QuickTimeEditListDiagnostic::new(
+                "segment_duration_overflow",
+                "media segment duration overflows",
+            )
+            .with_segment(segment_index)
+        })?;
+        if end > media_duration_ticks {
+            return Err(QuickTimeEditListDiagnostic::new(
+                "segment_extends_past_media_duration",
+                "media segment extends past media duration",
+            )
+            .with_segment(segment_index));
+        }
+        let start_index = sample_media_times.binary_search(&start).map_err(|_| {
+            QuickTimeEditListDiagnostic::new(
+                "non_sample_aligned_start",
+                "media segment start is not sample-aligned",
+            )
+            .with_segment(segment_index)
+        })?;
         let end_index = if end == media_duration_ticks {
             sample_media_times.len()
         } else {
-            sample_media_times
-                .binary_search(&end)
-                .map_err(|_| "media segment end is not sample-aligned".to_string())?
+            sample_media_times.binary_search(&end).map_err(|_| {
+                QuickTimeEditListDiagnostic::new(
+                    "non_sample_aligned_end",
+                    "media segment end is not sample-aligned",
+                )
+                .with_segment(segment_index)
+            })?
         };
         if start_index >= end_index {
-            return Err("media segment contains no complete samples".into());
+            return Err(QuickTimeEditListDiagnostic::new(
+                "empty_media_segment",
+                "media segment contains no complete samples",
+            )
+            .with_segment(segment_index));
         }
         for sample_index in start_index..end_index {
             if out[sample_index].is_some() {
-                return Err("media segments overlap in sample space".into());
+                return Err(QuickTimeEditListDiagnostic::new(
+                    "overlapping_media_segments",
+                    "media segments overlap in sample space",
+                )
+                .with_segment(segment_index)
+                .with_sample(sample_index));
             }
             let t = cursor
                 .checked_add(sample_media_times[sample_index] - start)
-                .ok_or_else(|| "presentation time overflows".to_string())?;
-            out[sample_index] = Some(
-                i64::try_from(t).map_err(|_| "presentation time exceeds i64 range".to_string())?,
-            );
+                .ok_or_else(|| {
+                    QuickTimeEditListDiagnostic::new(
+                        "presentation_time_overflow",
+                        "presentation time overflows",
+                    )
+                    .with_segment(segment_index)
+                    .with_sample(sample_index)
+                })?;
+            out[sample_index] = Some(i64::try_from(t).map_err(|_| {
+                QuickTimeEditListDiagnostic::new(
+                    "presentation_time_out_of_range",
+                    "presentation time exceeds i64 range",
+                )
+                .with_segment(segment_index)
+                .with_sample(sample_index)
+            })?);
+            source_times[sample_index] = Some(sample_media_times[sample_index]);
+            segment_indices[sample_index] = Some(u32::try_from(segment_index).map_err(|_| {
+                QuickTimeEditListDiagnostic::new(
+                    "segment_index_out_of_range",
+                    "edit segment index exceeds u32 range",
+                )
+                .with_segment(segment_index)
+                .with_sample(sample_index)
+            })?);
         }
-        cursor = cursor
-            .checked_add(duration)
-            .ok_or_else(|| "presentation timeline duration overflows".to_string())?;
+        cursor = cursor.checked_add(duration).ok_or_else(|| {
+            QuickTimeEditListDiagnostic::new(
+                "presentation_timeline_overflow",
+                "presentation timeline duration overflows",
+            )
+            .with_segment(segment_index)
+        })?;
     }
-    out.into_iter()
+    let covered_indices = out
+        .iter()
+        .enumerate()
+        .filter_map(|(index, time)| time.map(|_| index))
+        .collect::<Vec<_>>();
+    if covered_indices.is_empty() {
+        return Err(QuickTimeEditListDiagnostic::new(
+            "empty_media_segment",
+            "media segments contain no complete samples",
+        ));
+    }
+    if covered_indices.len() != sample_media_times.len() {
+        let first_covered = *covered_indices.first().unwrap();
+        let last_covered = *covered_indices.last().unwrap();
+        if let Some(sample_index) =
+            (first_covered..=last_covered).find(|&index| out[index].is_none())
+        {
+            return Err(QuickTimeEditListDiagnostic::new(
+                "gapped_media_segments",
+                "edit list media segments do not cover every sample",
+            )
+            .with_sample(sample_index));
+        }
+    }
+    let presentation_times = covered_indices
+        .iter()
+        .map(|&index| out[index])
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| "edit list media segments do not cover every sample".into())
+        .ok_or_else(|| {
+            QuickTimeEditListDiagnostic::new(
+                "gapped_media_segments",
+                "edit list media segments do not cover every sample",
+            )
+        })?;
+    let media_times = covered_indices
+        .iter()
+        .map(|&index| source_times[index])
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            QuickTimeEditListDiagnostic::new(
+                "gapped_media_segments",
+                "edit list media segments do not cover every sample",
+            )
+        })?;
+    let segment_indices = covered_indices
+        .iter()
+        .map(|&index| segment_indices[index])
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            QuickTimeEditListDiagnostic::new(
+                "gapped_media_segments",
+                "edit list media segments do not cover every sample",
+            )
+        })?;
+    Ok(QuickTimeEditPresentationMap {
+        presentation_times,
+        media_times,
+        segment_indices,
+        sample_indices: covered_indices,
+    })
+}
+
+fn quicktime_sample_read_order_from_presentation_times(
+    presentation_times: &[i64],
+) -> Option<Vec<usize>> {
+    let mut indexed = presentation_times
+        .iter()
+        .copied()
+        .enumerate()
+        .collect::<Vec<_>>();
+    indexed.sort_by_key(|&(_, time)| time);
+    if indexed.windows(2).any(|window| window[0].1 == window[1].1) {
+        return None;
+    }
+    Some(indexed.into_iter().map(|(index, _)| index).collect())
 }
 
 fn quicktime_edit_presentation_times(
@@ -1061,15 +1889,25 @@ fn quicktime_edit_presentation_times(
     sample_media_times: &[u64],
     media_duration_ticks: u64,
     metadata: &mut HashMap<String, MetadataValue>,
-) -> Option<Vec<i64>> {
+) -> Option<QuickTimeEditPresentationResult> {
     let mut empty_count = 0usize;
     let mut empty_movie_ticks = 0u64;
+    let mut leading_empty_movie_ticks = 0u64;
+    let mut empty_after_media_count = 0usize;
+    let mut empty_after_media_movie_ticks = 0u64;
+    let mut first_empty_after_media_segment_index = None;
+    let mut first_internal_empty_segment_index = None;
     let mut media_segments = Vec::new();
-    for entry in entries {
+    for (entry_index, entry) in entries.iter().enumerate() {
         if (entry.media_rate - 1.0).abs() > f64::EPSILON {
             metadata.insert(
                 "quicktime.edit_list.presentation_status".into(),
                 MetadataValue::String("not_applied_non_unit_rate".into()),
+            );
+            quicktime_insert_edit_list_pixel_order_diagnostic(
+                metadata,
+                "not_reordered_non_unit_rate",
+                "edit-list pixel-plane reordering is not applied for non-unit media rates",
             );
             metadata.insert(
                 "quicktime.edit_list.presentation_diagnostic".into(),
@@ -1079,6 +1917,14 @@ fn quicktime_edit_presentation_times(
                 )),
             );
             metadata.insert(
+                "quicktime.edit_list.unsupported_reason".into(),
+                MetadataValue::String("non_unit_rate".into()),
+            );
+            metadata.insert(
+                "quicktime.edit_list.first_problem_segment_index".into(),
+                MetadataValue::Int(entry_index as i64),
+            );
+            metadata.insert(
                 "quicktime.edit_list.media_rate".into(),
                 MetadataValue::Float(entry.media_rate),
             );
@@ -1086,15 +1932,22 @@ fn quicktime_edit_presentation_times(
         }
         if entry.media_time < 0 {
             if !media_segments.is_empty() {
-                metadata.insert(
-                    "quicktime.edit_list.presentation_status".into(),
-                    MetadataValue::String("not_applied_complex_edit_list".into()),
-                );
-                metadata.insert(
-                    "quicktime.edit_list.presentation_diagnostic".into(),
-                    MetadataValue::String("empty edit follows a media segment".into()),
-                );
-                return None;
+                empty_after_media_count += 1;
+                empty_after_media_movie_ticks =
+                    empty_after_media_movie_ticks.checked_add(entry.segment_duration)?;
+                if first_empty_after_media_segment_index.is_none() {
+                    first_empty_after_media_segment_index = Some(entry_index);
+                }
+                if entries[entry_index + 1..]
+                    .iter()
+                    .any(|later| later.media_time >= 0)
+                    && first_internal_empty_segment_index.is_none()
+                {
+                    first_internal_empty_segment_index = Some(entry_index);
+                }
+            } else {
+                leading_empty_movie_ticks =
+                    leading_empty_movie_ticks.checked_add(entry.segment_duration)?;
             }
             empty_count += 1;
             empty_movie_ticks = empty_movie_ticks.checked_add(entry.segment_duration)?;
@@ -1111,6 +1964,23 @@ fn quicktime_edit_presentation_times(
         "quicktime.edit_list.empty_duration_movie_ticks",
         empty_movie_ticks,
     );
+    if empty_after_media_count > 0 {
+        metadata.insert(
+            "quicktime.edit_list.empty_after_media_count".into(),
+            MetadataValue::Int(empty_after_media_count as i64),
+        );
+        quicktime_insert_u64_metadata(
+            metadata,
+            "quicktime.edit_list.empty_after_media_duration_movie_ticks",
+            empty_after_media_movie_ticks,
+        );
+        if let Some(segment_index) = first_empty_after_media_segment_index {
+            metadata.insert(
+                "quicktime.edit_list.first_empty_after_media_segment_index".into(),
+                MetadataValue::Int(segment_index as i64),
+            );
+        }
+    }
     let first = media_segments.first()?;
     metadata.insert(
         "quicktime.edit_list.media_time_ticks".into(),
@@ -1120,19 +1990,229 @@ fn quicktime_edit_presentation_times(
         "quicktime.edit_list.media_rate".into(),
         MetadataValue::Float(first.media_rate),
     );
-    let empty_media_ticks =
-        quicktime_movie_ticks_to_media_ticks(empty_movie_ticks, media_timescale, movie_timescale)?;
+    let empty_media_ticks = quicktime_movie_ticks_to_media_ticks(
+        leading_empty_movie_ticks,
+        media_timescale,
+        movie_timescale,
+    )?;
+    let has_leading_empty_edits = leading_empty_movie_ticks > 0;
+    let has_trailing_empty_edits = empty_after_media_count > 0;
     if media_segments.len() == 1 {
+        let single_segment_boundary_diagnostic = (!has_leading_empty_edits
+            && !has_trailing_empty_edits)
+            .then_some(())
+            .and_then(|_| u64::try_from(first.media_time).ok())
+            .and_then(|start| {
+                let duration = quicktime_movie_ticks_to_media_ticks(
+                    first.segment_duration,
+                    media_timescale,
+                    movie_timescale,
+                )?;
+                let end = start.checked_add(duration)?;
+                if end > media_duration_ticks {
+                    return None;
+                }
+                let start_index = match sample_media_times.binary_search(&start) {
+                    Ok(index) => index,
+                    Err(_) => {
+                        return Some(
+                            QuickTimeEditListDiagnostic::new(
+                                "non_sample_aligned_start",
+                                "media segment start is not sample-aligned",
+                            )
+                            .with_segment(0),
+                        );
+                    }
+                };
+                let end_index = if end == media_duration_ticks {
+                    sample_media_times.len()
+                } else {
+                    match sample_media_times.binary_search(&end) {
+                        Ok(index) => index,
+                        Err(_) => {
+                            return Some(
+                                QuickTimeEditListDiagnostic::new(
+                                    "non_sample_aligned_end",
+                                    "media segment end is not sample-aligned",
+                                )
+                                .with_segment(0),
+                            );
+                        }
+                    }
+                };
+                if start_index >= end_index {
+                    Some(
+                        QuickTimeEditListDiagnostic::new(
+                            "empty_media_segment",
+                            "media segment contains no complete samples",
+                        )
+                        .with_segment(0),
+                    )
+                } else {
+                    None
+                }
+            });
+        if let Some(diagnostic) = single_segment_boundary_diagnostic {
+            metadata.insert(
+                "quicktime.edit_list.presentation_status".into(),
+                MetadataValue::String("not_applied_complex_edit_list".into()),
+            );
+            quicktime_insert_edit_list_pixel_order_diagnostic(
+                metadata,
+                "not_reordered_complex_edit_list",
+                "edit-list pixel-plane reordering is not applied for non-sample-aligned, gapped, overlapping, or clipped media segments",
+            );
+            metadata.insert(
+                "quicktime.edit_list.presentation_diagnostic".into(),
+                MetadataValue::String(format!(
+                    "single media segment not applied: {}",
+                    diagnostic.message
+                )),
+            );
+            metadata.insert(
+                "quicktime.edit_list.unsupported_reason".into(),
+                MetadataValue::String(diagnostic.reason.into()),
+            );
+            if let Some(segment_index) = diagnostic.segment_index {
+                metadata.insert(
+                    "quicktime.edit_list.first_problem_segment_index".into(),
+                    MetadataValue::Int(segment_index as i64),
+                );
+            }
+            if let Some(sample_index) = diagnostic.sample_index {
+                metadata.insert(
+                    "quicktime.edit_list.first_problem_sample_index".into(),
+                    MetadataValue::Int(sample_index as i64),
+                );
+            }
+            return None;
+        }
+        let clipped_single = u64::try_from(first.media_time).ok().and_then(|start| {
+            let duration = quicktime_movie_ticks_to_media_ticks(
+                first.segment_duration,
+                media_timescale,
+                movie_timescale,
+            )?;
+            let end = start.checked_add(duration)?;
+            if end > media_duration_ticks {
+                return None;
+            }
+            let start_index = sample_media_times.binary_search(&start).ok()?;
+            let end_index = if end == media_duration_ticks {
+                sample_media_times.len()
+            } else {
+                sample_media_times.binary_search(&end).ok()?
+            };
+            if start_index >= end_index
+                || (start_index == 0 && end_index == sample_media_times.len())
+            {
+                None
+            } else {
+                Some((start, start_index, end_index))
+            }
+        });
+        if let Some((start, start_index, end_index)) = clipped_single {
+            metadata.insert(
+                "quicktime.edit_list.presentation_status".into(),
+                MetadataValue::String(
+                    match (has_leading_empty_edits, has_trailing_empty_edits) {
+                        (true, true) => {
+                            "applied_leading_and_trailing_empty_edits_clipped_normal_speed_media_segments"
+                        }
+                        (true, false) => {
+                            "applied_leading_empty_edits_clipped_normal_speed_media_segments"
+                        }
+                        (false, true) => {
+                            "applied_trailing_empty_edits_clipped_normal_speed_media_segments"
+                        }
+                        (false, false) => "applied_clipped_normal_speed_media_segments",
+                    }
+                    .into(),
+                ),
+            );
+            quicktime_insert_edit_list_pixel_order_diagnostic(
+                metadata,
+                "clipped_sample_aligned_normal_speed",
+                "open_bytes clips to edit-list presentation samples for a sample-aligned normal-speed media segment",
+            );
+            metadata.insert(
+                "quicktime.edit_list.presentation_diagnostic".into(),
+                MetadataValue::String(format!(
+                    "media_time {} applied at normal speed with sample-aligned clipped sample range",
+                    first.media_time
+                )),
+            );
+            let presentation_times = sample_media_times[start_index..end_index]
+                .iter()
+                .map(|time| {
+                    let t = empty_media_ticks.checked_add(*time - start)?;
+                    i64::try_from(t).ok()
+                })
+                .collect::<Option<Vec<_>>>()?;
+            quicktime_insert_u64_list_metadata(
+                metadata,
+                "quicktime.edit_list.sample_source_media_time_ticks",
+                &sample_media_times[start_index..end_index],
+            );
+            let segment_indices = vec![0; end_index - start_index];
+            quicktime_insert_u32_list_metadata(
+                metadata,
+                "quicktime.edit_list.sample_media_segment_index",
+                &segment_indices,
+            );
+            let sample_read_order = (start_index..end_index).collect::<Vec<_>>();
+            let sample_read_order_u32 = sample_read_order
+                .iter()
+                .copied()
+                .map(u32::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()?;
+            quicktime_insert_u32_list_metadata(
+                metadata,
+                "quicktime.edit_list.sample_read_order",
+                &sample_read_order_u32,
+            );
+            quicktime_insert_u32_list_metadata(
+                metadata,
+                "quicktime.edit_list.clipped_sample_indices",
+                &sample_read_order_u32,
+            );
+            quicktime_insert_clipped_sample_range_metadata(
+                metadata,
+                &sample_read_order,
+                sample_media_times,
+                media_duration_ticks,
+            )?;
+            return Some(QuickTimeEditPresentationResult {
+                presentation_times,
+                sample_read_order: Some(sample_read_order),
+            });
+        }
         let offset = i64::try_from(empty_media_ticks)
             .ok()?
             .checked_sub(first.media_time)?;
         metadata.insert(
             "quicktime.edit_list.presentation_status".into(),
-            MetadataValue::String(if empty_count == 0 {
-                "applied_single_normal_speed_media_segment".into()
-            } else {
-                "applied_leading_empty_edits_single_normal_speed_media_segment".into()
-            }),
+            MetadataValue::String(
+                match (has_leading_empty_edits, has_trailing_empty_edits) {
+                    (true, true) => {
+                        "applied_leading_and_trailing_empty_edits_single_normal_speed_media_segment"
+                    }
+                    (true, false) => {
+                        "applied_leading_empty_edits_single_normal_speed_media_segment"
+                    }
+                    (false, true) => {
+                        "applied_trailing_empty_edits_single_normal_speed_media_segment"
+                    }
+                    (false, false) => "applied_single_normal_speed_media_segment",
+                }
+                .into(),
+            ),
+        );
+        quicktime_insert_edit_list_pixel_order_diagnostic(
+            metadata,
+            "metadata_only_sample_table_order",
+            "edit-list timestamps and source mappings are recorded; open_bytes uses sample-table order and does not reorder or clip planes",
         );
         metadata.insert(
             "quicktime.edit_list.presentation_diagnostic".into(),
@@ -1145,46 +2225,185 @@ fn quicktime_edit_presentation_times(
             "quicktime.edit_list.presentation_offset_ticks".into(),
             MetadataValue::Int(offset),
         );
-        return sample_media_times
+        quicktime_insert_u64_list_metadata(
+            metadata,
+            "quicktime.edit_list.sample_source_media_time_ticks",
+            sample_media_times,
+        );
+        let segment_indices = vec![0; sample_media_times.len()];
+        quicktime_insert_u32_list_metadata(
+            metadata,
+            "quicktime.edit_list.sample_media_segment_index",
+            &segment_indices,
+        );
+        let presentation_times = sample_media_times
             .iter()
             .map(|time| i64::try_from(*time).ok()?.checked_add(offset))
-            .collect();
+            .collect::<Option<Vec<_>>>()?;
+        return Some(QuickTimeEditPresentationResult {
+            presentation_times,
+            sample_read_order: None,
+        });
     }
     match quicktime_multi_segment_presentation_times(
-        &media_segments,
-        empty_media_ticks,
+        entries,
         sample_media_times,
         media_duration_ticks,
         media_timescale,
         movie_timescale,
     ) {
-        Ok(times) => {
+        Ok(edit_map) => {
+            let clipped = edit_map.sample_indices.len() != sample_media_times.len();
+            let has_internal_empty_edits = first_internal_empty_segment_index.is_some();
             metadata.insert(
                 "quicktime.edit_list.presentation_status".into(),
-                MetadataValue::String(if empty_count == 0 {
-                    "applied_multiple_normal_speed_media_segments".into()
+                MetadataValue::String(if clipped {
+                    if has_internal_empty_edits {
+                        "applied_internal_empty_edits_clipped_normal_speed_media_segments"
+                    } else {
+                        match (has_leading_empty_edits, has_trailing_empty_edits) {
+                            (true, true) => {
+                                "applied_leading_and_trailing_empty_edits_clipped_normal_speed_media_segments"
+                            }
+                            (true, false) => {
+                                "applied_leading_empty_edits_clipped_normal_speed_media_segments"
+                            }
+                            (false, true) => {
+                                "applied_trailing_empty_edits_clipped_normal_speed_media_segments"
+                            }
+                            (false, false) => "applied_clipped_normal_speed_media_segments",
+                        }
+                    }
+                } else if has_leading_empty_edits && has_trailing_empty_edits {
+                    "applied_leading_and_trailing_empty_edits_multiple_normal_speed_media_segments"
+                } else if has_internal_empty_edits {
+                    "applied_internal_empty_edits_multiple_normal_speed_media_segments"
+                } else if has_leading_empty_edits {
+                    "applied_leading_empty_edits_multiple_normal_speed_media_segments"
+                } else if has_trailing_empty_edits {
+                    "applied_trailing_empty_edits_multiple_normal_speed_media_segments"
                 } else {
-                    "applied_leading_empty_edits_multiple_normal_speed_media_segments".into()
-                }),
+                    "applied_multiple_normal_speed_media_segments"
+                }
+                .into()),
+            );
+            quicktime_insert_edit_list_pixel_order_diagnostic(
+                metadata,
+                if clipped {
+                    "clipped_sample_aligned_normal_speed"
+                } else {
+                    "reordered_sample_aligned_normal_speed"
+                },
+                if has_internal_empty_edits {
+                    "open_bytes uses edit-list presentation order for sample-aligned normal-speed media segments and skips empty edits"
+                } else if clipped {
+                    "open_bytes clips to edit-list presentation samples for sample-aligned normal-speed media segments"
+                } else {
+                    "open_bytes uses edit-list presentation order for complete sample-aligned normal-speed media segments"
+                },
             );
             metadata.insert(
                 "quicktime.edit_list.presentation_diagnostic".into(),
                 MetadataValue::String(format!(
-                    "{} media segments applied at normal speed with sample-aligned boundaries",
-                    media_segments.len()
+                    "{} media segments applied at normal speed with sample-aligned boundaries{}{}",
+                    media_segments.len(),
+                    if has_internal_empty_edits {
+                        " and internal empty edits"
+                    } else {
+                        ""
+                    },
+                    if clipped {
+                        " and clipped sample range"
+                    } else {
+                        ""
+                    }
                 )),
             );
-            Some(times)
+            quicktime_insert_u64_list_metadata(
+                metadata,
+                "quicktime.edit_list.sample_source_media_time_ticks",
+                &edit_map.media_times,
+            );
+            quicktime_insert_u32_list_metadata(
+                metadata,
+                "quicktime.edit_list.sample_media_segment_index",
+                &edit_map.segment_indices,
+            );
+            let sample_read_positions =
+                quicktime_sample_read_order_from_presentation_times(&edit_map.presentation_times)?;
+            let sample_read_order = sample_read_positions
+                .iter()
+                .map(|&position| edit_map.sample_indices.get(position).copied())
+                .collect::<Option<Vec<_>>>()?;
+            let sample_read_order_u32 = sample_read_order
+                .iter()
+                .copied()
+                .map(u32::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()?;
+            quicktime_insert_u32_list_metadata(
+                metadata,
+                "quicktime.edit_list.sample_read_order",
+                &sample_read_order_u32,
+            );
+            if clipped {
+                let source_indices = edit_map
+                    .sample_indices
+                    .iter()
+                    .copied()
+                    .map(u32::try_from)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .ok()?;
+                quicktime_insert_u32_list_metadata(
+                    metadata,
+                    "quicktime.edit_list.clipped_sample_indices",
+                    &source_indices,
+                );
+                quicktime_insert_clipped_sample_range_metadata(
+                    metadata,
+                    &edit_map.sample_indices,
+                    sample_media_times,
+                    media_duration_ticks,
+                )?;
+            }
+            Some(QuickTimeEditPresentationResult {
+                presentation_times: edit_map.presentation_times,
+                sample_read_order: Some(sample_read_order),
+            })
         }
         Err(diagnostic) => {
             metadata.insert(
                 "quicktime.edit_list.presentation_status".into(),
                 MetadataValue::String("not_applied_complex_edit_list".into()),
             );
+            quicktime_insert_edit_list_pixel_order_diagnostic(
+                metadata,
+                "not_reordered_complex_edit_list",
+                "edit-list pixel-plane reordering is not applied for non-sample-aligned, gapped, overlapping, or clipped media segments",
+            );
             metadata.insert(
                 "quicktime.edit_list.presentation_diagnostic".into(),
-                MetadataValue::String(format!("multiple media segments not applied: {diagnostic}")),
+                MetadataValue::String(format!(
+                    "multiple media segments not applied: {}",
+                    diagnostic.message
+                )),
             );
+            metadata.insert(
+                "quicktime.edit_list.unsupported_reason".into(),
+                MetadataValue::String(diagnostic.reason.into()),
+            );
+            if let Some(segment_index) = diagnostic.segment_index {
+                metadata.insert(
+                    "quicktime.edit_list.first_problem_segment_index".into(),
+                    MetadataValue::Int(segment_index as i64),
+                );
+            }
+            if let Some(sample_index) = diagnostic.sample_index {
+                metadata.insert(
+                    "quicktime.edit_list.first_problem_sample_index".into(),
+                    MetadataValue::Int(sample_index as i64),
+                );
+            }
             None
         }
     }
@@ -1286,8 +2505,22 @@ fn parse_quicktime_track(
     video_track_count: usize,
     video_track_index: usize,
 ) -> Result<QuickTimeParsed> {
-    let stco = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stco"])?
-        .ok_or_else(|| BioFormatsError::UnsupportedFormat("QuickTime missing stco atom".into()))?;
+    let stco = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stco"])?;
+    let co64 = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"co64"])?;
+    let (chunk_offsets_atom, chunk_offset_table_type) = match (stco, co64) {
+        (Some(stco), None) => (stco, "stco"),
+        (None, Some(co64)) => (co64, "co64"),
+        (Some(_), Some(_)) => {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime track contains both stco and co64 chunk offset tables".into(),
+            ))
+        }
+        (None, None) => {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime missing stco/co64 atom".into(),
+            ))
+        }
+    };
     if stsd.data.len() < 44 || be_u32_at(stsd.data, 4) != Some(1) {
         return Err(BioFormatsError::UnsupportedFormat(
             "QuickTime stsd must contain exactly one video sample description".into(),
@@ -1310,6 +2543,7 @@ fn parse_quicktime_track(
         QuickTimeCodec::UncompressedRgb => 3usize,
         QuickTimeCodec::UncompressedGray => 1usize,
         QuickTimeCodec::Jpeg | QuickTimeCodec::Png => 3usize,
+        QuickTimeCodec::Rpza | QuickTimeCodec::AnimationRle { .. } => 3usize,
         QuickTimeCodec::Cinepak { depth: 8 } => 1usize,
         QuickTimeCodec::Cinepak { .. } => 3usize,
     };
@@ -1339,19 +2573,36 @@ fn parse_quicktime_track(
         ));
     }
 
-    if stco.data.len() < 8 {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime stco atom is truncated".into(),
-        ));
+    if chunk_offsets_atom.data.len() < 8 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime {chunk_offset_table_type} atom is truncated"
+        )));
     }
-    let chunk_count = be_u32_at(stco.data, 4).unwrap() as usize;
-    if chunk_count != sample_sizes.len() || stco.data.len() < 8 + chunk_count * 4 {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime blind parser requires one chunk offset per sample".into(),
-        ));
+    let chunk_count = be_u32_at(chunk_offsets_atom.data, 4).unwrap() as usize;
+    let offset_entry_size = if chunk_offset_table_type == "co64" {
+        8usize
+    } else {
+        4usize
+    };
+    if chunk_count != sample_sizes.len()
+        || chunk_offsets_atom.data.len() < 8 + chunk_count * offset_entry_size
+    {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime blind parser requires one {chunk_offset_table_type} chunk offset per sample"
+        )));
     }
     let sample_offsets: Vec<u64> = (0..chunk_count)
-        .map(|i| be_u32_at(stco.data, 8 + i * 4).unwrap() as u64)
+        .map(|i| {
+            let base = 8 + i * offset_entry_size;
+            if chunk_offset_table_type == "co64" {
+                let bytes = chunk_offsets_atom.data.get(base..base + 8).unwrap();
+                u64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ])
+            } else {
+                be_u32_at(chunk_offsets_atom.data, base).unwrap() as u64
+            }
+        })
         .collect();
     for (offset, size) in sample_offsets.iter().zip(&sample_sizes) {
         let end = offset
@@ -1431,6 +2682,54 @@ fn parse_quicktime_track(
             };
             decode_quicktime_cinepak_sample(first_sample, &probe_meta, 0, depth, None)?;
         }
+        QuickTimeCodec::Rpza => {
+            let probe_meta = ImageMetadata {
+                size_x: width,
+                size_y: height,
+                size_z: 1,
+                size_c: 3,
+                size_t: sample_sizes.len() as u32,
+                pixel_type: PixelType::Uint8,
+                bits_per_pixel: 8,
+                image_count: sample_sizes.len() as u32,
+                dimension_order: DimensionOrder::XYZCT,
+                is_rgb: true,
+                is_interleaved: true,
+                is_indexed: false,
+                is_little_endian: false,
+                resolution_count: 1,
+                series_metadata: HashMap::new(),
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            };
+            decode_quicktime_rpza_sample(first_sample, &probe_meta, 0)?;
+        }
+        QuickTimeCodec::AnimationRle { depth } => {
+            let probe_meta = ImageMetadata {
+                size_x: width,
+                size_y: height,
+                size_z: 1,
+                size_c: 3,
+                size_t: sample_sizes.len() as u32,
+                pixel_type: PixelType::Uint8,
+                bits_per_pixel: 8,
+                image_count: sample_sizes.len() as u32,
+                dimension_order: DimensionOrder::XYZCT,
+                is_rgb: true,
+                is_interleaved: true,
+                is_indexed: false,
+                is_little_endian: false,
+                resolution_count: 1,
+                series_metadata: HashMap::new(),
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            };
+            decode_quicktime_rle_sample(first_sample, &probe_meta, 0, depth, None)?;
+        }
         _ => {}
     }
 
@@ -1457,9 +2756,22 @@ fn parse_quicktime_track(
         "quicktime.sample_count",
         sample_sizes.len() as u64,
     );
+    quicktime_insert_u32_list_metadata(&mut metadata, "quicktime.sample_sizes", &sample_sizes);
+    quicktime_insert_u64_list_metadata(&mut metadata, "quicktime.chunk_offsets", &sample_offsets);
+    quicktime_insert_u64_list_metadata(&mut metadata, "quicktime.sample_offsets", &sample_offsets);
+    metadata.insert(
+        "quicktime.chunk_offset_table_type".into(),
+        MetadataValue::String(chunk_offset_table_type.into()),
+    );
     if let QuickTimeCodec::Cinepak { depth } = qt_codec {
         metadata.insert(
             "quicktime.cinepak.depth".into(),
+            MetadataValue::Int(depth as i64),
+        );
+    }
+    if let QuickTimeCodec::AnimationRle { depth } = qt_codec {
+        metadata.insert(
+            "quicktime.rle.depth".into(),
             MetadataValue::Int(depth as i64),
         );
     }
@@ -1468,6 +2780,12 @@ fn parse_quicktime_track(
         .transpose()?;
     let stts_entries = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stts"])?
         .map(|atom| parse_quicktime_stts(atom, sample_sizes.len()))
+        .transpose()?;
+    let stsc_entries = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stsc"])?
+        .map(parse_quicktime_stsc)
+        .transpose()?;
+    let ctts_entries = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"ctts"])?
+        .map(|atom| parse_quicktime_ctts(atom, sample_sizes.len()))
         .transpose()?;
     let edit_entries = descendant(trak, &[*b"edts", *b"elst"])?
         .map(parse_quicktime_elst)
@@ -1490,14 +2808,36 @@ fn parse_quicktime_track(
         );
         quicktime_insert_u64_metadata(&mut metadata, "quicktime.movie_duration_ticks", duration);
     }
+    let mut sample_read_order = None;
     if let Some(entries) = &stts_entries {
+        metadata.insert(
+            "quicktime.stts.entries".into(),
+            MetadataValue::String(
+                entries
+                    .iter()
+                    .map(|entry| format!("{}x{}", entry.sample_count, entry.sample_delta))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        );
+        if let Some(duration) = quicktime_stts_total_duration(entries) {
+            quicktime_insert_u64_metadata(&mut metadata, "quicktime.stts.duration_ticks", duration);
+            if let Some((timescale, _)) = media_header {
+                metadata.insert(
+                    "quicktime.average_frame_duration_seconds".into(),
+                    MetadataValue::Float(
+                        duration as f64 / f64::from(timescale) / sample_sizes.len() as f64,
+                    ),
+                );
+            }
+        }
         if let Some(sample_media_times) = quicktime_sample_media_times(entries) {
             quicktime_insert_u64_list_metadata(
                 &mut metadata,
                 "quicktime.sample_media_time_ticks",
                 &sample_media_times,
             );
-            let sample_presentation_times = if let Some(edit_entries) = &edit_entries {
+            let sample_presentation_result = if let Some(edit_entries) = &edit_entries {
                 quicktime_edit_presentation_times(
                     edit_entries,
                     media_header.map(|(timescale, _)| timescale),
@@ -1511,8 +2851,66 @@ fn parse_quicktime_track(
                     .iter()
                     .map(|time| i64::try_from(*time).ok())
                     .collect::<Option<Vec<_>>>()
+                    .map(|presentation_times| QuickTimeEditPresentationResult {
+                        presentation_times,
+                        sample_read_order: None,
+                    })
             };
-            if let Some(sample_presentation_times) = sample_presentation_times {
+            if let Some(sample_presentation_result) = sample_presentation_result {
+                if sample_read_order.is_none() {
+                    sample_read_order = sample_presentation_result.sample_read_order;
+                }
+                let sample_presentation_times = sample_presentation_result.presentation_times;
+                let sample_presentation_times = if let Some(ctts_entries) = &ctts_entries {
+                    if let Some(composition_offsets) =
+                        quicktime_sample_composition_offsets(ctts_entries)
+                    {
+                        metadata.insert(
+                            "quicktime.ctts.entries".into(),
+                            MetadataValue::String(
+                                ctts_entries
+                                    .iter()
+                                    .map(|entry| {
+                                        format!("{}x{}", entry.sample_count, entry.sample_offset)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            ),
+                        );
+                        quicktime_insert_i64_list_metadata(
+                            &mut metadata,
+                            "quicktime.sample_composition_offset_ticks",
+                            &composition_offsets,
+                        );
+                        match quicktime_apply_composition_offsets(
+                            &sample_presentation_times,
+                            &composition_offsets,
+                        ) {
+                            Some(times) => {
+                                metadata.insert(
+                                    "quicktime.ctts.presentation_status".into(),
+                                    MetadataValue::String("applied".into()),
+                                );
+                                times
+                            }
+                            None => {
+                                metadata.insert(
+                                    "quicktime.ctts.presentation_status".into(),
+                                    MetadataValue::String("not_applied_overflow".into()),
+                                );
+                                sample_presentation_times
+                            }
+                        }
+                    } else {
+                        metadata.insert(
+                            "quicktime.ctts.presentation_status".into(),
+                            MetadataValue::String("not_applied_overflow".into()),
+                        );
+                        sample_presentation_times
+                    }
+                } else {
+                    sample_presentation_times
+                };
                 quicktime_insert_i64_list_metadata(
                     &mut metadata,
                     "quicktime.sample_presentation_time_ticks",
@@ -1534,16 +2932,58 @@ fn parse_quicktime_track(
             "quicktime.edit_list.count".into(),
             MetadataValue::Int(entries.len() as i64),
         );
+        metadata.insert(
+            "quicktime.edit_list.entries".into(),
+            MetadataValue::String(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "duration={},media_time={},rate={}",
+                            entry.segment_duration, entry.media_time, entry.media_rate
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            ),
+        );
     }
+    if let Some(entries) = &stsc_entries {
+        metadata.insert(
+            "quicktime.stsc.entry_count".into(),
+            MetadataValue::Int(entries.len() as i64),
+        );
+        metadata.insert(
+            "quicktime.stsc.entries".into(),
+            MetadataValue::String(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "first_chunk={},samples_per_chunk={},sample_description_index={}",
+                            entry.first_chunk,
+                            entry.samples_per_chunk,
+                            entry.sample_description_index
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            ),
+        );
+    }
+    let displayed_sample_count = sample_read_order
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or(sample_sizes.len());
     let meta = ImageMetadata {
         size_x: width,
         size_y: height,
         size_z: 1,
         size_c: samples_per_pixel as u32,
-        size_t: sample_sizes.len() as u32,
+        size_t: displayed_sample_count as u32,
         pixel_type,
         bits_per_pixel: 8,
-        image_count: sample_sizes.len() as u32,
+        image_count: displayed_sample_count as u32,
         dimension_order: DimensionOrder::XYZCT,
         is_rgb: samples_per_pixel >= 3,
         is_interleaved: samples_per_pixel > 1,
@@ -1560,6 +3000,7 @@ fn parse_quicktime_track(
         meta,
         sample_offsets,
         sample_sizes,
+        sample_read_order,
         samples_per_pixel,
         codec: qt_codec,
     })
@@ -3254,7 +4695,10 @@ impl FormatReader for MincReader {
 ///
 /// MAC_256 greyscale/colour planes are bit-inverted as in Java.
 ///
-/// NOT PORTED: richer OME stage/detector metadata is omitted.
+/// OME stage/detector object projection is intentionally limited to provenance:
+/// this bounded tag parser distinguishes the safe LIFF fields it inspected
+/// from fields that would be needed to construct stage or detector OME objects,
+/// so it does not invent stage coordinates or detector identities.
 const OPENLAB_LIFF_MAGIC: u64 = 0x0000_ffff_696d_7072;
 
 // Openlab image (volume) types.
@@ -3273,6 +4717,8 @@ const OL_DEEP_GREY_16: i32 = 16;
 const OL_IMAGE_TYPE_1: i32 = 67;
 const OL_IMAGE_TYPE_2: i32 = 68;
 const OL_CALIBRATION: i32 = 69;
+const OL_USER: i32 = 72;
+const OPENLAB_MAX_TAG_HEADERS: usize = 1024;
 
 fn parse_axis_token(token: &str, axis: char) -> Option<u32> {
     let mut chars = token.chars();
@@ -3283,14 +4729,41 @@ fn parse_axis_token(token: &str, axis: char) -> Option<u32> {
 }
 
 #[derive(Clone)]
+struct OpenlabTagHeader {
+    offset: usize,
+    tag: i32,
+    sub_tag: i32,
+    next_offset: i64,
+    format_code: String,
+}
+
+#[derive(Clone)]
 struct OpenlabPlane {
     plane_offset: usize,
+    tag: i32,
+    sub_tag: i32,
+    format_code: String,
     volume_type: i32,
     pict: bool,
     width: u32,
     height: u32,
     name: String,
     series: i32,
+}
+
+/// Accumulator for the `USER` / `CVariableList` global metadata Java reads via
+/// `readVariable`. Mirrors the instance fields `gain`, `detectorOffset`,
+/// `xPos`, `yPos`, `zPos` plus the `addGlobalMeta(name, value)` pairs.
+#[derive(Default)]
+struct OpenlabUserVars {
+    /// All `(name, value)` pairs Java emits via `addGlobalMeta`, in order
+    /// (including the synthesized "X/Y/Z position for position #1" keys).
+    metas: Vec<(String, String)>,
+    gain: Option<String>,
+    detector_offset: Option<String>,
+    x_pos: Option<String>,
+    y_pos: Option<String>,
+    z_pos: Option<String>,
 }
 
 pub struct OpenlabLiffReader {
@@ -3336,6 +4809,15 @@ impl OpenlabLiffReader {
             14 => "DEEP_GREY_14",
             15 => "DEEP_GREY_15",
             OL_DEEP_GREY_16 => "DEEP_GREY_16",
+            _ => "UNKNOWN",
+        }
+    }
+
+    fn tag_name(tag: i32) -> &'static str {
+        match tag {
+            OL_IMAGE_TYPE_1 => "IMAGE_TYPE_1",
+            OL_IMAGE_TYPE_2 => "IMAGE_TYPE_2",
+            OL_CALIBRATION => "CALIBRATION",
             _ => "UNKNOWN",
         }
     }
@@ -3391,6 +4873,66 @@ impl OpenlabLiffReader {
         (tag, sub_tag, next_tag, fmt)
     }
 
+    /// Read one `CVariableList` entry (Java `readVariable`). Decodes the
+    /// variable's class, value and name, records it via the same
+    /// `addGlobalMeta`/instance-field assignments Java performs, and stores the
+    /// results in `vars`. Returns `Err` on the same invalid-revision conditions
+    /// Java raises a `FormatException` for.
+    fn read_variable(c: &mut Cursor, vars: &mut OpenlabUserVars) -> Result<()> {
+        let class_name = c.read_cstring();
+
+        let name;
+        let mut value = String::new();
+
+        let derived_class_version = c.read();
+        if derived_class_version != 1 {
+            return Err(BioFormatsError::Format(
+                "Openlab LIFF: invalid revision".into(),
+            ));
+        }
+
+        if class_name == "CStringVariable" {
+            let str_size = c.read_int();
+            value = c.read_string(str_size.max(0) as usize);
+            c.skip(1);
+        } else if class_name == "CFloatVariable" {
+            value = c.read_double().to_string();
+        }
+
+        let base_class_version = c.read();
+        if base_class_version == 1 || base_class_version == 2 {
+            let str_size = c.read_int();
+            name = c.read_string(str_size.max(0) as usize);
+            c.skip((base_class_version as i64) * 2 + 1);
+        } else {
+            return Err(BioFormatsError::Format(format!(
+                "Openlab LIFF: invalid revision: {base_class_version}"
+            )));
+        }
+
+        vars.metas.push((name.clone(), value.clone()));
+
+        if name == "Gain" {
+            vars.gain = Some(value);
+        } else if name == "Offset" {
+            vars.detector_offset = Some(value);
+        } else if name == "X-Y Stage: X Position" {
+            vars.x_pos = Some(value.clone());
+            vars.metas
+                .push(("X position for position #1".into(), value));
+        } else if name == "X-Y Stage: Y Position" {
+            vars.y_pos = Some(value.clone());
+            vars.metas
+                .push(("Y position for position #1".into(), value));
+        } else if name == "ZPosition" {
+            vars.z_pos = Some(value.clone());
+            vars.metas
+                .push(("Z position for position #1".into(), value));
+        }
+
+        Ok(())
+    }
+
     fn parse(path: &Path) -> Result<OpenlabLiffReader> {
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let mut c = Cursor::new(&data, false); // big-endian
@@ -3411,10 +4953,13 @@ impl OpenlabLiffReader {
         c.seek(first_offset.max(0) as usize);
 
         let mut planes: Vec<OpenlabPlane> = Vec::new();
+        let mut tag_headers: Vec<OpenlabTagHeader> = Vec::new();
+        let mut tag_headers_truncated = false;
         // Representative planes: (width, height, volume_type).
         let mut reps: Vec<(u32, u32, i32)> = Vec::new();
         let mut xcal = 0.0f32;
         let mut ycal = 0.0f32;
+        let mut user_vars = OpenlabUserVars::default();
         let total = data.len();
 
         while c.fp() + 8 < total {
@@ -3434,10 +4979,10 @@ impl OpenlabLiffReader {
             if tag < OL_IMAGE_TYPE_1 || tag > 76 {
                 break; // could not resync
             }
-            let _ = sub_tag;
 
             if tag == OL_IMAGE_TYPE_1 || tag == OL_IMAGE_TYPE_2 {
-                let pict = fmt.to_lowercase() == "pict";
+                let format_code = fmt.trim_matches('\0').trim().to_string();
+                let pict = format_code.eq_ignore_ascii_case("pict");
                 c.skip(24);
                 let volume_type = c.read_short() as i32;
                 c.skip(16);
@@ -3476,6 +5021,9 @@ impl OpenlabLiffReader {
 
                 planes.push(OpenlabPlane {
                     plane_offset,
+                    tag,
+                    sub_tag,
+                    format_code,
                     volume_type,
                     pict,
                     width,
@@ -3483,13 +5031,43 @@ impl OpenlabLiffReader {
                     name,
                     series,
                 });
-            } else if tag == OL_CALIBRATION {
-                c.skip(4);
-                let units = c.read_short() as i32;
-                let scaling = if units == 3 { 0.001f32 } else { 1.0f32 };
-                c.skip(12);
-                xcal = c.read_float() * scaling;
-                ycal = c.read_float() * scaling;
+            } else {
+                if tag_headers.len() < OPENLAB_MAX_TAG_HEADERS {
+                    tag_headers.push(OpenlabTagHeader {
+                        offset: fp.max(0) as usize,
+                        tag,
+                        sub_tag,
+                        next_offset: next_tag,
+                        format_code: fmt.trim_matches('\0').trim().to_string(),
+                    });
+                } else {
+                    tag_headers_truncated = true;
+                }
+                if tag == OL_CALIBRATION {
+                    c.skip(4);
+                    let units = c.read_short() as i32;
+                    let scaling = if units == 3 { 0.001f32 } else { 1.0f32 };
+                    c.skip(12);
+                    xcal = c.read_float() * scaling;
+                    ycal = c.read_float() * scaling;
+                } else if tag == OL_USER {
+                    let class_name = c.read_cstring();
+                    if class_name == "CVariableList" {
+                        let check = c.read() as i8;
+                        if check == 1 {
+                            let num_vars = c.read_short() as i32;
+                            for _ in 0..num_vars {
+                                // Mirror Java: a malformed variable aborts the
+                                // CVariableList (Java throws out of initFile);
+                                // here we stop reading further variables but
+                                // keep whatever was parsed and continue.
+                                if Self::read_variable(&mut c, &mut user_vars).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if next_tag <= fp || next_tag as usize > total {
@@ -3515,6 +5093,10 @@ impl OpenlabLiffReader {
                 plane_offsets[p.series as usize].push(q);
             }
         }
+
+        let has_stage =
+            user_vars.x_pos.is_some() || user_vars.y_pos.is_some() || user_vars.z_pos.is_some();
+        let has_detector = user_vars.gain.is_some() || user_vars.detector_offset.is_some();
 
         let mut metas = Vec::with_capacity(n_series);
         let mut plane_zct = Vec::with_capacity(n_series);
@@ -3595,6 +5177,167 @@ impl OpenlabLiffReader {
                     "raw".into()
                 }),
             );
+            // Combined stage+detector projection status (legacy key). Only the
+            // CVariableList branch can supply explicit stage/detector fields; if
+            // none were read it is faithful to report no safe LIFF fields.
+            meta.series_metadata.insert(
+                "openlab.ome.stage_detector_projection".into(),
+                MetadataValue::String(
+                    if has_stage || has_detector {
+                        "projected_from_cvariablelist_stage_detector_fields"
+                    } else {
+                        "not_projected_no_safe_liff_fields"
+                    }
+                    .into(),
+                ),
+            );
+            meta.series_metadata.insert(
+                "openlab.ome.stage_detector_projection.source_fields".into(),
+                MetadataValue::String(
+                    "plane tag/sub_tag/format/name/offset; non-image tag headers; calibration physical_size_x/y; CVariableList stage/detector variables"
+                        .into(),
+                ),
+            );
+            // Stage X/Y/Z projection (Java sets PlanePositionX/Y/Z).
+            meta.series_metadata.insert(
+                "openlab.ome.stage_projection".into(),
+                MetadataValue::String(
+                    if has_stage {
+                        "projected_from_cvariablelist_stage_positions"
+                    } else {
+                        "not_projected_no_explicit_stage_coordinates"
+                    }
+                    .into(),
+                ),
+            );
+            meta.series_metadata.insert(
+                "openlab.ome.stage_projection.inspected_fields".into(),
+                MetadataValue::String(
+                    if has_stage {
+                        "CVariableList variables 'X-Y Stage: X Position', 'X-Y Stage: Y Position', 'ZPosition'"
+                    } else {
+                        "plane names may encode image/Z/C/T labels; calibration stores physical pixel size only"
+                    }
+                    .into(),
+                ),
+            );
+            meta.series_metadata.insert(
+                "openlab.ome.stage_projection.reason".into(),
+                MetadataValue::String(
+                    if has_stage {
+                        "explicit stage X/Y/Z coordinates were read from the CVariableList USER tag and projected to PlanePositionX/Y/Z"
+                    } else {
+                        "no parsed LIFF field contains explicit stage X/Y/Z coordinates; plane names are only used for image/Z/C/T indexing and calibration values are pixel sizes"
+                    }
+                    .into(),
+                ),
+            );
+            // Detector gain/offset projection (Java sets DetectorSettingsGain/Offset
+            // on a Detector of type "Other").
+            meta.series_metadata.insert(
+                "openlab.ome.detector_projection".into(),
+                MetadataValue::String(
+                    if has_detector {
+                        "projected_from_cvariablelist_gain_offset"
+                    } else {
+                        "not_projected_no_explicit_detector_fields"
+                    }
+                    .into(),
+                ),
+            );
+            meta.series_metadata.insert(
+                "openlab.ome.detector_projection.inspected_fields".into(),
+                MetadataValue::String(
+                    if has_detector {
+                        "CVariableList variables 'Gain', 'Offset'; detector type set to 'Other'"
+                    } else {
+                        "volume_type and pixel_payload describe pixel storage, not detector identity"
+                    }
+                    .into(),
+                ),
+            );
+            meta.series_metadata.insert(
+                "openlab.ome.detector_projection.reason".into(),
+                MetadataValue::String(
+                    if has_detector {
+                        "Gain and/or Offset were read from the CVariableList USER tag and projected to DetectorSettings on a Detector of type 'Other'"
+                    } else {
+                        "no parsed LIFF field contains detector model, type, gain, offset, or channel light-path identity; volume_type, pixel_payload, and tag format are storage descriptors"
+                    }
+                    .into(),
+                ),
+            );
+            for (plane_index, &plane_idx) in list.iter().enumerate() {
+                let plane = &planes[plane_idx];
+                meta.series_metadata.insert(
+                    format!("openlab.plane.{plane_index}.tag"),
+                    MetadataValue::Int(plane.tag as i64),
+                );
+                meta.series_metadata.insert(
+                    format!("openlab.plane.{plane_index}.tag_name"),
+                    MetadataValue::String(Self::tag_name(plane.tag).into()),
+                );
+                meta.series_metadata.insert(
+                    format!("openlab.plane.{plane_index}.sub_tag"),
+                    MetadataValue::Int(plane.sub_tag as i64),
+                );
+                if !plane.format_code.is_empty() {
+                    meta.series_metadata.insert(
+                        format!("openlab.plane.{plane_index}.format"),
+                        MetadataValue::String(plane.format_code.clone()),
+                    );
+                }
+                if !plane.name.is_empty() {
+                    meta.series_metadata.insert(
+                        format!("openlab.plane.{plane_index}.name"),
+                        MetadataValue::String(plane.name.clone()),
+                    );
+                }
+                meta.series_metadata.insert(
+                    format!("openlab.plane.{plane_index}.offset"),
+                    MetadataValue::Int(plane.plane_offset as i64),
+                );
+            }
+            if !tag_headers.is_empty() {
+                meta.series_metadata.insert(
+                    "openlab.tag_header.count".into(),
+                    MetadataValue::Int(tag_headers.len() as i64),
+                );
+            }
+            if tag_headers_truncated {
+                meta.series_metadata.insert(
+                    "openlab.tag_header.truncated".into(),
+                    MetadataValue::Bool(true),
+                );
+            }
+            for (tag_index, header) in tag_headers.iter().enumerate() {
+                meta.series_metadata.insert(
+                    format!("openlab.tag_header.{tag_index}.tag"),
+                    MetadataValue::Int(header.tag as i64),
+                );
+                meta.series_metadata.insert(
+                    format!("openlab.tag_header.{tag_index}.tag_name"),
+                    MetadataValue::String(Self::tag_name(header.tag).into()),
+                );
+                meta.series_metadata.insert(
+                    format!("openlab.tag_header.{tag_index}.sub_tag"),
+                    MetadataValue::Int(header.sub_tag as i64),
+                );
+                if !header.format_code.is_empty() {
+                    meta.series_metadata.insert(
+                        format!("openlab.tag_header.{tag_index}.format"),
+                        MetadataValue::String(header.format_code.clone()),
+                    );
+                }
+                meta.series_metadata.insert(
+                    format!("openlab.tag_header.{tag_index}.offset"),
+                    MetadataValue::Int(header.offset as i64),
+                );
+                meta.series_metadata.insert(
+                    format!("openlab.tag_header.{tag_index}.next_offset"),
+                    MetadataValue::Int(header.next_offset),
+                );
+            }
             if i == 0 {
                 if xcal != 0.0 {
                     meta.series_metadata.insert(
@@ -3606,6 +5349,45 @@ impl OpenlabLiffReader {
                     meta.series_metadata.insert(
                         "openlab.physical_size_y".into(),
                         MetadataValue::Float(ycal as f64),
+                    );
+                }
+                // CVariableList global metadata (Java `addGlobalMeta` pairs from
+                // `readVariable`). Stored under the exact Java key names.
+                for (name, value) in &user_vars.metas {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    meta.series_metadata
+                        .insert(name.clone(), MetadataValue::String(value.clone()));
+                }
+                // Typed accessors for the OME stage/detector projection. Mirror
+                // Java's `gain`, `detectorOffset`, `xPos`, `yPos`, `zPos` fields.
+                if let Some(g) = &user_vars.gain {
+                    meta.series_metadata
+                        .insert("openlab.gain".into(), MetadataValue::String(g.clone()));
+                }
+                if let Some(o) = &user_vars.detector_offset {
+                    meta.series_metadata.insert(
+                        "openlab.detector_offset".into(),
+                        MetadataValue::String(o.clone()),
+                    );
+                }
+                if let Some(x) = &user_vars.x_pos {
+                    meta.series_metadata.insert(
+                        "openlab.stage_position_x".into(),
+                        MetadataValue::String(x.clone()),
+                    );
+                }
+                if let Some(y) = &user_vars.y_pos {
+                    meta.series_metadata.insert(
+                        "openlab.stage_position_y".into(),
+                        MetadataValue::String(y.clone()),
+                    );
+                }
+                if let Some(z) = &user_vars.z_pos {
+                    meta.series_metadata.insert(
+                        "openlab.stage_position_z".into(),
+                        MetadataValue::String(z.clone()),
                     );
                 }
             }
@@ -3624,6 +5406,20 @@ impl OpenlabLiffReader {
                     "openlab.image_name_zct_inference".into(),
                     MetadataValue::Bool(true),
                 );
+                for (plane_index, &(z, c, t)) in coords.iter().enumerate() {
+                    meta.series_metadata.insert(
+                        format!("openlab.plane.{plane_index}.the_z"),
+                        MetadataValue::Int(z as i64),
+                    );
+                    meta.series_metadata.insert(
+                        format!("openlab.plane.{plane_index}.the_c"),
+                        MetadataValue::Int(c as i64),
+                    );
+                    meta.series_metadata.insert(
+                        format!("openlab.plane.{plane_index}.the_t"),
+                        MetadataValue::Int(t as i64),
+                    );
+                }
                 plane_zct.push(Some(coords));
             } else {
                 plane_zct.push(None);
@@ -3834,10 +5630,50 @@ impl FormatReader for OpenlabLiffReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::ome_metadata::{create_lsid, OmeMetadata, OmePlane, OmePlate};
+        use crate::common::ome_metadata::{
+            create_lsid, OmeDetector, OmeInstrument, OmeMetadata, OmePlane, OmePlate,
+        };
 
         let meta = self.metas.get(self.current)?;
+        // Stage/detector global metadata is parsed once and stored on series 0
+        // (Java keeps it on the single global MetadataStore). Read it from
+        // there regardless of the current series so the projection is stable.
+        let global = self.metas.first().unwrap_or(meta);
+        let read_pos = |key: &str| -> Option<f64> {
+            match global.series_metadata.get(key) {
+                Some(MetadataValue::String(s)) => s.trim().parse::<f64>().ok(),
+                _ => None,
+            }
+        };
+        let gain = read_pos("openlab.gain");
+        let detector_offset = read_pos("openlab.detector_offset");
+        let stage_x = read_pos("openlab.stage_position_x");
+        let stage_y = read_pos("openlab.stage_position_y");
+        let stage_z = read_pos("openlab.stage_position_z");
+
         let mut ome = OmeMetadata::from_image_metadata(meta);
+
+        // Detector projection (Java: Instrument + Detector type "Other" +
+        // DetectorSettings gain/offset). We attach gain/offset to the single
+        // detector with type "Other".
+        if gain.is_some() || detector_offset.is_some() {
+            let instrument_index = ome.instruments.len();
+            ome.instruments.push(OmeInstrument {
+                id: Some(create_lsid("Instrument", &[0])),
+                detectors: vec![OmeDetector {
+                    id: Some(create_lsid("Detector", &[0, 0])),
+                    detector_type: Some("Other".into()),
+                    gain,
+                    offset: detector_offset,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            if let Some(image) = ome.images.get_mut(0) {
+                image.instrument_ref = Some(instrument_index);
+            }
+        }
+
         if let Some(image) = ome.images.get_mut(0) {
             if let Some(MetadataValue::String(name)) =
                 meta.series_metadata.get("openlab.image_name")
@@ -3864,6 +5700,19 @@ impl FormatReader for OpenlabLiffReader {
                         ..Default::default()
                     })
                     .collect();
+            }
+            // Stage-position projection (Java sets PlanePositionX/Y/Z on every
+            // plane of every series). If no per-plane Z/C/T were inferred, emit
+            // one plane carrying the positions so they are not lost.
+            if stage_x.is_some() || stage_y.is_some() || stage_z.is_some() {
+                if image.planes.is_empty() {
+                    image.planes.push(OmePlane::default());
+                }
+                for plane in image.planes.iter_mut() {
+                    plane.position_x = stage_x;
+                    plane.position_y = stage_y;
+                    plane.position_z = stage_z;
+                }
             }
         }
 
@@ -4411,5 +6260,92 @@ impl FormatReader for TextReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod openlab_user_var_tests {
+    use super::*;
+
+    /// Encode a single `CStringVariable` entry in the big-endian layout
+    /// `OpenlabLiffReader::read_variable` expects.
+    fn encode_string_var(class: &str, value: &str, name: &str, base_class_version: u8) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(class.as_bytes());
+        b.push(0); // className NUL terminator
+        b.push(1); // derivedClassVersion
+        b.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        b.extend_from_slice(value.as_bytes());
+        b.push(0); // skipBytes(1)
+        b.push(base_class_version);
+        b.extend_from_slice(&(name.len() as i32).to_be_bytes());
+        b.extend_from_slice(name.as_bytes());
+        // skipBytes(baseClassVersion * 2 + 1)
+        b.extend(std::iter::repeat(0u8).take(base_class_version as usize * 2 + 1));
+        b
+    }
+
+    /// Encode a single `CFloatVariable` entry.
+    fn encode_float_var(value: f64, name: &str, base_class_version: u8) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"CFloatVariable");
+        b.push(0);
+        b.push(1); // derivedClassVersion
+        b.extend_from_slice(&value.to_be_bytes());
+        b.push(base_class_version);
+        b.extend_from_slice(&(name.len() as i32).to_be_bytes());
+        b.extend_from_slice(name.as_bytes());
+        b.extend(std::iter::repeat(0u8).take(base_class_version as usize * 2 + 1));
+        b
+    }
+
+    #[test]
+    fn read_variable_captures_stage_and_detector_fields() {
+        // X-Y stage X position (string) -> xPos + synthesized position key.
+        let bytes = encode_string_var("CStringVariable", "123.5", "X-Y Stage: X Position", 1);
+        let mut c = Cursor::new(&bytes, false);
+        let mut vars = OpenlabUserVars::default();
+        OpenlabLiffReader::read_variable(&mut c, &mut vars).unwrap();
+        assert_eq!(vars.x_pos.as_deref(), Some("123.5"));
+        // The raw variable plus the synthesized "position #1" key are both emitted.
+        assert!(vars
+            .metas
+            .iter()
+            .any(|(n, v)| n == "X-Y Stage: X Position" && v == "123.5"));
+        assert!(vars
+            .metas
+            .iter()
+            .any(|(n, v)| n == "X position for position #1" && v == "123.5"));
+
+        // Gain (float) -> detector gain.
+        let bytes = encode_float_var(2.0, "Gain", 1);
+        let mut c = Cursor::new(&bytes, false);
+        let mut vars = OpenlabUserVars::default();
+        OpenlabLiffReader::read_variable(&mut c, &mut vars).unwrap();
+        assert_eq!(vars.gain.as_deref(), Some("2"));
+        assert!(vars.metas.iter().any(|(n, _)| n == "Gain"));
+
+        // ZPosition (string) -> zPos + synthesized key.
+        let bytes = encode_string_var("CStringVariable", "7", "ZPosition", 2);
+        let mut c = Cursor::new(&bytes, false);
+        let mut vars = OpenlabUserVars::default();
+        OpenlabLiffReader::read_variable(&mut c, &mut vars).unwrap();
+        assert_eq!(vars.z_pos.as_deref(), Some("7"));
+        assert!(vars
+            .metas
+            .iter()
+            .any(|(n, v)| n == "Z position for position #1" && v == "7"));
+    }
+
+    #[test]
+    fn read_variable_rejects_invalid_revision() {
+        // derivedClassVersion != 1 must error.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"CStringVariable");
+        b.push(0);
+        b.push(2); // invalid derivedClassVersion
+        let mut c = Cursor::new(&b, false);
+        let mut vars = OpenlabUserVars::default();
+        assert!(OpenlabLiffReader::read_variable(&mut c, &mut vars).is_err());
     }
 }

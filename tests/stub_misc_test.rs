@@ -443,6 +443,27 @@ fn openlab_v2_infers_zct_and_ome_names_from_plane_names() {
             .as_deref(),
         Some("Plate42 WellA01")
     );
+    assert_eq!(
+        meta.series_metadata
+            .get("openlab.plane.0.name")
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("Plate42 WellA01 Z1 C1 T1")
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("openlab.plane.1.the_c")
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("openlab.plane.2.the_t")
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("1")
+    );
 
     let ome = reader.ome_metadata().expect("Openlab OME metadata");
     assert_eq!(ome.images[0].name.as_deref(), Some("Plate42 WellA01"));
@@ -481,6 +502,89 @@ fn openlab_v2_ome_annotations_include_native_series_metadata() {
     match meta.series_metadata.get("openlab.pixel_payload") {
         Some(MetadataValue::String(value)) if value == "raw" => {}
         other => panic!("unexpected openlab.pixel_payload: {other:?}"),
+    }
+    match meta
+        .series_metadata
+        .get("openlab.ome.stage_detector_projection")
+    {
+        Some(MetadataValue::String(value)) if value == "not_projected_no_safe_liff_fields" => {}
+        other => panic!("unexpected openlab.ome.stage_detector_projection: {other:?}"),
+    }
+    match meta
+        .series_metadata
+        .get("openlab.ome.stage_detector_projection.source_fields")
+    {
+        Some(MetadataValue::String(value))
+            if value.contains("plane tag/sub_tag/format/name/offset")
+                && value.contains("calibration physical_size_x/y") => {}
+        other => {
+            panic!("unexpected openlab.ome.stage_detector_projection.source_fields: {other:?}")
+        }
+    }
+    match meta.series_metadata.get("openlab.ome.stage_projection") {
+        Some(MetadataValue::String(value))
+            if value == "not_projected_no_explicit_stage_coordinates" => {}
+        other => panic!("unexpected openlab.ome.stage_projection: {other:?}"),
+    }
+    match meta
+        .series_metadata
+        .get("openlab.ome.stage_projection.inspected_fields")
+    {
+        Some(MetadataValue::String(value))
+            if value.contains("plane names may encode image/Z/C/T labels")
+                && value.contains("calibration stores physical pixel size only") => {}
+        other => panic!("unexpected openlab.ome.stage_projection.inspected_fields: {other:?}"),
+    }
+    match meta
+        .series_metadata
+        .get("openlab.ome.stage_projection.reason")
+    {
+        Some(MetadataValue::String(value))
+            if value.contains("no parsed LIFF field contains explicit stage X/Y/Z coordinates")
+                && value.contains("plane names are only used for image/Z/C/T indexing")
+                && value.contains("calibration values are pixel sizes") => {}
+        other => panic!("unexpected openlab.ome.stage_projection.reason: {other:?}"),
+    }
+    match meta.series_metadata.get("openlab.ome.detector_projection") {
+        Some(MetadataValue::String(value))
+            if value == "not_projected_no_explicit_detector_fields" => {}
+        other => panic!("unexpected openlab.ome.detector_projection: {other:?}"),
+    }
+    match meta
+        .series_metadata
+        .get("openlab.ome.detector_projection.inspected_fields")
+    {
+        Some(MetadataValue::String(value))
+            if value.contains("volume_type")
+                && value.contains("pixel_payload")
+                && value.contains("not detector identity") => {}
+        other => panic!("unexpected openlab.ome.detector_projection.inspected_fields: {other:?}"),
+    }
+    match meta
+        .series_metadata
+        .get("openlab.ome.detector_projection.reason")
+    {
+        Some(MetadataValue::String(value))
+            if value.contains("no parsed LIFF field contains detector model")
+                && value.contains("gain, offset")
+                && value.contains("storage descriptors") => {}
+        other => panic!("unexpected openlab.ome.detector_projection.reason: {other:?}"),
+    }
+    match meta.series_metadata.get("openlab.plane.0.tag") {
+        Some(MetadataValue::Int(67)) => {}
+        other => panic!("unexpected openlab.plane.0.tag: {other:?}"),
+    }
+    match meta.series_metadata.get("openlab.plane.0.tag_name") {
+        Some(MetadataValue::String(value)) if value == "IMAGE_TYPE_1" => {}
+        other => panic!("unexpected openlab.plane.0.tag_name: {other:?}"),
+    }
+    match meta.series_metadata.get("openlab.plane.0.sub_tag") {
+        Some(MetadataValue::Int(0)) => {}
+        other => panic!("unexpected openlab.plane.0.sub_tag: {other:?}"),
+    }
+    match meta.series_metadata.get("openlab.plane.0.format") {
+        Some(MetadataValue::String(value)) if value == "RAW" => {}
+        other => panic!("unexpected openlab.plane.0.format: {other:?}"),
     }
     let physical_size_x = match meta.series_metadata.get("openlab.physical_size_x") {
         Some(MetadataValue::Float(value)) => *value,
@@ -528,6 +632,55 @@ fn openlab_v2_ome_annotations_include_native_series_metadata() {
     assert!(annotation
         .iter()
         .any(|(key, value)| key == "openlab.pixel_payload" && value == "raw"));
+    assert!(annotation.iter().any(
+        |(key, value)| key == "openlab.ome.stage_detector_projection"
+            && value == "not_projected_no_safe_liff_fields"
+    ));
+    assert!(annotation.iter().any(|(key, value)| key
+        == "openlab.ome.stage_detector_projection.source_fields"
+        && value.contains("plane tag/sub_tag/format/name/offset")
+        && value.contains("calibration physical_size_x/y")));
+    assert!(annotation
+        .iter()
+        .any(|(key, value)| key == "openlab.ome.stage_projection"
+            && value == "not_projected_no_explicit_stage_coordinates"));
+    assert!(annotation.iter().any(|(key, value)| key
+        == "openlab.ome.stage_projection.inspected_fields"
+        && value.contains("plane names may encode image/Z/C/T labels")
+        && value.contains("calibration stores physical pixel size only")));
+    assert!(annotation
+        .iter()
+        .any(|(key, value)| key == "openlab.ome.stage_projection.reason"
+            && value.contains("no parsed LIFF field contains explicit stage X/Y/Z coordinates")
+            && value.contains("plane names are only used for image/Z/C/T indexing")
+            && value.contains("calibration values are pixel sizes")));
+    assert!(annotation
+        .iter()
+        .any(|(key, value)| key == "openlab.ome.detector_projection"
+            && value == "not_projected_no_explicit_detector_fields"));
+    assert!(annotation.iter().any(|(key, value)| key
+        == "openlab.ome.detector_projection.inspected_fields"
+        && value.contains("volume_type")
+        && value.contains("pixel_payload")
+        && value.contains("not detector identity")));
+    assert!(annotation.iter().any(
+        |(key, value)| key == "openlab.ome.detector_projection.reason"
+            && value.contains("no parsed LIFF field contains detector model")
+            && value.contains("gain, offset")
+            && value.contains("storage descriptors")
+    ));
+    assert!(annotation
+        .iter()
+        .any(|(key, value)| key == "openlab.plane.0.tag" && value == "67"));
+    assert!(annotation
+        .iter()
+        .any(|(key, value)| key == "openlab.plane.0.tag_name" && value == "IMAGE_TYPE_1"));
+    assert!(annotation
+        .iter()
+        .any(|(key, value)| key == "openlab.plane.0.sub_tag" && value == "0"));
+    assert!(annotation
+        .iter()
+        .any(|(key, value)| key == "openlab.plane.0.format" && value == "RAW"));
     assert!(annotation
         .iter()
         .any(|(key, value)| key == "openlab.physical_size_x"

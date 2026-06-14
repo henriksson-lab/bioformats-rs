@@ -10,9 +10,12 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{
+    DimensionOrder, ImageMetadata, MetadataLevel, MetadataOptions, MetadataValue,
+};
 use crate::common::ome_metadata::{
-    create_lsid, OmeChannel, OmeImage, OmeMetadata, OmePlate, OmeWell, OmeWellSample,
+    create_lsid, OmeChannel, OmeDetector, OmeImage, OmeInstrument, OmeMetadata, OmeObjective,
+    OmePlate, OmeROI, OmeShape, OmeWell, OmeWellSample,
 };
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
@@ -26,6 +29,7 @@ use crate::tiff::jpeg_restart;
 // ---------------------------------------------------------------------------
 // Macro: thin TIFF wrapper
 // ---------------------------------------------------------------------------
+#[allow(unused_macros)]
 macro_rules! tiff_wrapper {
     (
         $(#[$attr:meta])*
@@ -617,10 +621,599 @@ impl FormatReader for DngReader {
 // ---------------------------------------------------------------------------
 // 2. Akoya/PerkinElmer Phenocycler QPTIFF
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Akoya/PerkinElmer Phenocycler QPTIFF — TIFF-based (`.qptiff`).
-    pub struct QptiffReader;
-    extensions: ["qptiff"];
+/// Akoya/PerkinElmer Phenocycler QPTIFF — TIFF-based (`.qptiff`).
+pub struct QptiffReader {
+    inner: crate::tiff::TiffReader,
+    meta: Option<ImageMetadata>,
+    current_resolution: usize,
+}
+
+impl QptiffReader {
+    pub fn new() -> Self {
+        QptiffReader {
+            inner: crate::tiff::TiffReader::new(),
+            meta: None,
+            current_resolution: 0,
+        }
+    }
+
+    fn current_ifd_indices(&self) -> Vec<usize> {
+        let Some(series) = self.inner.series_list().get(self.inner.series()) else {
+            return Vec::new();
+        };
+        if self.current_resolution == 0 {
+            series.ifd_indices.clone()
+        } else {
+            series
+                .sub_resolutions
+                .get(self.current_resolution - 1)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn refresh_metadata(&mut self) {
+        let mut meta = self.inner.metadata().clone();
+        qptiff_enrich_metadata(&self.inner, &mut meta, &self.current_ifd_indices());
+        self.meta = Some(meta);
+    }
+}
+
+impl Default for QptiffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn qptiff_ifd_value_summary(value: &crate::tiff::ifd::IfdValue) -> Option<MetadataValue> {
+    use crate::tiff::ifd::IfdValue;
+    match value {
+        IfdValue::Ascii(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(MetadataValue::String(text.chars().take(8192).collect()))
+            }
+        }
+        IfdValue::Short(v) => Some(MetadataValue::String(
+            v.iter().map(u16::to_string).collect::<Vec<_>>().join(","),
+        )),
+        IfdValue::Long(v) => Some(MetadataValue::String(
+            v.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+        )),
+        IfdValue::Long8(v) => Some(MetadataValue::String(
+            v.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
+        )),
+        IfdValue::Rational(v) => Some(MetadataValue::String(
+            v.iter()
+                .map(|(n, d)| format!("{n}/{d}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        )),
+        IfdValue::Float(v) => Some(MetadataValue::String(
+            v.iter().map(f32::to_string).collect::<Vec<_>>().join(","),
+        )),
+        IfdValue::Double(v) => Some(MetadataValue::String(
+            v.iter().map(f64::to_string).collect::<Vec<_>>().join(","),
+        )),
+        IfdValue::Byte(v) | IfdValue::Undefined(v) => Some(MetadataValue::Int(v.len() as i64)),
+        _ => None,
+    }
+}
+
+fn qptiff_tag_name(tag: u16) -> Option<&'static str> {
+    match tag {
+        270 => Some("ImageDescription"),
+        305 => Some("Software"),
+        306 => Some("DateTime"),
+        315 => Some("Artist"),
+        330 => Some("SubIFDs"),
+        33432 => Some("Copyright"),
+        34675 => Some("ICCProfile"),
+        50215 => Some("OceScanjobDescription"),
+        65000..=65535 => Some("Private"),
+        _ => None,
+    }
+}
+
+fn qptiff_insert_description_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    ifd_index: usize,
+    description: &str,
+) {
+    let description = description.trim_matches(char::from(0)).trim();
+    if description.is_empty() {
+        return;
+    }
+    metadata.insert(
+        format!("qptiff.ifd.{ifd_index}.ImageDescription"),
+        MetadataValue::String(description.chars().take(8192).collect()),
+    );
+
+    for (line_index, raw_line) in description
+        .split(['\n', '\r', ';', '|'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+        .take(256)
+    {
+        let Some((key, value)) = raw_line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches(char::from(0));
+        let value = value.trim().trim_matches(char::from(0));
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        let safe_key = key
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        metadata.insert(
+            format!("qptiff.ifd.{ifd_index}.description.{line_index}.{safe_key}"),
+            MetadataValue::String(value.chars().take(4096).collect()),
+        );
+    }
+
+    qptiff_insert_vendor_json_metadata(metadata, ifd_index, description);
+}
+
+fn qptiff_metadata_key_segment(raw: &str) -> String {
+    let key = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if key.is_empty() {
+        "_".into()
+    } else {
+        key
+    }
+}
+
+fn qptiff_insert_vendor_json_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    ifd_index: usize,
+    description: &str,
+) {
+    let text = description.trim_matches(char::from(0)).trim();
+    if text.len() > 65_536 || !(text.starts_with('{') || text.starts_with('[')) {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let graph_nodes = qptiff_insert_vendor_json_graph_metadata(metadata, ifd_index, &value);
+    let mut inserted = 0usize;
+    qptiff_flatten_vendor_json_value(
+        metadata,
+        ifd_index,
+        &value,
+        &mut Vec::new(),
+        0,
+        &mut inserted,
+    );
+    if inserted > 0 || graph_nodes > 0 {
+        metadata.insert(
+            format!("qptiff.ifd.{ifd_index}.vendor_object.format"),
+            MetadataValue::String("json".into()),
+        );
+    }
+    if inserted > 0 {
+        metadata.insert(
+            format!("qptiff.ifd.{ifd_index}.vendor_object.scalar_count"),
+            MetadataValue::Int(inserted as i64),
+        );
+    }
+    if graph_nodes > 0 {
+        metadata.insert(
+            format!("qptiff.ifd.{ifd_index}.vendor_object.graph.node_count"),
+            MetadataValue::Int(graph_nodes as i64),
+        );
+    }
+}
+
+fn qptiff_insert_vendor_json_graph_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    ifd_index: usize,
+    value: &serde_json::Value,
+) -> usize {
+    let mut node_count = 0usize;
+    qptiff_walk_vendor_json_graph(
+        metadata,
+        ifd_index,
+        value,
+        &mut Vec::new(),
+        0,
+        &mut node_count,
+    );
+    node_count
+}
+
+fn qptiff_walk_vendor_json_graph(
+    metadata: &mut HashMap<String, MetadataValue>,
+    ifd_index: usize,
+    value: &serde_json::Value,
+    path: &mut Vec<String>,
+    depth: usize,
+    node_count: &mut usize,
+) {
+    if depth > 8 || *node_count >= 128 {
+        return;
+    }
+
+    let (kind, children): (&str, Vec<(String, &serde_json::Value)>) = match value {
+        serde_json::Value::Object(map) => (
+            "object",
+            map.iter()
+                .take(256)
+                .map(|(key, child)| (qptiff_metadata_key_segment(key), child))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => (
+            "array",
+            items
+                .iter()
+                .enumerate()
+                .take(256)
+                .map(|(index, child)| (index.to_string(), child))
+                .collect(),
+        ),
+        _ => return,
+    };
+
+    let child_count = children.len();
+    let container_child_count = children
+        .iter()
+        .filter(|(_, child)| child.is_object() || child.is_array())
+        .count();
+    let scalar_child_count = child_count.saturating_sub(container_child_count);
+    let node_index = *node_count;
+    *node_count += 1;
+
+    let prefix = format!("qptiff.ifd.{ifd_index}.vendor_object.graph.{node_index}");
+    metadata.insert(
+        format!("{prefix}.path"),
+        MetadataValue::String(qptiff_vendor_json_graph_path(path)),
+    );
+    metadata.insert(format!("{prefix}.type"), MetadataValue::String(kind.into()));
+    metadata.insert(format!("{prefix}.depth"), MetadataValue::Int(depth as i64));
+    metadata.insert(
+        format!("{prefix}.child_count"),
+        MetadataValue::Int(child_count as i64),
+    );
+    metadata.insert(
+        format!("{prefix}.container_child_count"),
+        MetadataValue::Int(container_child_count as i64),
+    );
+    metadata.insert(
+        format!("{prefix}.scalar_child_count"),
+        MetadataValue::Int(scalar_child_count as i64),
+    );
+
+    if matches!(value, serde_json::Value::Object(_)) && !children.is_empty() {
+        metadata.insert(
+            format!("{prefix}.keys"),
+            MetadataValue::String(
+                children
+                    .iter()
+                    .take(64)
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            ),
+        );
+    }
+
+    if depth >= 8 {
+        return;
+    }
+
+    for (segment, child) in children {
+        if !(child.is_object() || child.is_array()) {
+            continue;
+        }
+        path.push(segment);
+        qptiff_walk_vendor_json_graph(metadata, ifd_index, child, path, depth + 1, node_count);
+        path.pop();
+        if *node_count >= 128 {
+            break;
+        }
+    }
+}
+
+fn qptiff_vendor_json_graph_path(path: &[String]) -> String {
+    if path.is_empty() {
+        "$".into()
+    } else {
+        path.join(".")
+    }
+}
+
+fn qptiff_insert_vendor_json_semantic_scalar(
+    metadata: &mut HashMap<String, MetadataValue>,
+    ifd_index: usize,
+    path: &[String],
+    value: &MetadataValue,
+) {
+    let Some(last) = path.last() else {
+        return;
+    };
+    let last_lower = last.to_ascii_lowercase();
+    let channel_index = path.windows(2).find_map(|pair| {
+        let container = pair[0].to_ascii_lowercase();
+        if matches!(container.as_str(), "channels" | "channel") {
+            pair[1].parse::<usize>().ok()
+        } else {
+            None
+        }
+    });
+
+    if last_lower == "name" {
+        if let Some(channel) = channel_index {
+            metadata.insert(
+                format!("qptiff.ifd.{ifd_index}.semantic.channel.{channel}.name"),
+                value.clone(),
+            );
+        }
+        return;
+    }
+
+    let alias = match last_lower.as_str() {
+        "channelname" | "channel_name" => Some("channel.0.name"),
+        "exposuretime" | "exposure_time" => Some("acquisition.exposure_time"),
+        "exposuretimeus" | "exposure_time_us" => Some("acquisition.exposure_time_us"),
+        "exposuretimems" | "exposure_time_ms" => Some("acquisition.exposure_time_ms"),
+        "excitationwavelength" | "excitation_wavelength" => Some("channel.0.excitation_wavelength"),
+        "emissionwavelength" | "emission_wavelength" => Some("channel.0.emission_wavelength"),
+        "objective" | "objectivename" | "objective_name" => Some("instrument.objective"),
+        "instrument" | "instrumentname" | "instrument_name" => Some("instrument.name"),
+        _ => None,
+    };
+    if let Some(alias) = alias {
+        let alias = if let Some(channel) = channel_index {
+            alias.replace("channel.0.", &format!("channel.{channel}."))
+        } else {
+            alias.to_string()
+        };
+        metadata.insert(
+            format!("qptiff.ifd.{ifd_index}.semantic.{alias}"),
+            value.clone(),
+        );
+    }
+}
+
+fn qptiff_flatten_vendor_json_value(
+    metadata: &mut HashMap<String, MetadataValue>,
+    ifd_index: usize,
+    value: &serde_json::Value,
+    path: &mut Vec<String>,
+    depth: usize,
+    inserted: &mut usize,
+) {
+    if depth > 8 || *inserted >= 256 {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter().take(256) {
+                path.push(qptiff_metadata_key_segment(key));
+                qptiff_flatten_vendor_json_value(
+                    metadata,
+                    ifd_index,
+                    child,
+                    path,
+                    depth + 1,
+                    inserted,
+                );
+                path.pop();
+                if *inserted >= 256 {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate().take(256) {
+                path.push(index.to_string());
+                qptiff_flatten_vendor_json_value(
+                    metadata,
+                    ifd_index,
+                    child,
+                    path,
+                    depth + 1,
+                    inserted,
+                );
+                path.pop();
+                if *inserted >= 256 {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::String(text) if !path.is_empty() => {
+            let metadata_value = MetadataValue::String(text.chars().take(4096).collect());
+            metadata.insert(
+                format!("qptiff.ifd.{ifd_index}.vendor_object.{}", path.join(".")),
+                metadata_value.clone(),
+            );
+            qptiff_insert_vendor_json_semantic_scalar(metadata, ifd_index, path, &metadata_value);
+            *inserted += 1;
+        }
+        serde_json::Value::Number(number) if !path.is_empty() => {
+            let metadata_value = if let Some(v) = number.as_i64() {
+                MetadataValue::Int(v)
+            } else if let Some(v) = number.as_u64() {
+                if v <= i64::MAX as u64 {
+                    MetadataValue::Int(v as i64)
+                } else {
+                    MetadataValue::String(v.to_string())
+                }
+            } else if let Some(v) = number.as_f64() {
+                MetadataValue::Float(v)
+            } else {
+                MetadataValue::String(number.to_string())
+            };
+            metadata.insert(
+                format!("qptiff.ifd.{ifd_index}.vendor_object.{}", path.join(".")),
+                metadata_value.clone(),
+            );
+            qptiff_insert_vendor_json_semantic_scalar(metadata, ifd_index, path, &metadata_value);
+            *inserted += 1;
+        }
+        serde_json::Value::Bool(value) if !path.is_empty() => {
+            let metadata_value = MetadataValue::Bool(*value);
+            metadata.insert(
+                format!("qptiff.ifd.{ifd_index}.vendor_object.{}", path.join(".")),
+                metadata_value.clone(),
+            );
+            qptiff_insert_vendor_json_semantic_scalar(metadata, ifd_index, path, &metadata_value);
+            *inserted += 1;
+        }
+        _ => {}
+    }
+}
+
+fn qptiff_enrich_metadata(
+    inner: &crate::tiff::TiffReader,
+    meta: &mut ImageMetadata,
+    ifd_indices: &[usize],
+) {
+    meta.series_metadata.insert(
+        "qptiff.ifd_count".into(),
+        MetadataValue::Int(inner.ifd_count() as i64),
+    );
+    if !ifd_indices.is_empty() {
+        meta.series_metadata.insert(
+            "qptiff.series_ifds".into(),
+            MetadataValue::String(
+                ifd_indices
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        );
+    }
+
+    for &ifd_index in ifd_indices.iter().take(512) {
+        let Some(ifd) = inner.ifd(ifd_index) else {
+            continue;
+        };
+        for tag in [
+            270u16, 305, 306, 315, 330, 33432, 34675, 50215, 65000, 65001, 65002, 65003, 65004,
+            65005, 65200, 65201, 65202, 65203, 65204, 65205,
+        ] {
+            let Some(value) = ifd.get(tag) else {
+                continue;
+            };
+            if tag == crate::tiff::ifd::tag::IMAGE_DESCRIPTION || (65000..=65535).contains(&tag) {
+                if let Some(description) = value.as_str() {
+                    qptiff_insert_description_metadata(
+                        &mut meta.series_metadata,
+                        ifd_index,
+                        description,
+                    );
+                }
+            }
+            if let Some(summary) = qptiff_ifd_value_summary(value) {
+                let label = qptiff_tag_name(tag).unwrap_or("Tag");
+                meta.series_metadata
+                    .insert(format!("qptiff.ifd.{ifd_index}.tag.{tag}.{label}"), summary);
+            }
+        }
+    }
+}
+
+impl FormatReader for QptiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("qptiff"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)?;
+        self.current_resolution = 0;
+        self.refresh_metadata();
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.meta = None;
+        self.current_resolution = 0;
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        self.inner.set_series(s)?;
+        self.current_resolution = 0;
+        self.refresh_metadata();
+        Ok(())
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)?;
+        self.current_resolution = level;
+        self.refresh_metadata();
+        Ok(())
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = self
+            .inner
+            .ome_metadata()
+            .unwrap_or_else(|| OmeMetadata::from_image_metadata(meta));
+        let _ = ome.add_original_metadata_annotations(meta, 0);
+        Some(ome)
+    }
 }
 
 // ===========================================================================
@@ -859,6 +1452,7 @@ impl FormatReader for GelReader {
 const IMSPECTOR_FILE_MAGIC: &[u8; 8] = b"OMAS_BF\n";
 const IMSPECTOR_SYNTHETIC_STACK_MAGIC: &[u8; 14] = b"OMAS_BF_STACK\n";
 const IMSPECTOR_MAGIC_NUMBER: u16 = 0xffff;
+const IMSPECTOR_MAX_DIMS: usize = 15;
 const IMSPECTOR_MIN_HEADER_LEN: usize = 14;
 const IMSPECTOR_STACK_OFFSET_POS: usize = IMSPECTOR_MIN_HEADER_LEN;
 const IMSPECTOR_SYNTHETIC_STACK_HEADER_LEN: usize = IMSPECTOR_SYNTHETIC_STACK_MAGIC.len() + 44;
@@ -989,6 +1583,28 @@ fn imspector_read_len_string(bytes: &[u8], offset: &mut usize) -> Result<String>
     Ok(value)
 }
 
+/// Read a fixed-length string of `len` bytes at `offset` (the OBF stack `Name`
+/// and `Description` are stored as plain byte runs whose length is given by a
+/// separate header field). Mirrors `RandomAccessInputStream.readString(length)`;
+/// decoded lossily because descriptions can carry non-UTF-8 bytes.
+fn imspector_read_fixed_string(
+    bytes: &[u8],
+    offset: usize,
+    len: i32,
+    field: &str,
+) -> Result<String> {
+    if len <= 0 {
+        return Ok(String::new());
+    }
+    let len = len as usize;
+    if bytes.len().saturating_sub(offset) < len {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector OBF/MSR {field} overruns input"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&bytes[offset..offset + len]).into_owned())
+}
+
 fn imspector_read_i32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i32> {
     if bytes.len().saturating_sub(*offset) < 4 {
         return Err(BioFormatsError::Format(format!(
@@ -1012,6 +1628,26 @@ fn imspector_read_i64(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i
         )));
     }
     let value = i64::from_le_bytes([
+        bytes[*offset],
+        bytes[*offset + 1],
+        bytes[*offset + 2],
+        bytes[*offset + 3],
+        bytes[*offset + 4],
+        bytes[*offset + 5],
+        bytes[*offset + 6],
+        bytes[*offset + 7],
+    ]);
+    *offset += 8;
+    Ok(value)
+}
+
+fn imspector_read_f64(bytes: &[u8], offset: &mut usize, field: &str) -> Result<f64> {
+    if bytes.len().saturating_sub(*offset) < 8 {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector OBF/MSR {field} is truncated"
+        )));
+    }
+    let value = f64::from_le_bytes([
         bytes[*offset],
         bytes[*offset + 1],
         bytes[*offset + 2],
@@ -1050,7 +1686,7 @@ fn imspector_checked_plane_len(width: u32, height: u32, bytes_per_sample: usize)
         .ok_or_else(|| BioFormatsError::Format("Imspector OBF/MSR plane size overflows".into()))
 }
 
-fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack>> {
+fn imspector_stack_offset(bytes: &[u8]) -> Result<Option<usize>> {
     if bytes.len() < IMSPECTOR_STACK_OFFSET_POS + 8 {
         return Ok(None);
     }
@@ -1067,9 +1703,781 @@ fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack
     if stack_offset == 0 {
         return Ok(None);
     }
-    let stack_offset = usize::try_from(stack_offset).map_err(|_| {
+    usize::try_from(stack_offset).map(Some).map_err(|_| {
         BioFormatsError::Format("Imspector OBF/MSR stack offset overflows usize".into())
+    })
+}
+
+fn imspector_skip_len_bytes(bytes: &[u8], offset: &mut usize, len: i32, field: &str) -> Result<()> {
+    let len = len.max(0) as usize;
+    if bytes.len().saturating_sub(*offset) < len {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector OBF/MSR {field} overruns input"
+        )));
+    }
+    *offset += len;
+    Ok(())
+}
+
+fn imspector_hex_preview(bytes: &[u8], limit: usize) -> String {
+    bytes
+        .iter()
+        .take(limit)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn imspector_ascii_preview(bytes: &[u8], limit: usize) -> String {
+    bytes
+        .iter()
+        .take(limit)
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
+/// Faithful translation of the `Description` XML handling in
+/// `OBFReader.initStack`. Java sanitizes the XML, renames the whitespace-laden
+/// `<Time Lapse ...>` element to `<TimeLapse ...>`, then walks the DOM: the
+/// document element's first child element is the root, each of its child
+/// elements is `nodeName`, and each grandchild contributes
+/// `addSeriesMeta(nodeName + " " + key, value)` — except `doc`/`hwr`
+/// grandchildren, whose own children are added one level deeper.
+///
+/// Returns the extracted `(key, value)` pairs (empty when the string did not
+/// parse as XML, in which case the caller stores the raw `Description`).
+fn imspector_parse_description(description: &str) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+
+    // some XML node names contain white space, which prevents parsing
+    let sanitized = description
+        .replace("<Time Lapse ", "<TimeLapse ")
+        .replace("</Time Lapse", "</TimeLapse");
+
+    let mut reader = quick_xml::Reader::from_str(&sanitized);
+    reader.config_mut().trim_text(false);
+
+    // Element-depth stack of node names. Depth 1 = document element,
+    // depth 2 = the chosen root, depth 3 = `nodeName`, depth 4 = grandchild
+    // (`key`), depth 5 = doc/hwr children.
+    let mut name_stack: Vec<String> = Vec::new();
+    let mut text = String::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut ok = true;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                ok = false;
+                break;
+            }
+            Ok(Event::Start(ref e)) => {
+                let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                name_stack.push(local);
+                text.clear();
+            }
+            Ok(Event::Text(t)) => {
+                text.push_str(&t.unescape().unwrap_or_default());
+            }
+            Ok(Event::End(_)) => {
+                let depth = name_stack.len();
+                // Depth 4: a grandchild whose parent (depth 3) is `nodeName`.
+                // Java emits `nodeName + " " + key` unless key is doc/hwr.
+                if depth == 4 {
+                    let key = &name_stack[3];
+                    let node_name = &name_stack[2];
+                    if key != "doc" && key != "hwr" {
+                        pairs.push((format!("{node_name} {key}"), text.trim().to_string()));
+                    }
+                } else if depth == 5 {
+                    // Depth 5: child of a doc/hwr grandchild. Java keys these as
+                    // `nodeName + " " + <this element's name>`.
+                    let parent = &name_stack[3];
+                    if parent == "doc" || parent == "hwr" {
+                        let node_name = &name_stack[2];
+                        let key = &name_stack[4];
+                        pairs.push((format!("{node_name} {key}"), text.trim().to_string()));
+                    }
+                }
+                text.clear();
+                name_stack.pop();
+            }
+            _ => {}
+        }
+    }
+
+    if !ok {
+        pairs.clear();
+    }
+    pairs
+}
+
+fn parse_imspector_native_stack(
+    bytes: &[u8],
+    stack_offset: usize,
+) -> Result<Option<(ImspectorStack, u64)>> {
+    if bytes.len().saturating_sub(stack_offset) < IMSPECTOR_SYNTHETIC_STACK_MAGIC.len() + 6 {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR native stack header is truncated".to_string(),
+        ));
+    }
+    if &bytes[stack_offset..stack_offset + IMSPECTOR_SYNTHETIC_STACK_MAGIC.len()]
+        != IMSPECTOR_SYNTHETIC_STACK_MAGIC
+    {
+        return Ok(None);
+    }
+
+    let magic_offset = stack_offset + IMSPECTOR_SYNTHETIC_STACK_MAGIC.len();
+    let magic = u16::from_le_bytes([bytes[magic_offset], bytes[magic_offset + 1]]);
+    if magic != IMSPECTOR_MAGIC_NUMBER {
+        return Ok(None);
+    }
+
+    let mut offset = magic_offset + 2;
+    let stack_version = imspector_read_i32(bytes, &mut offset, "native stack version")?;
+    if !(1..=6).contains(&stack_version) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Imspector OBF/MSR native stack version {stack_version} is unsupported by the bounded v1-v6 reader"
+        )));
+    }
+    let num_dims = imspector_read_i32(bytes, &mut offset, "dimension count")?;
+    if !(1..=5).contains(&num_dims) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Imspector OBF/MSR native stack dimension count {num_dims} is unsupported"
+        )));
+    }
+    let num_dims = num_dims as usize;
+
+    let mut sizes = [1i32; IMSPECTOR_MAX_DIMS];
+    let mut sample_count = 1usize;
+    for (d, slot) in sizes.iter_mut().enumerate() {
+        let size = imspector_read_i32(bytes, &mut offset, "dimension size")?;
+        if d < num_dims {
+            let positive = imspector_positive_dim(size, "dimension size")? as usize;
+            sample_count = sample_count.checked_mul(positive).ok_or_else(|| {
+                BioFormatsError::Format("Imspector OBF/MSR sample count overflows".into())
+            })?;
+            *slot = size;
+        }
+    }
+    // Faithful translation of OBFReader.initStack: read the 15 physical
+    // `Lengths` doubles (keeping the first numberOfDimensions) then the 15
+    // `Offsets` doubles. Java stores both arrays in the series metadata.
+    let mut lengths = Vec::with_capacity(num_dims);
+    for d in 0..IMSPECTOR_MAX_DIMS {
+        let length = imspector_read_f64(bytes, &mut offset, "dimension length")?;
+        if d < num_dims {
+            lengths.push(length);
+        }
+    }
+    let mut offsets = Vec::with_capacity(num_dims);
+    for d in 0..IMSPECTOR_MAX_DIMS {
+        let dim_offset = imspector_read_f64(bytes, &mut offset, "dimension offset")?;
+        if d < num_dims {
+            offsets.push(dim_offset);
+        }
+    }
+    if offset > bytes.len() {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR native dimension metadata is truncated".to_string(),
+        ));
+    }
+
+    let type_code = imspector_read_i32(bytes, &mut offset, "data type")?;
+    let pixel_type = imspector_pixel_type(type_code)?;
+    let bits_per_pixel = imspector_bits_per_pixel(type_code)?;
+    let compression = imspector_read_i32(bytes, &mut offset, "compression")?;
+    let compressed = imspector_compression_flag(compression)?;
+    offset = offset.checked_add(4).ok_or_else(|| {
+        BioFormatsError::Format("Imspector OBF/MSR native header offset overflows".into())
     })?;
+    let name_len = imspector_read_i32(bytes, &mut offset, "name length")?;
+    let description_len = imspector_read_i32(bytes, &mut offset, "description length")?;
+    offset = offset.checked_add(8).ok_or_else(|| {
+        BioFormatsError::Format("Imspector OBF/MSR native header offset overflows".into())
+    })?;
+    if offset > bytes.len() {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR native stack header is truncated".to_string(),
+        ));
+    }
+    let payload_len =
+        imspector_stack_length(imspector_read_i64(bytes, &mut offset, "payload length")?)?;
+    let next_stack = imspector_read_i64(bytes, &mut offset, "next stack offset")?;
+    let next_stack_offset = if next_stack < 0 {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR negative next stack offset on disk".into(),
+        ));
+    } else {
+        next_stack as u64
+    };
+    // OBFReader.initStack reads the stack `Name` and stores it under the
+    // "Name" series-metadata key, then parses the `Description` (see below).
+    let name_offset = offset;
+    let name = imspector_read_fixed_string(bytes, name_offset, name_len, "stack name")?;
+    imspector_skip_len_bytes(bytes, &mut offset, name_len, "stack name")?;
+    let description_offset = offset;
+    let description =
+        imspector_read_fixed_string(bytes, description_offset, description_len, "stack description")?;
+    imspector_skip_len_bytes(bytes, &mut offset, description_len, "stack description")?;
+
+    let payload_offset = offset;
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        BioFormatsError::Format("Imspector OBF/MSR payload length overflows usize".into())
+    })?;
+    let payload_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
+        BioFormatsError::Format("Imspector OBF/MSR payload end offset overflows".into())
+    })?;
+    if payload_end > bytes.len() {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR native payload overruns input".to_string(),
+        ));
+    }
+
+    let expected_len = sample_count
+        .checked_mul(pixel_type.bytes_per_sample())
+        .ok_or_else(|| {
+            BioFormatsError::Format("Imspector OBF/MSR native payload size overflows".into())
+        })?;
+    let mut footer_offset = payload_end;
+    let footer_skip = imspector_read_i32(bytes, &mut footer_offset, "native footer offset")?;
+    let mut steps_present = [false; IMSPECTOR_MAX_DIMS];
+    for (d, slot) in steps_present.iter_mut().enumerate() {
+        let present = imspector_read_i32(bytes, &mut footer_offset, "step presence")? != 0;
+        if d < num_dims {
+            *slot = present;
+        }
+    }
+    let mut step_labels_present = [false; IMSPECTOR_MAX_DIMS];
+    for (d, slot) in step_labels_present.iter_mut().enumerate() {
+        let present = imspector_read_i32(bytes, &mut footer_offset, "step-label presence")? != 0;
+        if d < num_dims {
+            *slot = present;
+        }
+    }
+    let mut obsolete_metadata_length = 0usize;
+    let mut num_flush_points = 0usize;
+    let mut flush_block_size = 0i64;
+    if stack_version >= 3 {
+        obsolete_metadata_length = usize::try_from(imspector_stack_length(imspector_read_i32(
+            bytes,
+            &mut footer_offset,
+            "obsolete metadata length",
+        )? as i64)?)
+        .map_err(|_| {
+            BioFormatsError::Format(
+                "Imspector OBF/MSR obsolete metadata length overflows usize".into(),
+            )
+        })?;
+        footer_offset = footer_offset
+            .checked_add(80 * (IMSPECTOR_MAX_DIMS + 1))
+            .ok_or_else(|| {
+                BioFormatsError::Format("Imspector OBF/MSR native footer offset overflows".into())
+            })?;
+        if footer_offset > bytes.len() {
+            return Err(BioFormatsError::Format(
+                "Imspector OBF/MSR native footer is truncated".to_string(),
+            ));
+        }
+        num_flush_points = usize::try_from(imspector_stack_length(imspector_read_i64(
+            bytes,
+            &mut footer_offset,
+            "flush point count",
+        )?)?)
+        .map_err(|_| {
+            BioFormatsError::Format("Imspector OBF/MSR flush point count overflows usize".into())
+        })?;
+        flush_block_size = imspector_read_i64(bytes, &mut footer_offset, "flush block size")?;
+    }
+
+    let mut tag_dictionary_length = 0usize;
+    let mut stack_end_disk = None;
+    let mut minimum_format_version = None;
+    if stack_version >= 4 {
+        tag_dictionary_length = usize::try_from(imspector_stack_length(imspector_read_i64(
+            bytes,
+            &mut footer_offset,
+            "tag dictionary length",
+        )?)?)
+        .map_err(|_| {
+            BioFormatsError::Format(
+                "Imspector OBF/MSR tag dictionary length overflows usize".into(),
+            )
+        })?;
+        stack_end_disk = Some(imspector_read_i64(bytes, &mut footer_offset, "stack end")?);
+        minimum_format_version = Some(imspector_read_i32(
+            bytes,
+            &mut footer_offset,
+            "minimum format version",
+        )?);
+    }
+
+    let mut samples_written = sample_count;
+    let mut num_chunk_positions = 0usize;
+    let mut stack_end_used_disk = None;
+    if stack_version >= 6 {
+        stack_end_used_disk = Some(imspector_read_i64(
+            bytes,
+            &mut footer_offset,
+            "stack end used",
+        )?);
+        samples_written = usize::try_from(imspector_stack_length(imspector_read_i64(
+            bytes,
+            &mut footer_offset,
+            "samples written",
+        )?)?)
+        .map_err(|_| {
+            BioFormatsError::Format("Imspector OBF/MSR samples written overflows usize".into())
+        })?;
+        num_chunk_positions = usize::try_from(imspector_stack_length(imspector_read_i64(
+            bytes,
+            &mut footer_offset,
+            "chunk position count",
+        )?)?)
+        .map_err(|_| {
+            BioFormatsError::Format("Imspector OBF/MSR chunk position count overflows usize".into())
+        })?;
+    }
+
+    let mut label_offset = payload_end
+        .checked_add(footer_skip.max(0) as usize)
+        .ok_or_else(|| {
+            BioFormatsError::Format("Imspector OBF/MSR native footer offset overflows".into())
+        })?;
+    let mut dimension_labels = Vec::new();
+    for d in 0..num_dims {
+        let label = imspector_read_len_string(bytes, &mut label_offset)?;
+        if !label.is_empty() {
+            dimension_labels.push(format!("{d}:{label}"));
+        }
+    }
+    let mut step_axes = Vec::new();
+    let mut step_previews = Vec::new();
+    for d in 0..num_dims {
+        if steps_present[d] {
+            step_axes.push(d.to_string());
+            let count = sizes[d] as usize;
+            let mut values = Vec::new();
+            for i in 0..count {
+                let value = imspector_read_f64(bytes, &mut label_offset, "step table value")?;
+                if i < 8 {
+                    values.push(value.to_string());
+                }
+            }
+            step_previews.push(format!("{d}:{}", values.join(",")));
+        }
+    }
+    let mut step_label_axes = Vec::new();
+    let mut step_label_previews = Vec::new();
+    for d in 0..num_dims {
+        if step_labels_present[d] {
+            step_label_axes.push(d.to_string());
+            let mut labels = Vec::new();
+            for _ in 0..sizes[d] {
+                let label = imspector_read_len_string(bytes, &mut label_offset)?;
+                if labels.len() < 8 && !label.is_empty() {
+                    labels.push(label);
+                }
+            }
+            if !labels.is_empty() {
+                step_label_previews.push(format!("{d}:{}", labels.join(",")));
+            }
+        }
+    }
+    label_offset = label_offset
+        .checked_add(obsolete_metadata_length)
+        .ok_or_else(|| {
+            BioFormatsError::Format("Imspector OBF/MSR native footer offset overflows".into())
+        })?;
+    let mut flush_point_previews = Vec::new();
+    for i in 0..num_flush_points {
+        let point = imspector_read_i64(bytes, &mut label_offset, "flush point")?;
+        if i < 8 {
+            flush_point_previews.push(point.to_string());
+        }
+    }
+    let tag_dictionary_offset = label_offset;
+    let tag_dictionary_end = tag_dictionary_offset
+        .checked_add(tag_dictionary_length)
+        .ok_or_else(|| {
+            BioFormatsError::Format("Imspector OBF/MSR native footer offset overflows".into())
+        })?;
+    if tag_dictionary_end > bytes.len() {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR native footer is truncated".to_string(),
+        ));
+    }
+    let tag_dictionary_preview = if tag_dictionary_length > 0 {
+        Some((
+            imspector_ascii_preview(&bytes[tag_dictionary_offset..tag_dictionary_end], 128),
+            imspector_hex_preview(&bytes[tag_dictionary_offset..tag_dictionary_end], 32),
+        ))
+    } else {
+        None
+    };
+    label_offset = label_offset
+        .checked_add(tag_dictionary_length)
+        .ok_or_else(|| {
+            BioFormatsError::Format("Imspector OBF/MSR native footer offset overflows".into())
+        })?;
+    if label_offset > bytes.len() {
+        return Err(BioFormatsError::Format(
+            "Imspector OBF/MSR native footer is truncated".to_string(),
+        ));
+    }
+
+    let decoded_payload = if num_chunk_positions > 0 {
+        if !compressed {
+            let expected_written_len = samples_written
+                .checked_mul(pixel_type.bytes_per_sample())
+                .ok_or_else(|| {
+                BioFormatsError::Format("Imspector OBF/MSR native payload size overflows".into())
+            })?;
+            if expected_written_len != expected_len {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Imspector OBF/MSR chunked native stack declares {samples_written} written samples but {sample_count} logical samples are required"
+                )));
+            }
+        }
+        let mut logical_positions = Vec::with_capacity(num_chunk_positions + 1);
+        let mut file_positions = Vec::with_capacity(num_chunk_positions + 1);
+        logical_positions.push(0usize);
+        file_positions.push(0usize);
+        for _ in 0..num_chunk_positions {
+            logical_positions.push(
+                usize::try_from(imspector_stack_length(imspector_read_i64(
+                    bytes,
+                    &mut label_offset,
+                    "chunk logical position",
+                )?)?)
+                .map_err(|_| {
+                    BioFormatsError::Format(
+                        "Imspector OBF/MSR chunk logical position overflows usize".into(),
+                    )
+                })?,
+            );
+            file_positions.push(
+                usize::try_from(imspector_stack_length(imspector_read_i64(
+                    bytes,
+                    &mut label_offset,
+                    "chunk file position",
+                )?)?)
+                .map_err(|_| {
+                    BioFormatsError::Format(
+                        "Imspector OBF/MSR chunk file position overflows usize".into(),
+                    )
+                })?,
+            );
+        }
+        let assembled_len = if compressed {
+            let last_logical = logical_positions.last().copied().unwrap_or(0);
+            let last_file = file_positions.last().copied().unwrap_or(0);
+            let last_file_len = payload_len.checked_sub(last_file).ok_or_else(|| {
+                BioFormatsError::Format("Imspector OBF/MSR chunk file positions are invalid".into())
+            })?;
+            last_logical.checked_add(last_file_len).ok_or_else(|| {
+                BioFormatsError::Format("Imspector OBF/MSR compressed chunk size overflows".into())
+            })?
+        } else {
+            expected_len
+        };
+        let mut assembled = vec![0u8; assembled_len];
+        for idx in 0..logical_positions.len() {
+            let logical_start = logical_positions[idx];
+            let logical_end = logical_positions
+                .get(idx + 1)
+                .copied()
+                .unwrap_or(assembled_len);
+            if logical_start > logical_end || logical_end > assembled_len {
+                return Err(BioFormatsError::Format(
+                    "Imspector OBF/MSR chunk logical positions are invalid".into(),
+                ));
+            }
+            let file_start = payload_offset
+                .checked_add(file_positions[idx])
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Imspector OBF/MSR chunk file offset overflows".into())
+                })?;
+            let chunk_len = logical_end - logical_start;
+            let file_end = file_start.checked_add(chunk_len).ok_or_else(|| {
+                BioFormatsError::Format("Imspector OBF/MSR chunk file end overflows".into())
+            })?;
+            if file_end > payload_end {
+                return Err(BioFormatsError::Format(
+                    "Imspector OBF/MSR chunk payload overruns native data block".into(),
+                ));
+            }
+            assembled[logical_start..logical_end].copy_from_slice(&bytes[file_start..file_end]);
+        }
+        if compressed {
+            let decoded = crate::common::codec::decompress_deflate(&assembled).map_err(|e| {
+                BioFormatsError::Codec(format!(
+                    "Imspector OBF/MSR compressed chunked native stack payload could not be decompressed: {e}"
+                ))
+            })?;
+            if decoded.len() != expected_len {
+                return Err(BioFormatsError::Format(format!(
+                    "Imspector OBF/MSR native chunked decompressed payload length {} does not match declared stack size {expected_len}",
+                    decoded.len()
+                )));
+            }
+            Some(decoded)
+        } else {
+            Some(assembled)
+        }
+    } else if compressed {
+        let decoded = crate::common::codec::decompress_deflate(&bytes[payload_offset..payload_end])
+            .map_err(|e| {
+                BioFormatsError::Codec(format!(
+                    "Imspector OBF/MSR compressed native stack payload could not be decompressed: {e}"
+                ))
+            })?;
+        if decoded.len() != expected_len {
+            return Err(BioFormatsError::Format(format!(
+                "Imspector OBF/MSR native decompressed payload length {} does not match declared stack size {expected_len}",
+                decoded.len()
+            )));
+        }
+        Some(decoded)
+    } else if payload_len != expected_len {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector OBF/MSR native payload length {payload_len} does not match declared stack size {expected_len}"
+        )));
+    } else {
+        None
+    };
+
+    let size_x = sizes[0] as u32;
+    let size_y = if num_dims > 1 { sizes[1] as u32 } else { 1 };
+    let size_z = if num_dims > 2 { sizes[2] as u32 } else { 1 };
+    let size_c = if num_dims > 3 { sizes[3] as u32 } else { 1 };
+    let size_t = if num_dims > 4 { sizes[4] as u32 } else { 1 };
+    let image_count = size_z
+        .checked_mul(size_c)
+        .and_then(|n| n.checked_mul(size_t))
+        .ok_or_else(|| BioFormatsError::Format("Imspector OBF/MSR image count overflows".into()))?;
+    let plane_len = imspector_checked_plane_len(size_x, size_y, pixel_type.bytes_per_sample())?;
+
+    let mut meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z,
+        size_c,
+        size_t,
+        pixel_type,
+        bits_per_pixel,
+        image_count,
+        dimension_order: DimensionOrder::XYZCT,
+        is_rgb: false,
+        is_interleaved: false,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        ..ImageMetadata::default()
+    };
+    meta.series_metadata.insert(
+        "imspector_version_subset".into(),
+        MetadataValue::String(if num_chunk_positions > 0 {
+            if compressed {
+                format!("native-v{stack_version}-zlib-chunked")
+            } else {
+                format!("native-v{stack_version}-uncompressed-chunked")
+            }
+        } else if compressed {
+            format!("native-v{stack_version}-zlib-contiguous")
+        } else {
+            format!("native-v{stack_version}-uncompressed-contiguous")
+        }),
+    );
+
+    // OBFReader.initStack: addGlobalMeta("Stack version", stackVersion).
+    meta.series_metadata.insert(
+        "Stack version".into(),
+        MetadataValue::Int(stack_version as i64),
+    );
+    // OBFReader.initStack stores the per-dimension physical `Lengths` and
+    // `Offsets` (kept to numberOfDimensions) in the series metadata.
+    meta.series_metadata.insert(
+        "Lengths".into(),
+        MetadataValue::String(
+            lengths
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    );
+    meta.series_metadata.insert(
+        "Offsets".into(),
+        MetadataValue::String(
+            offsets
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    );
+    if !name.is_empty() {
+        meta.series_metadata
+            .insert("Name".into(), MetadataValue::String(name));
+    }
+
+    // OBFReader.initFile derives PhysicalSize{X,Y,Z} from the first three
+    // Lengths divided by the corresponding dimension size; values below 0.01
+    // are treated as metres and scaled to micrometres. We have no dedicated
+    // physical-size field, so capture the derived micrometre values as series
+    // metadata, faithfully matching Java's scaling.
+    let physical_dims: [(usize, u32, &str); 3] = [
+        (0, size_x, "PhysicalSizeX"),
+        (1, size_y, "PhysicalSizeY"),
+        (2, size_z, "PhysicalSizeZ"),
+    ];
+    for (idx, dim_size, key) in physical_dims {
+        if let Some(length) = lengths.get(idx) {
+            let mut length = length.abs();
+            if length < 0.01 {
+                length *= 1_000_000.0;
+            }
+            if length > 0.0 && dim_size > 0 {
+                meta.series_metadata.insert(
+                    key.into(),
+                    MetadataValue::Float(length / dim_size as f64),
+                );
+            }
+        }
+    }
+
+    // OBFReader.initStack parses the stack `Description` as XML, extracting
+    // `<Time Lapse>`/`<TimeLapse>` child metadata; non-XML descriptions are
+    // kept verbatim under "Description".
+    if !description.is_empty() {
+        let pairs = imspector_parse_description(&description);
+        if pairs.is_empty() {
+            meta.series_metadata
+                .insert("Description".into(), MetadataValue::String(description));
+        } else {
+            for (key, value) in pairs {
+                meta.series_metadata
+                    .insert(key, MetadataValue::String(value));
+            }
+        }
+    }
+
+    if !dimension_labels.is_empty() {
+        meta.series_metadata.insert(
+            "imspector_dimension_labels".into(),
+            MetadataValue::String(dimension_labels.join(";")),
+        );
+    }
+    if !step_axes.is_empty() {
+        meta.series_metadata.insert(
+            "imspector_step_table_axes".into(),
+            MetadataValue::String(step_axes.join(",")),
+        );
+        meta.series_metadata.insert(
+            "imspector_step_table_previews".into(),
+            MetadataValue::String(step_previews.join(";")),
+        );
+    }
+    if !step_label_axes.is_empty() {
+        meta.series_metadata.insert(
+            "imspector_step_label_axes".into(),
+            MetadataValue::String(step_label_axes.join(",")),
+        );
+        if !step_label_previews.is_empty() {
+            meta.series_metadata.insert(
+                "imspector_step_label_previews".into(),
+                MetadataValue::String(step_label_previews.join(";")),
+            );
+        }
+    }
+    if stack_version >= 3 {
+        meta.series_metadata.insert(
+            "imspector_flush_point_count".into(),
+            MetadataValue::Int(num_flush_points as i64),
+        );
+        meta.series_metadata.insert(
+            "imspector_flush_block_size".into(),
+            MetadataValue::Int(flush_block_size),
+        );
+        if !flush_point_previews.is_empty() {
+            meta.series_metadata.insert(
+                "imspector_flush_point_previews".into(),
+                MetadataValue::String(flush_point_previews.join(",")),
+            );
+        }
+    }
+    if stack_version >= 4 {
+        meta.series_metadata.insert(
+            "imspector_tag_dictionary_length".into(),
+            MetadataValue::Int(tag_dictionary_length as i64),
+        );
+        if let Some((ascii_preview, hex_preview)) = tag_dictionary_preview {
+            meta.series_metadata.insert(
+                "imspector_tag_dictionary_offset".into(),
+                MetadataValue::Int(tag_dictionary_offset as i64),
+            );
+            meta.series_metadata.insert(
+                "imspector_tag_dictionary_ascii_preview".into(),
+                MetadataValue::String(ascii_preview),
+            );
+            meta.series_metadata.insert(
+                "imspector_tag_dictionary_hex_preview".into(),
+                MetadataValue::String(hex_preview),
+            );
+        }
+        if let Some(value) = stack_end_disk {
+            meta.series_metadata
+                .insert("imspector_stack_end".into(), MetadataValue::Int(value));
+        }
+        if let Some(value) = minimum_format_version {
+            meta.series_metadata.insert(
+                "imspector_minimum_format_version".into(),
+                MetadataValue::Int(value as i64),
+            );
+        }
+    }
+    if stack_version >= 6 {
+        if let Some(value) = stack_end_used_disk {
+            meta.series_metadata
+                .insert("imspector_stack_end_used".into(), MetadataValue::Int(value));
+        }
+        meta.series_metadata.insert(
+            "imspector_samples_written".into(),
+            MetadataValue::Int(samples_written as i64),
+        );
+        meta.series_metadata.insert(
+            "imspector_chunk_position_count".into(),
+            MetadataValue::Int(num_chunk_positions as i64),
+        );
+    }
+
+    Ok(Some((
+        ImspectorStack {
+            meta,
+            payload_offset: if compressed || num_chunk_positions > 0 {
+                0
+            } else {
+                payload_offset
+            },
+            plane_len,
+            decoded_payload,
+        },
+        next_stack_offset,
+    )))
+}
+
+fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack>> {
+    let Some(stack_offset) = imspector_stack_offset(bytes)? else {
+        return Ok(None);
+    };
     if bytes.len().saturating_sub(stack_offset) < IMSPECTOR_SYNTHETIC_STACK_HEADER_LEN {
         return Err(BioFormatsError::Format(
             "Imspector OBF/MSR stack header is truncated".to_string(),
@@ -1191,18 +2599,18 @@ fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack
 /// stack layouts are still intentionally rejected instead of guessed.
 pub struct ImspectorReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
     bytes: Vec<u8>,
-    stack: Option<ImspectorStack>,
+    stacks: Vec<ImspectorStack>,
+    current_series: usize,
 }
 
 impl ImspectorReader {
     pub fn new() -> Self {
         ImspectorReader {
             path: None,
-            meta: None,
             bytes: Vec::new(),
-            stack: None,
+            stacks: Vec::new(),
+            current_series: 0,
         }
     }
 }
@@ -1228,20 +2636,54 @@ impl FormatReader for ImspectorReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.path = None;
-        self.meta = None;
         self.bytes.clear();
-        self.stack = None;
+        self.stacks.clear();
+        self.current_series = 0;
         let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let header = parse_imspector_header(&bytes)?;
+        // Faithful translation of OBFReader.initFile's do/while stack loop:
+        // walk the linked list of native stacks starting at the file-header
+        // stack pointer, adding one series per stack until next == 0.
+        if let Some(first_offset) = imspector_stack_offset(&bytes)? {
+            let mut stack_offset = first_offset;
+            let mut stacks = Vec::new();
+            loop {
+                match parse_imspector_native_stack(&bytes, stack_offset)? {
+                    Some((stack, next_stack)) => {
+                        stacks.push(stack);
+                        if next_stack == 0 {
+                            break;
+                        }
+                        let next = usize::try_from(next_stack).map_err(|_| {
+                            BioFormatsError::Format(
+                                "Imspector OBF/MSR next stack offset overflows usize".into(),
+                            )
+                        })?;
+                        if next <= stack_offset || next >= bytes.len() {
+                            return Err(BioFormatsError::Format(
+                                "Imspector OBF/MSR next stack offset is out of range".into(),
+                            ));
+                        }
+                        stack_offset = next;
+                    }
+                    None => break,
+                }
+            }
+            if !stacks.is_empty() {
+                self.path = Some(path.to_path_buf());
+                self.bytes = bytes;
+                self.stacks = stacks;
+                return Ok(());
+            }
+        }
         if let Some(stack) = parse_imspector_synthetic_stack(&bytes)? {
             self.path = Some(path.to_path_buf());
-            self.meta = Some(stack.meta.clone());
             self.bytes = bytes;
-            self.stack = Some(stack);
+            self.stacks = vec![stack];
             return Ok(());
         }
         let mut detail = format!(
-            "Imspector OBF/MSR native stack decoding is unsupported unless explicit BFIMSPECTOR_RAW_STACK_V1 data is present (version {})",
+            "Imspector OBF/MSR native stack decoding is unsupported except v1-v6 single-stack contiguous raw/zlib and uncompressed or zlib-compressed chunked stacks or explicit BFIMSPECTOR_RAW_STACK_V1 data (version {})",
             header.version
         );
         if bytes.len() > IMSPECTOR_MIN_HEADER_LEN + 12 {
@@ -1257,40 +2699,41 @@ impl FormatReader for ImspectorReader {
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
         self.bytes.clear();
-        self.stack = None;
+        self.stacks.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        if self.meta.is_some() {
-            1
-        } else {
-            0
-        }
+        self.stacks.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if s >= self.stacks.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
-            .unwrap_or(crate::common::reader::uninitialized_metadata())
+        match self.stacks.get(self.current_series) {
+            Some(stack) => &stack.meta,
+            None => crate::common::reader::uninitialized_metadata(),
+        }
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let stack = self.stack.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let stack = self
+            .stacks
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= stack.meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
@@ -1319,7 +2762,11 @@ impl FormatReader for ImspectorReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &self
+            .stacks
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?
+            .meta;
         crop_full_plane("Imspector OBF/MSR", &full, meta, 1, x, y, w, h)
     }
 
@@ -1409,6 +2856,286 @@ mod imspector_tests {
         bytes.extend_from_slice(&payload_offset.to_le_bytes());
         bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
         bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn native_v1_stack_with_compression(
+        width: i32,
+        height: i32,
+        z: i32,
+        c: i32,
+        t: i32,
+        compression: i32,
+        pixels: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = imspector_header(1);
+        let stack_offset = 32u64;
+        bytes.extend_from_slice(&stack_offset.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(stack_offset as usize, 0);
+
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        for size in [width, height, z, c, t] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for _ in 5..15 {
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+        }
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&compression.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&(pixels.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(pixels);
+
+        bytes.extend_from_slice(&124i32.to_le_bytes());
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        for _ in 0..5 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn native_v1_stack(width: i32, height: i32, z: i32, c: i32, t: i32, pixels: &[u8]) -> Vec<u8> {
+        native_v1_stack_with_compression(width, height, z, c, t, 0, pixels)
+    }
+
+    fn push_len_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as i32).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn native_v1_stack_with_step_tables() -> Vec<u8> {
+        let mut bytes = imspector_header(1);
+        let stack_offset = 32u64;
+        bytes.extend_from_slice(&stack_offset.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(stack_offset as usize, 0);
+
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        for size in [2i32, 2, 1, 1, 1] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for _ in 5..15 {
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+        }
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+
+        let payload = [9u8, 8, 7, 6];
+        bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        bytes.extend_from_slice(&124i32.to_le_bytes());
+        for d in 0..15 {
+            bytes.extend_from_slice(&(if d == 0 { 1i32 } else { 0i32 }).to_le_bytes());
+        }
+        for d in 0..15 {
+            bytes.extend_from_slice(&(if d == 1 { 1i32 } else { 0i32 }).to_le_bytes());
+        }
+        push_len_string(&mut bytes, "X");
+        push_len_string(&mut bytes, "Y");
+        for _ in 2..5 {
+            push_len_string(&mut bytes, "");
+        }
+        bytes.extend_from_slice(&0.0f64.to_le_bytes());
+        bytes.extend_from_slice(&0.25f64.to_le_bytes());
+        push_len_string(&mut bytes, "top");
+        push_len_string(&mut bytes, "bottom");
+        bytes
+    }
+
+    fn native_v3_stack_with_flush_points() -> Vec<u8> {
+        let mut bytes = imspector_header(1);
+        let stack_offset = 32u64;
+        bytes.extend_from_slice(&stack_offset.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(stack_offset as usize, 0);
+
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&3i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        for size in [2i32, 2, 1, 1, 1] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for _ in 5..15 {
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+        }
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+
+        let payload = [1u8, 2, 3, 4];
+        bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        bytes.extend_from_slice(&1424i32.to_le_bytes());
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        for _ in 0..16 {
+            bytes.extend_from_slice(&[0u8; 80]);
+        }
+        bytes.extend_from_slice(&2i64.to_le_bytes());
+        bytes.extend_from_slice(&4096i64.to_le_bytes());
+        for _ in 0..5 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&128i64.to_le_bytes());
+        bytes.extend_from_slice(&512i64.to_le_bytes());
+        bytes
+    }
+
+    fn native_v6_chunked_stack() -> Vec<u8> {
+        let tag_dictionary = b"laser=STED\n\x01";
+        let mut bytes = imspector_header(1);
+        let stack_offset = 32u64;
+        bytes.extend_from_slice(&stack_offset.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(stack_offset as usize, 0);
+
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&6i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        for size in [2i32, 2, 2, 1, 1] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for _ in 5..15 {
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+        }
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+
+        let payload = [1u8, 2, 3, 4, 0xee, 0xee, 5, 6, 7, 8];
+        bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        bytes.extend_from_slice(&1468i32.to_le_bytes());
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        for _ in 0..16 {
+            bytes.extend_from_slice(&[0u8; 80]);
+        }
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&(tag_dictionary.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&6i32.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&8i64.to_le_bytes());
+        bytes.extend_from_slice(&1i64.to_le_bytes());
+        for _ in 0..5 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        bytes.extend_from_slice(tag_dictionary);
+        bytes.extend_from_slice(&4i64.to_le_bytes());
+        bytes.extend_from_slice(&6i64.to_le_bytes());
+        bytes
+    }
+
+    fn native_v6_zlib_chunked_stack() -> Vec<u8> {
+        let pixels = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let compressed = zlib_compress(&pixels);
+        let split = compressed.len().min(5);
+        let gap = [0xee, 0xee, 0xee];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&compressed[..split]);
+        payload.extend_from_slice(&gap);
+        payload.extend_from_slice(&compressed[split..]);
+
+        let mut bytes = imspector_header(1);
+        let stack_offset = 32u64;
+        bytes.extend_from_slice(&stack_offset.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(stack_offset as usize, 0);
+
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&6i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        for size in [2i32, 2, 2, 1, 1] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for _ in 5..15 {
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+        }
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+
+        bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        bytes.extend_from_slice(&1468i32.to_le_bytes());
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        for _ in 0..16 {
+            bytes.extend_from_slice(&[0u8; 80]);
+        }
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&6i32.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&(compressed.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&1i64.to_le_bytes());
+        for _ in 0..5 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(split as i64).to_le_bytes());
+        bytes.extend_from_slice(&((split + gap.len()) as i64).to_le_bytes());
         bytes
     }
 
@@ -1537,6 +3264,259 @@ mod imspector_tests {
     }
 
     #[test]
+    fn imspector_native_v1_uncompressed_stack_opens_planes_and_regions() {
+        let path = temp_path("native_v1_raw.obf");
+        let pixels = vec![10, 11, 12, 13, 20, 21, 22, 23];
+        std::fs::write(&path, native_v1_stack(2, 2, 2, 1, 1, &pixels)).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        match meta.series_metadata.get("imspector_version_subset") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "native-v1-uncompressed-contiguous")
+            }
+            other => panic!("unexpected imspector_version_subset metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 11, 12, 13]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![20, 21, 22, 23]);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+            vec![11, 13]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_native_step_tables_are_preserved_as_bounded_metadata() {
+        let path = temp_path("native_v1_step_tables.obf");
+        std::fs::write(&path, native_v1_stack_with_step_tables()).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.image_count, 1);
+        match meta.series_metadata.get("imspector_dimension_labels") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "0:X;1:Y")
+            }
+            other => panic!("unexpected imspector_dimension_labels metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_step_table_axes") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => assert_eq!(value, "0"),
+            other => panic!("unexpected imspector_step_table_axes metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_step_table_previews") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "0:0,0.25")
+            }
+            other => panic!("unexpected imspector_step_table_previews metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_step_label_axes") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => assert_eq!(value, "1"),
+            other => panic!("unexpected imspector_step_label_axes metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_step_label_previews") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "1:top,bottom")
+            }
+            other => panic!("unexpected imspector_step_label_previews metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 8, 7, 6]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_native_v3_flush_points_are_preserved_as_bounded_metadata() {
+        let path = temp_path("native_v3_flush_points.obf");
+        std::fs::write(&path, native_v3_stack_with_flush_points()).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.image_count, 1);
+        match meta.series_metadata.get("imspector_flush_point_count") {
+            Some(crate::common::metadata::MetadataValue::Int(value)) => assert_eq!(*value, 2),
+            other => panic!("unexpected imspector_flush_point_count metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_flush_block_size") {
+            Some(crate::common::metadata::MetadataValue::Int(value)) => assert_eq!(*value, 4096),
+            other => panic!("unexpected imspector_flush_block_size metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_flush_point_previews") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "128,512")
+            }
+            other => panic!("unexpected imspector_flush_point_previews metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_native_v6_uncompressed_chunked_stack_opens_planes() {
+        let path = temp_path("native_v6_chunked.obf");
+        std::fs::write(&path, native_v6_chunked_stack()).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.image_count, 2);
+        match meta.series_metadata.get("imspector_version_subset") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "native-v6-uncompressed-chunked")
+            }
+            other => panic!("unexpected imspector_version_subset metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_tag_dictionary_length") {
+            Some(crate::common::metadata::MetadataValue::Int(value)) => assert_eq!(*value, 12),
+            other => panic!("unexpected imspector_tag_dictionary_length metadata: {other:?}"),
+        }
+        match meta
+            .series_metadata
+            .get("imspector_tag_dictionary_ascii_preview")
+        {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "laser=STED..")
+            }
+            other => {
+                panic!("unexpected imspector_tag_dictionary_ascii_preview metadata: {other:?}")
+            }
+        }
+        match meta
+            .series_metadata
+            .get("imspector_tag_dictionary_hex_preview")
+        {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "6c 61 73 65 72 3d 53 54 45 44 0a 01")
+            }
+            other => panic!("unexpected imspector_tag_dictionary_hex_preview metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_minimum_format_version") {
+            Some(crate::common::metadata::MetadataValue::Int(value)) => assert_eq!(*value, 6),
+            other => panic!("unexpected imspector_minimum_format_version metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_stack_end_used") {
+            Some(crate::common::metadata::MetadataValue::Int(value)) => assert_eq!(*value, 10),
+            other => panic!("unexpected imspector_stack_end_used metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_samples_written") {
+            Some(crate::common::metadata::MetadataValue::Int(value)) => assert_eq!(*value, 8),
+            other => panic!("unexpected imspector_samples_written metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_chunk_position_count") {
+            Some(crate::common::metadata::MetadataValue::Int(value)) => assert_eq!(*value, 1),
+            other => panic!("unexpected imspector_chunk_position_count metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+        assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(), vec![6, 8]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_native_v6_zlib_chunked_stack_opens_planes() {
+        let path = temp_path("native_v6_zlib_chunked.obf");
+        std::fs::write(&path, native_v6_zlib_chunked_stack()).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.image_count, 2);
+        match meta.series_metadata.get("imspector_version_subset") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "native-v6-zlib-chunked")
+            }
+            other => panic!("unexpected imspector_version_subset metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![2, 4]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_native_v1_compressed_stack_opens_planes_and_regions() {
+        let path = temp_path("native_v1_zlib.obf");
+        let pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let compressed = zlib_compress(&pixels);
+        std::fs::write(
+            &path,
+            native_v1_stack_with_compression(2, 2, 2, 1, 1, 1, &compressed),
+        )
+        .unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.image_count, 2);
+        match meta.series_metadata.get("imspector_version_subset") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "native-v1-zlib-contiguous")
+            }
+            other => panic!("unexpected imspector_version_subset metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+        assert_eq!(reader.open_bytes_region(1, 0, 1, 2, 1).unwrap(), vec![7, 8]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_native_v1_compressed_stack_rejects_wrong_decompressed_size() {
+        let path = temp_path("native_v1_zlib_wrong_size.obf");
+        let compressed = zlib_compress(&[1, 2, 3]);
+        std::fs::write(
+            &path,
+            native_v1_stack_with_compression(2, 2, 1, 1, 1, 1, &compressed),
+        )
+        .unwrap();
+
+        let mut reader = ImspectorReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::Format(message)
+                if message.contains("native decompressed payload length 3")
+                    && message.contains("declared stack size 4")
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn imspector_synthetic_compressed_stack_opens_planes_and_regions() {
         let path = temp_path("synthetic_zlib.obf");
         let pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -1625,6 +3605,243 @@ mod imspector_tests {
 
         let _ = std::fs::remove_file(path);
     }
+
+    // Build a single self-contained native v1 stack block (magic .. footer)
+    // with no file-level header, so several can be concatenated and linked
+    // through their `next` pointers to exercise the multi-stack series loop.
+    fn native_v1_stack_block(
+        width: i32,
+        height: i32,
+        z: i32,
+        c: i32,
+        t: i32,
+        next: i64,
+        pixels: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        for size in [width, height, z, c, t] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for _ in 5..15 {
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+        }
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&(pixels.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&next.to_le_bytes());
+        bytes.extend_from_slice(pixels);
+
+        bytes.extend_from_slice(&124i32.to_le_bytes());
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        for _ in 0..5 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn imspector_native_multi_stack_exposes_one_series_per_stack() {
+        // Two linked native v1 stacks with different dimensions: the file
+        // header points at the first stack, whose `next` points at the second.
+        let stack1_pixels = vec![10u8, 11, 12, 13, 14, 15, 16, 17, 18];
+        let header_len = 32usize;
+        // The encoded `next` value does not change the block length, so the
+        // second stack starts at header_len + len(first block).
+        let block_len = native_v1_stack_block(2, 2, 2, 1, 1, 0, &[1, 2, 3, 4, 5, 6, 7, 8]).len();
+        let next_offset = (header_len + block_len) as i64;
+        let stack0 =
+            native_v1_stack_block(2, 2, 2, 1, 1, next_offset, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let stack1 = native_v1_stack_block(3, 3, 1, 1, 1, 0, &stack1_pixels);
+
+        let mut bytes = imspector_header(1);
+        bytes.extend_from_slice(&(header_len as u64).to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(header_len, 0);
+        bytes.extend_from_slice(&stack0);
+        bytes.extend_from_slice(&stack1);
+
+        let path = temp_path("native_multi_stack.obf");
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+
+        reader.set_series(0).unwrap();
+        assert_eq!(reader.series(), 0);
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_z, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.series(), 1);
+        assert_eq!(reader.metadata().size_x, 3);
+        assert_eq!(reader.metadata().size_y, 3);
+        assert_eq!(reader.metadata().image_count, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), stack1_pixels);
+
+        assert!(matches!(
+            reader.set_series(2),
+            Err(BioFormatsError::SeriesOutOfRange(2))
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_native_multi_stack_rejects_out_of_range_next_pointer() {
+        let stack0 = native_v1_stack_block(2, 2, 1, 1, 1, i64::MAX, &[1, 2, 3, 4]);
+        let header_len = 32usize;
+        let mut bytes = imspector_header(1);
+        bytes.extend_from_slice(&(header_len as u64).to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(header_len, 0);
+        bytes.extend_from_slice(&stack0);
+
+        let path = temp_path("native_multi_stack_bad_next.obf");
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::Format(message)
+                if message.contains("next stack offset is out of range")
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn native_v1_stack_with_description(
+        lengths: [f64; 5],
+        offsets: [f64; 5],
+        name: &str,
+        description: &str,
+        pixels: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = imspector_header(1);
+        let stack_offset = 32u64;
+        bytes.extend_from_slice(&stack_offset.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(stack_offset as usize, 0);
+
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        for size in [2i32, 2, 1, 1, 1] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for _ in 5..15 {
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+        }
+        // 15 Lengths doubles (first 5 meaningful) then 15 Offsets doubles.
+        for d in 0..15 {
+            let value = lengths.get(d).copied().unwrap_or(0.0);
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for d in 0..15 {
+            let value = offsets.get(d).copied().unwrap_or(0.0);
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&(name.len() as i32).to_le_bytes());
+        bytes.extend_from_slice(&(description.len() as i32).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&(pixels.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(description.as_bytes());
+        bytes.extend_from_slice(pixels);
+
+        bytes.extend_from_slice(&124i32.to_le_bytes());
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        for _ in 0..5 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn imspector_native_initstack_metadata_is_translated() {
+        use crate::common::metadata::MetadataValue;
+        // documentElement (doc) -> root -> TimeLapse (nodeName) -> Active/Step
+        // (grandchild keys). Java renames `<Time Lapse ` to `<TimeLapse `.
+        let description = "<doc><root><Time Lapse mode=\"on\"><Active>1</Active>\
+            <Step>0.5</Step></Time Lapse></root></doc>";
+        let bytes = native_v1_stack_with_description(
+            [2.0, 4.0, 0.0, 0.0, 0.0],
+            [1.5, 2.5, 0.0, 0.0, 0.0],
+            "stack-name",
+            description,
+            &[9u8, 8, 7, 6],
+        );
+        let path = temp_path("native_v1_initstack_meta.obf");
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+
+        // Stack version is recorded faithfully to OBFReader.initStack.
+        match meta.series_metadata.get("Stack version") {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 1),
+            other => panic!("unexpected Stack version metadata: {other:?}"),
+        }
+        // Lengths / Offsets arrays (first numberOfDimensions entries).
+        match meta.series_metadata.get("Lengths") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "2, 4, 0, 0, 0"),
+            other => panic!("unexpected Lengths metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("Offsets") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "1.5, 2.5, 0, 0, 0"),
+            other => panic!("unexpected Offsets metadata: {other:?}"),
+        }
+        // Stack Name.
+        match meta.series_metadata.get("Name") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "stack-name"),
+            other => panic!("unexpected Name metadata: {other:?}"),
+        }
+        // Time-Lapse XML grandchildren keyed `nodeName + " " + key`.
+        match meta.series_metadata.get("TimeLapse Active") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "1"),
+            other => panic!("unexpected TimeLapse Active metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("TimeLapse Step") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "0.5"),
+            other => panic!("unexpected TimeLapse Step metadata: {other:?}"),
+        }
+        // Physical sizes derived from Lengths / dimension size (length<0.01 is
+        // treated as metres; here both are plain micrometres).
+        match meta.series_metadata.get("PhysicalSizeX") {
+            Some(MetadataValue::Float(v)) => assert!((*v - 1.0).abs() < 1e-9),
+            other => panic!("unexpected PhysicalSizeX metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 8, 7, 6]);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,12 +3876,22 @@ fn hamamatsu_vms_parse_index(bytes: &[u8]) -> Result<HashMap<String, String>> {
                 key.as_str(),
                 "nolayers"
                     | "no_layers"
+                    | "nojpegcolumns"
+                    | "nojpegrows"
                     | "imagefile"
+                    | "imagefilename"
+                    | "imagename"
+                    | "imagepath"
                     | "mapfile"
+                    | "mapfilename"
+                    | "mapimage"
+                    | "mapimagefile"
                     | "optimisationfile"
                     | "optimizationfile"
                     | "physicalwidth"
                     | "physicalheight"
+                    | "macroimage"
+                    | "macroimagefile"
                     | "hamamatsu"
             ) {
                 saw_vms_key = true;
@@ -1718,6 +3945,67 @@ fn hamamatsu_vms_push_key(keys: &mut Vec<String>, key: String) {
     }
 }
 
+fn hamamatsu_vms_clean_path(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(trimmed)
+        .trim()
+}
+
+fn hamamatsu_vms_resolve_sidecar_path(parent: &Path, value: &str) -> PathBuf {
+    let cleaned = hamamatsu_vms_clean_path(value);
+    if cleaned.is_empty() {
+        return parent.join(cleaned);
+    }
+
+    let path = Path::new(cleaned);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        parent.join(path)
+    };
+    if joined.is_file() {
+        return joined;
+    }
+
+    let basename = cleaned
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(cleaned);
+    if basename != cleaned {
+        let fallback = parent.join(basename);
+        if fallback.is_file() {
+            return fallback;
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        let mut matches = entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(basename))
+            })
+            .map(|entry| entry.path());
+        if let Some(first) = matches.next() {
+            if matches.next().is_none() {
+                return first;
+            }
+        }
+    }
+
+    joined
+}
+
 fn hamamatsu_vms_tile_key_candidates(
     prefix: &str,
     layer: u32,
@@ -1738,6 +4026,15 @@ fn hamamatsu_vms_tile_key_candidates(
         hamamatsu_vms_push_key(&mut keys, format!("{prefix}[{row}][{col}]"));
         hamamatsu_vms_push_key(&mut keys, format!("{prefix}_{col}_{row}"));
         hamamatsu_vms_push_key(&mut keys, format!("{prefix}_{row}_{col}"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}column{col}row{row}"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}row{row}column{col}"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}col{col}row{row}"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}row{row}col{col}"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}x{col}y{row}"));
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}y{row}x{col}"));
+    }
+    if layer == 0 && row == 0 {
+        hamamatsu_vms_push_key(&mut keys, format!("{prefix}{col}"));
     }
     if col == 0 && row == 0 {
         hamamatsu_vms_push_key(&mut keys, format!("{prefix}({layer})"));
@@ -1766,10 +4063,12 @@ fn hamamatsu_vms_tile_value<'a>(
     col: u32,
     row: u32,
 ) -> Option<&'a String> {
-    let keys = hamamatsu_vms_tile_key_candidates("imagefile", layer, col, row, true);
-    for key in &keys {
-        if let Some(value) = values.get(key) {
-            return Some(value);
+    for prefix in ["imagefile", "imagefilename", "imagename", "imagepath"] {
+        let keys = hamamatsu_vms_tile_key_candidates(prefix, layer, col, row, true);
+        for key in &keys {
+            if let Some(value) = values.get(key) {
+                return Some(value);
+            }
         }
     }
     None
@@ -1880,7 +4179,13 @@ impl HamamatsuVmsJpegMarkerMetadata {
 
     fn icc_complete(&self) -> bool {
         match (self.icc_declared_chunks, self.icc_profile.as_ref()) {
-            (Some(count), Some(_)) => count == self.icc_seen_chunks && count > 0,
+            (Some(count), Some(_)) => {
+                count == self.icc_seen_chunks
+                    && count > 0
+                    && self.icc_missing_chunks == 0
+                    && self.icc_invalid_chunks == 0
+                    && self.icc_duplicate_chunks == 0
+            }
             _ => false,
         }
     }
@@ -2028,7 +4333,11 @@ fn hamamatsu_vms_parse_jpeg_marker_metadata(path: &Path) -> Result<HamamatsuVmsJ
         meta.icc_missing_chunks = (1..=count)
             .filter(|seq| !icc_chunks.contains_key(seq))
             .count() as u8;
-        if meta.icc_seen_chunks == count && meta.icc_missing_chunks == 0 {
+        if meta.icc_seen_chunks == count
+            && meta.icc_missing_chunks == 0
+            && meta.icc_invalid_chunks == 0
+            && meta.icc_duplicate_chunks == 0
+        {
             let total_len = (1..=count)
                 .filter_map(|seq| icc_chunks.get(&seq))
                 .map(Vec::len)
@@ -2171,6 +4480,43 @@ fn hamamatsu_vms_insert_jpeg_metadata(
     Ok(())
 }
 
+fn hamamatsu_vms_insert_capability_diagnostics(
+    metadata: &mut HashMap<String, MetadataValue>,
+    pixel_prefix: &str,
+) {
+    metadata.insert(
+        "VMS tile key aliases supported".into(),
+        MetadataValue::String(
+            "ImageFile, ImageFileName, ImageName, ImagePath with plain, (), [], [][ ], _, label-based row/column or x/y, and single-row zero-based numeric suffix coordinate forms".into(),
+        ),
+    );
+    metadata.insert(
+        "VMS associated image key aliases supported".into(),
+        MetadataValue::String(
+            "MacroImage, MacroImageFile, MacroImageName, MapFile, MapFileName, MapImage, MapImageFile"
+                .into(),
+        ),
+    );
+    metadata.insert(
+        "VMS unsupported tile key alias handling".into(),
+        MetadataValue::String(
+            "unrecognized tile aliases are not guessed; missing tiles fail with the unresolved layer/key"
+                .into(),
+        ),
+    );
+    metadata.insert(
+        format!("{pixel_prefix} JPEG decoded pixel formats"),
+        MetadataValue::String("RGB24, L8 expanded to RGB, CMYK32 converted to RGB".into()),
+    );
+    metadata.insert(
+        format!("{pixel_prefix} JPEG unsupported color handling"),
+        MetadataValue::String(
+            "other decoder pixel formats and ICC/profile transforms are reported but not applied"
+                .into(),
+        ),
+    );
+}
+
 fn hamamatsu_vms_parse_optional_index(path: &Path) -> Result<HashMap<String, String>> {
     let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| {
@@ -2251,12 +4597,24 @@ fn hamamatsu_vms_decode_jpeg(path: &Path, scale_denom: u32) -> Result<(u32, u32,
         }
         jpeg_decoder::PixelFormat::CMYK32 => hamamatsu_vms_cmyk_to_rgb(&data),
         other => {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "Hamamatsu VMS JPEG tile pixel format {other:?} is unsupported"
-            )));
+            return Err(hamamatsu_vms_unsupported_jpeg_pixel_format_error(
+                other, path,
+            ));
         }
     };
     Ok((info.width as u32, info.height as u32, rgb))
+}
+
+fn hamamatsu_vms_unsupported_jpeg_pixel_format_error(
+    pixel_format: jpeg_decoder::PixelFormat,
+    path: &Path,
+) -> BioFormatsError {
+    BioFormatsError::UnsupportedFormat(format!(
+        "Hamamatsu VMS JPEG tile pixel format {pixel_format:?} is unsupported for RGB output; \
+         supported decoder pixel formats are RGB24, L8 expanded to RGB, and CMYK32 converted to RGB; \
+         ICC/profile transforms are preserved as metadata only and are not applied: {}",
+        path.display()
+    ))
 }
 
 struct HamamatsuVmsDecodedJpegBand {
@@ -2446,7 +4804,7 @@ where
                         "Hamamatsu VMS missing layer {layer} {key}"
                     ))
                 })?;
-                let tile_path = parent.join(name);
+                let tile_path = hamamatsu_vms_resolve_sidecar_path(parent, name);
                 let (width, height) = hamamatsu_vms_jpeg_dimensions(&tile_path)?;
                 col_widths[col as usize] = col_widths[col as usize].max(width);
                 row_heights[row as usize] = row_heights[row as usize].max(height);
@@ -2561,6 +4919,7 @@ pub struct HamamatsuVmsReader {
     series: Vec<HamamatsuVmsSeries>,
     current_series: usize,
     current_resolution: usize,
+    metadata_level: MetadataLevel,
 }
 
 impl HamamatsuVmsReader {
@@ -2570,6 +4929,7 @@ impl HamamatsuVmsReader {
             series: Vec::new(),
             current_series: 0,
             current_resolution: 0,
+            metadata_level: MetadataLevel::All,
         }
     }
 }
@@ -2686,6 +5046,18 @@ impl FormatReader for HamamatsuVmsReader {
             "VMS series kind".into(),
             MetadataValue::String("full resolution".into()),
         );
+        // Java initFile reads SourceLens as the objective nominal magnification and
+        // (outside MINIMUM) attaches it to an Instrument/Objective on series 0 only.
+        if let Some(magnification) = values
+            .get("sourcelens")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            full_metadata.insert(
+                "VMS source_lens_magnification".into(),
+                MetadataValue::Float(magnification),
+            );
+        }
         if let (Some(physical_width), true) = (
             values
                 .get("physicalwidth")
@@ -2716,6 +5088,7 @@ impl FormatReader for HamamatsuVmsReader {
         {
             hamamatsu_vms_insert_jpeg_metadata(&mut full_metadata, "VMS tile", &first_tile_path)?;
         }
+        hamamatsu_vms_insert_capability_diagnostics(&mut full_metadata, "VMS tile");
         let mut pyramid_metadata = Vec::with_capacity(pyramid_sizes.len());
         for (resolution, (size_x, size_y)) in pyramid_sizes.iter().copied().enumerate() {
             let mut metadata = full_metadata.clone();
@@ -2775,6 +5148,7 @@ impl FormatReader for HamamatsuVmsReader {
             pixels: HamamatsuVmsPixels::TilePyramid(pyramid_tiles),
         });
 
+        let mut associated_kinds = Vec::new();
         for (kind, key, physical_width_key, physical_height_key) in [
             (
                 "macro",
@@ -2782,16 +5156,36 @@ impl FormatReader for HamamatsuVmsReader {
                 "physicalmacrowidth",
                 "physicalmacroheight",
             ),
+            (
+                "macro",
+                "macroimagefile",
+                "physicalmacrowidth",
+                "physicalmacroheight",
+            ),
+            (
+                "macro",
+                "macroimagename",
+                "physicalmacrowidth",
+                "physicalmacroheight",
+            ),
             ("map", "mapfile", "", ""),
+            ("map", "mapfilename", "", ""),
+            ("map", "mapimage", "", ""),
+            ("map", "mapimagefile", "", ""),
         ] {
+            if associated_kinds.contains(&kind) {
+                continue;
+            }
             let Some(name) = values.get(key) else {
                 continue;
             };
-            let image_path = parent.join(name);
+            let image_path = hamamatsu_vms_resolve_sidecar_path(parent, name);
             let (size_x, size_y) = hamamatsu_vms_jpeg_dimensions(&image_path)?;
+            associated_kinds.push(kind);
             let mut series_metadata = base_series_metadata.clone();
             series_metadata.insert("VMS series kind".into(), MetadataValue::String(kind.into()));
             hamamatsu_vms_insert_jpeg_metadata(&mut series_metadata, "VMS image", &image_path)?;
+            hamamatsu_vms_insert_capability_diagnostics(&mut series_metadata, "VMS image");
             if let (Some(physical_width), true) = (
                 values
                     .get(physical_width_key)
@@ -2855,6 +5249,10 @@ impl FormatReader for HamamatsuVmsReader {
         Ok(())
     }
 
+    fn set_metadata_options(&mut self, options: MetadataOptions) {
+        self.metadata_level = options.level;
+    }
+
     fn series_count(&self) -> usize {
         self.series.len()
     }
@@ -2890,6 +5288,70 @@ impl FormatReader for HamamatsuVmsReader {
         }
 
         let mut ome = OmeMetadata::from_image_metadata(meta);
+
+        // Java initFile sets the image name from the index file's base name plus a
+        // suffix that depends on the series kind ("full resolution"/"macro"/"map").
+        let base_name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        let kind = match meta.series_metadata.get("VMS series kind") {
+            Some(MetadataValue::String(kind)) => kind.as_str(),
+            _ => "full resolution",
+        };
+        if let (Some(base_name), Some(image)) = (base_name.as_ref(), ome.images.get_mut(0)) {
+            image.name = Some(format!("{base_name} {kind}"));
+        }
+
+        // Java guards physical sizes, instrument and objective behind a
+        // non-MINIMUM metadata level. Physical sizes apply to the full resolution
+        // (series 0) and macro (series 1); the instrument/objective applies to
+        // series 0 only.
+        if self.metadata_level != MetadataLevel::Minimal {
+            if kind == "full resolution" || kind == "macro" {
+                if let Some(image) = ome.images.get_mut(0) {
+                    if let Some(MetadataValue::Float(size_x)) =
+                        meta.series_metadata.get("VMS physical_size_x")
+                    {
+                        if size_x.is_finite() && *size_x > 0.0 {
+                            image.physical_size_x = Some(*size_x);
+                        }
+                    }
+                    if let Some(MetadataValue::Float(size_y)) =
+                        meta.series_metadata.get("VMS physical_size_y")
+                    {
+                        if size_y.is_finite() && *size_y > 0.0 {
+                            image.physical_size_y = Some(*size_y);
+                        }
+                    }
+                }
+            }
+            if kind == "full resolution" {
+                let magnification = match meta.series_metadata.get("VMS source_lens_magnification") {
+                    Some(MetadataValue::Float(value))
+                        if value.is_finite() && *value > 0.0 =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                };
+                ome.instruments.push(OmeInstrument {
+                    id: Some(create_lsid("Instrument", &[0])),
+                    objectives: vec![OmeObjective {
+                        id: Some(create_lsid("Objective", &[0, 0])),
+                        nominal_magnification: magnification,
+                        ..OmeObjective::default()
+                    }],
+                    ..OmeInstrument::default()
+                });
+                if let Some(image) = ome.images.get_mut(0) {
+                    image.instrument_ref = Some(0);
+                    image.objective_ref = Some(0);
+                }
+            }
+        }
+
         let _ = ome.add_original_metadata_annotations(meta, 0);
         Some(ome)
     }
@@ -3067,7 +5529,7 @@ impl FormatReader for HamamatsuVmsReader {
 mod hamamatsu_vms_tests {
     use super::HamamatsuVmsReader;
     use crate::common::error::BioFormatsError;
-    use crate::common::metadata::MetadataValue;
+    use crate::common::metadata::{MetadataLevel, MetadataOptions, MetadataValue};
     use crate::common::ome_metadata::OmeAnnotation;
     use crate::common::pixel_type::PixelType;
     use crate::common::reader::FormatReader;
@@ -3139,6 +5601,24 @@ mod hamamatsu_vms_tests {
         segment.extend_from_slice(&[2, 1]);
         segment.extend_from_slice(icc);
         bytes.splice(2..2, segment);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_rgb_jpeg_with_duplicate_icc_sequence(path: &std::path::Path, rgb: [u8; 3]) {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 100)
+            .encode(&rgb, 1, 1, image::ColorType::Rgb8.into())
+            .unwrap();
+        let mut segments = Vec::new();
+        for icc in [b"first".as_slice(), b"second".as_slice()] {
+            let app2_len = 2 + 14 + icc.len();
+            segments.extend_from_slice(&[0xff, 0xe2]);
+            segments.extend_from_slice(&(app2_len as u16).to_be_bytes());
+            segments.extend_from_slice(b"ICC_PROFILE\0");
+            segments.extend_from_slice(&[1, 1]);
+            segments.extend_from_slice(icc);
+        }
+        bytes.splice(2..2, segments);
         std::fs::write(path, bytes).unwrap();
     }
 
@@ -3276,6 +5756,106 @@ mod hamamatsu_vms_tests {
     }
 
     #[test]
+    fn hamamatsu_vms_populates_image_names_physical_sizes_and_objective() {
+        let path = temp_path("ome.vms");
+        let tile0 = temp_path("ome_tile.jpg");
+        let macro_image = temp_path("ome_macro.jpg");
+        let map_image = temp_path("ome_map.jpg");
+        write_rgb_jpeg_pixels(&tile0, 2, 1, &[240, 10, 20, 30, 220, 40]);
+        write_rgb_jpeg_pixels(&macro_image, 2, 1, &[10, 200, 20, 210, 20, 30]);
+        write_rgb_jpeg(&map_image, [80, 90, 100]);
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=2\n",
+                    "NoJpegRows=1\n",
+                    "ImageFile={}\n",
+                    "ImageFile(1,0)={}\n",
+                    "MacroImage={}\n",
+                    "MapFile={}\n",
+                    "PhysicalWidth=4\n",
+                    "PhysicalHeight=1\n",
+                    "PhysicalMacroWidth=8\n",
+                    "PhysicalMacroHeight=2\n",
+                    "SourceLens=20\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile0.file_name().unwrap().to_string_lossy(),
+                macro_image.file_name().unwrap().to_string_lossy(),
+                map_image.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let base_name = path.file_name().unwrap().to_string_lossy().into_owned();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+
+        // Series 0: full resolution name, physical sizes, and objective magnification.
+        let ome0 = reader.ome_metadata().unwrap();
+        let image0 = &ome0.images[0];
+        assert_eq!(image0.name.as_deref(), Some(format!("{base_name} full resolution").as_str()));
+        assert!((image0.physical_size_x.unwrap() - 1.0).abs() < 0.0001);
+        assert!((image0.physical_size_y.unwrap() - 1.0).abs() < 0.0001);
+        assert_eq!(image0.instrument_ref, Some(0));
+        assert_eq!(image0.objective_ref, Some(0));
+        assert_eq!(ome0.instruments.len(), 1);
+        assert!(
+            (ome0.instruments[0].objectives[0]
+                .nominal_magnification
+                .unwrap()
+                - 20.0)
+                .abs()
+                < 0.0001
+        );
+
+        // Series 1: macro name, physical sizes, but no instrument/objective.
+        reader.set_series(1).unwrap();
+        let ome1 = reader.ome_metadata().unwrap();
+        let image1 = &ome1.images[0];
+        assert_eq!(image1.name.as_deref(), Some(format!("{base_name} macro").as_str()));
+        assert!((image1.physical_size_x.unwrap() - 4.0).abs() < 0.0001);
+        assert!((image1.physical_size_y.unwrap() - 2.0).abs() < 0.0001);
+        assert!(image1.instrument_ref.is_none());
+        assert!(ome1.instruments.is_empty());
+
+        // Series 2: map name, no physical sizes, no instrument.
+        reader.set_series(2).unwrap();
+        let ome2 = reader.ome_metadata().unwrap();
+        let image2 = &ome2.images[0];
+        assert_eq!(image2.name.as_deref(), Some(format!("{base_name} map").as_str()));
+        assert!(image2.physical_size_x.is_none());
+        assert!(ome2.instruments.is_empty());
+
+        // MINIMUM metadata level suppresses physical sizes and the objective,
+        // but the image name is still set (matching Java initFile).
+        let mut minimal = HamamatsuVmsReader::new();
+        minimal.set_metadata_options(MetadataOptions {
+            level: MetadataLevel::Minimal,
+            original_metadata: true,
+        });
+        minimal.set_id(&path).unwrap();
+        let min_ome = minimal.ome_metadata().unwrap();
+        let min_image = &min_ome.images[0];
+        assert_eq!(
+            min_image.name.as_deref(),
+            Some(format!("{base_name} full resolution").as_str())
+        );
+        assert!(min_image.physical_size_x.is_none());
+        assert!(min_image.physical_size_y.is_none());
+        assert!(min_image.instrument_ref.is_none());
+        assert!(min_ome.instruments.is_empty());
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(macro_image);
+        let _ = std::fs::remove_file(map_image);
+    }
+
+    #[test]
     fn hamamatsu_vms_reads_layer_key_with_column_layer_row_order() {
         let path = temp_path("layer_key_variants.vms");
         let tile0 = temp_path("layer_key_variants_l0.jpg");
@@ -3354,6 +5934,86 @@ mod hamamatsu_vms_tests {
     }
 
     #[test]
+    fn hamamatsu_vms_reads_single_row_numeric_suffix_tile_aliases() {
+        let path = temp_path("numeric_suffix_tile_aliases.vms");
+        let tile0 = temp_path("numeric_suffix_tile_aliases_0.jpg");
+        let tile1 = temp_path("numeric_suffix_tile_aliases_1.jpg");
+        write_rgb_jpeg(&tile0, [240, 10, 20]);
+        write_rgb_jpeg(&tile1, [20, 30, 240]);
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=2\n",
+                    "NoJpegRows=1\n",
+                    "ImageFile0={}\n",
+                    "ImageFile1={}\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile1.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("VMS tile key aliases supported"),
+            Some(MetadataValue::String(v))
+                if v.contains("single-row zero-based numeric suffix")
+        ));
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane.len(), 6);
+        assert!(plane[0] > plane[2], "{plane:?}");
+        assert!(plane[5] > plane[3], "{plane:?}");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(tile1);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reads_image_name_alias_and_windows_sidecar_basename() {
+        let path = temp_path("image_name_alias.vms");
+        let tile0 = temp_path("image_name_alias_0.jpg");
+        let tile1 = temp_path("image_name_alias_1.jpg");
+        write_rgb_jpeg(&tile0, [240, 10, 20]);
+        write_rgb_jpeg(&tile1, [20, 30, 240]);
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=2\n",
+                    "NoJpegRows=1\n",
+                    "ImageName=\"C:\\scan\\{}\"\n",
+                    "ImageFileName(1,0)='D:\\other\\{}'\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile1.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane.len(), 6);
+        assert!(plane[0] > plane[2], "{plane:?}");
+        assert!(plane[5] > plane[3], "{plane:?}");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(tile1);
+    }
+
+    #[test]
     fn hamamatsu_vms_reads_two_index_row_column_tile_key_variant() {
         let path = temp_path("row_column_tile_key_variant.vms");
         let tile0 = temp_path("row_column_tile_key_variant_0.jpg");
@@ -3387,6 +6047,103 @@ mod hamamatsu_vms_tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(tile0);
         let _ = std::fs::remove_file(tile1);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reads_label_based_row_column_tile_key_variants() {
+        let path = temp_path("label_based_tile_key_variant.vms");
+        let tile0 = temp_path("label_based_tile_key_variant_0.jpg");
+        let tile1 = temp_path("label_based_tile_key_variant_1.jpg");
+        write_rgb_jpeg(&tile0, [240, 10, 20]);
+        write_rgb_jpeg(&tile1, [20, 30, 240]);
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=2\n",
+                    "NoJpegRows=1\n",
+                    "ImageFileRow0Column0={}\n",
+                    "ImageFileColumn1Row0={}\n"
+                ),
+                tile0.file_name().unwrap().to_string_lossy(),
+                tile1.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("VMS tile key aliases supported"),
+            Some(MetadataValue::String(v)) if v.contains("label-based row/column")
+        ));
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane.len(), 6);
+        assert!(plane[0] > plane[2], "{plane:?}");
+        assert!(plane[5] > plane[3], "{plane:?}");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile0);
+        let _ = std::fs::remove_file(tile1);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reads_macro_and_map_image_aliases_once() {
+        let path = temp_path("associated_aliases.vms");
+        let tile = temp_path("associated_aliases_tile.jpg");
+        let macro_image = temp_path("associated_aliases_macro.jpg");
+        let map_image = temp_path("associated_aliases_map.jpg");
+        write_rgb_jpeg(&tile, [240, 10, 20]);
+        write_rgb_jpeg(&macro_image, [20, 220, 30]);
+        write_rgb_jpeg(&map_image, [20, 30, 240]);
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=1\n",
+                    "NoJpegRows=1\n",
+                    "ImageFile={}\n",
+                    "MacroImageFile={}\n",
+                    "MacroImageName={}\n",
+                    "MapImageFile={}\n"
+                ),
+                tile.file_name().unwrap().to_string_lossy(),
+                macro_image.file_name().unwrap().to_string_lossy(),
+                macro_image.file_name().unwrap().to_string_lossy(),
+                map_image.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 3);
+        reader.set_series(1).unwrap();
+        assert!(matches!(
+            reader.metadata().series_metadata.get("VMS series kind"),
+            Some(MetadataValue::String(v)) if v == "macro"
+        ));
+        let macro_plane = reader.open_bytes(0).unwrap();
+        assert!(macro_plane[1] > macro_plane[0], "{macro_plane:?}");
+
+        reader.set_series(2).unwrap();
+        assert!(matches!(
+            reader.metadata().series_metadata.get("VMS series kind"),
+            Some(MetadataValue::String(v)) if v == "map"
+        ));
+        let map_plane = reader.open_bytes(0).unwrap();
+        assert!(map_plane[2] > map_plane[0], "{map_plane:?}");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile);
+        let _ = std::fs::remove_file(macro_image);
+        let _ = std::fs::remove_file(map_image);
     }
 
     #[test]
@@ -3457,6 +6214,53 @@ mod hamamatsu_vms_tests {
         assert!(matches!(
             metadata.get("VMS tile JPEG ICC profile applied"),
             Some(MetadataValue::Bool(false))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG decoded pixel formats"),
+            Some(MetadataValue::String(v))
+                if v == "RGB24, L8 expanded to RGB, CMYK32 converted to RGB"
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG unsupported color handling"),
+            Some(MetadataValue::String(v))
+                if v == "other decoder pixel formats and ICC/profile transforms are reported but not applied"
+        ));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile);
+    }
+
+    #[test]
+    fn hamamatsu_vms_reports_bounded_tile_alias_capabilities() {
+        let path = temp_path("tile_alias_diagnostics.vms");
+        let tile = temp_path("tile_alias_diagnostics.jpg");
+        write_rgb_jpeg(&tile, [240, 10, 20]);
+        std::fs::write(
+            &path,
+            format!(
+                "NoLayers=1\nNoJpegColumns=1\nNoJpegRows=1\nImageFileName={}\n",
+                tile.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("VMS tile key aliases supported"),
+            Some(MetadataValue::String(v))
+                if v.contains("ImageFileName") && v.contains("ImagePath")
+        ));
+        assert!(matches!(
+            metadata.get("VMS associated image key aliases supported"),
+            Some(MetadataValue::String(v))
+                if v.contains("MacroImageFile") && v.contains("MapImageFile")
+        ));
+        assert!(matches!(
+            metadata.get("VMS unsupported tile key alias handling"),
+            Some(MetadataValue::String(v))
+                if v.contains("unrecognized tile aliases are not guessed")
         ));
 
         let _ = std::fs::remove_file(path);
@@ -3567,6 +6371,63 @@ mod hamamatsu_vms_tests {
     }
 
     #[test]
+    fn hamamatsu_vms_reports_duplicate_icc_sequence_without_complete_profile() {
+        let path = temp_path("jpeg_duplicate_icc.vms");
+        let tile = temp_path("jpeg_duplicate_icc.jpg");
+        write_rgb_jpeg_with_duplicate_icc_sequence(&tile, [240, 10, 20]);
+        std::fs::write(
+            &path,
+            format!(
+                "NoLayers=1\nNoJpegColumns=1\nNoJpegRows=1\nImageFile={}\n",
+                tile.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC profile complete"),
+            Some(MetadataValue::Bool(false))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG color management"),
+            Some(MetadataValue::String(v))
+                if v == "incomplete icc profile markers preserved but not applied"
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC markers present"),
+            Some(MetadataValue::Bool(true))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC declared chunks"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC seen chunks"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC missing chunks"),
+            Some(MetadataValue::Int(0))
+        ));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC duplicate chunks"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(!metadata.contains_key("VMS tile JPEG ICC profile"));
+        assert!(!metadata.contains_key("VMS tile JPEG ICC profile bytes"));
+        assert!(matches!(
+            metadata.get("VMS tile JPEG ICC profile applied"),
+            Some(MetadataValue::Bool(false))
+        ));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile);
+    }
+
+    #[test]
     fn hamamatsu_vms_expands_grayscale_jpeg_tiles_to_rgb() {
         let path = temp_path("gray_tile.vms");
         let tile = temp_path("gray_tile.jpg");
@@ -3624,6 +6485,26 @@ mod hamamatsu_vms_tests {
                 0, 0, 255, // yellow ink absent
                 0, 0, 0, // black ink only
             ]
+        );
+    }
+
+    #[test]
+    fn hamamatsu_vms_reports_unsupported_jpeg_pixel_format_policy() {
+        let path = temp_path("unsupported_l16_pixel_format.jpg");
+        let err = super::hamamatsu_vms_unsupported_jpeg_pixel_format_error(
+            jpeg_decoder::PixelFormat::L16,
+            &path,
+        );
+        assert!(
+            matches!(
+                err,
+                BioFormatsError::UnsupportedFormat(ref message)
+                    if message.contains("L16")
+                        && message.contains("supported decoder pixel formats are RGB24, L8 expanded to RGB, and CMYK32 converted to RGB")
+                        && message.contains("ICC/profile transforms are preserved as metadata only and are not applied")
+                        && message.contains("unsupported_l16_pixel_format.jpg")
+            ),
+            "{err:?}"
         );
     }
 
@@ -3845,19 +6726,25 @@ mod hamamatsu_vms_tests {
 /// starting at offset 52. A `.dib` file is the same layout but not compressed.
 pub struct CellomicsReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    metas: Vec<ImageMetadata>,
+    current_series: usize,
     pixel_offset: u64,
     /// Decoded (decompressed for .c01, raw for .dib) file bytes.
     data: Vec<u8>,
+    series_sources: Vec<Vec<CellomicsDecodedSource>>,
+    series_planes: Vec<Vec<CellomicsPlaneSource>>,
 }
 
 impl CellomicsReader {
     pub fn new() -> Self {
         CellomicsReader {
             path: None,
-            meta: None,
+            metas: Vec::new(),
+            current_series: 0,
             pixel_offset: 52,
             data: Vec::new(),
+            series_sources: Vec::new(),
+            series_planes: Vec::new(),
         }
     }
 }
@@ -3889,6 +6776,185 @@ fn parse_legacy_cellomics_header(data: &[u8]) -> Result<(u32, u32, u32, PixelTyp
     Ok((w, h, 1, pt, bpp, 52))
 }
 
+#[derive(Debug, Clone)]
+struct CellomicsParsedHeader {
+    width: u32,
+    height: u32,
+    image_count: u32,
+    pixel_type: PixelType,
+    bits_per_pixel: u8,
+    pixel_offset: u64,
+    dib_header_size: Option<u32>,
+    dib_planes: u32,
+    dib_compression: Option<u32>,
+    dib_top_down: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct CellomicsDecodedSource {
+    path: PathBuf,
+    data: Vec<u8>,
+    pixel_offset: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CellomicsPlaneSource {
+    source_index: usize,
+    plane_index: u32,
+    channel_index: Option<u32>,
+}
+
+#[derive(Debug)]
+struct CellomicsPlateSeries {
+    sources: Vec<CellomicsDecodedSource>,
+    planes: Vec<CellomicsPlaneSource>,
+    metadata: HashMap<String, MetadataValue>,
+}
+
+#[derive(Debug)]
+struct CellomicsPlateAssembly {
+    series: Vec<CellomicsPlateSeries>,
+}
+
+#[derive(Debug)]
+struct CellomicsCandidate {
+    path: PathBuf,
+    metadata: CellomicsFilenameMetadata,
+    data: Vec<u8>,
+    header: CellomicsParsedHeader,
+    row: u32,
+    col: u32,
+    field: u32,
+    channel: u32,
+}
+
+fn decode_cellomics_file(path: &Path) -> Result<Vec<u8>> {
+    let raw = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    let is_c01 = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("c01"))
+        .unwrap_or(false);
+    if is_c01 {
+        if raw.len() < 4 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Cellomics C01 file is too short to contain a magic number".into(),
+            ));
+        }
+        crate::common::codec::decompress_deflate(&raw[4..]).map_err(|_| {
+            BioFormatsError::UnsupportedFormat(
+                "Cellomics C01 zlib payload could not be decompressed".into(),
+            )
+        })
+    } else {
+        Ok(raw)
+    }
+}
+
+fn parse_cellomics_decoded_header(data: &[u8]) -> Result<CellomicsParsedHeader> {
+    let mut dib_header_size_metadata = None;
+    let mut dib_planes_metadata = 1;
+    let mut dib_compression_metadata = None;
+    let mut dib_top_down_metadata = None;
+
+    let (width, height, image_count, pixel_type, bits_per_pixel, pixel_offset) = if data.len() >= 52
+    {
+        let dib_header_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if dib_header_size >= 40 {
+            dib_header_size_metadata = Some(dib_header_size);
+            let raw_w = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            let raw_h = i32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+            let w = raw_w.unsigned_abs();
+            let h = raw_h.unsigned_abs();
+            let n_planes = u16::from_le_bytes([data[12], data[13]]) as u32;
+            let bd = u16::from_le_bytes([data[14], data[15]]);
+            let compression = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+            dib_planes_metadata = n_planes;
+            dib_compression_metadata = Some(compression);
+            dib_top_down_metadata = Some(raw_h < 0);
+            if compression != 0 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Cellomics DIB compressed pixel data is not supported: compression={compression}"
+                    )));
+            }
+            if w == 0 || h == 0 || w > 32768 || h > 32768 {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "Cellomics DIB has invalid dimensions {w}x{h}"
+                )));
+            }
+            let (pt, bpp) = match bd {
+                8 => (PixelType::Uint8, 8u8),
+                16 => (PixelType::Uint16, 16u8),
+                _ => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Cellomics DIB bits per pixel {bd} is not supported"
+                    )));
+                }
+            };
+            let bytes_per_pixel = (bpp / 8) as u64;
+            let image_count = n_planes.max(1);
+            let plane_bytes = (w as u64)
+                .checked_mul(h as u64)
+                .and_then(|n| n.checked_mul(bytes_per_pixel))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Cellomics DIB plane size overflows".to_string())
+                })?;
+            let expected = 52u64
+                .checked_add(plane_bytes.checked_mul(image_count as u64).ok_or_else(|| {
+                    BioFormatsError::Format("Cellomics DIB total pixel size overflows".to_string())
+                })?)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Cellomics DIB file size overflows".to_string())
+                })?;
+            if (data.len() as u64) < expected {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "Cellomics DIB is too short: got {} bytes, expected at least {expected}",
+                    data.len()
+                )));
+            }
+            (w, h, image_count, pt, bpp, 52u64)
+        } else {
+            parse_legacy_cellomics_header(data)?
+        }
+    } else if data.len() >= 10 {
+        parse_legacy_cellomics_header(data)?
+    } else {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Cellomics header is too short to determine image dimensions".to_string(),
+        ));
+    };
+
+    let bytes_per_pixel = (bits_per_pixel / 8) as u64;
+    let plane_bytes = (width as u64)
+        .checked_mul(height as u64)
+        .and_then(|n| n.checked_mul(bytes_per_pixel))
+        .ok_or_else(|| BioFormatsError::Format("Cellomics plane size overflows".to_string()))?;
+    let expected = pixel_offset
+        .checked_add(plane_bytes.checked_mul(image_count as u64).ok_or_else(|| {
+            BioFormatsError::Format("Cellomics total pixel size overflows".to_string())
+        })?)
+        .ok_or_else(|| BioFormatsError::Format("Cellomics file size overflows".to_string()))?;
+    if (data.len() as u64) < expected {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Cellomics pixel payload is shorter than declared image: got {} bytes, expected at least {expected}",
+            data.len()
+        )));
+    }
+
+    Ok(CellomicsParsedHeader {
+        width,
+        height,
+        image_count,
+        pixel_type,
+        bits_per_pixel,
+        pixel_offset,
+        dib_header_size: dib_header_size_metadata,
+        dib_planes: dib_planes_metadata,
+        dib_compression: dib_compression_metadata,
+        dib_top_down: dib_top_down_metadata,
+    })
+}
+
 fn cellomics_plate_prefix(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let bytes = stem.as_bytes();
@@ -3902,6 +6968,321 @@ fn cellomics_plate_prefix(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CellomicsFilenameMetadata {
+    plate: Option<String>,
+    well: Option<String>,
+    field_index: Option<u32>,
+    channel_index: Option<u32>,
+}
+
+fn cellomics_filename_metadata(path: &Path) -> CellomicsFilenameMetadata {
+    let mut parsed = CellomicsFilenameMetadata::default();
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return parsed;
+    };
+    parsed.plate = cellomics_plate_prefix(path);
+
+    let bytes = stem.as_bytes();
+    for i in 0..bytes.len().saturating_sub(3) {
+        if !bytes[i].is_ascii_alphabetic()
+            || !bytes[i + 1].is_ascii_digit()
+            || !bytes[i + 2].is_ascii_digit()
+        {
+            continue;
+        }
+        let well = &stem[i..i + 3];
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let after_ok = i + 3 == bytes.len()
+            || !bytes[i + 3].is_ascii_alphanumeric()
+            || bytes[i + 3] == b'f'
+            || bytes[i + 3] == b'F'
+            || bytes[i + 3] == b'd'
+            || bytes[i + 3] == b'D'
+            || bytes[i + 3] == b'o'
+            || bytes[i + 3] == b'O'
+            || bytes[i + 3] == b'c'
+            || bytes[i + 3] == b'C';
+        if before_ok && after_ok {
+            parsed.well = Some(well.to_ascii_uppercase());
+            let mut rest = &stem[i + 3..];
+            while !rest.is_empty() {
+                let Some(tag) = rest.chars().next() else {
+                    break;
+                };
+                if !matches!(tag, 'f' | 'F' | 'd' | 'D' | 'o' | 'O' | 'c' | 'C') {
+                    break;
+                }
+                let digits_start = tag.len_utf8();
+                let digits_len = rest[digits_start..]
+                    .bytes()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                if digits_len == 0 {
+                    break;
+                }
+                let number = rest[digits_start..digits_start + digits_len]
+                    .parse::<u32>()
+                    .ok();
+                match tag {
+                    'f' | 'F' => parsed.field_index = number,
+                    'd' | 'D' | 'o' | 'O' | 'c' | 'C' => parsed.channel_index = number,
+                    _ => {}
+                }
+                rest = &rest[digits_start + digits_len..];
+            }
+            break;
+        }
+    }
+
+    parsed
+}
+
+fn cellomics_well_row_col(metadata: &CellomicsFilenameMetadata) -> Option<(u32, u32)> {
+    let well = metadata.well.as_deref()?;
+    if well.len() != 3 {
+        return None;
+    }
+    let bytes = well.as_bytes();
+    if !bytes[0].is_ascii_alphabetic() || !bytes[1].is_ascii_digit() || !bytes[2].is_ascii_digit() {
+        return None;
+    }
+    let row = bytes[0].to_ascii_uppercase().checked_sub(b'A')? as u32;
+    let col: u32 = well[1..3].parse().ok()?;
+    if col == 0 {
+        None
+    } else {
+        Some((row, col - 1))
+    }
+}
+
+fn cellomics_headers_match_for_plate_assembly(
+    left: &CellomicsParsedHeader,
+    right: &CellomicsParsedHeader,
+) -> bool {
+    left.image_count == 1
+        && right.image_count == 1
+        && left.width == right.width
+        && left.height == right.height
+        && left.pixel_type == right.pixel_type
+        && left.bits_per_pixel == right.bits_per_pixel
+        && left.pixel_offset == right.pixel_offset
+        && left.dib_header_size == right.dib_header_size
+        && left.dib_compression == right.dib_compression
+}
+
+fn cellomics_supported_pixel_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("c01") || e.eq_ignore_ascii_case("dib"))
+        .unwrap_or(false)
+}
+
+fn cellomics_plate_candidate(
+    path: PathBuf,
+    metadata: CellomicsFilenameMetadata,
+    data: Vec<u8>,
+    header: CellomicsParsedHeader,
+) -> Option<CellomicsCandidate> {
+    let (row, col) = cellomics_well_row_col(&metadata)?;
+    Some(CellomicsCandidate {
+        path,
+        field: metadata.field_index.unwrap_or(0),
+        channel: metadata.channel_index?,
+        metadata,
+        data,
+        header,
+        row,
+        col,
+    })
+}
+
+fn cellomics_plate_assembly(
+    path: &Path,
+    current_metadata: &CellomicsFilenameMetadata,
+    current_data: Vec<u8>,
+    current_header: &CellomicsParsedHeader,
+) -> Option<CellomicsPlateAssembly> {
+    current_metadata.plate.as_ref()?;
+    current_metadata.channel_index?;
+    if current_header.image_count != 1 {
+        return None;
+    }
+    let dir = path.parent()?;
+    let mut candidates = Vec::new();
+    candidates.push(cellomics_plate_candidate(
+        path.to_path_buf(),
+        current_metadata.clone(),
+        current_data,
+        current_header.clone(),
+    )?);
+
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let candidate_path = entry.path();
+        if candidate_path == path || !cellomics_supported_pixel_extension(&candidate_path) {
+            continue;
+        }
+        let parsed = cellomics_filename_metadata(&candidate_path);
+        if parsed.plate != current_metadata.plate || parsed.channel_index.is_none() {
+            continue;
+        }
+        let data = match decode_cellomics_file(&candidate_path) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        let header = match parse_cellomics_decoded_header(&data) {
+            Ok(header) => header,
+            Err(_) => continue,
+        };
+        if !cellomics_headers_match_for_plate_assembly(current_header, &header) {
+            continue;
+        }
+        if let Some(candidate) = cellomics_plate_candidate(candidate_path, parsed, data, header) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.row,
+            candidate.col,
+            candidate.field,
+            candidate.channel,
+            candidate.path.clone(),
+        )
+    });
+    candidates.dedup_by(|a, b| {
+        a.row == b.row && a.col == b.col && a.field == b.field && a.channel == b.channel
+    });
+
+    let mut series = Vec::new();
+    let mut current_key = None;
+    let mut current_group = Vec::new();
+    for candidate in candidates {
+        let key = (candidate.row, candidate.col, candidate.field);
+        if current_key.is_some() && current_key != Some(key) {
+            series.push(cellomics_plate_series_from_group(
+                std::mem::take(&mut current_group),
+                series.len(),
+            ));
+        }
+        current_key = Some(key);
+        current_group.push(candidate);
+    }
+    if !current_group.is_empty() {
+        series.push(cellomics_plate_series_from_group(
+            current_group,
+            series.len(),
+        ));
+    }
+
+    if series.is_empty() {
+        None
+    } else {
+        let series_count = series.len() as i64;
+        if series_count > 1 {
+            for series in &mut series {
+                series.metadata.insert(
+                    "cellomics.plate_assembly".into(),
+                    MetadataValue::String("plate_well_field_filename_series".into()),
+                );
+                series.metadata.insert(
+                    "cellomics.assembled_series_count".into(),
+                    MetadataValue::Int(series_count),
+                );
+            }
+        }
+        Some(CellomicsPlateAssembly { series })
+    }
+}
+
+fn cellomics_plate_series_from_group(
+    group: Vec<CellomicsCandidate>,
+    series_index: usize,
+) -> CellomicsPlateSeries {
+    let mut sources = Vec::with_capacity(group.len());
+    let mut planes = Vec::with_capacity(group.len());
+    let mut metadata = HashMap::new();
+    let row = group.first().map(|candidate| candidate.row).unwrap_or(0);
+    let col = group.first().map(|candidate| candidate.col).unwrap_or(0);
+    let field = group.first().map(|candidate| candidate.field).unwrap_or(0);
+    if let Some(well) = group
+        .first()
+        .and_then(|candidate| candidate.metadata.well.clone())
+    {
+        metadata.insert("cellomics.well".into(), MetadataValue::String(well));
+    }
+    metadata.insert(
+        "cellomics.series_index".into(),
+        MetadataValue::Int(series_index as i64),
+    );
+    metadata.insert("cellomics.well_row".into(), MetadataValue::Int(row as i64));
+    metadata.insert(
+        "cellomics.well_column".into(),
+        MetadataValue::Int(col as i64),
+    );
+    metadata.insert(
+        "cellomics.field_index".into(),
+        MetadataValue::Int(field as i64),
+    );
+
+    for (source_index, candidate) in group.into_iter().enumerate() {
+        let channel = candidate.channel;
+        sources.push(CellomicsDecodedSource {
+            path: candidate.path,
+            data: candidate.data,
+            pixel_offset: candidate.header.pixel_offset,
+        });
+        planes.push(CellomicsPlaneSource {
+            source_index,
+            plane_index: 0,
+            channel_index: Some(channel),
+        });
+    }
+
+    if !planes.is_empty() {
+        metadata.insert(
+            "cellomics.assembled_channel_indices".into(),
+            MetadataValue::String(
+                planes
+                    .iter()
+                    .filter_map(|plane| plane.channel_index.map(|channel| channel.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        );
+        metadata.insert(
+            "cellomics.assembled_files".into(),
+            MetadataValue::String(
+                sources
+                    .iter()
+                    .filter_map(|source| {
+                        source
+                            .path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| name.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        );
+    }
+    if planes.len() > 1 {
+        metadata.insert(
+            "cellomics.assembly".into(),
+            MetadataValue::String("sibling_filename_channels".into()),
+        );
+    }
+
+    CellomicsPlateSeries {
+        sources,
+        planes,
+        metadata,
+    }
 }
 
 fn find_cellomics_mdb(path: &Path) -> Option<PathBuf> {
@@ -3941,42 +7322,353 @@ fn cellomics_channel_metadata_from_table(
     let mut metadata = HashMap::new();
     for (channel, row) in table.rows.iter().enumerate() {
         let prefix = format!("cellomics.channel.{channel}");
-        if let Some(value) = mdb_row_value(row, &column_index, "name") {
-            metadata.insert(
-                format!("{prefix}.name"),
-                MetadataValue::String(value.to_string()),
-            );
-        }
-        if let Some(value) = mdb_row_value(row, &column_index, "exposuretime") {
+        cellomics_insert_first_string(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.name"),
+            &[
+                "name",
+                "channelname",
+                "chname",
+                "dye",
+                "dyename",
+                "fluorophore",
+            ],
+        );
+        cellomics_insert_first_typed(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.exposure_time"),
+            &[
+                "exposuretime",
+                "exposure",
+                "exposurems",
+                "exposuremilliseconds",
+            ],
+        );
+        cellomics_insert_first_typed(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.composite_color"),
+            &["compositecolor", "color", "colour", "rgb"],
+        );
+        cellomics_insert_first_typed(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.emission_wavelength"),
+            &["emissionwavelength", "emission", "emissionnm", "wavelength"],
+        );
+        cellomics_insert_first_typed(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.excitation_wavelength"),
+            &["excitationwavelength", "excitation", "excitationnm"],
+        );
+        cellomics_insert_first_string(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.filter"),
+            &["filter", "filtername", "emissionfilter", "excitationfilter"],
+        );
+        cellomics_insert_first_string(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.objective"),
+            &["objective", "objectivename", "magnification"],
+        );
+        cellomics_insert_first_typed(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.pixel_size_x"),
+            &[
+                "pixelsizex",
+                "pixelwidth",
+                "calibrationx",
+                "micronsperpixelx",
+            ],
+        );
+        cellomics_insert_first_typed(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.pixel_size_y"),
+            &[
+                "pixelsizey",
+                "pixelheight",
+                "calibrationy",
+                "micronsperpixely",
+            ],
+        );
+        cellomics_insert_first_typed(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.pixel_size"),
+            &["pixelsize", "micronsperpixel", "calibration"],
+        );
+        cellomics_insert_first_string(
+            &mut metadata,
+            row,
+            &column_index,
+            &format!("{prefix}.binning"),
+            &["binning", "bin", "camera binning"],
+        );
+
+        for (column_name, value) in table.columns.iter().zip(row.iter()) {
             let value = value.trim();
-            if let Ok(exposure) = value.parse::<f64>() {
-                metadata.insert(
-                    format!("{prefix}.exposure_time"),
-                    MetadataValue::Float(exposure),
-                );
-            } else {
-                metadata.insert(
-                    format!("{prefix}.exposure_time"),
-                    MetadataValue::String(value.to_string()),
-                );
+            if value.is_empty() {
+                continue;
             }
-        }
-        if let Some(value) = mdb_row_value(row, &column_index, "compositecolor") {
-            let value = value.trim();
-            if let Ok(color) = value.parse::<i64>() {
-                metadata.insert(
-                    format!("{prefix}.composite_color"),
-                    MetadataValue::Int(color),
-                );
-            } else {
-                metadata.insert(
-                    format!("{prefix}.composite_color"),
-                    MetadataValue::String(value.to_string()),
-                );
-            }
+            let normalized = cellomics_normalize_metadata_name(column_name);
+            let key = format!("{prefix}.mdb.{normalized}");
+            metadata
+                .entry(key)
+                .or_insert_with(|| MetadataValue::String(value.to_string()));
         }
     }
     metadata
+}
+
+fn cellomics_scalar_mdb_metadata_from_tables(
+    tables: &[crate::common::mdb::MdbTable],
+) -> HashMap<String, MetadataValue> {
+    let mut metadata = HashMap::new();
+    let mut recognized = Vec::new();
+
+    for table in tables {
+        let table_name = table.name.to_ascii_lowercase();
+        let Some((scope, aliases)) = cellomics_mdb_scalar_scope(&table_name) else {
+            continue;
+        };
+        recognized.push(scope);
+
+        let mut column_index = HashMap::new();
+        for (i, column) in table.columns.iter().enumerate() {
+            column_index.insert(column.to_ascii_lowercase(), i);
+        }
+        let Some(row) = table.rows.first() else {
+            metadata.insert(
+                format!("cellomics.mdb.{scope}.row_count"),
+                MetadataValue::Int(0),
+            );
+            continue;
+        };
+
+        metadata.insert(
+            format!("cellomics.mdb.{scope}.row_count"),
+            MetadataValue::Int(table.rows.len() as i64),
+        );
+        for (key, names) in aliases {
+            cellomics_insert_first_typed(
+                &mut metadata,
+                row,
+                &column_index,
+                &format!("cellomics.{scope}.{key}"),
+                names,
+            );
+        }
+
+        for (column_name, value) in table.columns.iter().zip(row.iter()) {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let normalized = cellomics_normalize_metadata_name(column_name);
+            metadata
+                .entry(format!("cellomics.mdb.{scope}.{normalized}"))
+                .or_insert_with(|| MetadataValue::String(value.to_string()));
+        }
+    }
+
+    if !recognized.is_empty() {
+        recognized.sort_unstable();
+        recognized.dedup();
+        metadata.insert(
+            "cellomics.mdb.scalar_tables".into(),
+            MetadataValue::String(recognized.join(",")),
+        );
+    }
+
+    metadata
+}
+
+fn cellomics_mdb_table_diagnostics_from_tables(
+    tables: &[crate::common::mdb::MdbTable],
+) -> HashMap<String, MetadataValue> {
+    let mut metadata = HashMap::new();
+    let mut recognized = Vec::new();
+    let mut unhandled = Vec::new();
+    let mut unhandled_shapes = Vec::new();
+
+    for table in tables {
+        let lower_name = table.name.to_ascii_lowercase();
+        if lower_name == "asnprotocolchannel" {
+            recognized.push(table.name.clone());
+        } else if cellomics_mdb_scalar_scope(&lower_name).is_some() {
+            recognized.push(table.name.clone());
+        } else {
+            unhandled.push(table.name.clone());
+            unhandled_shapes.push(format!(
+                "{}:rows={},columns={}",
+                table.name,
+                table.rows.len(),
+                table.columns.len()
+            ));
+        }
+    }
+
+    if !recognized.is_empty() {
+        recognized.sort_unstable();
+        recognized.dedup();
+        metadata.insert(
+            "cellomics.mdb.recognized_tables".into(),
+            MetadataValue::String(recognized.join(",")),
+        );
+    }
+    if !unhandled.is_empty() {
+        unhandled.sort_unstable();
+        unhandled.dedup();
+        metadata.insert(
+            "cellomics.mdb.unhandled_tables".into(),
+            MetadataValue::String(unhandled.join(",")),
+        );
+    }
+    if !unhandled_shapes.is_empty() {
+        unhandled_shapes.sort_unstable();
+        unhandled_shapes.dedup();
+        metadata.insert(
+            "cellomics.mdb.unhandled_table_shapes".into(),
+            MetadataValue::String(unhandled_shapes.join(";")),
+        );
+    }
+
+    metadata
+}
+
+fn cellomics_mdb_scalar_scope(
+    table_name: &str,
+) -> Option<(
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+)> {
+    const PROTOCOL_ALIASES: &[(&str, &[&str])] = &[
+        ("name", &["name", "protocolname", "assayname"]),
+        (
+            "description",
+            &["description", "protocolcomment", "comment"],
+        ),
+        ("objective", &["objective", "objectivename"]),
+        (
+            "magnification",
+            &["magnification", "objectivemagnification"],
+        ),
+        ("binning", &["binning", "camerabinning"]),
+    ];
+    const PLATE_ALIASES: &[(&str, &[&str])] = &[
+        ("name", &["name", "platename"]),
+        ("id", &["plateid", "barcode", "externalid"]),
+        ("description", &["description", "platedescription"]),
+        ("rows", &["rows", "platerows"]),
+        ("columns", &["columns", "platecolumns", "cols"]),
+        ("well_count", &["wellcount", "wells"]),
+    ];
+    const EXPERIMENT_ALIASES: &[(&str, &[&str])] = &[
+        ("name", &["name", "experimentname", "runname"]),
+        ("id", &["experimentid", "runid"]),
+        ("operator", &["operator", "username", "user"]),
+        ("date", &["date", "acquisitiondate", "rundate"]),
+        (
+            "instrument",
+            &["instrument", "instrumentname", "systemname"],
+        ),
+    ];
+    const INSTRUMENT_ALIASES: &[(&str, &[&str])] = &[
+        ("name", &["name", "instrumentname", "systemname"]),
+        ("model", &["model", "instrumentmodel", "systemmodel"]),
+        (
+            "manufacturer",
+            &["manufacturer", "vendor", "instrumentmanufacturer"],
+        ),
+        ("serial_number", &["serialnumber", "serial", "systemserial"]),
+        ("objective", &["objective", "objectivename"]),
+        (
+            "magnification",
+            &["magnification", "objectivemagnification"],
+        ),
+        ("camera", &["camera", "cameraname", "cameramodel"]),
+    ];
+
+    match table_name {
+        "asnprotocol" | "protocol" | "protocolinfo" => Some(("protocol", PROTOCOL_ALIASES)),
+        "asnplate" | "plate" | "plateinfo" => Some(("plate", PLATE_ALIASES)),
+        "asnexperiment" | "experiment" | "experimentinfo" | "run" | "runinfo" => {
+            Some(("experiment", EXPERIMENT_ALIASES))
+        }
+        "asninstrument" | "instrument" | "instrumentinfo" | "system" | "systeminfo" => {
+            Some(("instrument", INSTRUMENT_ALIASES))
+        }
+        _ => None,
+    }
+}
+
+fn cellomics_insert_first_string(
+    metadata: &mut HashMap<String, MetadataValue>,
+    row: &[String],
+    column_index: &HashMap<String, usize>,
+    key: &str,
+    aliases: &[&str],
+) {
+    if let Some(value) = aliases
+        .iter()
+        .find_map(|alias| mdb_row_value(row, column_index, alias))
+    {
+        metadata.insert(key.to_string(), MetadataValue::String(value.to_string()));
+    }
+}
+
+fn cellomics_insert_first_typed(
+    metadata: &mut HashMap<String, MetadataValue>,
+    row: &[String],
+    column_index: &HashMap<String, usize>,
+    key: &str,
+    aliases: &[&str],
+) {
+    if let Some(value) = aliases
+        .iter()
+        .find_map(|alias| mdb_row_value(row, column_index, alias))
+    {
+        let value = value.trim();
+        if let Ok(int_value) = value.parse::<i64>() {
+            metadata.insert(key.to_string(), MetadataValue::Int(int_value));
+        } else if let Ok(float_value) = value.parse::<f64>() {
+            metadata.insert(key.to_string(), MetadataValue::Float(float_value));
+        } else {
+            metadata.insert(key.to_string(), MetadataValue::String(value.to_string()));
+        }
+    }
+}
+
+fn cellomics_normalize_metadata_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_sep = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_sep = false;
+        } else if !last_sep {
+            out.push('_');
+            last_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn mdb_row_value<'a>(
@@ -4002,13 +7694,28 @@ fn read_cellomics_mdb_metadata(path: &Path) -> HashMap<String, MetadataValue> {
         "cellomics.mdb_file".into(),
         MetadataValue::String(mdb_path.display().to_string()),
     );
-    match crate::common::mdb::parse_table(&mdb_path, "asnProtocolChannel") {
-        Ok(Some(table)) => metadata.extend(cellomics_channel_metadata_from_table(&table)),
-        Ok(None) => {
-            metadata.insert(
-                "cellomics.mdb_missing_table".into(),
-                MetadataValue::String("asnProtocolChannel".into()),
-            );
+    match crate::common::mdb::parse_database(&mdb_path) {
+        Ok(tables) => {
+            let table_names: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
+            if !table_names.is_empty() {
+                metadata.insert(
+                    "cellomics.mdb_tables".into(),
+                    MetadataValue::String(table_names.join(",")),
+                );
+            }
+            if let Some(table) = tables
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("asnProtocolChannel"))
+            {
+                metadata.extend(cellomics_channel_metadata_from_table(table));
+            } else {
+                metadata.insert(
+                    "cellomics.mdb_missing_table".into(),
+                    MetadataValue::String("asnProtocolChannel".into()),
+                );
+            }
+            metadata.extend(cellomics_scalar_mdb_metadata_from_tables(&tables));
+            metadata.extend(cellomics_mdb_table_diagnostics_from_tables(&tables));
         }
         Err(e) => {
             metadata.insert(
@@ -4020,12 +7727,307 @@ fn read_cellomics_mdb_metadata(path: &Path) -> HashMap<String, MetadataValue> {
     metadata
 }
 
+fn insert_cellomics_file_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    path: &Path,
+    dib_header_size: Option<u32>,
+    dib_planes: u32,
+    dib_compression: Option<u32>,
+    dib_top_down: Option<bool>,
+) {
+    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+        metadata.insert(
+            "cellomics.file_name".into(),
+            MetadataValue::String(name.to_string()),
+        );
+    }
+    let parsed = cellomics_filename_metadata(path);
+    if let Some(value) = parsed.plate {
+        metadata.insert("cellomics.plate".into(), MetadataValue::String(value));
+    }
+    if let Some(value) = parsed.well {
+        metadata.insert("cellomics.well".into(), MetadataValue::String(value));
+    }
+    if let Some(value) = parsed.field_index {
+        metadata.insert(
+            "cellomics.field_index".into(),
+            MetadataValue::Int(value as i64),
+        );
+    }
+    if let Some(value) = parsed.channel_index {
+        metadata.insert(
+            "cellomics.filename_channel_index".into(),
+            MetadataValue::Int(value as i64),
+        );
+    }
+    if let Some(value) = dib_header_size {
+        metadata.insert(
+            "cellomics.dib.header_size".into(),
+            MetadataValue::Int(value as i64),
+        );
+    }
+    metadata.insert(
+        "cellomics.dib.planes".into(),
+        MetadataValue::Int(dib_planes as i64),
+    );
+    if let Some(value) = dib_compression {
+        metadata.insert(
+            "cellomics.dib.compression".into(),
+            MetadataValue::Int(value as i64),
+        );
+    }
+    if let Some(value) = dib_top_down {
+        metadata.insert(
+            "cellomics.dib.top_down".into(),
+            MetadataValue::String(value.to_string()),
+        );
+    }
+}
+
+fn cellomics_metadata_f64(metadata: &HashMap<String, MetadataValue>, key: &str) -> Option<f64> {
+    match metadata.get(key)? {
+        MetadataValue::Float(value) => Some(*value),
+        MetadataValue::Int(value) => Some(*value as f64),
+        MetadataValue::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn cellomics_metadata_i64(metadata: &HashMap<String, MetadataValue>, key: &str) -> Option<i64> {
+    match metadata.get(key)? {
+        MetadataValue::Int(value) => Some(*value),
+        MetadataValue::Float(value) if value.fract() == 0.0 => Some(*value as i64),
+        MetadataValue::String(value) => value.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn cellomics_metadata_string(
+    metadata: &HashMap<String, MetadataValue>,
+    key: &str,
+) -> Option<String> {
+    match metadata.get(key)? {
+        MetadataValue::String(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        MetadataValue::Int(value) => Some(value.to_string()),
+        MetadataValue::Float(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn cellomics_ome_color(value: i64) -> Option<i32> {
+    if (0..=0x00ff_ffff).contains(&value) {
+        let rgba = ((value as u32) << 8) | 0xff;
+        Some(rgba as i32)
+    } else if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
+        Some(value as i32)
+    } else {
+        None
+    }
+}
+
+fn cellomics_matching_channel_sources(
+    path: &Path,
+    current_metadata: &CellomicsFilenameMetadata,
+    current_data: Vec<u8>,
+    current_header: &CellomicsParsedHeader,
+) -> (
+    Vec<CellomicsDecodedSource>,
+    Vec<CellomicsPlaneSource>,
+    HashMap<String, MetadataValue>,
+) {
+    let mut metadata = HashMap::new();
+    let Some(current_channel) = current_metadata.channel_index else {
+        return (
+            vec![CellomicsDecodedSource {
+                path: path.to_path_buf(),
+                data: current_data,
+                pixel_offset: current_header.pixel_offset,
+            }],
+            (0..current_header.image_count)
+                .map(|plane_index| CellomicsPlaneSource {
+                    source_index: 0,
+                    plane_index,
+                    channel_index: None,
+                })
+                .collect(),
+            metadata,
+        );
+    };
+    if current_header.image_count != 1 {
+        return (
+            vec![CellomicsDecodedSource {
+                path: path.to_path_buf(),
+                data: current_data,
+                pixel_offset: current_header.pixel_offset,
+            }],
+            (0..current_header.image_count)
+                .map(|plane_index| CellomicsPlaneSource {
+                    source_index: 0,
+                    plane_index,
+                    channel_index: Some(current_channel),
+                })
+                .collect(),
+            metadata,
+        );
+    }
+
+    let Some(dir) = path.parent() else {
+        return (
+            vec![CellomicsDecodedSource {
+                path: path.to_path_buf(),
+                data: current_data,
+                pixel_offset: current_header.pixel_offset,
+            }],
+            vec![CellomicsPlaneSource {
+                source_index: 0,
+                plane_index: 0,
+                channel_index: Some(current_channel),
+            }],
+            metadata,
+        );
+    };
+
+    let current_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let mut candidates = vec![(
+        current_channel,
+        path.to_path_buf(),
+        current_data,
+        current_header.pixel_offset,
+    )];
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (
+            vec![CellomicsDecodedSource {
+                path: path.to_path_buf(),
+                data: candidates.remove(0).2,
+                pixel_offset: current_header.pixel_offset,
+            }],
+            vec![CellomicsPlaneSource {
+                source_index: 0,
+                plane_index: 0,
+                channel_index: Some(current_channel),
+            }],
+            metadata,
+        );
+    };
+
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let candidate_path = entry.path();
+        if candidate_path == path {
+            continue;
+        }
+        let candidate_ext = candidate_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if candidate_ext != current_ext {
+            continue;
+        }
+        let parsed = cellomics_filename_metadata(&candidate_path);
+        if parsed.plate != current_metadata.plate
+            || parsed.well != current_metadata.well
+            || parsed.field_index != current_metadata.field_index
+        {
+            continue;
+        }
+        let Some(channel) = parsed.channel_index else {
+            continue;
+        };
+        if candidates
+            .iter()
+            .any(|(known_channel, _, _, _)| *known_channel == channel)
+        {
+            continue;
+        }
+        let Ok(data) = decode_cellomics_file(&candidate_path) else {
+            continue;
+        };
+        let Ok(header) = parse_cellomics_decoded_header(&data) else {
+            continue;
+        };
+        if header.image_count != 1
+            || header.width != current_header.width
+            || header.height != current_header.height
+            || header.pixel_type != current_header.pixel_type
+            || header.bits_per_pixel != current_header.bits_per_pixel
+            || header.pixel_offset != current_header.pixel_offset
+            || header.dib_header_size != current_header.dib_header_size
+            || header.dib_compression != current_header.dib_compression
+        {
+            continue;
+        }
+        candidates.push((channel, candidate_path, data, header.pixel_offset));
+    }
+
+    candidates.sort_by_key(|(channel, _, _, _)| *channel);
+    let mut sources = Vec::with_capacity(candidates.len());
+    let mut planes = Vec::with_capacity(candidates.len());
+    for (source_index, (channel, source_path, data, pixel_offset)) in
+        candidates.into_iter().enumerate()
+    {
+        sources.push(CellomicsDecodedSource {
+            path: source_path,
+            data,
+            pixel_offset,
+        });
+        planes.push(CellomicsPlaneSource {
+            source_index,
+            plane_index: 0,
+            channel_index: Some(channel),
+        });
+    }
+
+    if planes.len() > 1 {
+        metadata.insert(
+            "cellomics.assembly".into(),
+            MetadataValue::String("sibling_filename_channels".into()),
+        );
+        metadata.insert(
+            "cellomics.assembled_channel_indices".into(),
+            MetadataValue::String(
+                planes
+                    .iter()
+                    .filter_map(|plane| plane.channel_index.map(|channel| channel.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        );
+        metadata.insert(
+            "cellomics.assembled_files".into(),
+            MetadataValue::String(
+                sources
+                    .iter()
+                    .filter_map(|source| {
+                        source
+                            .path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| name.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        );
+    }
+
+    (sources, planes, metadata)
+}
+
 #[cfg(test)]
 mod cellomics_mdb_tests {
-    use super::{cellomics_channel_metadata_from_table, cellomics_plate_prefix};
+    use super::{
+        cellomics_channel_metadata_from_table, cellomics_filename_metadata,
+        cellomics_mdb_table_diagnostics_from_tables, cellomics_ome_color, cellomics_plate_prefix,
+        cellomics_scalar_mdb_metadata_from_tables, CellomicsReader,
+    };
     use crate::common::mdb::MdbTable;
     use crate::common::metadata::MetadataValue;
+    use crate::common::reader::FormatReader;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn cellomics_plate_prefix_matches_well_token() {
@@ -4048,11 +8050,36 @@ mod cellomics_mdb_tests {
                 "Name".into(),
                 "ExposureTime".into(),
                 "CompositeColor".into(),
+                "EmissionWavelength".into(),
+                "ExcitationWavelength".into(),
+                "PixelSizeX".into(),
+                "PixelSizeY".into(),
+                "FilterName".into(),
                 "Ignored".into(),
             ],
             rows: vec![
-                vec!["DAPI".into(), "35.5".into(), "16711680".into(), "x".into()],
-                vec!["FITC".into(), "n/a".into(), "green".into(), "x".into()],
+                vec![
+                    "DAPI".into(),
+                    "35.5".into(),
+                    "16711680".into(),
+                    "460".into(),
+                    "405".into(),
+                    "0.65".into(),
+                    "0.66".into(),
+                    "DAPI cube".into(),
+                    "x".into(),
+                ],
+                vec![
+                    "FITC".into(),
+                    "n/a".into(),
+                    "green".into(),
+                    "525".into(),
+                    "488".into(),
+                    "".into(),
+                    "".into(),
+                    "FITC cube".into(),
+                    "x".into(),
+                ],
             ],
         };
 
@@ -4070,6 +8097,30 @@ mod cellomics_mdb_tests {
             Some(MetadataValue::Int(16711680))
         ));
         assert!(matches!(
+            metadata.get("cellomics.channel.0.emission_wavelength"),
+            Some(MetadataValue::Int(460))
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.channel.0.excitation_wavelength"),
+            Some(MetadataValue::Int(405))
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.channel.0.pixel_size_x"),
+            Some(MetadataValue::Float(v)) if (*v - 0.65).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.channel.0.pixel_size_y"),
+            Some(MetadataValue::Float(v)) if (*v - 0.66).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.channel.0.filter"),
+            Some(MetadataValue::String(v)) if v == "DAPI cube"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.channel.0.mdb.emissionwavelength"),
+            Some(MetadataValue::String(v)) if v == "460"
+        ));
+        assert!(matches!(
             metadata.get("cellomics.channel.1.exposure_time"),
             Some(MetadataValue::String(v)) if v == "n/a"
         ));
@@ -4077,6 +8128,295 @@ mod cellomics_mdb_tests {
             metadata.get("cellomics.channel.1.composite_color"),
             Some(MetadataValue::String(v)) if v == "green"
         ));
+    }
+
+    #[test]
+    fn cellomics_mdb_scalar_tables_project_protocol_plate_and_experiment() {
+        let tables = vec![
+            MdbTable {
+                name: "asnProtocol".into(),
+                columns: vec![
+                    "ProtocolName".into(),
+                    "ObjectiveMagnification".into(),
+                    "CameraBinning".into(),
+                ],
+                rows: vec![vec!["Drug screen".into(), "20".into(), "2x2".into()]],
+            },
+            MdbTable {
+                name: "asnPlate".into(),
+                columns: vec![
+                    "PlateID".into(),
+                    "PlateRows".into(),
+                    "PlateColumns".into(),
+                    "PlateDescription".into(),
+                ],
+                rows: vec![vec![
+                    "BAR123".into(),
+                    "8".into(),
+                    "12".into(),
+                    "96 well plate".into(),
+                ]],
+            },
+            MdbTable {
+                name: "asnExperiment".into(),
+                columns: vec![
+                    "ExperimentName".into(),
+                    "Operator".into(),
+                    "InstrumentName".into(),
+                ],
+                rows: vec![vec!["Run 7".into(), "Ada".into(), "ArrayScan".into()]],
+            },
+            MdbTable {
+                name: "asnInstrument".into(),
+                columns: vec![
+                    "InstrumentName".into(),
+                    "InstrumentModel".into(),
+                    "Manufacturer".into(),
+                    "SerialNumber".into(),
+                    "ObjectiveMagnification".into(),
+                    "CameraModel".into(),
+                ],
+                rows: vec![vec![
+                    "ArrayScan VTI".into(),
+                    "VTI 700".into(),
+                    "Thermo Fisher".into(),
+                    "SN42".into(),
+                    "20".into(),
+                    "Orca".into(),
+                ]],
+            },
+            MdbTable {
+                name: "Unrelated".into(),
+                columns: vec!["Name".into()],
+                rows: vec![vec!["ignored".into()]],
+            },
+        ];
+
+        let metadata = cellomics_scalar_mdb_metadata_from_tables(&tables);
+        assert!(matches!(
+            metadata.get("cellomics.mdb.scalar_tables"),
+            Some(MetadataValue::String(v)) if v == "experiment,instrument,plate,protocol"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.protocol.name"),
+            Some(MetadataValue::String(v)) if v == "Drug screen"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.protocol.magnification"),
+            Some(MetadataValue::Int(20))
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.protocol.binning"),
+            Some(MetadataValue::String(v)) if v == "2x2"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.plate.id"),
+            Some(MetadataValue::String(v)) if v == "BAR123"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.plate.rows"),
+            Some(MetadataValue::Int(8))
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.plate.columns"),
+            Some(MetadataValue::Int(12))
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.experiment.operator"),
+            Some(MetadataValue::String(v)) if v == "Ada"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.instrument.name"),
+            Some(MetadataValue::String(v)) if v == "ArrayScan VTI"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.instrument.model"),
+            Some(MetadataValue::String(v)) if v == "VTI 700"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.instrument.manufacturer"),
+            Some(MetadataValue::String(v)) if v == "Thermo Fisher"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.instrument.serial_number"),
+            Some(MetadataValue::String(v)) if v == "SN42"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.instrument.magnification"),
+            Some(MetadataValue::Int(20))
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.instrument.camera"),
+            Some(MetadataValue::String(v)) if v == "Orca"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.mdb.instrument.instrumentmodel"),
+            Some(MetadataValue::String(v)) if v == "VTI 700"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.mdb.protocol.objectivemagnification"),
+            Some(MetadataValue::String(v)) if v == "20"
+        ));
+        assert!(!metadata.contains_key("cellomics.unrelated.name"));
+    }
+
+    #[test]
+    fn cellomics_mdb_table_diagnostics_report_unhandled_shapes_without_mapping_semantics() {
+        let tables = vec![
+            MdbTable {
+                name: "asnProtocolChannel".into(),
+                columns: vec!["Name".into()],
+                rows: vec![vec!["DAPI".into()]],
+            },
+            MdbTable {
+                name: "asnPlate".into(),
+                columns: vec!["PlateID".into()],
+                rows: vec![vec!["BAR123".into()]],
+            },
+            MdbTable {
+                name: "asnWell".into(),
+                columns: vec!["Well".into(), "Value".into()],
+                rows: vec![
+                    vec!["A01".into(), "7".into()],
+                    vec!["A02".into(), "8".into()],
+                ],
+            },
+        ];
+
+        let metadata = cellomics_mdb_table_diagnostics_from_tables(&tables);
+        assert!(matches!(
+            metadata.get("cellomics.mdb.recognized_tables"),
+            Some(MetadataValue::String(value)) if value == "asnPlate,asnProtocolChannel"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.mdb.unhandled_tables"),
+            Some(MetadataValue::String(value)) if value == "asnWell"
+        ));
+        assert!(matches!(
+            metadata.get("cellomics.mdb.unhandled_table_shapes"),
+            Some(MetadataValue::String(value)) if value == "asnWell:rows=2,columns=2"
+        ));
+        assert!(!metadata.contains_key("cellomics.well.value"));
+    }
+
+    #[test]
+    fn cellomics_filename_metadata_extracts_well_field_and_channel() {
+        let parsed = cellomics_filename_metadata(Path::new("AS_09125_050118150001_A03f00d1.DIB"));
+        assert_eq!(parsed.plate.as_deref(), Some("AS_09125_050118150001"));
+        assert_eq!(parsed.well.as_deref(), Some("A03"));
+        assert_eq!(parsed.field_index, Some(0));
+        assert_eq!(parsed.channel_index, Some(1));
+    }
+
+    #[test]
+    fn cellomics_filename_metadata_extracts_java_o_channel_variant() {
+        let parsed = cellomics_filename_metadata(Path::new("WHICA-VTI1_090915160001_A01f00o2.DIB"));
+        assert_eq!(parsed.plate.as_deref(), Some("WHICA-VTI1_090915160001"));
+        assert_eq!(parsed.well.as_deref(), Some("A01"));
+        assert_eq!(parsed.field_index, Some(0));
+        assert_eq!(parsed.channel_index, Some(2));
+    }
+
+    #[test]
+    fn cellomics_ome_color_packs_rgb_with_opaque_alpha() {
+        assert_eq!(cellomics_ome_color(0x336699), Some(0x336699ff));
+    }
+
+    #[test]
+    fn cellomics_reader_assembles_matching_sibling_channel_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bioformats_cellomics_assembly_{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path_d0 = dir.join("AS_09125_050118150001_A03f00d0.DIB");
+        let path_d1 = dir.join("AS_09125_050118150001_A03f00d1.DIB");
+        let path_other_field = dir.join("AS_09125_050118150001_A03f01d2.DIB");
+
+        for (path, pixels) in [
+            (&path_d0, [1u8, 2, 3, 4]),
+            (&path_d1, [5u8, 6, 7, 8]),
+            (&path_other_field, [9u8, 10, 11, 12]),
+        ] {
+            let mut data = vec![0u8; 52];
+            data[0..4].copy_from_slice(&40u32.to_le_bytes());
+            data[4..8].copy_from_slice(&2i32.to_le_bytes());
+            data[8..12].copy_from_slice(&2i32.to_le_bytes());
+            data[12..14].copy_from_slice(&1u16.to_le_bytes());
+            data[14..16].copy_from_slice(&8u16.to_le_bytes());
+            data[16..20].copy_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&pixels);
+            std::fs::write(path, data).unwrap();
+        }
+
+        let mut reader = CellomicsReader::new();
+        reader.set_id(&path_d1).unwrap();
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("cellomics.assembly"),
+            Some(MetadataValue::String(value)) if value == "sibling_filename_channels"
+        ));
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("cellomics.assembled_channel_indices"),
+            Some(MetadataValue::String(value)) if value == "0,1"
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cellomics_reader_assembles_java_o_channel_sibling_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bioformats_cellomics_o_assembly_{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path_o1 = dir.join("WHICA-VTI1_090915160001_A01f00o1.DIB");
+        let path_o2 = dir.join("WHICA-VTI1_090915160001_A01f00o2.DIB");
+        let path_other_field = dir.join("WHICA-VTI1_090915160001_A01f01o3.DIB");
+
+        for (path, pixels) in [
+            (&path_o1, [11u8, 12, 13, 14]),
+            (&path_o2, [21u8, 22, 23, 24]),
+            (&path_other_field, [31u8, 32, 33, 34]),
+        ] {
+            let mut data = vec![0u8; 52];
+            data[0..4].copy_from_slice(&40u32.to_le_bytes());
+            data[4..8].copy_from_slice(&2i32.to_le_bytes());
+            data[8..12].copy_from_slice(&2i32.to_le_bytes());
+            data[12..14].copy_from_slice(&1u16.to_le_bytes());
+            data[14..16].copy_from_slice(&8u16.to_le_bytes());
+            data[16..20].copy_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&pixels);
+            std::fs::write(path, data).unwrap();
+        }
+
+        let mut reader = CellomicsReader::new();
+        reader.set_id(&path_o2).unwrap();
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![11, 12, 13, 14]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![21, 22, 23, 24]);
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("cellomics.assembled_channel_indices"),
+            Some(MetadataValue::String(value)) if value == "1,2"
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -4094,178 +8434,221 @@ impl FormatReader for CellomicsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let raw = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        // .c01 files are zlib-compressed after a 4-byte magic; .dib are raw.
-        let is_c01 = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("c01"))
-            .unwrap_or(false);
-        let data = if is_c01 {
-            if raw.len() < 4 {
-                return Err(BioFormatsError::UnsupportedFormat(
-                    "Cellomics C01 file is too short to contain a magic number".into(),
-                ));
-            }
-            crate::common::codec::decompress_deflate(&raw[4..]).map_err(|_| {
-                BioFormatsError::UnsupportedFormat(
-                    "Cellomics C01 zlib payload could not be decompressed".into(),
-                )
-            })?
-        } else {
-            raw
-        };
+        let data = decode_cellomics_file(path)?;
+        let header = parse_cellomics_decoded_header(&data)?;
+        let filename_metadata = cellomics_filename_metadata(path);
+        let mdb_metadata = read_cellomics_mdb_metadata(path);
+        let plate_assembly =
+            cellomics_plate_assembly(path, &filename_metadata, data.clone(), &header);
+        let mut metas = Vec::new();
+        let mut series_sources = Vec::new();
+        let mut series_planes = Vec::new();
 
-        let (w, h, image_count, pixel_type, bpp, pixel_offset) = if data.len() >= 52 {
-            let dib_header_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            if dib_header_size >= 40 {
-                let w = i32::from_le_bytes([data[4], data[5], data[6], data[7]]).unsigned_abs();
-                let h = i32::from_le_bytes([data[8], data[9], data[10], data[11]]).unsigned_abs();
-                let n_planes = u16::from_le_bytes([data[12], data[13]]) as u32;
-                let bd = u16::from_le_bytes([data[14], data[15]]);
-                let compression = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-                if compression != 0 {
-                    return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "Cellomics DIB compressed pixel data is not supported: compression={compression}"
-                    )));
-                }
-                if w == 0 || h == 0 || w > 32768 || h > 32768 {
-                    return Err(BioFormatsError::InvalidData(format!(
-                        "Cellomics DIB has invalid dimensions {w}x{h}"
-                    )));
-                }
-                let (pt, bpp) = match bd {
-                    8 => (PixelType::Uint8, 8u8),
-                    16 => (PixelType::Uint16, 16u8),
-                    _ => {
-                        return Err(BioFormatsError::UnsupportedFormat(format!(
-                            "Cellomics DIB bits per pixel {bd} is not supported"
-                        )));
-                    }
-                };
-                let bytes_per_pixel = (bpp / 8) as u64;
-                let image_count = n_planes.max(1);
-                let plane_bytes = (w as u64)
-                    .checked_mul(h as u64)
-                    .and_then(|n| n.checked_mul(bytes_per_pixel))
-                    .ok_or_else(|| {
-                        BioFormatsError::Format("Cellomics DIB plane size overflows".to_string())
-                    })?;
-                let expected = 52u64
-                    .checked_add(plane_bytes.checked_mul(image_count as u64).ok_or_else(|| {
-                        BioFormatsError::Format(
-                            "Cellomics DIB total pixel size overflows".to_string(),
-                        )
-                    })?)
-                    .ok_or_else(|| {
-                        BioFormatsError::Format("Cellomics DIB file size overflows".to_string())
-                    })?;
-                if (data.len() as u64) < expected {
-                    return Err(BioFormatsError::InvalidData(format!(
-                        "Cellomics DIB is too short: got {} bytes, expected at least {expected}",
-                        data.len()
-                    )));
-                }
-                (w, h, image_count, pt, bpp, 52u64)
-            } else {
-                parse_legacy_cellomics_header(&data)?
+        if let Some(assembly) = plate_assembly {
+            for series in assembly.series {
+                let representative_path = series
+                    .sources
+                    .first()
+                    .map(|source| source.path.as_path())
+                    .unwrap_or(path);
+                let mut series_metadata = mdb_metadata.clone();
+                series_metadata.extend(series.metadata);
+                insert_cellomics_file_metadata(
+                    &mut series_metadata,
+                    representative_path,
+                    header.dib_header_size,
+                    header.dib_planes,
+                    header.dib_compression,
+                    header.dib_top_down,
+                );
+                let image_count = series.planes.len() as u32;
+                metas.push(ImageMetadata {
+                    size_x: header.width,
+                    size_y: header.height,
+                    size_z: 1,
+                    size_c: image_count.max(1),
+                    size_t: 1,
+                    pixel_type: header.pixel_type,
+                    bits_per_pixel: header.bits_per_pixel,
+                    image_count: image_count.max(1),
+                    dimension_order: DimensionOrder::XYZCT,
+                    is_rgb: false,
+                    is_interleaved: false,
+                    is_indexed: false,
+                    is_little_endian: true,
+                    resolution_count: 1,
+                    series_metadata,
+                    lookup_table: None,
+                    modulo_z: None,
+                    modulo_c: None,
+                    modulo_t: None,
+                });
+                series_sources.push(series.sources);
+                series_planes.push(series.planes);
             }
-        } else if data.len() >= 10 {
-            parse_legacy_cellomics_header(&data)?
         } else {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Cellomics header is too short to determine image dimensions".to_string(),
-            ));
-        };
-
-        let bytes_per_pixel = (bpp / 8) as u64;
-        let plane_bytes = (w as u64)
-            .checked_mul(h as u64)
-            .and_then(|n| n.checked_mul(bytes_per_pixel))
-            .ok_or_else(|| BioFormatsError::Format("Cellomics plane size overflows".to_string()))?;
-        let expected = pixel_offset
-            .checked_add(plane_bytes.checked_mul(image_count as u64).ok_or_else(|| {
-                BioFormatsError::Format("Cellomics total pixel size overflows".to_string())
-            })?)
-            .ok_or_else(|| BioFormatsError::Format("Cellomics file size overflows".to_string()))?;
-        if (data.len() as u64) < expected {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "Cellomics pixel payload is shorter than declared image: got {} bytes, expected at least {expected}",
-                data.len()
-            )));
+            let (sources, planes, assembly_metadata) =
+                cellomics_matching_channel_sources(path, &filename_metadata, data.clone(), &header);
+            let image_count = planes.len() as u32;
+            let assembled_channels = assembly_metadata.contains_key("cellomics.assembly");
+            let mut series_metadata = mdb_metadata;
+            series_metadata.extend(assembly_metadata);
+            insert_cellomics_file_metadata(
+                &mut series_metadata,
+                path,
+                header.dib_header_size,
+                header.dib_planes,
+                header.dib_compression,
+                header.dib_top_down,
+            );
+            metas.push(ImageMetadata {
+                size_x: header.width,
+                size_y: header.height,
+                size_z: 1,
+                size_c: if assembled_channels { image_count } else { 1 },
+                size_t: 1,
+                pixel_type: header.pixel_type,
+                bits_per_pixel: header.bits_per_pixel,
+                image_count,
+                dimension_order: DimensionOrder::XYZCT,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: true,
+                resolution_count: 1,
+                series_metadata,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            });
+            series_sources.push(sources);
+            series_planes.push(planes);
         }
 
         self.path = Some(path.to_path_buf());
-        self.pixel_offset = pixel_offset;
+        self.current_series = 0;
+        self.pixel_offset = header.pixel_offset;
         self.data = data;
-        let series_metadata = read_cellomics_mdb_metadata(path);
-
-        self.meta = Some(ImageMetadata {
-            size_x: w,
-            size_y: h,
-            size_z: 1,
-            size_c: 1,
-            size_t: 1,
-            pixel_type,
-            bits_per_pixel: bpp,
-            image_count,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
-            is_interleaved: false,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata,
-            lookup_table: None,
-            modulo_z: None,
-            modulo_c: None,
-            modulo_t: None,
-        });
+        self.metas = metas;
+        self.series_sources = series_sources;
+        self.series_planes = series_planes;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
+        self.metas.clear();
+        self.current_series = 0;
         self.pixel_offset = 52;
         self.data = Vec::new();
+        self.series_sources = Vec::new();
+        self.series_planes = Vec::new();
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.metas.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if s >= self.metas.len() {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.metas
+            .get(self.current_series)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        let meta = self.metas.get(self.current_series)?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.get_mut(0) {
+            if let Some(plate) = cellomics_metadata_string(&meta.series_metadata, "cellomics.plate")
+            {
+                let well = cellomics_metadata_string(&meta.series_metadata, "cellomics.well")
+                    .map(|well| format!(" {well}"))
+                    .unwrap_or_default();
+                image.name = Some(format!("{plate}{well}"));
+            }
+            image.physical_size_x =
+                cellomics_metadata_f64(&meta.series_metadata, "cellomics.channel.0.pixel_size_x")
+                    .or_else(|| {
+                        cellomics_metadata_f64(
+                            &meta.series_metadata,
+                            "cellomics.channel.0.pixel_size",
+                        )
+                    });
+            image.physical_size_y =
+                cellomics_metadata_f64(&meta.series_metadata, "cellomics.channel.0.pixel_size_y")
+                    .or_else(|| {
+                        cellomics_metadata_f64(
+                            &meta.series_metadata,
+                            "cellomics.channel.0.pixel_size",
+                        )
+                    });
+            for (channel_index, channel) in image.channels.iter_mut().enumerate() {
+                let prefix = format!("cellomics.channel.{channel_index}");
+                channel.name =
+                    cellomics_metadata_string(&meta.series_metadata, &format!("{prefix}.name"));
+                channel.emission_wavelength = cellomics_metadata_f64(
+                    &meta.series_metadata,
+                    &format!("{prefix}.emission_wavelength"),
+                );
+                channel.excitation_wavelength = cellomics_metadata_f64(
+                    &meta.series_metadata,
+                    &format!("{prefix}.excitation_wavelength"),
+                );
+                channel.color = cellomics_metadata_i64(
+                    &meta.series_metadata,
+                    &format!("{prefix}.composite_color"),
+                )
+                .and_then(cellomics_ome_color);
+            }
+        }
+        let _ = ome.add_original_metadata_annotations(meta, 0);
+        Some(ome)
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let bytes_per_pixel = (meta.bits_per_pixel / 8) as usize;
         let n_bytes = meta.size_x as usize * meta.size_y as usize * bytes_per_pixel;
+        let planes = self
+            .series_planes
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let sources = self
+            .series_sources
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let plane_source = planes
+            .get(plane_index as usize)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let source = sources
+            .get(plane_source.source_index)
+            .ok_or_else(|| BioFormatsError::Format("Cellomics source index is invalid".into()))?;
         // Pixel data lives in the decoded (decompressed for .c01) buffer.
-        let plane_offset = self
+        let plane_offset = source
             .pixel_offset
             .checked_add(
-                (plane_index as u64)
+                (plane_source.plane_index as u64)
                     .checked_mul(n_bytes as u64)
                     .ok_or_else(|| {
                         BioFormatsError::Format("Cellomics plane offset overflows".to_string())
@@ -4274,12 +8657,12 @@ impl FormatReader for CellomicsReader {
             .ok_or_else(|| {
                 BioFormatsError::Format("Cellomics plane offset overflows".to_string())
             })? as usize;
-        if plane_offset + n_bytes > self.data.len() {
+        if plane_offset + n_bytes > source.data.len() {
             return Err(BioFormatsError::InvalidData(
                 "Cellomics plane extends beyond decoded payload".to_string(),
             ));
         }
-        Ok(self.data[plane_offset..plane_offset + n_bytes].to_vec())
+        Ok(source.data[plane_offset..plane_offset + n_bytes].to_vec())
     }
 
     fn open_bytes_region(
@@ -4290,17 +8673,26 @@ impl FormatReader for CellomicsReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         crop_full_plane("Cellomics", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
@@ -5356,9 +9748,11 @@ fn yk_row_name(row: u32) -> String {
 /// (`<Dimensions>`/`<DimensionDescription>` with `DimID` 1=X 2=Y 3=Z 4=T,
 /// 10=tile, plus `<Channels>`/`<ChannelDescription>`), mirroring
 /// `translateImageNodes`. Direct channel attributes (names, wavelengths, LUT
-/// names) are projected as conservative metadata, but the wider Leica
-/// LeicaMicrosystemsMetadata translation (instrument / detector / ROI / BGR
-/// channel ordering) is intentionally not ported and is left as an honest gap.
+/// names) are projected as conservative metadata. Wider Leica metadata is
+/// bounded to safe scalar XML attributes for instruments, detectors, ROI, stage
+/// and acquisition fields. RGB channel order is recorded from explicit
+/// `ChannelDescription BytesInc` offsets when the simple Leica XML layout is
+/// unambiguous; pixel bytes are still returned in stored order.
 const LOF_MAGIC_BYTE: u32 = 0x70;
 const LOF_MEMORY_BYTE: u8 = 0x2a;
 const LOF_TYPE_NAME: &str = "LMS_Object_File";
@@ -5841,10 +10235,13 @@ impl FormatReader for LeicaLofReader {
             img.physical_size_x = src.physical_size_x;
             img.physical_size_y = src.physical_size_y;
             img.physical_size_z = src.physical_size_z;
+            img.instrument_ref = src.instrument_ref;
             if !src.channels.is_empty() {
                 img.channels = src.channels.clone();
             }
         }
+        ome.instruments = lof_ome_instruments_from_metadata(meta);
+        ome.rois = lof_ome_rois_from_metadata(meta);
         Some(ome)
     }
 
@@ -6052,6 +10449,14 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
     for (channel_index, channel_node) in channel_nodes.iter().enumerate() {
         lof_insert_channel_metadata(&mut series_metadata, channel_index, channel_node);
     }
+    lof_insert_rgb_channel_order_metadata(
+        &mut series_metadata,
+        &channel_nodes,
+        is_rgb,
+        pixel_type.bytes_per_sample() as u64,
+    );
+    lof_insert_channel_lut_metadata(&mut series_metadata, &channel_nodes);
+    let (instruments, _rois) = lof_insert_structured_metadata(&mut series_metadata, &nodes);
 
     let effective_c = (size_c / rgb_channel_count.max(1)).max(1) as usize;
     let channels = lof_ome_channels(&channel_nodes, effective_c, rgb_channel_count);
@@ -6083,6 +10488,7 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
         physical_size_y: physical_size_y.filter(|v| *v > 0.0),
         physical_size_z: physical_size_z.filter(|v| *v > 0.0),
         channels,
+        instrument_ref: (!instruments.is_empty()).then_some(0),
         ..OmeImage::default()
     };
 
@@ -6091,6 +10497,148 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
         ome,
         tile_count,
         tile_bytes_inc,
+    })
+}
+
+fn lof_insert_structured_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    nodes: &[LofNode],
+) -> (Vec<OmeInstrument>, Vec<OmeROI>) {
+    let mut instruments = Vec::new();
+    let mut rois = Vec::new();
+    let mut detector_count = 0usize;
+    let mut stage_count = 0usize;
+    let mut acquisition_count = 0usize;
+    let mut lut_count = 0usize;
+
+    for node in nodes {
+        let lower = node.name.to_ascii_lowercase();
+        if lower.contains("instrument") || lower.contains("microscope") {
+            let idx = instruments.len();
+            let prefix = format!("lof.instrument.{idx}");
+            lof_insert_node_scalar_attrs(metadata, &prefix, node);
+            let instrument = OmeInstrument {
+                id: Some(create_lsid("Instrument", &[idx])),
+                microscope_model: lof_first_attr(node, &["Model", "Name", "SystemName", "Type"]),
+                microscope_manufacturer: lof_first_attr(node, &["Manufacturer", "Vendor"]),
+                ..OmeInstrument::default()
+            };
+            if instrument.microscope_model.is_some() || instrument.microscope_manufacturer.is_some()
+            {
+                instruments.push(instrument);
+            }
+        } else if lower.contains("detector") || lower.contains("camera") || lower.contains("pmt") {
+            let idx = detector_count;
+            detector_count += 1;
+            let prefix = format!("lof.detector.{idx}");
+            lof_insert_node_scalar_attrs(metadata, &prefix, node);
+            let detector = OmeDetector {
+                id: Some(create_lsid("Detector", &[0, idx])),
+                model: lof_first_attr(node, &["Model", "Name", "DetectorName"]),
+                manufacturer: lof_first_attr(node, &["Manufacturer", "Vendor"]),
+                detector_type: lof_first_attr(node, &["Type", "DetectorType"]),
+                gain: lof_first_f64(node, &["Gain", "DetectorGain"]),
+                offset: lof_first_f64(node, &["Offset", "DetectorOffset"]),
+            };
+            if detector.model.is_some()
+                || detector.manufacturer.is_some()
+                || detector.detector_type.is_some()
+                || detector.gain.is_some()
+                || detector.offset.is_some()
+            {
+                if instruments.is_empty() {
+                    instruments.push(OmeInstrument {
+                        id: Some(create_lsid("Instrument", &[0])),
+                        ..OmeInstrument::default()
+                    });
+                }
+                instruments[0].detectors.push(detector);
+            }
+        } else if lower == "roi" || lower.ends_with("roi") || lower.contains("regionofinterest") {
+            let idx = rois.len();
+            let prefix = format!("lof.roi.{idx}");
+            lof_insert_node_scalar_attrs(metadata, &prefix, node);
+            if let Some(roi) = lof_ome_roi(node, idx) {
+                rois.push(roi);
+            }
+        } else if lower.contains("stage") || lower.contains("position") {
+            lof_insert_node_scalar_attrs(metadata, &format!("lof.stage.{stage_count}"), node);
+            stage_count += 1;
+        } else if lower.contains("acquisition") {
+            lof_insert_node_scalar_attrs(
+                metadata,
+                &format!("lof.acquisition.{acquisition_count}"),
+                node,
+            );
+            acquisition_count += 1;
+        } else if lower.contains("lut") {
+            lof_insert_node_scalar_attrs(metadata, &format!("lof.lut.{lut_count}"), node);
+            lut_count += 1;
+        }
+    }
+
+    (instruments, rois)
+}
+
+fn lof_insert_node_scalar_attrs(
+    metadata: &mut HashMap<String, MetadataValue>,
+    prefix: &str,
+    node: &LofNode,
+) {
+    for (key, value) in &node.attrs {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = format!("{prefix}.{}", lof_key_name(key));
+        if let Ok(v) = trimmed.parse::<i64>() {
+            metadata.insert(key, MetadataValue::Int(v));
+        } else if let Ok(v) = trimmed.parse::<f64>() {
+            if v.is_finite() {
+                metadata.insert(key, MetadataValue::Float(v));
+            }
+        } else {
+            metadata.insert(key, MetadataValue::String(trimmed.to_string()));
+        }
+    }
+}
+
+fn lof_first_attr(node: &LofNode, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| lof_clean_attr(node, key))
+}
+
+fn lof_first_f64(node: &LofNode, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| lof_attr_f64(node, key))
+}
+
+fn lof_ome_roi(node: &LofNode, idx: usize) -> Option<OmeROI> {
+    let x = lof_first_f64(node, &["X", "Left", "PosX", "StageX"])?;
+    let y = lof_first_f64(node, &["Y", "Top", "PosY", "StageY"])?;
+    let shape = match (
+        lof_first_f64(node, &["Width", "SizeX"]),
+        lof_first_f64(node, &["Height", "SizeY"]),
+    ) {
+        (Some(width), Some(height)) if width >= 0.0 && height >= 0.0 => OmeShape::Rectangle {
+            x,
+            y,
+            width,
+            height,
+            the_z: None,
+            the_t: None,
+            the_c: None,
+        },
+        _ => OmeShape::Point {
+            x,
+            y,
+            the_z: None,
+            the_t: None,
+            the_c: None,
+        },
+    };
+    Some(OmeROI {
+        id: Some(create_lsid("ROI", &[idx])),
+        name: lof_first_attr(node, &["Name", "Label"]),
+        shapes: vec![shape],
     })
 }
 
@@ -6132,6 +10680,94 @@ fn lof_insert_channel_metadata(
     }
 }
 
+fn lof_insert_rgb_channel_order_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    channel_nodes: &[&LofNode],
+    is_rgb: bool,
+    bytes_per_sample: u64,
+) {
+    if !is_rgb || bytes_per_sample == 0 || channel_nodes.len() < 3 {
+        return;
+    }
+
+    let mut components = Vec::with_capacity(channel_nodes.len());
+    for (index, node) in channel_nodes.iter().enumerate() {
+        let Some(bytes_inc) = node
+            .attrs
+            .get("BytesInc")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        else {
+            return;
+        };
+        let Some(label) = lof_channel_component_label(node, index) else {
+            return;
+        };
+        components.push((bytes_inc, label));
+    }
+
+    components.sort_by_key(|(bytes_inc, _)| *bytes_inc);
+    let mut order = String::with_capacity(components.len());
+    let mut offsets = String::new();
+    for (idx, (bytes_inc, label)) in components.iter().enumerate() {
+        if idx > 0 {
+            offsets.push(',');
+        }
+        if bytes_inc % bytes_per_sample != 0 {
+            return;
+        }
+        offsets.push_str(&bytes_inc.to_string());
+        order.push(*label);
+    }
+
+    if order.len() >= 3 {
+        metadata.insert("lof.rgb.channel_order".into(), MetadataValue::String(order));
+        metadata.insert(
+            "lof.rgb.channel_order_source".into(),
+            MetadataValue::String("ChannelDescription BytesInc".into()),
+        );
+        metadata.insert(
+            "lof.rgb.channel_order_offsets".into(),
+            MetadataValue::String(offsets),
+        );
+    }
+}
+
+fn lof_channel_component_label(node: &LofNode, fallback_index: usize) -> Option<char> {
+    for key in ["Color", "Colour", "LUTColor", "LutColor", "ColorRGB", "RGB"] {
+        if let Some(value) = lof_clean_attr(node, key) {
+            if let Some(label) = lof_component_label_from_text(&value) {
+                return Some(label);
+            }
+        }
+    }
+    lof_channel_name(node)
+        .as_deref()
+        .and_then(lof_component_label_from_text)
+        .or_else(|| {
+            ["R", "G", "B", "A"]
+                .get(fallback_index)
+                .and_then(|s| s.chars().next())
+        })
+}
+
+fn lof_component_label_from_text(value: &str) -> Option<char> {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if lower.contains("red") || lower == "r" {
+        Some('R')
+    } else if lower.contains("green") || lower == "g" {
+        Some('G')
+    } else if lower.contains("blue") || lower == "b" {
+        Some('B')
+    } else if lower.contains("alpha") || lower == "a" {
+        Some('A')
+    } else {
+        None
+    }
+}
+
 fn lof_ome_channels(
     channel_nodes: &[&LofNode],
     effective_c: usize,
@@ -6140,15 +10776,139 @@ fn lof_ome_channels(
     (0..effective_c)
         .map(|channel_index| {
             let node = channel_nodes.get(channel_index).copied();
+            // Mirror the Leica `translateLuts` positional mapping: channel `i`
+            // takes its colour from the `i`-th channel description's `LUTName`.
+            // Only RGB-interleaved planes lack per-channel OME colours (the
+            // component LUTs are folded into a single packed channel), matching
+            // the Java behaviour where `translateLut` runs for every described
+            // channel of the (non-RGB) image.
+            let color = (samples_per_pixel <= 1)
+                .then(|| node.map(|n| lof_translate_lut(lof_lut_name(n))))
+                .flatten();
             OmeChannel {
                 name: node.and_then(lof_channel_name),
                 samples_per_pixel,
+                color,
                 excitation_wavelength: node.and_then(|n| lof_attr_f64(n, "ExcitationWavelength")),
                 emission_wavelength: node.and_then(|n| lof_attr_f64(n, "EmissionWavelength")),
-                ..OmeChannel::default()
+                ..Default::default()
             }
         })
         .collect()
+}
+
+/// Java `LMSMetadataExtractor.translateLut`: maps a Leica `LUTName` (a named
+/// colour or a `Gradient(b,g,r)` triple) to a packed RGBA colour. Whitespace is
+/// stripped first; unknown names fall back to opaque white. The packed value
+/// uses the OME convention `(R<<24)|(G<<16)|(B<<8)|A` (alpha 255).
+fn lof_translate_lut(lut_name: &str) -> i32 {
+    let stripped: String = lut_name.chars().filter(|c| !c.is_whitespace()).collect();
+    // Some LUTs are stored as gradients: `Gradient(b,g,r)`. Java reads the three
+    // components in reverse (index 2 = red, 1 = green, 0 = blue).
+    if let Some(rgb) = lof_parse_gradient_lut(&stripped) {
+        let (b, g, r) = rgb;
+        return lof_pack_rgba(r, g, b);
+    }
+    match stripped.to_ascii_lowercase().as_str() {
+        "red" => lof_pack_rgba(255, 0, 0),
+        "green" => lof_pack_rgba(0, 255, 0),
+        "blue" => lof_pack_rgba(0, 0, 255),
+        "cyan" => lof_pack_rgba(0, 255, 255),
+        "magenta" => lof_pack_rgba(255, 0, 255),
+        "yellow" => lof_pack_rgba(255, 255, 0),
+        _ => lof_pack_rgba(255, 255, 255),
+    }
+}
+
+/// Parse a Leica `Gradient(<u8>,<u8>,<u8>)` LUT (case-insensitive). Returns the
+/// three numeric components in source order, or `None` for any other text.
+fn lof_parse_gradient_lut(stripped: &str) -> Option<(u8, u8, u8)> {
+    let lower = stripped.to_ascii_lowercase();
+    let inner = lower
+        .strip_prefix("gradient(")
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    let parts: Vec<&str> = inner.split(',').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let a = parts[0].parse::<i32>().ok()?;
+    let b = parts[1].parse::<i32>().ok()?;
+    let c = parts[2].parse::<i32>().ok()?;
+    if !(0..=255).contains(&a) || !(0..=255).contains(&b) || !(0..=255).contains(&c) {
+        return None;
+    }
+    Some((a as u8, b as u8, c as u8))
+}
+
+/// Pack an RGB triple as an OME-style signed RGBA integer with opaque alpha,
+/// matching `ome.xml.model.primitives.Color(r, g, b, 255)`.
+fn lof_pack_rgba(r: u8, g: u8, b: u8) -> i32 {
+    (((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xff) as i32
+}
+
+/// Java `LMSMetadataExtractor.getChannelPriority`: maps a Leica `LUTName` to the
+/// channel-priority index that drives the synthetic 8/16-bit lookup table in
+/// `LOFReader.get8BitLookupTable`. Matching is case-sensitive lowercase (as in
+/// the Java `switch`), so capitalised names such as `"Red"` fall through to the
+/// default `8` (gray/identity).
+fn lof_channel_priority(lut_name: &str) -> i32 {
+    match lut_name {
+        "red" => 0,
+        "green" => 1,
+        "blue" => 2,
+        "cyan" => 3,
+        "magenta" => 4,
+        "yellow" => 5,
+        "black" => 6,
+        "gray" => 7,
+        _ => 8,
+    }
+}
+
+/// Java `LMSMetadataExtractor.translateChannelDescriptions` inverse-RGB test:
+/// BGR ordering is assumed unless the first three channels are explicitly
+/// described as `Red`, `Green`, `Blue` (in that order).
+fn lof_inverse_rgb(channel_nodes: &[&LofNode]) -> bool {
+    if channel_nodes.len() < 3 {
+        return true;
+    }
+    !(lof_lut_name(channel_nodes[0]) == "Red"
+        && lof_lut_name(channel_nodes[1]) == "Green"
+        && lof_lut_name(channel_nodes[2]) == "Blue")
+}
+
+/// The raw `LUTName` attribute of a channel description (empty string if absent),
+/// matching the Java `getAttribute("LUTName")` default.
+fn lof_lut_name(node: &LofNode) -> &str {
+    node.attrs.get("LUTName").map(String::as_str).unwrap_or("")
+}
+
+/// Capture the Leica per-channel LUT object-graph scalars that Java derives in
+/// `translateLuts` / `translateChannelDescriptions` but the LOF reader keeps in
+/// its transient `metaTemp` buffer (channel colour, channel priority, and the
+/// image-level inverse-RGB flag).
+fn lof_insert_channel_lut_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    channel_nodes: &[&LofNode],
+) {
+    for (channel_index, node) in channel_nodes.iter().enumerate() {
+        let lut_name = lof_lut_name(node);
+        let prefix = format!("lof.channel.{channel_index}");
+        metadata.insert(
+            format!("{prefix}.lut_color"),
+            MetadataValue::Int(lof_translate_lut(lut_name) as i64),
+        );
+        metadata.insert(
+            format!("{prefix}.channel_priority"),
+            MetadataValue::Int(lof_channel_priority(lut_name) as i64),
+        );
+    }
+    if !channel_nodes.is_empty() {
+        metadata.insert(
+            "lof.inverse_rgb".into(),
+            MetadataValue::String(lof_inverse_rgb(channel_nodes).to_string()),
+        );
+    }
 }
 
 fn lof_channel_name(node: &LofNode) -> Option<String> {
@@ -6169,6 +10929,128 @@ fn lof_clean_attr(node: &LofNode, key: &str) -> Option<String> {
 fn lof_attr_f64(node: &LofNode, key: &str) -> Option<f64> {
     let parsed = node.attrs.get(key)?.trim().parse::<f64>().ok()?;
     parsed.is_finite().then_some(parsed)
+}
+
+fn lof_ome_instruments_from_metadata(meta: &ImageMetadata) -> Vec<OmeInstrument> {
+    let mut instrument = OmeInstrument::default();
+    let mut has_instrument = false;
+
+    if let Some(value) = metadata_string(meta, "lof.instrument.0.model")
+        .or_else(|| metadata_string(meta, "lof.instrument.0.name"))
+        .or_else(|| metadata_string(meta, "lof.instrument.0.system_name"))
+    {
+        instrument.microscope_model = Some(value);
+        has_instrument = true;
+    }
+    if let Some(value) = metadata_string(meta, "lof.instrument.0.manufacturer")
+        .or_else(|| metadata_string(meta, "lof.instrument.0.vendor"))
+    {
+        instrument.microscope_manufacturer = Some(value);
+        has_instrument = true;
+    }
+
+    let mut detector_index = 0usize;
+    loop {
+        let base = format!("lof.detector.{detector_index}");
+        let detector = OmeDetector {
+            id: Some(create_lsid("Detector", &[0, detector_index])),
+            model: metadata_string(meta, &format!("{base}.model"))
+                .or_else(|| metadata_string(meta, &format!("{base}.name")))
+                .or_else(|| metadata_string(meta, &format!("{base}.detector_name"))),
+            manufacturer: metadata_string(meta, &format!("{base}.manufacturer"))
+                .or_else(|| metadata_string(meta, &format!("{base}.vendor"))),
+            detector_type: metadata_string(meta, &format!("{base}.type"))
+                .or_else(|| metadata_string(meta, &format!("{base}.detector_type"))),
+            gain: metadata_float(meta, &format!("{base}.gain"))
+                .or_else(|| metadata_float(meta, &format!("{base}.detector_gain"))),
+            offset: metadata_float(meta, &format!("{base}.offset"))
+                .or_else(|| metadata_float(meta, &format!("{base}.detector_offset"))),
+        };
+        if detector.model.is_none()
+            && detector.manufacturer.is_none()
+            && detector.detector_type.is_none()
+            && detector.gain.is_none()
+            && detector.offset.is_none()
+        {
+            break;
+        }
+        has_instrument = true;
+        instrument.detectors.push(detector);
+        detector_index += 1;
+    }
+
+    if has_instrument {
+        instrument.id = Some(create_lsid("Instrument", &[0]));
+        vec![instrument]
+    } else {
+        Vec::new()
+    }
+}
+
+fn lof_ome_rois_from_metadata(meta: &ImageMetadata) -> Vec<OmeROI> {
+    let mut rois = Vec::new();
+    let mut idx = 0usize;
+    loop {
+        let base = format!("lof.roi.{idx}");
+        let Some(x) = metadata_float(meta, &format!("{base}.x"))
+            .or_else(|| metadata_float(meta, &format!("{base}.left")))
+            .or_else(|| metadata_float(meta, &format!("{base}.pos_x")))
+        else {
+            break;
+        };
+        let Some(y) = metadata_float(meta, &format!("{base}.y"))
+            .or_else(|| metadata_float(meta, &format!("{base}.top")))
+            .or_else(|| metadata_float(meta, &format!("{base}.pos_y")))
+        else {
+            break;
+        };
+        let shape = match (
+            metadata_float(meta, &format!("{base}.width"))
+                .or_else(|| metadata_float(meta, &format!("{base}.size_x"))),
+            metadata_float(meta, &format!("{base}.height"))
+                .or_else(|| metadata_float(meta, &format!("{base}.size_y"))),
+        ) {
+            (Some(width), Some(height)) => OmeShape::Rectangle {
+                x,
+                y,
+                width,
+                height,
+                the_z: None,
+                the_t: None,
+                the_c: None,
+            },
+            _ => OmeShape::Point {
+                x,
+                y,
+                the_z: None,
+                the_t: None,
+                the_c: None,
+            },
+        };
+        rois.push(OmeROI {
+            id: Some(create_lsid("ROI", &[idx])),
+            name: metadata_string(meta, &format!("{base}.name"))
+                .or_else(|| metadata_string(meta, &format!("{base}.label"))),
+            shapes: vec![shape],
+        });
+        idx += 1;
+    }
+    rois
+}
+
+fn metadata_string(meta: &ImageMetadata, key: &str) -> Option<String> {
+    match meta.series_metadata.get(key) {
+        Some(MetadataValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn metadata_float(meta: &ImageMetadata, key: &str) -> Option<f64> {
+    match meta.series_metadata.get(key) {
+        Some(MetadataValue::Float(value)) => Some(*value),
+        Some(MetadataValue::Int(value)) => Some(*value as f64),
+        _ => None,
+    }
 }
 
 fn lof_key_name(key: &str) -> String {
@@ -7307,5 +12189,160 @@ mod mrw_tests {
         let err = MrwReader::new().set_id(&path).unwrap_err();
         assert!(err.to_string().contains("WBG scale"));
         std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod lof_lut_tests {
+    use super::{
+        lof_channel_priority, lof_inverse_rgb, lof_insert_channel_lut_metadata, lof_pack_rgba,
+        lof_translate_lut, lof_translate_metadata, LofNode,
+    };
+    use crate::common::metadata::MetadataValue;
+    use std::collections::HashMap;
+
+    fn channel_node(lut_name: &str) -> LofNode {
+        let mut attrs = HashMap::new();
+        if !lut_name.is_empty() {
+            attrs.insert("LUTName".to_string(), lut_name.to_string());
+        }
+        LofNode {
+            name: "ChannelDescription".to_string(),
+            attrs,
+        }
+    }
+
+    #[test]
+    fn translate_lut_maps_named_colours() {
+        // Java translateLut: named LUTs -> packed RGBA (alpha 255).
+        assert_eq!(lof_translate_lut("Red"), lof_pack_rgba(255, 0, 0));
+        assert_eq!(lof_translate_lut("green"), lof_pack_rgba(0, 255, 0));
+        assert_eq!(lof_translate_lut("Blue"), lof_pack_rgba(0, 0, 255));
+        assert_eq!(lof_translate_lut("Cyan"), lof_pack_rgba(0, 255, 255));
+        assert_eq!(lof_translate_lut("Magenta"), lof_pack_rgba(255, 0, 255));
+        assert_eq!(lof_translate_lut("Yellow"), lof_pack_rgba(255, 255, 0));
+        // Whitespace is stripped before matching.
+        assert_eq!(lof_translate_lut("  Red "), lof_pack_rgba(255, 0, 0));
+        // Unknown / empty falls back to opaque white.
+        assert_eq!(lof_translate_lut(""), lof_pack_rgba(255, 255, 255));
+        assert_eq!(lof_translate_lut("Glow"), lof_pack_rgba(255, 255, 255));
+    }
+
+    #[test]
+    fn translate_lut_decodes_gradient_in_reverse() {
+        // Gradient(b,g,r): Java reads component 2 as red, 1 as green, 0 as blue.
+        assert_eq!(
+            lof_translate_lut("Gradient(10,20,30)"),
+            lof_pack_rgba(30, 20, 10)
+        );
+        // Case-insensitive name and stripped whitespace.
+        assert_eq!(
+            lof_translate_lut("gradient( 1 , 2 , 3 )"),
+            lof_pack_rgba(3, 2, 1)
+        );
+        // Out-of-range components are not a gradient -> white fallback.
+        assert_eq!(
+            lof_translate_lut("Gradient(300,0,0)"),
+            lof_pack_rgba(255, 255, 255)
+        );
+    }
+
+    #[test]
+    fn channel_priority_is_case_sensitive_lowercase() {
+        // Java getChannelPriority switches on exact lowercase strings.
+        assert_eq!(lof_channel_priority("red"), 0);
+        assert_eq!(lof_channel_priority("green"), 1);
+        assert_eq!(lof_channel_priority("blue"), 2);
+        assert_eq!(lof_channel_priority("cyan"), 3);
+        assert_eq!(lof_channel_priority("magenta"), 4);
+        assert_eq!(lof_channel_priority("yellow"), 5);
+        assert_eq!(lof_channel_priority("black"), 6);
+        assert_eq!(lof_channel_priority("gray"), 7);
+        // Capitalised LUT names fall through to the default (gray/identity).
+        assert_eq!(lof_channel_priority("Red"), 8);
+        assert_eq!(lof_channel_priority(""), 8);
+    }
+
+    #[test]
+    fn inverse_rgb_requires_explicit_rgb_order() {
+        let rgb = [
+            &channel_node("Red"),
+            &channel_node("Green"),
+            &channel_node("Blue"),
+        ];
+        assert!(!lof_inverse_rgb(&rgb));
+
+        let bgr = [
+            &channel_node("Blue"),
+            &channel_node("Green"),
+            &channel_node("Red"),
+        ];
+        assert!(lof_inverse_rgb(&bgr));
+
+        // Fewer than three channels -> BGR assumed.
+        let two = [&channel_node("Red"), &channel_node("Green")];
+        assert!(lof_inverse_rgb(&two));
+    }
+
+    #[test]
+    fn channel_lut_metadata_records_colour_priority_and_order() {
+        let nodes = [
+            &channel_node("red"),
+            &channel_node("green"),
+            &channel_node("blue"),
+        ];
+        let mut metadata = HashMap::new();
+        lof_insert_channel_lut_metadata(&mut metadata, &nodes);
+
+        let red = lof_pack_rgba(255, 0, 0) as i64;
+        assert!(matches!(
+            metadata.get("lof.channel.0.lut_color"),
+            Some(MetadataValue::Int(v)) if *v == red
+        ));
+        assert!(matches!(
+            metadata.get("lof.channel.0.channel_priority"),
+            Some(MetadataValue::Int(0))
+        ));
+        assert!(matches!(
+            metadata.get("lof.channel.2.channel_priority"),
+            Some(MetadataValue::Int(2))
+        ));
+        // Lowercase r/g/b is not the explicit "Red"/"Green"/"Blue" order.
+        assert!(matches!(
+            metadata.get("lof.inverse_rgb"),
+            Some(MetadataValue::String(v)) if v == "true"
+        ));
+    }
+
+    #[test]
+    fn translate_metadata_populates_channel_colours() {
+        let xml = r#"<Data><Image>
+            <ImageDescription>
+              <Channels>
+                <ChannelDescription DataType="0" ChannelTag="0" Resolution="8"
+                  NameOfMeasurement="" Min="0" Max="255" Unit="" LUTName="Red"
+                  IsLUTInverted="0" BytesInc="0" BitInc="0"/>
+                <ChannelDescription DataType="0" ChannelTag="0" Resolution="8"
+                  NameOfMeasurement="" Min="0" Max="255" Unit="" LUTName="Green"
+                  IsLUTInverted="0" BytesInc="1" BitInc="0"/>
+              </Channels>
+              <Dimensions>
+                <DimensionDescription DimID="1" NumberOfElements="4" Length="0"
+                  Unit="" BytesInc="1" BitInc="0"/>
+                <DimensionDescription DimID="2" NumberOfElements="3" Length="0"
+                  Unit="" BytesInc="4" BitInc="0"/>
+              </Dimensions>
+            </ImageDescription>
+          </Image></Data>"#;
+
+        let info = lof_translate_metadata(xml).unwrap();
+        assert_eq!(info.ome.channels.len(), 2);
+        assert_eq!(info.ome.channels[0].color, Some(lof_pack_rgba(255, 0, 0)));
+        assert_eq!(info.ome.channels[1].color, Some(lof_pack_rgba(0, 255, 0)));
+        let green = lof_pack_rgba(0, 255, 0) as i64;
+        assert!(matches!(
+            info.meta.series_metadata.get("lof.channel.1.lut_color"),
+            Some(MetadataValue::Int(v)) if *v == green
+        ));
     }
 }

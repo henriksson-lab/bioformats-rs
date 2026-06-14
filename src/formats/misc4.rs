@@ -1754,6 +1754,98 @@ impl PciReader {
         }
     }
 
+    /// Port of Java's `addGlobalMeta` key derivation in `initFile`:
+    /// replace path separators with spaces, then strip the `Root Entry `,
+    /// `Field Data ` and `Details ` prefixes wherever they occur.
+    fn global_meta_key(name: &str) -> String {
+        let spaced = name.replace('/', " ");
+        spaced
+            .replace("Root Entry ", "")
+            .replace("Field Data ", "")
+            .replace("Details ", "")
+    }
+
+    /// Port of Java `getTimestampIndex`: the 1-based field number that follows
+    /// the last space in the parent path, returned 0-based.
+    fn timestamp_index(path: &str) -> Option<i64> {
+        let space = path.rfind(' ').map(|i| i + 1)?;
+        if space >= path.len() {
+            return None;
+        }
+        let end = path[space..].find('/').map(|i| space + i)?;
+        path[space..end].parse::<i64>().ok().map(|v| v - 1)
+    }
+
+    /// Port of Java `DateTools.convertDate(date, COBOL)`: `date` is milliseconds
+    /// since the COBOL epoch (1582-10-15 00:00:00 UTC). Produces the Bio-Formats
+    /// ISO-8601 `yyyy-MM-dd'T'HH:mm:ss` timestamp string.
+    fn convert_cobol_date(date_ms: i64) -> String {
+        // Milliseconds between the COBOL epoch (1582-10-15) and the Unix epoch
+        // (1970-01-01). Matches Bio-Formats `DateTools.COBOL`.
+        const COBOL_TO_UNIX_MS: i64 = 12_219_292_800_000;
+        let unix_ms = date_ms - COBOL_TO_UNIX_MS;
+        Self::format_iso8601(unix_ms)
+    }
+
+    /// Format Unix epoch milliseconds as `yyyy-MM-dd'T'HH:mm:ss` (UTC).
+    fn format_iso8601(unix_ms: i64) -> String {
+        let secs = unix_ms.div_euclid(1000);
+        let days = secs.div_euclid(86_400);
+        let tod = secs.rem_euclid(86_400);
+        let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+        // Civil-from-days algorithm (Howard Hinnant), epoch 1970-01-01.
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if m <= 2 { y + 1 } else { y };
+        format!("{year:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
+    }
+
+    /// Port of Java's `Comments` parsing: each `key=value` line becomes a global
+    /// metadata entry; `factor`, `magnification` and `units` adjust calibration.
+    fn parse_comments(
+        comments: &str,
+        meta: &mut HashMap<String, MetadataValue>,
+        scale_factor: &mut f64,
+        magnification: &mut f64,
+        units_is_pixel: &mut bool,
+    ) {
+        for line in comments.split('\n') {
+            let Some(eq) = line.find('=') else { continue };
+            let key = line[..eq].trim();
+            let value = line[eq + 1..].trim();
+            meta.insert(key.to_string(), MetadataValue::String(value.to_string()));
+
+            // Java strips a trailing `;...` suffix before parsing the number.
+            let trimmed = value.split(';').next().unwrap_or(value).trim();
+            match key {
+                "factor" => {
+                    if let Ok(v) = trimmed.parse::<f64>() {
+                        *scale_factor = v;
+                    }
+                }
+                "magnification" => {
+                    if let Ok(v) = trimmed.parse::<f64>() {
+                        *magnification = v;
+                    }
+                }
+                "units" => {
+                    // Java only acts on `units` when a `;` is present.
+                    if value.contains(';') && trimmed.eq_ignore_ascii_case("pixels") {
+                        *units_is_pixel = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Port of Java `getImageIndex`.
     fn image_index(path: &str, effective_size_c: i64) -> Option<u32> {
         let space = path.rfind(' ').map(|i| i + 1)?;
@@ -1894,6 +1986,16 @@ impl FormatReader for PciReader {
         let mut second_z = 0.0f64;
         let mut unique_z: Vec<f64> = Vec::new();
         let mut insertion: Vec<String> = Vec::new();
+        let mut binning: i64 = 0;
+        let mut creation_date: Option<String> = None;
+        // Per-field/timepoint `Time_From_Start` values (Java `timestamps`).
+        let mut timestamps: HashMap<i64, f64> = HashMap::new();
+        // Named scalar metadata (Java `addGlobalMeta`), emitted into `series_metadata`.
+        let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
+        let mut scale_factor: f64 = 1.0;
+        let mut magnification: f64 = 1.0;
+        // True once `units=pixels` is seen (Java leaves `units == UNITS.PIXEL`).
+        let mut units_is_pixel = false;
 
         for name in &all_files {
             let (parent, relative) = Self::split_path(name);
@@ -1905,6 +2007,18 @@ impl FormatReader for PciReader {
             } else {
                 None
             };
+
+            // Java: every non-image 8-byte stream is a named scalar double.
+            // Key = full path with separators replaced by spaces, stripping the
+            // `Root Entry `, `Field Data ` and `Details ` path prefixes.
+            if let Some(bytes) = stream.as_deref() {
+                if bytes.len() == 8 {
+                    if let Some(value) = Self::read_f64_le(bytes) {
+                        let key = Self::global_meta_key(name);
+                        series_metadata.insert(key, MetadataValue::Float(value));
+                    }
+                }
+            }
 
             if relative == "Field Count" {
                 if let Some(v) = stream.as_deref().and_then(Self::read_i32_le) {
@@ -1954,7 +2068,11 @@ impl FormatReader for PciReader {
                     size_x = d as i64;
                 }
             } else if relative.contains("Time_From_Start") {
-                // Timestamps are metadata-only; parsed but not stored.
+                if let Some(t) = stream.as_deref().and_then(Self::read_f64_le) {
+                    if let Some(idx) = Self::timestamp_index(parent) {
+                        timestamps.insert(idx, t);
+                    }
+                }
             } else if relative.ends_with("Position_Z") {
                 if let Some(z) = stream.as_deref().and_then(Self::read_f64_le) {
                     if !unique_z.contains(&z) && size_z <= 1 {
@@ -1966,14 +2084,33 @@ impl FormatReader for PciReader {
                         second_z = z;
                     }
                 }
+            } else if relative == "First Field Date & Time" {
+                if let Some(d) = stream.as_deref().and_then(Self::read_f64_le) {
+                    let date_ms = (d as i64).saturating_mul(1000);
+                    creation_date = Some(Self::convert_cobol_date(date_ms));
+                }
             } else if relative == "GroupMode" {
                 if let Some(v) = stream.as_deref().and_then(Self::read_i32_le) {
                     mode = v;
                 }
             } else if relative == "GroupSelectedFields" {
                 size_z = stream.as_ref().map(|s| s.len() as i64 / 8).unwrap_or(0);
+            } else if relative == "Binning" {
+                if let Some(d) = stream.as_deref().and_then(Self::read_f64_le) {
+                    binning = d as i64;
+                }
+            } else if relative == "Comments" {
+                if let Some(bytes) = stream.as_deref() {
+                    let comments = String::from_utf8_lossy(bytes);
+                    Self::parse_comments(
+                        &comments,
+                        &mut series_metadata,
+                        &mut scale_factor,
+                        &mut magnification,
+                        &mut units_is_pixel,
+                    );
+                }
             }
-            // Remaining metadata (Binning, Comments, physical sizes) omitted.
         }
 
         let z_first = (first_z - second_z).abs() > f64::EPSILON;
@@ -2055,6 +2192,55 @@ impl FormatReader for PciReader {
             }
         }
 
+        // Java stores the following into the OME MetadataStore. `ImageMetadata`
+        // has no equivalent typed fields, so capture them as named global
+        // metadata under stable keys so the data is not lost.
+        if let Some(date) = &creation_date {
+            series_metadata.insert(
+                "Acquisition Date".to_string(),
+                MetadataValue::String(date.clone()),
+            );
+        }
+        // PhysicalSizeX/Y = scaleFactor, scaled by magnification unless the
+        // calibration unit is pixels (Java multiplies only when not PIXEL).
+        let physical_size = if units_is_pixel {
+            scale_factor
+        } else {
+            scale_factor * magnification
+        };
+        if physical_size > 0.0 {
+            series_metadata.insert(
+                "PhysicalSizeX".to_string(),
+                MetadataValue::Float(physical_size),
+            );
+            series_metadata.insert(
+                "PhysicalSizeY".to_string(),
+                MetadataValue::Float(physical_size),
+            );
+        }
+        if binning > 0 {
+            series_metadata.insert(
+                "Binning".to_string(),
+                MetadataValue::String(format!("{binning}x{binning}")),
+            );
+        }
+        // Per-plane delta-T (Java `setPlaneDeltaT`) and the derived time
+        // increment between the first two acquired planes.
+        for i in 0..image_count {
+            if let Some(t) = timestamps.get(&i) {
+                series_metadata.insert(
+                    format!("DeltaT {i}"),
+                    MetadataValue::Float(*t),
+                );
+            }
+        }
+        if let (Some(first), Some(second)) = (timestamps.get(&1), timestamps.get(&2)) {
+            series_metadata.insert(
+                "TimeIncrement".to_string(),
+                MetadataValue::Float(second - first),
+            );
+        }
+
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x: size_x as u32,
@@ -2071,7 +2257,7 @@ impl FormatReader for PciReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
-            series_metadata: HashMap::new(),
+            series_metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
@@ -3218,7 +3404,8 @@ impl FormatReader for HrdgdfReader {
 /// blocks is supported: comma-separated values and ranges with optional
 /// positive steps, including nested blocks inside brace/class alternatives.
 /// Simple `*` and `?` path-component globs plus bounded recursive `**`
-/// directory globs are expanded from the pattern file's directory.
+/// directory globs are expanded from the pattern file's directory. A terminal
+/// `**` is limited to files that a registered reader can plausibly open.
 pub struct FilePatternReaderStub {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -3249,9 +3436,18 @@ impl FilePatternReaderStub {
 
     fn expand_pattern(pattern: &Path) -> Result<Option<ExpandedFilePattern>> {
         let text = pattern.to_string_lossy();
+        if should_expand_as_glob_before_blocks(&text)? {
+            let files = expand_simple_glob(pattern)?;
+            let glob_pattern = normalize_path_lexically(pattern);
+            let file_pattern = FilePattern::from_expanded_glob(&glob_pattern, &files)?;
+            return Ok(Some(ExpandedFilePattern::Glob {
+                files,
+                pattern: file_pattern,
+            }));
+        }
         if !contains_filepattern_block(&text) {
             reject_unsupported_filepattern_syntax(&text)?;
-            if contains_simple_glob(&text) {
+            if contains_glob_syntax(&text) {
                 let files = expand_simple_glob(pattern)?;
                 let glob_pattern = normalize_path_lexically(pattern);
                 let file_pattern = FilePattern::from_expanded_glob(&glob_pattern, &files)?;
@@ -3485,6 +3681,14 @@ impl FormatReader for FilePatternReaderStub {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if let Some(stitcher) = &self.stitcher {
+            return stitcher.ome_metadata();
+        }
+        let meta = self.meta.as_ref()?;
+        Some(crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta))
+    }
 }
 
 fn expand_pattern_text(pattern: &str, out: &mut Vec<String>) -> Result<()> {
@@ -3595,10 +3799,81 @@ fn contains_simple_glob(pattern: &str) -> bool {
     pattern.contains('*') || pattern.contains('?')
 }
 
+fn contains_glob_syntax(pattern: &str) -> bool {
+    contains_simple_glob(pattern) || contains_shell_glob_class(pattern)
+}
+
+fn should_expand_as_glob_before_blocks(pattern: &str) -> Result<bool> {
+    if !contains_simple_glob(pattern) {
+        return Ok(false);
+    }
+    if pattern.contains('<') || pattern.contains('{') {
+        return Ok(false);
+    }
+    let mut saw_class = false;
+    let mut idx = 0usize;
+    while let Some(rel_start) = pattern[idx..].find('[') {
+        let start = idx + rel_start;
+        let Some(rel_end) = pattern[start + 1..].find(']') else {
+            return Ok(false);
+        };
+        let end = start + 1 + rel_end;
+        if !is_shell_glob_class_body(&pattern[start + 1..end]) {
+            return Ok(false);
+        }
+        saw_class = true;
+        idx = end + 1;
+    }
+    Ok(saw_class)
+}
+
+fn contains_shell_glob_class(pattern: &str) -> bool {
+    let mut idx = 0usize;
+    while let Some(rel_start) = pattern[idx..].find('[') {
+        let start = idx + rel_start;
+        if let Some(rel_end) = pattern[start + 1..].find(']') {
+            let end = start + 1 + rel_end;
+            if is_shell_glob_class_body(&pattern[start + 1..end]) {
+                return true;
+            }
+            idx = end + 1;
+        } else {
+            return false;
+        }
+    }
+    false
+}
+
+fn is_shell_glob_class_body(body: &str) -> bool {
+    if body.is_empty()
+        || body.contains(',')
+        || body.contains(':')
+        || body.contains('<')
+        || body.contains('>')
+        || body.contains('{')
+        || body.contains('}')
+        || body.contains('[')
+        || body.contains(']')
+    {
+        return false;
+    }
+    let body = body
+        .strip_prefix('!')
+        .or_else(|| body.strip_prefix('^'))
+        .unwrap_or(body);
+    if body.is_empty() {
+        return false;
+    }
+    if let Some((first, last)) = body.split_once('-') {
+        return first.chars().count() == 1 && last.chars().count() == 1;
+    }
+    true
+}
+
 const MAX_RECURSIVE_GLOB_ENTRIES: usize = 4096;
 
 fn expand_simple_glob(pattern: &Path) -> Result<Vec<PathBuf>> {
-    if !contains_simple_glob(&pattern.to_string_lossy()) {
+    if !contains_glob_syntax(&pattern.to_string_lossy()) {
         return Ok(vec![pattern.to_path_buf()]);
     }
 
@@ -3643,6 +3918,7 @@ fn expand_simple_glob(pattern: &Path) -> Result<Vec<PathBuf>> {
     if roots.is_empty() {
         roots.push(PathBuf::from("."));
     }
+    let globs = collapse_adjacent_recursive_glob_components(globs);
 
     let mut paths = roots;
     let mut confinement_roots: Option<Vec<PathBuf>> = None;
@@ -3686,8 +3962,19 @@ fn expand_simple_glob(pattern: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn collapse_adjacent_recursive_glob_components(globs: Vec<String>) -> Vec<String> {
+    let mut collapsed = Vec::with_capacity(globs.len());
+    for glob in globs {
+        if glob == "**" && collapsed.last().is_some_and(|previous| previous == "**") {
+            continue;
+        }
+        collapsed.push(glob);
+    }
+    collapsed
+}
+
 fn is_glob_component(component: &str) -> bool {
-    component == "**" || contains_simple_glob(component)
+    component == "**" || contains_glob_syntax(component)
 }
 
 fn expand_parent_after_glob_component(
@@ -3749,7 +4036,7 @@ fn expand_glob_component(
         return expand_recursive_glob_component(bases, last);
     }
 
-    if !contains_simple_glob(component_pattern) {
+    if !contains_glob_syntax(component_pattern) {
         return Ok(bases
             .into_iter()
             .map(|mut base| {
@@ -3795,6 +4082,11 @@ fn expand_recursive_glob_component(bases: Vec<PathBuf>, last: bool) -> Result<Ve
     }
     matches.sort();
     matches.dedup();
+    if last && matches.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "FilePattern: recursive ** glob matched no supported reader files".to_string(),
+        ));
+    }
     Ok(matches)
 }
 
@@ -3811,7 +4103,9 @@ fn collect_recursive_glob_paths(
 
     if files {
         if base.is_file() {
-            matches.push(base.to_path_buf());
+            if is_supported_recursive_glob_file(base) {
+                matches.push(base.to_path_buf());
+            }
             return Ok(());
         }
     } else if base.is_dir() {
@@ -3828,7 +4122,7 @@ fn collect_recursive_glob_paths(
         let file_type = entry.file_type().map_err(BioFormatsError::Io)?;
         if file_type.is_dir() {
             collect_recursive_glob_paths(&entry.path(), files, matches)?;
-        } else if files {
+        } else if files && is_supported_recursive_glob_file(&entry.path()) {
             matches.push(entry.path());
             if matches.len() >= MAX_RECURSIVE_GLOB_ENTRIES {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
@@ -3838,6 +4132,21 @@ fn collect_recursive_glob_paths(
         }
     }
     Ok(())
+}
+
+fn is_supported_recursive_glob_file(path: &Path) -> bool {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pattern"))
+    {
+        return false;
+    }
+
+    let header = crate::common::io::peek_header(path, 512).unwrap_or_default();
+    crate::registry::all_readers_pub()
+        .into_iter()
+        .any(|reader| reader.is_this_type_by_bytes(&header) || reader.is_this_type_by_name(path))
 }
 
 fn simple_glob_matches(pattern: &str, name: &str) -> bool {
@@ -3852,6 +4161,20 @@ fn simple_glob_matches(pattern: &str, name: &str) -> bool {
         if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == name[n]) {
             p += 1;
             n += 1;
+        } else if p < pattern.len() && pattern[p] == b'[' {
+            let Some((end, matched)) = glob_bracket_class_matches(pattern, p, name[n]) else {
+                return false;
+            };
+            if matched {
+                p = end + 1;
+                n += 1;
+            } else if let Some(star_pos) = star {
+                p = star_pos + 1;
+                after_star_name += 1;
+                n = after_star_name;
+            } else {
+                return false;
+            }
         } else if p < pattern.len() && pattern[p] == b'*' {
             star = Some(p);
             p += 1;
@@ -3869,6 +4192,46 @@ fn simple_glob_matches(pattern: &str, name: &str) -> bool {
         p += 1;
     }
     p == pattern.len()
+}
+
+fn glob_bracket_class_matches(pattern: &[u8], start: usize, byte: u8) -> Option<(usize, bool)> {
+    let mut idx = start + 1;
+    if idx >= pattern.len() {
+        return None;
+    }
+    let negated = pattern[idx] == b'!' || pattern[idx] == b'^';
+    if negated {
+        idx += 1;
+    }
+
+    let mut matched = false;
+    let mut saw_member = false;
+    while idx < pattern.len() {
+        if pattern[idx] == b']' && saw_member {
+            return Some((idx, if negated { !matched } else { matched }));
+        }
+
+        let first = pattern[idx];
+        saw_member = true;
+        if idx + 2 < pattern.len() && pattern[idx + 1] == b'-' && pattern[idx + 2] != b']' {
+            let last = pattern[idx + 2];
+            let (lo, hi) = if first <= last {
+                (first, last)
+            } else {
+                (last, first)
+            };
+            if lo <= byte && byte <= hi {
+                matched = true;
+            }
+            idx += 3;
+        } else {
+            if first == byte {
+                matched = true;
+            }
+            idx += 1;
+        }
+    }
+    None
 }
 
 fn parse_pattern_block(block: &str) -> Result<Vec<String>> {
@@ -5473,5 +5836,73 @@ mod pds_tests {
         assert!(r.set_id(&hdr).is_err());
 
         cleanup(&[&hdr, &img]);
+    }
+}
+
+#[cfg(test)]
+mod pci_tests {
+    use super::*;
+
+    #[test]
+    fn global_meta_key_strips_prefixes() {
+        // Java replaces separators with spaces and drops the path prefixes.
+        assert_eq!(
+            PciReader::global_meta_key("Root Entry/Field Data/Field 1/Exposure"),
+            "Field 1 Exposure"
+        );
+        assert_eq!(
+            PciReader::global_meta_key("Root Entry/Details/Magnification"),
+            "Magnification"
+        );
+    }
+
+    #[test]
+    fn timestamp_index_is_zero_based_field() {
+        // Java reads the number after the last space, up to the next separator.
+        assert_eq!(
+            PciReader::timestamp_index("Root Entry/Field 3/Details"),
+            Some(2)
+        );
+        assert_eq!(PciReader::timestamp_index("no-space-here"), None);
+    }
+
+    #[test]
+    fn cobol_date_converts_to_iso8601() {
+        // COBOL epoch itself (date == 0 ms) is 1582-10-15T00:00:00.
+        assert_eq!(
+            PciReader::convert_cobol_date(0),
+            "1582-10-15T00:00:00"
+        );
+        // The Unix epoch in COBOL milliseconds round-trips to 1970-01-01.
+        let unix_epoch_in_cobol_ms = 12_219_292_800_000;
+        assert_eq!(
+            PciReader::convert_cobol_date(unix_epoch_in_cobol_ms),
+            "1970-01-01T00:00:00"
+        );
+    }
+
+    #[test]
+    fn parse_comments_captures_factor_and_magnification() {
+        let mut meta: HashMap<String, MetadataValue> = HashMap::new();
+        let mut scale_factor = 1.0;
+        let mut magnification = 1.0;
+        let mut units_is_pixel = false;
+        let comments = "factor = 0.5; um\nmagnification = 40\nunits = pixels; foo\n";
+        PciReader::parse_comments(
+            comments,
+            &mut meta,
+            &mut scale_factor,
+            &mut magnification,
+            &mut units_is_pixel,
+        );
+        assert_eq!(scale_factor, 0.5);
+        assert_eq!(magnification, 40.0);
+        assert!(units_is_pixel);
+        // Each key=value line is captured as named global metadata.
+        assert!(matches!(
+            meta.get("factor"),
+            Some(MetadataValue::String(s)) if s == "0.5; um"
+        ));
+        assert!(meta.contains_key("magnification"));
     }
 }

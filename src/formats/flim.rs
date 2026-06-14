@@ -27,6 +27,10 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
+const SDT_MAX_CURVE_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
+const SDT_MAX_ZIP_HEADER_PREVIEW_BYTES: usize = 256;
+const SDT_MAX_ZIP_FILE_NAME_PREVIEW_BYTES: usize = 64;
+
 fn r_i16_le(b: &[u8], off: usize) -> i16 {
     i16::from_le_bytes([b[off], b[off + 1]])
 }
@@ -38,6 +42,9 @@ fn r_u16_le(b: &[u8], off: usize) -> u16 {
 }
 fn r_u32_le(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+fn r_f32_le(b: &[u8], off: usize) -> f32 {
+    f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +68,12 @@ struct SdtSetup {
     img_x: u32,
     /// SP_IMG_Y — image height (used for measMode 13).
     img_y: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SdtSetupInfo {
+    setup: SdtSetup,
+    mcsta_points: u32,
 }
 
 /// Parse setup text block for image dimensions, mirroring SDTInfo.java's
@@ -237,6 +250,32 @@ fn read_sdt_zip_plane(
     Ok(out)
 }
 
+fn read_sdt_zip_payload_bounded(
+    f: &mut File,
+    block: &SdtBlock,
+    max_decoded_bytes: u64,
+    context: &str,
+) -> Result<Vec<u8>> {
+    f.seek(SeekFrom::Start(block.data_offset))
+        .map_err(BioFormatsError::Io)?;
+    let compressed_len = compressed_block_len(f, block)?;
+    let mut compressed = vec![0u8; compressed_len];
+    f.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;
+    let payload = zip_deflate_payload(&compressed)?;
+    let decoder = flate2::read::DeflateDecoder::new(Cursor::new(payload));
+    let mut limited = decoder.take(max_decoded_bytes + 1);
+    let mut decoded = Vec::new();
+    limited
+        .read_to_end(&mut decoded)
+        .map_err(|e| BioFormatsError::Codec(format!("SDT ZIP {context} decode failed: {e}")))?;
+    if decoded.len() as u64 > max_decoded_bytes {
+        return Err(BioFormatsError::Codec(format!(
+            "SDT ZIP {context} decoded payload exceeds bounded limit of {max_decoded_bytes} bytes"
+        )));
+    }
+    Ok(decoded)
+}
+
 fn copy_time_bin_row(row: &[u8], out: &mut [u8], time_bins: usize, sample_offset: usize) {
     for x in 0..out.len() / 2 {
         let input = (x * time_bins * 2) + sample_offset;
@@ -284,12 +323,108 @@ fn zip_deflate_payload(block: &[u8]) -> Result<&[u8]> {
     Ok(&block[payload_offset..])
 }
 
+fn read_sdt_block_prefix(f: &mut File, block: &SdtBlock, max_len: usize) -> Result<Vec<u8>> {
+    f.seek(SeekFrom::Start(block.data_offset))
+        .map_err(BioFormatsError::Io)?;
+    let block_len = compressed_block_len(f, block)?;
+    let mut prefix = vec![0u8; block_len.min(max_len)];
+    f.read_exact(&mut prefix).map_err(BioFormatsError::Io)?;
+    Ok(prefix)
+}
+
+fn insert_sdt_curve_zip_header_metadata(
+    meta_map: &mut HashMap<String, MetadataValue>,
+    prefix: &[u8],
+    block_len: u64,
+) {
+    meta_map.insert(
+        "sdt_curve_compressed_block_length".into(),
+        MetadataValue::Int(block_len as i64),
+    );
+    if !prefix.is_empty() {
+        meta_map.insert(
+            "sdt_curve_zip_leading_bytes".into(),
+            MetadataValue::Bytes(prefix[..prefix.len().min(16)].to_vec()),
+        );
+    }
+    if prefix.len() < 30 || &prefix[..4] != b"PK\x03\x04" {
+        return;
+    }
+
+    let flags = r_u16_le(prefix, 6);
+    let method = r_u16_le(prefix, 8);
+    let compressed_size = r_u32_le(prefix, 18);
+    let uncompressed_size = r_u32_le(prefix, 22);
+    let name_len = r_u16_le(prefix, 26) as usize;
+    let extra_len = r_u16_le(prefix, 28) as usize;
+    let payload_offset = 30usize
+        .checked_add(name_len)
+        .and_then(|v| v.checked_add(extra_len));
+
+    meta_map.insert(
+        "sdt_curve_zip_method".into(),
+        MetadataValue::Int(method as i64),
+    );
+    meta_map.insert(
+        "sdt_curve_zip_flags".into(),
+        MetadataValue::Int(flags as i64),
+    );
+    meta_map.insert(
+        "sdt_curve_zip_declared_compressed_size".into(),
+        MetadataValue::Int(compressed_size as i64),
+    );
+    meta_map.insert(
+        "sdt_curve_zip_declared_uncompressed_size".into(),
+        MetadataValue::Int(uncompressed_size as i64),
+    );
+    meta_map.insert(
+        "sdt_curve_zip_file_name_length".into(),
+        MetadataValue::Int(name_len as i64),
+    );
+    meta_map.insert(
+        "sdt_curve_zip_extra_length".into(),
+        MetadataValue::Int(extra_len as i64),
+    );
+    if let Some(payload_offset) = payload_offset {
+        meta_map.insert(
+            "sdt_curve_zip_payload_offset".into(),
+            MetadataValue::Int(payload_offset as i64),
+        );
+    }
+
+    let name_start = 30;
+    let name_end = name_start + name_len.min(SDT_MAX_ZIP_FILE_NAME_PREVIEW_BYTES);
+    if name_start < prefix.len() {
+        let available_end = name_end.min(prefix.len());
+        let preview = String::from_utf8_lossy(&prefix[name_start..available_end]).into_owned();
+        meta_map.insert(
+            "sdt_curve_zip_file_name_preview".into(),
+            MetadataValue::String(preview),
+        );
+    }
+    if name_len > SDT_MAX_ZIP_FILE_NAME_PREVIEW_BYTES || 30 + name_len > prefix.len() {
+        meta_map.insert(
+            "sdt_curve_zip_file_name_preview_truncated".into(),
+            MetadataValue::Bool(true),
+        );
+    }
+}
+
 fn read_sdt_setup_block(
     f: &mut File,
     setup_offs: u64,
     setup_length: usize,
     file_len: u64,
 ) -> Result<Option<SdtSetup>> {
+    Ok(read_sdt_setup_info(f, setup_offs, setup_length, file_len)?.map(|s| s.setup))
+}
+
+fn read_sdt_setup_info(
+    f: &mut File,
+    setup_offs: u64,
+    setup_length: usize,
+    file_len: u64,
+) -> Result<Option<SdtSetupInfo>> {
     if setup_offs == 0 || setup_length == 0 {
         return Ok(None);
     }
@@ -303,13 +438,159 @@ fn read_sdt_setup_block(
     let mut setup_buf = vec![0u8; setup_length.min(1 << 20)];
     let n = f.read(&mut setup_buf).map_err(BioFormatsError::Io)?;
     setup_buf.truncate(n);
-    let text = String::from_utf8_lossy(&setup_buf).into_owned();
-    Ok(Some(parse_sdt_setup(&text)))
+    let text_end = binary_setup_marker(&setup_buf).unwrap_or(setup_buf.len());
+    let text = String::from_utf8_lossy(&setup_buf[..text_end]).into_owned();
+    Ok(Some(SdtSetupInfo {
+        setup: parse_sdt_setup(&text),
+        mcsta_points: parse_sdt_mcsta_points(&setup_buf),
+    }))
+}
+
+fn binary_setup_marker(setup: &[u8]) -> Option<usize> {
+    const BINARY_SETUP: &[u8] = b"BIN_PARA_BEGIN:\0";
+    setup
+        .windows(BINARY_SETUP.len())
+        .position(|w| w == BINARY_SETUP)
+        .filter(|&pos| pos > 0)
+}
+
+fn parse_sdt_mcsta_points(setup: &[u8]) -> u32 {
+    // SDTInfo.java looks for BIN_PARA_BEGIN:\0, skips the next four bytes,
+    // then treats the following position as the base for BH/SPC binary setup
+    // offsets. MCS_TA.points is stored in the MCS image block at offset +8.
+    const BINARY_SETUP_LEN: usize = b"BIN_PARA_BEGIN:\0".len();
+    let Some(marker) = binary_setup_marker(setup) else {
+        return 0;
+    };
+    let Some(base) = marker
+        .checked_add(BINARY_SETUP_LEN)
+        .and_then(|v| v.checked_add(4))
+    else {
+        return 0;
+    };
+
+    let Some(binhdrext_offset) = read_u32_at(setup, base + 84).map(|v| v as usize) else {
+        return 0;
+    };
+    if binhdrext_offset == 0 {
+        return 0;
+    }
+    let Some(binhdrext) = base.checked_add(binhdrext_offset) else {
+        return 0;
+    };
+    let Some(mcs_img_offset) = read_u32_at(setup, binhdrext).map(|v| v as usize) else {
+        return 0;
+    };
+    if mcs_img_offset == 0 {
+        return 0;
+    }
+    let Some(mcsta_points_offset) = base
+        .checked_add(mcs_img_offset)
+        .and_then(|v| v.checked_add(8))
+    else {
+        return 0;
+    };
+    read_u16_at(setup, mcsta_points_offset)
+        .map(u32::from)
+        .unwrap_or(0)
+}
+
+fn read_u16_at(buf: &[u8], off: usize) -> Option<u16> {
+    let bytes = buf.get(off..off + 2)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32_at(buf: &[u8], off: usize) -> Option<u32> {
+    let bytes = buf.get(off..off + 4)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 /// Parsed Becker & Hickl SDT header (a partial port of SDTInfo.java covering
 /// the fields the reader needs: dimensions, channels, time bins, timepoints,
 /// MCS-TA points, count increment, and per-data-block offsets/lengths).
+#[derive(Clone, Copy, Debug)]
+struct SdtMeasureInfo {
+    meas_mode: i16,
+    adc_re: i16,
+    stopt: i16,
+    incr: u16,
+    scan_x: i32,
+    scan_y: i32,
+    scan_rx: i32,
+}
+
+/// MeasStopInfo descriptor sub-block (SDTInfo.java:798-836), present when
+/// measDescBlockLength >= 211 + 60. Information collected when the measurement
+/// is finished.
+#[derive(Clone, Copy, Debug, Default)]
+struct SdtMeasStopInfo {
+    status: u16,
+    flags: u16,
+    stop_time: f32,
+    cur_step: i32,
+    cur_cycle: i32,
+    cur_page: i32,
+    min_sync_rate: f32,
+    min_cfd_rate: f32,
+    min_tac_rate: f32,
+    min_adc_rate: f32,
+    max_sync_rate: f32,
+    max_cfd_rate: f32,
+    max_tac_rate: f32,
+    max_adc_rate: f32,
+    reserved1: i32,
+    reserved2: f32,
+}
+
+/// MeasFCSInfo descriptor sub-block (SDTInfo.java:839-871), present when
+/// measDescBlockLength >= 211 + 60 + 38. Information collected when a FIFO
+/// measurement is finished; describes the FCS / cross-FCS curve payloads.
+#[derive(Clone, Copy, Debug, Default)]
+struct SdtMeasFcsInfo {
+    chan: u16,
+    fcs_decay_calc: u16,
+    mt_resol: u32,
+    cortime: f32,
+    calc_photons: u32,
+    fcs_points: i32,
+    end_time: f32,
+    overruns: u16,
+    fcs_type: u16,
+    cross_chan: u16,
+    mod_: u16,
+    cross_mod: u16,
+    cross_mt_resol: u32,
+}
+
+/// Extended MeasureInfo descriptor sub-block (SDTInfo.java:874-898), present
+/// when measDescBlockLength >= 211 + 60 + 38 + 26. Valid for Camera mode or
+/// FIFO_IMAGE mode.
+#[derive(Clone, Copy, Debug, Default)]
+struct SdtExtendedMeasureInfo {
+    image_x: i32,
+    image_y: i32,
+    image_rx: i32,
+    image_ry: i32,
+    xy_gain: i16,
+    master_clock: i16,
+    adc_de: i16,
+    det_type: i16,
+    x_axis: i16,
+}
+
+/// MeasHISTInfo descriptor sub-block (SDTInfo.java:900-920), present when
+/// measDescBlockLength >= 211 + 60 + 38 + 26 + 24. Extension of MeasFCSInfo for
+/// the FIDA, FILDA and MCS histogram curve payloads.
+#[derive(Clone, Copy, Debug, Default)]
+struct SdtMeasHistInfo {
+    fida_time: f32,
+    filda_time: f32,
+    fida_points: i32,
+    filda_points: i32,
+    mcs_time: f32,
+    mcs_points: i32,
+}
+
 struct SdtInfo {
     width: u32,
     height: u32,
@@ -318,8 +599,452 @@ struct SdtInfo {
     timepoints: u32,
     mcsta_points: u32,
     incr: u16,
+    meas_infos: Vec<SdtMeasureInfo>,
+    meas_stop_info: Option<SdtMeasStopInfo>,
+    meas_fcs_info: Option<SdtMeasFcsInfo>,
+    extended_measure_info: Option<SdtExtendedMeasureInfo>,
+    meas_hist_info: Option<SdtMeasHistInfo>,
     block_offsets: Vec<u64>,
     block_lengths: Vec<u64>,
+    block_types: Vec<u16>,
+    block_measure_descs: Vec<i16>,
+}
+
+fn parse_sdt_measure_info(mb: &[u8]) -> SdtMeasureInfo {
+    // Field offsets within MeasureInfo (see SDTInfo.java order):
+    //   9 (time) + 11 (date) + 16 (modSerNo) = 36; measMode short at 36.
+    let meas_mode = r_i16_le(mb, 36);
+    // adcRE short at offset 36+2 + 6*float(4)=24 + short(2)+float(4)
+    //   + float(4)+short(2)+float(4)+float(4)+float(4) ... compute directly:
+    // Build cumulative offset from the documented field sequence:
+    // measMode(2), cfdLL..cfdHF(4 floats=16), synZC(4), synFD(2), synHF(4),
+    // tacR(4), tacG(2), tacOF(4), tacLL(4), tacLH(4), adcRE(2)...
+    let mut off = 36usize;
+    off += 2; // measMode
+    off += 16; // cfdLL,cfdLH,cfdZC,cfdHF
+    off += 4; // synZC
+    off += 2; // synFD
+    off += 4; // synHF
+    off += 4; // tacR
+    off += 2; // tacG
+    off += 4; // tacOF
+    off += 4; // tacLL
+    off += 4; // tacLH
+    let adc_re = r_i16_le(mb, off);
+    off += 2; // adcRE
+    off += 2; // ealDE
+    off += 2; // ncx
+    off += 2; // ncy
+    off += 2; // page (ushort)
+    off += 4; // colT
+    off += 4; // repT
+    let stopt = r_i16_le(mb, off);
+    off += 2; // stopt
+    off += 1; // overfl (ubyte)
+    off += 2; // useMotor
+    off += 2; // steps (ushort)
+    off += 4; // offset
+    off += 2; // dither
+    let incr = r_u16_le(mb, off);
+    off += 2; // incr
+    off += 2; // memBank
+    off += 16; // modType
+    off += 4; // synTH
+    off += 2; // deadTimeComp
+    off += 2; // polarityL
+    off += 2; // polarityF
+    off += 2; // polarityP
+    off += 2; // linediv
+    off += 2; // accumulate
+    off += 4; // flbckY
+    off += 4; // flbckX
+    off += 4; // bordU
+    off += 4; // bordL
+    off += 4; // pixTime
+    off += 2; // pixClk
+    off += 2; // trigger
+    let scan_x = r_i32_le(mb, off);
+    off += 4; // scanX
+    let scan_y = r_i32_le(mb, off);
+    off += 4; // scanY
+    let scan_rx = r_i32_le(mb, off);
+
+    SdtMeasureInfo {
+        meas_mode,
+        adc_re,
+        stopt,
+        incr,
+        scan_x,
+        scan_y,
+        scan_rx,
+    }
+}
+
+/// Parse the MeasStopInfo descriptor sub-block (SDTInfo.java:798-836). `base`
+/// is the offset of the sub-block within the descriptor buffer (211).
+fn parse_sdt_meas_stop_info(mb: &[u8], base: usize) -> SdtMeasStopInfo {
+    let mut off = base;
+    let status = r_u16_le(mb, off);
+    off += 2;
+    let flags = r_u16_le(mb, off);
+    off += 2;
+    let stop_time = r_f32_le(mb, off);
+    off += 4;
+    let cur_step = r_i32_le(mb, off);
+    off += 4;
+    let cur_cycle = r_i32_le(mb, off);
+    off += 4;
+    let cur_page = r_i32_le(mb, off);
+    off += 4;
+    let min_sync_rate = r_f32_le(mb, off);
+    off += 4;
+    let min_cfd_rate = r_f32_le(mb, off);
+    off += 4;
+    let min_tac_rate = r_f32_le(mb, off);
+    off += 4;
+    let min_adc_rate = r_f32_le(mb, off);
+    off += 4;
+    let max_sync_rate = r_f32_le(mb, off);
+    off += 4;
+    let max_cfd_rate = r_f32_le(mb, off);
+    off += 4;
+    let max_tac_rate = r_f32_le(mb, off);
+    off += 4;
+    let max_adc_rate = r_f32_le(mb, off);
+    off += 4;
+    let reserved1 = r_i32_le(mb, off);
+    off += 4;
+    let reserved2 = r_f32_le(mb, off);
+    SdtMeasStopInfo {
+        status,
+        flags,
+        stop_time,
+        cur_step,
+        cur_cycle,
+        cur_page,
+        min_sync_rate,
+        min_cfd_rate,
+        min_tac_rate,
+        min_adc_rate,
+        max_sync_rate,
+        max_cfd_rate,
+        max_tac_rate,
+        max_adc_rate,
+        reserved1,
+        reserved2,
+    }
+}
+
+/// Parse the MeasFCSInfo descriptor sub-block (SDTInfo.java:839-871). `base`
+/// is the offset of the sub-block within the descriptor buffer (271).
+fn parse_sdt_meas_fcs_info(mb: &[u8], base: usize) -> SdtMeasFcsInfo {
+    let mut off = base;
+    let chan = r_u16_le(mb, off);
+    off += 2;
+    let fcs_decay_calc = r_u16_le(mb, off);
+    off += 2;
+    let mt_resol = r_u32_le(mb, off);
+    off += 4;
+    let cortime = r_f32_le(mb, off);
+    off += 4;
+    let calc_photons = r_u32_le(mb, off);
+    off += 4;
+    let fcs_points = r_i32_le(mb, off);
+    off += 4;
+    let end_time = r_f32_le(mb, off);
+    off += 4;
+    let overruns = r_u16_le(mb, off);
+    off += 2;
+    let fcs_type = r_u16_le(mb, off);
+    off += 2;
+    let cross_chan = r_u16_le(mb, off);
+    off += 2;
+    let mod_ = r_u16_le(mb, off);
+    off += 2;
+    let cross_mod = r_u16_le(mb, off);
+    off += 2;
+    let cross_mt_resol = r_u32_le(mb, off);
+    SdtMeasFcsInfo {
+        chan,
+        fcs_decay_calc,
+        mt_resol,
+        cortime,
+        calc_photons,
+        fcs_points,
+        end_time,
+        overruns,
+        fcs_type,
+        cross_chan,
+        mod_,
+        cross_mod,
+        cross_mt_resol,
+    }
+}
+
+/// Parse the extended MeasureInfo descriptor sub-block (SDTInfo.java:874-898).
+/// `base` is the offset of the sub-block within the descriptor buffer (309).
+fn parse_sdt_extended_measure_info(mb: &[u8], base: usize) -> SdtExtendedMeasureInfo {
+    let mut off = base;
+    let image_x = r_i32_le(mb, off);
+    off += 4;
+    let image_y = r_i32_le(mb, off);
+    off += 4;
+    let image_rx = r_i32_le(mb, off);
+    off += 4;
+    let image_ry = r_i32_le(mb, off);
+    off += 4;
+    let xy_gain = r_i16_le(mb, off);
+    off += 2;
+    let master_clock = r_i16_le(mb, off);
+    off += 2;
+    let adc_de = r_i16_le(mb, off);
+    off += 2;
+    let det_type = r_i16_le(mb, off);
+    off += 2;
+    let x_axis = r_i16_le(mb, off);
+    SdtExtendedMeasureInfo {
+        image_x,
+        image_y,
+        image_rx,
+        image_ry,
+        xy_gain,
+        master_clock,
+        adc_de,
+        det_type,
+        x_axis,
+    }
+}
+
+/// Parse the MeasHISTInfo descriptor sub-block (SDTInfo.java:900-920). `base`
+/// is the offset of the sub-block within the descriptor buffer (335).
+fn parse_sdt_meas_hist_info(mb: &[u8], base: usize) -> SdtMeasHistInfo {
+    let mut off = base;
+    let fida_time = r_f32_le(mb, off);
+    off += 4;
+    let filda_time = r_f32_le(mb, off);
+    off += 4;
+    let fida_points = r_i32_le(mb, off);
+    off += 4;
+    let filda_points = r_i32_le(mb, off);
+    off += 4;
+    let mcs_time = r_f32_le(mb, off);
+    off += 4;
+    let mcs_points = r_i32_le(mb, off);
+    SdtMeasHistInfo {
+        fida_time,
+        filda_time,
+        fida_points,
+        filda_points,
+        mcs_time,
+        mcs_points,
+    }
+}
+
+fn sdt_curve_variant(meas_mode: i16) -> Option<&'static str> {
+    match meas_mode {
+        3 => Some("FCS"),
+        4 => Some("FIDA"),
+        5 => Some("FILDA"),
+        0 | 1 | 2 | 6 => Some("MCS/non-image curve"),
+        _ => None,
+    }
+}
+
+fn insert_sdt_measurement_metadata(
+    meta_map: &mut HashMap<String, MetadataValue>,
+    meas: &SdtMeasureInfo,
+) {
+    meta_map.insert(
+        "sdt_measurement_mode".into(),
+        MetadataValue::Int(meas.meas_mode as i64),
+    );
+    meta_map.insert(
+        "sdt_measurement_adc_re".into(),
+        MetadataValue::Int(meas.adc_re as i64),
+    );
+    meta_map.insert(
+        "sdt_measurement_stopt".into(),
+        MetadataValue::Int(meas.stopt as i64),
+    );
+    meta_map.insert(
+        "sdt_measurement_incr".into(),
+        MetadataValue::Int(meas.incr as i64),
+    );
+    meta_map.insert(
+        "sdt_measurement_scan_x".into(),
+        MetadataValue::Int(meas.scan_x as i64),
+    );
+    meta_map.insert(
+        "sdt_measurement_scan_y".into(),
+        MetadataValue::Int(meas.scan_y as i64),
+    );
+    meta_map.insert(
+        "sdt_measurement_scan_rx".into(),
+        MetadataValue::Int(meas.scan_rx as i64),
+    );
+}
+
+/// Emit MeasStopInfo.* metadata with the exact Java key names
+/// (SDTInfo.java:818-835).
+fn insert_sdt_meas_stop_info_metadata(
+    meta_map: &mut HashMap<String, MetadataValue>,
+    s: &SdtMeasStopInfo,
+) {
+    let p = "MeasStopInfo.";
+    meta_map.insert(format!("{p}status"), MetadataValue::Int(s.status as i64));
+    meta_map.insert(format!("{p}flags"), MetadataValue::Int(s.flags as i64));
+    meta_map.insert(
+        format!("{p}stopTime"),
+        MetadataValue::Float(s.stop_time as f64),
+    );
+    meta_map.insert(format!("{p}curStep"), MetadataValue::Int(s.cur_step as i64));
+    meta_map.insert(
+        format!("{p}curCycle"),
+        MetadataValue::Int(s.cur_cycle as i64),
+    );
+    meta_map.insert(format!("{p}curPage"), MetadataValue::Int(s.cur_page as i64));
+    meta_map.insert(
+        format!("{p}minSyncRate"),
+        MetadataValue::Float(s.min_sync_rate as f64),
+    );
+    meta_map.insert(
+        format!("{p}minCfdRate"),
+        MetadataValue::Float(s.min_cfd_rate as f64),
+    );
+    meta_map.insert(
+        format!("{p}minTacRate"),
+        MetadataValue::Float(s.min_tac_rate as f64),
+    );
+    meta_map.insert(
+        format!("{p}minAdcRate"),
+        MetadataValue::Float(s.min_adc_rate as f64),
+    );
+    meta_map.insert(
+        format!("{p}maxSyncRate"),
+        MetadataValue::Float(s.max_sync_rate as f64),
+    );
+    meta_map.insert(
+        format!("{p}maxCfdRate"),
+        MetadataValue::Float(s.max_cfd_rate as f64),
+    );
+    meta_map.insert(
+        format!("{p}maxTacRate"),
+        MetadataValue::Float(s.max_tac_rate as f64),
+    );
+    meta_map.insert(
+        format!("{p}maxAdcRate"),
+        MetadataValue::Float(s.max_adc_rate as f64),
+    );
+    meta_map.insert(
+        format!("{p}reserved1"),
+        MetadataValue::Int(s.reserved1 as i64),
+    );
+    meta_map.insert(
+        format!("{p}reserved2"),
+        MetadataValue::Float(s.reserved2 as f64),
+    );
+}
+
+/// Emit MeasFCSInfo.* metadata with the exact Java key names
+/// (SDTInfo.java:856-870).
+fn insert_sdt_meas_fcs_info_metadata(
+    meta_map: &mut HashMap<String, MetadataValue>,
+    f: &SdtMeasFcsInfo,
+) {
+    let p = "MeasFCSInfo.";
+    meta_map.insert(format!("{p}chan"), MetadataValue::Int(f.chan as i64));
+    meta_map.insert(
+        format!("{p}fcsDecayCalc"),
+        MetadataValue::Int(f.fcs_decay_calc as i64),
+    );
+    meta_map.insert(format!("{p}mtResol"), MetadataValue::Int(f.mt_resol as i64));
+    meta_map.insert(
+        format!("{p}cortime"),
+        MetadataValue::Float(f.cortime as f64),
+    );
+    meta_map.insert(
+        format!("{p}calcPhotons"),
+        MetadataValue::Int(f.calc_photons as i64),
+    );
+    meta_map.insert(
+        format!("{p}fcsPoints"),
+        MetadataValue::Int(f.fcs_points as i64),
+    );
+    meta_map.insert(
+        format!("{p}endTime"),
+        MetadataValue::Float(f.end_time as f64),
+    );
+    meta_map.insert(format!("{p}overruns"), MetadataValue::Int(f.overruns as i64));
+    meta_map.insert(format!("{p}fcsType"), MetadataValue::Int(f.fcs_type as i64));
+    meta_map.insert(
+        format!("{p}crossChan"),
+        MetadataValue::Int(f.cross_chan as i64),
+    );
+    meta_map.insert(format!("{p}mod"), MetadataValue::Int(f.mod_ as i64));
+    meta_map.insert(
+        format!("{p}crossMod"),
+        MetadataValue::Int(f.cross_mod as i64),
+    );
+    // SDTInfo.java stores crossMtResol via Float.valueOf despite the field being
+    // an unsigned long; mirror the resulting numeric value.
+    meta_map.insert(
+        format!("{p}crossMtResol"),
+        MetadataValue::Float(f.cross_mt_resol as f64),
+    );
+}
+
+/// Emit the extended MeasureInfo.* metadata with the exact Java key names
+/// (SDTInfo.java:887-896).
+fn insert_sdt_extended_measure_info_metadata(
+    meta_map: &mut HashMap<String, MetadataValue>,
+    e: &SdtExtendedMeasureInfo,
+) {
+    let p = "MeasureInfo.";
+    meta_map.insert(format!("{p}imageX"), MetadataValue::Int(e.image_x as i64));
+    meta_map.insert(format!("{p}imageY"), MetadataValue::Int(e.image_y as i64));
+    meta_map.insert(format!("{p}imageRX"), MetadataValue::Int(e.image_rx as i64));
+    meta_map.insert(format!("{p}imageRY"), MetadataValue::Int(e.image_ry as i64));
+    meta_map.insert(format!("{p}xyGain"), MetadataValue::Int(e.xy_gain as i64));
+    meta_map.insert(
+        format!("{p}masterClock"),
+        MetadataValue::Int(e.master_clock as i64),
+    );
+    meta_map.insert(format!("{p}adcDE"), MetadataValue::Int(e.adc_de as i64));
+    meta_map.insert(format!("{p}detType"), MetadataValue::Int(e.det_type as i64));
+    meta_map.insert(format!("{p}xAxis"), MetadataValue::Int(e.x_axis as i64));
+}
+
+/// Emit MeasHISTInfo.* metadata with the exact Java key names
+/// (SDTInfo.java:911-918).
+fn insert_sdt_meas_hist_info_metadata(
+    meta_map: &mut HashMap<String, MetadataValue>,
+    h: &SdtMeasHistInfo,
+) {
+    let p = "MeasHISTInfo.";
+    meta_map.insert(
+        format!("{p}fidaTime"),
+        MetadataValue::Float(h.fida_time as f64),
+    );
+    meta_map.insert(
+        format!("{p}fildaTime"),
+        MetadataValue::Float(h.filda_time as f64),
+    );
+    meta_map.insert(
+        format!("{p}fidaPoints"),
+        MetadataValue::Int(h.fida_points as i64),
+    );
+    meta_map.insert(
+        format!("{p}fildaPoints"),
+        MetadataValue::Int(h.filda_points as i64),
+    );
+    meta_map.insert(
+        format!("{p}mcsTime"),
+        MetadataValue::Float(h.mcs_time as f64),
+    );
+    meta_map.insert(
+        format!("{p}mcsPoints"),
+        MetadataValue::Int(h.mcs_points as i64),
+    );
 }
 
 /// Read the SDT header and measurement-descriptor blocks (SDTInfo.java).
@@ -359,113 +1084,113 @@ fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
     };
 
     // Setup text block: parse for SCAN_X/Y, ADC_RE, SCAN_RX, IMG_X/Y.
-    let setup = read_sdt_setup_block(f, setup_offs, setup_length, file_len)?.unwrap_or(SdtSetup {
-        scan_x: 0,
-        scan_y: 0,
-        adc_re: 256,
-        scan_rx: 0,
-        img_x: 0,
-        img_y: 0,
-    });
+    let setup_info =
+        read_sdt_setup_info(f, setup_offs, setup_length, file_len)?.unwrap_or(SdtSetupInfo {
+            setup: SdtSetup {
+                scan_x: 0,
+                scan_y: 0,
+                adc_re: 256,
+                scan_rx: 0,
+                img_x: 0,
+                img_y: 0,
+            },
+            mcsta_points: 0,
+        });
+    let setup = setup_info.setup;
     let mut width: u32 = setup.scan_x.max(1);
     let mut height: u32 = setup.scan_y.max(1);
     let mut time_bins: u32 = setup.adc_re.max(1);
     let mut channels: u32 = setup.scan_rx.max(1);
 
     let mut timepoints: u32 = 0;
-    let mcsta_points: u32 = 0; // MCS-TA parsing is in the binary setup extension; left 0.
+    let mcsta_points: u32 = setup_info.mcsta_points;
     let mut incr: u16 = 1;
+    let mut meas_infos = Vec::new();
+    let mut meas_stop_info: Option<SdtMeasStopInfo> = None;
+    let mut meas_fcs_info: Option<SdtMeasFcsInfo> = None;
+    let mut extended_measure_info: Option<SdtExtendedMeasureInfo> = None;
+    let mut meas_hist_info: Option<SdtMeasHistInfo> = None;
+
+    // Descriptor sub-block presence flags, keyed off measDescBlockLength
+    // (SDTInfo.java:643-647). Each successive sub-block follows MeasureInfo (211
+    // bytes), then MeasStopInfo (+60), MeasFCSInfo (+38), extended MeasureInfo
+    // (+26) and MeasHISTInfo (+24).
+    let has_meas_stop_info = meas_desc_block_length >= 211 + 60;
+    let has_meas_fcs_info = meas_desc_block_length >= 211 + 60 + 38;
+    let has_extended_measure_info = meas_desc_block_length >= 211 + 60 + 38 + 26;
+    let has_meas_hist_info = meas_desc_block_length >= 211 + 60 + 38 + 26 + 24;
 
     // Measurement-descriptor block (MeasureInfo) carries authoritative dims.
     if no_of_meas_desc_blocks > 0
         && meas_desc_block_length >= 211
         && meas_desc_block_offs < file_len
     {
-        f.seek(SeekFrom::Start(meas_desc_block_offs))
-            .map_err(BioFormatsError::Io)?;
-        let mut mb = vec![0u8; 211.min((file_len - meas_desc_block_offs) as usize)];
-        f.read_exact(&mut mb).map_err(BioFormatsError::Io)?;
-        // Field offsets within MeasureInfo (see SDTInfo.java order):
-        //   9 (time) + 11 (date) + 16 (modSerNo) = 36; measMode short at 36.
-        let meas_mode = r_i16_le(&mb, 36);
-        // adcRE short at offset 36+2 + 6*float(4)=24 + short(2)+float(4)
-        //   + float(4)+short(2)+float(4)+float(4)+float(4) ... compute directly:
-        // Build cumulative offset from the documented field sequence:
-        // measMode(2), cfdLL..cfdHF(4 floats=16), synZC(4), synFD(2), synHF(4),
-        // tacR(4), tacG(2), tacOF(4), tacLL(4), tacLH(4), adcRE(2)...
-        let mut off = 36usize;
-        off += 2; // measMode
-        off += 16; // cfdLL,cfdLH,cfdZC,cfdHF
-        off += 4; // synZC
-        off += 2; // synFD
-        off += 4; // synHF
-        off += 4; // tacR
-        off += 2; // tacG
-        off += 4; // tacOF
-        off += 4; // tacLL
-        off += 4; // tacLH
-        let adc_re = r_i16_le(&mb, off);
-        off += 2; // adcRE
-        off += 2; // ealDE
-        off += 2; // ncx
-        off += 2; // ncy
-        off += 2; // page (ushort)
-        off += 4; // colT
-        off += 4; // repT
-        let stopt = r_i16_le(&mb, off);
-        off += 2; // stopt
-        off += 1; // overfl (ubyte)
-        off += 2; // useMotor
-        off += 2; // steps (ushort)
-        off += 4; // offset
-        off += 2; // dither
-        incr = r_u16_le(&mb, off);
-        off += 2; // incr
-        off += 2; // memBank
-        off += 16; // modType
-        off += 4; // synTH
-        off += 2; // deadTimeComp
-        off += 2; // polarityL
-        off += 2; // polarityF
-        off += 2; // polarityP
-        off += 2; // linediv
-        off += 2; // accumulate
-        off += 4; // flbckY
-        off += 4; // flbckX
-        off += 4; // bordU
-        off += 4; // bordL
-        off += 4; // pixTime
-        off += 2; // pixClk
-        off += 2; // trigger
-        let scan_x = r_i32_le(&mb, off);
-        off += 4; // scanX
-        let scan_y = r_i32_le(&mb, off);
-        off += 4; // scanY
-        let scan_rx = r_i32_le(&mb, off);
-        // (remaining MeasureInfo fields are not needed)
+        for i in 0..no_of_meas_desc_blocks.max(0) as usize {
+            let Some(desc_offs) =
+                meas_desc_block_offs.checked_add((i * meas_desc_block_length) as u64)
+            else {
+                break;
+            };
+            if desc_offs + 211 > file_len {
+                break;
+            }
+            // Read the full descriptor so the FCS / HIST curve sub-blocks of the
+            // first descriptor can be decoded; bound the read to the file end.
+            let want = meas_desc_block_length.max(211);
+            let avail = (file_len - desc_offs) as usize;
+            let read_len = want.min(avail);
+            f.seek(SeekFrom::Start(desc_offs))
+                .map_err(BioFormatsError::Io)?;
+            let mut mb = vec![0u8; read_len];
+            f.read_exact(&mut mb).map_err(BioFormatsError::Io)?;
+            meas_infos.push(parse_sdt_measure_info(&mb));
 
-        timepoints = stopt.max(0) as u32;
+            // SDTInfo.java reads the MeasStopInfo / MeasFCSInfo / extended
+            // MeasureInfo / MeasHISTInfo sub-blocks once, immediately after the
+            // first MeasureInfo. Mirror that by parsing them from the first
+            // descriptor buffer when present and fully available.
+            if i == 0 {
+                if has_meas_stop_info && mb.len() >= 211 + 60 {
+                    meas_stop_info = Some(parse_sdt_meas_stop_info(&mb, 211));
+                }
+                if has_meas_fcs_info && mb.len() >= 211 + 60 + 38 {
+                    meas_fcs_info = Some(parse_sdt_meas_fcs_info(&mb, 211 + 60));
+                }
+                if has_extended_measure_info && mb.len() >= 211 + 60 + 38 + 26 {
+                    extended_measure_info =
+                        Some(parse_sdt_extended_measure_info(&mb, 211 + 60 + 38));
+                }
+                if has_meas_hist_info && mb.len() >= 211 + 60 + 38 + 26 + 24 {
+                    meas_hist_info = Some(parse_sdt_meas_hist_info(&mb, 211 + 60 + 38 + 26));
+                }
+            }
+        }
+    }
 
-        if scan_x > 0 {
-            width = scan_x as u32;
+    if let Some(first) = meas_infos.first() {
+        timepoints = first.stopt.max(0) as u32;
+        incr = first.incr;
+
+        if first.scan_x > 0 {
+            width = first.scan_x as u32;
         }
-        if scan_y > 0 {
-            height = scan_y as u32;
+        if first.scan_y > 0 {
+            height = first.scan_y as u32;
         }
-        if adc_re > 0 {
-            time_bins = adc_re as u32;
+        if first.adc_re > 0 {
+            time_bins = first.adc_re as u32;
         }
-        if scan_rx > 0 {
-            channels = scan_rx as u32;
+        if first.scan_rx > 0 {
+            channels = first.scan_rx as u32;
         }
-        if meas_mode == 0 || meas_mode == 1 {
+        if first.meas_mode == 0 || first.meas_mode == 1 {
             width = 1;
             height = 1;
         }
         // measMode 13 (FLIM imaging): width/height come from SP_IMG_X/Y in the
         // ASCII setup, and each measurement-descriptor block is a channel
         // (SDTInfo.java:790-793).
-        if meas_mode == 13 {
+        if first.meas_mode == 13 {
             width = setup.img_x.max(1);
             height = setup.img_y.max(1);
             channels = no_of_meas_desc_blocks.max(1) as u32;
@@ -480,6 +1205,8 @@ fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
     // header; the next header is located via nextBlockOffs.
     let mut block_offsets = Vec::new();
     let mut block_lengths = Vec::new();
+    let mut block_types = Vec::new();
+    let mut block_measure_descs = Vec::new();
     let mut next = data_block_offs;
     for _ in 0..block_count {
         if next == 0 || next + 22 > file_len {
@@ -489,13 +1216,17 @@ fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
         let mut bh = [0u8; 22];
         f.read_exact(&mut bh).map_err(BioFormatsError::Io)?;
         let next_block_offs = r_u32_le(&bh, 6) as u64;
+        let block_type = r_u16_le(&bh, 10);
+        let meas_desc_block_no = r_i16_le(&bh, 12);
         let block_length = r_u32_le(&bh, 18) as u64;
         let block_data_offset = next + 22; // file pointer after header
-        if block_data_offset >= file_len {
+        if block_data_offset > file_len || (block_data_offset == file_len && block_length > 0) {
             break;
         }
         block_offsets.push(block_data_offset);
         block_lengths.push(block_length);
+        block_types.push(block_type);
+        block_measure_descs.push(meas_desc_block_no);
 
         if next_block_offs == 0 || next_block_offs <= next {
             break;
@@ -511,8 +1242,15 @@ fn parse_sdt_info(f: &mut File, file_len: u64) -> Result<SdtInfo> {
         timepoints,
         mcsta_points,
         incr,
+        meas_infos,
+        meas_stop_info,
+        meas_fcs_info,
+        extended_measure_info,
+        meas_hist_info,
         block_offsets,
         block_lengths,
+        block_types,
+        block_measure_descs,
     })
 }
 
@@ -522,6 +1260,9 @@ struct SdtSeries {
     block: SdtBlock,
     n_time: u32,
     meta: ImageMetadata,
+    unsupported_layout_reason: Option<String>,
+    raw_curve_payload_len: Option<usize>,
+    compressed_curve_payload_len: Option<usize>,
 }
 
 pub struct SdtReader {
@@ -666,6 +1407,9 @@ impl FormatReader for SdtReader {
                 block,
                 n_time: adc_re,
                 meta: self.meta.clone().unwrap(),
+                unsupported_layout_reason: None,
+                raw_curve_payload_len: None,
+                compressed_curve_payload_len: None,
             }];
             self.current_series = 0;
             self.path = Some(path.to_path_buf());
@@ -683,13 +1427,19 @@ impl FormatReader for SdtReader {
         // Per SDTReader.java: sizeT = timeBins * timepoints, sizeC = channels.
         let timepoints = info.timepoints.max(1);
         let size_t = info.time_bins.saturating_mul(timepoints).max(1);
-        let plane_pixels = info.width as u64 * info.height as u64 * 2;
+        let disk_plane_bytes = padded_width(info.width as usize) as u64 * info.height as u64 * 2;
         let base_image_count = size_t.saturating_mul(info.channels);
 
         // Each data block becomes its own series.
         let mut series = Vec::with_capacity(info.block_offsets.len());
         for (i, &offset) in info.block_offsets.iter().enumerate() {
             let block_len = info.block_lengths.get(i).copied().unwrap_or(0);
+            let block_type = info.block_types.get(i).copied().unwrap_or(0);
+            let meas_desc_no = info.block_measure_descs.get(i).copied().unwrap_or(-1);
+            let meas_info = usize::try_from(meas_desc_no)
+                .ok()
+                .and_then(|idx| info.meas_infos.get(idx))
+                .or_else(|| info.meas_infos.first());
 
             let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
             meta_map.insert(
@@ -702,27 +1452,307 @@ impl FormatReader for SdtReader {
             );
             meta_map.insert("channels".into(), MetadataValue::Int(info.channels as i64));
             meta_map.insert("incr".into(), MetadataValue::Int(info.incr as i64));
+            meta_map.insert(
+                "sdt_block_type".into(),
+                MetadataValue::Int(block_type as i64),
+            );
+            if meas_desc_no >= 0 {
+                meta_map.insert(
+                    "sdt_measurement_descriptor_index".into(),
+                    MetadataValue::Int(meas_desc_no as i64),
+                );
+            }
+            if let Some(meas) = meas_info {
+                insert_sdt_measurement_metadata(&mut meta_map, meas);
+                if let Some(variant) = sdt_curve_variant(meas.meas_mode) {
+                    meta_map.insert(
+                        "sdt_curve_variant".into(),
+                        MetadataValue::String(variant.into()),
+                    );
+                }
+            }
+            // File-level descriptor sub-blocks (MeasStopInfo / MeasFCSInfo /
+            // extended MeasureInfo / MeasHISTInfo) describe the non-image
+            // FCS/FIDA/FILDA/MCS curve payloads; expose them on every series
+            // with the exact Java key names.
+            if let Some(stop) = info.meas_stop_info.as_ref() {
+                insert_sdt_meas_stop_info_metadata(&mut meta_map, stop);
+            }
+            if let Some(fcs) = info.meas_fcs_info.as_ref() {
+                insert_sdt_meas_fcs_info_metadata(&mut meta_map, fcs);
+            }
+            if let Some(ext) = info.extended_measure_info.as_ref() {
+                insert_sdt_extended_measure_info_metadata(&mut meta_map, ext);
+            }
+            if let Some(hist) = info.meas_hist_info.as_ref() {
+                insert_sdt_meas_hist_info_metadata(&mut meta_map, hist);
+            }
+
+            let mut sig = [0u8; 2];
+            let is_zip_block = f
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| f.read_exact(&mut sig))
+                .map(|_| &sig == b"PK")
+                .unwrap_or(false);
 
             // SDTReader.java: if the block length matches mcstaPoints * planeSize,
-            // sizeT becomes mcstaPoints for that series.
+            // sizeT becomes mcstaPoints for that series. planeSize is the
+            // padded on-disk stride, while exposed planes are cropped back to
+            // sizeX columns when reading.
             let mut series_t = size_t;
             let mut image_count = base_image_count;
-            let expected = plane_pixels.saturating_mul(base_image_count as u64);
+            let mut layout = "image";
+            let mut unsupported_layout_reason = None;
+            let mut raw_curve_payload_len = None;
+            let mut compressed_curve_payload_len = None;
+            let mut series_size_x = info.width;
+            let mut series_size_y = info.height;
+            let mut series_size_c = info.channels;
+            let mut series_pixel_type = PixelType::Uint16;
+            let mut series_bits_per_pixel = 16;
+            let expected = disk_plane_bytes.saturating_mul(base_image_count as u64);
+            let next_block_offset = info
+                .block_offsets
+                .get(i + 1)
+                .map(|o| o.saturating_sub(22))
+                .unwrap_or(0);
+            let probe_block = SdtBlock {
+                data_offset: offset,
+                next_block_offset,
+            };
             if info.mcsta_points > 0 && block_len != expected {
-                if (info.mcsta_points as u64).saturating_mul(plane_pixels) == block_len {
+                if (info.mcsta_points as u64).saturating_mul(disk_plane_bytes) == block_len {
                     series_t = info.mcsta_points;
                     image_count = series_t.saturating_mul(info.channels);
+                    layout = "mcs_ta";
                 }
+            }
+            if layout == "image" {
+                if let Some(meas) = meas_info {
+                    if let Some(variant) = sdt_curve_variant(meas.meas_mode) {
+                        if is_zip_block {
+                            if let Ok(prefix) = read_sdt_block_prefix(
+                                &mut f,
+                                &probe_block,
+                                SDT_MAX_ZIP_HEADER_PREVIEW_BYTES,
+                            ) {
+                                insert_sdt_curve_zip_header_metadata(
+                                    &mut meta_map,
+                                    &prefix,
+                                    block_len,
+                                );
+                            }
+                            match read_sdt_zip_payload_bounded(
+                                &mut f,
+                                &probe_block,
+                                SDT_MAX_CURVE_PAYLOAD_BYTES,
+                                "curve payload",
+                            ) {
+                                Ok(decoded) if decoded.is_empty() => {
+                                    series_size_x = 0;
+                                    series_size_y = 1;
+                                    series_size_c = 1;
+                                    series_t = 0;
+                                    image_count = 0;
+                                    compressed_curve_payload_len = Some(0);
+                                    layout = "empty_curve";
+                                    meta_map.insert(
+                                        "sdt_curve_payload_encoding".into(),
+                                        MetadataValue::String("zip_deflate_raw_u16_le".into()),
+                                    );
+                                    meta_map.insert(
+                                        "sdt_curve_sample_count".into(),
+                                        MetadataValue::Int(0),
+                                    );
+                                    meta_map.insert(
+                                        "sdt_curve_compressed_block_length".into(),
+                                        MetadataValue::Int(block_len as i64),
+                                    );
+                                }
+                                Ok(decoded)
+                                    if decoded.len() % 2 == 0
+                                        && decoded.len() / 2 <= u32::MAX as usize =>
+                                {
+                                    let sample_count = (decoded.len() / 2) as u32;
+                                    series_size_x = sample_count;
+                                    series_size_y = 1;
+                                    series_size_c = 1;
+                                    series_t = 1;
+                                    image_count = 1;
+                                    compressed_curve_payload_len = Some(decoded.len());
+                                    layout = "zip_u16_curve";
+                                    meta_map.insert(
+                                        "sdt_curve_payload_encoding".into(),
+                                        MetadataValue::String("zip_deflate_raw_u16_le".into()),
+                                    );
+                                    meta_map.insert(
+                                        "sdt_curve_sample_count".into(),
+                                        MetadataValue::Int(sample_count as i64),
+                                    );
+                                    meta_map.insert(
+                                        "sdt_curve_compressed_block_length".into(),
+                                        MetadataValue::Int(block_len as i64),
+                                    );
+                                }
+                                Ok(decoded) => {
+                                    let byte_count = decoded.len();
+                                    if byte_count <= u32::MAX as usize {
+                                        series_size_x = byte_count as u32;
+                                        series_size_y = 1;
+                                        series_size_c = 1;
+                                        series_t = 1;
+                                        image_count = 1;
+                                        series_pixel_type = PixelType::Uint8;
+                                        series_bits_per_pixel = 8;
+                                        compressed_curve_payload_len = Some(byte_count);
+                                        layout = "zip_odd_byte_curve";
+                                        meta_map.insert(
+                                            "sdt_curve_payload_encoding".into(),
+                                            MetadataValue::String(
+                                                "zip_deflate_raw_bytes_odd_length".into(),
+                                            ),
+                                        );
+                                        meta_map.insert(
+                                            "sdt_curve_byte_count".into(),
+                                            MetadataValue::Int(byte_count as i64),
+                                        );
+                                        meta_map.insert(
+                                            "sdt_curve_payload_diagnostic".into(),
+                                            MetadataValue::String(format!(
+                                                "non-image Becker & Hickl SDT/SPC {variant} curve measurement mode {} decoded to odd byte count {}; preserving raw bytes as uint8 curve payload",
+                                                meas.meas_mode, byte_count
+                                            )),
+                                        );
+                                        meta_map.insert(
+                                            "sdt_curve_compressed_block_length".into(),
+                                            MetadataValue::Int(block_len as i64),
+                                        );
+                                    } else {
+                                        let reason = format!(
+                                            "non-image Becker & Hickl SDT/SPC {variant} curve measurement mode {} has unsupported ZIP-deflated curve payload length {} after decompression",
+                                            meas.meas_mode, byte_count
+                                        );
+                                        meta_map.insert(
+                                            "sdt_unsupported_layout_reason".into(),
+                                            MetadataValue::String(reason.clone()),
+                                        );
+                                        unsupported_layout_reason = Some(reason);
+                                        layout = "non_image_curve";
+                                    }
+                                }
+                                Err(err) => {
+                                    let reason = format!(
+                                        "non-image Becker & Hickl SDT/SPC {variant} curve measurement mode {} has unsupported ZIP-deflated curve payload: {err}",
+                                        meas.meas_mode
+                                    );
+                                    meta_map.insert(
+                                        "sdt_unsupported_layout_reason".into(),
+                                        MetadataValue::String(reason.clone()),
+                                    );
+                                    unsupported_layout_reason = Some(reason);
+                                    layout = "non_image_curve";
+                                }
+                            }
+                        } else if block_len == 0 {
+                            series_size_x = 0;
+                            series_size_y = 1;
+                            series_size_c = 1;
+                            series_t = 0;
+                            image_count = 0;
+                            raw_curve_payload_len = Some(0);
+                            layout = "empty_curve";
+                            meta_map.insert(
+                                "sdt_curve_payload_encoding".into(),
+                                MetadataValue::String("raw_u16_le".into()),
+                            );
+                            meta_map.insert("sdt_curve_sample_count".into(), MetadataValue::Int(0));
+                        } else if block_len % 2 == 0 && block_len / 2 <= u32::MAX as u64 {
+                            let sample_count = (block_len / 2) as u32;
+                            series_size_x = sample_count;
+                            series_size_y = 1;
+                            series_size_c = 1;
+                            series_t = 1;
+                            image_count = 1;
+                            raw_curve_payload_len = Some(block_len as usize);
+                            layout = "raw_u16_curve";
+                            meta_map.insert(
+                                "sdt_curve_payload_encoding".into(),
+                                MetadataValue::String("raw_u16_le".into()),
+                            );
+                            meta_map.insert(
+                                "sdt_curve_sample_count".into(),
+                                MetadataValue::Int(sample_count as i64),
+                            );
+                        } else if block_len <= u32::MAX as u64 {
+                            series_size_x = block_len as u32;
+                            series_size_y = 1;
+                            series_size_c = 1;
+                            series_t = 1;
+                            image_count = 1;
+                            series_pixel_type = PixelType::Uint8;
+                            series_bits_per_pixel = 8;
+                            raw_curve_payload_len = Some(block_len as usize);
+                            layout = "raw_odd_byte_curve";
+                            meta_map.insert(
+                                "sdt_curve_payload_encoding".into(),
+                                MetadataValue::String("raw_bytes_odd_length".into()),
+                            );
+                            meta_map.insert(
+                                "sdt_curve_byte_count".into(),
+                                MetadataValue::Int(block_len as i64),
+                            );
+                            meta_map.insert(
+                                "sdt_curve_payload_diagnostic".into(),
+                                MetadataValue::String(format!(
+                                    "non-image Becker & Hickl SDT/SPC {variant} curve measurement mode {} has odd byte count {}; preserving raw bytes as uint8 curve payload",
+                                    meas.meas_mode, block_len
+                                )),
+                            );
+                        } else {
+                            let reason = format!(
+                                "non-image Becker & Hickl SDT/SPC {variant} curve measurement mode {} has no supported raw u16 curve payload",
+                                meas.meas_mode
+                            );
+                            meta_map.insert(
+                                "sdt_unsupported_layout_reason".into(),
+                                MetadataValue::String(reason.clone()),
+                            );
+                            unsupported_layout_reason = Some(reason);
+                            layout = "non_image_curve";
+                        }
+                    }
+                }
+            }
+            if block_len > 0 && block_len != expected && layout == "image" && !is_zip_block {
+                let reason = format!(
+                    "raw SDT data block length {block_len} does not match image layout {expected} bytes or supported MCS-TA layout"
+                );
+                meta_map.insert(
+                    "sdt_unsupported_layout_reason".into(),
+                    MetadataValue::String(reason.clone()),
+                );
+                unsupported_layout_reason = Some(reason);
+                layout = "unsupported";
+            }
+            meta_map.insert(
+                "sdt_data_block_layout".into(),
+                MetadataValue::String(layout.into()),
+            );
+            if block_len > 0 {
+                meta_map.insert(
+                    "sdt_data_block_length".into(),
+                    MetadataValue::Int(block_len as i64),
+                );
             }
 
             let meta = ImageMetadata {
-                size_x: info.width,
-                size_y: info.height,
+                size_x: series_size_x,
+                size_y: series_size_y,
                 size_z: 1,
-                size_c: info.channels,
+                size_c: series_size_c,
                 size_t: series_t,
-                pixel_type: PixelType::Uint16,
-                bits_per_pixel: 16,
+                pixel_type: series_pixel_type,
+                bits_per_pixel: series_bits_per_pixel,
                 image_count,
                 dimension_order: DimensionOrder::XYZTC,
                 is_rgb: false,
@@ -737,22 +1767,17 @@ impl FormatReader for SdtReader {
                 modulo_t: None,
             };
 
-            // The compressed/raw payload for this block ends where the next
-            // block's 22-byte header begins (block_offsets[i+1] is the data
-            // offset, i.e. header start + 22).
-            let next_block_offset = info
-                .block_offsets
-                .get(i + 1)
-                .map(|o| o.saturating_sub(22))
-                .unwrap_or(0);
-
             series.push(SdtSeries {
-                block: SdtBlock {
-                    data_offset: offset,
-                    next_block_offset,
+                block: probe_block,
+                n_time: if info.mcsta_points > 0 && series_t == info.mcsta_points {
+                    series_t
+                } else {
+                    info.time_bins
                 },
-                n_time: info.time_bins,
                 meta,
+                unsupported_layout_reason,
+                raw_curve_payload_len,
+                compressed_curve_payload_len,
             });
         }
 
@@ -817,6 +1842,45 @@ impl FormatReader for SdtReader {
             .map(|s| s.block.clone())
             .or_else(|| self.blocks.first().cloned())
             .ok_or_else(|| BioFormatsError::Format("SDT plane has no data block".into()))?;
+        if let Some(curve_len) = self
+            .series
+            .get(self.current_series)
+            .and_then(|s| s.raw_curve_payload_len)
+        {
+            let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+            f.seek(SeekFrom::Start(block.data_offset))
+                .map_err(BioFormatsError::Io)?;
+            let mut out = vec![0u8; curve_len];
+            f.read_exact(&mut out).map_err(BioFormatsError::Io)?;
+            return Ok(out);
+        }
+        if let Some(curve_len) = self
+            .series
+            .get(self.current_series)
+            .and_then(|s| s.compressed_curve_payload_len)
+        {
+            let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+            let out =
+                read_sdt_zip_payload_bounded(&mut f, &block, curve_len as u64, "curve payload")?;
+            if out.len() != curve_len {
+                return Err(BioFormatsError::Codec(format!(
+                    "SDT ZIP curve payload decoded to {} bytes, expected {curve_len}",
+                    out.len()
+                )));
+            }
+            return Ok(out);
+        }
+        if let Some(reason) = self
+            .series
+            .get(self.current_series)
+            .and_then(|s| s.unsupported_layout_reason.as_ref())
+        {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "unsupported Becker & Hickl SDT/SPC data block layout: {reason}"
+            )));
+        }
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
 
@@ -857,7 +1921,7 @@ impl FormatReader for SdtReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        let bps = 2usize;
+        let bps = ((meta.bits_per_pixel as usize).max(1) + 7) / 8;
         let row = meta.size_x as usize * bps;
         let out_row = w as usize * bps;
         let mut out = Vec::with_capacity(h as usize * out_row);
@@ -906,6 +1970,822 @@ impl FormatReader for SdtReader {
             });
         }
         Some(ome)
+    }
+}
+
+#[cfg(test)]
+mod sdt_tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_sdt_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_sdt_{nanos}_{name}"))
+    }
+
+    fn put_u16(buf: &mut [u8], off: usize, value: u16) {
+        buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_i16(buf: &mut [u8], off: usize, value: i16) {
+        buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(buf: &mut [u8], off: usize, value: u32) {
+        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_i32(buf: &mut [u8], off: usize, value: i32) {
+        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn synthetic_setup_with_mcsta_points(points: u16) -> Vec<u8> {
+        let mut setup = b"#SP [SP_SCAN_X,I,4]\n#SP [SP_SCAN_Y,I,1]\n#SP [SP_ADC_RE,I,4]\n#SP [SP_SCAN_RX,I,1]\n".to_vec();
+        setup.extend_from_slice(b"BIN_PARA_BEGIN:\0");
+        setup.extend_from_slice(&[0; 4]);
+        let base = setup.len();
+        setup.resize(base + 160, 0);
+        put_u32(&mut setup, base + 84, 96);
+        put_u32(&mut setup, base + 96, 128);
+        put_u16(&mut setup, base + 128 + 8, points);
+        setup
+    }
+
+    fn synthetic_setup(width: u16, height: u16, times: u16) -> Vec<u8> {
+        format!(
+            "#SP [SP_SCAN_X,I,{width}]\n#SP [SP_SCAN_Y,I,{height}]\n#SP [SP_ADC_RE,I,{times}]\n#SP [SP_SCAN_RX,I,1]\n"
+        )
+        .into_bytes()
+    }
+
+    fn decay_payload(width: u16, height: u16, times: u16, base_value: u16) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for _y in 0..height {
+            for x in 0..width {
+                for t in 0..times {
+                    payload.extend_from_slice(&(base_value + x * 10 + t).to_le_bytes());
+                }
+            }
+        }
+        payload
+    }
+
+    fn padded_decay_payload(width: u16, height: u16, times: u16, base_value: u16) -> Vec<u8> {
+        let padded = padded_width(width as usize) as u16;
+        let mut payload = Vec::new();
+        for y in 0..height {
+            for x in 0..padded {
+                for t in 0..times {
+                    let value = if x < width {
+                        base_value + y * 100 + x * 10 + t
+                    } else {
+                        9000 + y * 100 + x * 10 + t
+                    };
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        payload
+    }
+
+    fn zip_deflate_local_file(payload: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let name = b"curve.bin";
+        let mut zip = Vec::new();
+        zip.extend_from_slice(b"PK\x03\x04");
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&8u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(name);
+        zip.extend_from_slice(&compressed);
+        zip
+    }
+
+    fn zip_local_file_with_method(method: u16, name: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut zip = Vec::new();
+        zip.extend_from_slice(b"PK\x03\x04");
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&method.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(name);
+        zip.extend_from_slice(payload);
+        zip
+    }
+
+    fn write_single_block_sdt(path: &Path, setup: &[u8], payload: &[u8]) {
+        let setup_offs = 42u32;
+        let data_block_offs = setup_offs as usize + setup.len();
+
+        let mut file = vec![0; 42];
+        put_i16(&mut file, 0, 1);
+        put_i32(&mut file, 8, setup_offs as i32);
+        put_u16(&mut file, 12, setup.len() as u16);
+        put_i32(&mut file, 14, data_block_offs as i32);
+        put_i16(&mut file, 18, 1);
+        put_i32(&mut file, 20, 0);
+        put_i32(&mut file, 24, 0);
+        put_i16(&mut file, 28, 0);
+        put_i16(&mut file, 30, 0);
+        put_u16(&mut file, 32, 0x5555);
+        file.extend_from_slice(setup);
+
+        file.resize(data_block_offs + 22, 0);
+        put_i32(
+            &mut file,
+            data_block_offs + 2,
+            (data_block_offs + 22) as i32,
+        );
+        put_i32(&mut file, data_block_offs + 6, 0);
+        put_u32(&mut file, data_block_offs + 18, payload.len() as u32);
+        file.extend_from_slice(payload);
+        fs::write(path, file).unwrap();
+    }
+
+    fn synthetic_measure_info(
+        meas_mode: i16,
+        width: i32,
+        height: i32,
+        times: i16,
+        channels: i32,
+    ) -> Vec<u8> {
+        let mut mb = vec![0u8; 211];
+        put_i16(&mut mb, 36, meas_mode);
+        put_i16(&mut mb, 82, times);
+        put_i16(&mut mb, 100, 0);
+        put_u16(&mut mb, 113, 1);
+        put_i32(&mut mb, 173, width);
+        put_i32(&mut mb, 177, height);
+        put_i32(&mut mb, 181, channels);
+        mb
+    }
+
+    fn write_single_block_sdt_with_measure_info(
+        path: &Path,
+        setup: &[u8],
+        measure_info: &[u8],
+        payload: &[u8],
+    ) {
+        let setup_offs = 42u32;
+        let meas_desc_offs = setup_offs as usize + setup.len();
+        let data_block_offs = meas_desc_offs + measure_info.len();
+
+        let mut file = vec![0; 42];
+        put_i16(&mut file, 0, 1);
+        put_i32(&mut file, 8, setup_offs as i32);
+        put_u16(&mut file, 12, setup.len() as u16);
+        put_i32(&mut file, 14, data_block_offs as i32);
+        put_i16(&mut file, 18, 1);
+        put_i32(&mut file, 20, 0);
+        put_i32(&mut file, 24, meas_desc_offs as i32);
+        put_i16(&mut file, 28, 1);
+        put_i16(&mut file, 30, measure_info.len() as i16);
+        put_u16(&mut file, 32, 0x5555);
+        file.extend_from_slice(setup);
+        file.extend_from_slice(measure_info);
+
+        file.resize(data_block_offs + 22, 0);
+        put_i32(
+            &mut file,
+            data_block_offs + 2,
+            (data_block_offs + 22) as i32,
+        );
+        put_i32(&mut file, data_block_offs + 6, 0);
+        put_i16(&mut file, data_block_offs + 12, 0);
+        put_u32(&mut file, data_block_offs + 18, payload.len() as u32);
+        file.extend_from_slice(payload);
+        fs::write(path, file).unwrap();
+    }
+
+    #[test]
+    fn sdt_raw_odd_width_uses_padded_rows_but_returns_cropped_plane() {
+        let path = temp_sdt_path("padded_rows.sdt");
+        let setup = synthetic_setup(3, 2, 2);
+        let payload = padded_decay_payload(3, 2, 2, 10);
+        write_single_block_sdt(&path, &setup, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 3);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().size_t, 2);
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_data_block_layout")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "image"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+
+        let plane = reader.open_bytes(1).unwrap();
+        let values: Vec<u16> = plane
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(values, vec![11, 21, 31, 111, 121, 131]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_raw_unmatched_block_length_reports_unsupported_layout() {
+        let path = temp_sdt_path("unsupported_curve.sdt");
+        let setup = synthetic_setup(4, 1, 4);
+        let payload = vec![1, 2, 3, 4, 5, 6];
+        write_single_block_sdt(&path, &setup, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_data_block_layout")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "unsupported"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_unsupported_layout_reason")
+        {
+            Some(MetadataValue::String(v)) => {
+                assert!(v.contains("raw SDT data block length 6"));
+                assert!(v.contains("image layout 32 bytes"));
+            }
+            other => panic!("unexpected SDT unsupported metadata: {other:?}"),
+        }
+
+        let err = reader.open_bytes(0).unwrap_err();
+        match err {
+            BioFormatsError::UnsupportedFormat(msg) => {
+                assert!(msg.contains("unsupported Becker & Hickl SDT/SPC data block layout"));
+                assert!(msg.contains("raw SDT data block length 6"));
+            }
+            other => panic!("unexpected SDT error: {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_fcs_measurement_mode_decodes_raw_u16_curve_payload() {
+        let path = temp_sdt_path("fcs_curve.sdt");
+        let setup = synthetic_setup(4, 1, 4);
+        let measure_info = synthetic_measure_info(3, 4, 1, 4, 1);
+        let mut payload = Vec::new();
+        for value in [7u16, 11, 13] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        write_single_block_sdt_with_measure_info(&path, &setup, &measure_info, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 3);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().size_t, 1);
+        assert_eq!(reader.metadata().image_count, 1);
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_data_block_layout")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "raw_u16_curve"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+        match reader.metadata().series_metadata.get("sdt_curve_variant") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "FCS"),
+            other => panic!("unexpected SDT curve metadata: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_payload_encoding")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "raw_u16_le"),
+            other => panic!("unexpected SDT curve payload encoding: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_sample_count")
+        {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 3),
+            other => panic!("unexpected SDT curve sample count: {other:?}"),
+        }
+
+        let plane = reader.open_bytes(0).unwrap();
+        let values: Vec<u16> = plane
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(values, vec![7, 11, 13]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_fcs_measurement_mode_decodes_zip_deflated_u16_curve_payload() {
+        let path = temp_sdt_path("fcs_zip_curve.sdt");
+        let setup = synthetic_setup(4, 1, 4);
+        let measure_info = synthetic_measure_info(3, 4, 1, 4, 1);
+        let mut raw_curve = Vec::new();
+        for value in [17u16, 19, 23, 29] {
+            raw_curve.extend_from_slice(&value.to_le_bytes());
+        }
+        let payload = zip_deflate_local_file(&raw_curve);
+        write_single_block_sdt_with_measure_info(&path, &setup, &measure_info, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 4);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().size_t, 1);
+        assert_eq!(reader.metadata().image_count, 1);
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_data_block_layout")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "zip_u16_curve"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_payload_encoding")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "zip_deflate_raw_u16_le"),
+            other => panic!("unexpected SDT curve payload encoding: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_sample_count")
+        {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 4),
+            other => panic!("unexpected SDT curve sample count: {other:?}"),
+        }
+
+        let plane = reader.open_bytes(0).unwrap();
+        let values: Vec<u16> = plane
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(values, vec![17, 19, 23, 29]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_fcs_measurement_mode_exposes_empty_zip_deflated_curve_as_metadata_only() {
+        let path = temp_sdt_path("fcs_empty_zip_curve.sdt");
+        let setup = synthetic_setup(4, 1, 4);
+        let measure_info = synthetic_measure_info(3, 4, 1, 4, 1);
+        let payload = zip_deflate_local_file(&[]);
+        write_single_block_sdt_with_measure_info(&path, &setup, &measure_info, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 0);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().size_t, 0);
+        assert_eq!(reader.metadata().image_count, 0);
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_data_block_layout")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "empty_curve"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_payload_encoding")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "zip_deflate_raw_u16_le"),
+            other => panic!("unexpected SDT curve payload encoding: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_sample_count")
+        {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 0),
+            other => panic!("unexpected SDT curve sample count: {other:?}"),
+        }
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::PlaneOutOfRange(0))
+        ));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_fcs_measurement_mode_exposes_empty_raw_curve_as_metadata_only() {
+        let path = temp_sdt_path("fcs_empty_raw_curve.sdt");
+        let setup = synthetic_setup(4, 1, 4);
+        let measure_info = synthetic_measure_info(3, 4, 1, 4, 1);
+        write_single_block_sdt_with_measure_info(&path, &setup, &measure_info, &[]);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 0);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().size_t, 0);
+        assert_eq!(reader.metadata().image_count, 0);
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_data_block_layout")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "empty_curve"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_payload_encoding")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "raw_u16_le"),
+            other => panic!("unexpected SDT curve payload encoding: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_sample_count")
+        {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 0),
+            other => panic!("unexpected SDT curve sample count: {other:?}"),
+        }
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::PlaneOutOfRange(0))
+        ));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_fcs_measurement_mode_preserves_odd_sized_raw_curve_payload_as_bytes() {
+        let path = temp_sdt_path("fcs_odd_curve.sdt");
+        let setup = synthetic_setup(4, 1, 4);
+        let measure_info = synthetic_measure_info(3, 4, 1, 4, 1);
+        let payload = vec![1, 2, 3, 4, 5];
+        write_single_block_sdt_with_measure_info(&path, &setup, &measure_info, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 5);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().size_t, 1);
+        assert_eq!(reader.metadata().image_count, 1);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+        assert_eq!(reader.metadata().bits_per_pixel, 8);
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_data_block_layout")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "raw_odd_byte_curve"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_payload_encoding")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "raw_bytes_odd_length"),
+            other => panic!("unexpected SDT curve payload encoding: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_byte_count")
+        {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 5),
+            other => panic!("unexpected SDT curve byte count: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_payload_diagnostic")
+        {
+            Some(MetadataValue::String(v)) => {
+                assert!(v.contains("odd byte count 5"));
+                assert!(v.contains("preserving raw bytes"));
+            }
+            other => panic!("unexpected SDT curve diagnostic: {other:?}"),
+        }
+        assert_eq!(reader.open_bytes(0).unwrap(), payload);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 3, 1).unwrap(),
+            vec![2, 3, 4]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_fcs_measurement_mode_preserves_odd_sized_zip_curve_payload_as_bytes() {
+        let path = temp_sdt_path("fcs_odd_zip_curve.sdt");
+        let setup = synthetic_setup(4, 1, 4);
+        let measure_info = synthetic_measure_info(3, 4, 1, 4, 1);
+        let raw_curve = vec![9, 8, 7];
+        let payload = zip_deflate_local_file(&raw_curve);
+        write_single_block_sdt_with_measure_info(&path, &setup, &measure_info, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 3);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.metadata().size_t, 1);
+        assert_eq!(reader.metadata().image_count, 1);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+        assert_eq!(reader.metadata().bits_per_pixel, 8);
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_data_block_layout")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "zip_odd_byte_curve"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_payload_encoding")
+        {
+            Some(MetadataValue::String(v)) => {
+                assert_eq!(v, "zip_deflate_raw_bytes_odd_length")
+            }
+            other => panic!("unexpected SDT curve payload encoding: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_byte_count")
+        {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 3),
+            other => panic!("unexpected SDT curve byte count: {other:?}"),
+        }
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_curve_payload_diagnostic")
+        {
+            Some(MetadataValue::String(v)) => {
+                assert!(v.contains("decoded to odd byte count 3"));
+                assert!(v.contains("preserving raw bytes"));
+            }
+            other => panic!("unexpected SDT curve diagnostic: {other:?}"),
+        }
+        assert_eq!(reader.open_bytes(0).unwrap(), raw_curve);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_fcs_zip_curve_with_unsupported_method_preserves_header_diagnostics() {
+        let path = temp_sdt_path("fcs_zip_method_diagnostic.sdt");
+        let setup = synthetic_setup(4, 1, 4);
+        let measure_info = synthetic_measure_info(3, 4, 1, 4, 1);
+        let payload = zip_local_file_with_method(0, b"curve-raw.bin", &[1, 2, 3, 4]);
+        write_single_block_sdt_with_measure_info(&path, &setup, &measure_info, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+        match metadata.get("sdt_data_block_layout") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "non_image_curve"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+        match metadata.get("sdt_unsupported_layout_reason") {
+            Some(MetadataValue::String(v)) => {
+                assert!(v.contains("unsupported ZIP-deflated curve payload"));
+                assert!(v.contains("unsupported SDT ZIP compression method 0"));
+            }
+            other => panic!("unexpected SDT unsupported metadata: {other:?}"),
+        }
+        match metadata.get("sdt_curve_zip_method") {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 0),
+            other => panic!("unexpected SDT ZIP method metadata: {other:?}"),
+        }
+        match metadata.get("sdt_curve_zip_declared_uncompressed_size") {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 4),
+            other => panic!("unexpected SDT ZIP size metadata: {other:?}"),
+        }
+        match metadata.get("sdt_curve_zip_file_name_preview") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "curve-raw.bin"),
+            other => panic!("unexpected SDT ZIP name metadata: {other:?}"),
+        }
+        match metadata.get("sdt_curve_zip_leading_bytes") {
+            Some(MetadataValue::Bytes(v)) => assert_eq!(&v[..4], b"PK\x03\x04"),
+            other => panic!("unexpected SDT ZIP leading-byte metadata: {other:?}"),
+        }
+
+        let err = reader.open_bytes(0).unwrap_err();
+        match err {
+            BioFormatsError::UnsupportedFormat(msg) => {
+                assert!(msg.contains("unsupported Becker & Hickl SDT/SPC data block layout"));
+                assert!(msg.contains("unsupported SDT ZIP compression method 0"));
+            }
+            other => panic!("unexpected SDT error: {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_preserves_measurement_descriptor_scalars_as_metadata() {
+        let path = temp_sdt_path("descriptor_metadata.sdt");
+        let setup = synthetic_setup(3, 2, 5);
+        let measure_info = synthetic_measure_info(13, 3, 2, 5, 2);
+        let payload = padded_decay_payload(3, 2, 5, 20);
+        write_single_block_sdt_with_measure_info(&path, &setup, &measure_info, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+        for (key, expected) in [
+            ("sdt_measurement_mode", 13),
+            ("sdt_measurement_adc_re", 5),
+            ("sdt_measurement_stopt", 0),
+            ("sdt_measurement_incr", 1),
+            ("sdt_measurement_scan_x", 3),
+            ("sdt_measurement_scan_y", 2),
+            ("sdt_measurement_scan_rx", 2),
+        ] {
+            match metadata.get(key) {
+                Some(MetadataValue::Int(v)) => assert_eq!(*v, expected, "{key}"),
+                other => panic!("unexpected {key} metadata: {other:?}"),
+            }
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn put_f32(buf: &mut [u8], off: usize, value: f32) {
+        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn sdt_parses_fcs_and_hist_descriptor_subblocks_as_metadata() {
+        // Build a full-length measurement descriptor with all five sub-blocks
+        // present (MeasureInfo 211, MeasStopInfo 60, MeasFCSInfo 38, extended
+        // MeasureInfo 26, MeasHISTInfo 24 = 359 bytes) so the FCS/FIDA/FILDA/MCS
+        // curve descriptors are decoded.
+        let path = temp_sdt_path("fcs_hist_descriptor.sdt");
+        let setup = synthetic_setup(4, 1, 4);
+        // FCS measurement mode (3), single-line, 4 time bins, 1 channel.
+        let mut measure_info = synthetic_measure_info(3, 4, 1, 4, 1);
+        measure_info.resize(211 + 60 + 38 + 26 + 24, 0);
+
+        // MeasStopInfo at offset 211: status (u16) and stopTime (f32).
+        put_u16(&mut measure_info, 211, 7);
+        put_f32(&mut measure_info, 211 + 4, 1.5);
+
+        // MeasFCSInfo at offset 271: fcsDecayCalc bitmask (decay|fcs|FIDA|MCS)
+        // at +2, fcsPoints (i32) at +16 (chan, fcsDecayCalc, mtResol, cortime,
+        // calcPhotons all precede it).
+        put_u16(&mut measure_info, 271 + 2, 0b10111);
+        put_i32(&mut measure_info, 271 + 16, 1024);
+
+        // Extended MeasureInfo at offset 309: imageX (i32) and detType (i16).
+        put_i32(&mut measure_info, 309, 256);
+        put_i16(&mut measure_info, 309 + 22, 9);
+
+        // MeasHISTInfo at offset 335: fidaPoints (+8), fildaPoints (+12),
+        // mcsPoints (+20).
+        put_i32(&mut measure_info, 335 + 8, 64);
+        put_i32(&mut measure_info, 335 + 12, 32);
+        put_i32(&mut measure_info, 335 + 20, 256);
+
+        // Provide a raw curve payload (mode 3 is a non-image FCS curve).
+        let payload = vec![0u8; 8];
+        write_single_block_sdt_with_measure_info(&path, &setup, &measure_info, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+
+        for (key, expected) in [
+            ("MeasStopInfo.status", 7),
+            ("MeasFCSInfo.fcsDecayCalc", 0b10111),
+            ("MeasFCSInfo.fcsPoints", 1024),
+            ("MeasureInfo.imageX", 256),
+            ("MeasureInfo.detType", 9),
+            ("MeasHISTInfo.fidaPoints", 64),
+            ("MeasHISTInfo.fildaPoints", 32),
+            ("MeasHISTInfo.mcsPoints", 256),
+        ] {
+            match metadata.get(key) {
+                Some(MetadataValue::Int(v)) => assert_eq!(*v, expected, "{key}"),
+                other => panic!("unexpected {key} metadata: {other:?}"),
+            }
+        }
+        match metadata.get("MeasStopInfo.stopTime") {
+            Some(MetadataValue::Float(v)) => assert!((*v - 1.5).abs() < 1e-6),
+            other => panic!("unexpected MeasStopInfo.stopTime metadata: {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_binary_setup_mcsta_points_sizes_mcs_ta_series() {
+        let path = temp_sdt_path("mcsta.sdt");
+        let setup = synthetic_setup_with_mcsta_points(3);
+        let setup_offs = 42u32;
+        let data_block_offs = setup_offs as usize + setup.len();
+
+        let block0 = decay_payload(4, 1, 4, 10);
+        let block1 = decay_payload(4, 1, 3, 100);
+        let block0_header = data_block_offs;
+        let block1_header = block0_header + 22 + block0.len();
+
+        let mut file = vec![0; 42];
+        put_i16(&mut file, 0, 1);
+        put_i32(&mut file, 8, setup_offs as i32);
+        put_u16(&mut file, 12, setup.len() as u16);
+        put_i32(&mut file, 14, data_block_offs as i32);
+        put_i16(&mut file, 18, 2);
+        put_i32(&mut file, 20, 0);
+        put_i32(&mut file, 24, 0);
+        put_i16(&mut file, 28, 0);
+        put_i16(&mut file, 30, 0);
+        put_u16(&mut file, 32, 0x5555);
+        file.extend_from_slice(&setup);
+
+        file.resize(block0_header + 22, 0);
+        put_i16(&mut file, block0_header, 0);
+        put_i32(&mut file, block0_header + 2, (block0_header + 22) as i32);
+        put_i32(&mut file, block0_header + 6, block1_header as i32);
+        put_u32(&mut file, block0_header + 18, block0.len() as u32);
+        file.extend_from_slice(&block0);
+
+        file.resize(block1_header + 22, 0);
+        put_i16(&mut file, block1_header, 1);
+        put_i32(&mut file, block1_header + 2, (block1_header + 22) as i32);
+        put_i32(&mut file, block1_header + 6, 0);
+        put_u32(&mut file, block1_header + 18, block1.len() as u32);
+        file.extend_from_slice(&block1);
+
+        fs::write(&path, file).unwrap();
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.metadata().size_t, 4);
+        assert_eq!(reader.metadata().image_count, 4);
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.metadata().size_t, 3);
+        assert_eq!(reader.metadata().image_count, 3);
+        match reader.metadata().series_metadata.get("time_channels") {
+            Some(MetadataValue::Int(v)) => assert_eq!(*v, 4),
+            other => panic!("unexpected time_channels metadata: {other:?}"),
+        }
+
+        let plane = reader.open_bytes(2).unwrap();
+        let values: Vec<u16> = plane
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(values, vec![102, 112, 122, 132]);
+
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -990,6 +2870,11 @@ impl FormatReader for LiFlimReader {
             "packing".into(),
             MetadataValue::String(layout.packing.clone()),
         );
+        // Mirror Java initOriginalMetadata(): surface every INI key/value pair as
+        // global metadata under the "<table header> - <key>" key. This is how
+        // Java exposes the BACKGROUND_TABLE (background.*), datatype, channel
+        // count and hasDarkImage keys as original metadata.
+        liflim_add_global_meta(&ini, &mut series_metadata);
 
         self.meta = Some(ImageMetadata {
             size_x: layout.size_x,
@@ -1196,6 +3081,31 @@ fn parse_liflim_ini(text: &str) -> HashMap<String, HashMap<String, String>> {
             .insert(key.trim().to_string(), value.trim().to_string());
     }
     tables
+}
+
+/// Mirrors the generic INI-walk in Java `LiFlimReader.initOriginalMetadata()`
+/// (the `for (IniTable table : ini)` loop), which calls
+/// `addGlobalMeta(name + " - " + key, value)` for every key in every table.
+///
+/// `name` is the table header (`IniTable.HEADER_KEY`); for the version 2.0
+/// default table our parser stores the section as the empty string, which Java
+/// represents with `IniTable.DEFAULT_HEADER` ("MainTable").
+fn liflim_add_global_meta(
+    ini: &HashMap<String, HashMap<String, String>>,
+    series_metadata: &mut HashMap<String, MetadataValue>,
+) {
+    const DEFAULT_HEADER: &str = "MainTable";
+    for (section, table) in ini {
+        let name = if section.is_empty() {
+            DEFAULT_HEADER
+        } else {
+            section.as_str()
+        };
+        for (key, value) in table {
+            let meta_key = format!("{name} - {key}");
+            series_metadata.insert(meta_key, MetadataValue::String(value.clone()));
+        }
+    }
 }
 
 fn parse_liflim_layout(ini: &HashMap<String, HashMap<String, String>>) -> Result<LiFlimLayout> {
@@ -1472,6 +3382,65 @@ timestamps=1
         reader.set_id(&path).unwrap();
         assert_eq!(reader.metadata().bits_per_pixel, 12);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0xbc, 0x0a, 0x23, 0x01]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn liflim_surfaces_ini_keys_including_background_table() {
+        let path = temp_path("background.fli");
+        let header = "\
+[FLIMIMAGE: INFO]
+version=1.0
+compression=0
+[FLIMIMAGE: LAYOUT]
+datatype=UINT16
+packing=lsb
+channels=1
+x=2
+y=1
+z=1
+phases=1
+frequencies=1
+timestamps=1
+hasDarkImage=0
+[FLIMIMAGE: BACKGROUND]
+datatype=UINT16
+channels=1
+x=2
+y=1
+z=1
+phases=1
+frequencies=1
+timestamps=1
+";
+        let mut payload = Vec::new();
+        for value in 1u16..=2 {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        write_liflim(&path, header, &payload);
+
+        let mut reader = LiFlimReader::new();
+        reader.set_id(&path).unwrap();
+        let md = &reader.metadata().series_metadata;
+
+        // Background-table keys are surfaced under Java's "<header> - <key>" form.
+        match md.get("FLIMIMAGE: BACKGROUND - datatype") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "UINT16"),
+            other => panic!("missing background datatype metadata: {other:?}"),
+        }
+        match md.get("FLIMIMAGE: BACKGROUND - channels") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "1"),
+            other => panic!("missing background channels metadata: {other:?}"),
+        }
+        // The layout/info keys are surfaced too (e.g. hasDarkImage, version).
+        match md.get("FLIMIMAGE: LAYOUT - hasDarkImage") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "0"),
+            other => panic!("missing hasDarkImage metadata: {other:?}"),
+        }
+        match md.get("FLIMIMAGE: INFO - version") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "1.0"),
+            other => panic!("missing version metadata: {other:?}"),
+        }
         let _ = std::fs::remove_file(path);
     }
 

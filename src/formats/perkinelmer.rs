@@ -97,6 +97,22 @@ pub struct PerkinElmerReader {
     is_tiff: bool,
     tiff_reader: crate::tiff::TiffReader,
     tiff_loaded: bool,
+
+    // -- Data fields mirroring the Java PerkinElmerReader --
+    /// "Experiment details:" string (Wavelengths/Frames/Slices). Java `details`.
+    details: Option<String>,
+    /// "Z slice space" string. Java `sliceSpace`.
+    slice_space: Option<String>,
+    /// "Pixel Size X"/"Pixel Size Y" in microns. Java `pixelSizeX`/`pixelSizeY`.
+    pixel_size_x: f64,
+    pixel_size_y: f64,
+    /// "Start Time:"/"Finish Time:" raw strings. Java `startTime`/`finishTime`.
+    start_time: Option<String>,
+    finish_time: Option<String>,
+    /// "Origin X/Y/Z" stage positions. Java `originX`/`originY`/`originZ`.
+    origin_x: f64,
+    origin_y: f64,
+    origin_z: f64,
 }
 
 impl PerkinElmerReader {
@@ -109,6 +125,15 @@ impl PerkinElmerReader {
             is_tiff: true,
             tiff_reader: crate::tiff::TiffReader::new(),
             tiff_loaded: false,
+            details: None,
+            slice_space: None,
+            pixel_size_x: 1.0,
+            pixel_size_y: 1.0,
+            start_time: None,
+            finish_time: None,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_z: 0.0,
         }
     }
 }
@@ -131,7 +156,6 @@ fn is_tiff_name(name: &str) -> bool {
 }
 
 /// Result of parsing the metadata companion files.
-#[derive(Default)]
 struct PeMeta {
     size_x: u32,
     size_y: u32,
@@ -139,9 +163,42 @@ struct PeMeta {
     size_c: u32,
     size_t: u32,
     details: Option<String>,
+    slice_space: Option<String>,
+    pixel_size_x: f64,
+    pixel_size_y: f64,
+    start_time: Option<String>,
+    finish_time: Option<String>,
+    origin_x: f64,
+    origin_y: f64,
+    origin_z: f64,
     metadata: HashMap<String, MetadataValue>,
 }
 
+impl Default for PeMeta {
+    fn default() -> Self {
+        // pixelSize defaults to 1, origins to 0 — matches the Java field inits.
+        PeMeta {
+            size_x: 0,
+            size_y: 0,
+            size_z: 0,
+            size_c: 0,
+            size_t: 0,
+            details: None,
+            slice_space: None,
+            pixel_size_x: 1.0,
+            pixel_size_y: 1.0,
+            start_time: None,
+            finish_time: None,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_z: 0.0,
+            metadata: HashMap::new(),
+        }
+    }
+}
+
+/// One Java function: `parseKeyValue`. Records every key as global metadata and
+/// fills the typed dimension/physical/timing fields.
 fn pe_parse_key_value(m: &mut PeMeta, key: &str, value: &str) {
     m.metadata
         .insert(key.to_string(), MetadataValue::String(value.to_string()));
@@ -162,6 +219,34 @@ fn pe_parse_key_value(m: &mut PeMeta, key: &str, value: &str) {
             }
         }
         "Experiment details:" => m.details = Some(value.to_string()),
+        "Z slice space" => m.slice_space = Some(value.to_string()),
+        "Pixel Size X" => {
+            if let Ok(v) = value.trim().parse() {
+                m.pixel_size_x = v;
+            }
+        }
+        "Pixel Size Y" => {
+            if let Ok(v) = value.trim().parse() {
+                m.pixel_size_y = v;
+            }
+        }
+        "Finish Time:" => m.finish_time = Some(value.to_string()),
+        "Start Time:" => m.start_time = Some(value.to_string()),
+        "Origin X" => {
+            if let Ok(v) = value.trim().parse() {
+                m.origin_x = v;
+            }
+        }
+        "Origin Y" => {
+            if let Ok(v) = value.trim().parse() {
+                m.origin_y = v;
+            }
+        }
+        "Origin Z" => {
+            if let Ok(v) = value.trim().parse() {
+                m.origin_z = v;
+            }
+        }
         _ => {}
     }
 }
@@ -233,6 +318,137 @@ fn pe_parse_htm(m: &mut PeMeta, content: &str) {
         }
         j += 2;
     }
+}
+
+/// One Java function: `parseCSVFile`. Whitespace-split tokens with a positional
+/// state machine that picks out Calibration Unit / Pixel Size X / Pixel Size Y /
+/// Z slice space, then `key+key`/`value` triplets.
+fn pe_parse_csv(m: &mut PeMeta, content: &str) {
+    let tokens: Vec<&str> = content
+        .split_whitespace()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let hash_keys = [
+        "Calibration Unit",
+        "Pixel Size X",
+        "Pixel Size Y",
+        "Z slice space",
+    ];
+    let mut t_num = 0usize;
+    let mut pt = 0usize;
+    let mut j = 0usize;
+    while j < tokens.len() {
+        let key: Option<String>;
+        let value: Option<String>;
+        if t_num < 7 {
+            j += 1;
+            key = None;
+            value = None;
+        } else if (t_num > 7 && t_num < 12) || (t_num > 12 && t_num < 18) || (t_num > 18 && t_num < 22)
+        {
+            j += 1;
+            key = None;
+            value = None;
+        } else if pt < hash_keys.len() {
+            key = Some(hash_keys[pt].to_string());
+            pt += 1;
+            value = Some(tokens[j].to_string());
+            j += 1;
+        } else {
+            // key = tokens[j++] + tokens[j++]; value = tokens[j++];
+            if j + 2 >= tokens.len() {
+                break;
+            }
+            let k = format!("{}{}", tokens[j], tokens[j + 1]);
+            j += 2;
+            let v = tokens[j].to_string();
+            j += 1;
+            key = Some(k);
+            value = Some(v);
+        }
+
+        if let (Some(k), Some(v)) = (key, value) {
+            pe_parse_key_value(m, &k, &v);
+        }
+        t_num += 1;
+    }
+}
+
+/// One Java function: `parseZpoFile`. Each whitespace token becomes an indexed
+/// "Z slice position" global metadata entry (mirrors `addGlobalMetaList`).
+fn pe_parse_zpo(m: &mut PeMeta, content: &str) {
+    let mut n = 1usize;
+    for token in content.split_whitespace() {
+        m.metadata.insert(
+            format!("Z slice position #{n}"),
+            MetadataValue::String(token.to_string()),
+        );
+        n += 1;
+    }
+}
+
+/// Convert a PerkinElmer `Finish Time:` string formatted as DATE_FORMAT
+/// (`HH:mm:ss (MM/dd/yyyy)`) into OME ISO8601 (`yyyy-MM-ddTHH:mm:ss`), mirroring
+/// Java's `Timestamp.valueOf(DateTools.formatDate(finishTime, DATE_FORMAT))`.
+/// Returns `None` when the string does not match, matching Java's null result.
+fn pe_finish_time_to_iso8601(s: &str) -> Option<String> {
+    let s = s.trim();
+    // Expect "HH:mm:ss (MM/dd/yyyy)".
+    let (time_part, rest) = s.split_once(' ')?;
+    let date_part = rest.trim().trim_start_matches('(').trim_end_matches(')');
+    let mut tparts = time_part.split(':');
+    let hh = tparts.next()?;
+    let mm = tparts.next()?;
+    let ss = tparts.next()?;
+    if tparts.next().is_some() {
+        return None;
+    }
+    let mut dparts = date_part.split('/');
+    let month = dparts.next()?;
+    let day = dparts.next()?;
+    let year = dparts.next()?;
+    if dparts.next().is_some() {
+        return None;
+    }
+    // Validate numerics so a malformed header yields None (Java returns null).
+    for p in [hh, mm, ss, month, day, year] {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(format!(
+        "{:0>4}-{:0>2}-{:0>2}T{:0>2}:{:0>2}:{:0>2}",
+        year, month, day, hh, mm, ss
+    ))
+}
+
+/// Convert an ISO8601 `yyyy-MM-ddTHH:mm:ss` string into Unix epoch
+/// milliseconds (UTC). Mirrors Java's `DateTools.getTime`, used only to compute
+/// the relative per-plane DeltaT spacing, so absolute timezone is irrelevant.
+fn pe_iso8601_to_unix_millis(iso: &str) -> Option<i64> {
+    let (date, time) = iso.split_once('T')?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    let mut t = time.split(':');
+    let hh: i64 = t.next()?.parse().ok()?;
+    let mm: i64 = t.next()?.parse().ok()?;
+    let ss: i64 = t.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days since 1970-01-01 via a civil-date algorithm (Howard Hinnant).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(((days * 86400 + hh * 3600 + mm * 60 + ss) * 1000) as i64)
 }
 
 fn parse_pe_dataset(id: &Path) -> Result<(PeMeta, Vec<PixelsFile>, usize, bool)> {
@@ -371,11 +587,21 @@ fn parse_pe_dataset(id: &Path) -> Result<(PeMeta, Vec<PixelsFile>, usize, bool)>
     }
     let ext_count = found_exts.len().max(1);
 
-    // Parse metadata.
+    // Parse metadata. Java order: .tim, then .csv (or .zpo if no .csv), then
+    // the aggressive .htm pass that defines wavelength/timepoint counts.
     let mut m = PeMeta::default();
     if let Some(tf) = &tim_file {
         if let Ok(content) = std::fs::read_to_string(tf) {
             pe_parse_tim(&mut m, &content);
+        }
+    }
+    if let Some(cf) = &csv_file {
+        if let Ok(content) = std::fs::read_to_string(cf) {
+            pe_parse_csv(&mut m, &content);
+        }
+    } else if let Some(zf) = &zpo_file {
+        if let Ok(content) = std::fs::read_to_string(zf) {
+            pe_parse_zpo(&mut m, &content);
         }
     }
     let htm = htm_file.clone().unwrap_or(htm_id);
@@ -386,7 +612,6 @@ fn parse_pe_dataset(id: &Path) -> Result<(PeMeta, Vec<PixelsFile>, usize, bool)>
             "PerkinElmer: valid .htm header file not found".into(),
         ));
     }
-    let _ = (csv_file, zpo_file);
 
     // Parse experiment details for Wavelengths/Frames/Slices.
     if let Some(details) = m.details.clone() {
@@ -447,6 +672,18 @@ impl PerkinElmerReader {
             Some(f) if f.first_index >= 0 => 0,
             _ => no / self.ext_count as u32,
         }
+    }
+
+    /// "Experiment details:" string (Java `details`). Also available as the
+    /// `Experiment details:` global metadata key.
+    pub fn details(&self) -> Option<&str> {
+        self.details.as_deref()
+    }
+
+    /// "Z slice space" string (Java `sliceSpace`). Also available as the
+    /// `Z slice space` global metadata key.
+    pub fn slice_space(&self) -> Option<&str> {
+        self.slice_space.as_deref()
     }
 }
 
@@ -550,6 +787,19 @@ impl FormatReader for PerkinElmerReader {
             ext_count = (size_t * size_c) as usize;
         }
 
+        // Mirror the Java data fields on the reader. They are surfaced into the
+        // OME projection by `ome_metadata()` below, exactly where Java's
+        // initFile populates the MetadataStore.
+        self.details = m.details.clone();
+        self.slice_space = m.slice_space.clone();
+        self.pixel_size_x = m.pixel_size_x;
+        self.pixel_size_y = m.pixel_size_y;
+        self.start_time = m.start_time.clone();
+        self.finish_time = m.finish_time.clone();
+        self.origin_x = m.origin_x;
+        self.origin_y = m.origin_y;
+        self.origin_z = m.origin_z;
+
         let meta = ImageMetadata {
             size_x,
             size_y,
@@ -586,6 +836,16 @@ impl FormatReader for PerkinElmerReader {
         self.meta = None;
         self.files.clear();
         self.ext_count = 1;
+        // Reset data fields to their constructor defaults (Java close()).
+        self.details = None;
+        self.slice_space = None;
+        self.pixel_size_x = 1.0;
+        self.pixel_size_y = 1.0;
+        self.start_time = None;
+        self.finish_time = None;
+        self.origin_x = 0.0;
+        self.origin_y = 0.0;
+        self.origin_z = 0.0;
         if self.tiff_loaded {
             let _ = self.tiff_reader.close();
             self.tiff_loaded = false;
@@ -678,6 +938,79 @@ impl FormatReader for PerkinElmerReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{OmeMetadata, OmePlane};
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        let img = ome.images.get_mut(0)?;
+
+        // finishTime -> Image AcquisitionDate (Java initFile, line 606-610).
+        if let Some(date) = self
+            .finish_time
+            .as_deref()
+            .and_then(pe_finish_time_to_iso8601)
+        {
+            img.acquisition_date = Some(date);
+        }
+
+        // pixelSizeX/Y -> Pixels PhysicalSizeX/Y (Java initFile, line 614-621).
+        if self.pixel_size_x.is_finite() && self.pixel_size_x > 0.0 {
+            img.physical_size_x = Some(self.pixel_size_x);
+        }
+        if self.pixel_size_y.is_finite() && self.pixel_size_y > 0.0 {
+            img.physical_size_y = Some(self.pixel_size_y);
+        }
+
+        // start/finish time -> per-plane DeltaT (Java initFile, line 647-659):
+        // secondsPerPlane = (end - start) / imageCount; planeDeltaT = i * spp.
+        let start = self
+            .start_time
+            .as_deref()
+            .and_then(pe_finish_time_to_iso8601)
+            .and_then(|iso| pe_iso8601_to_unix_millis(&iso));
+        let end = self
+            .finish_time
+            .as_deref()
+            .and_then(pe_finish_time_to_iso8601)
+            .and_then(|iso| pe_iso8601_to_unix_millis(&iso));
+        let seconds_per_plane = match (start, end) {
+            (Some(s), Some(e)) if meta.image_count > 0 => {
+                Some((e - s) as f64 / meta.image_count as f64 / 1000.0)
+            }
+            _ => None,
+        };
+
+        // originX/Y/Z -> per-plane StagePosition (Java initFile, line 665-677).
+        // Java writes the same origin onto every plane.
+        let has_origin = self.origin_x != 0.0 || self.origin_y != 0.0 || self.origin_z != 0.0;
+        if has_origin || seconds_per_plane.is_some() {
+            let c_size = meta.size_c.max(1);
+            let z_size = meta.size_z.max(1);
+            if img.planes.is_empty() {
+                for i in 0..meta.image_count {
+                    img.planes.push(OmePlane {
+                        the_z: (i / c_size) % z_size,
+                        the_c: i % c_size,
+                        the_t: i / (c_size * z_size),
+                        ..Default::default()
+                    });
+                }
+            }
+            for (i, plane) in img.planes.iter_mut().enumerate() {
+                if has_origin {
+                    plane.position_x = Some(self.origin_x);
+                    plane.position_y = Some(self.origin_y);
+                    plane.position_z = Some(self.origin_z);
+                }
+                if let Some(spp) = seconds_per_plane {
+                    plane.delta_t = Some(i as f64 * spp);
+                }
+            }
+        }
+
+        Some(ome)
     }
 }
 
@@ -875,7 +1208,12 @@ fn photon_dynamics_header_path(path: &Path) -> PathBuf {
         .map(|e| e.eq_ignore_ascii_case("img"))
         .unwrap_or(false)
     {
-        path.with_extension("hdr")
+        let lower = path.with_extension("hdr");
+        if lower.exists() {
+            lower
+        } else {
+            path.with_extension("HDR")
+        }
     } else {
         path.to_path_buf()
     }
@@ -948,16 +1286,21 @@ fn parse_photon_dynamics_header(
     if color == Some(4) {
         meta.size_c = 3;
         meta.is_rgb = true;
+        meta.is_interleaved = false;
     } else if let Some(color) = color {
         meta.is_indexed = color > 0;
     }
     meta.series_metadata = metadata;
 
     let pixels_path = photon_dynamics_pixels_path(&header_path);
-    let record_width = record_width.unwrap_or(size_x as usize).max(size_x as usize);
+    let record_width = record_width.ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Photon Dynamics PDS header missing FILE REC LEN".into())
+    })?;
+    let record_width = record_width.max(size_x as usize);
     let row_pixels = record_width;
     let required_len = (row_pixels as u64)
         .checked_mul(size_y as u64)
+        .and_then(|n| n.checked_mul(meta.size_c as u64))
         .and_then(|n| n.checked_mul(2))
         .ok_or_else(|| BioFormatsError::Format("Photon Dynamics IMG size overflows".into()))?;
     let actual_len = std::fs::metadata(&pixels_path)
@@ -992,38 +1335,49 @@ fn read_photon_dynamics_plane(
     }
 
     let mut file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-    let mut out = vec![0u8; w as usize * h as usize * 2];
+    let channel_bytes = w as usize * h as usize * 2;
+    let mut out = vec![0u8; channel_bytes * meta.size_c as usize];
     let read_x = if reverse_x { meta.size_x - w - x } else { x } as usize;
     let read_y = if reverse_y { meta.size_y - h - y } else { y } as usize;
     let row_stride = record_width.max(meta.size_x as usize) * 2;
+    let channel_stride = row_stride * meta.size_y as usize;
 
-    for row in 0..h as usize {
-        let src = ((read_y + row) * row_stride + read_x * 2) as u64;
-        file.seek(SeekFrom::Start(src))
-            .map_err(BioFormatsError::Io)?;
-        let dst = row * w as usize * 2;
-        file.read_exact(&mut out[dst..dst + w as usize * 2])
-            .map_err(BioFormatsError::Io)?;
+    for channel in 0..meta.size_c as usize {
+        for row in 0..h as usize {
+            let src = (channel * channel_stride + (read_y + row) * row_stride + read_x * 2) as u64;
+            file.seek(SeekFrom::Start(src))
+                .map_err(BioFormatsError::Io)?;
+            let dst = channel * channel_bytes + row * w as usize * 2;
+            file.read_exact(&mut out[dst..dst + w as usize * 2])
+                .map_err(BioFormatsError::Io)?;
+        }
     }
 
     if reverse_x {
-        for row in out.chunks_exact_mut(w as usize * 2) {
-            for col in 0..w as usize / 2 {
-                let left = col * 2;
-                let right = (w as usize - col - 1) * 2;
-                row.swap(left, right);
-                row.swap(left + 1, right + 1);
+        for channel in 0..meta.size_c as usize {
+            let start = channel * channel_bytes;
+            let end = start + channel_bytes;
+            for row in out[start..end].chunks_exact_mut(w as usize * 2) {
+                for col in 0..w as usize / 2 {
+                    let left = col * 2;
+                    let right = (w as usize - col - 1) * 2;
+                    row.swap(left, right);
+                    row.swap(left + 1, right + 1);
+                }
             }
         }
     }
 
     if reverse_y {
         let row_bytes = w as usize * 2;
-        for row in 0..h as usize / 2 {
-            let top = row * row_bytes;
-            let bottom = (h as usize - row - 1) * row_bytes;
-            for col in 0..row_bytes {
-                out.swap(top + col, bottom + col);
+        for channel in 0..meta.size_c as usize {
+            let base = channel * channel_bytes;
+            for row in 0..h as usize / 2 {
+                let top = base + row * row_bytes;
+                let bottom = base + (h as usize - row - 1) * row_bytes;
+                for col in 0..row_bytes {
+                    out.swap(top + col, bottom + col);
+                }
             }
         }
     }
@@ -1037,7 +1391,18 @@ impl FormatReader for PhotonDynamicsReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("hdr") | Some("img") | Some("pds"))
+        match ext.as_deref() {
+            Some("hdr") | Some("pds") => std::fs::read(path)
+                .map(|header| self.is_this_type_by_bytes(&header))
+                .unwrap_or(false),
+            Some("img") => {
+                let header_path = photon_dynamics_header_path(path);
+                std::fs::read(header_path)
+                    .map(|header| self.is_this_type_by_bytes(&header))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -1045,6 +1410,7 @@ impl FormatReader for PhotonDynamicsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, pixels_path, record_width, reverse_x, reverse_y) =
             parse_photon_dynamics_header(path)?;
         self.path = Some(photon_dynamics_header_path(path));
@@ -1067,13 +1433,15 @@ impl FormatReader for PhotonDynamicsReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
     fn series(&self) -> usize {
@@ -1162,6 +1530,14 @@ mod photon_dynamics_tests {
         (hdr, img)
     }
 
+    fn tmp_base(name: &str) -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}_{id}"))
+    }
+
     fn write_header(path: &Path, sign_x: &str, sign_y: &str, rec_len: usize) {
         std::fs::write(
             path,
@@ -1195,6 +1571,88 @@ mod photon_dynamics_tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         assert_eq!(reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(), crop);
+
+        let _ = std::fs::remove_file(hdr);
+        let _ = std::fs::remove_file(img);
+    }
+
+    #[test]
+    fn photon_dynamics_detects_only_identification_headers() {
+        let (hdr, img) = tmp_pair("photon_detect");
+        std::fs::write(&hdr, b"not a photon dynamics header").unwrap();
+        std::fs::write(&img, []).unwrap();
+
+        let mut reader = PhotonDynamicsReader::new();
+        assert!(!reader.is_this_type_by_name(&hdr));
+        assert!(!reader.is_this_type_by_name(&img));
+        assert!(matches!(
+            reader.set_series(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+        assert_eq!(reader.series_count(), 0);
+
+        write_header(&hdr, "+", "+", 4);
+        assert!(reader.is_this_type_by_name(&hdr));
+        assert!(reader.is_this_type_by_name(&img));
+
+        let _ = std::fs::remove_file(hdr);
+        let _ = std::fs::remove_file(img);
+    }
+
+    #[test]
+    fn photon_dynamics_opens_img_with_uppercase_hdr_sibling() {
+        let base = tmp_base("photon_upper_hdr");
+        let hdr = base.with_extension("HDR");
+        let img = base.with_extension("IMG");
+        write_header(&hdr, "+", "+", 4);
+        let samples = [1u16, 2, 3, 99, 4, 5, 6, 88];
+        let bytes: Vec<u8> = samples.into_iter().flat_map(u16::to_le_bytes).collect();
+        std::fs::write(&img, bytes).unwrap();
+
+        let mut reader = PhotonDynamicsReader::new();
+        assert!(reader.is_this_type_by_name(&img));
+        reader.set_id(&img).unwrap();
+        assert_eq!(reader.path.as_deref(), Some(hdr.as_path()));
+        assert_eq!(
+            reader.open_bytes_region(0, 0, 1, 3, 1).unwrap(),
+            [4u16, 5, 6]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_file(hdr);
+        let _ = std::fs::remove_file(img);
+    }
+
+    #[test]
+    fn photon_dynamics_reads_planar_rgb_payload() {
+        let (hdr, img) = tmp_pair("photon_rgb");
+        std::fs::write(
+            &hdr,
+            " IDENTIFICATION\nNXP = 2\nNYP = 1\nSIGNX = '+'\nSIGNY = '+'\nCOLOR = 4\nFILE REC LEN = 6\n",
+        )
+        .unwrap();
+        let samples = [
+            10u16, 20, 0xeeee, // red row plus padding
+            30, 40, 0xeeee, // green row plus padding
+            50, 60, 0xeeee, // blue row plus padding
+        ];
+        let bytes: Vec<u8> = samples.into_iter().flat_map(u16::to_le_bytes).collect();
+        std::fs::write(&img, bytes).unwrap();
+
+        let mut reader = PhotonDynamicsReader::new();
+        reader.set_id(&hdr).unwrap();
+        assert_eq!(reader.metadata().size_c, 3);
+        assert!(reader.metadata().is_rgb);
+        assert!(!reader.metadata().is_interleaved);
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            [10u16, 20, 30, 40, 50, 60]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
 
         let _ = std::fs::remove_file(hdr);
         let _ = std::fs::remove_file(img);
@@ -1247,5 +1705,216 @@ mod photon_dynamics_tests {
 
         let _ = std::fs::remove_file(hdr);
         let _ = std::fs::remove_file(img);
+    }
+
+    #[test]
+    fn photon_dynamics_failed_reopen_clears_state() {
+        let (valid_hdr, valid_img) = tmp_pair("photon_valid_reopen");
+        write_header(&valid_hdr, "+", "+", 3);
+        let samples = [1u16, 2, 3, 4, 5, 6];
+        let bytes: Vec<u8> = samples.into_iter().flat_map(u16::to_le_bytes).collect();
+        std::fs::write(&valid_img, bytes).unwrap();
+
+        let (bad_hdr, bad_img) = tmp_pair("photon_bad_reopen");
+        std::fs::write(&bad_hdr, b"NXP = 3\nNYP = 2\n").unwrap();
+        std::fs::write(&bad_img, []).unwrap();
+
+        let mut reader = PhotonDynamicsReader::new();
+        reader.set_id(&valid_hdr).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        let _ = reader.set_id(&bad_hdr).unwrap_err();
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        let _ = std::fs::remove_file(valid_hdr);
+        let _ = std::fs::remove_file(valid_img);
+        let _ = std::fs::remove_file(bad_hdr);
+        let _ = std::fs::remove_file(bad_img);
+    }
+}
+
+#[cfg(test)]
+mod perkinelmer_metadata_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{name}_{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_key_value_fills_origin_pixel_size_and_times() {
+        let mut m = PeMeta::default();
+        pe_parse_key_value(&mut m, "Pixel Size X", "0.25");
+        pe_parse_key_value(&mut m, "Pixel Size Y", "0.30");
+        pe_parse_key_value(&mut m, "Origin X", "10.0");
+        pe_parse_key_value(&mut m, "Origin Y", "20.0");
+        pe_parse_key_value(&mut m, "Origin Z", "5.5");
+        pe_parse_key_value(&mut m, "Start Time:", "09:30:00 (01/02/2020)");
+        pe_parse_key_value(&mut m, "Finish Time:", "09:31:00 (01/02/2020)");
+        pe_parse_key_value(&mut m, "Z slice space", "1.25");
+        pe_parse_key_value(&mut m, "Experiment details:", "3 Wavelengths 4 Frames 2 Slices");
+
+        assert_eq!(m.pixel_size_x, 0.25);
+        assert_eq!(m.pixel_size_y, 0.30);
+        assert_eq!(m.origin_x, 10.0);
+        assert_eq!(m.origin_y, 20.0);
+        assert_eq!(m.origin_z, 5.5);
+        assert_eq!(m.start_time.as_deref(), Some("09:30:00 (01/02/2020)"));
+        assert_eq!(m.finish_time.as_deref(), Some("09:31:00 (01/02/2020)"));
+        assert_eq!(m.slice_space.as_deref(), Some("1.25"));
+        assert_eq!(m.details.as_deref(), Some("3 Wavelengths 4 Frames 2 Slices"));
+        // Every key is also kept as global metadata (Java addGlobalMeta).
+        assert!(matches!(
+            m.metadata.get("Origin Z"),
+            Some(MetadataValue::String(v)) if v == "5.5"
+        ));
+    }
+
+    #[test]
+    fn parse_csv_extracts_pixel_sizes_and_slice_space() {
+        // 23 tokens: significant values at indices 7, 12, 18, 22.
+        let mut tokens = vec!["x"; 23];
+        tokens[7] = "microns"; // Calibration Unit
+        tokens[12] = "0.42"; // Pixel Size X
+        tokens[18] = "0.43"; // Pixel Size Y
+        tokens[22] = "2.5"; // Z slice space
+        let content = tokens.join(" ");
+
+        let mut m = PeMeta::default();
+        pe_parse_csv(&mut m, &content);
+
+        assert_eq!(m.pixel_size_x, 0.42);
+        assert_eq!(m.pixel_size_y, 0.43);
+        assert_eq!(m.slice_space.as_deref(), Some("2.5"));
+        assert!(matches!(
+            m.metadata.get("Calibration Unit"),
+            Some(MetadataValue::String(v)) if v == "microns"
+        ));
+    }
+
+    #[test]
+    fn parse_zpo_records_indexed_slice_positions() {
+        let mut m = PeMeta::default();
+        pe_parse_zpo(&mut m, "0.0 1.5 3.0");
+        assert!(matches!(
+            m.metadata.get("Z slice position #1"),
+            Some(MetadataValue::String(v)) if v == "0.0"
+        ));
+        assert!(matches!(
+            m.metadata.get("Z slice position #3"),
+            Some(MetadataValue::String(v)) if v == "3.0"
+        ));
+    }
+
+    #[test]
+    fn finish_time_converts_to_iso8601() {
+        assert_eq!(
+            pe_finish_time_to_iso8601("09:31:05 (01/02/2020)").as_deref(),
+            Some("2020-01-02T09:31:05")
+        );
+        // Malformed strings yield None (Java returns null).
+        assert_eq!(pe_finish_time_to_iso8601("not a date"), None);
+        assert_eq!(pe_finish_time_to_iso8601("9:31 (1/2/2020)"), None);
+    }
+
+    #[test]
+    fn iso8601_to_unix_millis_spacing_is_one_minute() {
+        let start = pe_iso8601_to_unix_millis("2020-01-02T09:30:00").unwrap();
+        let end = pe_iso8601_to_unix_millis("2020-01-02T09:31:00").unwrap();
+        assert_eq!(end - start, 60_000);
+        // Known epoch anchor: 1970-01-01T00:00:00 == 0 ms.
+        assert_eq!(pe_iso8601_to_unix_millis("1970-01-01T00:00:00"), Some(0));
+    }
+
+    #[test]
+    fn set_id_surfaces_pixel_size_origin_and_time_in_ome() {
+        let dir = unique_dir("perkin_ome");
+        let htm = dir.join("scan.htm");
+        std::fs::write(&htm, b"<html><body></body></html>").unwrap();
+
+        // A .csv companion supplies the pixel sizes deterministically.
+        let mut tokens = vec!["x"; 23];
+        tokens[7] = "microns";
+        tokens[12] = "0.25";
+        tokens[18] = "0.30";
+        tokens[22] = "1.0";
+        std::fs::write(dir.join("scan.csv"), tokens.join(" ")).unwrap();
+
+        // A small TIFF pixel file (single plane).
+        let mut meta = ImageMetadata {
+            size_x: 3,
+            size_y: 2,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            is_little_endian: true,
+            ..default_meta(3, 2, PixelType::Uint8)
+        };
+        meta.dimension_order = DimensionOrder::XYZCT;
+        crate::writer_registry::ImageWriter::save(
+            &dir.join("scan.tif"),
+            &meta,
+            &[vec![1u8, 2, 3, 4, 5, 6]],
+        )
+        .unwrap();
+
+        let mut pe = PerkinElmerReader::new();
+        pe.set_id(&htm).unwrap();
+
+        // Typed fields populated from the .csv.
+        assert_eq!(pe.pixel_size_x, 0.25);
+        assert_eq!(pe.pixel_size_y, 0.30);
+        assert_eq!(pe.slice_space(), Some("1.0"));
+
+        // Manually set origin/time on the reader to exercise the OME projection
+        // (the .htm token format is brittle to construct in a unit test).
+        pe.origin_x = 11.0;
+        pe.origin_y = 22.0;
+        pe.origin_z = 3.0;
+        pe.start_time = Some("09:30:00 (01/02/2020)".into());
+        pe.finish_time = Some("09:31:00 (01/02/2020)".into());
+
+        let ome = pe.ome_metadata().unwrap();
+        let img = &ome.images[0];
+        assert_eq!(img.physical_size_x, Some(0.25));
+        assert_eq!(img.physical_size_y, Some(0.30));
+        assert_eq!(img.acquisition_date.as_deref(), Some("2020-01-02T09:31:00"));
+        assert_eq!(img.planes.len(), 1);
+        assert_eq!(img.planes[0].position_x, Some(11.0));
+        assert_eq!(img.planes[0].position_y, Some(22.0));
+        assert_eq!(img.planes[0].position_z, Some(3.0));
+        assert_eq!(img.planes[0].delta_t, Some(0.0));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn close_resets_data_fields_to_defaults() {
+        let mut pe = PerkinElmerReader::new();
+        pe.pixel_size_x = 9.0;
+        pe.origin_z = 4.0;
+        pe.finish_time = Some("x".into());
+        pe.details = Some("d".into());
+        pe.slice_space = Some("s".into());
+        pe.close().unwrap();
+        assert_eq!(pe.pixel_size_x, 1.0);
+        assert_eq!(pe.pixel_size_y, 1.0);
+        assert_eq!(pe.origin_z, 0.0);
+        assert!(pe.finish_time.is_none());
+        assert!(pe.details().is_none());
+        assert!(pe.slice_space().is_none());
     }
 }

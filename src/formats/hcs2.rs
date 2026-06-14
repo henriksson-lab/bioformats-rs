@@ -122,10 +122,677 @@ tiff_wrapper! {
 // ---------------------------------------------------------------------------
 // 2. SimplePCI / HCImage
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// SimplePCI/HCImage TIFF (`.tif`).
-    pub struct SimplePciTiffReader;
-    extensions: ["tif"];
+/// SimplePCI/HCImage TIFF (`.tif`).
+pub struct SimplePciTiffReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl SimplePciTiffReader {
+    pub fn new() -> Self {
+        SimplePciTiffReader {
+            inner: crate::tiff::TiffReader::new(),
+        }
+    }
+
+    fn enrich_metadata(&mut self) {
+        let desc = {
+            let series = self.inner.series_list();
+            if series.is_empty() {
+                return;
+            }
+            series[0]
+                .metadata
+                .series_metadata
+                .get("ImageDescription")
+                .and_then(|v| {
+                    if let MetadataValue::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+        };
+        let Some(desc) = desc else { return };
+
+        let vendor = parse_simplepci_description(&desc);
+        if vendor.is_empty() {
+            return;
+        }
+
+        for series in self.inner.series_list_mut() {
+            for (key, value) in &vendor {
+                series
+                    .metadata
+                    .series_metadata
+                    .insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+impl Default for SimplePciTiffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for SimplePciTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("tif"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.close()?;
+        self.inner.set_id(path)?;
+        for series in self.inner.series_list_mut() {
+            series.metadata.series_metadata.insert(
+                "hcs2.wrapper".to_string(),
+                MetadataValue::String("SimplePciTiffReader".to_string()),
+            );
+        }
+        self.enrich_metadata();
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.inner.series_count() == 0 {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+}
+
+fn parse_simplepci_description(desc: &str) -> HashMap<String, MetadataValue> {
+    let lower = desc.to_ascii_lowercase();
+    if !lower.contains("simplepci") && !lower.contains("simple pci") && !lower.contains("hcimage") {
+        return HashMap::new();
+    }
+
+    let mut vendor = HashMap::new();
+    let software = match (
+        lower.contains("simplepci") || lower.contains("simple pci"),
+        lower.contains("hcimage"),
+    ) {
+        (true, true) => "SimplePCI HCImage",
+        (true, false) => "SimplePCI",
+        (false, true) => "HCImage",
+        (false, false) => unreachable!(),
+    };
+    vendor.insert(
+        "simplepci.software".to_string(),
+        MetadataValue::String(software.to_string()),
+    );
+
+    insert_simplepci_xml_metadata(&mut vendor, desc);
+
+    for line in desc.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('[') || line.starts_with('<') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=').or_else(|| line.split_once(':')) else {
+            continue;
+        };
+        let key = simplepci_metadata_key(key);
+        let value = value.trim().trim_matches('"');
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        insert_parsed_hcs_metadata_value(&mut vendor, format!("simplepci.{key}"), value);
+    }
+
+    vendor
+}
+
+fn simplepci_metadata_key(key: &str) -> String {
+    key.trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn insert_parsed_hcs_metadata_value(
+    metadata: &mut HashMap<String, MetadataValue>,
+    key: String,
+    value: &str,
+) {
+    if let Ok(f) = value.parse::<f64>() {
+        metadata.insert(key, MetadataValue::Float(f));
+    } else {
+        metadata.insert(key, MetadataValue::String(value.to_string()));
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HcsXmlTag {
+    name: String,
+    attrs: HashMap<String, String>,
+    start_offset: usize,
+    body_start: usize,
+    self_closing: bool,
+}
+
+fn hcs_xml_scan_tags(xml: &str) -> Vec<HcsXmlTag> {
+    let bytes = xml.as_bytes();
+    let mut tags = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if xml[i..].starts_with("<!--") {
+            if let Some(end) = xml[i..].find("-->") {
+                i += end + 3;
+            } else {
+                break;
+            }
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'/')
+            || bytes.get(i + 1) == Some(&b'?')
+            || bytes.get(i + 1) == Some(&b'!')
+        {
+            if let Some(end) = xml[i..].find('>') {
+                i += end + 1;
+            } else {
+                break;
+            }
+            continue;
+        }
+
+        let mut j = i + 1;
+        let mut in_quote = 0u8;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if in_quote != 0 {
+                if c == in_quote {
+                    in_quote = 0;
+                }
+            } else if c == b'"' || c == b'\'' {
+                in_quote = c;
+            } else if c == b'>' {
+                break;
+            }
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+
+        let inner = &xml[i + 1..j];
+        let self_closing = inner.trim_end().ends_with('/');
+        let inner_trim = inner.trim_end().trim_end_matches('/');
+        let name_end = inner_trim
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(inner_trim.len());
+        let name = inner_trim[..name_end].to_string();
+        let attrs = hcs_xml_parse_attrs(&inner_trim[name_end..]);
+        tags.push(HcsXmlTag {
+            name,
+            attrs,
+            start_offset: i,
+            body_start: j + 1,
+            self_closing,
+        });
+        i = j + 1;
+    }
+    tags
+}
+
+fn hcs_xml_parse_attrs(s: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !(bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let key = s[key_start..i].trim().to_string();
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            if key.is_empty() {
+                break;
+            }
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let quote = bytes[i];
+        if quote == b'"' || quote == b'\'' {
+            i += 1;
+            let val_start = i;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            if !key.is_empty() {
+                map.insert(key, hcs_xml_unescape(&s[val_start..i]));
+            }
+            i += 1;
+        } else {
+            let val_start = i;
+            while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
+                i += 1;
+            }
+            if !key.is_empty() {
+                map.insert(key, hcs_xml_unescape(&s[val_start..i]));
+            }
+        }
+    }
+    map
+}
+
+fn hcs_xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn hcs_xml_element_text(xml: &str, tag: &HcsXmlTag) -> Option<String> {
+    if tag.self_closing {
+        return None;
+    }
+    let rest = &xml[tag.body_start..];
+    let end = rest.find('<')?;
+    let text = hcs_xml_unescape(rest[..end].trim());
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn hcs_xml_matching_end_offset(xml: &str, tag: &HcsXmlTag) -> Option<usize> {
+    if tag.self_closing {
+        return Some(tag.body_start);
+    }
+    let mut i = tag.body_start;
+    let mut depth = 1usize;
+    while i < xml.len() {
+        let rel = xml[i..].find('<')?;
+        i += rel;
+        let end = xml[i..].find('>')?;
+        let inner = &xml[i + 1..i + end].trim();
+        if let Some(close_name) = inner.strip_prefix('/') {
+            let close_name = close_name.split_whitespace().next().unwrap_or("");
+            if close_name.eq_ignore_ascii_case(&tag.name) {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i + end + 1);
+                }
+            }
+        } else if !inner.starts_with('!') && !inner.starts_with('?') {
+            let self_closing = inner.trim_end().ends_with('/');
+            let start = inner.trim_end().trim_end_matches('/');
+            let name_end = start
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(start.len());
+            if start[..name_end].eq_ignore_ascii_case(&tag.name) && !self_closing {
+                depth += 1;
+            }
+        }
+        i += end + 1;
+    }
+    None
+}
+
+fn hcs_key_suffix(name: &str) -> String {
+    let mut suffix = String::new();
+    let chars: Vec<char> = name.chars().collect();
+    for (i, ch) in chars.iter().copied().enumerate() {
+        if ch.is_ascii_uppercase() {
+            let prev = i.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
+            let next = chars.get(i + 1).copied();
+            let starts_new_word = prev
+                .is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+                || (prev.is_some_and(|p| p.is_ascii_uppercase())
+                    && next.is_some_and(|n| n.is_ascii_lowercase()));
+            if i > 0 && starts_new_word {
+                suffix.push('_');
+            }
+            suffix.push(ch.to_ascii_lowercase());
+        } else if ch == ' ' || ch == '-' {
+            suffix.push('_');
+        } else {
+            suffix.push(ch.to_ascii_lowercase());
+        }
+    }
+    simplepci_metadata_key(&suffix)
+}
+
+fn hcs_xml_attr_case_insensitive<'a>(
+    attrs: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+}
+
+fn insert_simplepci_xml_metadata(metadata: &mut HashMap<String, MetadataValue>, desc: &str) {
+    if !desc.contains('<') {
+        return;
+    }
+
+    let tags = hcs_xml_scan_tags(desc);
+    insert_simplepci_hierarchy_scalar_metadata(metadata, desc, &tags);
+
+    let mut scalar_count = 0usize;
+    for tag in tags.iter().take(128) {
+        if scalar_count >= 256 {
+            break;
+        }
+        let tag_key = hcs_key_suffix(&tag.name);
+        if tag_key.is_empty() {
+            continue;
+        }
+
+        let mut attr_names: Vec<_> = tag.attrs.keys().map(String::as_str).collect();
+        attr_names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+        for attr in attr_names.into_iter().take(32) {
+            if scalar_count >= 256 {
+                break;
+            }
+            let Some(value) = hcs_xml_attr_case_insensitive(&tag.attrs, attr) else {
+                continue;
+            };
+            let attr_key = hcs_key_suffix(attr);
+            if attr_key.is_empty() {
+                continue;
+            }
+            insert_parsed_hcs_metadata_value(
+                metadata,
+                format!("simplepci.xml.{tag_key}.{attr_key}"),
+                value,
+            );
+            insert_simplepci_xml_alias(metadata, &tag_key, &attr_key, value);
+            scalar_count += 1;
+        }
+
+        if scalar_count < 256 {
+            if let Some(text) = hcs_xml_element_text(desc, tag) {
+                let text: String = text.chars().take(4096).collect();
+                insert_parsed_hcs_metadata_value(
+                    metadata,
+                    format!("simplepci.xml.{tag_key}.text"),
+                    &text,
+                );
+                insert_simplepci_xml_text_alias(metadata, &tag_key, &text);
+                scalar_count += 1;
+            }
+        }
+    }
+
+    if scalar_count > 0 {
+        metadata.insert(
+            "simplepci.xml_scalar_count".into(),
+            MetadataValue::Int(scalar_count as i64),
+        );
+    }
+}
+
+fn insert_simplepci_xml_alias(
+    metadata: &mut HashMap<String, MetadataValue>,
+    tag_key: &str,
+    attr_key: &str,
+    value: &str,
+) {
+    let alias = match (tag_key, attr_key) {
+        (_, "exposure_time") => Some("exposure_time"),
+        (_, "objective_magnification") => Some("objective_magnification"),
+        ("objective", "magnification") => Some("objective_magnification"),
+        ("channel", "name") | ("wavelength", "channel_name") => Some("channel_name"),
+        (_, "channel_name") => Some("channel_name"),
+        (_, "wavelength") => Some("wavelength"),
+        (_, "well") | ("well", "id") | ("well", "name") => Some("well"),
+        (_, "site") | ("site", "id") | ("field", "id") => Some("site"),
+        _ => None,
+    };
+    if let Some(alias) = alias {
+        let key = format!("simplepci.{alias}");
+        if !metadata.contains_key(&key) {
+            insert_parsed_hcs_metadata_value(metadata, key, value);
+        }
+    }
+}
+
+fn insert_simplepci_xml_text_alias(
+    metadata: &mut HashMap<String, MetadataValue>,
+    tag_key: &str,
+    value: &str,
+) {
+    let alias = match tag_key {
+        "exposure_time" => Some("exposure_time"),
+        "objective_magnification" => Some("objective_magnification"),
+        "channel_name" => Some("channel_name"),
+        "wavelength" => Some("wavelength"),
+        "well" | "well_id" => Some("well"),
+        "site" | "site_id" | "field" | "field_id" => Some("site"),
+        _ => None,
+    };
+    if let Some(alias) = alias {
+        let key = format!("simplepci.{alias}");
+        if !metadata.contains_key(&key) {
+            insert_parsed_hcs_metadata_value(metadata, key, value);
+        }
+    }
+}
+
+fn insert_simplepci_hierarchy_scalar_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    xml: &str,
+    tags: &[HcsXmlTag],
+) {
+    #[derive(Clone)]
+    struct StackNode {
+        suffix: String,
+        end_offset: usize,
+        interesting: bool,
+    }
+
+    let mut stack: Vec<StackNode> = Vec::new();
+    let mut node_count = 0usize;
+    let mut scalar_count = 0usize;
+
+    for tag in tags {
+        while stack
+            .last()
+            .is_some_and(|node| tag.start_offset >= node.end_offset)
+        {
+            stack.pop();
+        }
+
+        let suffix = hcs_key_suffix(&tag.name);
+        if suffix.is_empty() {
+            continue;
+        }
+        let interesting = simplepci_is_hierarchy_object_tag(&suffix);
+        let in_interesting_path = interesting || stack.iter().any(|node| node.interesting);
+
+        if in_interesting_path && !simplepci_is_xml_root_tag(&suffix) {
+            let mut scalars: Vec<(String, String)> = Vec::new();
+
+            let mut attr_names: Vec<_> = tag.attrs.keys().map(String::as_str).collect();
+            attr_names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+            for attr in attr_names.into_iter().take(32) {
+                if let Some(value) = hcs_xml_attr_case_insensitive(&tag.attrs, attr) {
+                    scalars.push((hcs_key_suffix(attr), value.to_string()));
+                }
+            }
+
+            if let Some(text) = hcs_xml_element_text(xml, tag) {
+                scalars.push(("text".into(), text.chars().take(4096).collect()));
+            }
+
+            if !scalars.is_empty() && node_count < 64 {
+                let mut path: Vec<&str> = stack
+                    .iter()
+                    .filter(|node| node.interesting)
+                    .filter(|node| !simplepci_is_xml_root_tag(&node.suffix))
+                    .map(|node| node.suffix.as_str())
+                    .collect();
+                path.push(&suffix);
+
+                let node_key = format!("simplepci.hierarchy.{node_count}");
+                metadata.insert(
+                    format!("{node_key}.path"),
+                    MetadataValue::String(path.join(".")),
+                );
+                metadata.insert(
+                    format!("{node_key}.type"),
+                    MetadataValue::String(suffix.clone()),
+                );
+                metadata.insert(
+                    format!("{node_key}.depth"),
+                    MetadataValue::Int(path.len() as i64),
+                );
+
+                for (key, value) in scalars {
+                    if scalar_count >= 256 {
+                        break;
+                    }
+                    if !key.is_empty() {
+                        insert_parsed_hcs_metadata_value(
+                            metadata,
+                            format!("{node_key}.{key}"),
+                            &value,
+                        );
+                        scalar_count += 1;
+                    }
+                }
+                node_count += 1;
+            }
+        }
+
+        if !tag.self_closing && stack.len() < 8 {
+            let end_offset = hcs_xml_matching_end_offset(xml, tag).unwrap_or(xml.len());
+            stack.push(StackNode {
+                suffix,
+                end_offset,
+                interesting,
+            });
+        }
+
+        if node_count >= 64 || scalar_count >= 256 {
+            break;
+        }
+    }
+
+    if node_count > 0 {
+        metadata.insert(
+            "simplepci.hierarchy.node_count".into(),
+            MetadataValue::Int(node_count as i64),
+        );
+        metadata.insert(
+            "simplepci.hierarchy.scalar_count".into(),
+            MetadataValue::Int(scalar_count as i64),
+        );
+    }
+}
+
+fn simplepci_is_xml_root_tag(suffix: &str) -> bool {
+    matches!(
+        suffix,
+        "hc_image" | "h_c_image" | "simplepci" | "simple_pci" | "simple_p_c_i"
+    )
+}
+
+fn simplepci_is_hierarchy_object_tag(suffix: &str) -> bool {
+    simplepci_is_xml_root_tag(suffix)
+        || matches!(
+            suffix,
+            "acquisition"
+                | "calibration"
+                | "camera"
+                | "capture"
+                | "channel"
+                | "channels"
+                | "experiment"
+                | "field"
+                | "filter"
+                | "image"
+                | "lens"
+                | "microscope"
+                | "objective"
+                | "plane"
+                | "sequence"
+                | "site"
+                | "stage"
+                | "time_point"
+                | "wavelength"
+                | "well"
+                | "xy_stage"
+                | "z_stage"
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -149,10 +816,158 @@ tiff_wrapper! {
 // ---------------------------------------------------------------------------
 // 5. Trestle whole-slide
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Trestle whole-slide TIFF (`.tif`).
-    pub struct TrestleReader;
-    extensions: ["tif"];
+
+/// Trestle whole-slide TIFF (`.tif`).
+///
+/// Ported from the upstream Java `TrestleReader`. Pixel I/O is delegated to the
+/// inner `TiffReader`; this wrapper additionally translates
+/// `TrestleReader.initStandardMetadata`, which parses the first IFD's comment
+/// (a `;`-separated list of `key=value` pairs) into global metadata.
+pub struct TrestleReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl TrestleReader {
+    pub fn new() -> Self {
+        TrestleReader {
+            inner: crate::tiff::TiffReader::new(),
+        }
+    }
+
+    /// Mirror of `TrestleReader.isThisType(RandomAccessInputStream)`: the first
+    /// IFD's COPYRIGHT tag must contain "Trestle Corp.".
+    fn is_trestle_copyright(&self) -> bool {
+        // TIFF COPYRIGHT tag (33432); no named constant in `tiff::ifd::tag`.
+        const COPYRIGHT: u16 = 33432;
+        self.inner
+            .ifd(0)
+            .and_then(|ifd| ifd.get_str(COPYRIGHT))
+            .map(|c| c.contains("Trestle Corp."))
+            .unwrap_or(false)
+    }
+
+    /// Mirror of the `addGlobalMeta(key, value)` loop in
+    /// `TrestleReader.initStandardMetadata`. The first IFD comment is split on
+    /// `;`, and every `key=value` fragment is stored.
+    fn init_standard_metadata(&mut self) {
+        if !self.is_trestle_copyright() {
+            return;
+        }
+        let comment = {
+            let series = self.inner.series_list();
+            series.first().and_then(|s| {
+                s.metadata
+                    .series_metadata
+                    .get("ImageDescription")
+                    .and_then(|v| match v {
+                        MetadataValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+            })
+        };
+        let Some(comment) = comment else { return };
+
+        let mut parsed: Vec<(String, MetadataValue)> = Vec::new();
+        for v in comment.split(';') {
+            let Some(eq) = v.find('=') else { continue };
+            let key = v[..eq].trim();
+            let value = v[eq + 1..].trim();
+            if key.is_empty() {
+                continue;
+            }
+            parsed.push((
+                key.to_string(),
+                MetadataValue::String(value.to_string()),
+            ));
+        }
+        if parsed.is_empty() {
+            return;
+        }
+        for series in self.inner.series_list_mut() {
+            for (key, value) in &parsed {
+                series
+                    .metadata
+                    .series_metadata
+                    .insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+impl Default for TrestleReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for TrestleReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("tif"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.close()?;
+        self.inner.set_id(path)?;
+        for series in self.inner.series_list_mut() {
+            series.metadata.series_metadata.insert(
+                "hcs2.wrapper".to_string(),
+                MetadataValue::String("TrestleReader".to_string()),
+            );
+        }
+        self.init_standard_metadata();
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.inner.series_count() == 0 {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,6 +2428,17 @@ mod operetta {
         y: u32,
     }
 
+    /// Plate-level scalars captured by `OperettaHandler.endElement`
+    /// (`Name`, `PlateTypeName`, `PlateID`, `MeasurementID`). Mirrors the
+    /// handler's `plateName`/`plateDescription`/`plateID`/`measurementID`.
+    #[derive(Clone, Default)]
+    struct PlateInfo {
+        plate_name: Option<String>,
+        plate_description: Option<String>,
+        plate_identifier: Option<String>,
+        measurement_id: Option<String>,
+    }
+
     pub fn parse(path: &Path) -> Result<HcsAssembly> {
         let xml = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -1624,6 +2450,7 @@ mod operetta {
         let mut channels: Map<i32, Channel> = Map::new();
         let mut plate_rows = 0i32;
         let mut plate_cols = 0i32;
+        let mut plate_info = PlateInfo::default();
 
         // Parser state. A single stateful SAX pass populates `planes`/`channels`.
         let mut active_plane: Option<Plane> = None;
@@ -1667,6 +2494,7 @@ mod operetta {
                         &mut planes,
                         &mut plate_rows,
                         &mut plate_cols,
+                        &mut plate_info,
                         &dir,
                         &images_dir,
                     );
@@ -1691,6 +2519,7 @@ mod operetta {
                         &mut planes,
                         &mut plate_rows,
                         &mut plate_cols,
+                        &mut plate_info,
                         &dir,
                         &images_dir,
                     );
@@ -1812,7 +2641,7 @@ mod operetta {
                 .find(|p| p.x > 0 && p.y > 0)
                 .map(|p| (p.x.max(size_x), p.y.max(size_y)))
                 .unwrap_or((size_x, size_y));
-            series.push(super::make_series_meta(
+            let mut meta = super::make_series_meta(
                 sx.max(1),
                 sy.max(1),
                 size_z,
@@ -1823,7 +2652,29 @@ mod operetta {
                 little_endian,
                 DimensionOrder::XYCZT,
                 "PerkinElmer Operetta",
-            ));
+            );
+            // OperettaReader.initStandardMetadata addGlobalMeta(...) plate scalars.
+            if let Some(v) = &plate_info.plate_name {
+                meta.series_metadata
+                    .insert("Plate name".to_string(), MetadataValue::String(v.clone()));
+            }
+            if let Some(v) = &plate_info.plate_description {
+                meta.series_metadata.insert(
+                    "Plate description".to_string(),
+                    MetadataValue::String(v.clone()),
+                );
+            }
+            if let Some(v) = &plate_info.plate_identifier {
+                meta.series_metadata
+                    .insert("Plate ID".to_string(), MetadataValue::String(v.clone()));
+            }
+            if let Some(v) = &plate_info.measurement_id {
+                meta.series_metadata.insert(
+                    "Measurement ID".to_string(),
+                    MetadataValue::String(v.clone()),
+                );
+            }
+            series.push(meta);
             asm_planes.push(
                 sp.iter()
                     .map(|p| match p {
@@ -1931,6 +2782,7 @@ mod operetta {
         _planes: &mut Vec<Plane>,
         plate_rows: &mut i32,
         plate_cols: &mut i32,
+        plate_info: &mut PlateInfo,
         dir: &Path,
         images_dir: &Path,
     ) {
@@ -1945,6 +2797,21 @@ mod operetta {
                 if let Ok(n) = v.parse::<i32>() {
                     *plate_cols = n;
                 }
+            }
+            // OperettaHandler.endElement plate-level scalars. `Name` is the
+            // last-seen value (handler keeps no nesting guard); `PlateTypeName`
+            // is the plate description.
+            "Name" => {
+                plate_info.plate_name = Some(v.to_string());
+            }
+            "PlateTypeName" => {
+                plate_info.plate_description = Some(v.to_string());
+            }
+            "PlateID" => {
+                plate_info.plate_identifier = Some(v.to_string());
+            }
+            "MeasurementID" => {
+                plate_info.measurement_id = Some(v.to_string());
             }
             _ => {}
         }
@@ -2084,6 +2951,23 @@ mod columbus {
         timepoint: i32,
         channel: i32,
         z: i32,
+        // Scalar metadata mirrored from ColumbusReader.Plane (parseImageXML).
+        channel_name: Option<String>,
+        /// MeasurementTimeOffset, in seconds (Java `Plane.deltaT`).
+        delta_t: Option<f64>,
+        /// AbsTime timestamp text (Java parses this to epoch seconds for deltaT).
+        abs_time: Option<String>,
+        /// MainEmissionWavelength (nm).
+        em_wavelength: Option<f64>,
+        /// MainExcitationWavelength (nm).
+        ex_wavelength: Option<f64>,
+        /// ImageResolutionX/Y in micrometers (Java `Plane.sizeX`/`sizeY`).
+        physical_size_x: Option<f64>,
+        physical_size_y: Option<f64>,
+        /// PositionX/Y/Z in micrometers (Java `Plane.positionX/Y/Z`).
+        position_x: Option<f64>,
+        position_y: Option<f64>,
+        position_z: Option<f64>,
     }
 
     pub fn parse(path: &Path) -> Result<HcsAssembly> {
@@ -2092,7 +2976,10 @@ mod columbus {
         let parent = xml_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         let main_xml = std::fs::read_to_string(&xml_path).map_err(BioFormatsError::Io)?;
-        let (plate_rows, plate_cols, image_refs) = parse_measurement_index(&main_xml);
+        let measurement = parse_measurement_index(&main_xml);
+        let plate_rows = measurement.plate_rows;
+        let plate_cols = measurement.plate_cols;
+        let image_refs = &measurement.refs;
 
         // The per-image XML lists may live in timepoint subdirectories, or be
         // referenced directly. Discover all *.columbusidx.xml under the parent.
@@ -2120,7 +3007,7 @@ mod columbus {
             }
         }
         // Also accept references named in the measurement index itself.
-        for r in &image_refs {
+        for r in image_refs {
             let cand = parent.join(r);
             if is_columbus_idx(&cand) && !image_xmls.iter().any(|(p, _)| p == &cand) {
                 image_xmls.push((cand, 0));
@@ -2139,8 +3026,13 @@ mod columbus {
         }
 
         let mut planes: Vec<Plane> = Vec::new();
+        let mut acquisition_date: Option<String> = None;
         for (p, t) in &image_xmls {
-            parse_image_xml(p, *t, &mut planes);
+            if let Some(date) = parse_image_xml(p, *t, &mut planes) {
+                if acquisition_date.is_none() {
+                    acquisition_date = Some(date);
+                }
+            }
         }
 
         if planes.is_empty() {
@@ -2248,7 +3140,7 @@ mod columbus {
                             }
                         }
                     }
-                    series.push(super::make_series_meta(
+                    let mut meta = super::make_series_meta(
                         size_x,
                         size_y,
                         size_z,
@@ -2259,7 +3151,22 @@ mod columbus {
                         little_endian,
                         order,
                         "PerkinElmer Columbus",
-                    ));
+                    );
+                    project_series_metadata(
+                        &mut meta,
+                        &planes,
+                        row,
+                        col,
+                        field,
+                        size_c,
+                        acquisition_date.as_deref(),
+                    );
+                    // MeasurementHandler.endElement addGlobalMeta(...) keys
+                    // (ScreenName, PlateName, PlateType, Measurement, ...).
+                    for (k, v) in &measurement.global {
+                        meta.series_metadata.insert(k.clone(), v.clone());
+                    }
+                    series.push(meta);
                     asm_planes.push(sp);
                 }
             }
@@ -2306,10 +3213,19 @@ mod columbus {
     }
 
     /// Parse the top-level measurement index for plate dims + referenced files.
-    fn parse_measurement_index(xml: &str) -> (i32, i32, Vec<String>) {
-        let mut plate_rows = 0i32;
-        let mut plate_cols = 0i32;
-        let mut refs: Vec<String> = Vec::new();
+    /// Captured scalars from the `MeasurementIndex.ColumbusIDX.xml` index,
+    /// mirroring `ColumbusReader.MeasurementHandler`.
+    #[derive(Default)]
+    pub(super) struct MeasurementInfo {
+        pub(super) plate_rows: i32,
+        pub(super) plate_cols: i32,
+        refs: Vec<String>,
+        /// `addGlobalMeta(currentName, value)` for every element in the index.
+        pub(super) global: Vec<(String, MetadataValue)>,
+    }
+
+    pub(super) fn parse_measurement_index(xml: &str) -> MeasurementInfo {
+        let mut info = MeasurementInfo::default();
         let mut cur = String::new();
         let mut reader = quick_xml::Reader::from_str(xml);
         reader.config_mut().trim_text(false);
@@ -2326,21 +3242,30 @@ mod columbus {
                     }
                 }
                 Ok(quick_xml::events::Event::End(_)) => {
+                    // MeasurementHandler.endElement: addGlobalMeta(currentName,
+                    // value) for every element, where `value` is the
+                    // accumulated character data (untrimmed in Java).
+                    if !cur.is_empty() {
+                        info.global.push((
+                            cur.clone(),
+                            MetadataValue::String(text.clone()),
+                        ));
+                    }
                     let v = text.trim();
                     match cur.as_str() {
                         "PlateRows" => {
                             if let Ok(n) = v.parse() {
-                                plate_rows = n;
+                                info.plate_rows = n;
                             }
                         }
                         "PlateColumns" => {
                             if let Ok(n) = v.parse() {
-                                plate_cols = n;
+                                info.plate_cols = n;
                             }
                         }
                         "Reference" => {
                             if !v.is_empty() {
-                                refs.push(v.to_string());
+                                info.refs.push(v.to_string());
                             }
                         }
                         _ => {}
@@ -2353,13 +3278,110 @@ mod columbus {
                 _ => {}
             }
         }
-        (plate_rows, plate_cols, refs)
+        info
+    }
+
+    /// Project the per-image scalar metadata captured by `parse_image_xml` into
+    /// one series' metadata map, mirroring the OME store writes in
+    /// `ColumbusReader.initFile` (acquisition date, well-sample/plane positions,
+    /// physical sizes, and per-channel name + emission/excitation wavelengths).
+    fn project_series_metadata(
+        meta: &mut ImageMetadata,
+        planes: &[Plane],
+        row: i32,
+        col: i32,
+        field: i32,
+        size_c: u32,
+        acquisition_date: Option<&str>,
+    ) {
+        let find = |t: i32, c: i32, z: i32| -> Option<&Plane> {
+            planes.iter().find(|p| {
+                p.row == row
+                    && p.col == col
+                    && p.field == field
+                    && p.timepoint == t
+                    && p.channel == c
+                    && p.z == z
+            })
+        };
+        let m = &mut meta.series_metadata;
+
+        if let Some(date) = acquisition_date {
+            // store.setImageAcquisitionDate
+            m.insert(
+                "columbus.AcquisitionDate".to_string(),
+                MetadataValue::String(date.to_string()),
+            );
+        }
+
+        // Base plane (row, col, field, t=0, c=0, z=0): well-sample position +
+        // physical pixel size (store.setWellSamplePositionX/Y, PhysicalSizeX/Y).
+        if let Some(base) = find(0, 0, 0) {
+            if let Some(x) = base.position_x {
+                m.insert("columbus.WellSamplePositionX".to_string(), MetadataValue::Float(x));
+            }
+            if let Some(y) = base.position_y {
+                m.insert("columbus.WellSamplePositionY".to_string(), MetadataValue::Float(y));
+            }
+            if let Some(x) = base.physical_size_x {
+                m.insert("columbus.PhysicalSizeX".to_string(), MetadataValue::Float(x));
+            }
+            if let Some(y) = base.physical_size_y {
+                m.insert("columbus.PhysicalSizeY".to_string(), MetadataValue::Float(y));
+            }
+            if let Some(z) = base.position_z {
+                // store.setPlanePositionZ (first plane of the series)
+                m.insert("columbus.PlanePositionZ".to_string(), MetadataValue::Float(z));
+            }
+            if let Some(dt) = base.delta_t {
+                // store.setPlaneDeltaT (MeasurementTimeOffset)
+                m.insert("columbus.PlaneDeltaT".to_string(), MetadataValue::Float(dt));
+            }
+            if let Some(abs) = &base.abs_time {
+                m.insert(
+                    "columbus.AbsTime".to_string(),
+                    MetadataValue::String(abs.clone()),
+                );
+            }
+        }
+
+        // Per-channel scalars (store.setChannelName / Emission / Excitation).
+        for c in 0..size_c as i32 {
+            if let Some(p) = find(0, c, 0) {
+                if let Some(name) = &p.channel_name {
+                    m.insert(
+                        format!("columbus.Channel{c}.Name"),
+                        MetadataValue::String(name.clone()),
+                    );
+                }
+                if let Some(em) = p.em_wavelength {
+                    if em as i64 > 0 {
+                        m.insert(
+                            format!("columbus.Channel{c}.EmissionWavelength"),
+                            MetadataValue::Float(em),
+                        );
+                    }
+                }
+                if let Some(ex) = p.ex_wavelength {
+                    if ex as i64 > 0 {
+                        m.insert(
+                            format!("columbus.Channel{c}.ExcitationWavelength"),
+                            MetadataValue::Float(ex),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Parse a per-timepoint image-list XML, appending discovered planes.
-    fn parse_image_xml(path: &Path, external_time: i32, out: &mut Vec<Plane>) {
+    ///
+    /// Returns the `MeasurementStartTime` text from the `Plates/Plate` graph
+    /// (the acquisition date), mirroring `ColumbusReader.parseImageXML`. Java
+    /// only records it for the first/base timepoint (`externalTime <= 0`).
+    fn parse_image_xml(path: &Path, external_time: i32, out: &mut Vec<Plane>) -> Option<String> {
         let Ok(xml) = std::fs::read_to_string(path) else {
-            return;
+            return None;
         };
         let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
@@ -2372,6 +3394,7 @@ mod columbus {
         let mut text = String::new();
         let mut cur_attrs: Map<String, String> = Map::new();
         let mut plane = Plane::default();
+        let mut acquisition_date: Option<String> = None;
 
         loop {
             match reader.read_event() {
@@ -2399,6 +3422,15 @@ mod columbus {
                 Ok(quick_xml::events::Event::End(ref e)) => {
                     let ln = super::xmlutil::local_name(e);
                     let v = text.trim().to_string();
+                    // Plate-level MeasurementStartTime lives outside <Image>.
+                    if ln == "MeasurementStartTime"
+                        && !in_image
+                        && external_time <= 0
+                        && acquisition_date.is_none()
+                        && !v.is_empty()
+                    {
+                        acquisition_date = Some(v.clone());
+                    }
                     if in_image && ln != "Image" {
                         apply_image_field(&mut plane, &cur, &v, &cur_attrs, &parent, external_time);
                     }
@@ -2417,6 +3449,18 @@ mod columbus {
                 _ => {}
             }
         }
+        acquisition_date
+    }
+
+    /// Calculate a value in micrometers based on the raw value and the `Unit`
+    /// attribute (port of `ColumbusReader.correctUnits`).
+    fn correct_units(value: f64, unit: Option<&str>) -> f64 {
+        match unit {
+            Some("m") => value * 1_000_000.0,
+            Some("cm") => value * 10_000.0,
+            Some("nm") => value / 1000.0,
+            _ => value,
+        }
     }
 
     fn apply_image_field(
@@ -2427,6 +3471,7 @@ mod columbus {
         parent: &Path,
         external_time: i32,
     ) {
+        let unit = || attrs.get("Unit").map(|s| s.as_str());
         match name {
             "URL" => {
                 p.file = Some(parent.join(value));
@@ -2469,6 +3514,58 @@ mod columbus {
                     p.channel = n - 1;
                 }
             }
+            "ChannelName" => {
+                if !value.is_empty() {
+                    p.channel_name = Some(value.to_string());
+                }
+            }
+            "MeasurementTimeOffset" => {
+                if let Ok(v) = value.parse::<f64>() {
+                    p.delta_t = Some(v);
+                }
+            }
+            "AbsTime" => {
+                // Java parses this ISO timestamp to epoch seconds and stores it
+                // as deltaT; we retain the raw text for metadata projection.
+                if !value.is_empty() {
+                    p.abs_time = Some(value.to_string());
+                }
+            }
+            "MainEmissionWavelength" => {
+                if let Ok(v) = value.parse::<f64>() {
+                    p.em_wavelength = Some(v);
+                }
+            }
+            "MainExcitationWavelength" => {
+                if let Ok(v) = value.parse::<f64>() {
+                    p.ex_wavelength = Some(v);
+                }
+            }
+            "ImageResolutionX" => {
+                if let Ok(v) = value.parse::<f64>() {
+                    p.physical_size_x = Some(correct_units(v, unit()));
+                }
+            }
+            "ImageResolutionY" => {
+                if let Ok(v) = value.parse::<f64>() {
+                    p.physical_size_y = Some(correct_units(v, unit()));
+                }
+            }
+            "PositionX" => {
+                if let Ok(v) = value.parse::<f64>() {
+                    p.position_x = Some(correct_units(v, unit()));
+                }
+            }
+            "PositionY" => {
+                if let Ok(v) = value.parse::<f64>() {
+                    p.position_y = Some(correct_units(v, unit()));
+                }
+            }
+            "PositionZ" => {
+                if let Ok(v) = value.parse::<f64>() {
+                    p.position_z = Some(correct_units(v, unit()));
+                }
+            }
             _ => {}
         }
     }
@@ -2484,6 +3581,12 @@ mod scanr {
 
     fn block(index: i32, axis: &str) -> String {
         format!("{}{:05}", axis, index)
+    }
+
+    /// Port of Java `DataTools.parseDouble`: lenient numeric parse that returns
+    /// `None` rather than throwing when the string is not a number.
+    fn parse_double(v: &str) -> Option<f64> {
+        v.trim().parse::<f64>().ok()
     }
 
     fn adjust_well_dims(well_count: usize) -> (i32, i32) {
@@ -2718,10 +3821,53 @@ mod scanr {
         let size_t = n_timepoints.max(1) as u32;
         let image_count = (size_z * size_t * size_c) as usize;
 
+        // Java `nFields` for store indexing: recomputed from the ORIGINAL field
+        // geometry (NOT the realPosCount-clamped n_pos used for series_count).
+        let n_fields = if h.found_positions {
+            h.field_position_count.max(1) as i32
+        } else {
+            (h.field_rows * h.field_columns).max(1)
+        };
+
+        // Whether Java would populate per-plane Plane.* metadata at all.
+        let populate_planes = h.delta_t.is_some()
+            || h.exposures.len() >= size_c as usize
+            || h.field_position_x.iter().any(|p| p.is_some())
+            || h.field_position_y.iter().any(|p| p.is_some());
+
+        // Java walks wellNumbers with a cursor that skips removed (None) entries,
+        // converting the stored 1-based well number into a 0-based plate index.
+        let mut well_index_cursor = 0i32;
+
         let mut series = Vec::with_capacity(series_count);
         let mut asm_planes: Vec<Vec<PlaneRef>> = Vec::with_capacity(series_count);
         for s in 0..series_count {
-            series.push(super::make_series_meta(
+            let i = s as i32;
+            let field = if n_fields > 0 { i % n_fields } else { 0 };
+            let well = if n_fields > 0 { i / n_fields } else { 0 };
+
+            // Mirror Java's wellNumbers cursor walk (store loop, ~line 650).
+            while h.well_numbers.get(&well_index_cursor).is_none()
+                && well_index_cursor < h.well_numbers.len() as i32
+            {
+                well_index_cursor += 1;
+            }
+            let well_index = match h.well_numbers.get(&well_index_cursor) {
+                Some(n) => n - 1,
+                None => well_index_cursor,
+            };
+            let well_row = if well_columns > 0 {
+                well_index / well_columns
+            } else {
+                0
+            };
+            let well_col = if well_columns > 0 {
+                well_index % well_columns
+            } else {
+                0
+            };
+
+            let mut meta = super::make_series_meta(
                 size_x,
                 size_y,
                 size_z,
@@ -2732,7 +3878,100 @@ mod scanr {
                 little_endian,
                 order,
                 "Olympus ScanR",
-            ));
+            );
+
+            // store.setPlateName / Plate dimensions (plate-level, repeated per series).
+            if let Some(name) = &h.plate_name {
+                meta.series_metadata.insert(
+                    "Plate name".to_string(),
+                    MetadataValue::String(name.clone()),
+                );
+            }
+            meta.series_metadata
+                .insert("PlateRows".to_string(), MetadataValue::Int(well_rows as i64));
+            meta.series_metadata.insert(
+                "PlateColumns".to_string(),
+                MetadataValue::Int(well_columns as i64),
+            );
+            // store.setWellRow / setWellColumn.
+            meta.series_metadata
+                .insert("WellRow".to_string(), MetadataValue::Int(well_row as i64));
+            meta.series_metadata.insert(
+                "WellColumn".to_string(),
+                MetadataValue::Int(well_col as i64),
+            );
+
+            // store.setChannelName(channelNames.get(c), i, c).
+            for c in 0..size_c as usize {
+                if let Some(cname) = h.channel_names.get(c) {
+                    meta.series_metadata.insert(
+                        format!("Channel {} Name", c),
+                        MetadataValue::String(cname.clone()),
+                    );
+                }
+            }
+
+            // store.setPixelsPhysicalSizeX/Y (microns/pixel).
+            if let Some(px) = h.pixel_size {
+                meta.series_metadata.insert(
+                    "PhysicalSizeX".to_string(),
+                    MetadataValue::Float(px),
+                );
+                meta.series_metadata.insert(
+                    "PhysicalSizeY".to_string(),
+                    MetadataValue::Float(px),
+                );
+            }
+
+            // store.setWellSamplePositionX/Y[field] (reference-frame lengths).
+            if let Some(Some(px)) = h.field_position_x.get(field as usize) {
+                meta.series_metadata.insert(
+                    "WellSamplePositionX".to_string(),
+                    MetadataValue::Float(*px),
+                );
+            }
+            if let Some(Some(py)) = h.field_position_y.get(field as usize) {
+                meta.series_metadata.insert(
+                    "WellSamplePositionY".to_string(),
+                    MetadataValue::Float(*py),
+                );
+            }
+
+            if populate_planes {
+                // store.setPlanePositionX/Y, ExposureTime, DeltaT, per plane.
+                if let Some(Some(px)) = h.field_position_x.get(field as usize) {
+                    meta.series_metadata.insert(
+                        "PlanePositionX".to_string(),
+                        MetadataValue::Float(*px),
+                    );
+                }
+                if let Some(Some(py)) = h.field_position_y.get(field as usize) {
+                    meta.series_metadata.insert(
+                        "PlanePositionY".to_string(),
+                        MetadataValue::Float(*py),
+                    );
+                }
+                // exposure time per channel: ms -> seconds (store.setPlaneExposureTime).
+                for c in 0..size_c as usize {
+                    if let Some(Some(time_ms)) = h.exposures.get(c) {
+                        meta.series_metadata.insert(
+                            format!("Channel {} ExposureTime", c),
+                            MetadataValue::Float(time_ms / 1000.0),
+                        );
+                    }
+                }
+                if let Some(dt) = h.delta_t {
+                    meta.series_metadata
+                        .insert("PlaneDeltaT".to_string(), MetadataValue::Float(dt));
+                }
+            }
+
+            series.push(meta);
+            if field == n_fields - 1 {
+                well_index_cursor += 1;
+            }
+            let _ = well;
+
             // tiffs layout: index = series * image_count + plane (per Java openBytes).
             // tiffs is compacted by the skip-missing-wells loop above, so series
             // indices map only onto wells/positions that actually have data.
@@ -2745,7 +3984,6 @@ mod scanr {
             }
             asm_planes.push(sp);
         }
-        let _ = (well_rows, well_columns);
 
         if series.is_empty() {
             return Err(BioFormatsError::Format(
@@ -2801,6 +4039,23 @@ mod scanr {
         well_numbers: Map<i32, i32>,
         found_positions: bool,
         field_position_count: usize,
+        /// Java `ScanrReader.plateName` ("plate name" Val).
+        plate_name: Option<String>,
+        /// Java `ScanrReader.pixelSize` ("conversion factor um/pixel" Val), microns/pixel.
+        pixel_size: Option<f64>,
+        /// Java `ScanrReader.exposures` ("exposure time" Vals), one per channel, in ms.
+        exposures: Vec<Option<f64>>,
+        /// Java `ScanrReader.deltaT` ("timeloop delay [ms]" Val) in seconds.
+        delta_t: Option<f64>,
+        /// Java `ScanrReader.fieldPositionX` (REFERENCEFRAME units), filled in
+        /// subposition-list order. Sized lazily to `field_position_count`.
+        field_position_x: Vec<Option<f64>>,
+        /// Java `ScanrReader.fieldPositionY`.
+        field_position_y: Vec<Option<f64>>,
+        /// Java handler `nextXPos` cursor into `field_position_x`.
+        next_x_pos: usize,
+        /// Java handler `nextYPos` cursor into `field_position_y`.
+        next_y_pos: usize,
     }
 
     impl ScanrHandler {
@@ -2844,7 +4099,10 @@ mod scanr {
                                     if self.found_positions && self.field_position_count == 0 =>
                                 {
                                     if let Ok(n) = v.parse::<usize>() {
+                                        // Java: fieldPositionX/Y = new Length[nPositions].
                                         self.field_position_count = n;
+                                        self.field_position_x = vec![None; n];
+                                        self.field_position_y = vec![None; n];
                                     }
                                 }
                                 "Val" => {
@@ -2890,17 +4148,29 @@ mod scanr {
                 "# slices" => self.size_z = v.parse().unwrap_or(0),
                 "timeloop real" => self.size_t = v.parse().unwrap_or(0),
                 "timeloop count" => self.size_t = v.parse::<u32>().unwrap_or(0) + 1,
+                // Java: deltaT = Integer.parseInt(v) / 1000.0 (ms -> seconds).
+                "timeloop delay [ms]" => {
+                    if let Ok(n) = v.parse::<i64>() {
+                        self.delta_t = Some(n as f64 / 1000.0);
+                    }
+                }
                 "name" if *valid_channel => {
                     if !self.channel_names.contains(&v.to_string()) {
                         self.channel_names.push(v.to_string());
                     }
                 }
+                // Java: plateName = v.
+                "plate name" => self.plate_name = Some(v.to_string()),
+                // Java: exposures.add(DataTools.parseDouble(v)).
+                "exposure time" => self.exposures.push(parse_double(v)),
                 "idle" if *valid_channel => {
                     if let Some(last) = self.channel_names.last().cloned() {
                         if v == "0" && last != "Autofocus" {
                             self.size_c += 1;
                         } else {
+                            // Java removes both the channel name and its exposure.
                             self.channel_names.pop();
+                            self.exposures.pop();
                         }
                     }
                 }
@@ -2917,6 +4187,25 @@ mod scanr {
                         }
                     } else if let Ok(n) = well_index.parse::<i32>() {
                         self.well_labels.insert(v.to_string(), n);
+                    }
+                }
+                // Java: pixelSize = DataTools.parseDouble(v).
+                "conversion factor um/pixel" => self.pixel_size = parse_double(v),
+                // Java fall-through: subposition coordinates, X then Y, paired by
+                // nextXPos == nextYPos. Values are reference-frame lengths.
+                _ if self.found_positions => {
+                    if self.next_x_pos == self.next_y_pos {
+                        if self.next_x_pos < self.field_position_x.len() {
+                            if let Some(n) = parse_double(v) {
+                                self.field_position_x[self.next_x_pos] = Some(n);
+                                self.next_x_pos += 1;
+                            }
+                        }
+                    } else if self.next_y_pos < self.field_position_y.len() {
+                        if let Some(n) = parse_double(v) {
+                            self.field_position_y[self.next_y_pos] = Some(n);
+                            self.next_y_pos += 1;
+                        }
                     }
                 }
                 _ => {}
@@ -3850,6 +5139,209 @@ mod tests {
         writer.close().unwrap();
     }
 
+    fn tiff_entry(tag: u16, typ: u16, count: u32, value: u32) -> [u8; 12] {
+        let mut entry = [0u8; 12];
+        entry[0..2].copy_from_slice(&tag.to_le_bytes());
+        entry[2..4].copy_from_slice(&typ.to_le_bytes());
+        entry[4..8].copy_from_slice(&count.to_le_bytes());
+        entry[8..12].copy_from_slice(&value.to_le_bytes());
+        entry
+    }
+
+    fn write_tiff_with_description(path: &Path, description: &str, pixel: u8) {
+        let mut desc = description.as_bytes().to_vec();
+        desc.push(0);
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),
+            tiff_entry(257, 4, 1, 1),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, 1),
+            tiff_entry(270, 2, desc.len() as u32, 0),
+            tiff_entry(273, 4, 1, 0),
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 1),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+        ];
+        let ifd_start = 8u32;
+        let desc_start = ifd_start + 2 + (entries.len() as u32) * 12 + 4;
+        let pixel_start = desc_start + desc.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for mut entry in entries {
+            if u16::from_le_bytes([entry[0], entry[1]]) == 270 {
+                entry[8..12].copy_from_slice(&desc_start.to_le_bytes());
+            } else if u16::from_le_bytes([entry[0], entry[1]]) == 273 {
+                entry[8..12].copy_from_slice(&pixel_start.to_le_bytes());
+            }
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&desc);
+        bytes.push(pixel);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn simplepci_tiff_projects_description_metadata_and_delegates_pixels() {
+        let path = temp_path("simplepci_metadata.tif");
+        write_tiff_with_description(
+            &path,
+            "Created by SimplePCI HCImage\nExposure Time=12.5\nChannel Name=DAPI\nWell=A01\n",
+            91,
+        );
+
+        let mut reader = SimplePciTiffReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+
+        assert!(matches!(
+            metadata.get("hcs2.wrapper"),
+            Some(MetadataValue::String(value)) if value == "SimplePciTiffReader"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.software"),
+            Some(MetadataValue::String(value)) if value == "SimplePCI HCImage"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.exposure_time"),
+            Some(MetadataValue::Float(value)) if (*value - 12.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.channel_name"),
+            Some(MetadataValue::String(value)) if value == "DAPI"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.well"),
+            Some(MetadataValue::String(value)) if value == "A01"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![91]);
+        assert_eq!(reader.open_bytes_region(0, 0, 0, 1, 1).unwrap(), vec![91]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn simplepci_tiff_ignores_plain_tiff_descriptions_for_vendor_metadata() {
+        let path = temp_path("simplepci_plain_description.tif");
+        write_tiff_with_description(&path, "Exposure Time=12.5\nWell=A01\n", 7);
+
+        let mut reader = SimplePciTiffReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert!(reader
+            .metadata()
+            .series_metadata
+            .contains_key("hcs2.wrapper"));
+        assert!(
+            !reader
+                .metadata()
+                .series_metadata
+                .keys()
+                .any(|key| key.starts_with("simplepci.")),
+            "plain TIFF descriptions should not get SimplePCI vendor metadata"
+        );
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![7]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn simplepci_tiff_preserves_nested_xml_object_scalars() {
+        let path = temp_path("simplepci_nested_xml_metadata.tif");
+        write_tiff_with_description(
+            &path,
+            "Created by HCImage\n\
+<HCImage>\n\
+  <Acquisition RunName=\"Assay 7\">\n\
+    <Channel Name=\"TRITC\" Wavelength=\"561\">\n\
+      <Objective Magnification=\"60\" NumericAperture=\"1.4\"/>\n\
+    </Channel>\n\
+    <Camera SerialNumber=\"CAM-17\">\n\
+      <Gain>2.5</Gain>\n\
+    </Camera>\n\
+  </Acquisition>\n\
+</HCImage>\n",
+            19,
+        );
+
+        let mut reader = SimplePciTiffReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+
+        assert!(matches!(
+            metadata.get("simplepci.software"),
+            Some(MetadataValue::String(value)) if value == "HCImage"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.xml_scalar_count"),
+            Some(MetadataValue::Int(7))
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.node_count"),
+            Some(MetadataValue::Int(5))
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.scalar_count"),
+            Some(MetadataValue::Int(7))
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.0.path"),
+            Some(MetadataValue::String(value)) if value == "acquisition"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.0.run_name"),
+            Some(MetadataValue::String(value)) if value == "Assay 7"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.1.path"),
+            Some(MetadataValue::String(value)) if value == "acquisition.channel"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.1.name"),
+            Some(MetadataValue::String(value)) if value == "TRITC"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.1.wavelength"),
+            Some(MetadataValue::Float(value)) if (*value - 561.0).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.2.path"),
+            Some(MetadataValue::String(value)) if value == "acquisition.channel.objective"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.2.magnification"),
+            Some(MetadataValue::Float(value)) if (*value - 60.0).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.2.numeric_aperture"),
+            Some(MetadataValue::Float(value)) if (*value - 1.4).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.3.serial_number"),
+            Some(MetadataValue::String(value)) if value == "CAM-17"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.4.path"),
+            Some(MetadataValue::String(value)) if value == "acquisition.camera.gain"
+        ));
+        assert!(matches!(
+            metadata.get("simplepci.hierarchy.4.text"),
+            Some(MetadataValue::Float(value)) if (*value - 2.5).abs() < f64::EPSILON
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![19]);
+        assert_eq!(reader.open_bytes_region(0, 0, 0, 1, 1).unwrap(), vec![19]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn hcs_assembly_empty_plane_ref_stays_black() {
         let meta = test_meta(3, 2);
@@ -3949,5 +5441,332 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn columbus_parse_image_xml_captures_measurement_start_time_and_scalars() {
+        let dir = temp_path("columbus_scalars");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A real backing TIFF so HcsAssembly::validate accepts the well-sample.
+        let tiff = dir.join("img.tif");
+        let meta = test_meta(2, 2);
+        write_tiff(&tiff, &meta, &[1u8, 2, 3, 4]);
+
+        std::fs::write(
+            dir.join("MeasurementIndex.ColumbusIDX.xml"),
+            r#"<ColumbusMeasurementIndex><ScreenName>MyScreen</ScreenName><PlateName>MyPlate</PlateName><PlateType>96well</PlateType><PlateRows>1</PlateRows><PlateColumns>1</PlateColumns><Reference>Images.ColumbusIDX.xml</Reference></ColumbusMeasurementIndex>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Images.ColumbusIDX.xml"),
+            r#"<Root>
+<Plates><Plate><MeasurementStartTime>2020-01-02T03:04:05Z</MeasurementStartTime></Plate></Plates>
+<Images><Image>
+<URL BufferNo="0">img.tif</URL>
+<Row>1</Row><Col>1</Col><FieldID>1</FieldID><PlaneID>1</PlaneID>
+<TimepointID>1</TimepointID><ChannelID>1</ChannelID>
+<ChannelName>DAPI</ChannelName>
+<MainEmissionWavelength>461</MainEmissionWavelength>
+<MainExcitationWavelength>358</MainExcitationWavelength>
+<ImageResolutionX Unit="m">0.000001</ImageResolutionX>
+<ImageResolutionY Unit="m">0.000001</ImageResolutionY>
+<PositionX Unit="m">0.001</PositionX>
+<PositionY Unit="m">0.002</PositionY>
+<PositionZ Unit="m">0.003</PositionZ>
+<MeasurementTimeOffset>1.5</MeasurementTimeOffset>
+</Image></Images>
+</Root>"#,
+        )
+        .unwrap();
+
+        let mut reader = ColumbusReader::new();
+        reader
+            .set_id(&dir.join("MeasurementIndex.ColumbusIDX.xml"))
+            .unwrap();
+        let md = &reader.metadata().series_metadata;
+
+        assert!(
+            matches!(md.get("columbus.AcquisitionDate"),
+                Some(MetadataValue::String(v)) if v == "2020-01-02T03:04:05Z"),
+            "missing MeasurementStartTime: {md:?}"
+        );
+        assert!(matches!(
+            md.get("columbus.Channel0.Name"),
+            Some(MetadataValue::String(v)) if v == "DAPI"
+        ));
+        assert!(matches!(
+            md.get("columbus.Channel0.EmissionWavelength"),
+            Some(MetadataValue::Float(v)) if (*v - 461.0).abs() < 1e-9
+        ));
+        // PositionX 0.001 m -> 1000 um via correct_units("m").
+        assert!(matches!(
+            md.get("columbus.WellSamplePositionX"),
+            Some(MetadataValue::Float(v)) if (*v - 1000.0).abs() < 1e-6
+        ));
+        // ImageResolutionX 1e-6 m -> 1.0 um.
+        assert!(matches!(
+            md.get("columbus.PhysicalSizeX"),
+            Some(MetadataValue::Float(v)) if (*v - 1.0).abs() < 1e-9
+        ));
+        assert!(matches!(
+            md.get("columbus.PlaneDeltaT"),
+            Some(MetadataValue::Float(v)) if (*v - 1.5).abs() < 1e-9
+        ));
+
+        // MeasurementHandler.endElement addGlobalMeta(currentName, value):
+        // every element of the measurement index becomes a global key.
+        assert!(matches!(
+            md.get("ScreenName"),
+            Some(MetadataValue::String(v)) if v == "MyScreen"
+        ));
+        assert!(matches!(
+            md.get("PlateName"),
+            Some(MetadataValue::String(v)) if v == "MyPlate"
+        ));
+        assert!(matches!(
+            md.get("PlateType"),
+            Some(MetadataValue::String(v)) if v == "96well"
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `parse_measurement_index` captures every element as a global-meta entry
+    /// (mirrors ColumbusReader.MeasurementHandler.endElement addGlobalMeta).
+    #[test]
+    fn columbus_measurement_index_captures_global_meta() {
+        let info = columbus::parse_measurement_index(
+            r#"<Root><ScreenName>S</ScreenName><PlateName>P</PlateName><PlateType>T</PlateType><PlateRows>2</PlateRows><PlateColumns>3</PlateColumns></Root>"#,
+        );
+        assert_eq!(info.plate_rows, 2);
+        assert_eq!(info.plate_cols, 3);
+        let has = |k: &str, want: &str| {
+            info.global
+                .iter()
+                .any(|(key, v)| key == k && matches!(v, MetadataValue::String(s) if s == want))
+        };
+        assert!(has("ScreenName", "S"));
+        assert!(has("PlateName", "P"));
+        assert!(has("PlateType", "T"));
+        assert!(has("PlateRows", "2"));
+    }
+
+    /// Build a single-IFD TIFF carrying a COPYRIGHT tag plus an
+    /// ImageDescription comment, for exercising TrestleReader detection +
+    /// `initStandardMetadata` comment parsing.
+    fn write_tiff_with_copyright_and_comment(path: &Path, copyright: &str, comment: &str) {
+        let mut cr = copyright.as_bytes().to_vec();
+        cr.push(0);
+        let mut desc = comment.as_bytes().to_vec();
+        desc.push(0);
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),
+            tiff_entry(257, 4, 1, 1),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, 1),
+            tiff_entry(270, 2, desc.len() as u32, 0),    // ImageDescription
+            tiff_entry(273, 4, 1, 0),                    // StripOffsets
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 1),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+            tiff_entry(33432, 2, cr.len() as u32, 0),    // Copyright
+        ];
+        let ifd_start = 8u32;
+        let cr_start = ifd_start + 2 + (entries.len() as u32) * 12 + 4;
+        let desc_start = cr_start + cr.len() as u32;
+        let pixel_start = desc_start + desc.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for mut entry in entries {
+            match u16::from_le_bytes([entry[0], entry[1]]) {
+                270 => entry[8..12].copy_from_slice(&desc_start.to_le_bytes()),
+                273 => entry[8..12].copy_from_slice(&pixel_start.to_le_bytes()),
+                33432 => entry[8..12].copy_from_slice(&cr_start.to_le_bytes()),
+                _ => {}
+            }
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&cr);
+        bytes.extend_from_slice(&desc);
+        bytes.push(42);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn trestle_parses_comment_keyvalues_when_copyright_matches() {
+        let path = temp_path("trestle.tif");
+        write_tiff_with_copyright_and_comment(
+            &path,
+            "Copyright Trestle Corp.",
+            "OverlapsXY=0 0 ; Objective=20x ;Scanner=MedScan",
+        );
+
+        let mut reader = TrestleReader::new();
+        reader.set_id(&path).unwrap();
+        let md = &reader.metadata().series_metadata;
+
+        assert!(matches!(
+            md.get("hcs2.wrapper"),
+            Some(MetadataValue::String(v)) if v == "TrestleReader"
+        ));
+        // addGlobalMeta(key, value) for each `;`-separated `key=value`.
+        assert!(matches!(
+            md.get("OverlapsXY"),
+            Some(MetadataValue::String(v)) if v == "0 0"
+        ));
+        assert!(matches!(
+            md.get("Objective"),
+            Some(MetadataValue::String(v)) if v == "20x"
+        ));
+        assert!(matches!(
+            md.get("Scanner"),
+            Some(MetadataValue::String(v)) if v == "MedScan"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![42]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trestle_ignores_comment_without_trestle_copyright() {
+        let path = temp_path("trestle_plain.tif");
+        write_tiff_with_copyright_and_comment(
+            &path,
+            "Some Other Vendor",
+            "Objective=20x;Scanner=MedScan",
+        );
+
+        let mut reader = TrestleReader::new();
+        reader.set_id(&path).unwrap();
+        let md = &reader.metadata().series_metadata;
+
+        assert!(md.contains_key("hcs2.wrapper"));
+        assert!(
+            !md.contains_key("Objective") && !md.contains_key("Scanner"),
+            "non-Trestle copyright must not capture comment scalars: {md:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Build a minimal ScanR dataset (experiment_descriptor.xml + one data TIFF)
+    /// and confirm the newly-captured ScanrHandler fields surface into
+    /// series_metadata: plate name, physical pixel size, channel name,
+    /// per-channel exposure time (ms -> s) and timeloop deltaT (ms -> s).
+    #[test]
+    fn scanr_surfaces_plate_channel_exposure_and_deltat() {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("bioformats_scanr_{id}"));
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+
+        // One channel "DAPI", one well "A1" (number 1), pixel size + plate name +
+        // exposure (1500 ms) + timeloop delay (2000 ms -> 2.0 s deltaT).
+        let xml = r#"<?xml version="1.0" encoding="ISO-8859-1"?>
+<root>
+  <Name>plate name</Name><Val>MyPlate</Val>
+  <Name>conversion factor um/pixel</Name><Val>0.65</Val>
+  <Name>timeloop delay [ms]</Name><Val>2000</Val>
+  <Cluster>
+    <Name>name</Name><Val>DAPI</Val>
+    <Name>exposure time</Name><Val>1500</Val>
+    <Name>idle</Name><Val>0</Val>
+  </Cluster>
+  <Name>well selection table + cDNA</Name><Val>1</Val>
+  <Name>well selection table + cDNA</Name><Val>A1</Val>
+</root>"#;
+        let xml_path = dir.join("experiment_descriptor.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        // data TIFF whose name carries the W/P/Z/T blocks and channel name.
+        let tiff = data.join("--W00001--P00001--Z00000--T00000--DAPI.tif");
+        let meta = test_meta(4, 4);
+        write_tiff(&tiff, &meta, &vec![0u8; 16]);
+
+        let mut reader = ScanrReader::new();
+        reader.set_id(&xml_path).unwrap();
+        let md = &reader.metadata().series_metadata;
+
+        assert!(
+            matches!(md.get("Plate name"), Some(MetadataValue::String(v)) if v == "MyPlate"),
+            "plate name not captured: {md:?}"
+        );
+        assert!(
+            matches!(md.get("PhysicalSizeX"), Some(MetadataValue::Float(v)) if (*v - 0.65).abs() < 1e-9),
+            "pixel size not captured: {md:?}"
+        );
+        assert!(
+            matches!(md.get("Channel 0 Name"), Some(MetadataValue::String(v)) if v == "DAPI"),
+            "channel name not captured: {md:?}"
+        );
+        assert!(
+            matches!(md.get("Channel 0 ExposureTime"), Some(MetadataValue::Float(v)) if (*v - 1.5).abs() < 1e-9),
+            "exposure time (s) not captured: {md:?}"
+        );
+        assert!(
+            matches!(md.get("PlaneDeltaT"), Some(MetadataValue::Float(v)) if (*v - 2.0).abs() < 1e-9),
+            "deltaT not captured: {md:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Confirm ScanR subposition-list field positions surface as
+    /// WellSamplePositionX/Y / PlanePositionX/Y (Java foundPositions branch).
+    #[test]
+    fn scanr_surfaces_field_positions() {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("bioformats_scanr_{id}"));
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+
+        // subposition list with one position: X=10.0 then Y=20.0 (paired).
+        let xml = r#"<?xml version="1.0" encoding="ISO-8859-1"?>
+<root>
+  <Cluster>
+    <Name>name</Name><Val>DAPI</Val>
+    <Name>idle</Name><Val>0</Val>
+  </Cluster>
+  <Name>subposition list</Name>
+  <Dimsize>1</Dimsize>
+  <Val>10.0</Val>
+  <Val>20.0</Val>
+  <Name>well selection table + cDNA</Name><Val>1</Val>
+  <Name>well selection table + cDNA</Name><Val>A1</Val>
+</root>"#;
+        let xml_path = dir.join("experiment_descriptor.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let tiff = data.join("--W00001--P00001--Z00000--T00000--DAPI.tif");
+        let meta = test_meta(4, 4);
+        write_tiff(&tiff, &meta, &vec![0u8; 16]);
+
+        let mut reader = ScanrReader::new();
+        reader.set_id(&xml_path).unwrap();
+        let md = &reader.metadata().series_metadata;
+
+        assert!(
+            matches!(md.get("WellSamplePositionX"), Some(MetadataValue::Float(v)) if (*v - 10.0).abs() < 1e-9),
+            "field position X not captured: {md:?}"
+        );
+        assert!(
+            matches!(md.get("WellSamplePositionY"), Some(MetadataValue::Float(v)) if (*v - 20.0).abs() < 1e-9),
+            "field position Y not captured: {md:?}"
+        );
+        assert!(
+            matches!(md.get("PlanePositionX"), Some(MetadataValue::Float(v)) if (*v - 10.0).abs() < 1e-9),
+            "plane position X not captured: {md:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

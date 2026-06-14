@@ -1011,6 +1011,15 @@ struct Im3NativeState {
     datasets: Vec<Im3NativeDataset>,
 }
 
+/// A `Spectrum` record parsed from a SpectralLibrary, mirroring the Java
+/// `IM3Reader.Spectrum` inner class (name plus per-bin wavelengths/magnitudes).
+#[derive(Clone)]
+struct Im3Spectrum {
+    name: Option<String>,
+    wavelengths: Option<Vec<f64>>,
+    magnitudes: Option<Vec<f64>>,
+}
+
 struct Im3NativeDataset {
     meta: ImageMetadata,
     data_offset: u64,
@@ -1231,6 +1240,72 @@ fn im3_float_entry(bytes: &[u8], rec: &Im3Record) -> Option<f64> {
     (values.len() == 1).then_some(values[0])
 }
 
+/// Read the boolean entries of a `BooleanIM3Record` (Java `REC_BOOLEAN`).
+///
+/// Mirrors the Java `BooleanIM3Record.getNumEntries`/`getEntry` accessors: the
+/// count is stored as an int32 at `offset + 4`, and each value is a single
+/// non-zero byte starting at `offset + 8`.
+fn im3_bool_entries(bytes: &[u8], rec: &Im3Record) -> Option<Vec<bool>> {
+    if rec.rec_type != 9 || rec.payload_len < 8 {
+        return None;
+    }
+    let count = im3_read_u32_le(bytes, rec.payload_offset + 4, "boolean count").ok()? as usize;
+    if 8usize.checked_add(count)? > rec.payload_len || count > 4096 {
+        return None;
+    }
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let byte = *bytes.get(rec.payload_offset + 8 + index)?;
+        values.push(byte != 0);
+    }
+    Some(values)
+}
+
+/// Parse a `Spectrum` container record from a SpectralLibrary, mirroring the
+/// Java `IM3Reader.Spectrum(IRandomAccess, ContainerRecord)` constructor.
+///
+/// The container groups a `Name` string record and a `Spectrum` container
+/// record; the latter is walked by `im3_parse_spectrum_record` for the
+/// per-bin wavelengths and magnitudes.
+fn im3_parse_spectrum(bytes: &[u8], rec: &Im3Record) -> Result<Im3Spectrum> {
+    let mut spectrum = Im3Spectrum {
+        name: None,
+        wavelengths: None,
+        magnitudes: None,
+    };
+    for sub_rec in im3_container_children(bytes, rec)? {
+        if sub_rec.name == "Name" && sub_rec.rec_type == 10 {
+            spectrum.name = im3_string_entry(bytes, &sub_rec);
+        } else if sub_rec.name == "Spectrum" && sub_rec.rec_type == 0 {
+            im3_parse_spectrum_record(bytes, &sub_rec, &mut spectrum)?;
+        }
+    }
+    Ok(spectrum)
+}
+
+/// Walk the nested `Spectrum` container, mirroring the Java
+/// `IM3Reader.Spectrum.parseSpectrumRecord` method: one level of unnamed
+/// container nesting holds the `Wavelengths` and `Magnitudes` float records.
+fn im3_parse_spectrum_record(
+    bytes: &[u8],
+    rec: &Im3Record,
+    spectrum: &mut Im3Spectrum,
+) -> Result<()> {
+    for sub_rec in im3_container_children(bytes, rec)? {
+        if sub_rec.rec_type != 0 {
+            continue;
+        }
+        for sub_sub_rec in im3_container_children(bytes, &sub_rec)? {
+            if sub_sub_rec.name == "Wavelengths" && sub_sub_rec.rec_type == 7 {
+                spectrum.wavelengths = im3_float_entries(bytes, &sub_sub_rec);
+            } else if sub_sub_rec.name == "Magnitudes" && sub_sub_rec.rec_type == 7 {
+                spectrum.magnitudes = im3_float_entries(bytes, &sub_sub_rec);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn im3_scalar_metadata_value(bytes: &[u8], rec: &Im3Record) -> Result<Option<MetadataValue>> {
     if rec.rec_type == 6 && rec.name != "Shape" {
         let values = im3_int_entries(bytes, rec)?;
@@ -1255,6 +1330,18 @@ fn im3_scalar_metadata_value(bytes: &[u8], rec: &Im3Record) -> Result<Option<Met
                 values
                     .iter()
                     .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )))
+        }
+    } else if let Some(values) = im3_bool_entries(bytes, rec) {
+        if values.len() == 1 {
+            Ok(Some(MetadataValue::Bool(values[0])))
+        } else {
+            Ok(Some(MetadataValue::String(
+                values
+                    .iter()
+                    .map(bool::to_string)
                     .collect::<Vec<_>>()
                     .join(","),
             )))
@@ -1489,8 +1576,36 @@ fn parse_im3_native(path: &Path) -> Result<Im3NativeState> {
     }
 
     let mut datasets = Vec::new();
+    let mut spectra: Vec<Im3Spectrum> = Vec::new();
     for rec in top_records.iter().filter(|rec| rec.rec_type == 0) {
         im3_collect_dataset_candidates(&bytes, rec, &mut datasets)?;
+        // Mirror the SpectralLibrary branch of Java IM3Reader.initFile: for each
+        // top-level container, locate the SpectralLibrary container, then descend
+        // the unnamed container / Spectra / Values nesting to its Spectrum records.
+        for sub_ds in im3_container_children(&bytes, rec)? {
+            if sub_ds.rec_type == 0 && sub_ds.name == "SpectralLibrary" {
+                for sl_container in im3_container_children(&bytes, &sub_ds)? {
+                    if sl_container.rec_type != 0 {
+                        continue;
+                    }
+                    for sl_spectra in im3_container_children(&bytes, &sl_container)? {
+                        if sl_spectra.rec_type != 0 || sl_spectra.name != "Spectra" {
+                            continue;
+                        }
+                        for sl_rec in im3_container_children(&bytes, &sl_spectra)? {
+                            if sl_rec.name != "Values" || sl_rec.rec_type != 0 {
+                                continue;
+                            }
+                            for spectrum_rec in im3_container_children(&bytes, &sl_rec)? {
+                                if spectrum_rec.rec_type == 0 {
+                                    spectra.push(im3_parse_spectrum(&bytes, &spectrum_rec)?);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     if datasets.is_empty() {
         return Err(BioFormatsError::UnsupportedFormat(
@@ -1505,6 +1620,7 @@ fn parse_im3_native(path: &Path) -> Result<Im3NativeState> {
             dataset,
             dataset_count,
             dataset_index,
+            &spectra,
         )?);
     }
 
@@ -1519,6 +1635,7 @@ fn parse_im3_native_dataset(
     dataset: &Im3DatasetCandidate,
     dataset_count: usize,
     dataset_index: usize,
+    spectra: &[Im3Spectrum],
 ) -> Result<Im3NativeDataset> {
     let shape_rec = &dataset.shape;
     let data_rec = &dataset.data;
@@ -1591,6 +1708,47 @@ fn parse_im3_native_dataset(
         crate::common::metadata::MetadataValue::Int(dataset_index as i64),
     );
     im3_insert_container_scalar_metadata(bytes, &dataset.container, &mut meta)?;
+
+    // Surface the file-level SpectralLibrary spectra (Java IM3Reader.getSpectra)
+    // as bounded series metadata: name, wavelengths, and magnitudes per spectrum.
+    if !spectra.is_empty() {
+        meta.series_metadata.insert(
+            "im3.spectral_library.spectrum_count".into(),
+            MetadataValue::Int(spectra.len() as i64),
+        );
+        for (index, spectrum) in spectra.iter().enumerate() {
+            if let Some(name) = &spectrum.name {
+                meta.series_metadata.insert(
+                    format!("im3.spectral_library.spectrum.{index}.name"),
+                    MetadataValue::String(name.clone()),
+                );
+            }
+            if let Some(wavelengths) = &spectrum.wavelengths {
+                meta.series_metadata.insert(
+                    format!("im3.spectral_library.spectrum.{index}.wavelengths"),
+                    MetadataValue::String(
+                        wavelengths
+                            .iter()
+                            .map(|value| value.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                );
+            }
+            if let Some(magnitudes) = &spectrum.magnitudes {
+                meta.series_metadata.insert(
+                    format!("im3.spectral_library.spectrum.{index}.magnitudes"),
+                    MetadataValue::String(
+                        magnitudes
+                            .iter()
+                            .map(|value| value.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                );
+            }
+        }
+    }
 
     Ok(Im3NativeDataset {
         meta,
@@ -1837,6 +1995,13 @@ struct SlideBook7Series {
     meta: ImageMetadata,
     files: Vec<SlideBook7PlaneFile>,
     plane_len: usize,
+    // Decoded typed-record plane metadata (Java GetElapsedTime / GetExposureTime
+    // / GetXPosition / GetYPosition / GetZPosition + GetInterplaneSpacing) used to
+    // build OME plane timing/position.
+    elapsed_times: Vec<f64>,
+    channel_exposures: Vec<Option<i64>>,
+    stage_positions: Vec<(f64, f64, f64)>,
+    interplane_spacing: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -1855,6 +2020,7 @@ struct SlideBook7NpyHeader {
     little_endian: bool,
     fortran_order: bool,
     shape: Vec<u32>,
+    descr: String,
 }
 
 struct SlideBook7NativeRoot {
@@ -2172,6 +2338,1343 @@ fn slidebook7_insert_scalar_metadata(
     }
 }
 
+// ── SlideBook 7 typed YAML record decoder ────────────────────────────────────
+//
+// Faithful translation of the `ClassDecoder`/record-class layer of the upstream
+// Java `SlideBook7Reader`. Upstream parses each `*.yaml` record file with the
+// third-party snakeyaml library (`Yaml.compose`) into a node tree, then a
+// reflection-driven `ClassDecoder.Decode` walks `StartClass`/`EndClass`-delimited
+// blocks and assigns recognised attributes onto typed record fields (unknown
+// attributes are dropped — Java `DecodeUnknownString` has an empty body). Rust
+// has no runtime reflection and the project takes no YAML dependency, so the
+// snakeyaml `compose` is reproduced by `slidebook7_yaml_compose` and the
+// reflection assignment becomes an explicit per-record `assign` closure; the
+// `StartClass`/`ClassName`/`EndClass` control flow of `Decode` is preserved
+// exactly. Declaring only the fields a record consumes is faithful: upstream
+// silently ignores attributes that have no matching field.
+
+#[derive(Clone, Debug, PartialEq)]
+enum Sb7Node {
+    Scalar(String),
+    Sequence(Vec<Sb7Node>),
+    Mapping(Vec<(String, Sb7Node)>),
+}
+
+// Stands in for snakeyaml `Yaml.compose`: an indentation-driven parse of the
+// block mappings, block/flow scalar sequences, and nested mappings that the
+// SlideBook 7 record files use. Duplicate keys (`StartClass`/`EndClass`) are
+// preserved in order, matching snakeyaml's `MappingNode.getValue()` list.
+fn slidebook7_yaml_compose(text: &str) -> Sb7Node {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut pos = 0usize;
+    slidebook7_yaml_compose_block(&lines, &mut pos, 0)
+}
+
+fn slidebook7_yaml_compose_block(lines: &[&str], pos: &mut usize, indent: usize) -> Sb7Node {
+    let mut is_sequence = false;
+    let mut peek = *pos;
+    while peek < lines.len() {
+        let trimmed = lines[peek].trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            peek += 1;
+            continue;
+        }
+        is_sequence = trimmed == "-" || trimmed.starts_with("- ");
+        break;
+    }
+
+    if is_sequence {
+        let mut items = Vec::new();
+        while *pos < lines.len() {
+            let line = lines[*pos];
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                *pos += 1;
+                continue;
+            }
+            let line_indent = line.len() - line.trim_start().len();
+            if line_indent < indent {
+                break;
+            }
+            if !(trimmed == "-" || trimmed.starts_with("- ")) {
+                break;
+            }
+            let rest = trimmed[1..].trim_start().to_string();
+            *pos += 1;
+            if rest.is_empty() {
+                items.push(slidebook7_yaml_compose_block(lines, pos, indent + 1));
+            } else {
+                items.push(slidebook7_yaml_scalar_or_flow(&rest));
+            }
+        }
+        Sb7Node::Sequence(items)
+    } else {
+        let mut entries = Vec::new();
+        while *pos < lines.len() {
+            let line = lines[*pos];
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                *pos += 1;
+                continue;
+            }
+            let line_indent = line.len() - line.trim_start().len();
+            if line_indent < indent {
+                break;
+            }
+            if line_indent > indent {
+                *pos += 1;
+                continue;
+            }
+            let Some((key, value)) = trimmed.split_once(':') else {
+                *pos += 1;
+                continue;
+            };
+            let key = key.trim().to_string();
+            let value = value.trim().to_string();
+            *pos += 1;
+            if value.is_empty() {
+                let mut child_indent = indent + 1;
+                let mut child_peek = *pos;
+                while child_peek < lines.len() {
+                    let child_trimmed = lines[child_peek].trim();
+                    if child_trimmed.is_empty() || child_trimmed.starts_with('#') {
+                        child_peek += 1;
+                        continue;
+                    }
+                    child_indent = lines[child_peek].len() - lines[child_peek].trim_start().len();
+                    break;
+                }
+                if child_indent > indent {
+                    let node = slidebook7_yaml_compose_block(lines, pos, child_indent);
+                    entries.push((key, node));
+                } else {
+                    entries.push((key, Sb7Node::Scalar(String::new())));
+                }
+            } else {
+                entries.push((key, slidebook7_yaml_scalar_or_flow(&value)));
+            }
+        }
+        Sb7Node::Mapping(entries)
+    }
+}
+
+fn slidebook7_yaml_scalar_or_flow(value: &str) -> Sb7Node {
+    let trimmed = value.trim();
+    if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let items = inner
+            .split(',')
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .map(|item| Sb7Node::Scalar(item.to_string()))
+            .collect();
+        Sb7Node::Sequence(items)
+    } else {
+        Sb7Node::Scalar(trimmed.to_string())
+    }
+}
+
+// Translation of Java `ClassDecoder.RestoreSpecialCharacters`.
+fn slidebook7_restore_special_characters(value: &str) -> String {
+    value
+        .replace("_#9;", "\t")
+        .replace("_#10;", "\n")
+        .replace("_#13;", "\r")
+        .replace("_#34;", "\"")
+        .replace("_#58;", ":")
+        .replace("_#92;", "\\")
+        .replace("_#91;", "[")
+        .replace("_#93;", "]")
+        .replace("_#124;", "|")
+        .replace("_#60;", "<")
+        .replace("_#62;", ">")
+        .replace("_#32;", " ")
+        .replace("__empty", "")
+}
+
+// Translation of Java `ClassDecoder.Decode(MappingNode, inStartIndex)`. Walks the
+// `StartClass`/`EndClass` blocks; for the first block whose leading `ClassName`
+// attribute equals `sb_name`, invokes `assign` for each subsequent attribute and
+// returns the index just past the consumed block (so composed records decode in
+// sequence). Sequence-valued attributes keep snakeyaml's "element 0 is the count"
+// convention, exposed to `assign` as the raw `Sb7Node::Sequence`.
+fn slidebook7_class_decode(
+    node: &Sb7Node,
+    start_index: usize,
+    sb_name: &str,
+    mut assign: impl FnMut(&str, &Sb7Node),
+) -> usize {
+    let Sb7Node::Mapping(tuples) = node else {
+        return start_index + 1;
+    };
+    let mut class_index = start_index;
+    while class_index < tuples.len() {
+        let (key, value) = &tuples[class_index];
+        if key == "EndClass" {
+            break;
+        }
+        if key != "StartClass" {
+            class_index += 1;
+            continue;
+        }
+        if let Sb7Node::Mapping(attrs) = value {
+            for (attr_index, (attr_name, attr_value)) in attrs.iter().enumerate() {
+                if attr_index == 0 {
+                    if attr_name != "ClassName" {
+                        break;
+                    }
+                    match attr_value {
+                        Sb7Node::Scalar(name) if name == sb_name => {}
+                        _ => break,
+                    }
+                    continue;
+                }
+                assign(attr_name, attr_value);
+            }
+        }
+        class_index += 1;
+    }
+    class_index + 1
+}
+
+// Decodes a snakeyaml `Integer[]`/`Long[]`/`Float[]` sequence the way Java does:
+// a list whose first element is the count, returning the trailing values. Java
+// drops the array entirely when the list size is <= 1.
+fn slidebook7_decode_number_array(node: &Sb7Node, first_is_size: bool) -> Option<Vec<f64>> {
+    let Sb7Node::Sequence(items) = node else {
+        return None;
+    };
+    // With first_is_size (Java GetXArray firstIsSize=true) element 0 is the count
+    // and is dropped; Java drops the whole array when the list size is <= 1.
+    let values: &[Sb7Node] = if first_is_size {
+        if items.len() <= 1 {
+            return None;
+        }
+        &items[1..]
+    } else {
+        &items[..]
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for item in values {
+        match item {
+            Sb7Node::Scalar(value) => out.push(value.trim().parse::<f64>().ok()?),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7LensDef70 {
+    name: Option<String>,
+    na: Option<f64>,
+    micron_per_pixel: Option<f64>,
+    actual_magnification: Option<f64>,
+    camera_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7OptovarDef70 {
+    name: Option<String>,
+    magnification: Option<f64>,
+    default: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7MainViewRecord70 {
+    view_id: Option<i64>,
+    red_channel: Option<i64>,
+    green_channel: Option<i64>,
+    blue_channel: Option<i64>,
+    low: Option<Vec<f64>>,
+    high: Option<Vec<f64>>,
+    gamma: Option<Vec<f64>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7ImageRecord70 {
+    width: Option<i64>,
+    height: Option<i64>,
+    num_planes: Option<i64>,
+    num_channels: Option<i64>,
+    num_timepoints: Option<i64>,
+    num_masks: Option<i64>,
+    name: Option<String>,
+    info: Option<String>,
+    unique_id: Option<String>,
+    thumbnail: Option<Vec<f64>>,
+    lens: Sb7LensDef70,
+    optovar: Sb7OptovarDef70,
+    main_view: Sb7MainViewRecord70,
+}
+
+impl Sb7ImageRecord70 {
+    // Translation of Java `CImageRecord70.Decode`: decode this record's own
+    // fields, then chain the composed lens / optovar / main-view sub-records from
+    // the returned index.
+    fn decode(node: &Sb7Node) -> Self {
+        let mut record = Sb7ImageRecord70::default();
+
+        let mut last_index = slidebook7_class_decode(node, 0, "CImageRecord70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mWidth" => record.width = text.parse::<i64>().ok(),
+                    "mHeight" => record.height = text.parse::<i64>().ok(),
+                    "mNumPlanes" => record.num_planes = text.parse::<i64>().ok(),
+                    "mNumChannels" => record.num_channels = text.parse::<i64>().ok(),
+                    "mNumTimepoints" => record.num_timepoints = text.parse::<i64>().ok(),
+                    "mNumMasks" => record.num_masks = text.parse::<i64>().ok(),
+                    "mName" => record.name = Some(slidebook7_restore_special_characters(text)),
+                    "mInfo" => record.info = Some(slidebook7_restore_special_characters(text)),
+                    "mUniqueId" => {
+                        record.unique_id = Some(slidebook7_restore_special_characters(text))
+                    }
+                    _ => {}
+                }
+            } else if name == "mThumbNail" {
+                record.thumbnail = slidebook7_decode_number_array(value, true);
+            }
+        });
+
+        last_index = slidebook7_class_decode(node, last_index, "CLensDef70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mName" => {
+                        record.lens.name = Some(slidebook7_restore_special_characters(text))
+                    }
+                    "mNA" => record.lens.na = text.parse::<f64>().ok(),
+                    "mMicronPerPixel" => record.lens.micron_per_pixel = text.parse::<f64>().ok(),
+                    "mActualMagnification" => {
+                        record.lens.actual_magnification = text.parse::<f64>().ok()
+                    }
+                    "mCameraName" => {
+                        record.lens.camera_name = Some(slidebook7_restore_special_characters(text))
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        last_index = slidebook7_class_decode(node, last_index, "COptovarDef70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mName" => {
+                        record.optovar.name = Some(slidebook7_restore_special_characters(text))
+                    }
+                    "mMagnification" => record.optovar.magnification = text.parse::<f64>().ok(),
+                    "mDefault" => record.optovar.default = Some(text == "true"),
+                    _ => {}
+                }
+            }
+        });
+
+        slidebook7_class_decode(node, last_index, "CMainViewRecord70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mViewID" => record.main_view.view_id = text.parse::<i64>().ok(),
+                    "mRedChannel" => record.main_view.red_channel = text.parse::<i64>().ok(),
+                    "mGreenChannel" => record.main_view.green_channel = text.parse::<i64>().ok(),
+                    "mBlueChannel" => record.main_view.blue_channel = text.parse::<i64>().ok(),
+                    _ => {}
+                }
+            } else {
+                match name {
+                    "mLow" => record.main_view.low = slidebook7_decode_number_array(value, true),
+                    "mHigh" => record.main_view.high = slidebook7_decode_number_array(value, true),
+                    "mGamma" => record.main_view.gamma = slidebook7_decode_number_array(value, true),
+                    _ => {}
+                }
+            }
+        });
+
+        record
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7ExposureRecord70 {
+    exposure_time: Option<i64>,
+    interplane_spacing: Option<f64>,
+    z_start_position: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7FluorDef70 {
+    name: Option<String>,
+    excitation_lambda: Option<f64>,
+    lambda: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7ChannelDef70 {
+    name: Option<String>,
+    camera_name: Option<String>,
+    fluor: Sb7FluorDef70,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7ChannelRecord70 {
+    num_planes: Option<i64>,
+    data_type: Option<i64>,
+    exposure: Sb7ExposureRecord70,
+    channel_def: Sb7ChannelDef70,
+}
+
+impl Sb7ChannelDef70 {
+    // Translation of Java `CChannelDef70.Decode`: own fields, then the chained
+    // `CFluorDef70` (which inherits `ClassDecoder.Decode`, so its fields are
+    // assigned through the generic walk).
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7ChannelDef70::default();
+        let after_def = slidebook7_class_decode(node, start_index, "CChannelDef70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mName" => record.name = Some(slidebook7_restore_special_characters(text)),
+                    "mCameraName" => {
+                        record.camera_name = Some(slidebook7_restore_special_characters(text))
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let after_fluor = slidebook7_class_decode(node, after_def, "CFluorDef70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mName" => {
+                        record.fluor.name = Some(slidebook7_restore_special_characters(text))
+                    }
+                    "mExcitationLambda" => record.fluor.excitation_lambda = text.parse::<f64>().ok(),
+                    "mLambda" => record.fluor.lambda = text.parse::<f64>().ok(),
+                    _ => {}
+                }
+            }
+        });
+        (record, after_fluor)
+    }
+}
+
+impl Sb7ChannelRecord70 {
+    // Translation of Java `CChannelRecord70.Decode`: own fields, then the chained
+    // `CExposureRecord70` (inherited decode) and `CChannelDef70`.
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7ChannelRecord70::default();
+        let after_record =
+            slidebook7_class_decode(node, start_index, "CChannelRecord70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mNumPlanes" => record.num_planes = text.parse::<i64>().ok(),
+                        "mDataType" => record.data_type = text.parse::<i64>().ok(),
+                        _ => {}
+                    }
+                }
+            });
+        let after_exposure =
+            slidebook7_class_decode(node, after_record, "CExposureRecord70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mExposureTime" => record.exposure.exposure_time = text.parse::<i64>().ok(),
+                        "mInterplaneSpacing" => {
+                            record.exposure.interplane_spacing = text.parse::<f64>().ok()
+                        }
+                        "mZStartPosition" => {
+                            record.exposure.z_start_position = text.parse::<f64>().ok()
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        let (channel_def, next_index) = Sb7ChannelDef70::decode(node, after_exposure);
+        record.channel_def = channel_def;
+        (record, next_index)
+    }
+}
+
+// Translation of Java `ClassDecoder.FindNextClass`: return the `ClassName` and
+// index of the next `StartClass` block, or `("", -1)` at `EndClass`/end.
+fn slidebook7_find_next_class(node: &Sb7Node, start_index: usize) -> (String, i64) {
+    let Sb7Node::Mapping(tuples) = node else {
+        return (String::new(), -1);
+    };
+    let mut class_index = start_index;
+    while class_index < tuples.len() {
+        let (key, value) = &tuples[class_index];
+        if key == "EndClass" {
+            break;
+        }
+        if key != "StartClass" {
+            class_index += 1;
+            continue;
+        }
+        if let Sb7Node::Mapping(attrs) = value {
+            if let Some((attr_name, attr_value)) = attrs.first() {
+                if attr_name != "ClassName" {
+                    break;
+                }
+                if let Sb7Node::Scalar(name) = attr_value {
+                    return (name.clone(), class_index as i64);
+                }
+            }
+        }
+        class_index += 1;
+    }
+    (String::new(), -1)
+}
+
+// Translation of Java `CImageGroup.LoadChannelRecord`'s decode loop: one
+// `CChannelRecord70` per channel, then consume any trailing remap/manip/
+// histogram classes until the next `CChannelRecord70` or end-of-data. (Java has
+// no terminal `else` for an unrecognised intervening class, which would spin;
+// the unknown-class arm breaks instead.)
+fn slidebook7_load_channel_records(
+    node: &Sb7Node,
+    num_channels: usize,
+) -> (Vec<Sb7ChannelRecord70>, Sb7ChannelExtras) {
+    let mut channels = Vec::new();
+    let mut extras = Sb7ChannelExtras::default();
+    let mut last_index = 0usize;
+    for _ in 0..num_channels {
+        let (channel_record, next_index) = Sb7ChannelRecord70::decode(node, last_index);
+        last_index = next_index;
+        channels.push(channel_record);
+        loop {
+            let (class_name, pair_index) = slidebook7_find_next_class(node, last_index);
+            if pair_index < 0 {
+                break;
+            }
+            let pair_index = pair_index as usize;
+            match class_name.as_str() {
+                "CChannelRecord70" => {
+                    last_index = pair_index;
+                    break;
+                }
+                "CHistogramRecord70" => {
+                    let (histogram, next) = Sb7HistogramRecord70::decode(node, pair_index);
+                    extras.histograms.push(histogram);
+                    last_index = next;
+                }
+                "CRemapChannelLUT70" => {
+                    let (lut, next) = Sb7RemapChannelLut70::decode(node, pair_index);
+                    extras.remap_luts.push(lut);
+                    last_index = next;
+                }
+                "CAlignManipRecord70" => {
+                    let (manip, next) = Sb7AlignManipRecord70::decode(node, pair_index);
+                    extras.align_manips.push(manip);
+                    last_index = next;
+                }
+                "CRatioManipRecord70" => {
+                    let (manip, next) = Sb7RatioManipRecord70::decode(node, pair_index);
+                    extras.ratio_manips.push(manip);
+                    last_index = next;
+                }
+                "CFRETManipRecord70" => {
+                    let (manip, next) = Sb7FretManipRecord70::decode(node, pair_index);
+                    extras.fret_manips.push(manip);
+                    last_index = next;
+                }
+                "CRemapManipRecord70" => {
+                    let (manip, next) = Sb7RemapManipRecord70::decode(node, pair_index);
+                    extras.remap_manips.push(manip);
+                    last_index = next;
+                }
+                _ => break,
+            }
+        }
+    }
+    (channels, extras)
+}
+
+// Translation of Java `ClassDecoder.GetStringValue`: scan the mapping tuples
+// from `start_index` for a scalar-valued `key_name`, returning its value and the
+// index just past it (or `("", -1)` if not found).
+fn slidebook7_get_string_value(
+    node: &Sb7Node,
+    start_index: usize,
+    key_name: &str,
+    restore: bool,
+) -> (String, i64) {
+    let Sb7Node::Mapping(tuples) = node else {
+        return (String::new(), -1);
+    };
+    let mut index = start_index;
+    while index < tuples.len() {
+        let (key, value) = &tuples[index];
+        if key == key_name {
+            if let Sb7Node::Scalar(text) = value {
+                let out = if restore {
+                    slidebook7_restore_special_characters(text)
+                } else {
+                    text.clone()
+                };
+                return (out, index as i64 + 1);
+            }
+            return (String::new(), -1);
+        }
+        index += 1;
+    }
+    (String::new(), -1)
+}
+
+// Translation of Java `ClassDecoder.GetIntegerValue`: as above but parsed to an
+// integer. Returns `(value, next_index)` or `(-1, -1)`.
+fn slidebook7_get_integer_value(node: &Sb7Node, start_index: usize, key_name: &str) -> (i64, i64) {
+    let (text, next) = slidebook7_get_string_value(node, start_index, key_name, false);
+    if next >= 0 {
+        if let Ok(value) = text.trim().parse::<i64>() {
+            return (value, next);
+        }
+    }
+    (-1, -1)
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7MaskRecord70 {
+    name: Option<String>,
+    persistent_submasks: Option<i64>,
+    centroid_feature: Option<String>,
+    centroid_channel: Option<i64>,
+}
+
+impl Sb7MaskRecord70 {
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7MaskRecord70::default();
+        let next = slidebook7_class_decode(node, start_index, "CMaskRecord70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mName" => record.name = Some(slidebook7_restore_special_characters(text)),
+                    "mPersistentSubmasks" => record.persistent_submasks = text.parse::<i64>().ok(),
+                    "mCentroidFeature" => {
+                        record.centroid_feature = Some(slidebook7_restore_special_characters(text))
+                    }
+                    "mCentroidChannel" => record.centroid_channel = text.parse::<i64>().ok(),
+                    _ => {}
+                }
+            }
+        });
+        (record, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7DataTableHeader70 {
+    channel_index: Option<i64>,
+    rows: Option<i64>,
+    columns: Option<i64>,
+    planes: Option<i64>,
+    value_type: Option<i64>,
+    table_type: Option<i64>,
+}
+
+impl Sb7DataTableHeader70 {
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7DataTableHeader70::default();
+        let next =
+            slidebook7_class_decode(node, start_index, "CDataTableHeaderRecord70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mChannelIndex" => record.channel_index = text.parse::<i64>().ok(),
+                        "mRows" => record.rows = text.parse::<i64>().ok(),
+                        "mColumns" => record.columns = text.parse::<i64>().ok(),
+                        "mPlanes" => record.planes = text.parse::<i64>().ok(),
+                        "mValueType" => record.value_type = text.parse::<i64>().ok(),
+                        "mTableType" => record.table_type = text.parse::<i64>().ok(),
+                        _ => {}
+                    }
+                }
+            });
+        (record, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7Annotation70 {
+    graphic_type: Option<i64>,
+    dependency_type: Option<i64>,
+    text: Option<String>,
+    group_id: Option<i64>,
+    plane_id: Option<i64>,
+    sequence_id: Option<i64>,
+    object_id: Option<i64>,
+}
+
+impl Sb7Annotation70 {
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7Annotation70::default();
+        let next = slidebook7_class_decode(node, start_index, "CAnnotation70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mGraphicType70" => record.graphic_type = text.parse::<i64>().ok(),
+                    "mDependencyType70" => record.dependency_type = text.parse::<i64>().ok(),
+                    "mText" => record.text = Some(slidebook7_restore_special_characters(text)),
+                    "mGroupId" => record.group_id = text.parse::<i64>().ok(),
+                    "mPlaneId" => record.plane_id = text.parse::<i64>().ok(),
+                    "mSequenceId" => record.sequence_id = text.parse::<i64>().ok(),
+                    "mObjectId" => record.object_id = text.parse::<i64>().ok(),
+                    _ => {}
+                }
+            }
+        });
+        (record, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7CubeAnnotation70 {
+    is_background: Option<bool>,
+    region_index: Option<i64>,
+    is_frap: Option<bool>,
+    frap_device: Option<String>,
+    ann: Sb7Annotation70,
+}
+
+impl Sb7CubeAnnotation70 {
+    // Translation of Java `CCubeAnnotation70.Decode`: own fields, then the chained
+    // base `CAnnotation70`.
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7CubeAnnotation70::default();
+        let after_cube =
+            slidebook7_class_decode(node, start_index, "CCubeAnnotation70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mIsBackground" => record.is_background = Some(text == "true"),
+                        "mRegionIndex" => record.region_index = text.parse::<i64>().ok(),
+                        "mIsFRAP" => record.is_frap = Some(text == "true"),
+                        "mFRAPDevice" => {
+                            record.frap_device = Some(slidebook7_restore_special_characters(text))
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        let (ann, next) = Sb7Annotation70::decode(node, after_cube);
+        record.ann = ann;
+        (record, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7FrapRegionAnnotation70 {
+    xml: Option<String>,
+    ann: Sb7Annotation70,
+    region_count: usize,
+}
+
+impl Sb7FrapRegionAnnotation70 {
+    // Translation of Java `CFRAPRegionAnnotation70.Decode`: own field (mXML), the
+    // chained base `CAnnotation70`, then `theNumRegions` cube annotations.
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7FrapRegionAnnotation70::default();
+        let after_frap =
+            slidebook7_class_decode(node, start_index, "CFRAPRegionAnnotation70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    if name == "mXML" {
+                        record.xml = Some(slidebook7_restore_special_characters(text.trim()));
+                    }
+                }
+            });
+        let (ann, after_ann) = Sb7Annotation70::decode(node, after_frap);
+        record.ann = ann;
+        let (num_regions, after_count) =
+            slidebook7_get_integer_value(node, after_ann, "theNumRegions");
+        let mut index = if after_count >= 0 {
+            after_count as usize
+        } else {
+            after_ann
+        };
+        let count = num_regions.max(0) as usize;
+        for _ in 0..count {
+            let (_region, next) = Sb7CubeAnnotation70::decode(node, index);
+            index = next;
+        }
+        record.region_count = count;
+        (record, index)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7UnknownAnnotation70 {
+    ann: Sb7Annotation70,
+}
+
+impl Sb7UnknownAnnotation70 {
+    // Translation of Java `CUnknownAnnotation70.Decode`: empty own class, then the
+    // chained base `CAnnotation70`.
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let after_unknown =
+            slidebook7_class_decode(node, start_index, "CUnknownAnnotation70", |_, _| {});
+        let (ann, next) = Sb7Annotation70::decode(node, after_unknown);
+        (Sb7UnknownAnnotation70 { ann }, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7Annotations {
+    cube: Vec<Sb7CubeAnnotation70>,
+    base: Vec<Sb7Annotation70>,
+    frap: Vec<Sb7FrapRegionAnnotation70>,
+    unknown: Vec<Sb7UnknownAnnotation70>,
+}
+
+// Translation of Java `CImageGroup.LoadMaks`: a leading `theNumMasks` count, that
+// many `CMaskRecord70`, then per-timepoint `theMaskCompressedSizes`/
+// `theMaskFileOffsets` position tables. Returns the mask records and the number
+// of position tables seen.
+fn slidebook7_load_masks(node: &Sb7Node) -> (Vec<Sb7MaskRecord70>, usize) {
+    let Sb7Node::Mapping(tuples) = node else {
+        return (Vec::new(), 0);
+    };
+    let mut masks = Vec::new();
+    let (num_masks, _) = slidebook7_get_integer_value(node, 0, "theNumMasks");
+    if num_masks <= 0 {
+        return (masks, 0);
+    }
+    let mut last_index = 1usize;
+    for _ in 0..num_masks {
+        let (mask, next) = Sb7MaskRecord70::decode(node, last_index);
+        last_index = next;
+        masks.push(mask);
+    }
+    let mut position_tables = 0usize;
+    loop {
+        let (_timepoint, next) =
+            slidebook7_get_integer_value(node, last_index, "theTimepointIndex");
+        if next < 0 {
+            break;
+        }
+        let mut index = next as usize;
+        match tuples.get(index) {
+            Some((key, _)) if key == "theMaskCompressedSizes" => index += 1,
+            _ => break,
+        }
+        match tuples.get(index) {
+            Some((key, _)) if key == "theMaskFileOffsets" => index += 1,
+            _ => break,
+        }
+        position_tables += 1;
+        last_index = index;
+    }
+    (masks, position_tables)
+}
+
+// Translation of Java `CImageGroup.LoadAnnotations`: a leading
+// `CDataTableHeaderRecord70`, then per-timepoint cube / base / FRAP-region /
+// unknown annotation lists, each prefixed by its `*ListSize` count.
+fn slidebook7_load_annotations(node: &Sb7Node) -> (Sb7DataTableHeader70, Vec<Sb7Annotations>) {
+    let (header, after_header) = Sb7DataTableHeader70::decode(node, 0);
+    let mut timepoints = Vec::new();
+    let mut last_index: i64 = after_header as i64;
+    loop {
+        let (_timepoint, tp_next) =
+            slidebook7_get_integer_value(node, last_index.max(0) as usize, "theTimepointIndex");
+        if tp_next < 0 {
+            break;
+        }
+        last_index = tp_next;
+        let mut anno = Sb7Annotations::default();
+
+        let (cube_size, next) = slidebook7_get_integer_value(
+            node,
+            last_index as usize,
+            "theCubeAnnotation70ListSize",
+        );
+        if next < 0 {
+            break;
+        }
+        last_index = next;
+        for _ in 0..cube_size.max(0) {
+            let (cube, after) = Sb7CubeAnnotation70::decode(node, last_index as usize);
+            anno.cube.push(cube);
+            last_index = after as i64;
+        }
+
+        let (base_size, next) =
+            slidebook7_get_integer_value(node, last_index as usize, "theAnnotation70ListSize");
+        if next < 0 {
+            break;
+        }
+        last_index = next;
+        for _ in 0..base_size.max(0) {
+            let (ann, after) = Sb7Annotation70::decode(node, last_index as usize);
+            anno.base.push(ann);
+            last_index = after as i64;
+        }
+
+        let (frap_size, next) = slidebook7_get_integer_value(
+            node,
+            last_index as usize,
+            "theFRAPRegionAnnotation70ListSize",
+        );
+        if next < 0 {
+            break;
+        }
+        last_index = next;
+        for _ in 0..frap_size.max(0) {
+            let (frap, after) = Sb7FrapRegionAnnotation70::decode(node, last_index as usize);
+            anno.frap.push(frap);
+            last_index = after as i64;
+        }
+
+        let (unknown_size, next) = slidebook7_get_integer_value(
+            node,
+            last_index as usize,
+            "theUnknownAnnotation70ListSize",
+        );
+        if next < 0 {
+            break;
+        }
+        last_index = next;
+        for _ in 0..unknown_size.max(0) {
+            let (unknown, after) = Sb7UnknownAnnotation70::decode(node, last_index as usize);
+            anno.unknown.push(unknown);
+            last_index = after as i64;
+        }
+
+        timepoints.push(anno);
+    }
+    (header, timepoints)
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7RemapChannelLut70 {
+    remap_type: Option<i64>,
+    low_desired: Option<f64>,
+    high_desired: Option<f64>,
+    low_given: Option<i64>,
+    high_given: Option<i64>,
+    built_table: Option<bool>,
+    equation_string: Option<String>,
+}
+
+impl Sb7RemapChannelLut70 {
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7RemapChannelLut70::default();
+        let next = slidebook7_class_decode(node, start_index, "CRemapChannelLUT70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mRemapType" => record.remap_type = text.parse::<i64>().ok(),
+                    "mLowDesired" => record.low_desired = text.parse::<f64>().ok(),
+                    "mHighDesired" => record.high_desired = text.parse::<f64>().ok(),
+                    "mLowGiven" => record.low_given = text.parse::<i64>().ok(),
+                    "mHighGiven" => record.high_given = text.parse::<i64>().ok(),
+                    "mBuiltTable" => record.built_table = Some(text == "true"),
+                    "mEquationString" => {
+                        record.equation_string =
+                            Some(slidebook7_restore_special_characters(text))
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (record, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7AlignManipRecord70 {
+    manip_id: Option<i64>,
+    x_offset: Option<f64>,
+    y_offset: Option<f64>,
+    z_offset: Option<f64>,
+}
+
+impl Sb7AlignManipRecord70 {
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7AlignManipRecord70::default();
+        let next = slidebook7_class_decode(node, start_index, "CAlignManipRecord70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mManipID" => record.manip_id = text.parse::<i64>().ok(),
+                    "mXOffset" => record.x_offset = text.parse::<f64>().ok(),
+                    "mYOffset" => record.y_offset = text.parse::<f64>().ok(),
+                    "mZOffset" => record.z_offset = text.parse::<f64>().ok(),
+                    _ => {}
+                }
+            }
+        });
+        (record, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7RatioManipRecord70 {
+    manip_id: Option<i64>,
+    kd: Option<f64>,
+    rmin: Option<f64>,
+    rmax: Option<f64>,
+    beta: Option<f64>,
+}
+
+impl Sb7RatioManipRecord70 {
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7RatioManipRecord70::default();
+        let next = slidebook7_class_decode(node, start_index, "CRatioManipRecord70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mManipID" => record.manip_id = text.parse::<i64>().ok(),
+                    "mKd" => record.kd = text.parse::<f64>().ok(),
+                    "mRmin" => record.rmin = text.parse::<f64>().ok(),
+                    "mRmax" => record.rmax = text.parse::<f64>().ok(),
+                    "mBeta" => record.beta = text.parse::<f64>().ok(),
+                    _ => {}
+                }
+            }
+        });
+        (record, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7FretManipRecord70 {
+    manip_id: Option<i64>,
+    fret_paradigm: Option<i64>,
+    fd_dd: Option<f64>,
+    fa_aa: Option<f64>,
+}
+
+impl Sb7FretManipRecord70 {
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7FretManipRecord70::default();
+        let next = slidebook7_class_decode(node, start_index, "CFRETManipRecord70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mManipID" => record.manip_id = text.parse::<i64>().ok(),
+                    "mFRETParadigm" => record.fret_paradigm = text.parse::<i64>().ok(),
+                    "mFdDd" => record.fd_dd = text.parse::<f64>().ok(),
+                    "mFaAa" => record.fa_aa = text.parse::<f64>().ok(),
+                    _ => {}
+                }
+            }
+        });
+        (record, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7RemapManipRecord70 {
+    manip_id: Option<i64>,
+    remap_type: Option<i64>,
+    num_calib_points: Option<i64>,
+}
+
+impl Sb7RemapManipRecord70 {
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7RemapManipRecord70::default();
+        let next = slidebook7_class_decode(node, start_index, "CRemapManipRecord70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mManipID" => record.manip_id = text.parse::<i64>().ok(),
+                    "mRemapType" => record.remap_type = text.parse::<i64>().ok(),
+                    "mNumCalibPoints" => record.num_calib_points = text.parse::<i64>().ok(),
+                    _ => {}
+                }
+            }
+        });
+        (record, next)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7ChannelExtras {
+    histograms: Vec<Sb7HistogramRecord70>,
+    remap_luts: Vec<Sb7RemapChannelLut70>,
+    align_manips: Vec<Sb7AlignManipRecord70>,
+    ratio_manips: Vec<Sb7RatioManipRecord70>,
+    fret_manips: Vec<Sb7FretManipRecord70>,
+    remap_manips: Vec<Sb7RemapManipRecord70>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7HistogramRecord70 {
+    min: Option<i64>,
+    max: Option<i64>,
+    mean: Option<f64>,
+    num_bins: Option<i64>,
+    channel_index: Option<i64>,
+}
+
+impl Sb7HistogramRecord70 {
+    fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
+        let mut record = Sb7HistogramRecord70::default();
+        let next = slidebook7_class_decode(node, start_index, "CHistogramRecord70", |name, value| {
+            if let Sb7Node::Scalar(text) = value {
+                let text = text.trim();
+                match name {
+                    "mMin" => record.min = text.parse::<i64>().ok(),
+                    "mMax" => record.max = text.parse::<i64>().ok(),
+                    "mMean" => record.mean = text.parse::<f64>().ok(),
+                    "mNumBins" => record.num_bins = text.parse::<i64>().ok(),
+                    "mChannelIndex" => record.channel_index = text.parse::<i64>().ok(),
+                    _ => {}
+                }
+            }
+        });
+        (record, next)
+    }
+}
+
+// Translation of Java `CImageGroup.LoadElapsedTimes`: the `theElapsedTimes` tuple
+// holds a count-prefixed integer array.
+fn slidebook7_load_elapsed_times(node: &Sb7Node) -> Vec<f64> {
+    let Sb7Node::Mapping(tuples) = node else {
+        return Vec::new();
+    };
+    if let Some((key, value)) = tuples.first() {
+        if key == "theElapsedTimes" {
+            if let Some(values) = slidebook7_decode_number_array(value, true) {
+                return values;
+            }
+        }
+    }
+    Vec::new()
+}
+
+// Translation of Java `CImageGroup.LoadSAPositions`: a leading `theImageCount`,
+// then that many count-prefixed `theSAPositions` arrays.
+fn slidebook7_load_sa_positions(node: &Sb7Node) -> Vec<Vec<f64>> {
+    let Sb7Node::Mapping(tuples) = node else {
+        return Vec::new();
+    };
+    let (image_count, mut next) = slidebook7_get_integer_value(node, 0, "theImageCount");
+    let mut positions = Vec::new();
+    if next < 0 {
+        return positions;
+    }
+    for _ in 0..image_count.max(0) {
+        let index = next as usize;
+        match tuples.get(index) {
+            Some((key, value)) if key == "theSAPositions" => {
+                positions.push(slidebook7_decode_number_array(value, true).unwrap_or_default());
+                next = index as i64 + 1;
+            }
+            _ => break,
+        }
+    }
+    positions
+}
+
+// Translation of Java `CImageGroup.LoadStagePosition`: a `StructArraySize` count,
+// then a flat `StructArrayValues` float array (no size prefix) grouped into XYZ
+// points.
+fn slidebook7_load_stage_positions(node: &Sb7Node) -> Vec<(f64, f64, f64)> {
+    let Sb7Node::Mapping(tuples) = node else {
+        return Vec::new();
+    };
+    let (_size, next) = slidebook7_get_integer_value(node, 0, "StructArraySize");
+    let mut points = Vec::new();
+    if next < 0 {
+        return points;
+    }
+    let index = next as usize;
+    if let Some((key, value)) = tuples.get(index) {
+        if key == "StructArrayValues" {
+            if let Some(values) = slidebook7_decode_number_array(value, false) {
+                let mut p = 0usize;
+                while p + 2 < values.len() {
+                    points.push((values[p], values[p + 1], values[p + 2]));
+                    p += 3;
+                }
+            }
+        }
+    }
+    points
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7AuxTable {
+    xml_descriptor: Option<String>,
+    value_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7AuxXmlTable {
+    xml_descriptor: Option<String>,
+    xml_data: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sb7AuxData {
+    float_tables: Vec<Sb7AuxTable>,
+    double_tables: Vec<Sb7AuxTable>,
+    sint32_tables: Vec<Sb7AuxTable>,
+    sint64_tables: Vec<Sb7AuxTable>,
+    xml_tables: Vec<Sb7AuxXmlTable>,
+}
+
+// Translation of Java `CImageGroup.LoadAuxData`: five sequential typed-table
+// sections (float / double / sint32 / sint64 / serialized-XML), each prefixed by
+// a `theAux*DataTablesSize` count; every numeric table is a
+// `CDataTableHeaderRecord70`, a `theXMLDescriptor`, and a count-prefixed
+// `theAuxData` array. Java translates this as one method, so the sections are
+// kept inline rather than factored into a helper.
+fn slidebook7_load_aux_data(node: &Sb7Node) -> Sb7AuxData {
+    let mut aux = Sb7AuxData::default();
+    let Sb7Node::Mapping(tuples) = node else {
+        return aux;
+    };
+    let mut last_index: i64 = 0;
+
+    // FLOAT
+    let (count, next) =
+        slidebook7_get_integer_value(node, last_index as usize, "theAuxFloatDataTablesSize");
+    if next < 0 {
+        return aux;
+    }
+    last_index = next;
+    for _ in 0..count.max(0) {
+        let (_header, after_header) = Sb7DataTableHeader70::decode(node, last_index as usize);
+        let (descriptor, after_desc) =
+            slidebook7_get_string_value(node, after_header, "theXMLDescriptor", true);
+        if after_desc < 0 {
+            return aux;
+        }
+        let index = after_desc as usize;
+        let value_count = match tuples.get(index) {
+            Some((key, value)) if key == "theAuxData" => {
+                slidebook7_decode_number_array(value, true).map_or(0, |v| v.len())
+            }
+            _ => return aux,
+        };
+        aux.float_tables.push(Sb7AuxTable {
+            xml_descriptor: Some(descriptor).filter(|s| !s.is_empty()),
+            value_count,
+        });
+        last_index = index as i64 + 1;
+    }
+
+    // DOUBLE
+    let (count, next) =
+        slidebook7_get_integer_value(node, last_index as usize, "theAuxDoubleDataTablesSize");
+    if next < 0 {
+        return aux;
+    }
+    last_index = next;
+    for _ in 0..count.max(0) {
+        let (_header, after_header) = Sb7DataTableHeader70::decode(node, last_index as usize);
+        let (descriptor, after_desc) =
+            slidebook7_get_string_value(node, after_header, "theXMLDescriptor", true);
+        if after_desc < 0 {
+            return aux;
+        }
+        let index = after_desc as usize;
+        let value_count = match tuples.get(index) {
+            Some((key, value)) if key == "theAuxData" => {
+                slidebook7_decode_number_array(value, true).map_or(0, |v| v.len())
+            }
+            _ => return aux,
+        };
+        aux.double_tables.push(Sb7AuxTable {
+            xml_descriptor: Some(descriptor).filter(|s| !s.is_empty()),
+            value_count,
+        });
+        last_index = index as i64 + 1;
+    }
+
+    // SINT32
+    let (count, next) =
+        slidebook7_get_integer_value(node, last_index as usize, "theAuxSInt32DataTablesSize");
+    if next < 0 {
+        return aux;
+    }
+    last_index = next;
+    for _ in 0..count.max(0) {
+        let (_header, after_header) = Sb7DataTableHeader70::decode(node, last_index as usize);
+        let (descriptor, after_desc) =
+            slidebook7_get_string_value(node, after_header, "theXMLDescriptor", true);
+        if after_desc < 0 {
+            return aux;
+        }
+        let index = after_desc as usize;
+        let value_count = match tuples.get(index) {
+            Some((key, value)) if key == "theAuxData" => {
+                slidebook7_decode_number_array(value, true).map_or(0, |v| v.len())
+            }
+            _ => return aux,
+        };
+        aux.sint32_tables.push(Sb7AuxTable {
+            xml_descriptor: Some(descriptor).filter(|s| !s.is_empty()),
+            value_count,
+        });
+        last_index = index as i64 + 1;
+    }
+
+    // SINT64
+    let (count, next) =
+        slidebook7_get_integer_value(node, last_index as usize, "theAuxSInt64DataTablesSize");
+    if next < 0 {
+        return aux;
+    }
+    last_index = next;
+    for _ in 0..count.max(0) {
+        let (_header, after_header) = Sb7DataTableHeader70::decode(node, last_index as usize);
+        let (descriptor, after_desc) =
+            slidebook7_get_string_value(node, after_header, "theXMLDescriptor", true);
+        if after_desc < 0 {
+            return aux;
+        }
+        let index = after_desc as usize;
+        let value_count = match tuples.get(index) {
+            Some((key, value)) if key == "theAuxData" => {
+                slidebook7_decode_number_array(value, true).map_or(0, |v| v.len())
+            }
+            _ => return aux,
+        };
+        aux.sint64_tables.push(Sb7AuxTable {
+            xml_descriptor: Some(descriptor).filter(|s| !s.is_empty()),
+            value_count,
+        });
+        last_index = index as i64 + 1;
+    }
+
+    // XML / serialized
+    let (count, next) =
+        slidebook7_get_integer_value(node, last_index as usize, "theAuxSerializedDataTablesSize");
+    if next < 0 {
+        return aux;
+    }
+    last_index = next;
+    for _ in 0..count.max(0) {
+        let (_header, after_header) = Sb7DataTableHeader70::decode(node, last_index as usize);
+        let (descriptor, after_desc) =
+            slidebook7_get_string_value(node, after_header, "theXMLDescriptor", true);
+        if after_desc < 0 {
+            return aux;
+        }
+        let (_size, after_size) =
+            slidebook7_get_integer_value(node, after_desc as usize, "theXmlAuxDataSize");
+        if after_size < 0 {
+            return aux;
+        }
+        let (xml_data, after_xml) =
+            slidebook7_get_string_value(node, after_size as usize, "theXmlAuxData", true);
+        if after_xml < 0 {
+            return aux;
+        }
+        aux.xml_tables.push(Sb7AuxXmlTable {
+            xml_descriptor: Some(descriptor).filter(|s| !s.is_empty()),
+            xml_data: Some(xml_data).filter(|s| !s.is_empty()),
+        });
+        last_index = after_xml;
+    }
+
+    aux
+}
+
 fn slidebook7_yaml_record_path(stack: &[(usize, String)], key: &str) -> String {
     let mut parts = stack
         .iter()
@@ -2433,6 +3936,7 @@ fn slidebook7_header_shape(header: &str) -> Result<Vec<u32>> {
 }
 
 fn slidebook7_npyz_decode(data: &[u8], path: &Path) -> Result<Vec<u8>> {
+    let mut probes = Vec::new();
     for kind in 0..3 {
         let mut decoded = Vec::new();
         let result = match kind {
@@ -2440,13 +3944,37 @@ fn slidebook7_npyz_decode(data: &[u8], path: &Path) -> Result<Vec<u8>> {
             1 => flate2::read::ZlibDecoder::new(data).read_to_end(&mut decoded),
             _ => flate2::read::DeflateDecoder::new(data).read_to_end(&mut decoded),
         };
-        if result.is_ok() && decoded.starts_with(b"\x93NUMPY") {
-            return Ok(decoded);
+        let label = match kind {
+            0 => "gzip",
+            1 => "zlib",
+            _ => "deflate",
+        };
+        match &result {
+            Ok(_) if decoded.starts_with(b"\x93NUMPY") => return Ok(decoded),
+            Ok(_) => probes.push(format!(
+                "{label}: inflated {} bytes but not a NPY payload",
+                decoded.len()
+            )),
+            Err(err) => probes.push(format!("{label}: {err}")),
         }
     }
+    let container = if data.starts_with(b"PK\x03\x04") {
+        "ZIP container"
+    } else if data.starts_with(b"\x1f\x8b") {
+        "gzip container"
+    } else {
+        "unknown container"
+    };
+    let preview_len = data.len().min(8);
+    let first_bytes = data[..preview_len]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     Err(BioFormatsError::UnsupportedFormat(format!(
-        "SlideBook 7 NPYZ image data is not a gzip/zlib/deflate-compressed NPY payload: {}",
-        path.display()
+        "SlideBook 7 NPYZ image data is not a gzip/zlib/deflate-compressed NPY payload ({container}, first bytes [{first_bytes}]): {}; probes {}",
+        path.display(),
+        probes.join(", ")
     )))
 }
 
@@ -2530,6 +4058,7 @@ fn parse_slidebook7_npy_header_bytes(data: &[u8], path: &Path) -> Result<SlideBo
         little_endian,
         fortran_order,
         shape: slidebook7_header_shape(header)?,
+        descr: descr.to_string(),
     })
 }
 
@@ -2694,20 +4223,34 @@ impl SlideBook7Reader {
     fn parse_native_group(group: &Path) -> Result<SlideBook7Series> {
         let record_path = group.join("ImageRecord.yaml");
         let record = std::fs::read_to_string(&record_path).map_err(BioFormatsError::Io)?;
-        let size_x = slidebook7_yaml_u32(&record, &["mWidth", "Width", "NumColumns"])
+        // Real SlideBook 7 record files use the typed StartClass/EndClass layout
+        // decoded by CImageRecord70 (the faithful upstream path). Files that do
+        // not carry a CImageRecord70 class leave these fields unset, and the
+        // bounded line-scan fallback recovers the dimensions instead.
+        let typed = Sb7ImageRecord70::decode(&slidebook7_yaml_compose(&record));
+        let typed_dim = |value: Option<i64>| -> Option<u32> {
+            value.and_then(|v| u32::try_from(v).ok()).filter(|v| *v > 0)
+        };
+        let size_x = typed_dim(typed.width)
+            .or_else(|| slidebook7_yaml_u32(&record, &["mWidth", "Width", "NumColumns"]))
             .ok_or_else(|| slidebook7_missing_record(&record_path, "mWidth"))?;
-        let size_y = slidebook7_yaml_u32(&record, &["mHeight", "Height", "NumRows"])
+        let size_y = typed_dim(typed.height)
+            .or_else(|| slidebook7_yaml_u32(&record, &["mHeight", "Height", "NumRows"]))
             .ok_or_else(|| slidebook7_missing_record(&record_path, "mHeight"))?;
-        let size_z = slidebook7_yaml_u32(&record, &["mNumPlanes", "NumPlanes", "Planes"])
+        let size_z = typed_dim(typed.num_planes)
+            .or_else(|| slidebook7_yaml_u32(&record, &["mNumPlanes", "NumPlanes", "Planes"]))
             .unwrap_or(1)
             .max(1);
-        let declared_c = slidebook7_yaml_u32(&record, &["mNumChannels", "NumChannels", "Channels"])
+        let declared_c = typed_dim(typed.num_channels)
+            .or_else(|| slidebook7_yaml_u32(&record, &["mNumChannels", "NumChannels", "Channels"]))
             .unwrap_or(1)
             .max(1);
-        let declared_t =
-            slidebook7_yaml_u32(&record, &["mNumTimepoints", "NumTimepoints", "Timepoints"])
-                .unwrap_or(1)
-                .max(1);
+        let declared_t = typed_dim(typed.num_timepoints)
+            .or_else(|| {
+                slidebook7_yaml_u32(&record, &["mNumTimepoints", "NumTimepoints", "Timepoints"])
+            })
+            .unwrap_or(1)
+            .max(1);
         if size_x == 0 || size_y == 0 {
             return Err(BioFormatsError::Format(format!(
                 "SlideBook 7 ImageRecord {} has zero dimensions",
@@ -2771,6 +4314,42 @@ impl SlideBook7Reader {
         }
         files.sort_by_key(|f| (f.timepoint, f.channel, f.path.clone()));
 
+        // CompressionDictionary.yaml maps each ImageData payload to its declared
+        // compression; a `.npyz` payload must name a supported compressed
+        // algorithm or the native group is rejected as inconsistent.
+        let dictionary_path = group.join("CompressionDictionary.yaml");
+        let mut dictionary_entries = 0usize;
+        if let Ok(dictionary) = std::fs::read_to_string(&dictionary_path) {
+            for line in dictionary.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let Some((name, compression)) = trimmed.split_once(':') else {
+                    continue;
+                };
+                let name = name.trim();
+                let compression = compression.trim();
+                if name.is_empty() || compression.is_empty() {
+                    continue;
+                }
+                dictionary_entries += 1;
+                if name.ends_with(".npyz")
+                    && !matches!(
+                        compression.to_ascii_lowercase().as_str(),
+                        "gzip" | "zlib" | "deflate"
+                    )
+                {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "SlideBook 7 compression dictionary {} declares unsupported compression {:?} for {}",
+                        dictionary_path.display(),
+                        compression,
+                        name
+                    )));
+                }
+            }
+        }
+
         let first = parse_slidebook7_npy_header(&files[0].path)?;
         let pixel_type = first.pixel_type;
         let bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
@@ -2779,14 +4358,26 @@ impl SlideBook7Reader {
             let npy = parse_slidebook7_npy_header(&file.path)?;
             if npy.pixel_type != pixel_type {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "SlideBook 7 mixed NPY pixel types are unsupported in {}",
-                    group.display()
+                    "SlideBook 7 mixed NPY pixel types are unsupported in {}: {} has descriptor {:?} ({:?}), {} has descriptor {:?} ({:?})",
+                    group.display(),
+                    files[0].path.display(),
+                    first.descr,
+                    first.pixel_type,
+                    file.path.display(),
+                    npy.descr,
+                    npy.pixel_type,
                 )));
             }
             if npy.little_endian != first.little_endian {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "SlideBook 7 mixed NPY byte orders are unsupported in {}",
-                    group.display()
+                    "SlideBook 7 mixed NPY byte orders are unsupported in {}: {} has descriptor {:?} ({}), {} has descriptor {:?} ({})",
+                    group.display(),
+                    files[0].path.display(),
+                    first.descr,
+                    if first.little_endian { "little-endian" } else { "big-endian" },
+                    file.path.display(),
+                    npy.descr,
+                    if npy.little_endian { "little-endian" } else { "big-endian" },
                 )));
             }
         }
@@ -2832,10 +4423,602 @@ impl SlideBook7Reader {
             ..ImageMetadata::default()
         };
         meta.series_metadata = slidebook7_image_record_metadata(&record);
+        // Project the typed CImageRecord70 fields (and its chained lens / optovar
+        // / main-view sub-records) when the record file used the StartClass layout.
+        if typed.width.is_some() {
+            let mut put_string = |key: &str, value: &Option<String>| {
+                if let Some(value) = value {
+                    meta.series_metadata.insert(
+                        key.into(),
+                        crate::common::metadata::MetadataValue::String(value.clone()),
+                    );
+                }
+            };
+            put_string("slidebook7.image_record.name", &typed.name);
+            put_string("slidebook7.image_record.info", &typed.info);
+            put_string("slidebook7.image_record.unique_id", &typed.unique_id);
+            put_string("slidebook7.image_record.lens.name", &typed.lens.name);
+            put_string("slidebook7.image_record.lens.camera_name", &typed.lens.camera_name);
+            put_string("slidebook7.image_record.optovar.name", &typed.optovar.name);
+            let mut put_float = |key: &str, value: Option<f64>| {
+                if let Some(value) = value.filter(|v| v.is_finite()) {
+                    meta.series_metadata.insert(
+                        key.into(),
+                        crate::common::metadata::MetadataValue::Float(value),
+                    );
+                }
+            };
+            put_float("slidebook7.image_record.lens.numerical_aperture", typed.lens.na);
+            put_float(
+                "slidebook7.image_record.lens.micron_per_pixel",
+                typed.lens.micron_per_pixel,
+            );
+            put_float(
+                "slidebook7.image_record.lens.magnification",
+                typed.lens.actual_magnification,
+            );
+            put_float(
+                "slidebook7.image_record.optovar.magnification",
+                typed.optovar.magnification,
+            );
+            let mut put_int = |key: &str, value: Option<i64>| {
+                if let Some(value) = value {
+                    meta.series_metadata.insert(
+                        key.into(),
+                        crate::common::metadata::MetadataValue::Int(value),
+                    );
+                }
+            };
+            put_int("slidebook7.image_record.num_masks", typed.num_masks);
+            put_int("slidebook7.image_record.main_view.view_id", typed.main_view.view_id);
+            put_int(
+                "slidebook7.image_record.main_view.red_channel",
+                typed.main_view.red_channel,
+            );
+            put_int(
+                "slidebook7.image_record.main_view.green_channel",
+                typed.main_view.green_channel,
+            );
+            put_int(
+                "slidebook7.image_record.main_view.blue_channel",
+                typed.main_view.blue_channel,
+            );
+            if let Some(default) = typed.optovar.default {
+                meta.series_metadata.insert(
+                    "slidebook7.image_record.optovar.default".into(),
+                    crate::common::metadata::MetadataValue::Bool(default),
+                );
+            }
+            for (key, values) in [
+                ("slidebook7.image_record.thumbnail", &typed.thumbnail),
+                ("slidebook7.image_record.main_view.low", &typed.main_view.low),
+                ("slidebook7.image_record.main_view.high", &typed.main_view.high),
+                ("slidebook7.image_record.main_view.gamma", &typed.main_view.gamma),
+            ] {
+                if let Some(values) = values {
+                    meta.series_metadata.insert(
+                        format!("{key}.count"),
+                        crate::common::metadata::MetadataValue::Int(values.len() as i64),
+                    );
+                }
+            }
+        }
+        // Decoded plane-metadata inputs collected from the typed records below
+        // and consumed by the OME plane builder.
+        let mut channel_exposures: Vec<Option<i64>> = Vec::new();
+        let mut interplane_spacing: Option<f64> = None;
+        let mut elapsed_times: Vec<f64> = Vec::new();
+        let mut stage_positions: Vec<(f64, f64, f64)> = Vec::new();
+
+        // ChannelRecord.yaml carries one typed CChannelRecord70 per channel
+        // (Java CImageGroup.LoadChannelRecord). When present, project the channel
+        // name / camera / exposure / fluor wavelengths.
+        let channel_record_path = group.join("ChannelRecord.yaml");
+        if let Ok(channel_text) = std::fs::read_to_string(&channel_record_path) {
+            let channel_node = slidebook7_yaml_compose(&channel_text);
+            let (channel_records, extras) =
+                slidebook7_load_channel_records(&channel_node, declared_c as usize);
+            channel_exposures = channel_records
+                .iter()
+                .map(|channel| channel.exposure.exposure_time)
+                .collect();
+            // Java GetInterplaneSpacing reads channel 0's exposure record.
+            interplane_spacing = channel_records
+                .first()
+                .and_then(|channel| channel.exposure.interplane_spacing)
+                .filter(|v| v.is_finite());
+            if !extras.histograms.is_empty() {
+                meta.series_metadata.insert(
+                    "slidebook7.histogram.count".into(),
+                    crate::common::metadata::MetadataValue::Int(extras.histograms.len() as i64),
+                );
+                if let Some(histogram) = extras.histograms.first() {
+                    for (key, value) in [
+                        ("slidebook7.histogram.0.min", histogram.min),
+                        ("slidebook7.histogram.0.max", histogram.max),
+                        ("slidebook7.histogram.0.num_bins", histogram.num_bins),
+                        ("slidebook7.histogram.0.channel_index", histogram.channel_index),
+                    ] {
+                        if let Some(value) = value {
+                            meta.series_metadata.insert(
+                                key.into(),
+                                crate::common::metadata::MetadataValue::Int(value),
+                            );
+                        }
+                    }
+                    if let Some(mean) = histogram.mean.filter(|v| v.is_finite()) {
+                        meta.series_metadata.insert(
+                            "slidebook7.histogram.0.mean".into(),
+                            crate::common::metadata::MetadataValue::Float(mean),
+                        );
+                    }
+                }
+            }
+            // Channel manipulation/LUT records (Java mRemapChannelLUTList /
+            // mAlignManipRecordList / mRatioManipRecordList / mFRETManipRecList /
+            // mRemapManipRecList).
+            for (key, count) in [
+                ("slidebook7.remap_lut.count", extras.remap_luts.len()),
+                ("slidebook7.align_manip.count", extras.align_manips.len()),
+                ("slidebook7.ratio_manip.count", extras.ratio_manips.len()),
+                ("slidebook7.fret_manip.count", extras.fret_manips.len()),
+                ("slidebook7.remap_manip.count", extras.remap_manips.len()),
+            ] {
+                if count > 0 {
+                    meta.series_metadata.insert(
+                        key.into(),
+                        crate::common::metadata::MetadataValue::Int(count as i64),
+                    );
+                }
+            }
+            if let Some(lut) = extras.remap_luts.first() {
+                if let Some(remap_type) = lut.remap_type {
+                    meta.series_metadata.insert(
+                        "slidebook7.remap_lut.0.remap_type".into(),
+                        crate::common::metadata::MetadataValue::Int(remap_type),
+                    );
+                }
+                if let Some(equation) = &lut.equation_string {
+                    meta.series_metadata.insert(
+                        "slidebook7.remap_lut.0.equation".into(),
+                        crate::common::metadata::MetadataValue::String(equation.clone()),
+                    );
+                }
+                for (key, value) in [
+                    ("slidebook7.remap_lut.0.low_desired", lut.low_desired),
+                    ("slidebook7.remap_lut.0.high_desired", lut.high_desired),
+                ] {
+                    if let Some(value) = value.filter(|v| v.is_finite()) {
+                        meta.series_metadata
+                            .insert(key.into(), crate::common::metadata::MetadataValue::Float(value));
+                    }
+                }
+                for (key, value) in [
+                    ("slidebook7.remap_lut.0.low_given", lut.low_given),
+                    ("slidebook7.remap_lut.0.high_given", lut.high_given),
+                ] {
+                    if let Some(value) = value {
+                        meta.series_metadata
+                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                    }
+                }
+                if let Some(built) = lut.built_table {
+                    meta.series_metadata.insert(
+                        "slidebook7.remap_lut.0.built_table".into(),
+                        crate::common::metadata::MetadataValue::Bool(built),
+                    );
+                }
+            }
+            if let Some(align) = extras.align_manips.first() {
+                for (key, value) in [
+                    ("slidebook7.align_manip.0.manip_id", align.manip_id),
+                ] {
+                    if let Some(value) = value {
+                        meta.series_metadata
+                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                    }
+                }
+                for (key, value) in [
+                    ("slidebook7.align_manip.0.x_offset", align.x_offset),
+                    ("slidebook7.align_manip.0.y_offset", align.y_offset),
+                    ("slidebook7.align_manip.0.z_offset", align.z_offset),
+                ] {
+                    if let Some(value) = value.filter(|v| v.is_finite()) {
+                        meta.series_metadata
+                            .insert(key.into(), crate::common::metadata::MetadataValue::Float(value));
+                    }
+                }
+            }
+            if let Some(ratio) = extras.ratio_manips.first() {
+                if let Some(manip_id) = ratio.manip_id {
+                    meta.series_metadata.insert(
+                        "slidebook7.ratio_manip.0.manip_id".into(),
+                        crate::common::metadata::MetadataValue::Int(manip_id),
+                    );
+                }
+                for (key, value) in [
+                    ("slidebook7.ratio_manip.0.kd", ratio.kd),
+                    ("slidebook7.ratio_manip.0.rmin", ratio.rmin),
+                    ("slidebook7.ratio_manip.0.rmax", ratio.rmax),
+                    ("slidebook7.ratio_manip.0.beta", ratio.beta),
+                ] {
+                    if let Some(value) = value.filter(|v| v.is_finite()) {
+                        meta.series_metadata
+                            .insert(key.into(), crate::common::metadata::MetadataValue::Float(value));
+                    }
+                }
+            }
+            if let Some(fret) = extras.fret_manips.first() {
+                for (key, value) in [
+                    ("slidebook7.fret_manip.0.manip_id", fret.manip_id),
+                    ("slidebook7.fret_manip.0.fret_paradigm", fret.fret_paradigm),
+                ] {
+                    if let Some(value) = value {
+                        meta.series_metadata
+                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                    }
+                }
+                for (key, value) in [
+                    ("slidebook7.fret_manip.0.fd_dd", fret.fd_dd),
+                    ("slidebook7.fret_manip.0.fa_aa", fret.fa_aa),
+                ] {
+                    if let Some(value) = value.filter(|v| v.is_finite()) {
+                        meta.series_metadata
+                            .insert(key.into(), crate::common::metadata::MetadataValue::Float(value));
+                    }
+                }
+            }
+            if let Some(remap) = extras.remap_manips.first() {
+                for (key, value) in [
+                    ("slidebook7.remap_manip.0.manip_id", remap.manip_id),
+                    ("slidebook7.remap_manip.0.remap_type", remap.remap_type),
+                    ("slidebook7.remap_manip.0.num_calib_points", remap.num_calib_points),
+                ] {
+                    if let Some(value) = value {
+                        meta.series_metadata
+                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                    }
+                }
+            }
+            for (index, channel) in channel_records.iter().enumerate() {
+                let prefix = format!("slidebook7.channel.{index}");
+                if let Some(name) = channel
+                    .channel_def
+                    .name
+                    .as_ref()
+                    .or(channel.channel_def.fluor.name.as_ref())
+                {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.name"),
+                        crate::common::metadata::MetadataValue::String(name.clone()),
+                    );
+                }
+                if let Some(camera) = &channel.channel_def.camera_name {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.camera_name"),
+                        crate::common::metadata::MetadataValue::String(camera.clone()),
+                    );
+                }
+                if let Some(exposure) = channel.exposure.exposure_time {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.exposure_time"),
+                        crate::common::metadata::MetadataValue::Int(exposure),
+                    );
+                }
+                if let Some(value) = channel
+                    .channel_def
+                    .fluor
+                    .excitation_lambda
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.excitation_wavelength"),
+                        crate::common::metadata::MetadataValue::Float(value),
+                    );
+                }
+                if let Some(value) = channel
+                    .channel_def
+                    .fluor
+                    .lambda
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.emission_wavelength"),
+                        crate::common::metadata::MetadataValue::Float(value),
+                    );
+                }
+                if let Some(planes) = channel.num_planes {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.num_planes"),
+                        crate::common::metadata::MetadataValue::Int(planes),
+                    );
+                }
+            }
+        }
+        // MaskRecord.yaml carries the typed CMaskRecord70 list plus per-timepoint
+        // position tables (Java CImageGroup.LoadMaks).
+        if let Ok(mask_text) = std::fs::read_to_string(group.join("MaskRecord.yaml")) {
+            let (masks, position_tables) = slidebook7_load_masks(&slidebook7_yaml_compose(&mask_text));
+            meta.series_metadata.insert(
+                "slidebook7.mask.count".into(),
+                crate::common::metadata::MetadataValue::Int(masks.len() as i64),
+            );
+            meta.series_metadata.insert(
+                "slidebook7.mask.position_tables".into(),
+                crate::common::metadata::MetadataValue::Int(position_tables as i64),
+            );
+            for (index, mask) in masks.iter().enumerate() {
+                let prefix = format!("slidebook7.mask.{index}");
+                if let Some(name) = &mask.name {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.name"),
+                        crate::common::metadata::MetadataValue::String(name.clone()),
+                    );
+                }
+                if let Some(feature) = &mask.centroid_feature {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.centroid_feature"),
+                        crate::common::metadata::MetadataValue::String(feature.clone()),
+                    );
+                }
+                if let Some(channel) = mask.centroid_channel {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.centroid_channel"),
+                        crate::common::metadata::MetadataValue::Int(channel),
+                    );
+                }
+                if let Some(submasks) = mask.persistent_submasks {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.persistent_submasks"),
+                        crate::common::metadata::MetadataValue::Int(submasks),
+                    );
+                }
+            }
+        }
+
+        // AnnotationRecord.yaml carries a CDataTableHeaderRecord70 plus the
+        // per-timepoint cube/base/FRAP/unknown annotation graph (Java
+        // CImageGroup.LoadAnnotations).
+        if let Ok(annotation_text) = std::fs::read_to_string(group.join("AnnotationRecord.yaml")) {
+            let (header, timepoints) =
+                slidebook7_load_annotations(&slidebook7_yaml_compose(&annotation_text));
+            meta.series_metadata.insert(
+                "slidebook7.annotation.timepoint_count".into(),
+                crate::common::metadata::MetadataValue::Int(timepoints.len() as i64),
+            );
+            for (key, value) in [
+                ("slidebook7.annotation.data_table.channel_index", header.channel_index),
+                ("slidebook7.annotation.data_table.rows", header.rows),
+                ("slidebook7.annotation.data_table.columns", header.columns),
+                ("slidebook7.annotation.data_table.planes", header.planes),
+                ("slidebook7.annotation.data_table.value_type", header.value_type),
+                ("slidebook7.annotation.data_table.table_type", header.table_type),
+            ] {
+                if let Some(value) = value {
+                    meta.series_metadata
+                        .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                }
+            }
+            let cube_total: usize = timepoints.iter().map(|tp| tp.cube.len()).sum();
+            let base_total: usize = timepoints.iter().map(|tp| tp.base.len()).sum();
+            let frap_total: usize = timepoints.iter().map(|tp| tp.frap.len()).sum();
+            let unknown_total: usize = timepoints.iter().map(|tp| tp.unknown.len()).sum();
+            for (key, value) in [
+                ("slidebook7.annotation.cube_count", cube_total),
+                ("slidebook7.annotation.base_count", base_total),
+                ("slidebook7.annotation.frap_region_count", frap_total),
+                ("slidebook7.annotation.unknown_count", unknown_total),
+            ] {
+                meta.series_metadata
+                    .insert(key.into(), crate::common::metadata::MetadataValue::Int(value as i64));
+            }
+            // Bounded sample of the first base/cube/FRAP/unknown annotation.
+            if let Some(base) = timepoints.iter().find_map(|tp| tp.base.first()) {
+                if let Some(text) = &base.text {
+                    meta.series_metadata.insert(
+                        "slidebook7.annotation.0.text".into(),
+                        crate::common::metadata::MetadataValue::String(text.clone()),
+                    );
+                }
+                for (key, value) in [
+                    ("slidebook7.annotation.0.graphic_type", base.graphic_type),
+                    ("slidebook7.annotation.0.dependency_type", base.dependency_type),
+                    ("slidebook7.annotation.0.group_id", base.group_id),
+                    ("slidebook7.annotation.0.plane_id", base.plane_id),
+                    ("slidebook7.annotation.0.sequence_id", base.sequence_id),
+                    ("slidebook7.annotation.0.object_id", base.object_id),
+                ] {
+                    if let Some(value) = value {
+                        meta.series_metadata
+                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                    }
+                }
+            }
+            if let Some(cube) = timepoints.iter().find_map(|tp| tp.cube.first()) {
+                if let Some(is_background) = cube.is_background {
+                    meta.series_metadata.insert(
+                        "slidebook7.annotation.cube.0.is_background".into(),
+                        crate::common::metadata::MetadataValue::Bool(is_background),
+                    );
+                }
+                if let Some(region_index) = cube.region_index {
+                    meta.series_metadata.insert(
+                        "slidebook7.annotation.cube.0.region_index".into(),
+                        crate::common::metadata::MetadataValue::Int(region_index),
+                    );
+                }
+                if let Some(is_frap) = cube.is_frap {
+                    meta.series_metadata.insert(
+                        "slidebook7.annotation.cube.0.is_frap".into(),
+                        crate::common::metadata::MetadataValue::Bool(is_frap),
+                    );
+                }
+                if let Some(device) = &cube.frap_device {
+                    meta.series_metadata.insert(
+                        "slidebook7.annotation.cube.0.frap_device".into(),
+                        crate::common::metadata::MetadataValue::String(device.clone()),
+                    );
+                }
+                if let Some(object_id) = cube.ann.object_id {
+                    meta.series_metadata.insert(
+                        "slidebook7.annotation.cube.0.annotation_object_id".into(),
+                        crate::common::metadata::MetadataValue::Int(object_id),
+                    );
+                }
+            }
+            if let Some(frap) = timepoints.iter().find_map(|tp| tp.frap.first()) {
+                if let Some(xml) = &frap.xml {
+                    meta.series_metadata.insert(
+                        "slidebook7.annotation.frap.0.xml".into(),
+                        crate::common::metadata::MetadataValue::String(xml.clone()),
+                    );
+                }
+                meta.series_metadata.insert(
+                    "slidebook7.annotation.frap.0.region_count".into(),
+                    crate::common::metadata::MetadataValue::Int(frap.region_count as i64),
+                );
+                if let Some(graphic_type) = frap.ann.graphic_type {
+                    meta.series_metadata.insert(
+                        "slidebook7.annotation.frap.0.annotation_graphic_type".into(),
+                        crate::common::metadata::MetadataValue::Int(graphic_type),
+                    );
+                }
+            }
+            if let Some(unknown) = timepoints.iter().find_map(|tp| tp.unknown.first()) {
+                if let Some(plane_id) = unknown.ann.plane_id {
+                    meta.series_metadata.insert(
+                        "slidebook7.annotation.unknown.0.annotation_plane_id".into(),
+                        crate::common::metadata::MetadataValue::Int(plane_id),
+                    );
+                }
+            }
+        }
+
+        // ElapsedTimes.yaml / SAPositionData.yaml / StagePositionData.yaml carry
+        // count-prefixed numeric arrays (Java LoadElapsedTimes / LoadSAPositions /
+        // LoadStagePosition).
+        if let Ok(text) = std::fs::read_to_string(group.join("ElapsedTimes.yaml")) {
+            elapsed_times = slidebook7_load_elapsed_times(&slidebook7_yaml_compose(&text));
+            if !elapsed_times.is_empty() {
+                meta.series_metadata.insert(
+                    "slidebook7.elapsed_times.count".into(),
+                    crate::common::metadata::MetadataValue::Int(elapsed_times.len() as i64),
+                );
+                if let Some(first) = elapsed_times.first().filter(|v| v.is_finite()) {
+                    meta.series_metadata.insert(
+                        "slidebook7.elapsed_times.0".into(),
+                        crate::common::metadata::MetadataValue::Float(*first),
+                    );
+                }
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(group.join("SAPositionData.yaml")) {
+            let sa_positions = slidebook7_load_sa_positions(&slidebook7_yaml_compose(&text));
+            if !sa_positions.is_empty() {
+                meta.series_metadata.insert(
+                    "slidebook7.sa_positions.image_count".into(),
+                    crate::common::metadata::MetadataValue::Int(sa_positions.len() as i64),
+                );
+                meta.series_metadata.insert(
+                    "slidebook7.sa_positions.0.count".into(),
+                    crate::common::metadata::MetadataValue::Int(sa_positions[0].len() as i64),
+                );
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(group.join("StagePositionData.yaml")) {
+            stage_positions = slidebook7_load_stage_positions(&slidebook7_yaml_compose(&text));
+            if let Some((x, y, z)) = stage_positions.first().copied() {
+                meta.series_metadata.insert(
+                    "slidebook7.stage_positions.count".into(),
+                    crate::common::metadata::MetadataValue::Int(stage_positions.len() as i64),
+                );
+                for (key, value) in [
+                    ("slidebook7.stage_positions.0.x", x),
+                    ("slidebook7.stage_positions.0.y", y),
+                    ("slidebook7.stage_positions.0.z", z),
+                ] {
+                    if value.is_finite() {
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Float(value),
+                        );
+                    }
+                }
+            }
+        }
+
+        // AuxData.yaml carries the typed multi-section aux data tables (Java
+        // LoadAuxData).
+        if let Ok(text) = std::fs::read_to_string(group.join("AuxData.yaml")) {
+            let aux = slidebook7_load_aux_data(&slidebook7_yaml_compose(&text));
+            for (key, count) in [
+                ("slidebook7.aux.float_tables", aux.float_tables.len()),
+                ("slidebook7.aux.double_tables", aux.double_tables.len()),
+                ("slidebook7.aux.sint32_tables", aux.sint32_tables.len()),
+                ("slidebook7.aux.sint64_tables", aux.sint64_tables.len()),
+                ("slidebook7.aux.xml_tables", aux.xml_tables.len()),
+            ] {
+                if count > 0 {
+                    meta.series_metadata.insert(
+                        key.into(),
+                        crate::common::metadata::MetadataValue::Int(count as i64),
+                    );
+                }
+            }
+            if let Some(table) = aux.float_tables.first() {
+                meta.series_metadata.insert(
+                    "slidebook7.aux.float.0.value_count".into(),
+                    crate::common::metadata::MetadataValue::Int(table.value_count as i64),
+                );
+                if let Some(descriptor) = &table.xml_descriptor {
+                    meta.series_metadata.insert(
+                        "slidebook7.aux.float.0.descriptor".into(),
+                        crate::common::metadata::MetadataValue::String(descriptor.clone()),
+                    );
+                }
+            }
+            for (key, table) in [
+                ("slidebook7.aux.double.0.value_count", aux.double_tables.first()),
+                ("slidebook7.aux.sint32.0.value_count", aux.sint32_tables.first()),
+                ("slidebook7.aux.sint64.0.value_count", aux.sint64_tables.first()),
+            ] {
+                if let Some(table) = table {
+                    meta.series_metadata.insert(
+                        key.into(),
+                        crate::common::metadata::MetadataValue::Int(table.value_count as i64),
+                    );
+                }
+            }
+            if let Some(table) = aux.xml_tables.first() {
+                if let Some(descriptor) = &table.xml_descriptor {
+                    meta.series_metadata.insert(
+                        "slidebook7.aux.xml.0.descriptor".into(),
+                        crate::common::metadata::MetadataValue::String(descriptor.clone()),
+                    );
+                }
+                if let Some(xml_data) = &table.xml_data {
+                    meta.series_metadata.insert(
+                        "slidebook7.aux.xml.0.data".into(),
+                        crate::common::metadata::MetadataValue::String(xml_data.clone()),
+                    );
+                }
+            }
+        }
+
+        if dictionary_entries > 0 {
+            meta.series_metadata.insert(
+                "slidebook7.compression_dictionary.entries".into(),
+                crate::common::metadata::MetadataValue::Int(dictionary_entries as i64),
+            );
+        }
         Ok(SlideBook7Series {
             meta,
             files,
             plane_len,
+            elapsed_times,
+            channel_exposures,
+            stage_positions,
+            interplane_spacing,
         })
     }
 
@@ -3039,6 +5222,55 @@ impl FormatReader for SlideBook7Reader {
                 for (index, series) in state.series.iter().enumerate() {
                     let mut image =
                         crate::common::ome_metadata::OmeMetadata::from_image_metadata(&series.meta);
+                    // Promote the decoded typed-record timing/position into OME
+                    // planes (Java initFile plane loop: DeltaT per timepoint,
+                    // ExposureTime per channel, PositionX/Y from the stage point
+                    // and PositionZ offset by the interplane spacing). The plane
+                    // index follows this reader's z/c/t order. Java units are
+                    // milliseconds (time) and micrometres (position); time is
+                    // converted to seconds for the OME plane fields.
+                    let has_plane_data = !series.elapsed_times.is_empty()
+                        || series.channel_exposures.iter().any(|e| e.is_some())
+                        || !series.stage_positions.is_empty();
+                    if has_plane_data {
+                        if let Some(ome_image) = image.images.get_mut(0) {
+                            let size_z = series.meta.size_z.max(1);
+                            let size_c = series.meta.size_c.max(1);
+                            let image_count = series.meta.image_count.max(1);
+                            let stage = series.stage_positions.first().copied();
+                            let mut planes = Vec::with_capacity(image_count as usize);
+                            for p in 0..image_count {
+                                let z = p % size_z;
+                                let c = (p / size_z) % size_c;
+                                let t = p / (size_z * size_c);
+                                let delta_t = series
+                                    .elapsed_times
+                                    .get(t as usize)
+                                    .copied()
+                                    .filter(|v| v.is_finite())
+                                    .map(|ms| ms / 1000.0);
+                                let exposure_time = series
+                                    .channel_exposures
+                                    .get(c as usize)
+                                    .copied()
+                                    .flatten()
+                                    .map(|ms| ms as f64 / 1000.0);
+                                planes.push(crate::common::ome_metadata::OmePlane {
+                                    the_z: z,
+                                    the_c: c,
+                                    the_t: t,
+                                    delta_t,
+                                    exposure_time,
+                                    position_x: stage.map(|(x, _, _)| x),
+                                    position_y: stage.map(|(_, y, _)| y),
+                                    position_z: stage.map(|(_, _, sz)| {
+                                        sz + series.interplane_spacing.unwrap_or(0.0) * z as f64
+                                    }),
+                                });
+                            }
+                            ome_image.planes = planes;
+                        }
+                    }
                     ome.images.extend(image.images.drain(..));
                     let _ = ome.add_original_metadata_annotations(&series.meta, index);
                 }
@@ -3610,66 +5842,331 @@ fn ivision_apply_xml_metadata(
 
     let mut ome = crate::common::ome_metadata::OmeMetadata::from_ome_xml(&xml);
     let _ = ome.populate_pixels(meta, 0);
-    let image = ome.images.first()?;
 
-    if let Some(name) = image.name.as_ref().filter(|v| !v.trim().is_empty()) {
-        meta.series_metadata.insert(
-            "iVision XML Image Name".into(),
-            MetadataValue::String(name.clone()),
-        );
-    }
-    if let Some(value) = image.physical_size_x.filter(|v| v.is_finite()) {
-        meta.series_metadata.insert(
-            "iVision XML PhysicalSizeX".into(),
-            MetadataValue::Float(value),
-        );
-    }
-    if let Some(value) = image.physical_size_y.filter(|v| v.is_finite()) {
-        meta.series_metadata.insert(
-            "iVision XML PhysicalSizeY".into(),
-            MetadataValue::Float(value),
-        );
-    }
-    if let Some(value) = image.physical_size_z.filter(|v| v.is_finite()) {
-        meta.series_metadata.insert(
-            "iVision XML PhysicalSizeZ".into(),
-            MetadataValue::Float(value),
-        );
-    }
-    if let Some(value) = image.time_increment.filter(|v| v.is_finite()) {
-        meta.series_metadata.insert(
-            "iVision XML TimeIncrement".into(),
-            MetadataValue::Float(value),
-        );
-    }
-
-    for (index, channel) in image.channels.iter().enumerate().take(meta.size_c as usize) {
-        let prefix = format!("iVision XML Channel {index}");
-        if let Some(name) = channel.name.as_ref().filter(|v| !v.trim().is_empty()) {
+    if let Some(image) = ome.images.first() {
+        if let Some(name) = image.name.as_ref().filter(|v| !v.trim().is_empty()) {
             meta.series_metadata.insert(
-                format!("{prefix} Name"),
+                "iVision XML Image Name".into(),
                 MetadataValue::String(name.clone()),
             );
         }
-        if let Some(value) = channel.excitation_wavelength.filter(|v| v.is_finite()) {
+        if let Some(value) = image.physical_size_x.filter(|v| v.is_finite()) {
             meta.series_metadata.insert(
-                format!("{prefix} ExcitationWavelength"),
+                "iVision XML PhysicalSizeX".into(),
                 MetadataValue::Float(value),
             );
         }
-        if let Some(value) = channel.emission_wavelength.filter(|v| v.is_finite()) {
+        if let Some(value) = image.physical_size_y.filter(|v| v.is_finite()) {
             meta.series_metadata.insert(
-                format!("{prefix} EmissionWavelength"),
+                "iVision XML PhysicalSizeY".into(),
                 MetadataValue::Float(value),
             );
         }
-        if let Some(value) = channel.color {
-            meta.series_metadata
-                .insert(format!("{prefix} Color"), MetadataValue::Int(value as i64));
+        if let Some(value) = image.physical_size_z.filter(|v| v.is_finite()) {
+            meta.series_metadata.insert(
+                "iVision XML PhysicalSizeZ".into(),
+                MetadataValue::Float(value),
+            );
+        }
+        if let Some(value) = image.time_increment.filter(|v| v.is_finite()) {
+            meta.series_metadata.insert(
+                "iVision XML TimeIncrement".into(),
+                MetadataValue::Float(value),
+            );
+        }
+
+        for (index, channel) in image.channels.iter().enumerate().take(meta.size_c as usize) {
+            let prefix = format!("iVision XML Channel {index}");
+            if let Some(name) = channel.name.as_ref().filter(|v| !v.trim().is_empty()) {
+                meta.series_metadata.insert(
+                    format!("{prefix} Name"),
+                    MetadataValue::String(name.clone()),
+                );
+            }
+            if let Some(value) = channel.excitation_wavelength.filter(|v| v.is_finite()) {
+                meta.series_metadata.insert(
+                    format!("{prefix} ExcitationWavelength"),
+                    MetadataValue::Float(value),
+                );
+            }
+            if let Some(value) = channel.emission_wavelength.filter(|v| v.is_finite()) {
+                meta.series_metadata.insert(
+                    format!("{prefix} EmissionWavelength"),
+                    MetadataValue::Float(value),
+                );
+            }
+            if let Some(value) = channel.color {
+                meta.series_metadata
+                    .insert(format!("{prefix} Color"), MetadataValue::Int(value as i64));
+            }
         }
     }
 
+    // The iVision XML is an Apple plist of <key>iplab:Foo</key><value/> pairs,
+    // not OME-XML, so the OME image above is usually empty.  Mirror the Java
+    // IvisionHandler/initFile, which scrapes the iplab:* acquisition keys and
+    // writes them into the MetadataStore (objective, detector, planes, dates).
+    let acq = ivision_parse_acquisition_metadata(&xml);
+    acq.apply(meta, &mut ome);
+
     Some(ome)
+}
+
+/// iVision acquisition metadata scraped from the trailing plist XML.
+///
+/// Mirrors the `iplab:*` keys that the Java `IvisionReader.IvisionHandler`
+/// recognises and the `initFile` code that pushes them into the MetadataStore.
+#[derive(Default)]
+struct IvisionAcquisitionMetadata {
+    bin_x: Option<String>,
+    bin_y: Option<String>,
+    creation_date: Option<String>,
+    exposure_time: Option<String>,
+    gain: Option<String>,
+    offset: Option<String>,
+    delta_t: Option<String>,
+    magnification: Option<f64>,
+    lens_na: Option<f64>,
+    refractive_index: Option<f64>,
+    wavelength: Option<String>,
+}
+
+/// Parse the iVision plist XML, extracting the recognised `iplab:*` keys.
+///
+/// One Java function: `IvisionHandler` (`startElement`/`characters`/`endElement`).
+/// The plist serialises each entry as `<key>iplab:Foo</key><string>value</string>`
+/// (or `<real>`, `<integer>`, …); we pair each recognised key with the following
+/// non-`key` value element, matching the SAX handler's `key`/`value` bookkeeping.
+fn ivision_parse_acquisition_metadata(xml: &str) -> IvisionAcquisitionMetadata {
+    let mut acq = IvisionAcquisitionMetadata::default();
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut current_element: Option<String> = None;
+    let mut key: Option<String> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(element)) => {
+                current_element = Some(ivision_xml_component_name(element.name().as_ref()));
+            }
+            Ok(quick_xml::events::Event::Empty(_)) => {
+                // Self-closing element carries no characters; ignore like the
+                // SAX handler, which only acts on character data.
+                current_element = None;
+            }
+            Ok(quick_xml::events::Event::Text(text)) => {
+                let Ok(value) = text.unescape() else { continue };
+                let value = value.trim();
+                if value.is_empty() {
+                    continue;
+                }
+                // BaseHandler keys on the *raw* element name ("key"); our
+                // component-name strips the namespace but preserves "key".
+                if current_element.as_deref() == Some("key") {
+                    key = Some(value.to_string());
+                } else if let Some(k) = key.take() {
+                    ivision_assign_acquisition_field(&mut acq, &k, value);
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                current_element = None;
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    acq
+}
+
+/// Mirror of `IvisionHandler.endElement`: map one recognised `iplab:*` key to a
+/// field. Invalid numbers are silently dropped exactly as the Java try/catch.
+fn ivision_assign_acquisition_field(acq: &mut IvisionAcquisitionMetadata, key: &str, value: &str) {
+    match key {
+        "iplab:Bin_X" => acq.bin_x = Some(value.to_string()),
+        "iplab:Bin_Y" => acq.bin_y = Some(value.to_string()),
+        "iplab:Capture_Date" => acq.creation_date = Some(value.to_string()),
+        "iplab:Exposure" => acq.exposure_time = Some(value.to_string()),
+        "iplab:Gain" => acq.gain = Some(value.to_string()),
+        "iplab:Offset" => acq.offset = Some(value.to_string()),
+        "iplab:Interval_T" => acq.delta_t = Some(value.to_string()),
+        "iplab:Objective_Mag" => acq.magnification = value.parse::<f64>().ok(),
+        "iplab:Objective_NA" => acq.lens_na = value.parse::<f64>().ok(),
+        "iplab:Objective_RI" => acq.refractive_index = value.parse::<f64>().ok(),
+        "iplab:Wavelength" => acq.wavelength = Some(value.to_string()),
+        _ => {}
+    }
+}
+
+impl IvisionAcquisitionMetadata {
+    /// Surface the scraped acquisition fields into `series_metadata` and the OME
+    /// store, mirroring `IvisionReader.initFile`'s MetadataStore calls:
+    ///   * `Capture_Date` → image acquisition date,
+    ///   * `Interval_T` → Pixels TimeIncrement + per-plane DeltaT,
+    ///   * `Exposure` → per-plane ExposureTime,
+    ///   * `Objective_Mag`/`Objective_NA` → Objective + settings refractive index,
+    ///   * `Gain`/`Bin_X`/`Bin_Y` → DetectorSettings gain + binning.
+    fn apply(
+        &self,
+        meta: &mut ImageMetadata,
+        ome: &mut crate::common::ome_metadata::OmeMetadata,
+    ) {
+        use crate::common::ome_metadata::{
+            create_lsid, OmeChannel, OmeDetector, OmeImage, OmeInstrument, OmeObjective, OmePlane,
+        };
+
+        // addGlobalMeta(key, value): the handler records every recognised key.
+        let put_str = |meta: &mut ImageMetadata, k: &str, v: &Option<String>| {
+            if let Some(v) = v.as_ref().filter(|s| !s.trim().is_empty()) {
+                meta.series_metadata
+                    .insert(k.to_string(), MetadataValue::String(v.clone()));
+            }
+        };
+        put_str(meta, "iplab:Bin_X", &self.bin_x);
+        put_str(meta, "iplab:Bin_Y", &self.bin_y);
+        put_str(meta, "iplab:Capture_Date", &self.creation_date);
+        put_str(meta, "iplab:Exposure", &self.exposure_time);
+        put_str(meta, "iplab:Gain", &self.gain);
+        put_str(meta, "iplab:Offset", &self.offset);
+        put_str(meta, "iplab:Interval_T", &self.delta_t);
+        put_str(meta, "iplab:Wavelength", &self.wavelength);
+        if let Some(v) = self.magnification {
+            meta.series_metadata
+                .insert("iplab:Objective_Mag".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = self.lens_na {
+            meta.series_metadata
+                .insert("iplab:Objective_NA".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = self.refractive_index {
+            meta.series_metadata
+                .insert("iplab:Objective_RI".into(), MetadataValue::Float(v));
+        }
+
+        // Ensure there is exactly one OME image to attach acquisition data to.
+        if ome.images.is_empty() {
+            ome.images.push(OmeImage::default());
+        }
+
+        // creationDate → store.setImageAcquisitionDate(...).
+        if let Some(date) = self.creation_date.as_ref().filter(|s| !s.trim().is_empty()) {
+            let date = date.trim().to_string();
+            ome.images[0].acquisition_date = Some(date.clone());
+            meta.series_metadata
+                .insert("acquisition_date".into(), MetadataValue::String(date));
+        }
+
+        // deltaT → store.setPixelsTimeIncrement(...).
+        let delta_t = self
+            .delta_t
+            .as_ref()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite());
+        if let Some(increment) = delta_t {
+            ome.images[0].time_increment = Some(increment);
+        }
+
+        // exposureTime → per-plane ExposureTime (seconds).
+        let exposure = self
+            .exposure_time
+            .as_ref()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite());
+
+        // Build one OmePlane per image plane so DeltaT/ExposureTime have a home.
+        if (delta_t.is_some() || exposure.is_some()) && ome.images[0].planes.is_empty() {
+            let plane_count = meta.image_count.max(1);
+            for index in 0..plane_count {
+                let the_z = if meta.size_z > 0 {
+                    index % meta.size_z
+                } else {
+                    0
+                };
+                let the_t = if meta.size_z > 0 {
+                    index / meta.size_z
+                } else {
+                    0
+                };
+                ome.images[0].planes.push(OmePlane {
+                    the_z,
+                    the_c: 0,
+                    the_t,
+                    delta_t,
+                    exposure_time: exposure,
+                    ..OmePlane::default()
+                });
+            }
+        }
+
+        // Objective (lensNA / magnification) and Detector (gain / binning) live
+        // on a single Instrument, referenced by the image.
+        let mut instrument = OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            ..Default::default()
+        };
+
+        let has_objective = self.lens_na.is_some() || self.magnification.is_some();
+        if has_objective || self.refractive_index.is_some() {
+            instrument.objectives.push(OmeObjective {
+                id: Some(create_lsid("Objective", &[0, 0])),
+                correction: Some("Other".into()),
+                immersion: Some("Other".into()),
+                lens_na: self.lens_na,
+                nominal_magnification: self.magnification,
+                ..Default::default()
+            });
+            ome.images[0].objective_ref = Some(0);
+        }
+
+        // binX/binY → DetectorSettings binning string "<x>x<y>".
+        let binning = match (self.bin_x.as_ref(), self.bin_y.as_ref()) {
+            (Some(x), Some(y)) => Some(format!("{}x{}", x.trim(), y.trim())),
+            _ => None,
+        };
+        let gain = self
+            .gain
+            .as_ref()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite());
+
+        instrument.detectors.push(OmeDetector {
+            id: Some(create_lsid("Detector", &[0, 0])),
+            detector_type: Some("Other".into()),
+            gain,
+            ..Default::default()
+        });
+
+        // DetectorSettings (gain + binning) hang off the first channel.
+        if gain.is_some() || binning.is_some() {
+            if ome.images[0].channels.is_empty() {
+                ome.images[0].channels.push(OmeChannel {
+                    samples_per_pixel: meta.size_c.max(1),
+                    ..OmeChannel::default()
+                });
+            }
+            let channel = &mut ome.images[0].channels[0];
+            channel.detector_settings_gain = gain;
+            channel.detector_settings_binning = binning;
+            channel.detector_ref = Some(create_lsid("Detector", &[0, 0]));
+        }
+
+        let instrument_index = ome.instruments.len();
+        ome.instruments.push(instrument);
+        ome.images[0].instrument_ref = Some(instrument_index);
+
+        // refractiveIndex → ObjectiveSettings RefractiveIndex; OmeMetadata has no
+        // dedicated field, so surface it as series metadata only (Java keeps it on
+        // the store, which we also mirror via the iplab:Objective_RI key above).
+        if let Some(wavelength) = self.wavelength.as_ref().filter(|s| !s.trim().is_empty()) {
+            meta.series_metadata.insert(
+                "iVision XML Wavelength".into(),
+                MetadataValue::String(wavelength.clone()),
+            );
+        }
+    }
 }
 
 fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
@@ -4379,8 +6876,15 @@ struct XlefDelegate {
 
 #[derive(Clone, Copy)]
 enum XlefSeriesRef {
-    Delegate { delegate: usize, series: usize },
-    Lms { metadata: usize },
+    Delegate {
+        delegate: usize,
+        series: usize,
+        /// Tile index within the referencing XLIF tilescan (0 when not a tilescan).
+        tile: usize,
+    },
+    Lms {
+        metadata: usize,
+    },
 }
 
 impl XlefReader {
@@ -4455,14 +6959,50 @@ impl XlefReader {
         }
     }
 
-    fn add_delegate(&mut self, reference: &Path, mut reader: Box<dyn FormatReader>) -> Result<()> {
+    /// Builds the unsupported-pixel error for an LMS metadata-only series. Returns
+    /// `None` for pixel-delegate series (which can decode normally). When the LMS
+    /// leaf declared a raw pixel layout, the message enumerates the declaration
+    /// (Java LMSMainXmlNodes: ChannelDescription/DimensionDescription BytesInc plus
+    /// Memory/Storage block nodes) so callers know exactly what was unsupported.
+    fn lms_pixel_delegate_error(&self) -> Option<BioFormatsError> {
+        let meta = self.current_lms_metadata()?;
+        let int = |key: &str| match meta.series_metadata.get(key) {
+            Some(crate::common::metadata::MetadataValue::Int(value)) => *value,
+            _ => 0,
+        };
+        let declared = matches!(
+            meta.series_metadata.get("xlef.lms.pixel_layout.status"),
+            Some(crate::common::metadata::MetadataValue::String(status)) if status == "declared_unsupported"
+        );
+        let path = xlef_lms_metadata_string(meta, "xlef.lms.path").unwrap_or_default();
+        let message = if declared {
+            format!(
+                "Leica XLEF LMS metadata series has no pixel delegate yet: unsupported LMS pixel layout declared by {path} ({} ChannelDescription BytesInc strides, {} DimensionDescription BytesInc strides, {} memory nodes, {} storage nodes)",
+                int("xlef.lms.pixel_layout.channel_bytes_inc_count"),
+                int("xlef.lms.pixel_layout.dimension_bytes_inc_count"),
+                int("xlef.lms.pixel_layout.memory_count"),
+                int("xlef.lms.pixel_layout.storage_count"),
+            )
+        } else {
+            "Leica XLEF LMS metadata series has no pixel delegate yet".into()
+        };
+        Some(BioFormatsError::UnsupportedFormat(message))
+    }
+
+    fn add_delegate(
+        &mut self,
+        reference: &Path,
+        tile_count: u32,
+        mut reader: Box<dyn FormatReader>,
+    ) -> Result<()> {
         reader.set_id(reference)?;
-        self.add_initialized_delegate(reference, reader)
+        self.add_initialized_delegate(reference, tile_count, reader)
     }
 
     fn add_initialized_delegate(
         &mut self,
         reference: &Path,
+        tile_count: u32,
         reader: Box<dyn FormatReader>,
     ) -> Result<()> {
         let delegate_index = self.delegates.len();
@@ -4473,11 +7013,18 @@ impl XlefReader {
                 reference.display()
             )));
         }
+        // Tilescans are exposed as one series per tile (Java: LIFReader/XLEF
+        // getReaderIndex semantics). The delegate itself only knows one physical
+        // series; each tile re-reads the same delegate series.
+        let tile_count = tile_count.max(1) as usize;
         for series in 0..series_count {
-            self.series_map.push(XlefSeriesRef::Delegate {
-                delegate: delegate_index,
-                series,
-            });
+            for tile in 0..tile_count {
+                self.series_map.push(XlefSeriesRef::Delegate {
+                    delegate: delegate_index,
+                    series,
+                    tile,
+                });
+            }
         }
         self.delegates.push(XlefDelegate {
             reader,
@@ -4492,8 +7039,12 @@ impl XlefReader {
 
         for series_index in 0..series_count {
             let mapping = self.series_map[series_index];
-            let (mut meta, source_path, source_kind) = match mapping {
-                XlefSeriesRef::Delegate { delegate, series } => {
+            let (mut meta, source_path, source_kind, tile) = match mapping {
+                XlefSeriesRef::Delegate {
+                    delegate,
+                    series,
+                    tile,
+                } => {
                     let delegate = self
                         .delegates
                         .get_mut(delegate)
@@ -4503,6 +7054,7 @@ impl XlefReader {
                         delegate.reader.metadata().clone(),
                         delegate.path.display().to_string(),
                         "pixel_delegate",
+                        Some(tile),
                     )
                 }
                 XlefSeriesRef::Lms { metadata } => {
@@ -4513,7 +7065,7 @@ impl XlefReader {
                         .clone();
                     let source_path =
                         xlef_lms_metadata_string(&meta, "xlef.lms.path").unwrap_or_default();
-                    (meta, source_path, "lms_metadata")
+                    (meta, source_path, "lms_metadata", None)
                 }
             };
 
@@ -4543,6 +7095,12 @@ impl XlefReader {
                 "xlef.project.source_kind".into(),
                 MetadataValue::String(source_kind.into()),
             );
+            if let Some(tile) = tile {
+                meta.series_metadata.insert(
+                    "xlef.project.tile_index".into(),
+                    MetadataValue::Int(tile as i64),
+                );
+            }
             metadata.push(meta);
         }
 
@@ -4551,8 +7109,9 @@ impl XlefReader {
     }
 
     fn set_delegate_series_for_current(&mut self) -> Result<()> {
-        if let Some(XlefSeriesRef::Delegate { delegate, series }) =
-            self.series_map.get(self.current_series).copied()
+        if let Some(XlefSeriesRef::Delegate {
+            delegate, series, ..
+        }) = self.series_map.get(self.current_series).copied()
         {
             self.delegates[delegate].reader.set_series(series)?;
         }
@@ -4562,7 +7121,7 @@ impl XlefReader {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum XlefReference {
-    Image(PathBuf),
+    Image { path: PathBuf, tile_count: u32 },
     Lms(PathBuf),
 }
 
@@ -4577,6 +7136,20 @@ fn xlef_collect_referenced_images(
     }
 
     let xml = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+    // Tilescans: an XLIF document declares its tile count via the DimensionDescription
+    // whose DimID is "10" (Java XlifDocument.getTileCount). Images referenced directly
+    // by this XLIF inherit that tile count; non-XLIF documents default to a single tile.
+    let doc_tile_count = if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+        == Some("xlif")
+    {
+        xlef_xlif_tile_count(&xml)
+    } else {
+        1
+    };
     let mut images: Vec<XlefReference> = Vec::new();
     for reference in xlef_referenced_paths(&xml, path) {
         if xlef_is_project_reference(&reference) {
@@ -4590,7 +7163,10 @@ fn xlef_collect_referenced_images(
                 unsupported.push(reference);
             }
         } else if xlef_is_supported_image_reference(&reference) {
-            let image = XlefReference::Image(reference);
+            let image = XlefReference::Image {
+                path: reference,
+                tile_count: doc_tile_count,
+            };
             if !images.iter().any(|p| p == &image) {
                 images.push(image);
             }
@@ -4687,6 +7263,24 @@ fn xlef_is_project_reference(path: &Path) -> bool {
     )
 }
 
+// Translation of Leica XlifDocument.getTileCount(): scan DimensionDescription
+// nodes and return the NumberOfElements of the one whose DimID is "10",
+// defaulting to a single tile.
+fn xlef_xlif_tile_count(xml: &str) -> u32 {
+    for (name, attrs) in scn_scan_tags(xml) {
+        if name != "DimensionDescription" {
+            continue;
+        }
+        if attrs.get("DimID").map(|id| id.as_str()) == Some("10") {
+            return attrs
+                .get("NumberOfElements")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .unwrap_or(1);
+        }
+    }
+    1
+}
+
 fn xlef_is_supported_image_reference(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -4745,13 +7339,20 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
     meta.dimension_order = crate::common::metadata::DimensionOrder::XYZCT;
     let mut channel_count_from_descriptions = 0u32;
     let mut size_c_from_dimension = false;
+    // Pixel-layout diagnostics: Leica LMS metadata leaves declare their raw pixel
+    // payout through per-channel/per-dimension BytesInc strides plus optional
+    // Memory/Storage block nodes. We capture the shape of that declaration (Java
+    // LMSMainXmlNodes: ChannelDescription/DimensionDescription/Memory/Storage) so
+    // the unsupported-layout diagnostics can describe exactly what was declared.
+    let mut channel_bytes_inc_count = 0i64;
+    let mut dimension_bytes_inc_count = 0i64;
+    let mut memory_count = 0i64;
+    let mut storage_count = 0i64;
+    // ROI alias capture index (Java LeicaMicrosystemsMetadata ROIs/ROI extractor).
+    let mut roi_index = 0u32;
     meta.series_metadata.insert(
         "xlef.lms.path".into(),
         crate::common::metadata::MetadataValue::String(reference.display().to_string()),
-    );
-    meta.series_metadata.insert(
-        "xlef.lms.pixel_payload".into(),
-        crate::common::metadata::MetadataValue::String("unsupported".into()),
     );
 
     for (name, attrs) in &tags {
@@ -4791,6 +7392,9 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
         } else if name.eq_ignore_ascii_case("ChannelDescription") {
             let channel_index = channel_count_from_descriptions;
             channel_count_from_descriptions = channel_count_from_descriptions.saturating_add(1);
+            if attrs.contains_key("BytesInc") {
+                channel_bytes_inc_count += 1;
+            }
             xlef_lms_insert_channel_metadata(&mut meta, channel_index, attrs);
             if let Some(bits) = attrs.get("Resolution").and_then(|v| v.parse::<u8>().ok()) {
                 meta.bits_per_pixel = bits;
@@ -4816,6 +7420,14 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
                 format!("xlef.lms.dimension.{dim_id}.elements"),
                 crate::common::metadata::MetadataValue::Int(elements as i64),
             );
+            if let Some(bytes_inc) = attrs.get("BytesInc").and_then(|v| v.trim().parse::<i64>().ok())
+            {
+                dimension_bytes_inc_count += 1;
+                meta.series_metadata.insert(
+                    format!("xlef.lms.dimension.{dim_id}.bytes_inc"),
+                    crate::common::metadata::MetadataValue::Int(bytes_inc),
+                );
+            }
             if let Some(unit) = attrs.get("Unit").filter(|v| !v.is_empty()) {
                 meta.series_metadata.insert(
                     format!("xlef.lms.dimension.{dim_id}.unit"),
@@ -4872,7 +7484,129 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
                 }
                 _ => {}
             }
+        } else if name.eq_ignore_ascii_case("ROI") {
+            // Translation of LeicaMicrosystemsMetadata ROI extraction: capture the
+            // shape-defining attribute aliases (Rectangle X/Y/Width/Height,
+            // Line X1/Y1/X2/Y2/TheZ, Ellipse CenterX/CenterY/RadiusX/RadiusY/TheC/TheT,
+            // Point X/Y/IndexC) under xlef.lms.roi.N.* so they can later project to
+            // OME shapes. The graph-count pass below counts the same ROI nodes.
+            let prefix = format!("xlef.lms.roi.{roi_index}");
+            roi_index += 1;
+            for (attr, suffix) in [("ID", "id"), ("Name", "name")] {
+                if let Some(value) = attrs.get(attr).filter(|v| !v.trim().is_empty()) {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.{suffix}"),
+                        crate::common::metadata::MetadataValue::String(value.trim().to_string()),
+                    );
+                }
+            }
+            for (attr, suffix) in [
+                ("X", "x"),
+                ("Y", "y"),
+                ("Width", "width"),
+                ("Height", "height"),
+                ("X1", "x1"),
+                ("Y1", "y1"),
+                ("X2", "x2"),
+                ("Y2", "y2"),
+                ("CenterX", "center_x"),
+                ("CenterY", "center_y"),
+                ("RadiusX", "radius_x"),
+                ("RadiusY", "radius_y"),
+            ] {
+                if let Some(value) = attrs.get(attr).and_then(|v| xlef_parse_f64(v)) {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.{suffix}"),
+                        crate::common::metadata::MetadataValue::Float(value),
+                    );
+                }
+            }
+            for (attr, suffix) in [
+                ("TheZ", "the_z"),
+                ("TheC", "the_c"),
+                ("TheT", "the_t"),
+                ("IndexC", "index_c"),
+            ] {
+                if let Some(value) = attrs.get(attr).and_then(|v| v.trim().parse::<i64>().ok()) {
+                    meta.series_metadata.insert(
+                        format!("{prefix}.{suffix}"),
+                        crate::common::metadata::MetadataValue::Int(value),
+                    );
+                }
+            }
+            if let Some(shape) = attrs.get("Shape").filter(|v| !v.trim().is_empty()) {
+                meta.series_metadata.insert(
+                    format!("{prefix}.shape"),
+                    crate::common::metadata::MetadataValue::String(shape.trim().to_string()),
+                );
+            }
+        } else if name.eq_ignore_ascii_case("Memory") {
+            memory_count += 1;
+            if memory_count == 1 {
+                if let Some(value) = attrs.get("Compression").filter(|v| !v.trim().is_empty()) {
+                    meta.series_metadata.insert(
+                        "xlef.lms.pixel_layout.compression".into(),
+                        crate::common::metadata::MetadataValue::String(value.trim().to_string()),
+                    );
+                }
+                if let Some(value) = attrs.get("MemoryBlockID").filter(|v| !v.trim().is_empty()) {
+                    meta.series_metadata.insert(
+                        "xlef.lms.pixel_layout.memory_block_id".into(),
+                        crate::common::metadata::MetadataValue::String(value.trim().to_string()),
+                    );
+                }
+            }
+        } else if name.eq_ignore_ascii_case("Storage") {
+            storage_count += 1;
+            if storage_count == 1 {
+                if let Some(value) = attrs.get("FileName").filter(|v| !v.trim().is_empty()) {
+                    meta.series_metadata.insert(
+                        "xlef.lms.pixel_layout.storage_reference".into(),
+                        crate::common::metadata::MetadataValue::String(value.trim().to_string()),
+                    );
+                }
+            }
         }
+    }
+
+    // Pixel-layout payload classification. A layout is "declared" when the leaf
+    // exposes any raw-stride or block reference (Java LMSMainXmlNodes). We surface
+    // the declared-but-unsupported state plus the diagnostic counts; metadata-only
+    // leaves with no such declaration keep the plain "unsupported" payload marker.
+    let pixel_layout_declared = channel_bytes_inc_count > 0
+        || dimension_bytes_inc_count > 0
+        || memory_count > 0
+        || storage_count > 0;
+    if pixel_layout_declared {
+        meta.series_metadata.insert(
+            "xlef.lms.pixel_payload".into(),
+            crate::common::metadata::MetadataValue::String("declared_unsupported".into()),
+        );
+        meta.series_metadata.insert(
+            "xlef.lms.pixel_layout.status".into(),
+            crate::common::metadata::MetadataValue::String("declared_unsupported".into()),
+        );
+        meta.series_metadata.insert(
+            "xlef.lms.pixel_layout.channel_bytes_inc_count".into(),
+            crate::common::metadata::MetadataValue::Int(channel_bytes_inc_count),
+        );
+        meta.series_metadata.insert(
+            "xlef.lms.pixel_layout.dimension_bytes_inc_count".into(),
+            crate::common::metadata::MetadataValue::Int(dimension_bytes_inc_count),
+        );
+        meta.series_metadata.insert(
+            "xlef.lms.pixel_layout.memory_count".into(),
+            crate::common::metadata::MetadataValue::Int(memory_count),
+        );
+        meta.series_metadata.insert(
+            "xlef.lms.pixel_layout.storage_count".into(),
+            crate::common::metadata::MetadataValue::Int(storage_count),
+        );
+    } else {
+        meta.series_metadata.insert(
+            "xlef.lms.pixel_payload".into(),
+            crate::common::metadata::MetadataValue::String("unsupported".into()),
+        );
     }
 
     xlef_lms_capture_graph_metadata(&mut meta, &tags);
@@ -4943,6 +7677,9 @@ fn xlef_lms_graph_kind(name: &str) -> Option<&'static str> {
         "detectordescription" | "detector" => Some("detector"),
         "laserdescription" | "laser" | "lasersource" => Some("laser"),
         "objectivedescription" | "objective" => Some("objective"),
+        "microscopedescription" | "microscope" => Some("microscope"),
+        "filterdescription" | "filter" => Some("filter"),
+        "dichroicdescription" | "dichroic" => Some("dichroic"),
         "roi" | "roidescription" | "regionofinterest" => Some("roi"),
         "stageposition" | "position" | "positiondescription" => Some("position"),
         "timestamp" | "timestampdescription" | "timestamplist" => Some("timestamp"),
@@ -4970,11 +7707,20 @@ fn xlef_lms_capture_graph_attrs(
         "Wavelength",
         "Power",
         "Magnification",
+        "CalibratedMagnification",
         "NumericalAperture",
         "NA",
+        "WorkingDistance",
         "Immersion",
         "Correction",
         "Medium",
+        "Gain",
+        "Offset",
+        "FilterType",
+        "CutIn",
+        "CutOut",
+        "ExcitationWavelength",
+        "EmissionWavelength",
         "X",
         "Y",
         "Z",
@@ -5015,8 +7761,16 @@ fn xlef_lms_graph_float_attr(key: &str) -> bool {
         "Wavelength"
             | "Power"
             | "Magnification"
+            | "CalibratedMagnification"
             | "NumericalAperture"
             | "NA"
+            | "WorkingDistance"
+            | "Gain"
+            | "Offset"
+            | "CutIn"
+            | "CutOut"
+            | "ExcitationWavelength"
+            | "EmissionWavelength"
             | "X"
             | "Y"
             | "Z"
@@ -5097,6 +7851,54 @@ fn xlef_lms_insert_channel_metadata(
             format!("{prefix}.resolution"),
             crate::common::metadata::MetadataValue::Int(bits),
         );
+    }
+    // Channel colour (Java LeicaMicrosystemsMetadata.Channel.setColor). Leica
+    // encodes the channel LUT either as an HTML hex colour ("#RRGGBB") or as a
+    // comma-separated "R,G,B" triple. We retain the original string and also pack
+    // it into OME's signed-i32 RGBA word (R<<24 | G<<16 | B<<8 | 0xFF).
+    if let Some(raw) = attrs
+        .get("Color")
+        .or_else(|| attrs.get("ColorRGB"))
+        .filter(|v| !v.trim().is_empty())
+    {
+        let raw = raw.trim();
+        meta.series_metadata.insert(
+            format!("{prefix}.color"),
+            crate::common::metadata::MetadataValue::String(raw.to_string()),
+        );
+        let rgb = if let Some(hex) = raw.strip_prefix('#') {
+            (hex.len() == 6)
+                .then(|| u32::from_str_radix(hex, 16).ok())
+                .flatten()
+                .map(|packed| {
+                    (
+                        ((packed >> 16) & 0xff) as i64,
+                        ((packed >> 8) & 0xff) as i64,
+                        (packed & 0xff) as i64,
+                    )
+                })
+        } else {
+            let parts: Vec<&str> = raw.split(',').map(|p| p.trim()).collect();
+            if parts.len() == 3 {
+                match (
+                    parts[0].parse::<i64>(),
+                    parts[1].parse::<i64>(),
+                    parts[2].parse::<i64>(),
+                ) {
+                    (Ok(r), Ok(g), Ok(b)) => Some((r & 0xff, g & 0xff, b & 0xff)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((r, g, b)) = rgb {
+            let ome_color = ((r << 24) | (g << 16) | (b << 8) | 0xff) as i32 as i64;
+            meta.series_metadata.insert(
+                format!("{prefix}.ome_color"),
+                crate::common::metadata::MetadataValue::Int(ome_color),
+            );
+        }
     }
 }
 
@@ -5190,8 +7992,251 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
             channel.emission_wavelength =
                 xlef_lms_metadata_float(meta, &format!("{prefix}.emission_wavelength"))
                     .filter(|v| *v > 0.0);
+            // OME channel colour: the LMS extractor pre-packed the channel LUT into
+            // the signed RGBA word (xlef.lms.channel.N.ome_color).
+            if let Some(crate::common::metadata::MetadataValue::Int(packed)) =
+                meta.series_metadata.get(&format!("{prefix}.ome_color"))
+            {
+                channel.color = Some(*packed as i32);
+            }
         }
     }
+
+    // Instrument graph (Java LeicaMicrosystemsMetadata hardware extractors). The
+    // generic OME projection deliberately skips the xlef.lms.* namespace, so we
+    // build the single LMS instrument explicitly here from the captured graph keys.
+    let mut instrument = crate::common::ome_metadata::OmeInstrument {
+        id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+        microscope_model: xlef_lms_metadata_string(meta, "xlef.lms.microscope.0.name"),
+        microscope_manufacturer: xlef_lms_metadata_string(
+            meta,
+            "xlef.lms.microscope.0.manufacturer",
+        ),
+        ..Default::default()
+    };
+    let objective_model = xlef_lms_metadata_string(meta, "xlef.lms.objective.0.name");
+    if objective_model.is_some()
+        || meta
+            .series_metadata
+            .keys()
+            .any(|k| k.starts_with("xlef.lms.objective.0."))
+    {
+        instrument
+            .objectives
+            .push(crate::common::ome_metadata::OmeObjective {
+                id: Some(crate::common::ome_metadata::create_lsid("Objective", &[0, 0])),
+                model: objective_model,
+                manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.objective.0.manufacturer"),
+                nominal_magnification: xlef_lms_metadata_float(
+                    meta,
+                    "xlef.lms.objective.0.magnification",
+                ),
+                calibrated_magnification: xlef_lms_metadata_float(
+                    meta,
+                    "xlef.lms.objective.0.calibrated_magnification",
+                ),
+                lens_na: xlef_lms_metadata_float(meta, "xlef.lms.objective.0.numerical_aperture"),
+                immersion: xlef_lms_metadata_string(meta, "xlef.lms.objective.0.immersion"),
+                correction: xlef_lms_metadata_string(meta, "xlef.lms.objective.0.correction"),
+                working_distance: xlef_lms_metadata_float(
+                    meta,
+                    "xlef.lms.objective.0.working_distance",
+                ),
+            });
+    }
+    if meta
+        .series_metadata
+        .keys()
+        .any(|k| k.starts_with("xlef.lms.detector.0."))
+    {
+        instrument
+            .detectors
+            .push(crate::common::ome_metadata::OmeDetector {
+                id: Some(crate::common::ome_metadata::create_lsid("Detector", &[0, 0])),
+                model: xlef_lms_metadata_string(meta, "xlef.lms.detector.0.name"),
+                manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.detector.0.manufacturer"),
+                detector_type: xlef_lms_metadata_string(meta, "xlef.lms.detector.0.type"),
+                gain: xlef_lms_metadata_float(meta, "xlef.lms.detector.0.gain"),
+                offset: xlef_lms_metadata_float(meta, "xlef.lms.detector.0.offset"),
+            });
+    }
+    if meta
+        .series_metadata
+        .keys()
+        .any(|k| k.starts_with("xlef.lms.laser.0."))
+    {
+        instrument
+            .light_sources
+            .push(crate::common::ome_metadata::OmeLightSource {
+                id: Some(crate::common::ome_metadata::create_lsid("LightSource", &[0, 0])),
+                model: xlef_lms_metadata_string(meta, "xlef.lms.laser.0.name"),
+                manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.laser.0.manufacturer"),
+                light_source_type: Some("Laser".into()),
+                power: xlef_lms_metadata_float(meta, "xlef.lms.laser.0.power"),
+            });
+    }
+    if meta
+        .series_metadata
+        .keys()
+        .any(|k| k.starts_with("xlef.lms.filter.0."))
+    {
+        instrument
+            .filters
+            .push(crate::common::ome_metadata::OmeFilter {
+                id: Some(crate::common::ome_metadata::create_lsid("Filter", &[0, 0])),
+                model: xlef_lms_metadata_string(meta, "xlef.lms.filter.0.name"),
+                manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.filter.0.manufacturer"),
+                filter_type: xlef_lms_metadata_string(meta, "xlef.lms.filter.0.filter_type"),
+                cut_in: xlef_lms_metadata_float(meta, "xlef.lms.filter.0.cut_in"),
+                cut_out: xlef_lms_metadata_float(meta, "xlef.lms.filter.0.cut_out"),
+            });
+    }
+    if meta
+        .series_metadata
+        .keys()
+        .any(|k| k.starts_with("xlef.lms.dichroic.0."))
+    {
+        instrument
+            .dichroics
+            .push(crate::common::ome_metadata::OmeDichroic {
+                id: Some(crate::common::ome_metadata::create_lsid("Dichroic", &[0, 0])),
+                model: xlef_lms_metadata_string(meta, "xlef.lms.dichroic.0.name"),
+                manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.dichroic.0.manufacturer"),
+            });
+    }
+    if instrument.microscope_model.is_some()
+        || instrument.microscope_manufacturer.is_some()
+        || !instrument.objectives.is_empty()
+        || !instrument.detectors.is_empty()
+        || !instrument.light_sources.is_empty()
+        || !instrument.filters.is_empty()
+        || !instrument.dichroics.is_empty()
+    {
+        if let Some(image) = ome.images.get_mut(0) {
+            image.instrument_ref = Some(0);
+            if !instrument.objectives.is_empty() {
+                image.objective_ref = Some(0);
+            }
+        }
+        ome.instruments = vec![instrument];
+    }
+
+    // ROIs (Java LeicaMicrosystemsMetadata ROIs/ROI extractor). Project the captured
+    // xlef.lms.roi.N.* alias keys into OME ROI shapes, dispatching on the recorded
+    // Shape (Line/Ellipse/Point) or, when absent, on which geometry aliases are set.
+    let mut roi_count = 0usize;
+    while meta
+        .series_metadata
+        .keys()
+        .any(|k| k.starts_with(&format!("xlef.lms.roi.{roi_count}.")))
+    {
+        roi_count += 1;
+    }
+    if roi_count > 0 {
+        let mut rois = Vec::with_capacity(roi_count);
+        for index in 0..roi_count {
+            let prefix = format!("xlef.lms.roi.{index}");
+            let the_z = xlef_lms_metadata_float(meta, &format!("{prefix}.the_z")).map(|v| v as u32);
+            let the_t = xlef_lms_metadata_float(meta, &format!("{prefix}.the_t")).map(|v| v as u32);
+            // OME Point/Ellipse channel index: Leica Point ROIs carry IndexC, while
+            // Ellipse ROIs carry TheC; both project onto OME the_c.
+            let the_c = xlef_lms_metadata_float(meta, &format!("{prefix}.the_c"))
+                .or_else(|| xlef_lms_metadata_float(meta, &format!("{prefix}.index_c")))
+                .map(|v| v as u32);
+            let shape_kind = xlef_lms_metadata_string(meta, &format!("{prefix}.shape"));
+            let x = xlef_lms_metadata_float(meta, &format!("{prefix}.x"));
+            let y = xlef_lms_metadata_float(meta, &format!("{prefix}.y"));
+            let center_x = xlef_lms_metadata_float(meta, &format!("{prefix}.center_x"));
+            let center_y = xlef_lms_metadata_float(meta, &format!("{prefix}.center_y"));
+            let x1 = xlef_lms_metadata_float(meta, &format!("{prefix}.x1"));
+            let y1 = xlef_lms_metadata_float(meta, &format!("{prefix}.y1"));
+            let x2 = xlef_lms_metadata_float(meta, &format!("{prefix}.x2"));
+            let y2 = xlef_lms_metadata_float(meta, &format!("{prefix}.y2"));
+            let width = xlef_lms_metadata_float(meta, &format!("{prefix}.width"));
+            let height = xlef_lms_metadata_float(meta, &format!("{prefix}.height"));
+            let radius_x = xlef_lms_metadata_float(meta, &format!("{prefix}.radius_x"));
+            let radius_y = xlef_lms_metadata_float(meta, &format!("{prefix}.radius_y"));
+
+            let is_line = shape_kind
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("Line"))
+                .unwrap_or(false)
+                || (x1.is_some() && y1.is_some() && x2.is_some() && y2.is_some());
+            let is_ellipse = shape_kind
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("Ellipse"))
+                .unwrap_or(false)
+                || (radius_x.is_some() && radius_y.is_some());
+
+            let shape = if is_line {
+                match (x1, y1, x2, y2) {
+                    (Some(x1), Some(y1), Some(x2), Some(y2)) => {
+                        Some(crate::common::ome_metadata::OmeShape::Line {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            the_z,
+                            the_t,
+                            the_c,
+                        })
+                    }
+                    _ => None,
+                }
+            } else if is_ellipse {
+                match (
+                    center_x.or(x),
+                    center_y.or(y),
+                    radius_x,
+                    radius_y,
+                ) {
+                    (Some(x), Some(y), Some(radius_x), Some(radius_y)) => {
+                        Some(crate::common::ome_metadata::OmeShape::Ellipse {
+                            x,
+                            y,
+                            radius_x,
+                            radius_y,
+                            the_z,
+                            the_t,
+                            the_c,
+                        })
+                    }
+                    _ => None,
+                }
+            } else if let (Some(x), Some(y), Some(width), Some(height)) = (x, y, width, height) {
+                Some(crate::common::ome_metadata::OmeShape::Rectangle {
+                    x,
+                    y,
+                    width,
+                    height,
+                    the_z,
+                    the_t,
+                    the_c,
+                })
+            } else if let (Some(x), Some(y)) = (x, y) {
+                Some(crate::common::ome_metadata::OmeShape::Point {
+                    x,
+                    y,
+                    the_z,
+                    the_t,
+                    the_c,
+                })
+            } else {
+                None
+            };
+
+            let id = xlef_lms_metadata_string(meta, &format!("{prefix}.id"))
+                .or_else(|| Some(crate::common::ome_metadata::create_lsid("ROI", &[index])));
+            let name = xlef_lms_metadata_string(meta, &format!("{prefix}.name"));
+            rois.push(crate::common::ome_metadata::OmeROI {
+                id,
+                name,
+                shapes: shape.into_iter().collect(),
+            });
+        }
+        ome.rois = rois;
+    }
+
     let _ = ome.add_original_metadata_annotations(meta, 0);
     ome
 }
@@ -5254,12 +8299,12 @@ impl FormatReader for XlefReader {
         let references = Self::referenced_images(path)?;
         for reference in references {
             match reference {
-                XlefReference::Image(reference) => {
-                    self.add_delegate(&reference, xlef_delegate_for_reference(&reference))?;
+                XlefReference::Image { path, tile_count } => {
+                    self.add_delegate(&path, tile_count, xlef_delegate_for_reference(&path))?;
                 }
                 XlefReference::Lms(reference) => {
                     if let Some(reader) = xlef_lms_delegate_for_reference(&reference)? {
-                        self.add_initialized_delegate(&reference, reader)?;
+                        self.add_initialized_delegate(&reference, 1, reader)?;
                     } else {
                         let metadata = xlef_lms_metadata_for_reference(&reference)?;
                         let metadata_index = self.lms_metadata.len();
@@ -5295,7 +8340,10 @@ impl FormatReader for XlefReader {
             .series_map
             .get(s)
             .ok_or(BioFormatsError::SeriesOutOfRange(s))?;
-        if let XlefSeriesRef::Delegate { delegate, series } = mapping {
+        if let XlefSeriesRef::Delegate {
+            delegate, series, ..
+        } = mapping
+        {
             self.delegates[delegate].reader.set_series(series)?;
         }
         self.current_series = s;
@@ -5312,9 +8360,15 @@ impl FormatReader for XlefReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if let Some(error) = self.lms_pixel_delegate_error() {
+            return Err(error);
+        }
         self.current_delegate_mut()?.open_bytes(p)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        if let Some(error) = self.lms_pixel_delegate_error() {
+            return Err(error);
+        }
         self.current_delegate_mut()?
             .open_bytes_region(p, x, y, w, h)
     }
@@ -6537,6 +9591,10 @@ struct VsiPyramidMeta {
     blue_offset: Option<f64>,
     stack_type: Option<String>,
     acquisition_time: Option<i64>,
+    /// Stage origin position (micrometres) from RWC_FRAME_ORIGIN
+    /// (CellSensReader.java:1859-1863).
+    origin_x: Option<f64>,
+    origin_y: Option<f64>,
     /// Prefix-gated VALUE metadata (CellSensReader.java:1960-1979).
     channel_wavelengths: Vec<f64>,
     z_start: Option<f64>,
@@ -6552,6 +9610,13 @@ struct VsiPyramidMeta {
     /// exposures; the prefixed ones land here.
     default_exposure_time: Option<i64>,
     other_exposure_times: Vec<i64>,
+    /// Generic named-tag original metadata: `(tagPrefix + getTagName(tag))`
+    /// keyed raw string values, mirroring Java's
+    /// `addMetaList(tagPrefix + tagName, value, ...)` /
+    /// `addGlobalMetaList(...)` (CellSensReader.java:1995-2002). Kept as an
+    /// ordered list so repeated keys accumulate (like Java's Vector-valued
+    /// metadata entries). Surfaced alongside the typed `cellsens.ets.*` keys.
+    named_tags: Vec<(String, String)>,
 }
 
 const ETS_RAW: i32 = 0;
@@ -7224,7 +10289,7 @@ fn insert_cellsens_acquisition_metadata(
             }
         }
     }
-    let floats: [(&str, Option<f64>); 12] = [
+    let floats: [(&str, Option<f64>); 14] = [
         ("objective_magnification", m.magnification),
         ("numerical_aperture", m.numerical_aperture),
         ("working_distance", m.working_distance),
@@ -7237,6 +10302,9 @@ fn insert_cellsens_acquisition_metadata(
         ("red_offset", m.red_offset),
         ("green_offset", m.green_offset),
         ("blue_offset", m.blue_offset),
+        // Stage origin position (CellSensReader.java:1859-1863).
+        ("frame_origin_x", m.origin_x),
+        ("frame_origin_y", m.origin_y),
     ];
     for (key, val) in floats {
         if let Some(x) = val {
@@ -7304,6 +10372,30 @@ fn insert_cellsens_acquisition_metadata(
             MetadataValue::Int(*x),
         );
     }
+
+    // Generic named-tag original metadata, the `tagPrefix + getTagName(tag)`
+    // string keys Java records via addMetaList/addGlobalMetaList
+    // (CellSensReader.java:1995-2002). Repeated keys accumulate into a Vector in
+    // Java; here we surface a single occurrence under `{prefix}.tag.{name}` and
+    // any further occurrences under `{prefix}.tag.{name}.{idx}` (matching how the
+    // other list-valued metadata is surfaced).
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (key, _) in &m.named_tags {
+        *counts.entry(key.as_str()).or_insert(0) += 1;
+    }
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for (key, value) in &m.named_tags {
+        let total = counts.get(key.as_str()).copied().unwrap_or(1);
+        let full = if total > 1 {
+            let i = seen.entry(key.as_str()).or_insert(0);
+            let out = format!("{prefix}.tag.{key}.{i}");
+            *i += 1;
+            out
+        } else {
+            format!("{prefix}.tag.{key}")
+        };
+        sm.insert(full, MetadataValue::String(value.clone()));
+    }
 }
 
 // ---- VSI proprietary tag-tree parser (CellSensReader.java:1589-2079) --------
@@ -7356,6 +10448,12 @@ const VSI_TILE_ORIGIN: i32 = 2410;
 // RWC_FRAME_SCALE: physical pixel size (doubleValues[0]/[1]) in micrometres
 // (CellSensReader.java:300, 1853-1858).
 const VSI_RWC_FRAME_SCALE: i32 = 2019;
+// RWC_FRAME_ORIGIN: stage origin position (doubleValues[0]/[1]) in micrometres
+// (CellSensReader.java:300, 1859-1863). Numerically equal to
+// EXTERNAL_FILE_PROPERTIES (2018); the two are disambiguated by context exactly
+// as in Java (the metadata-index bump checks the tag against IMAGE_FRAME_VOLUME,
+// while the origin capture lives in the DOUBLE-array leaf switch).
+const VSI_RWC_FRAME_ORIGIN: i32 = 2018;
 const VSI_HAS_EXTERNAL_FILE: i32 = 20005;
 const VSI_Z_START: i32 = 2012;
 const VSI_TIME_START: i32 = 2100;
@@ -7511,7 +10609,7 @@ impl<'a> VsiTagParser<'a> {
         }
     }
 
-    fn read_tags_inner(&mut self, container_fp: i64, _populate: bool, tag_prefix: &str) -> i64 {
+    fn read_tags_inner(&mut self, container_fp: i64, populate: bool, tag_prefix: &str) -> i64 {
         if container_fp + 24 >= self.len() {
             return container_fp;
         }
@@ -7632,6 +10730,26 @@ impl<'a> VsiTagParser<'a> {
                         self.capture_metadata(tag, v, tag_prefix);
                     }
                 }
+
+                // Generic named-tag original metadata, mirroring Java's
+                // addMetaList/addGlobalMetaList(tagPrefix + getTagName(tag), value)
+                // (CellSensReader.java:1995-2002). Only emitted when the tag has a
+                // known name and metadata population is enabled. The
+                // metadataIndex >= 0 (per-pyramid `addMetaList`) branch is the one
+                // surfaced into series_metadata; the global branch (< 0) gates out
+                // the bare VALUE tag exactly like Java.
+                if populate {
+                    if let (Some(name), Some(v)) = (cellsens_tag_name(tag), &value) {
+                        let key = format!("{tag_prefix}{name}");
+                        if self.metadata_index >= 0 {
+                            let idx = self.metadata_index as usize;
+                            self.pyramids[idx].meta.named_tags.push((key, v.clone()));
+                        }
+                        // else: global metadata (tag != VALUE || prefix non-empty);
+                        // the per-ETS reader has no global series store, so unlike
+                        // Java these are not surfaced here.
+                    }
+                }
             }
 
             // Dimension ordering (CellSensReader.java:2013-2061).
@@ -7710,7 +10828,10 @@ impl<'a> VsiTagParser<'a> {
         match tag {
             VSI_DEVICE_NAME => m.device_names.push(v.to_string()),
             VSI_DEVICE_ID => m.device_ids.push(v.to_string()),
-            VSI_DEVICE_SUBTYPE => m.device_subtypes.push(v.to_string()),
+            // DEVICE_SUBTYPE is translated to a label before storage, mirroring
+            // Java's `getDeviceSubtype(value)` then `pyramid.deviceTypes.add(value)`
+            // (CellSensReader.java:1886-1889).
+            VSI_DEVICE_SUBTYPE => m.device_subtypes.push(get_device_subtype(v)),
             VSI_DEVICE_MANUFACTURER => m.device_manufacturers.push(v.to_string()),
             VSI_OBJECTIVE_NAME => m.objective_names.push(v.to_string()),
             VSI_OBJECTIVE_TYPE => {
@@ -7769,7 +10890,9 @@ impl<'a> VsiTagParser<'a> {
             VSI_RED_OFFSET => m.red_offset = as_f64(),
             VSI_GREEN_OFFSET => m.green_offset = as_f64(),
             VSI_BLUE_OFFSET => m.blue_offset = as_f64(),
-            VSI_STACK_TYPE => m.stack_type = Some(v.to_string()),
+            // STACK_TYPE is translated to a label before storage, mirroring Java's
+            // `value = getStackType(value)` (CellSensReader.java:1883-1884).
+            VSI_STACK_TYPE => m.stack_type = Some(get_stack_type(v)),
             VSI_CREATION_TIME => {
                 if m.acquisition_time.is_none() {
                     m.acquisition_time = as_i64();
@@ -7871,11 +10994,290 @@ impl<'a> VsiTagParser<'a> {
                         p.physical_size_x = Some(vals[0]);
                         p.physical_size_y = Some(vals[1]);
                     }
+                } else if tag == VSI_RWC_FRAME_ORIGIN && vals.len() >= 2 && self.metadata_index >= 0
+                {
+                    // Stage origin position (CellSensReader.java:1859-1863). Only the
+                    // first value wins, mirroring Java's `pyramid.originX == null` guard.
+                    let m = &mut self.pyramids[self.metadata_index as usize].meta;
+                    if m.origin_x.is_none() {
+                        m.origin_x = Some(vals[0]);
+                        m.origin_y = Some(vals[1]);
+                    }
                 }
                 Some(format!("{vals:?}"))
             }
             _ => None,
         }
+    }
+}
+
+// Stack-type enum values (CellSensReader.java:315-323), translated by
+// `get_stack_type`.
+const VSI_STACK_DEFAULT_IMAGE: i64 = 0;
+const VSI_STACK_OVERVIEW_IMAGE: i64 = 1;
+const VSI_STACK_SAMPLE_MASK: i64 = 2;
+const VSI_STACK_FOCUS_IMAGE: i64 = 4;
+const VSI_STACK_EFI_SHARPNESS_MAP: i64 = 8;
+const VSI_STACK_EFI_HEIGHT_MAP: i64 = 16;
+const VSI_STACK_EFI_TEXTURE_MAP: i64 = 32;
+const VSI_STACK_EFI_STACK: i64 = 64;
+const VSI_STACK_MACRO_IMAGE: i64 = 256;
+
+/// Translate a STACK_TYPE numeric code to a human-readable label. Mirrors
+/// `CellSensReader.getStackType` (CellSensReader.java:2564-2587). An unrecognised
+/// (or non-numeric) value passes through unchanged, exactly like Java.
+fn get_stack_type(value: &str) -> String {
+    match value.trim().parse::<i64>() {
+        Ok(VSI_STACK_DEFAULT_IMAGE) => "Default image".to_string(),
+        Ok(VSI_STACK_OVERVIEW_IMAGE) => "Overview image".to_string(),
+        Ok(VSI_STACK_SAMPLE_MASK) => "Sample mask".to_string(),
+        Ok(VSI_STACK_FOCUS_IMAGE) => "Focus image".to_string(),
+        Ok(VSI_STACK_EFI_SHARPNESS_MAP) => "EFI sharpness map".to_string(),
+        Ok(VSI_STACK_EFI_HEIGHT_MAP) => "EFI height map".to_string(),
+        Ok(VSI_STACK_EFI_TEXTURE_MAP) => "EFI texture map".to_string(),
+        Ok(VSI_STACK_EFI_STACK) => "EFI stack".to_string(),
+        Ok(VSI_STACK_MACRO_IMAGE) => "Macro image".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// Translate a DEVICE_SUBTYPE numeric code to a human-readable label. Mirrors
+/// `CellSensReader.getDeviceSubtype` (CellSensReader.java:2519-2562). An
+/// unrecognised (or non-numeric) value passes through unchanged, like Java.
+fn get_device_subtype(value: &str) -> String {
+    match value.trim().parse::<i64>() {
+        Ok(0) => "Camera".to_string(),
+        Ok(10000) => "Stage".to_string(),
+        Ok(20000) => "Objective revolver".to_string(),
+        Ok(20001) => "TV Adapter".to_string(),
+        Ok(20002) => "Filter Wheel".to_string(),
+        Ok(20003) => "Lamp".to_string(),
+        Ok(20004) => "Aperture Stop".to_string(),
+        Ok(20005) => "Shutter".to_string(),
+        Ok(20006) => "Objective".to_string(),
+        Ok(20007) => "Objective Changer".to_string(),
+        Ok(20008) => "TopLens".to_string(),
+        Ok(20009) => "Prism".to_string(),
+        Ok(20010) => "Zoom".to_string(),
+        Ok(20011) => "DSU".to_string(),
+        Ok(20012) => "ZDC".to_string(),
+        Ok(20050) => "Stage Insert".to_string(),
+        Ok(30000) => "Slide Loader".to_string(),
+        Ok(40000) => "Manual Control".to_string(),
+        Ok(40500) => "Microscope Frame".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// Map a numeric VSI/ETS tag ID to its human-readable name. Direct port of
+/// `CellSensReader.getTagName` (CellSensReader.java:2110-2517): the big switch
+/// mapping tag IDs to the strings Java records under `tagPrefix + tagName`.
+/// Returns `None` for unhandled tags, exactly like Java (which returns null and
+/// logs "Unhandled tag").
+fn cellsens_tag_name(tag: i32) -> Option<&'static str> {
+    match tag {
+        2063 => Some("Image plane rectangle unit (Y dimension)"), // Y_PLANE_DIMENSION_UNIT
+        2064 => Some("Y dimension unit"),                         // Y_DIMENSION_UNIT
+        2073 => Some("Channel under/overflow"),                   // CHANNEL_OVERFLOW
+        2055 => Some("Specimen"),                                 // SLIDE_SPECIMEN
+        2057 => Some("Tissue"),                                   // SLIDE_TISSUE
+        2058 => Some("Preparation"),                              // SLIDE_PREPARATION
+        2059 => Some("Staining"),                                 // SLIDE_STAINING
+        2060 => Some("Slide Info"),                               // SLIDE_INFO
+        2061 => Some("Slide Name"),                               // SLIDE_NAME
+        100002 => Some("Exposure time (microseconds)"),          // EXPOSURE_TIME
+        100003 => Some("Camera gain"),                            // CAMERA_GAIN
+        100004 => Some("Camera offset"),                          // CAMERA_OFFSET
+        100005 => Some("Gamma"),                                  // CAMERA_GAMMA
+        100006 => Some("Sharpness"),                              // SHARPNESS
+        100007 => Some("Red channel gain"),                       // RED_GAIN
+        100008 => Some("Green channel gain"),                     // GREEN_GAIN
+        100009 => Some("Blue channel gain"),                      // BLUE_GAIN
+        100010 => Some("Red channel offset"),                     // RED_OFFSET
+        100011 => Some("Green channel offset"),                   // GREEN_OFFSET
+        100012 => Some("Blue channel offset"),                    // BLUE_OFFSET
+        100013 => Some("Shading sub"),                            // SHADING_SUB
+        100014 => Some("Shading mul"),                            // SHADING_MUL
+        100015 => Some("Binning (X)"),                            // X_BINNING
+        100016 => Some("Binning (Y)"),                            // Y_BINNING
+        100017 => Some("Clipping"),                               // CLIPPING
+        100023 => Some("Mirror (horizontal)"),                    // MIRROR_H
+        100024 => Some("Mirror (vertical)"),                      // MIRROR_V
+        100025 => Some("Clipping state"),                         // CLIPPING_STATE
+        100030 => Some("ICC enabled"),                            // ICC_ENABLED
+        100031 => Some("Brightness"),                             // BRIGHTNESS
+        100032 => Some("Contrast"),                               // CONTRAST
+        100033 => Some("Contrast reference"),                     // CONTRAST_TARGET
+        100034 => Some("Camera accumulation"),                    // ACCUMULATION
+        100035 => Some("Camera averaging"),                       // AVERAGING
+        100038 => Some("ISO sensitivity"),                        // ISO_SENSITIVITY
+        100039 => Some("Camera accumulation mode"),               // ACCUMULATION_MODE
+        100043 => Some("Autoexposure enabled"),                   // AUTOEXPOSURE
+        100044 => Some("Autoexposure metering mode"),             // EXPOSURE_METERING_MODE
+        2012 => Some("Z stack start"),                            // Z_START
+        2013 => Some("Z stack increment"),                        // Z_INCREMENT
+        2014 => Some("Z position"),                               // Z_VALUE
+        2100 => Some("Timelapse start"),                          // TIME_START
+        2016 => Some("Timelapse increment"),                      // TIME_INCREMENT
+        2017 => Some("Timestamp"),                                // TIME_VALUE
+        2039 => Some("Lambda start"),                             // LAMBDA_START
+        2040 => Some("Lambda increment"),                         // LAMBDA_INCREMENT
+        2041 => Some("Lambda value"),                             // LAMBDA_VALUE
+        2021 => Some("Dimension name"),                           // DIMENSION_NAME
+        2023 => Some("Dimension description"),                    // DIMENSION_MEANING
+        2025 => Some("Dimension start ID"),                       // DIMENSION_START_ID
+        2026 => Some("Dimension increment ID"),                   // DIMENSION_INCREMENT_ID
+        2027 => Some("Dimension value ID"),                       // DIMENSION_VALUE_ID
+        2053 => Some("Image size"),                               // IMAGE_BOUNDARY
+        20004 => Some("Tile system"),                             // TILE_SYSTEM
+        20005 => Some("External file present"),                   // HAS_EXTERNAL_FILE
+        20025 => Some("External file volume"),                    // EXTERNAL_DATA_VOLUME
+        2410 => Some("Origin of tile coordinate system"),         // TILE_ORIGIN
+        2003 => Some("Display limits"),                           // DISPLAY_LIMITS
+        2004 => Some("Stack display LUT"),                        // STACK_DISPLAY_LUT
+        2005 => Some("Gamma correction"),                         // GAMMA_CORRECTION
+        2006 => Some("Frame origin (plane coordinates)"),         // FRAME_ORIGIN
+        2007 => Some("Frame scale (plane coordinates)"),          // FRAME_SCALE
+        2008 => Some("Display color"),                            // DISPLAY_COLOR
+        2015 => Some("Creation time (UTC)"),                      // CREATION_TIME
+        2018 => Some("Origin"),                                   // RWC_FRAME_ORIGIN
+        2019 => Some("Calibration"),                              // RWC_FRAME_SCALE
+        2020 => Some("Calibration units"),                        // RWC_FRAME_UNIT
+        2030 => Some("Layer"),                                    // STACK_NAME
+        2031 => Some("Channel dimension"),                        // CHANNEL_DIM
+        2074 => Some("Image Type"),                               // STACK_TYPE
+        2076 => Some("Live overflow"),                            // LIVE_OVERFLOW
+        20035 => Some("IS transmission mask"),                    // IS_TRANSMISSION
+        10047 => Some("Contrast and brightness"),                 // CONTRAST_BRIGHTNESS
+        10048 => Some("Acquisition properties"),                  // ACQUISITION_PROPERTIES
+        10065 => Some("Gradient LUT"),                            // GRADIENT_LUT
+        10000 => Some("Display processor type"),                  // DISPLAY_PROCESSOR_TYPE
+        10001 => Some("Render operation ID"),                     // RENDER_OPERATION_ID
+        10005 => Some("Displayed stack ID"),                      // DISPLAY_STACK_ID
+        10006 => Some("Transparency ID"),                         // TRANSPARENCY_ID
+        10007 => Some("Display third ID"),                        // THIRD_ID
+        10008 => Some("Display visible"),                         // DISPLAY_VISIBLE
+        10009 => Some("Transparency value"),                      // TRANSPARENCY_VALUE
+        10013 => Some("Display LUT"),                             // DISPLAY_LUT
+        10014 => Some("Display stack index"),                     // DISPLAY_STACK_INDEX
+        10018 => Some("Channel transparency value"),              // CHANNEL_TRANSPARENCY_VALUE
+        10025 => Some("Channel visible"),                         // CHANNEL_VISIBLE
+        10028 => Some("List of selected channels"),               // SELECTED_CHANNELS
+        10032 => Some("Display gamma correction"),                // DISPLAY_GAMMA_CORRECTION
+        10033 => Some("Channel gamma correction"),                // CHANNEL_GAMMA_CORRECTION
+        10045 => Some("Display contrast and brightness"),         // DISPLAY_CONTRAST_BRIGHTNESS
+        10046 => Some("Channel contrast and brightness"),         // CHANNEL_CONTRAST_BRIGHTNESS
+        10049 => Some("Active stack dimension"),                  // ACTIVE_STACK_DIMENSION
+        10050 => Some("Selected frames"),                         // SELECTED_FRAMES
+        10054 => Some("Displayed LUT ID"),                        // DISPLAYED_LUT_ID
+        10056 => Some("Hidden layer"),                            // HIDDEN_LAYER
+        10057 => Some("Layer fixed in XY"),                       // LAYER_XY_FIXED
+        10060 => Some("Active layer vector"),                     // ACTIVE_LAYER_VECTOR
+        10061 => Some("Active layer index vector"),               // ACTIVE_LAYER_INDEX_VECTOR
+        10062 => Some("Chained layers"),                          // CHAINED_LAYERS
+        10063 => Some("Layer selection"),                         // LAYER_SELECTION
+        10064 => Some("Layer selection index"),                   // LAYER_SELECTION_INDEX
+        10066 => Some("Canvas background color 1"),               // CANVAS_COLOR_1
+        10067 => Some("Canvas background color 2"),               // CANVAS_COLOR_2
+        10069 => Some("Original frame rate (ms)"),                // ORIGINAL_FRAME_RATE
+        10070 => Some("Use original frame rate"),                 // USE_ORIGINAL_FRAME_RATE
+        10071 => Some("Active channel"),                          // ACTIVE_CHANNEL
+        2011 => Some("Plane unit"),                               // PLANE_UNIT
+        20006 => Some("Origin"),                                  // PLANE_ORIGIN_RWC
+        20007 => Some("Physical pixel size"),                     // PLANE_SCALE_RWC
+        1073741824 => Some("Original magnification"),             // MAGNIFICATION
+        11 => Some("Document Name"),                              // DOCUMENT_NAME
+        13 => Some("Document Note"),                              // DOCUMENT_NOTE
+        14 => Some("Document Creation Time"),                     // DOCUMENT_TIME
+        15 => Some("Document Author"),                            // DOCUMENT_AUTHOR
+        16 => Some("Document Company"),                           // DOCUMENT_COMPANY
+        17 => Some("Document creator name"),                      // DOCUMENT_CREATOR_NAME
+        18 => Some("Document creator major version"),             // DOCUMENT_CREATOR_MAJOR_VERSION
+        19 => Some("Document creator minor version"),             // DOCUMENT_CREATOR_MINOR_VERSION
+        20 => Some("Document creator sub version"),               // DOCUMENT_CREATOR_SUB_VERSION
+        21 => Some("Product Build Number"),                       // DOCUMENT_CREATOR_BUILD_NUMBER
+        22 => Some("Document creator package"),                   // DOCUMENT_CREATOR_PACKAGE
+        23 => Some("Document product"),                           // DOCUMENT_PRODUCT
+        24 => Some("Document product name"),                      // DOCUMENT_PRODUCT_NAME
+        25 => Some("Document product version"),                   // DOCUMENT_PRODUCT_VERSION
+        27 => Some("Document type hint"),                         // DOCUMENT_TYPE_HINT
+        28 => Some("Document thumbnail"),                         // DOCUMENT_THUMB
+        2022 => Some("Coarse pyramid level"),                     // COARSE_PYRAMID_LEVEL
+        2028 => Some("Extra samples"),                            // EXTRA_SAMPLES
+        2034 => Some("Default background color"),                 // DEFAULT_BACKGROUND_COLOR
+        2035 => Some("Version number"),                           // VERSION_NUMBER
+        2419 => Some("Channel name"),                             // CHANNEL_NAME
+        120060 => Some("Magnification"),                          // OBJECTIVE_MAG
+        120061 => Some("Numerical Aperture"),                     // NUMERICAL_APERTURE
+        120062 => Some("Objective Working Distance"),             // WORKING_DISTANCE
+        120063 => Some("Objective Name"),                         // OBJECTIVE_NAME
+        120064 => Some("Objective Type"),                         // OBJECTIVE_TYPE
+        120065 => Some("Objective Description"),
+        120066 => Some("Objective Subtype"),
+        120069 => Some("Brightness Correction"),
+        120070 => Some("Objective Lens"),
+        120075 => Some("Objective X Shift"),
+        120076 => Some("Objective Y Shift"),
+        120077 => Some("Objective Z Shift"),
+        120078 => Some("Objective Gear Setting"),
+        120635 => Some("Slide Bar Code"),
+        120638 => Some("Tray No."),
+        120637 => Some("Slide No."),
+        34 => Some("Product Name"),
+        35 => Some("Product Version"),
+        120116 => Some("Device Name"),                            // DEVICE_NAME
+        100049 => Some("Camera Actual Bit Depth"),                // BIT_DEPTH
+        120001 => Some("Device Position"),
+        120050 => Some("TV Adapter Magnification"),
+        120079 => Some("Objective Refractive Index"),             // REFRACTIVE_INDEX
+        120117 => Some("Device Type"),
+        120129 => Some("Device Unit ID"),                         // DEVICE_ID
+        120130 => Some("Device Subtype"),                         // DEVICE_SUBTYPE
+        120132 => Some("Device Model"),
+        120133 => Some("Device Manufacturer"),                    // DEVICE_MANUFACTURER
+        121102 => Some("Stage Insert Position"),
+        121131 => Some("Laser/Lamp Intensity"),
+        268435456 => Some("Units"),
+        268435458 => Some("Value"),                               // VALUE
+        175208 => Some("Snapshot Count"),
+        175209 => Some("Scanning Time (seconds)"),
+        120210 => Some("Device Configuration Position"),
+        120211 => Some("Device Configuration Index"),
+        124000 => Some("Aperture Max Mode"),
+        100048 => Some("Camera Maximum Frame Size"),              // FRAME_SIZE
+        100055 => Some("Camera HDRI Enabled"),                    // HDRI_ON
+        100056 => Some("Camera Images per HDRI image"),           // HDRI_FRAMES
+        100057 => Some("Camera HDRI Exposure Ratio"),             // HDRI_EXPOSURE_RANGE
+        100058 => Some("Camera HDRI Mapping Mode"),               // HDRI_MAP_MODE
+        100059 => Some("Camera Custom Grayscale Value"),          // CUSTOM_GRAYSCALE
+        100060 => Some("Camera Saturation"),                      // SATURATION
+        100061 => Some("Camera White Balance Preset ID"),         // WB_PRESET_ID
+        100062 => Some("Camera White Balance Preset Name"),       // WB_PRESET_NAME
+        100063 => Some("Camera White Balance Mode"),              // WB_MODE
+        100064 => Some("Camera CCD Sensitivity"),                 // CCD_SENSITIVITY
+        100065 => Some("Camera Enhanced Dynamic Range"),          // ENHANCED_DYNAMIC_RANGE
+        100066 => Some("Camera Pixel Clock (MHz)"),               // PIXEL_CLOCK
+        100067 => Some("Camera Colorspace"),                      // COLORSPACE
+        100068 => Some("Camera Cooling Enabled"),                 // COOLING_ON
+        100069 => Some("Camera Cooling Fan Speed"),               // FAN_SPEED
+        100070 => Some("Camera Cooling Temperature Target"),      // TEMPERATURE_TARGET
+        100071 => Some("Camera Gain Unit"),                       // GAIN_UNIT
+        100072 => Some("Camera EM Gain"),                         // EM_GAIN
+        100073 => Some("Camera Photon Imaging Mode"),             // PHOTON_IMAGING_MODE
+        100074 => Some("Camera Frame Transfer Enabled"),          // FRAME_TRANSFER
+        100075 => Some("Camera iXon Shift Speed"),                // ANDOR_SHIFT_SPEED
+        100076 => Some("Camera Vertical Clock Amplitude"),        // VCLOCK_AMPLITUDE
+        100077 => Some("Camera Spurious Noise Removal Enabled"),  // SPURIOUS_NOISE_REMOVAL
+        100078 => Some("Camera Signal Output"),                   // SIGNAL_OUTPUT
+        100079 => Some("Camera Baseline Offset Clamp"),           // BASELINE_OFFSET_CLAMP
+        100080 => Some("Camera DP80 Frame Centering"),            // DP80_FRAME_CENTERING
+        100081 => Some("Camera Hot Pixel Correction Enabled"),    // HOT_PIXEL_CORRECTION
+        100082 => Some("Camera Noise Reduction"),                 // NOISE_REDUCTION
+        100083 => Some("Camera WiDER"),                           // WIDER
+        100084 => Some("Camera Photobleaching Enabled"),          // PHOTOBLEACHING
+        100085 => Some("Camera Preamp Gain"),                     // PREAMP_GAIN_VALUE
+        100086 => Some("Camera WiDER Enabled"),                   // WIDER_ENABLED
+        _ => None,
     }
 }
 
@@ -9784,6 +13186,439 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn slidebook7_typed_decoder_matches_java_classdecoder() {
+        // Real SlideBook 7 record layout: StartClass/EndClass-delimited typed
+        // classes, ClassName-gated, with count-prefixed numeric arrays.
+        let yaml = "\
+StartClass:
+  ClassName: CImageRecord70
+  mWidth: 320
+  mHeight: 240
+  mNumPlanes: 5
+  mNumChannels: 2
+  mNumTimepoints: 3
+  mNumMasks: 1
+  mName: Capture A
+  mInfo: line1_#10;line2
+  mUniqueId: abc-123
+  mThumbNail: [3, 100, 200, 300]
+EndClass: 0
+StartClass:
+  ClassName: CLensDef70
+  mName: 60x Oil
+  mNA: 1.4
+  mMicronPerPixel: 0.1083
+  mActualMagnification: 60
+  mCameraName: ORCA
+EndClass: 0
+StartClass:
+  ClassName: COptovarDef70
+  mName: 1.5x
+  mMagnification: 1.5
+  mDefault: true
+EndClass: 0
+StartClass:
+  ClassName: CMainViewRecord70
+  mViewID: 7
+  mRedChannel: 0
+  mGreenChannel: 1
+  mBlueChannel: 2
+  mLow: [2, 10, 20]
+  mHigh: [2, 4000, 4095]
+  mGamma: [2, 1.0, 0.8]
+EndClass: 0
+";
+        let node = slidebook7_yaml_compose(yaml);
+        let record = Sb7ImageRecord70::decode(&node);
+
+        assert_eq!(record.width, Some(320));
+        assert_eq!(record.height, Some(240));
+        assert_eq!(record.num_planes, Some(5));
+        assert_eq!(record.num_channels, Some(2));
+        assert_eq!(record.num_timepoints, Some(3));
+        assert_eq!(record.num_masks, Some(1));
+        assert_eq!(record.name.as_deref(), Some("Capture A"));
+        // _#10; restored to a newline by RestoreSpecialCharacters.
+        assert_eq!(record.info.as_deref(), Some("line1\nline2"));
+        assert_eq!(record.unique_id.as_deref(), Some("abc-123"));
+        // count prefix (3) dropped, trailing values kept.
+        assert_eq!(record.thumbnail, Some(vec![100.0, 200.0, 300.0]));
+
+        // Composed lens / optovar sub-records decoded from the chained index.
+        assert_eq!(record.lens.name.as_deref(), Some("60x Oil"));
+        assert_eq!(record.lens.na, Some(1.4));
+        assert_eq!(record.lens.camera_name.as_deref(), Some("ORCA"));
+        assert_eq!(record.optovar.magnification, Some(1.5));
+        assert_eq!(record.optovar.default, Some(true));
+
+        // Main-view numeric arrays.
+        assert_eq!(record.main_view.view_id, Some(7));
+        assert_eq!(record.main_view.red_channel, Some(0));
+        assert_eq!(record.main_view.low, Some(vec![10.0, 20.0]));
+        assert_eq!(record.main_view.high, Some(vec![4000.0, 4095.0]));
+        assert_eq!(record.main_view.gamma, Some(vec![1.0, 0.8]));
+    }
+
+    #[test]
+    fn slidebook7_typed_channel_records_decode_with_interleaved_manip_classes() {
+        // Two channels; channel 0 is followed by manip/LUT classes that must be
+        // skipped before the next CChannelRecord70 (Java LoadChannelRecord loop).
+        let yaml = "\
+StartClass:
+  ClassName: CChannelRecord70
+  mNumPlanes: 4
+  mDataType: 0
+EndClass: 0
+StartClass:
+  ClassName: CExposureRecord70
+  mExposureTime: 50
+EndClass: 0
+StartClass:
+  ClassName: CChannelDef70
+  mName: DAPI
+  mCameraName: ORCA
+EndClass: 0
+StartClass:
+  ClassName: CFluorDef70
+  mName: DAPI dye
+  mExcitationLambda: 405
+  mLambda: 461
+EndClass: 0
+StartClass:
+  ClassName: CRemapChannelLUT70
+  mManipID: 7
+EndClass: 0
+StartClass:
+  ClassName: CHistogramRecord70
+  mManipID: 8
+EndClass: 0
+StartClass:
+  ClassName: CChannelRecord70
+  mNumPlanes: 4
+  mDataType: 0
+EndClass: 0
+StartClass:
+  ClassName: CExposureRecord70
+  mExposureTime: 120
+EndClass: 0
+StartClass:
+  ClassName: CChannelDef70
+  mName: FITC
+EndClass: 0
+StartClass:
+  ClassName: CFluorDef70
+  mExcitationLambda: 488
+  mLambda: 525
+EndClass: 0
+";
+        let node = slidebook7_yaml_compose(yaml);
+        let (channels, extras) = slidebook7_load_channel_records(&node, 2);
+        // The CRemapChannelLUT70 + CHistogramRecord70 interleaved after channel 0
+        // are now captured rather than skipped.
+        assert_eq!(extras.histograms.len(), 1);
+        assert_eq!(extras.remap_luts.len(), 1);
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].channel_def.name.as_deref(), Some("DAPI"));
+        assert_eq!(channels[0].channel_def.camera_name.as_deref(), Some("ORCA"));
+        assert_eq!(channels[0].exposure.exposure_time, Some(50));
+        assert_eq!(channels[0].channel_def.fluor.excitation_lambda, Some(405.0));
+        assert_eq!(channels[0].channel_def.fluor.lambda, Some(461.0));
+        // Second channel decoded after the skipped manip/LUT classes.
+        assert_eq!(channels[1].channel_def.name.as_deref(), Some("FITC"));
+        assert_eq!(channels[1].exposure.exposure_time, Some(120));
+        assert_eq!(channels[1].channel_def.fluor.lambda, Some(525.0));
+    }
+
+    #[test]
+    fn slidebook7_typed_mask_records_load_like_java() {
+        let yaml = "\
+theNumMasks: 2
+StartClass:
+  ClassName: CMaskRecord70
+  mName: Nucleus
+  mCentroidFeature: area
+  mCentroidChannel: 0
+  mPersistentSubmasks: 1
+EndClass: 0
+StartClass:
+  ClassName: CMaskRecord70
+  mName: Cytoplasm
+  mCentroidChannel: 1
+EndClass: 0
+theTimepointIndex: 0
+theMaskCompressedSizes: [1, 128]
+theMaskFileOffsets: [1, 4096]
+theTimepointIndex: 1
+theMaskCompressedSizes: [1, 130]
+theMaskFileOffsets: [1, 8192]
+";
+        let node = slidebook7_yaml_compose(yaml);
+        let (masks, position_tables) = slidebook7_load_masks(&node);
+        assert_eq!(masks.len(), 2);
+        assert_eq!(masks[0].name.as_deref(), Some("Nucleus"));
+        assert_eq!(masks[0].centroid_feature.as_deref(), Some("area"));
+        assert_eq!(masks[0].centroid_channel, Some(0));
+        assert_eq!(masks[1].name.as_deref(), Some("Cytoplasm"));
+        assert_eq!(masks[1].centroid_channel, Some(1));
+        assert_eq!(position_tables, 2);
+    }
+
+    #[test]
+    fn slidebook7_typed_annotation_graph_loads_like_java() {
+        // One timepoint: 1 cube (base CAnnotation70 chained), 1 base annotation,
+        // 1 FRAP region (base + 2 cube regions), 1 unknown (base chained).
+        let yaml = "\
+StartClass:
+  ClassName: CDataTableHeaderRecord70
+  mChannelIndex: 0
+  mRows: 2
+  mColumns: 3
+  mTableType: 4
+EndClass: 0
+theTimepointIndex: 0
+theCubeAnnotation70ListSize: 1
+StartClass:
+  ClassName: CCubeAnnotation70
+  mIsBackground: false
+  mRegionIndex: 5
+  mIsFRAP: true
+  mFRAPDevice: Galvo
+EndClass: 0
+StartClass:
+  ClassName: CAnnotation70
+  mGraphicType70: 2
+  mObjectId: 11
+EndClass: 0
+theAnnotation70ListSize: 1
+StartClass:
+  ClassName: CAnnotation70
+  mGraphicType70: 7
+  mText: Region A
+  mPlaneId: 3
+EndClass: 0
+theFRAPRegionAnnotation70ListSize: 1
+StartClass:
+  ClassName: CFRAPRegionAnnotation70
+  mXML: <frap/>
+EndClass: 0
+StartClass:
+  ClassName: CAnnotation70
+  mGraphicType70: 9
+EndClass: 0
+theNumRegions: 2
+StartClass:
+  ClassName: CCubeAnnotation70
+  mRegionIndex: 0
+EndClass: 0
+StartClass:
+  ClassName: CAnnotation70
+  mObjectId: 21
+EndClass: 0
+StartClass:
+  ClassName: CCubeAnnotation70
+  mRegionIndex: 1
+EndClass: 0
+StartClass:
+  ClassName: CAnnotation70
+  mObjectId: 22
+EndClass: 0
+theUnknownAnnotation70ListSize: 1
+StartClass:
+  ClassName: CUnknownAnnotation70
+EndClass: 0
+StartClass:
+  ClassName: CAnnotation70
+  mPlaneId: 99
+EndClass: 0
+";
+        let node = slidebook7_yaml_compose(yaml);
+        let (header, timepoints) = slidebook7_load_annotations(&node);
+        assert_eq!(header.channel_index, Some(0));
+        assert_eq!(header.table_type, Some(4));
+        assert_eq!(timepoints.len(), 1);
+        let tp = &timepoints[0];
+        assert_eq!(tp.cube.len(), 1);
+        assert_eq!(tp.cube[0].region_index, Some(5));
+        assert_eq!(tp.cube[0].is_frap, Some(true));
+        assert_eq!(tp.cube[0].frap_device.as_deref(), Some("Galvo"));
+        assert_eq!(tp.cube[0].ann.object_id, Some(11));
+        assert_eq!(tp.base.len(), 1);
+        assert_eq!(tp.base[0].text.as_deref(), Some("Region A"));
+        assert_eq!(tp.base[0].graphic_type, Some(7));
+        assert_eq!(tp.base[0].plane_id, Some(3));
+        assert_eq!(tp.frap.len(), 1);
+        assert_eq!(tp.frap[0].xml.as_deref(), Some("<frap/>"));
+        assert_eq!(tp.frap[0].region_count, 2);
+        assert_eq!(tp.frap[0].ann.graphic_type, Some(9));
+        // The unknown annotation is reached only if the FRAP region's 2 cube
+        // regions (4 classes) were consumed with the correct index advancement.
+        assert_eq!(tp.unknown.len(), 1);
+        assert_eq!(tp.unknown[0].ann.plane_id, Some(99));
+    }
+
+    #[test]
+    fn slidebook7_typed_channel_manip_records_capture_fields() {
+        // One channel followed by one of each manip/LUT class; all field sets
+        // must be captured (not just skipped for index advancement).
+        let yaml = "\
+StartClass:
+  ClassName: CChannelRecord70
+  mNumPlanes: 1
+EndClass: 0
+StartClass:
+  ClassName: CExposureRecord70
+  mExposureTime: 10
+EndClass: 0
+StartClass:
+  ClassName: CChannelDef70
+  mName: Ch0
+EndClass: 0
+StartClass:
+  ClassName: CFluorDef70
+  mLambda: 500
+EndClass: 0
+StartClass:
+  ClassName: CRemapChannelLUT70
+  mRemapType: 2
+  mLowDesired: 0.0
+  mHighDesired: 1.0
+  mLowGiven: 10
+  mHighGiven: 4000
+  mBuiltTable: true
+  mEquationString: y=x
+EndClass: 0
+StartClass:
+  ClassName: CAlignManipRecord70
+  mManipID: 1
+  mXOffset: 1.5
+  mYOffset: -2.5
+  mZOffset: 0.25
+EndClass: 0
+StartClass:
+  ClassName: CRatioManipRecord70
+  mManipID: 2
+  mKd: 224.0
+  mRmin: 0.3
+  mRmax: 3.1
+  mBeta: 5.0
+EndClass: 0
+StartClass:
+  ClassName: CFRETManipRecord70
+  mManipID: 3
+  mFRETParadigm: 1
+  mFdDd: 0.7
+  mFaAa: 0.4
+EndClass: 0
+StartClass:
+  ClassName: CRemapManipRecord70
+  mManipID: 4
+  mRemapType: 6
+  mNumCalibPoints: 8
+EndClass: 0
+";
+        let node = slidebook7_yaml_compose(yaml);
+        let (channels, extras) = slidebook7_load_channel_records(&node, 1);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(extras.remap_luts.len(), 1);
+        let lut = &extras.remap_luts[0];
+        assert_eq!(lut.remap_type, Some(2));
+        assert_eq!(lut.low_given, Some(10));
+        assert_eq!(lut.high_given, Some(4000));
+        assert_eq!(lut.built_table, Some(true));
+        assert_eq!(lut.equation_string.as_deref(), Some("y=x"));
+        assert_eq!(extras.align_manips.len(), 1);
+        assert_eq!(extras.align_manips[0].manip_id, Some(1));
+        assert_eq!(extras.align_manips[0].x_offset, Some(1.5));
+        assert_eq!(extras.align_manips[0].z_offset, Some(0.25));
+        assert_eq!(extras.ratio_manips.len(), 1);
+        assert_eq!(extras.ratio_manips[0].kd, Some(224.0));
+        assert_eq!(extras.ratio_manips[0].beta, Some(5.0));
+        assert_eq!(extras.fret_manips.len(), 1);
+        assert_eq!(extras.fret_manips[0].fret_paradigm, Some(1));
+        assert_eq!(extras.fret_manips[0].fd_dd, Some(0.7));
+        assert_eq!(extras.remap_manips.len(), 1);
+        assert_eq!(extras.remap_manips[0].remap_type, Some(6));
+        assert_eq!(extras.remap_manips[0].num_calib_points, Some(8));
+    }
+
+    #[test]
+    fn slidebook7_typed_elapsed_sa_stage_loaders_match_java() {
+        let elapsed = slidebook7_load_elapsed_times(&slidebook7_yaml_compose(
+            "theElapsedTimes: [3, 0, 100, 200]\n",
+        ));
+        assert_eq!(elapsed, vec![0.0, 100.0, 200.0]);
+
+        let sa = slidebook7_load_sa_positions(&slidebook7_yaml_compose(
+            "theImageCount: 2\ntheSAPositions: [2, 5, 6]\ntheSAPositions: [2, 7, 8]\n",
+        ));
+        assert_eq!(sa.len(), 2);
+        assert_eq!(sa[0], vec![5.0, 6.0]);
+        assert_eq!(sa[1], vec![7.0, 8.0]);
+
+        // StructArrayValues is a flat (non-size-prefixed) float array grouped XYZ.
+        let stage = slidebook7_load_stage_positions(&slidebook7_yaml_compose(
+            "StructArraySize: 2\nStructArrayValues: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]\n",
+        ));
+        assert_eq!(stage, vec![(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)]);
+    }
+
+    #[test]
+    fn slidebook7_typed_aux_data_loads_all_sections() {
+        let yaml = "\
+theAuxFloatDataTablesSize: 1
+StartClass:
+  ClassName: CDataTableHeaderRecord70
+  mChannelIndex: 0
+EndClass: 0
+theXMLDescriptor: float-desc
+theAuxData: [3, 1.5, 2.5, 3.5]
+theAuxDoubleDataTablesSize: 1
+StartClass:
+  ClassName: CDataTableHeaderRecord70
+  mChannelIndex: 1
+EndClass: 0
+theXMLDescriptor: double-desc
+theAuxData: [2, 9.0, 8.0]
+theAuxSInt32DataTablesSize: 0
+theAuxSInt64DataTablesSize: 0
+theAuxSerializedDataTablesSize: 1
+StartClass:
+  ClassName: CDataTableHeaderRecord70
+  mChannelIndex: 2
+EndClass: 0
+theXMLDescriptor: xml-desc
+theXmlAuxDataSize: 1
+theXmlAuxData: <aux/>
+";
+        let aux = slidebook7_load_aux_data(&slidebook7_yaml_compose(yaml));
+        assert_eq!(aux.float_tables.len(), 1);
+        assert_eq!(aux.float_tables[0].xml_descriptor.as_deref(), Some("float-desc"));
+        assert_eq!(aux.float_tables[0].value_count, 3);
+        assert_eq!(aux.double_tables.len(), 1);
+        assert_eq!(aux.double_tables[0].value_count, 2);
+        assert_eq!(aux.sint32_tables.len(), 0);
+        assert_eq!(aux.sint64_tables.len(), 0);
+        assert_eq!(aux.xml_tables.len(), 1);
+        assert_eq!(aux.xml_tables[0].xml_descriptor.as_deref(), Some("xml-desc"));
+        assert_eq!(aux.xml_tables[0].xml_data.as_deref(), Some("<aux/>"));
+    }
+
+    #[test]
+    fn slidebook7_typed_decoder_skips_unmatched_classname() {
+        // A StartClass whose ClassName does not match must leave fields unset
+        // (Java breaks out of the attribute loop on the leading ClassName).
+        let yaml = "\
+StartClass:
+  ClassName: CSomeOtherRecord
+  mWidth: 999
+EndClass: 0
+";
+        let node = slidebook7_yaml_compose(yaml);
+        let record = Sb7ImageRecord70::decode(&node);
+        assert_eq!(record.width, None);
+    }
+
     struct TestEntry {
         tag: u16,
         typ: u16,
@@ -9986,6 +13821,14 @@ mod tests {
         payload.extend_from_slice(&0u32.to_le_bytes());
         payload.extend_from_slice(&value.to_le_bytes());
         im3_record(name, 7, payload)
+    }
+
+    fn im3_bool_scalar(name: &str, value: bool) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(if value { 1 } else { 0 });
+        im3_record(name, 9, payload)
     }
 
     fn im3_data_record(size_x: u32, size_y: u32, size_c: u32, pixels: &[u8]) -> Vec<u8> {
@@ -10334,6 +14177,117 @@ mod tests {
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>()
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn im3_parses_spectral_library_and_boolean_records_like_java() {
+        let path = temp_flim2_path("native-spectral-library.im3");
+        let pixels = [3u16, 30]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let dataset = im3_container(
+            "",
+            vec![
+                im3_int_array("Shape", &[1, 1, 2]),
+                im3_bool_scalar("Homogeneous", true),
+                im3_data_record(1, 1, 2, &pixels),
+            ],
+        );
+        // SpectralLibrary -> (unnamed container) -> Spectra -> Values -> spectrum
+        // containers, each grouping a Name and a Spectrum container whose nested
+        // container holds Wavelengths/Magnitudes float records.
+        let spectrum_one = im3_container(
+            "",
+            vec![
+                im3_java_string_scalar("Name", "DAPI"),
+                im3_container(
+                    "Spectrum",
+                    vec![im3_container(
+                        "",
+                        vec![
+                            im3_java_float_array("Wavelengths", &[420.0, 440.0]),
+                            im3_java_float_array("Magnitudes", &[0.5, 0.75]),
+                        ],
+                    )],
+                ),
+            ],
+        );
+        let spectrum_two = im3_container(
+            "",
+            vec![
+                im3_java_string_scalar("Name", "FITC"),
+                im3_container(
+                    "Spectrum",
+                    vec![im3_container(
+                        "",
+                        vec![im3_java_float_array("Wavelengths", &[520.0, 540.0])],
+                    )],
+                ),
+            ],
+        );
+        let spectral_library = im3_container(
+            "SpectralLibrary",
+            vec![im3_container(
+                "",
+                vec![im3_container(
+                    "Spectra",
+                    vec![im3_container("Values", vec![spectrum_one, spectrum_two])],
+                )],
+            )],
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&im3_container(
+            "Root",
+            vec![
+                im3_container("DataSet", vec![dataset]),
+                spectral_library,
+            ],
+        ));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = Im3Reader::new();
+        reader.set_id(&path).expect("native IM3 spectral-library fixture");
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("im3.spectral_library.spectrum_count"),
+            Some(crate::common::metadata::MetadataValue::Int(2))
+        ));
+        assert!(matches!(
+            metadata.get("im3.spectral_library.spectrum.0.name"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "DAPI"
+        ));
+        assert!(matches!(
+            metadata.get("im3.spectral_library.spectrum.0.wavelengths"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "420,440"
+        ));
+        assert!(matches!(
+            metadata.get("im3.spectral_library.spectrum.0.magnitudes"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "0.5,0.75"
+        ));
+        assert!(matches!(
+            metadata.get("im3.spectral_library.spectrum.1.name"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "FITC"
+        ));
+        assert!(matches!(
+            metadata.get("im3.spectral_library.spectrum.1.wavelengths"),
+            Some(crate::common::metadata::MetadataValue::String(value)) if value == "520,540"
+        ));
+        // The second spectrum has no Magnitudes record, so none is surfaced.
+        assert!(metadata
+            .get("im3.spectral_library.spectrum.1.magnitudes")
+            .is_none());
+        // A REC_BOOLEAN scalar is now recognised rather than flagged unsupported.
+        assert!(matches!(
+            metadata.get("im3.native.homogeneous"),
+            Some(crate::common::metadata::MetadataValue::Bool(true))
+        ));
+        assert!(metadata
+            .get("im3.native.unsupported_metadata_records")
+            .is_none());
 
         let _ = std::fs::remove_file(path);
     }
@@ -10861,6 +14815,114 @@ mod tests {
             reader.open_bytes(2),
             Err(BioFormatsError::PlaneOutOfRange(2))
         ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ivision_native_scrapes_iplab_acquisition_metadata_like_java() {
+        // 16-bit mono, 2x2, single Z plane, with a trailing Apple plist that
+        // carries the same iplab:* keys the Java IvisionHandler recognises.
+        let path = temp_flim2_path("native-iplab.ipm");
+        let payload = [0x0102u16, 0x0304, 0x0506, 0x0708]
+            .into_iter()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        let mut bytes = vec![0u8; 72];
+        bytes[..4].copy_from_slice(b"1.0A");
+        bytes[4] = 1;
+        bytes[5] = 6; // 16-bit unsigned mono
+        bytes[6..10].copy_from_slice(&2u32.to_be_bytes());
+        bytes[10..14].copy_from_slice(&2u32.to_be_bytes());
+        bytes[20..22].copy_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&vec![0u8; 2048]); // LUT, since x>1 && y>1
+        bytes.extend_from_slice(&payload);
+        let plist = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "<plist version=\"1.0\"><dict>",
+            "<key>iplab:Bin_X</key><string>2</string>",
+            "<key>iplab:Bin_Y</key><string>2</string>",
+            "<key>iplab:Capture_Date</key><string>2018-04-12T09:08:07Z</string>",
+            "<key>iplab:Exposure</key><string>0.125</string>",
+            "<key>iplab:Gain</key><string>3.5</string>",
+            "<key>iplab:Offset</key><string>10</string>",
+            "<key>iplab:Interval_T</key><string>2.0</string>",
+            "<key>iplab:Objective_Mag</key><string>40.0</string>",
+            "<key>iplab:Objective_NA</key><string>1.3</string>",
+            "<key>iplab:Objective_RI</key><string>1.515</string>",
+            "<key>iplab:Wavelength</key><string>488</string>",
+            "</dict></plist>",
+        );
+        bytes.extend_from_slice(plist.as_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = IvisionReader::new();
+        reader.set_id(&path).expect("native iplab iVision fixture");
+
+        let md = &reader.metadata().series_metadata;
+        // addGlobalMeta keys, mirroring the Java handler.
+        assert!(matches!(
+            md.get("iplab:Bin_X"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "2"
+        ));
+        assert!(matches!(
+            md.get("iplab:Capture_Date"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "2018-04-12T09:08:07Z"
+        ));
+        assert!(matches!(
+            md.get("iplab:Exposure"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "0.125"
+        ));
+        assert!(matches!(
+            md.get("iplab:Gain"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "3.5"
+        ));
+        assert!(matches!(
+            md.get("iplab:Interval_T"),
+            Some(crate::common::metadata::MetadataValue::String(v)) if v == "2.0"
+        ));
+        assert!(matches!(
+            md.get("iplab:Objective_Mag"),
+            Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 40.0).abs() < 1e-9
+        ));
+        assert!(matches!(
+            md.get("iplab:Objective_NA"),
+            Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 1.3).abs() < 1e-9
+        ));
+        assert!(matches!(
+            md.get("iplab:Objective_RI"),
+            Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 1.515).abs() < 1e-9
+        ));
+
+        let ome = reader.ome_metadata().expect("iVision OME metadata");
+        let image = ome.images.first().expect("OME image");
+        assert_eq!(
+            image.acquisition_date.as_deref(),
+            Some("2018-04-12T09:08:07Z")
+        );
+        assert!(matches!(image.time_increment, Some(v) if (v - 2.0).abs() < 1e-9));
+
+        // Plane-level DeltaT / ExposureTime.
+        let plane = image.planes.first().expect("OME plane");
+        assert!(matches!(plane.delta_t, Some(v) if (v - 2.0).abs() < 1e-9));
+        assert!(matches!(plane.exposure_time, Some(v) if (v - 0.125).abs() < 1e-9));
+
+        // Objective: lensNA + magnification.
+        let instrument = ome
+            .instruments
+            .get(image.instrument_ref.expect("instrument ref"))
+            .expect("OME instrument");
+        let objective = instrument.objectives.first().expect("OME objective");
+        assert!(matches!(objective.lens_na, Some(v) if (v - 1.3).abs() < 1e-9));
+        assert!(
+            matches!(objective.nominal_magnification, Some(v) if (v - 40.0).abs() < 1e-9)
+        );
+
+        // DetectorSettings: gain + binning on the first channel.
+        let channel = image.channels.first().expect("OME channel");
+        assert!(matches!(channel.detector_settings_gain, Some(v) if (v - 3.5).abs() < 1e-9));
+        assert_eq!(channel.detector_settings_binning.as_deref(), Some("2x2"));
 
         let _ = std::fs::remove_file(path);
     }
@@ -11410,7 +15472,13 @@ mod tests {
         let refs = xlef_referenced_paths(&std::fs::read_to_string(&xlef).unwrap(), &xlef);
         assert_eq!(refs, vec![tiff]);
         let images = XlefReader::referenced_images(&xlef).unwrap();
-        assert_eq!(images, vec![XlefReference::Image(refs[0].clone())]);
+        assert_eq!(
+            images,
+            vec![XlefReference::Image {
+                path: refs[0].clone(),
+                tile_count: 1,
+            }]
+        );
         let _ = std::fs::remove_file(xlef);
     }
 
@@ -11910,6 +15978,157 @@ mod tests {
         assert_eq!(p.height, Some(567), "IMAGE_BOUNDARY height = intValues[3]");
         assert_eq!(p.tile_origin_x, Some(16));
         assert_eq!(p.tile_origin_y, Some(32));
+    }
+
+    /// DEVICE_SUBTYPE and STACK_TYPE numeric codes are translated to human
+    /// readable labels (CellSensReader.java:1883-1889, getStackType /
+    /// getDeviceSubtype), and RWC_FRAME_ORIGIN populates the stage origin
+    /// (CellSensReader.java:1859-1863).
+    #[test]
+    fn vsi_tags_translate_device_subtype_stack_type_and_frame_origin() {
+        let mut origin = Vec::new();
+        origin.extend_from_slice(&12.5f64.to_le_bytes());
+        origin.extend_from_slice(&34.0f64.to_le_bytes());
+        let fields = vec![
+            VsiField {
+                field_type: VSI_INT,
+                tag: VSI_IMAGE_FRAME_VOLUME,
+                data: 0i32.to_le_bytes().to_vec(),
+            },
+            VsiField {
+                field_type: VSI_INT,
+                tag: VSI_EXTERNAL_FILE_PROPERTIES,
+                data: 0i32.to_le_bytes().to_vec(),
+            },
+            VsiField {
+                field_type: VSI_INT,
+                tag: VSI_DEVICE_SUBTYPE,
+                data: 20006i32.to_le_bytes().to_vec(), // -> "Objective"
+            },
+            VsiField {
+                field_type: VSI_INT,
+                tag: VSI_STACK_TYPE,
+                data: 1i32.to_le_bytes().to_vec(), // -> "Overview image"
+            },
+            VsiField {
+                field_type: 261, // DOUBLE_2
+                tag: VSI_RWC_FRAME_ORIGIN,
+                data: origin,
+            },
+        ];
+        let stream = build_vsi_tag_stream(&fields);
+        let mut parser = VsiTagParser::new(&stream);
+        parser.read_tags(8, true, "");
+
+        assert_eq!(parser.pyramids.len(), 1);
+        let m = &parser.pyramids[0].meta;
+        assert_eq!(
+            m.device_subtypes,
+            vec!["Objective".to_string()],
+            "DEVICE_SUBTYPE 20006 translated to label"
+        );
+        assert_eq!(
+            m.stack_type.as_deref(),
+            Some("Overview image"),
+            "STACK_TYPE 1 translated to label"
+        );
+        assert_eq!(m.origin_x, Some(12.5));
+        assert_eq!(m.origin_y, Some(34.0));
+
+        // The translated values also flow into the emitted series metadata.
+        let mut sm = HashMap::new();
+        insert_cellsens_acquisition_metadata(&mut sm, "cellsens.ets.0", m);
+        let get = |k: &str| sm.get(k).map(|v: &MetadataValue| v.to_string());
+        assert_eq!(
+            get("cellsens.ets.0.device_subtype").as_deref(),
+            Some("Objective")
+        );
+        assert_eq!(
+            get("cellsens.ets.0.stack_type").as_deref(),
+            Some("Overview image")
+        );
+        assert_eq!(get("cellsens.ets.0.frame_origin_x").as_deref(), Some("12.5"));
+        assert_eq!(get("cellsens.ets.0.frame_origin_y").as_deref(), Some("34"));
+    }
+
+    /// `cellsens_tag_name` mirrors the Java `getTagName` switch: known tag IDs
+    /// resolve to the exact Java strings; unhandled tags return `None`.
+    #[test]
+    fn cellsens_tag_name_resolves_named_tags() {
+        assert_eq!(cellsens_tag_name(100006), Some("Sharpness")); // SHARPNESS
+        assert_eq!(cellsens_tag_name(100031), Some("Brightness")); // BRIGHTNESS
+        assert_eq!(cellsens_tag_name(120063), Some("Objective Name")); // OBJECTIVE_NAME
+        assert_eq!(cellsens_tag_name(268435458), Some("Value")); // VALUE
+        assert_eq!(cellsens_tag_name(120065), Some("Objective Description"));
+        // Unhandled tag -> None (Java returns null / logs "Unhandled tag").
+        assert_eq!(cellsens_tag_name(999999), None);
+    }
+
+    /// Named-but-untyped tags are surfaced as `cellsens.ets.*.tag.<name>`
+    /// original metadata, mirroring Java's
+    /// `addMetaList(tagPrefix + getTagName(tag), value)`
+    /// (CellSensReader.java:1995-2002), in addition to the typed keys.
+    #[test]
+    fn vsi_tags_emit_named_original_metadata() {
+        let fields = vec![
+            VsiField {
+                field_type: VSI_INT,
+                tag: VSI_IMAGE_FRAME_VOLUME,
+                data: 0i32.to_le_bytes().to_vec(),
+            },
+            VsiField {
+                field_type: VSI_INT,
+                tag: VSI_EXTERNAL_FILE_PROPERTIES,
+                data: 0i32.to_le_bytes().to_vec(),
+            },
+            VsiField {
+                field_type: VSI_INT,
+                tag: 100006, // SHARPNESS -> "Sharpness" (not typed)
+                data: 7i32.to_le_bytes().to_vec(),
+            },
+            VsiField {
+                field_type: VSI_INT,
+                tag: 100031, // BRIGHTNESS -> "Brightness" (not typed)
+                data: 42i32.to_le_bytes().to_vec(),
+            },
+        ];
+        let stream = build_vsi_tag_stream(&fields);
+        let mut parser = VsiTagParser::new(&stream);
+        parser.read_tags(8, true, "");
+
+        assert_eq!(parser.pyramids.len(), 1);
+        let m = &parser.pyramids[0].meta;
+        assert!(
+            m.named_tags
+                .iter()
+                .any(|(k, v)| k == "Sharpness" && v == "7"),
+            "Sharpness named tag captured, got {:?}",
+            m.named_tags
+        );
+        assert!(
+            m.named_tags
+                .iter()
+                .any(|(k, v)| k == "Brightness" && v == "42"),
+            "Brightness named tag captured, got {:?}",
+            m.named_tags
+        );
+
+        // The named tags are surfaced into series metadata under `.tag.<name>`.
+        let mut sm = HashMap::new();
+        insert_cellsens_acquisition_metadata(&mut sm, "cellsens.ets.0", m);
+        let get = |k: &str| sm.get(k).map(|v: &MetadataValue| v.to_string());
+        assert_eq!(get("cellsens.ets.0.tag.Sharpness").as_deref(), Some("7"));
+        assert_eq!(get("cellsens.ets.0.tag.Brightness").as_deref(), Some("42"));
+    }
+
+    /// `get_stack_type` and `get_device_subtype` pass unknown/non-numeric values
+    /// through unchanged, matching Java's `return type` fallthrough.
+    #[test]
+    fn vsi_stack_and_device_subtype_passthrough_unknown() {
+        assert_eq!(get_stack_type("999"), "999");
+        assert_eq!(get_stack_type("not a number"), "not a number");
+        assert_eq!(get_device_subtype("12345"), "12345");
+        assert_eq!(get_device_subtype("Camera"), "Camera");
     }
 
     #[test]

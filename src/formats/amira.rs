@@ -640,6 +640,75 @@ fn r_f32_le_w(b: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+// Mirrors the addGlobalMeta(...) block of Java SpiderReader.initFile: reads the
+// named header words (4-byte little-endian floats) plus the trailing date/time/
+// title strings and stores them under Java's exact key names. Header layout in
+// words (word N = byte offset (N-1)*4); some words Java skips are omitted here.
+fn read_spider_metadata(path: &Path) -> Result<HashMap<String, MetadataValue>> {
+    let f = File::open(path).map_err(BioFormatsError::Io)?;
+    // Read up to 1024 bytes (through the 160-byte title at byte 864), zero-
+    // padding short files so payload validation — not this read — reports any
+    // truncation. read_to_end may exceed 1024; truncate/pad to a fixed size.
+    let mut hdr = Vec::new();
+    f.take(1024).read_to_end(&mut hdr).map_err(BioFormatsError::Io)?;
+    hdr.resize(1024, 0);
+
+    let int_w = |off: usize| MetadataValue::Int(r_f32_le_w(&hdr, off) as i32 as i64);
+    let float_w = |off: usize| MetadataValue::Float(r_f32_le_w(&hdr, off) as f64);
+    let str_at = |off: usize, len: usize| {
+        MetadataValue::String(
+            String::from_utf8_lossy(&hdr[off..off + len])
+                .trim_end_matches('\0')
+                .trim()
+                .to_string(),
+        )
+    };
+
+    let mut m = HashMap::new();
+    m.insert("NSLICE".into(), int_w(0));
+    m.insert("NROW".into(), int_w(4));
+    m.insert("IREC".into(), int_w(8));
+    m.insert("IFORM".into(), int_w(16));
+    m.insert("IMAMI".into(), int_w(20));
+    m.insert("FMAX".into(), float_w(24));
+    m.insert("FMIN".into(), float_w(28));
+    m.insert("AV".into(), float_w(32));
+    m.insert("SIG".into(), float_w(36));
+    m.insert("NSAM".into(), int_w(44));
+    m.insert("LABREC".into(), int_w(48));
+    m.insert("IANGLE".into(), int_w(52));
+    m.insert("PHI".into(), float_w(56));
+    m.insert("THETA".into(), float_w(60));
+    m.insert("GAMMA".into(), float_w(64));
+    m.insert("XOFF".into(), float_w(68));
+    m.insert("YOFF".into(), float_w(72));
+    m.insert("ZOFF".into(), float_w(76));
+    m.insert("SCALE".into(), float_w(80));
+    m.insert("LABBYT".into(), int_w(84));
+    m.insert("LENBYT".into(), int_w(88));
+    m.insert("ISTACK/MAXINDX".into(), int_w(92));
+    m.insert("MAXIM".into(), float_w(100));
+    m.insert("IMGNUM".into(), float_w(104));
+    m.insert("LASTINDX".into(), float_w(108));
+    m.insert("KANGLE".into(), float_w(120));
+    m.insert("PHI1".into(), float_w(124));
+    m.insert("THETA1".into(), float_w(128));
+    m.insert("PSI1".into(), float_w(132));
+    m.insert("PHI2".into(), float_w(136));
+    m.insert("THETA2".into(), float_w(140));
+    m.insert("PSI2".into(), float_w(144));
+    m.insert("PIXSIZ".into(), float_w(148));
+    m.insert("EV".into(), float_w(152));
+    m.insert("PHI3".into(), float_w(408));
+    m.insert("THETA3".into(), float_w(404));
+    m.insert("PSI3".into(), float_w(400));
+    m.insert("LANGLE".into(), float_w(412));
+    m.insert("CDAT".into(), str_at(844, 12));
+    m.insert("CTIM".into(), str_at(856, 8));
+    m.insert("CTIT".into(), str_at(864, 160));
+    Ok(m)
+}
+
 fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
     let mut f = File::open(path).map_err(BioFormatsError::Io)?;
     let mut hdr = [0u8; 256]; // read first 256 bytes = enough for the key fields
@@ -748,7 +817,7 @@ impl FormatReader for SpiderReader {
             is_little_endian: true,
             resolution_count: 1,
             series_metadata: {
-                let mut m = HashMap::new();
+                let mut m = read_spider_metadata(path)?;
                 m.insert("format".into(), MetadataValue::String("Spider EM".into()));
                 m
             },
@@ -826,5 +895,65 @@ impl FormatReader for SpiderReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod spider_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn put_f32(buf: &mut [u8], word: usize, v: f32) {
+        let off = word * 4;
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn spider_header_metadata_keys() {
+        // Build a minimal 1024-byte little-endian Spider header (a single 2x2
+        // 2D image, IFORM=1) plus the float32 pixel payload.
+        let mut hdr = vec![0u8; 1024];
+        put_f32(&mut hdr, 0, 1.0); // NSLICE (word 1)
+        put_f32(&mut hdr, 1, 2.0); // NROW
+        put_f32(&mut hdr, 4, 1.0); // IFORM (word 5)
+        put_f32(&mut hdr, 6, 9.5); // FMAX (word 7)
+        put_f32(&mut hdr, 7, -3.25); // FMIN (word 8)
+        put_f32(&mut hdr, 11, 2.0); // NSAM (word 12)
+        put_f32(&mut hdr, 13, 0.0); // LABREC (word 14) -> labbyt drives header size
+        put_f32(&mut hdr, 21, 1024.0); // LABBYT (word 22) header size in bytes
+
+        let path = std::env::temp_dir().join(format!(
+            "spider_meta_{}_{}.spi",
+            std::process::id(),
+            line!()
+        ));
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&hdr).unwrap();
+            f.write_all(&[0u8; 2 * 2 * 4]).unwrap(); // 2x2 float32 plane
+            f.flush().unwrap();
+        }
+
+        let mut r = SpiderReader::new();
+        r.set_id(&path).unwrap();
+        let md = &r.metadata().series_metadata;
+
+        let int_of = |k: &str| match md.get(k) {
+            Some(MetadataValue::Int(v)) => *v,
+            other => panic!("{k} not Int: {other:?}"),
+        };
+        let float_of = |k: &str| match md.get(k) {
+            Some(MetadataValue::Float(v)) => *v,
+            other => panic!("{k} not Float: {other:?}"),
+        };
+
+        assert_eq!(int_of("IFORM"), 1);
+        assert_eq!(int_of("NSLICE"), 1);
+        assert_eq!(float_of("FMAX"), 9.5);
+        assert_eq!(float_of("FMIN"), -3.25);
+        assert_eq!(int_of("NSAM"), 2);
+        assert!(matches!(md.get("CTIT"), Some(MetadataValue::String(_))));
+
+        std::fs::remove_file(&path).ok();
     }
 }

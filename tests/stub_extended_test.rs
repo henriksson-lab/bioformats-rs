@@ -5,7 +5,7 @@
 //! small synthetic fixtures built to match the on-disk layout that each Java
 //! reader parses.
 
-use bioformats::formats::extended::{BurleighReader, LeicaLofReader, NafReader};
+use bioformats::formats::extended::{BurleighReader, ImspectorReader, LeicaLofReader, NafReader};
 use bioformats::{FormatReader, MetadataValue};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +20,128 @@ fn temp_path(name: &str) -> PathBuf {
 
 fn utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Imspector OBF/MSR (Java OBFReader)
+// ---------------------------------------------------------------------------
+
+const IMSPECTOR_FILE_MAGIC: &[u8; 8] = b"OMAS_BF\n";
+const IMSPECTOR_MAGIC_NUMBER: u16 = 0xffff;
+const IMSPECTOR_STACK_MAGIC: &[u8; 14] = b"OMAS_BF_STACK\n";
+
+fn imspector_header(version: i32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(IMSPECTOR_FILE_MAGIC);
+    bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+    bytes.extend_from_slice(&version.to_le_bytes());
+    bytes
+}
+
+fn zlib_compress(bytes: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn native_imspector_v1_stack(
+    width: i32,
+    height: i32,
+    z: i32,
+    c: i32,
+    t: i32,
+    compression: i32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut bytes = imspector_header(1);
+    let stack_offset = 32u64;
+    bytes.extend_from_slice(&stack_offset.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.resize(stack_offset as usize, 0);
+
+    bytes.extend_from_slice(IMSPECTOR_STACK_MAGIC);
+    bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+    bytes.extend_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&5i32.to_le_bytes());
+    for size in [width, height, z, c, t] {
+        bytes.extend_from_slice(&size.to_le_bytes());
+    }
+    for _ in 5..15 {
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+    }
+    for _ in 0..30 {
+        bytes.extend_from_slice(&0f64.to_bits().to_le_bytes());
+    }
+    bytes.extend_from_slice(&0x01i32.to_le_bytes());
+    bytes.extend_from_slice(&compression.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&0i64.to_le_bytes());
+    bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+    bytes.extend_from_slice(&0i64.to_le_bytes());
+    bytes.extend_from_slice(payload);
+
+    bytes.extend_from_slice(&124i32.to_le_bytes());
+    for _ in 0..30 {
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+    }
+    for _ in 0..5 {
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn imspector_reads_native_v1_zlib_contiguous_stack() {
+    let pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let compressed = zlib_compress(&pixels);
+    let path = temp_path("native_v1_zlib.obf");
+    std::fs::write(
+        &path,
+        native_imspector_v1_stack(2, 2, 2, 1, 1, 1, &compressed),
+    )
+    .unwrap();
+
+    let mut reader = ImspectorReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 2);
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.image_count, 2);
+    assert!(matches!(
+        meta.series_metadata.get("imspector_version_subset"),
+        Some(MetadataValue::String(value)) if value == "native-v1-zlib-contiguous"
+    ));
+
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+    assert_eq!(reader.open_bytes_region(1, 0, 1, 2, 1).unwrap(), vec![7, 8]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn imspector_rejects_native_v1_zlib_wrong_decompressed_size() {
+    let compressed = zlib_compress(&[1, 2, 3]);
+    let path = temp_path("native_v1_zlib_wrong_size.obf");
+    std::fs::write(
+        &path,
+        native_imspector_v1_stack(2, 2, 1, 1, 1, 1, &compressed),
+    )
+    .unwrap();
+
+    let mut reader = ImspectorReader::new();
+    let err = reader.set_id(&path).unwrap_err();
+    assert!(format!("{err}").contains("native decompressed payload length 3"));
+    assert!(format!("{err}").contains("declared stack size 4"));
+
+    let _ = std::fs::remove_file(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +326,114 @@ fn lof_projects_channel_names_lut_and_wavelength_metadata() {
     assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("FITC"));
     assert_eq!(ome.images[0].channels[0].excitation_wavelength, Some(405.0));
     assert_eq!(ome.images[0].channels[1].emission_wavelength, Some(525.0));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn lof_records_bgr_channel_order_from_channel_offsets() {
+    let pixels = vec![10u8, 20, 30, 40, 50, 60];
+    let xml = "\
+<Image><ImageDescription>\
+<Channels>\
+<ChannelDescription Name=\"Red\" Resolution=\"8\" BytesInc=\"2\"/>\
+<ChannelDescription Name=\"Green\" Resolution=\"8\" BytesInc=\"1\"/>\
+<ChannelDescription Name=\"Blue\" Resolution=\"8\" BytesInc=\"0\"/>\
+</Channels>\
+<Dimensions>\
+<DimensionDescription DimID=\"1\" NumberOfElements=\"2\" BytesInc=\"3\"/>\
+<DimensionDescription DimID=\"2\" NumberOfElements=\"1\" BytesInc=\"6\"/>\
+</Dimensions>\
+</ImageDescription></Image>";
+    let bytes = build_lof_with_xml(xml, &pixels);
+    let path = temp_path("bgr_channel_order.lof");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut reader = LeicaLofReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(meta.is_rgb);
+    assert_eq!(meta.size_c, 3);
+    assert!(matches!(
+        meta.series_metadata.get("lof.rgb.channel_order"),
+        Some(MetadataValue::String(value)) if value == "BGR"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("lof.rgb.channel_order_source"),
+        Some(MetadataValue::String(value)) if value == "ChannelDescription BytesInc"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("lof.rgb.channel_order_offsets"),
+        Some(MetadataValue::String(value)) if value == "0,1,2"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn lof_projects_structured_instrument_detector_roi_and_stage_metadata() {
+    let pixels = vec![1u8, 2, 3, 4];
+    let xml = "\
+<Image><ImageDescription>\
+<InstrumentDescription Manufacturer=\"Leica\" Model=\"SP8\"/>\
+<DetectorDescription Name=\"HyD 1\" Type=\"HyD\" Gain=\"1.25\" Offset=\"2\"/>\
+<StagePosition X=\"12.5\" Y=\"-3.25\" Z=\"1.5\"/>\
+<AcquisitionDescription Mode=\"Sequential\" LaserPower=\"7.5\"/>\
+<ROI Name=\"Cell 1\" X=\"10\" Y=\"20\" Width=\"30\" Height=\"40\"/>\
+<Channels><ChannelDescription Name=\"DAPI\" Resolution=\"8\" BytesInc=\"1\"/></Channels>\
+<Dimensions>\
+<DimensionDescription DimID=\"1\" NumberOfElements=\"4\" BytesInc=\"1\"/>\
+<DimensionDescription DimID=\"2\" NumberOfElements=\"1\" BytesInc=\"4\"/>\
+</Dimensions>\
+</ImageDescription></Image>";
+    let bytes = build_lof_with_xml(xml, &pixels);
+    let path = temp_path("structured_metadata.lof");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut reader = LeicaLofReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata.get("lof.instrument.0.manufacturer"),
+        Some(MetadataValue::String(value)) if value == "Leica"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("lof.detector.0.type"),
+        Some(MetadataValue::String(value)) if value == "HyD"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("lof.stage.0.x"),
+        Some(MetadataValue::Float(value)) if (*value - 12.5).abs() < f64::EPSILON
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("lof.acquisition.0.mode"),
+        Some(MetadataValue::String(value)) if value == "Sequential"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("lof.roi.0.name"),
+        Some(MetadataValue::String(value)) if value == "Cell 1"
+    ));
+
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(ome.images[0].instrument_ref, Some(0));
+    assert_eq!(ome.instruments.len(), 1);
+    assert_eq!(
+        ome.instruments[0].microscope_manufacturer.as_deref(),
+        Some("Leica")
+    );
+    assert_eq!(ome.instruments[0].microscope_model.as_deref(), Some("SP8"));
+    assert_eq!(ome.instruments[0].detectors.len(), 1);
+    assert_eq!(
+        ome.instruments[0].detectors[0].model.as_deref(),
+        Some("HyD 1")
+    );
+    assert_eq!(
+        ome.instruments[0].detectors[0].detector_type.as_deref(),
+        Some("HyD")
+    );
+    assert_eq!(ome.rois.len(), 1);
+    assert_eq!(ome.rois[0].name.as_deref(), Some("Cell 1"));
 
     let _ = std::fs::remove_file(path);
 }

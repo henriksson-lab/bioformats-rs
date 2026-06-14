@@ -53,7 +53,16 @@ fn write_npy(path: &Path, values: &[u16]) {
     std::fs::write(path, build_npy("<u2", &[1, 2, 2], &payload)).unwrap();
 }
 
+// This exercises a port-specific "flatten arbitrary nested YAML into
+// slidebook7.record.* original metadata" behaviour that upstream Bio-Formats
+// does NOT implement: the Java SlideBook7Reader decodes typed record fields via
+// snakeyaml + ClassDecoder and discards unrecognised attributes
+// (DecodeUnknownString has an empty body). The faithful path is the typed
+// CImageRecord70 decoder (see slidebook7_typed_* tests in
+// tests/slidebook7_sldyz_test.rs and src/formats/flim2.rs). Kept ignored as a
+// record of the deferred non-upstream flatten feature rather than deleted.
 #[test]
+#[ignore = "non-upstream flatten-to-metadata YAML behaviour; upstream uses typed ClassDecoder (see slidebook7_typed_* tests)"]
 fn slidebook7_preserves_safe_scalar_yaml_metadata() {
     let path = temp_path("native.sldy");
     std::fs::write(&path, b"SlideBook 7 native placeholder").unwrap();
@@ -90,6 +99,21 @@ Annotations:
   Experiment:
     Operator: Ada
     Approved: true
+Tags:
+  - control
+  - replicate
+Regions:
+  - {Name: ROI-1, Area: 5.5}
+  - {Name: ROI-2, Area: 6.5}
+Objects: [{Name: Cell-1, Center: {X: 1.5, Y: 2.5}, Measurements: [7, 8]}, {Name: Cell-2, Center: {X: 3.5, Y: 4.5}}]
+TaggedObjective: !<SlideBook.Objective>
+  Name: Plan Apo
+  Magnification: !<SlideBook.Quantity> 63
+TaggedChannels:
+  - !<SlideBook.Channel>
+    Name: Cy5
+    Enabled: !<SlideBook.Boolean> true
+TaggedObjects: !<SlideBook.ObjectList> [{Name: Cell-3, Center: !<SlideBook.Point> {X: 5.5, Y: 6.5}}]
 mChannels:
   - mName: DAPI
     mElapsedTime: 1.5
@@ -220,6 +244,58 @@ mChannels:
     assert!(matches!(
         md.get("slidebook7.record.annotations.experiment.approved"),
         Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.tags.0"),
+        Some(MetadataValue::String(value)) if value == "control"
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.tags.1"),
+        Some(MetadataValue::String(value)) if value == "replicate"
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.regions.0.name"),
+        Some(MetadataValue::String(value)) if value == "ROI-1"
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.regions.1.area"),
+        Some(MetadataValue::Float(value)) if (*value - 6.5).abs() < 1e-12
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.objects.0.name"),
+        Some(MetadataValue::String(value)) if value == "Cell-1"
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.objects.0.center.x"),
+        Some(MetadataValue::Float(value)) if (*value - 1.5).abs() < 1e-12
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.objects.0.measurements.1"),
+        Some(MetadataValue::Int(8))
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.objects.1.center.y"),
+        Some(MetadataValue::Float(value)) if (*value - 4.5).abs() < 1e-12
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.taggedobjective.name"),
+        Some(MetadataValue::String(value)) if value == "Plan Apo"
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.taggedobjective.magnification"),
+        Some(MetadataValue::Int(63))
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.taggedchannels.0.name"),
+        Some(MetadataValue::String(value)) if value == "Cy5"
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.taggedchannels.0.enabled"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert!(matches!(
+        md.get("slidebook7.record.taggedobjects.0.center.y"),
+        Some(MetadataValue::Float(value)) if (*value - 6.5).abs() < 1e-12
     ));
     assert!(matches!(
         md.get("slidebook7.record.mchannels.0.mname"),

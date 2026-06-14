@@ -12,9 +12,10 @@
 //! per-series dimensions / pixel type, and maps memory-block IDs to pixel data
 //! offsets. Tiled acquisitions are expanded into one series per tile, matching
 //! the Java behaviour. Pixel reads are supported for the simple uncompressed
-//! non-RGB strided layout confirmed by local fixtures and RGB payloads whose
-//! XML strides fully describe repeated interleaved or planar RGB triples; other
-//! payload variants return precise `UnsupportedFormat` errors.
+//! non-RGB strided layout confirmed by local fixtures and color payloads whose
+//! XML strides describe repeated interleaved, planar, or ordered padded-planar
+//! sample groups; other payload variants return precise `UnsupportedFormat`
+//! errors.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -218,11 +219,10 @@ impl LifReader {
         self.end_pointer = end_pointer;
 
         // -- XML metadata --
-        let (series, ordered_ids) = parse_xml(&xml)?;
+        let (mut series, ordered_ids) = parse_xml(&xml)?;
         if series.is_empty() {
             return Err(BioFormatsError::Format("No images found in LIF".into()));
         }
-        self.series = series;
 
         // Match memory blocks to image elements by ID, preserving the XML
         // order. Fall back to file order if IDs do not match.
@@ -232,11 +232,16 @@ impl LifReader {
                 matched.push(b.clone());
             }
         }
-        self.memory_blocks = if matched.len() == ordered_ids.len() && !matched.is_empty() {
-            matched
-        } else {
-            raw_blocks
-        };
+        let matched_by_id = matched.len() == ordered_ids.len() && !matched.is_empty();
+        self.memory_blocks = if matched_by_id { matched } else { raw_blocks };
+        annotate_lif_storage(
+            &mut series,
+            &ordered_ids,
+            &self.memory_blocks,
+            matched_by_id,
+        );
+        annotate_lif_compression_payloads(&mut series, &self.memory_blocks, data);
+        self.series = series;
 
         Ok(())
     }
@@ -357,12 +362,10 @@ impl FormatReader for LifReader {
         }
 
         let (group, tile) = self.tile_position(self.current_series);
-        let block = self.memory_blocks.get(group).ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat(format!(
-                "Leica LIF pixel block for series {} was not discovered",
-                self.current_series
-            ))
-        })?;
+        let block = match self.memory_blocks.get(group) {
+            Some(block) => block,
+            None => return blank_lif_region(m, &info.layout, w, h),
+        };
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         decode_lif_region(&data, block, info, tile as u64, plane_index, x, y, w, h)
@@ -399,8 +402,10 @@ fn decode_lif_region(
     let plane_layout = lif_plane_layout(meta, &info.layout)?;
     let rgb_samples = lif_rgb_channel_count(meta);
     let samples = match plane_layout {
-        LifPlaneLayout::InterleavedRgb => rgb_samples as u64,
-        LifPlaneLayout::Scalar | LifPlaneLayout::PlanarRgb => 1,
+        LifPlaneLayout::InterleavedColor => rgb_samples as u64,
+        LifPlaneLayout::Scalar
+        | LifPlaneLayout::PlanarColor
+        | LifPlaneLayout::PaddedPlanarColor => 1,
     };
     let pixel_stride = checked_mul_u64(bps, samples, "Leica LIF pixel stride")?;
     let layout = &info.layout;
@@ -453,8 +458,11 @@ fn decode_lif_region(
         "Leica LIF T offset",
     )?;
 
-    if matches!(plane_layout, LifPlaneLayout::PlanarRgb) {
-        return decode_lif_planar_rgb_region(
+    if matches!(
+        plane_layout,
+        LifPlaneLayout::PlanarColor | LifPlaneLayout::PaddedPlanarColor
+    ) {
+        return decode_lif_planar_color_region(
             data,
             block,
             info,
@@ -473,7 +481,7 @@ fn decode_lif_region(
         checked_mul_u64(u64::from(x), pixel_stride, "Leica LIF column offset")?,
         "Leica LIF region offset",
     )?;
-    let rgb_group_base = if matches!(plane_layout, LifPlaneLayout::InterleavedRgb) {
+    let rgb_group_base = if matches!(plane_layout, LifPlaneLayout::InterleavedColor) {
         lif_rgb_group_offsets(layout, c, rgb_samples)?[0]
     } else {
         0
@@ -502,6 +510,11 @@ fn decode_lif_region(
 
     if let Some(compression) = &info.layout.compression {
         copy_lif_compressed_ranges(data, block, compression, &row_ranges, plane_index, &mut out)?;
+        // color planes are stored in BGR order (Java openBytes); only for
+        // three-sample RGB groups, matching the getRGBChannelCount() == 3 gate.
+        if matches!(plane_layout, LifPlaneLayout::InterleavedColor) && rgb_samples == 3 {
+            bgr_to_rgb(&mut out, true, bps as usize, rgb_samples as usize);
+        }
         return Ok(out);
     }
 
@@ -513,12 +526,14 @@ fn decode_lif_region(
         let abs_src = checked_add_u64(block.file_offset, src, "Leica LIF source offset")?;
         let abs_end = checked_add_u64(block.file_offset, end, "Leica LIF source end")?;
         if abs_end > block_end || abs_end as usize > data.len() {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "Leica LIF plane {plane_index} exceeds memory block {} (offset {abs_src}, end {abs_end}, block end {block_end})",
-                block.id
-            )));
+            return blank_lif_region(meta, layout, w, h);
         }
         out.extend_from_slice(&data[abs_src as usize..abs_end as usize]);
+    }
+    // color planes are stored in BGR order (Java openBytes); only for
+    // three-sample RGB groups, matching the getRGBChannelCount() == 3 gate.
+    if matches!(plane_layout, LifPlaneLayout::InterleavedColor) && rgb_samples == 3 {
+        bgr_to_rgb(&mut out, true, bps as usize, rgb_samples as usize);
     }
     Ok(out)
 }
@@ -526,8 +541,9 @@ fn decode_lif_region(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifPlaneLayout {
     Scalar,
-    InterleavedRgb,
-    PlanarRgb,
+    InterleavedColor,
+    PlanarColor,
+    PaddedPlanarColor,
 }
 
 fn lif_plane_layout(meta: &ImageMetadata, layout: &PixelLayout) -> Result<LifPlaneLayout> {
@@ -535,66 +551,114 @@ fn lif_plane_layout(meta: &ImageMetadata, layout: &PixelLayout) -> Result<LifPla
         return Ok(LifPlaneLayout::Scalar);
     }
     let rgb_samples = lif_rgb_channel_count(meta);
-    if rgb_samples != 3
+    if rgb_samples < 2
         || meta.size_c < rgb_samples
         || meta.size_c % rgb_samples != 0
         || layout.channel_offsets.len() != meta.size_c as usize
     {
         return Err(BioFormatsError::UnsupportedFormat(format!(
-            "Leica LIF unsupported RGB layout: interleaved={}, channel count={}, channel offsets={:?}",
-            meta.is_interleaved, meta.size_c, layout.channel_offsets
+            "Leica LIF unsupported color layout: interleaved={}, samples per pixel={}, channel count={}, channel offsets={:?}",
+            meta.is_interleaved, rgb_samples, meta.size_c, layout.channel_offsets
         )));
     }
 
     let bps = meta.pixel_type.bytes_per_sample() as u64;
     if meta.is_interleaved {
         for group in layout.channel_offsets.chunks_exact(rgb_samples as usize) {
-            if group[1] != checked_add_u64(group[0], bps, "Leica LIF RGB sample offset")?
-                || group[2]
-                    != checked_add_u64(
-                        group[0],
-                        checked_mul_u64(bps, 2, "Leica LIF RGB sample offset")?,
-                        "Leica LIF RGB sample offset",
-                    )?
-            {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "Leica LIF unsupported RGB layout: interleaved={}, channel offsets={:?}, expected repeated RGB triples",
-                    meta.is_interleaved, layout.channel_offsets
-                )));
+            for sample in 1..rgb_samples as usize {
+                let expected = checked_add_u64(
+                    group[0],
+                    checked_mul_u64(bps, sample as u64, "Leica LIF color sample offset")?,
+                    "Leica LIF color sample offset",
+                )?;
+                if group[sample] != expected {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "Leica LIF unsupported irregular/non-contiguous color layout: interleaved={}, samples per pixel={}, channel offsets={:?}, expected repeated contiguous sample groups",
+                        meta.is_interleaved, rgb_samples, layout.channel_offsets
+                    )));
+                }
             }
         }
-        return Ok(LifPlaneLayout::InterleavedRgb);
+        return Ok(LifPlaneLayout::InterleavedColor);
     } else if layout.x_stride == bps {
         let plane_stride = checked_mul_u64(
             layout.y_stride,
             u64::from(meta.size_y),
-            "Leica LIF RGB plane stride",
+            "Leica LIF color plane stride",
         )?;
+        let mut is_contiguous_planar = true;
         for group in layout.channel_offsets.chunks_exact(rgb_samples as usize) {
-            if group[1] != checked_add_u64(group[0], plane_stride, "Leica LIF RGB plane offset")?
-                || group[2]
-                    != checked_add_u64(
-                        group[0],
-                        checked_mul_u64(plane_stride, 2, "Leica LIF RGB plane offset")?,
-                        "Leica LIF RGB plane offset",
-                    )?
-            {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "Leica LIF unsupported RGB layout: interleaved={}, channel offsets={:?}, expected repeated planar RGB triples",
-                    meta.is_interleaved, layout.channel_offsets
-                )));
+            for sample in 1..rgb_samples as usize {
+                let expected = checked_add_u64(
+                    group[0],
+                    checked_mul_u64(plane_stride, sample as u64, "Leica LIF color plane offset")?,
+                    "Leica LIF color plane offset",
+                )?;
+                if group[sample] != expected {
+                    is_contiguous_planar = false;
+                    break;
+                }
+            }
+            if !is_contiguous_planar {
+                break;
             }
         }
-        return Ok(LifPlaneLayout::PlanarRgb);
+        if is_contiguous_planar {
+            return Ok(LifPlaneLayout::PlanarColor);
+        }
+        if is_ordered_non_overlapping_planar_color(meta, layout)? {
+            return Ok(LifPlaneLayout::PaddedPlanarColor);
+        }
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Leica LIF unsupported irregular/non-contiguous color layout: interleaved={}, samples per pixel={}, channel offsets={:?}, expected repeated planar sample groups or ordered non-overlapping padded planes",
+            meta.is_interleaved, rgb_samples, layout.channel_offsets
+        )));
     }
 
     Err(BioFormatsError::UnsupportedFormat(format!(
-        "Leica LIF unsupported RGB layout: interleaved={}, channel offsets={:?}",
-        meta.is_interleaved, layout.channel_offsets
+        "Leica LIF unsupported irregular/non-contiguous color layout: interleaved={}, samples per pixel={}, channel offsets={:?}",
+        meta.is_interleaved, rgb_samples, layout.channel_offsets
     )))
 }
 
-fn decode_lif_planar_rgb_region(
+fn is_ordered_non_overlapping_planar_color(
+    meta: &ImageMetadata,
+    layout: &PixelLayout,
+) -> Result<bool> {
+    if layout.channel_offsets.len() != meta.size_c as usize || layout.x_stride == 0 {
+        return Ok(false);
+    }
+    if !layout
+        .channel_offsets
+        .windows(2)
+        .all(|pair| pair[0] <= pair[1])
+    {
+        return Ok(false);
+    }
+    let bps = meta.pixel_type.bytes_per_sample() as u64;
+    let row_bytes = checked_mul_u64(u64::from(meta.size_x), bps, "Leica LIF row bytes")?;
+    if layout.y_stride < row_bytes {
+        return Ok(false);
+    }
+    let footprint = checked_add_u64(
+        checked_mul_u64(
+            u64::from(meta.size_y.saturating_sub(1)),
+            layout.y_stride,
+            "Leica LIF color plane footprint",
+        )?,
+        row_bytes,
+        "Leica LIF color plane footprint",
+    )?;
+    for pair in layout.channel_offsets.windows(2) {
+        let prev_end = checked_add_u64(pair[0], footprint, "Leica LIF color plane end")?;
+        if prev_end > pair[1] {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn decode_lif_planar_color_region(
     data: &[u8],
     block: &MemoryBlock,
     info: &SeriesInfo,
@@ -660,6 +724,11 @@ fn decode_lif_planar_rgb_region(
 
     if let Some(compression) = &info.layout.compression {
         copy_lif_compressed_ranges(data, block, compression, &row_ranges, plane_index, &mut out)?;
+        // color planes are stored in BGR order (Java openBytes); only for
+        // three-sample RGB groups, matching the getRGBChannelCount() == 3 gate.
+        if rgb_samples == 3 {
+            bgr_to_rgb(&mut out, false, bps as usize, rgb_samples);
+        }
         return Ok(out);
     }
 
@@ -667,20 +736,84 @@ fn decode_lif_planar_rgb_region(
         let abs_src = checked_add_u64(block.file_offset, src, "Leica LIF source offset")?;
         let abs_end = checked_add_u64(block.file_offset, end, "Leica LIF source end")?;
         if abs_end > block_end || abs_end as usize > data.len() {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "Leica LIF plane {plane_index} exceeds memory block {} (offset {abs_src}, end {abs_end}, block end {block_end})",
-                    block.id
-                )));
+            return blank_lif_region(meta, layout, w, h);
         }
         out.extend_from_slice(&data[abs_src as usize..abs_end as usize]);
     }
+    // color planes are stored in BGR order (Java openBytes); only for
+    // three-sample RGB groups, matching the getRGBChannelCount() == 3 gate.
+    if rgb_samples == 3 {
+        bgr_to_rgb(&mut out, false, bps as usize, rgb_samples);
+    }
     Ok(out)
+}
+
+/// Mirror of Java `ImageTools.bgrToRgb`: Leica stores colour samples in BGR
+/// order, so swap the first and third samples to obtain RGB. Buffers with
+/// fewer than three samples (`c < 3`) are left untouched, matching Java. For
+/// the interleaved case the first and third sample of every pixel are swapped
+/// in place; for the planar case the entire first and third sample planes are
+/// exchanged. The callers only invoke this for three-sample RGB groups,
+/// matching Java `openBytes`' `getRGBChannelCount() == 3` gate.
+fn bgr_to_rgb(buf: &mut [u8], interleaved: bool, bpp: usize, c: usize) {
+    if c < 3 {
+        return;
+    }
+    if interleaved {
+        let pixel = bpp * c;
+        if pixel == 0 {
+            return;
+        }
+        let mut i = 0;
+        while i + bpp * 2 + bpp <= buf.len() {
+            for b in 0..bpp {
+                buf.swap(i + b, i + b + bpp * 2);
+            }
+            i += pixel;
+        }
+    } else {
+        let channel_len = buf.len() / (bpp * c);
+        if channel_len == 0 {
+            return;
+        }
+        for k in 0..channel_len {
+            buf.swap(k, channel_len * 2 + k);
+        }
+    }
+}
+
+fn blank_lif_region(meta: &ImageMetadata, layout: &PixelLayout, w: u32, h: u32) -> Result<Vec<u8>> {
+    let plane_layout = lif_plane_layout(meta, layout)?;
+    let bps = meta.pixel_type.bytes_per_sample() as u64;
+    let samples = match plane_layout {
+        LifPlaneLayout::InterleavedColor
+        | LifPlaneLayout::PlanarColor
+        | LifPlaneLayout::PaddedPlanarColor => lif_rgb_channel_count(meta) as u64,
+        LifPlaneLayout::Scalar => 1,
+    };
+    let len = checked_mul_u64(u64::from(w), u64::from(h), "Leica LIF blank plane pixels")?;
+    let len = checked_mul_u64(len, bps, "Leica LIF blank plane bytes")?;
+    let len = checked_mul_u64(len, samples, "Leica LIF blank plane samples")?;
+    let len = usize::try_from(len)
+        .map_err(|_| BioFormatsError::Format("Leica LIF blank plane is too large".into()))?;
+    Ok(vec![0; len])
 }
 
 #[derive(Debug, Clone, Copy)]
 enum LifCompression {
     Zlib,
     RawDeflate,
+    Gzip,
+}
+
+impl LifCompression {
+    fn metadata_status(self) -> &'static str {
+        match self {
+            LifCompression::Zlib => "supported_zlib",
+            LifCompression::RawDeflate => "supported_raw_deflate",
+            LifCompression::Gzip => "supported_gzip",
+        }
+    }
 }
 
 fn copy_lif_compressed_ranges(
@@ -691,11 +824,6 @@ fn copy_lif_compressed_ranges(
     plane_index: u32,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let kind = lif_compression_kind(compression).ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat(format!(
-            "Leica LIF compressed pixel payload declares unsupported compression hint: {compression}; only zlib/deflate memory blocks are supported"
-        ))
-    })?;
     let block_end = block
         .file_offset
         .checked_add(block.byte_len)
@@ -708,18 +836,100 @@ fn copy_lif_compressed_ranges(
         )));
     }
     let compressed = &data[block.file_offset as usize..block_end as usize];
+    let kind = lif_compression_kind_for_payload(compression, compressed).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "Leica LIF compressed pixel payload declares unsupported compression hint: {compression}; payload signature {}; first bytes [{}]; only zlib/deflate/gzip memory blocks are supported",
+            lif_payload_signature(compressed),
+            lif_payload_first_bytes(compressed)
+        ))
+    })?;
     stream_lif_compressed_ranges(compressed, kind, row_ranges, &block.id, plane_index, out)
 }
 
 fn lif_compression_kind(compression: &str) -> Option<LifCompression> {
     let lower = compression.to_ascii_lowercase();
+    let value = compression
+        .split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or(compression)
+        .trim()
+        .to_ascii_lowercase();
+    let normalized_value: String = value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     if lower.contains("zlib") {
         Some(LifCompression::Zlib)
+    } else if normalized_value.contains("gzip") || normalized_value == "gz" {
+        Some(LifCompression::Gzip)
     } else if lower.contains("deflate") {
         Some(LifCompression::RawDeflate)
     } else {
         None
     }
+}
+
+fn lif_compression_kind_for_payload(compression: &str, payload: &[u8]) -> Option<LifCompression> {
+    lif_compression_kind(compression).or_else(|| {
+        if !is_generic_compressed_hint(compression) {
+            return None;
+        }
+        match lif_payload_signature(payload) {
+            "zlib stream" => Some(LifCompression::Zlib),
+            "gzip stream" => Some(LifCompression::Gzip),
+            _ => None,
+        }
+    })
+}
+
+fn is_generic_compressed_hint(compression: &str) -> bool {
+    let value = compression
+        .split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or(compression)
+        .trim()
+        .to_ascii_lowercase();
+    matches!(value.as_str(), "1" | "true" | "yes" | "compressed")
+}
+
+fn lif_block_payload<'a>(data: &'a [u8], block: &MemoryBlock) -> Option<&'a [u8]> {
+    let start = usize::try_from(block.file_offset).ok()?;
+    let len = usize::try_from(block.byte_len).ok()?;
+    let end = start.checked_add(len)?;
+    data.get(start..end)
+}
+
+fn lif_payload_signature(payload: &[u8]) -> &'static str {
+    if payload.is_empty() {
+        "empty payload"
+    } else if payload.starts_with(&[0x1f, 0x8b]) {
+        "gzip stream"
+    } else if payload.len() >= 2
+        && payload[0] & 0x0f == 8
+        && payload[0] >> 4 <= 7
+        && (((payload[0] as u16) << 8) | payload[1] as u16) % 31 == 0
+    {
+        "zlib stream"
+    } else if payload.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        "Zstandard frame"
+    } else if payload.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        "XZ stream"
+    } else if payload.starts_with(b"BZh") {
+        "bzip2 stream"
+    } else if payload.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+        "LZ4 frame"
+    } else {
+        "unknown payload"
+    }
+}
+
+fn lif_payload_first_bytes(payload: &[u8]) -> String {
+    payload
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn stream_lif_compressed_ranges(
@@ -730,7 +940,7 @@ fn stream_lif_compressed_ranges(
     plane_index: u32,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 
     match kind {
         LifCompression::Zlib => {
@@ -739,6 +949,10 @@ fn stream_lif_compressed_ranges(
         }
         LifCompression::RawDeflate => {
             let mut decoder = DeflateDecoder::new(compressed);
+            read_lif_compressed_ranges(&mut decoder, row_ranges, block_id, plane_index, out)?;
+        }
+        LifCompression::Gzip => {
+            let mut decoder = GzDecoder::new(compressed);
             read_lif_compressed_ranges(&mut decoder, row_ranges, block_id, plane_index, out)?;
         }
     }
@@ -838,16 +1052,26 @@ fn zct_for_plane(plane_index: u32, meta: &ImageMetadata) -> (u32, u32, u32) {
 }
 
 fn lif_rgb_channel_count(meta: &ImageMetadata) -> u32 {
-    if meta.is_rgb {
-        3
+    if !meta.is_rgb {
+        return 1;
+    }
+    let zt = meta.size_z.max(1).saturating_mul(meta.size_t.max(1));
+    let effective_c = if zt == 0 { 0 } else { meta.image_count / zt };
+    if effective_c > 0 {
+        (meta.size_c / effective_c).max(1)
     } else {
-        1
+        3
     }
 }
 
 fn lif_effective_size_c(meta: &ImageMetadata) -> u32 {
     if meta.is_rgb {
-        (meta.size_c / lif_rgb_channel_count(meta)).max(1)
+        let zt = meta.size_z.max(1).saturating_mul(meta.size_t.max(1));
+        if zt > 0 && meta.image_count >= zt {
+            (meta.image_count / zt).max(1)
+        } else {
+            (meta.size_c / lif_rgb_channel_count(meta)).max(1)
+        }
     } else {
         meta.size_c.max(1)
     }
@@ -862,7 +1086,7 @@ fn lif_rgb_group_offsets(layout: &PixelLayout, c: u32, rgb_samples: u32) -> Resu
         .get(first..first + rgb_samples as usize)
         .ok_or_else(|| {
             BioFormatsError::UnsupportedFormat(format!(
-                "Leica LIF RGB channel group {c} is not described by channel offsets {:?}",
+                "Leica LIF color channel group {c} is not described by channel offsets {:?}",
                 layout.channel_offsets
             ))
         })
@@ -1056,6 +1280,7 @@ fn parse_xml(xml: &str) -> Result<(Vec<SeriesInfo>, Vec<String>)> {
             info.meta
                 .series_metadata
                 .insert("lif.compressed".to_string(), MetadataValue::Bool(true));
+            annotate_lif_compression(&mut info.meta, &compression);
             info.layout.compression = Some(compression);
         }
         let tiles = info.tile_count.max(1);
@@ -1066,6 +1291,157 @@ fn parse_xml(xml: &str) -> Result<(Vec<SeriesInfo>, Vec<String>)> {
     }
 
     Ok((series, ordered_ids))
+}
+
+fn annotate_lif_compression(meta: &mut ImageMetadata, compression: &str) {
+    let (status, diagnostic) = match lif_compression_kind(compression) {
+        Some(kind) => (kind.metadata_status(), None),
+        None => (
+            "unsupported_hint",
+            Some(format!(
+                "Leica LIF compressed pixel payload declares unsupported compression hint: {compression}; only zlib/deflate/gzip memory blocks are supported"
+            )),
+        ),
+    };
+    meta.series_metadata.insert(
+        "lif.compression.status".to_string(),
+        MetadataValue::String(status.to_string()),
+    );
+    if let Some(diagnostic) = diagnostic {
+        meta.series_metadata.insert(
+            "lif.compression.diagnostic".to_string(),
+            MetadataValue::String(diagnostic),
+        );
+    }
+}
+
+fn annotate_lif_storage(
+    series: &mut [SeriesInfo],
+    ordered_ids: &[String],
+    memory_blocks: &[MemoryBlock],
+    matched_by_id: bool,
+) {
+    let mut series_index = 0usize;
+    for (group_index, requested_id) in ordered_ids.iter().enumerate() {
+        if series_index >= series.len() {
+            break;
+        }
+        let tiles = series[series_index].tile_count.max(1) as usize;
+        let end = (series_index + tiles).min(series.len());
+        let block = memory_blocks.get(group_index);
+
+        for info in &mut series[series_index..end] {
+            info.meta.series_metadata.insert(
+                "lif.memory_block.requested_id".to_string(),
+                MetadataValue::String(requested_id.clone()),
+            );
+
+            match block {
+                Some(block) => {
+                    let status = if matched_by_id {
+                        "matched_by_id"
+                    } else {
+                        "fallback_file_order"
+                    };
+                    info.meta.series_metadata.insert(
+                        "lif.memory_block.status".to_string(),
+                        MetadataValue::String(status.to_string()),
+                    );
+                    info.meta.series_metadata.insert(
+                        "lif.memory_block.resolved_id".to_string(),
+                        MetadataValue::String(block.id.clone()),
+                    );
+                    info.meta.series_metadata.insert(
+                        "lif.memory_block.file_offset".to_string(),
+                        MetadataValue::Int(block.file_offset.min(i64::MAX as u64) as i64),
+                    );
+                    info.meta.series_metadata.insert(
+                        "lif.memory_block.byte_length".to_string(),
+                        MetadataValue::Int(block.byte_len.min(i64::MAX as u64) as i64),
+                    );
+                    if !matched_by_id {
+                        info.meta.series_metadata.insert(
+                            "lif.memory_block.diagnostic".to_string(),
+                            MetadataValue::String(
+                                "XML MemoryBlockID entries did not all match file memory block IDs; using file order"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
+                None => {
+                    info.meta.series_metadata.insert(
+                        "lif.memory_block.status".to_string(),
+                        MetadataValue::String("missing".to_string()),
+                    );
+                    info.meta.series_metadata.insert(
+                        "lif.memory_block.diagnostic".to_string(),
+                        MetadataValue::String(
+                            "No file memory block was available for this XML image".to_string(),
+                        ),
+                    );
+                }
+            }
+        }
+
+        series_index = end;
+    }
+}
+
+fn annotate_lif_compression_payloads(
+    series: &mut [SeriesInfo],
+    memory_blocks: &[MemoryBlock],
+    data: &[u8],
+) {
+    let mut series_index = 0usize;
+    let mut group_index = 0usize;
+    while series_index < series.len() {
+        let tiles = series[series_index].tile_count.max(1) as usize;
+        let end = (series_index + tiles).min(series.len());
+
+        if series[series_index].layout.compression.is_some() {
+            if let Some(block) = memory_blocks.get(group_index) {
+                if let Some(payload) = lif_block_payload(data, block) {
+                    let signature = lif_payload_signature(payload);
+                    let first_bytes = lif_payload_first_bytes(payload);
+                    for info in &mut series[series_index..end] {
+                        if let Some(compression) = info.layout.compression.as_deref() {
+                            if lif_compression_kind(compression).is_none() {
+                                if let Some(kind) =
+                                    lif_compression_kind_for_payload(compression, payload)
+                                {
+                                    info.meta.series_metadata.insert(
+                                        "lif.compression.status".to_string(),
+                                        MetadataValue::String(format!(
+                                            "{}_payload_signature",
+                                            kind.metadata_status()
+                                        )),
+                                    );
+                                    info.meta.series_metadata.insert(
+                                        "lif.compression.diagnostic".to_string(),
+                                        MetadataValue::String(format!(
+                                            "Leica LIF compressed pixel payload declares generic/unsupported compression hint {compression}; routing by bounded payload signature {signature}"
+                                        )),
+                                    );
+                                }
+                            }
+                        }
+                        info.meta.series_metadata.insert(
+                            "lif.compression.payload_signature".to_string(),
+                            MetadataValue::String(signature.to_string()),
+                        );
+                        info.meta.series_metadata.insert(
+                            "lif.compression.payload_first_bytes".to_string(),
+                            MetadataValue::String(first_bytes.clone()),
+                        );
+                    }
+                }
+            }
+        }
+
+        series_index = end;
+        group_index += 1;
+    }
 }
 
 fn compression_hint(dom: &Dom, img: usize, mem_node: Option<usize>) -> Option<String> {
@@ -1324,10 +1700,11 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
     m.dimension_order = dimension_order_from_bytes(&bytes_per_axis);
     m.is_rgb = is_rgb;
     m.is_interleaved = is_rgb
-        && !is_direct_planar_rgb(
+        && !is_decodable_planar_rgb(
             is_rgb,
             m.size_c,
             pixel_type.bytes_per_sample() as u64,
+            size_x,
             size_y,
             x_stride,
             y_stride,
@@ -1375,20 +1752,29 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
         );
     }
 
-    let rgb_channel_count = if is_rgb { 3 } else { 1 };
-    m.image_count = size_z * size_t * (m.size_c / rgb_channel_count.max(1));
+    let effective_size_c = if is_rgb {
+        (m.size_c / 3).max(1)
+    } else {
+        m.size_c.max(1)
+    };
+    let rgb_channel_count = if is_rgb {
+        (m.size_c / effective_size_c).max(1)
+    } else {
+        1
+    };
+    m.image_count = size_z * size_t * effective_size_c;
     m.series_metadata.insert(
         "lif.rgb_samples_per_pixel".to_string(),
         MetadataValue::Int(i64::from(rgb_channel_count)),
     );
     m.series_metadata.insert(
         "lif.effective_size_c".to_string(),
-        MetadataValue::Int(i64::from((m.size_c / rgb_channel_count.max(1)).max(1))),
+        MetadataValue::Int(i64::from(effective_size_c)),
     );
 
     // Effective channel count (OME channels): one per ChannelDescription for
     // non-RGB, or the RGB group count otherwise.
-    let effective_c = (m.size_c / rgb_channel_count.max(1)).max(1) as usize;
+    let effective_c = effective_size_c.max(1) as usize;
     let ch_names = channel_names(dom, img, effective_c);
     let channels: Vec<OmeChannel> = ch_names
         .into_iter()
@@ -1407,50 +1793,125 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
         ..OmeImage::default()
     };
 
+    let layout = PixelLayout {
+        x_stride,
+        y_stride,
+        channel_offsets,
+        c_stride,
+        z_stride,
+        t_stride,
+        tile_stride: (tile_bytes_inc > 0).then_some(tile_bytes_inc),
+        compression: None,
+    };
+    annotate_lif_color_layout(&mut m, &layout);
+
     Ok(SeriesInfo {
         meta: m,
         tile_count,
         ome,
-        layout: PixelLayout {
-            x_stride,
-            y_stride,
-            channel_offsets,
-            c_stride,
-            z_stride,
-            t_stride,
-            tile_stride: (tile_bytes_inc > 0).then_some(tile_bytes_inc),
-            compression: None,
-        },
+        layout,
     })
 }
 
-fn is_direct_planar_rgb(
+fn annotate_lif_color_layout(meta: &mut ImageMetadata, layout: &PixelLayout) {
+    if !meta.is_rgb {
+        return;
+    }
+    let (status, diagnostic) = match lif_plane_layout(meta, layout) {
+        Ok(LifPlaneLayout::InterleavedColor) => ("interleaved_contiguous", None),
+        Ok(LifPlaneLayout::PlanarColor) => ("planar_contiguous", None),
+        Ok(LifPlaneLayout::PaddedPlanarColor) => ("planar_padded_non_contiguous", None),
+        Ok(LifPlaneLayout::Scalar) => ("scalar", None),
+        Err(err) => (
+            "unsupported_irregular_non_contiguous",
+            Some(format!("{err}")),
+        ),
+    };
+    meta.series_metadata.insert(
+        "lif.color_layout.status".to_string(),
+        MetadataValue::String(status.to_string()),
+    );
+    if let Some(diagnostic) = diagnostic {
+        meta.series_metadata.insert(
+            "lif.color_layout.diagnostic".to_string(),
+            MetadataValue::String(diagnostic),
+        );
+    }
+}
+
+fn is_decodable_planar_rgb(
     is_rgb: bool,
     size_c: u32,
     bps: u64,
+    size_x: u32,
     size_y: u32,
     x_stride: u64,
     y_stride: u64,
     channel_offsets: &[u64],
 ) -> Result<bool> {
-    if !is_rgb
-        || size_c < 3
-        || size_c % 3 != 0
-        || channel_offsets.len() != size_c as usize
-        || x_stride != bps
-    {
+    if !is_rgb || size_c < 3 || channel_offsets.len() != size_c as usize || x_stride != bps {
         return Ok(false);
     }
-    let plane_stride = checked_mul_u64(y_stride, u64::from(size_y), "Leica LIF RGB plane stride")?;
-    for group in channel_offsets.chunks_exact(3) {
-        if group[1] != checked_add_u64(group[0], plane_stride, "Leica LIF RGB plane offset")?
-            || group[2]
-                != checked_add_u64(
-                    group[0],
-                    checked_mul_u64(plane_stride, 2, "Leica LIF RGB plane offset")?,
-                    "Leica LIF RGB plane offset",
-                )?
-        {
+    let effective_c = (size_c / 3).max(1);
+    let samples_per_pixel = (size_c / effective_c).max(1);
+    if samples_per_pixel < 2 || size_c % samples_per_pixel != 0 {
+        return Ok(false);
+    }
+    let plane_stride =
+        checked_mul_u64(y_stride, u64::from(size_y), "Leica LIF color plane stride")?;
+    let mut is_contiguous_planar = true;
+    for group in channel_offsets.chunks_exact(samples_per_pixel as usize) {
+        for sample in 1..samples_per_pixel as usize {
+            let expected = checked_add_u64(
+                group[0],
+                checked_mul_u64(plane_stride, sample as u64, "Leica LIF color plane offset")?,
+                "Leica LIF color plane offset",
+            )?;
+            if group[sample] != expected {
+                is_contiguous_planar = false;
+                break;
+            }
+        }
+        if !is_contiguous_planar {
+            break;
+        }
+    }
+    if is_contiguous_planar {
+        return Ok(true);
+    }
+    if channel_offsets_are_ordered_non_overlapping(size_x, size_y, bps, y_stride, channel_offsets)?
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn channel_offsets_are_ordered_non_overlapping(
+    size_x: u32,
+    size_y: u32,
+    bps: u64,
+    y_stride: u64,
+    channel_offsets: &[u64],
+) -> Result<bool> {
+    if !channel_offsets.windows(2).all(|pair| pair[0] <= pair[1]) {
+        return Ok(false);
+    }
+    let row_bytes = checked_mul_u64(u64::from(size_x), bps, "Leica LIF row bytes")?;
+    if y_stride < row_bytes {
+        return Ok(false);
+    }
+    let footprint = checked_add_u64(
+        checked_mul_u64(
+            u64::from(size_y.saturating_sub(1)),
+            y_stride,
+            "Leica LIF color plane footprint",
+        )?,
+        row_bytes,
+        "Leica LIF color plane footprint",
+    )?;
+    for pair in channel_offsets.windows(2) {
+        let prev_end = checked_add_u64(pair[0], footprint, "Leica LIF color plane end")?;
+        if prev_end > pair[1] {
             return Ok(false);
         }
     }
@@ -1636,6 +2097,26 @@ mod tests {
         bytes
     }
 
+    fn synthetic_rgba_lif_bytes() -> Vec<u8> {
+        let xml = r#"<LMSDataContainerHeader><Element Name="Experiment"><Element Name="RGBA Scan"><Memory MemoryBlockID="RgbaMem"/><Data><Image Name="RGBA Image"><ImageDescription><Channels><ChannelDescription BytesInc="0"/><ChannelDescription BytesInc="1"/><ChannelDescription BytesInc="2"/><ChannelDescription BytesInc="3"/></Channels><Dimensions><DimensionDescription DimID="1" NumberOfElements="2" BytesInc="3"/><DimensionDescription DimID="2" NumberOfElements="2" BytesInc="8"/></Dimensions></ImageDescription></Image></Data></Element></Element></LMSDataContainerHeader>"#;
+        let xml = utf16le(xml);
+
+        let mut bytes = vec![0x70, 0, 0, 0x70, 0, 0, 0, 0, 0x2a];
+        bytes.extend_from_slice(&((xml.len() / 2) as i32).to_le_bytes());
+        bytes.extend_from_slice(&xml);
+
+        let id = utf16le("RgbaMem");
+        bytes.extend_from_slice(&(0x70_i32).to_le_bytes());
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.push(0x2a);
+        bytes.extend_from_slice(&16_i32.to_le_bytes());
+        bytes.push(0x2a);
+        bytes.extend_from_slice(&((id.len() / 2) as i32).to_le_bytes());
+        bytes.extend_from_slice(&id);
+        bytes.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18]);
+        bytes
+    }
+
     fn synthetic_planar_rgb_lif_bytes(channel_offsets: [u64; 3]) -> Vec<u8> {
         let xml = format!(
             r#"<LMSDataContainerHeader><Element Name="Experiment"><Element Name="Planar RGB Scan"><Memory MemoryBlockID="PlanarRgbMem"/><Data><Image Name="Planar RGB Image"><ImageDescription><Channels><ChannelDescription BytesInc="{}"/><ChannelDescription BytesInc="{}"/><ChannelDescription BytesInc="{}"/></Channels><Dimensions><DimensionDescription DimID="1" NumberOfElements="2" BytesInc="3"/><DimensionDescription DimID="2" NumberOfElements="2" BytesInc="2"/><DimensionDescription DimID="3" NumberOfElements="2" BytesInc="12"/></Dimensions></ImageDescription></Image></Data></Element></Element></LMSDataContainerHeader>"#,
@@ -1659,6 +2140,29 @@ mod tests {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 101, 102, 103, 104, 105, 106, 107, 108, 109,
             110, 111, 112,
         ]);
+        bytes
+    }
+
+    fn synthetic_padded_planar_rgb_lif_bytes(channel_offsets: [u64; 3]) -> Vec<u8> {
+        let xml = format!(
+            r#"<LMSDataContainerHeader><Element Name="Experiment"><Element Name="Padded Planar RGB Scan"><Memory MemoryBlockID="PaddedPlanarRgbMem"/><Data><Image Name="Padded Planar RGB Image"><ImageDescription><Channels><ChannelDescription BytesInc="{}"/><ChannelDescription BytesInc="{}"/><ChannelDescription BytesInc="{}"/></Channels><Dimensions><DimensionDescription DimID="1" NumberOfElements="2" BytesInc="3"/><DimensionDescription DimID="2" NumberOfElements="2" BytesInc="2"/></Dimensions></ImageDescription></Image></Data></Element></Element></LMSDataContainerHeader>"#,
+            channel_offsets[0], channel_offsets[1], channel_offsets[2]
+        );
+        let xml = utf16le(&xml);
+
+        let mut bytes = vec![0x70, 0, 0, 0x70, 0, 0, 0, 0, 0x2a];
+        bytes.extend_from_slice(&((xml.len() / 2) as i32).to_le_bytes());
+        bytes.extend_from_slice(&xml);
+
+        let id = utf16le("PaddedPlanarRgbMem");
+        bytes.extend_from_slice(&(0x70_i32).to_le_bytes());
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.push(0x2a);
+        bytes.extend_from_slice(&15_i32.to_le_bytes());
+        bytes.push(0x2a);
+        bytes.extend_from_slice(&((id.len() / 2) as i32).to_le_bytes());
+        bytes.extend_from_slice(&id);
+        bytes.extend_from_slice(&[1, 2, 3, 4, 99, 5, 6, 7, 8, 88, 9, 10, 11, 12, 77]);
         bytes
     }
 
@@ -1735,6 +2239,28 @@ mod tests {
         bytes
     }
 
+    fn synthetic_memory_id_lif_bytes(xml_id: &str, block_id: &str) -> Vec<u8> {
+        let xml = format!(
+            r#"<LMSDataContainerHeader><Element Name="Experiment"><Element Name="Storage Scan"><Memory MemoryBlockID="{xml_id}"/><Data><Image Name="Storage Image"><ImageDescription><Channels><ChannelDescription BytesInc="0"/></Channels><Dimensions><DimensionDescription DimID="1" NumberOfElements="2" BytesInc="1"/><DimensionDescription DimID="2" NumberOfElements="2" BytesInc="2"/></Dimensions></ImageDescription></Image></Data></Element></Element></LMSDataContainerHeader>"#
+        );
+        let xml = utf16le(&xml);
+
+        let mut bytes = vec![0x70, 0, 0, 0x70, 0, 0, 0, 0, 0x2a];
+        bytes.extend_from_slice(&((xml.len() / 2) as i32).to_le_bytes());
+        bytes.extend_from_slice(&xml);
+
+        let id = utf16le(block_id);
+        bytes.extend_from_slice(&(0x70_i32).to_le_bytes());
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.push(0x2a);
+        bytes.extend_from_slice(&4_i32.to_le_bytes());
+        bytes.push(0x2a);
+        bytes.extend_from_slice(&((id.len() / 2) as i32).to_le_bytes());
+        bytes.extend_from_slice(&id);
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        bytes
+    }
+
     fn deflate_stored(raw: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut chunks = raw.chunks(u16::MAX as usize).peekable();
@@ -1759,6 +2285,16 @@ mod tests {
         }
         out.extend_from_slice(&((b << 16) | a).to_be_bytes());
         out
+    }
+
+    fn gzip_compressed(raw: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(raw).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn synthetic_tiled_lif_bytes(include_tile_stride: bool) -> Vec<u8> {
@@ -1842,6 +2378,26 @@ mod tests {
         assert!(!meta.is_rgb);
         assert!(meta.is_indexed);
         assert!(meta.is_little_endian);
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.requested_id"),
+            Some(MetadataValue::String(value)) if value == "Mem1"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.resolved_id"),
+            Some(MetadataValue::String(value)) if value == "Mem1"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.status"),
+            Some(MetadataValue::String(value)) if value == "matched_by_id"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.byte_length"),
+            Some(MetadataValue::Int(192))
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.file_offset"),
+            Some(MetadataValue::Int(value)) if *value > 0
+        ));
 
         let ome = reader.ome_metadata().expect("OME metadata");
         assert_eq!(ome.images.len(), 1);
@@ -1870,7 +2426,44 @@ mod tests {
     }
 
     #[test]
-    fn reports_precise_error_for_truncated_pixel_block() {
+    fn records_memory_block_file_order_fallback_provenance() {
+        let bytes = synthetic_memory_id_lif_bytes("XmlMem", "ActualMem");
+        let path = temp_lif_path("memory_fallback");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LifReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.requested_id"),
+            Some(MetadataValue::String(value)) if value == "XmlMem"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.resolved_id"),
+            Some(MetadataValue::String(value)) if value == "ActualMem"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.status"),
+            Some(MetadataValue::String(value)) if value == "fallback_file_order"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.byte_length"),
+            Some(MetadataValue::Int(4))
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.diagnostic"),
+            Some(MetadataValue::String(value))
+                if value.contains("MemoryBlockID")
+                    && value.contains("file order")
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), [1, 2, 3, 4]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn returns_blank_plane_for_truncated_pixel_block_like_java() {
         let mut bytes = synthetic_lif_bytes();
         bytes.truncate(bytes.len() - 192);
         let path = temp_lif_path("missing_block");
@@ -1878,12 +2471,28 @@ mod tests {
 
         let mut reader = LifReader::new();
         reader.set_id(&path).unwrap();
-        let err = reader.open_bytes(0).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
-                if message.contains("exceeds memory block") && message.contains("Mem1")),
-            "{err:?}"
-        );
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 24]);
+        assert_eq!(reader.open_bytes_region(5, 1, 1, 2, 2).unwrap(), vec![0; 8]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn returns_blank_plane_for_missing_pixel_block_like_java() {
+        let mut bytes = synthetic_lif_bytes();
+        let xml_chars = i32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        bytes.truncate(13 + xml_chars * 2);
+        let path = temp_lif_path("no_memory_block");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LifReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("lif.memory_block.status"),
+            Some(MetadataValue::String(value)) if value == "missing"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 24]);
 
         let _ = std::fs::remove_file(path);
     }
@@ -1906,6 +2515,20 @@ mod tests {
             meta.series_metadata.get("lif.compression"),
             Some(MetadataValue::String(value)) if value == "Compression=zlib"
         ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression.status"),
+            Some(MetadataValue::String(value)) if value == "supported_zlib"
+        ));
+        assert!(matches!(
+            meta.series_metadata
+                .get("lif.compression.payload_signature"),
+            Some(MetadataValue::String(value)) if value == "zlib stream"
+        ));
+        assert!(matches!(
+            meta.series_metadata
+                .get("lif.compression.payload_first_bytes"),
+            Some(MetadataValue::String(value)) if value == "78 01 01 04 00 fb ff 01"
+        ));
 
         assert_eq!(reader.open_bytes(0).unwrap(), [1, 2, 3, 4]);
         assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), [2, 4]);
@@ -1922,25 +2545,138 @@ mod tests {
         let mut reader = LifReader::new();
         reader.set_id(&path).unwrap();
 
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("lif.compression.status"),
+            Some(MetadataValue::String(value)) if value == "supported_raw_deflate"
+        ));
         assert_eq!(reader.open_bytes(0).unwrap(), [5, 6, 7, 8]);
 
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
+    fn reads_gzip_compressed_lif_payload() {
+        let bytes = synthetic_compressed_lif_bytes("GZip", &gzip_compressed(&[9, 10, 11, 12]));
+        let path = temp_lif_path("gzip");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LifReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression"),
+            Some(MetadataValue::String(value)) if value == "Compression=GZip"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression.status"),
+            Some(MetadataValue::String(value)) if value == "supported_gzip"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), [9, 10, 11, 12]);
+        assert_eq!(reader.open_bytes_region(0, 0, 1, 2, 1).unwrap(), [11, 12]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_generic_compressed_lif_payload_by_zlib_signature() {
+        let bytes = synthetic_compressed_lif_bytes("true", &zlib_stored(&[21, 22, 23, 24]));
+        let path = temp_lif_path("generic_zlib");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LifReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression"),
+            Some(MetadataValue::String(value)) if value == "Compression=true"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression.status"),
+            Some(MetadataValue::String(value)) if value == "supported_zlib_payload_signature"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression.diagnostic"),
+            Some(MetadataValue::String(value))
+                if value.contains("Compression=true")
+                    && value.contains("payload signature zlib stream")
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), [21, 22, 23, 24]);
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), [22, 24]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_generic_compressed_lif_payload_by_gzip_signature() {
+        let bytes = synthetic_compressed_lif_bytes("yes", &gzip_compressed(&[31, 32, 33, 34]));
+        let path = temp_lif_path("generic_gzip");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LifReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression"),
+            Some(MetadataValue::String(value)) if value == "Compression=yes"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression.status"),
+            Some(MetadataValue::String(value)) if value == "supported_gzip_payload_signature"
+        ));
+        assert!(matches!(
+            meta.series_metadata
+                .get("lif.compression.payload_signature"),
+            Some(MetadataValue::String(value)) if value == "gzip stream"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), [31, 32, 33, 34]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn rejects_unknown_compressed_lif_payload_hint() {
-        let bytes = synthetic_compressed_lif_bytes("LeicaMagic", &[1, 2, 3]);
+        let bytes = synthetic_compressed_lif_bytes("LeicaMagic", &[0x1f, 0x8b, 0x08, 0x00, 0xff]);
         let path = temp_lif_path("unknown_compressed");
         std::fs::write(&path, &bytes).unwrap();
 
         let mut reader = LifReader::new();
         reader.set_id(&path).unwrap();
 
+        let meta = reader.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression.status"),
+            Some(MetadataValue::String(value)) if value == "unsupported_hint"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.compression.diagnostic"),
+            Some(MetadataValue::String(value))
+                if value.contains("Compression=LeicaMagic")
+                    && value.contains("zlib/deflate")
+        ));
+        assert!(matches!(
+            meta.series_metadata
+                .get("lif.compression.payload_signature"),
+            Some(MetadataValue::String(value)) if value == "gzip stream"
+        ));
+        assert!(matches!(
+            meta.series_metadata
+                .get("lif.compression.payload_first_bytes"),
+            Some(MetadataValue::String(value)) if value == "1f 8b 08 00 ff"
+        ));
+
         let err = reader.open_bytes(0).unwrap_err();
         assert!(
             matches!(err, BioFormatsError::UnsupportedFormat(ref message)
                 if message.contains("unsupported compression hint")
                     && message.contains("Compression=LeicaMagic")
+                    && message.contains("payload signature gzip stream")
+                    && message.contains("first bytes [1f 8b 08 00 ff]")
                     && message.contains("zlib/deflate")),
             "{err:?}"
         );
@@ -2022,17 +2758,62 @@ mod tests {
         assert_eq!(ome.images[0].channels.len(), 1);
         assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
 
+        // color planes are stored in BGR order; the reader swaps B<->R per
+        // pixel (Java ImageTools.bgrToRgb, interleaved, 3 samples).
         assert_eq!(
             reader.open_bytes(0).unwrap(),
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            [3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10]
         );
         assert_eq!(
             reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
-            [4, 5, 6, 10, 11, 12]
+            [6, 5, 4, 12, 11, 10]
         );
         assert_eq!(
             reader.open_bytes(1).unwrap(),
-            [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112]
+            [103, 102, 101, 106, 105, 104, 109, 108, 107, 112, 111, 110]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_uncompressed_interleaved_four_sample_color_pixels() {
+        let bytes = synthetic_rgba_lif_bytes();
+        let path = temp_lif_path("rgba");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LifReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 4);
+        assert_eq!(meta.image_count, 1);
+        assert!(meta.is_rgb);
+        assert!(meta.is_interleaved);
+        assert!(!meta.is_indexed);
+        assert!(matches!(
+            meta.series_metadata.get("lif.rgb_samples_per_pixel"),
+            Some(MetadataValue::Int(4))
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.effective_size_c"),
+            Some(MetadataValue::Int(1))
+        ));
+
+        let ome = reader.ome_metadata().expect("OME metadata");
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].channels[0].samples_per_pixel, 4);
+
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18]
+        );
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+            [5, 6, 7, 8, 15, 16, 17, 18]
         );
 
         let _ = std::fs::remove_file(path);
@@ -2061,17 +2842,19 @@ mod tests {
         assert_eq!(ome.images[0].channels.len(), 1);
         assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
 
+        // planar color planes are stored in BGR order; the reader swaps the
+        // first and third planes (Java ImageTools.bgrToRgb, planar, 3 samples).
         assert_eq!(
             reader.open_bytes(0).unwrap(),
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            [9, 10, 11, 12, 5, 6, 7, 8, 1, 2, 3, 4]
         );
         assert_eq!(
             reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
-            [2, 4, 6, 8, 10, 12]
+            [10, 12, 6, 8, 2, 4]
         );
         assert_eq!(
             reader.open_bytes(1).unwrap(),
-            [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112]
+            [109, 110, 111, 112, 105, 106, 107, 108, 101, 102, 103, 104]
         );
 
         let _ = std::fs::remove_file(path);
@@ -2097,17 +2880,19 @@ mod tests {
             meta.series_metadata.get("lif.compression"),
             Some(MetadataValue::String(value)) if value == "Compression=zlib"
         ));
+        // planar color planes are stored in BGR order; the reader swaps the
+        // first and third planes (Java ImageTools.bgrToRgb, planar, 3 samples).
         assert_eq!(
             reader.open_bytes(0).unwrap(),
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            [9, 10, 11, 12, 5, 6, 7, 8, 1, 2, 3, 4]
         );
         assert_eq!(
             reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
-            [2, 4, 6, 8, 10, 12]
+            [10, 12, 6, 8, 2, 4]
         );
         assert_eq!(
             reader.open_bytes(1).unwrap(),
-            [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112]
+            [109, 110, 111, 112, 105, 106, 107, 108, 101, 102, 103, 104]
         );
 
         let _ = std::fs::remove_file(path);
@@ -2141,13 +2926,15 @@ mod tests {
         assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
         assert_eq!(ome.images[0].channels[1].samples_per_pixel, 3);
 
+        // each three-sample group is stored in BGR order; the reader swaps
+        // B<->R per pixel (Java ImageTools.bgrToRgb, interleaved, 3 samples).
         assert_eq!(
             reader.open_bytes(0).unwrap(),
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            [3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10]
         );
         assert_eq!(
             reader.open_bytes(1).unwrap(),
-            [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112]
+            [103, 102, 101, 106, 105, 104, 109, 108, 107, 112, 111, 110]
         );
 
         let _ = std::fs::remove_file(path);
@@ -2168,31 +2955,79 @@ mod tests {
         assert!(meta.is_rgb);
         assert!(!meta.is_interleaved);
 
+        // each planar three-sample group is stored in BGR order; the reader
+        // swaps the first and third planes (Java ImageTools.bgrToRgb, planar).
         assert_eq!(
             reader.open_bytes(0).unwrap(),
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            [9, 10, 11, 12, 5, 6, 7, 8, 1, 2, 3, 4]
         );
         assert_eq!(
             reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(),
-            [102, 104, 106, 108, 110, 112]
+            [110, 112, 106, 108, 102, 104]
         );
 
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn rejects_unknown_rgb_channel_stride_layout() {
-        let bytes = synthetic_planar_rgb_lif_bytes([0, 5, 10]);
-        let path = temp_lif_path("unknown_rgb_stride");
+    fn reads_padded_planar_rgb_from_non_contiguous_channel_offsets() {
+        let bytes = synthetic_padded_planar_rgb_lif_bytes([0, 5, 10]);
+        let path = temp_lif_path("padded_planar_rgb");
         std::fs::write(&path, &bytes).unwrap();
 
         let mut reader = LifReader::new();
         reader.set_id(&path).unwrap();
 
+        let meta = reader.metadata();
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.image_count, 1);
+        assert!(meta.is_rgb);
+        assert!(!meta.is_interleaved);
+        assert!(matches!(
+            meta.series_metadata.get("lif.color_layout.status"),
+            Some(MetadataValue::String(value)) if value == "planar_padded_non_contiguous"
+        ));
+
+        // planar color planes are stored in BGR order; the reader swaps the
+        // first and third planes (Java ImageTools.bgrToRgb, planar, 3 samples).
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            [9, 10, 11, 12, 5, 6, 7, 8, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+            [10, 12, 6, 8, 2, 4]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_overlapping_rgb_channel_stride_layout() {
+        let bytes = synthetic_planar_rgb_lif_bytes([0, 3, 10]);
+        let path = temp_lif_path("overlapping_rgb_stride");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LifReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("lif.color_layout.status"),
+            Some(MetadataValue::String(value)) if value == "unsupported_irregular_non_contiguous"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.color_layout.diagnostic"),
+            Some(MetadataValue::String(value))
+                if value.contains("irregular/non-contiguous")
+                    && value.contains("channel offsets=[0, 3, 10]")
+        ));
+
         let err = reader.open_bytes(0).unwrap_err();
         assert!(
             matches!(err, BioFormatsError::UnsupportedFormat(ref message)
-                if message.contains("unsupported RGB layout")
+                if message.contains("unsupported irregular/non-contiguous color layout")
+                    && message.contains("irregular/non-contiguous")
                     && message.contains("channel offsets")),
             "{err:?}"
         );

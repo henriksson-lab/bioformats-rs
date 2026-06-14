@@ -86,6 +86,15 @@ pub struct DeltavisionReader {
     positions_in_time: bool,
     stage_ordering: StageOrdering,
     extended_headers: Vec<DvExtendedHeader>,
+    /// Per-channel neutral-density filter values (mirrors Java `ndFilters`).
+    ///
+    /// Java seeds each entry from the first plane's extended-header `ndFilter`
+    /// for that channel (`if (ndFilters[w] == null) ndFilters[w] = hdr.ndFilter`)
+    /// and lets the `.log` companion's "ND filter" lines override it. `None`
+    /// entries (e.g. a "BLANK" log value) leave the channel without an NDFilter.
+    nd_filters: Vec<Option<f64>>,
+    /// Parsed metadata from the `.log` deconvolution companion file (if present).
+    log_data: Option<LogFileData>,
 }
 
 impl DeltavisionReader {
@@ -101,7 +110,65 @@ impl DeltavisionReader {
             positions_in_time: false,
             stage_ordering: StageOrdering::default(),
             extended_headers: Vec::new(),
+            nd_filters: Vec::new(),
+            log_data: None,
         }
+    }
+}
+
+/// Objective metadata projected from the `.log` companion (mirrors the
+/// `store.setObjective*` calls in Java `DeltavisionReader.parseLogFile`).
+#[derive(Debug, Clone, Default)]
+struct LogObjective {
+    manufacturer: Option<String>,
+    nominal_magnification: Option<f64>,
+    lens_na: Option<f64>,
+    correction: Option<String>,
+    immersion: Option<String>,
+    model: Option<String>,
+    id: Option<String>,
+}
+
+/// Detector metadata projected from the `.log` companion.
+#[derive(Debug, Clone, Default)]
+struct LogDetector {
+    detector_type: Option<String>,
+    model: Option<String>,
+    gain: Option<f64>,
+}
+
+/// Result of parsing the `.log` deconvolution companion file. Mirrors the OME
+/// projections performed by Java `DeltavisionReader.parseLogFile`.
+#[derive(Debug, Clone, Default)]
+struct LogFileData {
+    objective: LogObjective,
+    detector: LogDetector,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
+    acquisition_date: Option<String>,
+    channel_names: Vec<String>,
+    /// Distinct "ND filter" values from the log (Java `filters`), each divided
+    /// by 100. A `None` entry mirrors a value Java could not parse (e.g. the
+    /// "BLANK" default for deconvolved data), which still occupies a slot.
+    nd_filters: Vec<Option<f64>>,
+}
+
+impl LogFileData {
+    fn has_objective(&self) -> bool {
+        let o = &self.objective;
+        o.manufacturer.is_some()
+            || o.nominal_magnification.is_some()
+            || o.lens_na.is_some()
+            || o.correction.is_some()
+            || o.immersion.is_some()
+            || o.model.is_some()
+            || o.id.is_some()
+    }
+
+    fn has_detector(&self) -> bool {
+        let d = &self.detector;
+        d.detector_type.is_some() || d.model.is_some() || d.gain.is_some()
     }
 }
 
@@ -524,6 +591,74 @@ fn older_position_series_count(
     n
 }
 
+/// Locate the `.log` companion file next to the given DeltaVision file, exactly
+/// as Java `DeltavisionReader.findLogFiles` does for the (non-deconvolution)
+/// `logFile`. Returns `None` if the current file has no extension or no log
+/// companion exists.
+fn find_log_file(current_file: &Path) -> Option<PathBuf> {
+    let name = current_file.to_str()?;
+    // The current file name has no extension -> skip (Java: lastIndexOf(".") == -1).
+    if !name.contains('.') {
+        return None;
+    }
+
+    let log_file: PathBuf = if name.ends_with("_D3D.dv") {
+        // <base>_D3D.dv -> <base>.dv.log
+        let base = &name[..name.find("_D3D.dv").unwrap()];
+        PathBuf::from(format!("{base}.dv.log"))
+    } else {
+        // <id>.log, falling back to <id-without-ext>.log
+        let candidate = PathBuf::from(format!("{name}.log"));
+        if candidate.exists() {
+            candidate
+        } else {
+            let base = &name[..name.rfind('.').unwrap()];
+            PathBuf::from(format!("{base}.log"))
+        }
+    };
+
+    if log_file.exists() {
+        Some(log_file)
+    } else {
+        None
+    }
+}
+
+/// Convert a DeltaVision `Created` timestamp (`E MMM d HH:mm:ss yyyy`, e.g.
+/// "Wed Jul 25 14:00:00 2007") into an ISO-8601 string, mirroring Java's
+/// `DateTools.formatDate(line, DATE_FORMATS)`. Returns `None` if unparseable.
+fn format_dv_date(line: &str) -> Option<String> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    // Expect: <weekday> <month> <day> <HH:mm:ss> <year>
+    if tokens.len() != 5 {
+        return None;
+    }
+    let month = match tokens[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: u32 = tokens[2].parse().ok()?;
+    let year: i32 = tokens[4].parse().ok()?;
+    let time = tokens[3];
+    // Validate the HH:mm:ss component.
+    let time_parts: Vec<&str> = time.split(':').collect();
+    if time_parts.len() != 3 || time_parts.iter().any(|p| p.parse::<u32>().is_err()) {
+        return None;
+    }
+    Some(format!("{year:04}-{month:02}-{day:02}T{time}"))
+}
+
 impl Default for DeltavisionReader {
     fn default() -> Self {
         Self::new()
@@ -591,6 +726,235 @@ impl DeltavisionReader {
             y
         };
         (y_index * x_tiles + x_index) as u32
+    }
+
+    /// Faithful translation of Java `DeltavisionReader.parseLogFile`. Reads the
+    /// line-oriented `key: value` `.log` companion located next to the DV file,
+    /// records the same global-metadata keys Java records (into every series'
+    /// `series_metadata`, since this port has no shared global-metadata map) and
+    /// collects the objective/detector/channel/date projections that Java pushes
+    /// into the OME `MetadataStore`. Returns `true` if a log file was parsed.
+    fn parse_log_file(&mut self) -> bool {
+        let Some(current_file) = self.path.clone() else {
+            return false;
+        };
+        let Some(log_file) = find_log_file(&current_file) else {
+            return false;
+        };
+        let Ok(contents) = std::fs::read_to_string(&log_file) else {
+            return false;
+        };
+
+        // DataTools.readFile(...).split("[\r\n]") -- split on every CR or LF.
+        let lines: Vec<&str> = contents.split(['\r', '\n']).collect();
+
+        let mut prefix = String::new();
+        let mut current_image: u32 = 0;
+        let mut list_counters: HashMap<String, usize> = HashMap::new();
+
+        let mut log = LogFileData::default();
+        // Accumulated global-metadata keys (Java addGlobalMeta / addGlobalMetaList).
+        let mut global_meta: Vec<(String, String)> = Vec::new();
+
+        for raw_line in lines {
+            let line = raw_line;
+            let colon = line.find(':');
+            if let Some(colon) = colon.filter(|&c| c < line.len() - 1 && !line.starts_with("Created"))
+            {
+                let key = line[..colon].trim().to_string();
+                let mut value = line[colon + 1..].trim().to_string();
+                if value.is_empty() && !key.is_empty() {
+                    prefix = key.clone();
+                }
+                global_meta.push((format!("{prefix} {key}"), value.clone()));
+
+                // Objective properties
+                if key == "Objective" {
+                    // assume first word is the manufacturer's name
+                    if let Some(space) = value.find(' ') {
+                        let manufacturer = value[..space].to_string();
+                        let extra = &value[space + 1..];
+                        let tokens: Vec<&str> = extra.split(',').collect();
+
+                        log.objective.manufacturer = Some(manufacturer);
+
+                        let mut magnification = "";
+                        let mut na = "";
+                        if let Some(first) = tokens.first() {
+                            if let Some(end) = first.find('X') {
+                                if end > 0 {
+                                    magnification = &first[..end];
+                                }
+                            }
+                            if let Some(start) = first.find('/') {
+                                na = &first[start + 1..];
+                            }
+                        }
+                        if let Ok(mag) = magnification.trim().parse::<f64>() {
+                            log.objective.nominal_magnification = Some(mag);
+                        }
+                        if let Ok(na) = na.trim().parse::<f64>() {
+                            log.objective.lens_na = Some(na);
+                        }
+                        if tokens.len() >= 2 {
+                            log.objective.correction = Some(tokens[1].trim().to_string());
+                        }
+                        // TODO: Token #2 is the microscope model name.
+                        if tokens.len() > 3 {
+                            log.objective.model = Some(tokens[3].trim().to_string());
+                        }
+                    }
+                } else if key.eq_ignore_ascii_case("Lens ID") {
+                    if let Some(comma) = value.find(',') {
+                        value = value[..comma].to_string();
+                    }
+                    if let Some(space) = value.find(' ') {
+                        value = value[space + 1..].to_string();
+                    }
+                    if value != "null" {
+                        log.objective.id = Some(format!("Objective:{value}"));
+                        log.objective.correction = Some("Other".to_string());
+                        log.objective.immersion = Some("Other".to_string());
+                    }
+                }
+                // Image properties
+                else if key == "Pixel Size" {
+                    let pixel_sizes: Vec<&str> = value.split(' ').collect();
+                    for (q, raw) in pixel_sizes.iter().enumerate() {
+                        let size = raw.trim().parse::<f64>().ok();
+                        match q {
+                            0 => log.physical_size_x = size,
+                            1 => log.physical_size_y = size,
+                            2 => log.physical_size_z = size,
+                            _ => {}
+                        }
+                    }
+                } else if key == "Binning" {
+                    log.detector.detector_type = Some("Other".to_string());
+                }
+                // Camera properties
+                else if key == "Type" {
+                    log.detector.model = Some(value.clone());
+                } else if key == "Gain" {
+                    let cleaned = value.replace('X', "");
+                    if let Ok(gain) = cleaned.trim().parse::<f64>() {
+                        log.detector.gain = Some(gain);
+                    }
+                }
+                // Plane properties
+                else if key == "EM filter" {
+                    if !log.channel_names.contains(&value) {
+                        log.channel_names.push(value.clone());
+                    }
+                } else if key == "ND filter" {
+                    // Java: value.replaceAll("%", ""); nd = parse / 100; dedupe;
+                    // on NumberFormatException add null (BLANK is silent).
+                    let cleaned = value.replace('%', "");
+                    match cleaned.trim().parse::<f64>() {
+                        Ok(parsed) => {
+                            let nd = parsed / 100.0;
+                            if !log.nd_filters.iter().any(|f| *f == Some(nd)) {
+                                log.nd_filters.push(Some(nd));
+                            }
+                        }
+                        Err(_) => {
+                            log.nd_filters.push(None);
+                        }
+                    }
+                } else if key == "Stage coordinates" {
+                    current_image += 1;
+                }
+                // ("Speed", "Temp Setting") parsed by Java affect detector
+                // read-out rate / environment temperature only; not projected here.
+            } else if line.starts_with("Image") {
+                prefix = line.to_string();
+            } else if line.starts_with("Created") {
+                let mut date_line = line;
+                if line.len() > 8 {
+                    date_line = line[8..].trim();
+                }
+                if let Some(date) = format_dv_date(date_line) {
+                    log.acquisition_date = Some(date);
+                }
+            } else if let Some(rest) = line.strip_prefix("#KEY") {
+                // Java: line.substring(line.indexOf(" ")).trim()
+                let line = rest.trim_start();
+                let split = line.find(':').or_else(|| line.find(' '));
+                if let Some(split) = split {
+                    let key = line[..split].trim().to_string();
+                    let value = line[split + 1..].trim().to_string();
+                    global_meta.push((key, value));
+                }
+            } else if let Some(p) = line.strip_suffix(':') {
+                prefix = p.to_string();
+            } else if !line.starts_with('#')
+                && !line.replace('-', "").is_empty()
+                && !prefix.is_empty()
+            {
+                // addGlobalMetaList(prefix, line): append with an incrementing index.
+                let n = list_counters.entry(prefix.clone()).or_insert(0);
+                *n += 1;
+                global_meta.push((format!("{prefix} #{n}"), line.to_string()));
+            }
+        }
+
+        let _ = current_image;
+
+        // Mirror Java's addGlobalMeta(...) into every series' metadata map (this
+        // port has no shared global-metadata store).
+        for meta in self.series.iter_mut() {
+            for (k, v) in &global_meta {
+                meta.series_metadata
+                    .insert(k.clone(), MetadataValue::String(v.clone()));
+            }
+        }
+
+        self.log_data = Some(log);
+        true
+    }
+
+    /// Build the per-channel `nd_filters` array, mirroring how Java fills its
+    /// `ndFilters[]`: the `.log` companion's "ND filter" values take precedence
+    /// (copied per channel in `parseLogFile`), and any channel still without a
+    /// value is seeded from the first plane's extended-header `ndFilter`
+    /// (`if (ndFilters[w] == null) ndFilters[w] = hdr.ndFilter`). Must run after
+    /// `parse_log_file` so the log values win, exactly as in Java `initFile`.
+    fn populate_nd_filters(&mut self, size_c: u32) {
+        let mut nd_filters: Vec<Option<f64>> = vec![None; size_c as usize];
+
+        // Java parseLogFile: for c in [0, effectiveSizeC): if c < filters.size()
+        // ndFilters[c] = filters.get(c).
+        if let Some(log) = &self.log_data {
+            for (c, slot) in nd_filters.iter_mut().enumerate() {
+                if let Some(value) = log.nd_filters.get(c) {
+                    *slot = *value;
+                }
+            }
+        }
+
+        // Java initExtraMetadata: seed remaining channels from the first plane's
+        // extended-header ndFilter, using series 0's stage-mapped index.
+        if !self.extended_headers.is_empty() {
+            if let Some(meta) = self.series.first() {
+                let metadata_series = self.stage_metadata_series_index(0);
+                for (c, slot) in nd_filters.iter_mut().enumerate() {
+                    if slot.is_none() {
+                        let raw_idx = self.file_plane_index_for_series(
+                            0,
+                            c as u32,
+                            0,
+                            metadata_series,
+                            meta,
+                        ) as usize;
+                        if let Some(h) = self.extended_headers.get(raw_idx) {
+                            *slot = Some(h.nd_filter as f64);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.nd_filters = nd_filters;
     }
 }
 
@@ -844,6 +1208,12 @@ impl FormatReader for DeltavisionReader {
         self.stage_ordering = stage_ordering(&extended_headers, series_count);
         self.extended_headers = extended_headers;
         self.path = Some(path.to_path_buf());
+        self.log_data = None;
+        // Java initFile: parseLogFile(store) (gated on isGroupFiles(), which
+        // defaults to true). Locates the `.log` companion and projects its
+        // metadata; absent companions are skipped silently.
+        self.parse_log_file();
+        self.populate_nd_filters(channels);
         Ok(())
     }
 
@@ -855,6 +1225,8 @@ impl FormatReader for DeltavisionReader {
         self.positions_in_time = false;
         self.stage_ordering = StageOrdering::default();
         self.extended_headers.clear();
+        self.nd_filters.clear();
+        self.log_data = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -1018,6 +1390,82 @@ impl FormatReader for DeltavisionReader {
                 }
             }
         }
+
+        // Channel NDFilter (Java store.setChannelNDFilter(ndFilters[w], ...)).
+        for c in 0..meta.size_c as usize {
+            if let Some(channel) = img.channels.get_mut(c) {
+                if let Some(Some(nd)) = self.nd_filters.get(c) {
+                    channel.nd_filter = Some(*nd);
+                }
+            }
+        }
+        // Project metadata parsed from the `.log` companion file, mirroring the
+        // OME `MetadataStore` writes in Java `DeltavisionReader.parseLogFile`.
+        if let Some(log) = &self.log_data {
+            use crate::common::ome_metadata::{OmeDetector, OmeInstrument, OmeObjective};
+            let img = &mut ome.images[0];
+
+            if let Some(date) = &log.acquisition_date {
+                img.acquisition_date = Some(date.clone());
+            }
+
+            // Physical pixel sizes (Pixel Size: X Y Z).
+            if let Some(v) = log.physical_size_x {
+                img.physical_size_x = Some(v);
+            }
+            if let Some(v) = log.physical_size_y {
+                img.physical_size_y = Some(v);
+            }
+            if let Some(v) = log.physical_size_z {
+                img.physical_size_z = Some(v);
+            }
+
+            // Channel names (EM filter).
+            for (c, name) in log.channel_names.iter().enumerate() {
+                if let Some(channel) = img.channels.get_mut(c) {
+                    channel.name = Some(name.clone());
+                }
+            }
+
+            if log.has_objective() || log.has_detector() {
+                if ome.instruments.is_empty() {
+                    ome.instruments.push(OmeInstrument::default());
+                }
+                let inst = &mut ome.instruments[0];
+
+                if log.has_objective() {
+                    let o = &log.objective;
+                    inst.objectives.push(OmeObjective {
+                        id: o.id.clone(),
+                        model: o.model.clone(),
+                        manufacturer: o.manufacturer.clone(),
+                        nominal_magnification: o.nominal_magnification,
+                        calibrated_magnification: None,
+                        lens_na: o.lens_na,
+                        immersion: o.immersion.clone(),
+                        correction: o.correction.clone(),
+                        working_distance: None,
+                    });
+                }
+                if log.has_detector() {
+                    let d = &log.detector;
+                    inst.detectors.push(OmeDetector {
+                        id: None,
+                        model: d.model.clone(),
+                        manufacturer: None,
+                        detector_type: d.detector_type.clone(),
+                        gain: d.gain,
+                        offset: None,
+                    });
+                }
+
+                ome.images[0].instrument_ref = Some(0);
+                if log.has_objective() {
+                    ome.images[0].objective_ref = Some(0);
+                }
+            }
+        }
+
         let _ = ome.add_original_metadata_annotations(meta, 0);
         Some(ome)
     }
@@ -1466,6 +1914,143 @@ mod tests {
         assert_eq!(ome.images[0].planes[1].delta_t, Some(1.100000023841858));
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn nd_filter_seeded_from_extended_header_when_no_log() {
+        // ext_header writes ndFilter=50.0; from_floats divides by 100 -> 0.5.
+        let headers = [
+            ext_header(0.25, 10.0, 20.0, 0.05, 488.0, 525.0),
+            ext_header(1.25, 11.0, 21.0, 0.07, 561.0, 620.0),
+        ];
+        let path = write_synthetic_dv_with_extended_headers(
+            "nd_filter_seed",
+            1,
+            1,
+            2,
+            5,
+            1,
+            0,
+            2,
+            &headers,
+            &[&[7], &[9]],
+        );
+
+        let mut reader = DeltavisionReader::new();
+        reader.set_id(&path).unwrap();
+        // Two channels, both seeded from their first plane's ndFilter (0.5).
+        assert_eq!(reader.nd_filters, vec![Some(0.5), Some(0.5)]);
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].nd_filter, Some(0.5));
+        assert_eq!(ome.images[0].channels[1].nd_filter, Some(0.5));
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn nd_filter_from_log_overrides_extended_header() {
+        let headers = [ext_header(0.25, 10.0, 20.0, 0.05, 488.0, 525.0)];
+        let path = write_synthetic_dv_with_extended_headers(
+            "nd_filter_log_override",
+            1,
+            1,
+            1,
+            5,
+            1,
+            0,
+            1,
+            &headers,
+            &[&[7]],
+        );
+        let log_path = PathBuf::from(format!("{}.log", path.to_str().unwrap()));
+        // "ND filter" value with a percent sign, parsed and divided by 100.
+        fs::write(&log_path, "ND filter:   32%\n").unwrap();
+
+        let mut reader = DeltavisionReader::new();
+        reader.set_id(&path).unwrap();
+        // Log value (0.32) wins over the extended-header seed (0.5).
+        assert_eq!(reader.nd_filters, vec![Some(0.32)]);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].nd_filter, Some(0.32));
+
+        fs::remove_file(&log_path).ok();
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parses_log_companion_into_metadata_and_ome() {
+        // Single-channel 1x1 plane; the magic/header is enough for set_id.
+        let path = write_synthetic_dv("log_companion", 1, 1, 1, 0, 1, 0, 1, &[&[42]]);
+        // find_log_file first tries "<id>.log" -> "<...>.dv.log".
+        let log_path = PathBuf::from(format!("{}.log", path.to_str().unwrap()));
+        let log = "Created:     Wed Jul 25 14:00:00 2007\n\
+                   Objective:   Olympus 60X/1.40,PlanApo,microscope,UPLSAPO60X\n\
+                   Lens ID:     Olympus 12345\n\
+                   Pixel Size:  0.1 0.1 0.2\n\
+                   Binning:     2x2\n\
+                   Type:        CoolSNAP HQ\n\
+                   Gain:        2X\n\
+                   EM filter:   FITC\n";
+        fs::write(&log_path, log).unwrap();
+
+        let mut reader = DeltavisionReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        // addGlobalMeta keys (Java exact key names, prefixed by current prefix).
+        assert_eq!(
+            meta.series_metadata.get(" Objective").unwrap().to_string(),
+            "Olympus 60X/1.40,PlanApo,microscope,UPLSAPO60X"
+        );
+        assert_eq!(
+            meta.series_metadata.get(" Lens ID").unwrap().to_string(),
+            "Olympus 12345"
+        );
+        assert_eq!(
+            meta.series_metadata.get(" Binning").unwrap().to_string(),
+            "2x2"
+        );
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].acquisition_date.as_deref(), Some("2007-07-25T14:00:00"));
+        assert_eq!(ome.images[0].physical_size_x, Some(0.1));
+        assert_eq!(ome.images[0].physical_size_z, Some(0.2));
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("FITC"));
+
+        let inst = &ome.instruments[0];
+        let obj = &inst.objectives[0];
+        // Objective: manufacturer is the first word; magnification/NA from token 0.
+        assert_eq!(obj.manufacturer.as_deref(), Some("Olympus"));
+        assert_eq!(obj.nominal_magnification, Some(60.0));
+        assert_eq!(obj.lens_na, Some(1.40));
+        // Lens ID strips the manufacturer prefix and sets the objective ID.
+        assert_eq!(obj.id.as_deref(), Some("Objective:12345"));
+        // Lens ID overrides correction/immersion to "Other".
+        assert_eq!(obj.correction.as_deref(), Some("Other"));
+        assert_eq!(obj.immersion.as_deref(), Some("Other"));
+
+        let det = &inst.detectors[0];
+        assert_eq!(det.detector_type.as_deref(), Some("Other"));
+        assert_eq!(det.model.as_deref(), Some("CoolSNAP HQ"));
+        assert_eq!(det.gain, Some(2.0));
+
+        assert_eq!(ome.images[0].objective_ref, Some(0));
+        assert_eq!(ome.images[0].instrument_ref, Some(0));
+
+        fs::remove_file(&log_path).ok();
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn missing_log_companion_is_skipped_silently() {
+        let path = write_synthetic_dv("no_log_companion", 1, 1, 1, 0, 1, 0, 1, &[&[42]]);
+        let mut reader = DeltavisionReader::new();
+        reader.set_id(&path).unwrap();
+        // No log -> no objective/detector instrument projected.
+        let ome = reader.ome_metadata().unwrap();
+        assert!(ome.instruments.is_empty() || ome.instruments[0].objectives.is_empty());
+        fs::remove_file(&path).ok();
     }
 
     #[test]

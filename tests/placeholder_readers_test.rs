@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bioformats::common::error::BioFormatsError;
 use bioformats::formats::misc4::FilePatternReaderStub;
 use bioformats::FormatReader;
+use bioformats::MetadataValue;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -137,11 +138,50 @@ fn filepattern_reader_groups_string_channel_labels_and_time() {
     );
     assert_eq!(
         meta.series_metadata
+            .get("FilePattern Channel 1 Name")
+            .unwrap()
+            .to_string(),
+        "FITC"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("Channel 1 Name")
+            .unwrap()
+            .to_string(),
+        "FITC"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("Channel:1:Name")
+            .unwrap()
+            .to_string(),
+        "FITC"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern Channel 1 Label")
+            .unwrap()
+            .to_string(),
+        "FITC"
+    );
+    assert_eq!(
+        meta.series_metadata
             .get("FilePattern axes")
             .unwrap()
             .to_string(),
         "C,T"
     );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern Axes")
+            .unwrap()
+            .to_string(),
+        "C,T"
+    );
+
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+    assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("FITC"));
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -177,11 +217,44 @@ fn filepattern_reader_preserves_explicit_pattern_metadata_slice() {
     );
     assert_eq!(
         meta.series_metadata
+            .get("FilePattern Pattern")
+            .unwrap()
+            .to_string(),
+        dir.join(pattern_text).display().to_string()
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("File pattern")
+            .unwrap()
+            .to_string(),
+        dir.join(pattern_text).display().to_string()
+    );
+    assert_eq!(
+        meta.series_metadata.get("FilePattern").unwrap().to_string(),
+        dir.join(pattern_text).display().to_string()
+    );
+    assert_eq!(
+        meta.series_metadata
             .get("FilePattern root")
             .unwrap()
             .to_string(),
         dir.display().to_string()
     );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern Root")
+            .unwrap()
+            .to_string(),
+        dir.display().to_string()
+    );
+    assert!(matches!(
+        meta.series_metadata.get("FilePattern block count"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("FilePattern Block Count"),
+        Some(MetadataValue::Int(2))
+    ));
     assert_eq!(
         meta.series_metadata
             .get("FilePattern block 0 token")
@@ -191,11 +264,84 @@ fn filepattern_reader_preserves_explicit_pattern_metadata_slice() {
     );
     assert_eq!(
         meta.series_metadata
+            .get("FilePattern Block 0 Token")
+            .unwrap()
+            .to_string(),
+        "<DAPI,FITC>"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern Axis 0 Token")
+            .unwrap()
+            .to_string(),
+        "<DAPI,FITC>"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("Axis 0 Token")
+            .unwrap()
+            .to_string(),
+        "<DAPI,FITC>"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern Axis 0 Type")
+            .unwrap()
+            .to_string(),
+        "C"
+    );
+    assert_eq!(
+        meta.series_metadata.get("Axis 0 Type").unwrap().to_string(),
+        "C"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern Axis 0 Values")
+            .unwrap()
+            .to_string(),
+        "DAPI,FITC"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("Axis 0 Values")
+            .unwrap()
+            .to_string(),
+        "DAPI,FITC"
+    );
+    assert!(matches!(
+        meta.series_metadata.get("FilePattern Axis 0 Size"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Axis 0 Size"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("FilePattern block 0 count"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("FilePattern Block 0 Count"),
+        Some(MetadataValue::Int(2))
+    ));
+    assert_eq!(
+        meta.series_metadata
             .get("FilePattern block 1 token")
             .unwrap()
             .to_string(),
         "[0-1]"
     );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern Block 1 Token")
+            .unwrap()
+            .to_string(),
+        "[0-1]"
+    );
+    assert!(matches!(
+        meta.series_metadata.get("FilePattern block 1 count"),
+        Some(MetadataValue::Int(2))
+    ));
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -473,6 +619,163 @@ fn filepattern_reader_expands_nested_brace_and_class_channel_alternation() {
 }
 
 #[test]
+fn filepattern_reader_expands_deeper_nested_brace_and_class_alternation() {
+    let dir = tmp_dir("deeper_nested_blocks");
+    std::fs::create_dir_all(&dir).unwrap();
+    for channel in ["DAPI", "FITC0", "FITC1", "TRITC0", "TRITC1"] {
+        std::fs::write(dir.join(format!("img_{channel}.fake")), b"").unwrap();
+    }
+    let pattern = dir.join("stack.pattern");
+    std::fs::write(&pattern, "img_{DAPI,{FITC,TRITC}[0-1]}.fake").unwrap();
+
+    let mut reader = FilePatternReaderStub::new();
+    reader.set_id(&pattern).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 5);
+    assert_eq!(meta.image_count, 5);
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern block 0 values")
+            .unwrap()
+            .to_string(),
+        "DAPI,FITC0,FITC1,TRITC0,TRITC1"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern Block 0 Values")
+            .unwrap()
+            .to_string(),
+        "DAPI,FITC0,FITC1,TRITC0,TRITC1"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern Channel 4 Name")
+            .unwrap()
+            .to_string(),
+        "TRITC1"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn filepattern_reader_matches_overlapping_explicit_channel_labels() {
+    let dir = tmp_dir("overlap_labels");
+    std::fs::create_dir_all(&dir).unwrap();
+    for channel in ["A", "AB"] {
+        std::fs::write(dir.join(format!("img_{channel}.fake")), b"").unwrap();
+    }
+    let pattern = dir.join("stack.pattern");
+    std::fs::write(&pattern, "img_{A,AB}.fake").unwrap();
+
+    let mut reader = FilePatternReaderStub::new();
+    reader.set_id(&pattern).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern block 0 values")
+            .unwrap()
+            .to_string(),
+        "A,AB"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern channel 1 name")
+            .unwrap()
+            .to_string(),
+        "AB"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn filepattern_reader_expands_shell_bracket_glob_classes() {
+    let dir = tmp_dir("shell_bracket_glob");
+    std::fs::create_dir_all(&dir).unwrap();
+    for channel in ["A", "B"] {
+        for t in 0..2 {
+            std::fs::write(dir.join(format!("img_c{channel}_t{t}.fake")), b"").unwrap();
+        }
+    }
+    std::fs::write(dir.join("img_cC_t0.fake"), b"").unwrap();
+    let pattern = dir.join("stack.pattern");
+    std::fs::write(&pattern, "img_c[AB]_t?.fake").unwrap();
+
+    let mut reader = FilePatternReaderStub::new();
+    reader.set_id(&pattern).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 4);
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern block 0 token")
+            .unwrap()
+            .to_string(),
+        "[AB]"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern block 0 values")
+            .unwrap()
+            .to_string(),
+        "A,B"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern channel 1 name")
+            .unwrap()
+            .to_string(),
+        "B"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn filepattern_reader_expands_negated_shell_bracket_glob_classes() {
+    let dir = tmp_dir("negated_shell_bracket_glob");
+    std::fs::create_dir_all(&dir).unwrap();
+    for channel in ["A", "B", "C"] {
+        for t in 0..2 {
+            std::fs::write(dir.join(format!("img_c{channel}_t{t}.fake")), b"").unwrap();
+        }
+    }
+    let pattern = dir.join("stack.pattern");
+    std::fs::write(&pattern, "img_c[!C]_t?.fake").unwrap();
+
+    let mut reader = FilePatternReaderStub::new();
+    reader.set_id(&pattern).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 4);
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern block 0 token")
+            .unwrap()
+            .to_string(),
+        "[!C]"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern block 0 values")
+            .unwrap()
+            .to_string(),
+        "A,B"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern channel 1 name")
+            .unwrap()
+            .to_string(),
+        "B"
+    );
+    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn filepattern_reader_uses_directory_blocks_as_axes() {
     let dir = tmp_dir("dir_axes");
     for channel in ["DAPI", "FITC"] {
@@ -548,6 +851,108 @@ fn filepattern_reader_expands_recursive_directory_globs() {
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 4);
     assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn filepattern_reader_recursive_glob_matches_zero_or_more_directories() {
+    let dir = tmp_dir("recursive_zero_or_more");
+    let plate = dir.join("plate");
+    let nested = plate.join("well_A");
+    std::fs::create_dir_all(&nested).unwrap();
+    for t in 0..2 {
+        std::fs::write(plate.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")), b"").unwrap();
+        std::fs::write(nested.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")), b"").unwrap();
+    }
+    let pattern = dir.join("stack.pattern");
+    std::fs::write(&pattern, "plate/**/img_t?&sizeX=2&sizeY=1.fake").unwrap();
+
+    let mut reader = FilePatternReaderStub::new();
+    reader.set_id(&pattern).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_t, 2);
+    assert_eq!(meta.image_count, 4);
+    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn filepattern_reader_collapses_adjacent_recursive_globs() {
+    let dir = tmp_dir("recursive_adjacent_globs");
+    let plate = dir.join("plate");
+    let nested = plate.join("well_A").join("site_0");
+    std::fs::create_dir_all(&nested).unwrap();
+    for t in 0..2 {
+        std::fs::write(plate.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")), b"").unwrap();
+        std::fs::write(nested.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")), b"").unwrap();
+    }
+    let pattern = dir.join("stack.pattern");
+    std::fs::write(&pattern, "plate/**/**/img_t?&sizeX=2&sizeY=1.fake").unwrap();
+
+    let mut reader = FilePatternReaderStub::new();
+    reader.set_id(&pattern).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 4);
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern file count")
+            .unwrap()
+            .to_string(),
+        "4"
+    );
+    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn filepattern_reader_terminal_recursive_glob_ignores_unreadable_sidecars() {
+    let dir = tmp_dir("recursive_terminal_sidecars");
+    let plate = dir.join("plate");
+    let nested = plate.join("well_A");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(plate.join("img_t0&sizeX=2&sizeY=1.fake"), b"").unwrap();
+    std::fs::write(nested.join("img_t1&sizeX=2&sizeY=1.fake"), b"").unwrap();
+    std::fs::write(plate.join("notes.sidecar"), b"not an image").unwrap();
+    std::fs::write(nested.join("acquisition.unreadable"), b"not an image").unwrap();
+    let pattern = dir.join("stack.pattern");
+    std::fs::write(&pattern, "plate/**").unwrap();
+
+    let mut reader = FilePatternReaderStub::new();
+    reader.set_id(&pattern).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(
+        meta.series_metadata
+            .get("FilePattern file count")
+            .unwrap()
+            .to_string(),
+        "2"
+    );
+    assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(), vec![1]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn filepattern_reader_terminal_recursive_glob_reports_unsupported_sidecar_only_tree() {
+    let dir = tmp_dir("recursive_terminal_sidecar_only");
+    let plate = dir.join("plate");
+    let nested = plate.join("well_A");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(plate.join("notes.sidecar"), b"not an image").unwrap();
+    std::fs::write(nested.join("acquisition.unreadable"), b"not an image").unwrap();
+    let pattern = dir.join("stack.pattern");
+    std::fs::write(&pattern, "plate/**").unwrap();
+
+    let mut reader = FilePatternReaderStub::new();
+    let err = reader.set_id(&pattern).unwrap_err();
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("recursive ** glob matched no supported reader files"))
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }

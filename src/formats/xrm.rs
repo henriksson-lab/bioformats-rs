@@ -138,6 +138,19 @@ impl FormatReader for XrmReader {
 fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
     let mut ole = OleFile::open(path)?;
 
+    // Java keys metadata emission off the .txm/.txrm suffix (initFile: isTXM/isTXRM).
+    let suffix = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let is_txm = suffix.as_deref() == Some("txm");
+    // Java initFile: paramsPrefix = isTXM ? GENERAL_PARAMS : PROJECTION.
+    let params_prefix = if is_txm {
+        "General Parameters: "
+    } else {
+        "Projection Info: "
+    };
+
     let mut size_x = None;
     let mut size_y = None;
     let mut pixel_type = None;
@@ -171,6 +184,12 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
             let code = read_xrm_i32(&mut ole, &path)?;
             let (ty, label) = xrm_pixel_type(code)?;
             pixel_type = Some(ty);
+            if is_txm {
+                metadata.insert(
+                    "Reconstruction Settings: Output data type".into(),
+                    MetadataValue::String(label.into()),
+                );
+            }
             metadata.insert(
                 "Image Details: Data type".into(),
                 MetadataValue::String(label.into()),
@@ -189,6 +208,67 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
                     MetadataValue::Float(value as f64),
                 );
             }
+        } else if path == "/ImageInfo/AcquisitionMode" {
+            let mode = read_xrm_i32(&mut ole, &path)?;
+            let mode_value = match mode {
+                0 => "Tomography".to_string(),
+                10 => "Recon".to_string(),
+                other => other.to_string(),
+            };
+            metadata.insert(
+                "Image Details: Acquisition mode".into(),
+                MetadataValue::String(mode_value),
+            );
+        } else if path == "/ImageInfo/SourceFilterName" {
+            if let Ok(value) = read_xrm_string(&mut ole, &path) {
+                metadata.insert(
+                    "Source Assembly Info: Source Filter Name".into(),
+                    MetadataValue::String(value.clone()),
+                );
+                metadata.insert(
+                    format!("{params_prefix}Source filter name"),
+                    MetadataValue::String(value),
+                );
+            }
+        } else if path == "/ImageInfo/Voltage" {
+            if let Ok(value) = read_xrm_f32(&mut ole, &path) {
+                metadata.insert(
+                    "Source Assembly Info: Voltage (kV)".into(),
+                    MetadataValue::Float(value as f64),
+                );
+            }
+        } else if path == "/exeVersion" {
+            if let Ok(value) = read_xrm_string(&mut ole, &path) {
+                metadata.insert(
+                    "Dataset Info: Executable version".into(),
+                    MetadataValue::String(value),
+                );
+            }
+        } else if path == "/DetAssemblyInfo/LensInfo/LensName" {
+            if let Ok(value) = read_xrm_string(&mut ole, &path) {
+                metadata.insert(
+                    format!("{params_prefix}Objective name"),
+                    MetadataValue::String(value),
+                );
+            }
+        } else if path == "/ImageInfo/CameraNumberOfFramesPerImage" {
+            let v = read_xrm_i32(&mut ole, &path)?;
+            metadata.insert(
+                format!("{params_prefix}Frames per image"),
+                MetadataValue::Int(v as i64),
+            );
+        } else if path == "/ImageInfo/NoOfImagesAveraged" {
+            let v = read_xrm_i32(&mut ole, &path)?;
+            metadata.insert(
+                format!("{params_prefix}Images per projection"),
+                MetadataValue::Int(v as i64),
+            );
+        } else if path == "/ImageInfo/CameraBinning" {
+            let v = read_xrm_i32(&mut ole, &path)?;
+            metadata.insert(
+                format!("{params_prefix}Camera binning"),
+                MetadataValue::Int(v as i64),
+            );
         }
     }
 
@@ -389,6 +469,96 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xrm_captures_named_global_metadata_keys() {
+        // .txrm: paramsPrefix == "Projection Info: ", no "Output data type".
+        let txrm = temp_path("named_meta.txrm");
+        {
+            let mut comp = cfb::create(&txrm).unwrap();
+            write_i32_stream(&mut comp, "/ImageInfo/ImageWidth", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/ImageHeight", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/DataType", 5);
+            write_i32_stream(&mut comp, "/ImageInfo/AcquisitionMode", 0);
+            write_stream(&mut comp, "/ImageInfo/SourceFilterName", b"LE1\0");
+            write_stream(&mut comp, "/ImageInfo/Voltage", &40.0f32.to_le_bytes());
+            write_stream(&mut comp, "/exeVersion", b"1.2.3\0");
+            write_stream(&mut comp, "/DetAssemblyInfo/LensInfo/LensName", b"20X\0");
+            write_i32_stream(&mut comp, "/ImageInfo/CameraNumberOfFramesPerImage", 4);
+            write_i32_stream(&mut comp, "/ImageInfo/NoOfImagesAveraged", 3);
+            write_i32_stream(&mut comp, "/ImageInfo/CameraBinning", 2);
+            write_stream(&mut comp, "/ImageData/Image1", &[0u8; 8]);
+        }
+
+        let mut reader = XrmReader::new();
+        reader.set_id(&txrm).unwrap();
+        let md = &reader.metadata().series_metadata;
+        assert_eq!(
+            md.get("Image Details: Acquisition mode").map(|v| v.to_string()),
+            Some("Tomography".to_string())
+        );
+        assert_eq!(
+            md.get("Source Assembly Info: Source Filter Name")
+                .map(|v| v.to_string()),
+            Some("LE1".to_string())
+        );
+        assert_eq!(
+            md.get("Projection Info: Source filter name")
+                .map(|v| v.to_string()),
+            Some("LE1".to_string())
+        );
+        assert!(md.contains_key("Source Assembly Info: Voltage (kV)"));
+        assert_eq!(
+            md.get("Dataset Info: Executable version")
+                .map(|v| v.to_string()),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            md.get("Projection Info: Objective name").map(|v| v.to_string()),
+            Some("20X".to_string())
+        );
+        assert_eq!(
+            md.get("Projection Info: Frames per image").map(|v| v.to_string()),
+            Some("4".to_string())
+        );
+        assert_eq!(
+            md.get("Projection Info: Images per projection")
+                .map(|v| v.to_string()),
+            Some("3".to_string())
+        );
+        assert_eq!(
+            md.get("Projection Info: Camera binning").map(|v| v.to_string()),
+            Some("2".to_string())
+        );
+        // TXRM must NOT carry the TXM-only "Output data type" key.
+        assert!(!md.contains_key("Reconstruction Settings: Output data type"));
+        let _ = std::fs::remove_file(txrm);
+
+        // .txm: emits "Output data type" and uses "General Parameters: " prefix.
+        let txm = temp_path("named_meta.txm");
+        {
+            let mut comp = cfb::create(&txm).unwrap();
+            write_i32_stream(&mut comp, "/ImageInfo/ImageWidth", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/ImageHeight", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/DataType", 5);
+            write_i32_stream(&mut comp, "/ImageInfo/CameraBinning", 2);
+            write_stream(&mut comp, "/ImageData/Image1", &[0u8; 8]);
+        }
+        let mut reader = XrmReader::new();
+        reader.set_id(&txm).unwrap();
+        let md = &reader.metadata().series_metadata;
+        assert_eq!(
+            md.get("Reconstruction Settings: Output data type")
+                .map(|v| v.to_string()),
+            Some("ushort".to_string())
+        );
+        assert_eq!(
+            md.get("General Parameters: Camera binning")
+                .map(|v| v.to_string()),
+            Some("2".to_string())
+        );
+        let _ = std::fs::remove_file(txm);
     }
 
     #[test]

@@ -47,6 +47,34 @@ fn nifti_pixel_type(datatype: i16) -> Result<(PixelType, Option<u32>)> {
     })
 }
 
+// ── Unit decoding ─────────────────────────────────────────────────────────────
+//
+// Mirrors NiftiReader.populateExtendedMetadata: the spatial unit defaults to
+// MICROMETER and the time unit to SECOND; the xyzt_units byte overrides them.
+//   spatialUnits = units & 7;   timeUnits = units & 0x38;
+// Java only recognises METER/MILLIMETER for space and MILLISECOND/MICROSECOND
+// for time (any other code leaves the default).
+
+/// Spatial unit symbol selected by the low 3 bits of xyzt_units. Defaults to
+/// "µm" (UNITS.MICROMETER) like the Java reader.
+fn spatial_unit_symbol(xyzt_units: u8) -> &'static str {
+    match xyzt_units & 7 {
+        UNITS_METER => "m",
+        UNITS_MM => "mm",
+        _ => "µm",
+    }
+}
+
+/// Time unit symbol selected by bits 3..5 of xyzt_units. Defaults to "s"
+/// (UNITS.SECOND) like the Java reader.
+fn time_unit_symbol(xyzt_units: u8) -> &'static str {
+    match xyzt_units & 0x38 {
+        UNITS_MSEC => "ms",
+        UNITS_USEC => "µs",
+        _ => "s",
+    }
+}
+
 // ── Header parsing ────────────────────────────────────────────────────────────
 //
 // NIfTI-1 / Analyze 7.5 header is exactly 348 bytes.
@@ -58,10 +86,22 @@ fn nifti_pixel_type(datatype: i16) -> Result<(PixelType, Option<u32>)> {
 //  72-73:  bitpix     (int16)
 //  76-107: pixdim[0..7] (float32 × 8)
 // 108-111: vox_offset (float32) — only meaningful for NIfTI
+//     123: xyzt_units (uint8) — packed spatial (bits 0..2) + time (bits 3..5) codes
 // 148-227: descrip[80] (char)
 // 344-347: magic[4]
 
 const HDR_SIZE: usize = 348;
+
+// ── xyzt_units codes ──────────────────────────────────────────────────────────
+// Mirrors NiftiReader's UNITS_* constants used to decode the xyzt_units byte.
+/// Spatial unit code: meters.
+const UNITS_METER: u8 = 1;
+/// Spatial unit code: millimeters.
+const UNITS_MM: u8 = 2;
+/// Time unit code: milliseconds.
+const UNITS_MSEC: u8 = 16;
+/// Time unit code: microseconds.
+const UNITS_USEC: u8 = 24;
 
 #[derive(Debug)]
 struct NiftiHeader {
@@ -75,6 +115,8 @@ struct NiftiHeader {
     pixdim: [f32; 7],
     /// Byte offset of data in the data file (for .nii single-file)
     vox_offset: f32,
+    /// xyzt_units byte (offset 123): packed spatial + time unit codes.
+    xyzt_units: u8,
     /// "n+1\0" = single .nii, "ni1\0" = paired, "\0\0\0\0" = Analyze
     magic: [u8; 4],
     little_endian: bool,
@@ -139,6 +181,10 @@ fn parse_header(buf: &[u8]) -> Result<NiftiHeader> {
 
     let vox_offset = read_f32(buf, 108, le);
 
+    // xyzt_units packs the spatial unit in bits 0..2 and the time unit in
+    // bits 3..5 (NiftiReader: units & 7 / units & 0x38). Byte at offset 123.
+    let xyzt_units = buf[123];
+
     let magic: [u8; 4] = [buf[344], buf[345], buf[346], buf[347]];
 
     let descrip = std::str::from_utf8(&buf[148..228])
@@ -153,6 +199,7 @@ fn parse_header(buf: &[u8]) -> Result<NiftiHeader> {
         bitpix,
         pixdim,
         vox_offset,
+        xyzt_units,
         magic,
         little_endian: le,
         descrip,
@@ -246,6 +293,32 @@ fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
             MetadataValue::Float(hdr.pixdim[2] as f64),
         );
     }
+
+    // Java NiftiReader stores voxelWidth/voxelHeight/sliceThickness/deltaT as
+    // pixdim[1..4]. In this struct hdr.pixdim[0..3] are NIfTI pixdim[1..4], so
+    // deltaT == hdr.pixdim[3]. addGlobalMeta("Time increment", deltaT) and
+    // store.setPixelsTimeIncrement(new Time(deltaT, timeUnit)).
+    let delta_t = hdr.pixdim[3] as f64;
+    meta_map.insert("time_increment".into(), MetadataValue::Float(delta_t));
+
+    // Spatial/time units from the xyzt_units byte (addGlobalMeta "XYZT units"
+    // etc.). The voxel sizes above are expressed in this spatial unit; the
+    // time increment in this time unit.
+    meta_map.insert("xyzt_units".into(), MetadataValue::Int(hdr.xyzt_units as i64));
+    meta_map.insert(
+        "spatial_unit".into(),
+        MetadataValue::String(spatial_unit_symbol(hdr.xyzt_units).into()),
+    );
+    meta_map.insert(
+        "time_unit".into(),
+        MetadataValue::String(time_unit_symbol(hdr.xyzt_units).into()),
+    );
+
+    // addGlobalMeta("Number of dimensions", nDimensions).
+    meta_map.insert(
+        "nDimensions".into(),
+        MetadataValue::Int(hdr.ndim as i64),
+    );
 
     Ok(ImageMetadata {
         size_x,
@@ -528,6 +601,8 @@ impl FormatReader for NiftiReader {
         img.physical_size_x = get_f("voxel_size_x_mm");
         img.physical_size_y = get_f("voxel_size_y_mm");
         img.physical_size_z = get_f("voxel_size_z_mm");
+        // Java: store.setPixelsTimeIncrement(new Time(deltaT, timeUnit)).
+        img.time_increment = get_f("time_increment");
         if let Some(MetadataValue::String(d)) = meta.series_metadata.get("description") {
             img.description = Some(d.clone());
         }
@@ -539,5 +614,91 @@ impl FormatReader for NiftiReader {
                 .map(|s| s.to_string());
         }
         Some(ome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::metadata::MetadataValue;
+
+    /// Build a minimal valid 348-byte little-endian NIfTI-1 header with the
+    /// data fields populated at their spec offsets.
+    fn synthetic_header(xyzt_units: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; HDR_SIZE];
+        // sizeof_hdr = 348 at offset 0
+        buf[0..4].copy_from_slice(&348i32.to_le_bytes());
+        // dim[0] = nDimensions = 4 at offset 40
+        buf[40..42].copy_from_slice(&4i16.to_le_bytes());
+        // dim[1..4] = X,Y,Z,T at offsets 42,44,46,48
+        buf[42..44].copy_from_slice(&8i16.to_le_bytes());
+        buf[44..46].copy_from_slice(&6i16.to_le_bytes());
+        buf[46..48].copy_from_slice(&4i16.to_le_bytes());
+        buf[48..50].copy_from_slice(&2i16.to_le_bytes());
+        // datatype = 2 (UINT8) at offset 70, bitpix = 8 at offset 72
+        buf[70..72].copy_from_slice(&2i16.to_le_bytes());
+        buf[72..74].copy_from_slice(&8i16.to_le_bytes());
+        // pixdim[1..4] = voxelWidth, voxelHeight, sliceThickness, deltaT
+        // pixdim array starts at offset 76; pixdim[1] = offset 80.
+        buf[80..84].copy_from_slice(&1.5f32.to_le_bytes()); // voxelWidth
+        buf[84..88].copy_from_slice(&2.5f32.to_le_bytes()); // voxelHeight
+        buf[88..92].copy_from_slice(&3.5f32.to_le_bytes()); // sliceThickness
+        buf[92..96].copy_from_slice(&4.5f32.to_le_bytes()); // deltaT
+        // xyzt_units byte at offset 123
+        buf[123] = xyzt_units;
+        // descrip at offset 148
+        let desc = b"a synthetic nifti";
+        buf[148..148 + desc.len()].copy_from_slice(desc);
+        // magic "n+1\0" at offset 344
+        buf[344..348].copy_from_slice(b"n+1\0");
+        buf
+    }
+
+    #[test]
+    fn captures_delta_t_units_and_ndimensions() {
+        // spatialUnits = MM (2), timeUnits = MSEC (16) → byte = 2 | 16 = 18.
+        let buf = synthetic_header(UNITS_MM | UNITS_MSEC);
+        let hdr = parse_header(&buf).unwrap();
+        assert_eq!(hdr.ndim, 4);
+        assert_eq!(hdr.xyzt_units, 18);
+
+        let meta = build_metadata(&hdr).unwrap();
+        let m = &meta.series_metadata;
+
+        let float_of = |k: &str| match m.get(k) {
+            Some(MetadataValue::Float(v)) => *v,
+            other => panic!("expected Float for {k}, got {other:?}"),
+        };
+        let int_of = |k: &str| match m.get(k) {
+            Some(MetadataValue::Int(v)) => *v,
+            other => panic!("expected Int for {k}, got {other:?}"),
+        };
+        let str_of = |k: &str| match m.get(k) {
+            Some(MetadataValue::String(v)) => v.clone(),
+            other => panic!("expected String for {k}, got {other:?}"),
+        };
+
+        // deltaT == pixdim[4] surfaced as time_increment
+        assert_eq!(float_of("time_increment"), 4.5);
+        // nDimensions
+        assert_eq!(int_of("nDimensions"), 4);
+        // spatial + time unit symbols decoded from xyzt_units
+        assert_eq!(str_of("spatial_unit"), "mm");
+        assert_eq!(str_of("time_unit"), "ms");
+        assert_eq!(int_of("xyzt_units"), 18);
+        // voxel sizes (pixdim[1..3]) still captured
+        assert_eq!(float_of("voxel_size_x_mm"), 1.5);
+        assert_eq!(float_of("voxel_size_y_mm"), 2.5);
+        assert_eq!(float_of("voxel_size_z_mm"), 3.5);
+    }
+
+    #[test]
+    fn unit_defaults_micrometer_and_second() {
+        // xyzt_units = 0 → defaults like the Java reader.
+        assert_eq!(spatial_unit_symbol(0), "µm");
+        assert_eq!(time_unit_symbol(0), "s");
+        // microsecond time code (24)
+        assert_eq!(time_unit_symbol(UNITS_USEC), "µs");
+        assert_eq!(spatial_unit_symbol(UNITS_METER), "m");
     }
 }

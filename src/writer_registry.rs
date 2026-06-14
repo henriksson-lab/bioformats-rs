@@ -20,6 +20,7 @@ fn writer_for(path: &Path) -> Option<Box<dyn FormatWriter>> {
         Box::new(crate::formats::jpeg::JpegWriter::new()),
         Box::new(crate::formats::bmp::BmpWriter::new()),
         Box::new(crate::formats::raster::TgaWriter::new()),
+        Box::new(crate::formats::raster::PnmWriter::new()),
         Box::new(crate::formats::ics::IcsWriter::new()),
         Box::new(crate::formats::mrc::MrcWriter::new()),
         Box::new(crate::formats::fits::FitsWriter::new()),
@@ -31,6 +32,24 @@ fn writer_for(path: &Path) -> Option<Box<dyn FormatWriter>> {
         Box::new(crate::formats::eps::EpsWriter::new()),
     ];
     writers.into_iter().find(|w| w.is_this_type(path))
+}
+
+fn unsupported_native_writer_reason(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "lif" | "nd2" | "czi" => Some(format!(
+            "native .{ext} writing is not registered: the local Bio-Formats writer list has no LIF/ND2/CZI writer to translate; use OME-TIFF/TIFF for export"
+        )),
+        _ => None,
+    }
+}
+
+fn writer_for_or_error(path: &Path) -> Result<Box<dyn FormatWriter>> {
+    writer_for(path).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(
+            unsupported_native_writer_reason(path).unwrap_or_else(|| path.display().to_string()),
+        )
+    })
 }
 
 impl ImageWriter {
@@ -125,8 +144,7 @@ impl ImageWriter {
 
     /// Convenience: write all planes in one call.
     pub fn save(path: &Path, meta: &ImageMetadata, planes: &[Vec<u8>]) -> Result<()> {
-        let mut w = writer_for(path)
-            .ok_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string()))?;
+        let mut w = writer_for_or_error(path)?;
         let expected_planes = Self::validate_stack_support(w.as_ref(), meta)?;
         Self::validate_save_plane_count(expected_planes, planes.len())?;
         Self::validate_save_plane_sizes(meta, planes)?;
@@ -140,8 +158,7 @@ impl ImageWriter {
 
     /// Lower-level: stream planes manually.
     pub fn open(path: &Path, meta: &ImageMetadata) -> Result<Self> {
-        let mut w = writer_for(path)
-            .ok_or_else(|| BioFormatsError::UnsupportedFormat(path.display().to_string()))?;
+        let mut w = writer_for_or_error(path)?;
         let expected_planes = Self::validate_stack_support(w.as_ref(), meta)?;
         w.set_metadata(meta)?;
         w.set_id(path)?;

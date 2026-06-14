@@ -115,11 +115,17 @@ struct MrcHeader {
     origin_x: f32,
     origin_y: f32,
     origin_z: f32,
+    alpha: f32,
+    beta: f32,
+    gamma: f32,
     imod_stamp: u32,
     imod_flags: i32,
+    ispg: i32,
     extended_header_size: i32,
+    ext_type: String,
     min_value: f32,
     max_value: f32,
+    mean_value: f32,
     little_endian: bool,
 }
 
@@ -230,14 +236,51 @@ fn parse_header(buf: &[u8]) -> Result<MrcHeader> {
         read_i32_be(buf, 92)
     };
 
-    // Min/max pixel values (DMIN/DMAX). Per MRCReader.java these are read
-    // immediately after the 12-byte MAPC/MAPR/MAPS block (offset 76 = DMIN,
-    // offset 80 = DMAX, offset 84 = DMEAN).
-    let (min_value, max_value) = if little_endian {
-        (read_f32_le(buf, 76), read_f32_le(buf, 80))
+    // Cell angles (alpha/beta/gamma) at offsets 52/56/60, read in MRCReader.java
+    // immediately after the cell dimensions.
+    let (alpha, beta, gamma) = if little_endian {
+        (
+            read_f32_le(buf, 52),
+            read_f32_le(buf, 56),
+            read_f32_le(buf, 60),
+        )
     } else {
-        (read_f32_be(buf, 76), read_f32_be(buf, 80))
+        (
+            read_f32_be(buf, 52),
+            read_f32_be(buf, 56),
+            read_f32_be(buf, 60),
+        )
     };
+
+    // Min/max/mean pixel values (DMIN/DMAX/DMEAN). Per MRCReader.java these are
+    // read immediately after the 12-byte MAPC/MAPR/MAPS block (offset 76 = DMIN,
+    // offset 80 = DMAX, offset 84 = DMEAN).
+    let (min_value, max_value, mean_value) = if little_endian {
+        (
+            read_f32_le(buf, 76),
+            read_f32_le(buf, 80),
+            read_f32_le(buf, 84),
+        )
+    } else {
+        (
+            read_f32_be(buf, 76),
+            read_f32_be(buf, 80),
+            read_f32_be(buf, 84),
+        )
+    };
+
+    // ISPG (space group number) at offset 88, read after DMEAN in MRCReader.java.
+    let ispg = if little_endian {
+        read_i32_le(buf, 88)
+    } else {
+        read_i32_be(buf, 88)
+    };
+
+    // Extended header type: 4-char string at offset 104 ("Extended header type").
+    let ext_type = String::from_utf8_lossy(&buf[104..108])
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
 
     Ok(MrcHeader {
         nx,
@@ -259,11 +302,17 @@ fn parse_header(buf: &[u8]) -> Result<MrcHeader> {
         origin_x,
         origin_y,
         origin_z,
+        alpha,
+        beta,
+        gamma,
         imod_stamp,
         imod_flags,
+        ispg,
         extended_header_size,
+        ext_type,
         min_value,
         max_value,
+        mean_value,
         little_endian,
     })
 }
@@ -463,6 +512,36 @@ impl FormatReader for MrcReader {
         series_metadata.insert("OriginY".into(), MetadataValue::Float(hdr.origin_y as f64));
         series_metadata.insert("OriginZ".into(), MetadataValue::Float(hdr.origin_z as f64));
         series_metadata.insert("FlipY".into(), MetadataValue::Bool(flip_y));
+
+        // Named header metadata, mirroring the addGlobalMeta() calls in
+        // MRCReader.initFile (offsets in the 1024-byte MRC2014 header).
+        series_metadata.insert("Grid size (X)".into(), MetadataValue::Int(hdr.mx as i64));
+        series_metadata.insert("Grid size (Y)".into(), MetadataValue::Int(hdr.my as i64));
+        series_metadata.insert("Grid size (Z)".into(), MetadataValue::Int(hdr.mz as i64));
+        series_metadata.insert("Cell size (X)".into(), MetadataValue::Float(hdr.xlen as f64));
+        series_metadata.insert("Cell size (Y)".into(), MetadataValue::Float(hdr.ylen as f64));
+        series_metadata.insert("Cell size (Z)".into(), MetadataValue::Float(hdr.zlen as f64));
+        series_metadata.insert("Alpha angle".into(), MetadataValue::Float(hdr.alpha as f64));
+        series_metadata.insert("Beta angle".into(), MetadataValue::Float(hdr.beta as f64));
+        series_metadata.insert("Gamma angle".into(), MetadataValue::Float(hdr.gamma as f64));
+        series_metadata.insert(
+            "Minimum pixel value".into(),
+            MetadataValue::Float(hdr.min_value as f64),
+        );
+        series_metadata.insert(
+            "Maximum pixel value".into(),
+            MetadataValue::Float(hdr.max_value as f64),
+        );
+        series_metadata.insert(
+            "Mean pixel value".into(),
+            MetadataValue::Float(hdr.mean_value as f64),
+        );
+        series_metadata.insert("ISPG".into(), MetadataValue::Int(hdr.ispg as i64));
+        series_metadata.insert("Is data cube".into(), MetadataValue::Bool(hdr.ispg == 1));
+        series_metadata.insert(
+            "Extended header type".into(),
+            MetadataValue::String(hdr.ext_type.clone()),
+        );
         if hdr.mx > 0 && hdr.xlen > 0.0 {
             let px_a = hdr.xlen / hdr.mx as f32;
             series_metadata.insert(
@@ -965,6 +1044,53 @@ mod tests {
         assert_eq!(meta.pixel_type, PixelType::Uint8);
         assert!(!meta.is_little_endian);
         assert_eq!(plane, vec![3, 4, 1, 2]);
+    }
+
+    #[test]
+    fn mrc_reader_captures_named_header_metadata() {
+        // Mirrors the addGlobalMeta() keys recorded by MRCReader.initFile.
+        let path = write_mrc_fixture("named_header_meta", 1, 2, 3, 0, 0.0);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[52..56].copy_from_slice(&90.0f32.to_le_bytes()); // alpha
+        bytes[56..60].copy_from_slice(&90.0f32.to_le_bytes()); // beta
+        bytes[60..64].copy_from_slice(&120.0f32.to_le_bytes()); // gamma
+        bytes[76..80].copy_from_slice(&(-3.0f32).to_le_bytes()); // DMIN
+        bytes[80..84].copy_from_slice(&7.0f32.to_le_bytes()); // DMAX
+        bytes[84..88].copy_from_slice(&2.5f32.to_le_bytes()); // DMEAN
+        bytes[88..92].copy_from_slice(&1i32.to_le_bytes()); // ISPG
+        bytes[104..108].copy_from_slice(b"AGAR"); // extended header type
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reader = MrcReader::new();
+        reader.set_id(&path).unwrap();
+        let sm = reader.metadata().series_metadata.clone();
+        fs::remove_file(path).ok();
+
+        let get_f = |k: &str| match sm.get(k) {
+            Some(MetadataValue::Float(v)) => *v,
+            other => panic!("expected float for {k}, got {other:?}"),
+        };
+        let get_i = |k: &str| match sm.get(k) {
+            Some(MetadataValue::Int(v)) => *v,
+            other => panic!("expected int for {k}, got {other:?}"),
+        };
+        let get_b = |k: &str| match sm.get(k) {
+            Some(MetadataValue::Bool(v)) => *v,
+            other => panic!("expected bool for {k}, got {other:?}"),
+        };
+        let get_s = |k: &str| match sm.get(k) {
+            Some(MetadataValue::String(v)) => v.clone(),
+            other => panic!("expected string for {k}, got {other:?}"),
+        };
+
+        assert_eq!(get_f("Gamma angle"), 120.0);
+        assert_eq!(get_f("Alpha angle"), 90.0);
+        assert_eq!(get_i("ISPG"), 1);
+        assert!(get_b("Is data cube"));
+        assert_eq!(get_f("Mean pixel value"), 2.5);
+        assert_eq!(get_f("Minimum pixel value"), -3.0);
+        assert_eq!(get_f("Maximum pixel value"), 7.0);
+        assert_eq!(get_s("Extended header type"), "AGAR");
     }
 
     #[test]

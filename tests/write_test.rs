@@ -531,6 +531,47 @@ fn image_writer_rejects_image_count_above_dimensions() {
 }
 
 #[test]
+fn image_writer_reports_native_vendor_writers_as_explicitly_untranslated() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_c = 1;
+    meta.image_count = 1;
+
+    for ext in ["lif", "nd2", "czi"] {
+        let path = temp_path(&format!("native_vendor_writer.{ext}"));
+        let err = ImageWriter::save(&path, &meta, &[vec![0]]).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("native .{ext} writing is not registered")),
+            "unexpected {ext} error: {err}"
+        );
+        assert!(
+            message.contains("no LIF/ND2/CZI writer to translate"),
+            "missing Java parity rationale for {ext}: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "unsupported native writer created {}",
+            path.display()
+        );
+
+        let stream_path = temp_path(&format!("native_vendor_stream_writer.{ext}"));
+        let stream_err = match ImageWriter::open(&stream_path, &meta) {
+            Ok(_) => panic!("streaming writer unexpectedly opened {ext}"),
+            Err(err) => err,
+        };
+        assert!(
+            stream_err
+                .to_string()
+                .contains("no LIF/ND2/CZI writer to translate"),
+            "missing streaming Java parity rationale for {ext}: {stream_err}"
+        );
+    }
+}
+
+#[test]
 fn image_writer_derives_missing_plane_count_from_dimensions() {
     let mut meta = ImageMetadata::default();
     meta.size_x = 4;
@@ -1376,5 +1417,19 @@ fn png_round_trip() {
 
     let data: Vec<u8> = (0u8..192).collect(); // 8×8×3
     let readback = round_trip("test.png", &meta, &data);
+    assert_eq!(readback, data);
+}
+
+#[test]
+fn pnm_round_trip_gray8() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 4;
+    meta.size_y = 4;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_c = 1;
+    meta.image_count = 1;
+
+    let data: Vec<u8> = (0u8..16).collect();
+    let readback = round_trip("test.pgm", &meta, &data);
     assert_eq!(readback, data);
 }

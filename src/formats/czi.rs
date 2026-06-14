@@ -971,52 +971,75 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
     })
 }
 
-/// Port of ZeissCZIReader.checkPALM (ZeissCZIReader:2277-2335): the file is PALM
-/// when the metadata XML carries a `CustomAttributes/LsmTag` whose `Name`
-/// attribute starts with "palm", or an
-/// Experiment/ExperimentBlocks/AcquisitionBlock/MultiTrackSetup/TrackSetup/
-/// PalmSlider element whose text content is "true".
+/// Port of ZeissCZIReader.checkPALM (ZeissCZIReader:2277-2335). The file is PALM
+/// when either:
 ///
-/// The crate keeps the metadata as a raw XML string (no DOM), so this performs a
-/// string/regex-free scan equivalent to the Java DOM walk.
+/// 1. the metadata XML carries a `CustomAttributes` block whose descendant
+///    `LsmTag` elements include a `Name` attribute starting with "palm"
+///    (case-insensitive), or
+/// 2. the `Experiment → ExperimentBlocks → AcquisitionBlock → MultiTrackSetup →
+///    TrackSetup → PalmSlider` element graph exists and the `PalmSlider` text
+///    content parses (Java `Boolean.parseBoolean`) as `true`.
+///
+/// Java's control flow is preserved exactly: the `LsmTag` check comes first; if
+/// no `Experiment` element is present the method returns `false`; and the
+/// `PalmSlider` value is only consulted after walking the full nested path
+/// (`getFirstNode` descends to the first matching descendant at each step). The
+/// crate keeps the metadata as a raw XML string (no DOM), so the nested walk uses
+/// `first_element_body` to slice each successive container before searching it.
 fn check_palm(xml: &str) -> bool {
     if xml.is_empty() {
         return false;
     }
-    // LsmTag Name starting with "palm" (case-insensitive). Scan each <LsmTag ...>
-    // opening tag for a Name="..." attribute.
-    let lower = xml.to_ascii_lowercase();
-    let mut search_from = 0usize;
-    while let Some(rel) = lower[search_from..].find("<lsmtag") {
-        let tag_start = search_from + rel;
-        let tag_end = lower[tag_start..]
-            .find('>')
-            .map(|e| tag_start + e)
-            .unwrap_or(lower.len());
-        let tag = &lower[tag_start..tag_end];
-        if let Some(npos) = tag.find("name=") {
-            let rest = &tag[npos + 5..];
-            let trimmed = rest.trim_start_matches(['"', '\'']);
-            if trimmed.starts_with("palm") {
-                return true;
+
+    // (1) CustomAttributes/LsmTag with Name starting "palm" (ZeissCZIReader:2293).
+    // getElementsByTagName("LsmTag") returns *descendants* of the first
+    // CustomAttributes block, so restrict the LsmTag scan to that block's body.
+    if let Some(custom) = first_element_body(xml, "CustomAttributes") {
+        let lower = custom.to_ascii_lowercase();
+        let mut search_from = 0usize;
+        while let Some(rel) = lower[search_from..].find("<lsmtag") {
+            let tag_start = search_from + rel;
+            let tag_end = lower[tag_start..]
+                .find('>')
+                .map(|e| tag_start + e)
+                .unwrap_or(lower.len());
+            let tag = &lower[tag_start..tag_end];
+            if let Some(npos) = tag.find("name=") {
+                let rest = &tag[npos + 5..];
+                let trimmed = rest.trim_start_matches(['"', '\'']);
+                if trimmed.starts_with("palm") {
+                    return true;
+                }
             }
+            search_from = tag_end.max(tag_start + 1);
         }
-        search_from = tag_end.max(tag_start + 1);
     }
 
-    // PalmSlider element with text content "true". The PalmSlider tag only appears
-    // under the MultiTrack/TrackSetup path in PALM acquisitions, so a positive
-    // text match is sufficient here.
-    if let Some(pos) = lower.find("<palmslider>") {
-        let value_start = pos + "<palmslider>".len();
-        if let Some(rel_end) = lower[value_start..].find("</palmslider>") {
-            let value = lower[value_start..value_start + rel_end].trim();
-            if value == "true" {
-                return true;
-            }
-        }
-    }
-    false
+    // (2) Experiment → ExperimentBlocks → AcquisitionBlock → MultiTrackSetup →
+    // TrackSetup → PalmSlider (ZeissCZIReader:2310-2334). Each `getFirstNode`
+    // step must succeed (the whole path must exist) or Java returns false; an
+    // absent `Experiment` short-circuits the same way.
+    let Some(experiment) = first_element_body(xml, "Experiment") else {
+        return false;
+    };
+    let Some(blocks) = first_element_body(experiment, "ExperimentBlocks") else {
+        return false;
+    };
+    let Some(acquisition) = first_element_body(blocks, "AcquisitionBlock") else {
+        return false;
+    };
+    let Some(multi_track) = first_element_body(acquisition, "MultiTrackSetup") else {
+        return false;
+    };
+    let Some(track_setup) = first_element_body(multi_track, "TrackSetup") else {
+        return false;
+    };
+    let Some(palm_slider) = first_element_body(track_setup, "PalmSlider") else {
+        return false;
+    };
+    // Boolean.parseBoolean: true only for an exact (case-insensitive) "true".
+    palm_slider.trim().eq_ignore_ascii_case("true")
 }
 
 /// Parse a space-separated modulo label list from the metadata XML for a key
@@ -1156,6 +1179,7 @@ fn build_czi_channels(xml: &str) -> Vec<crate::common::ome_metadata::OmeChannel>
                     .and_then(|s| s.parse().ok()),
                 excitation_wavelength: child_value(block, "ExcitationWavelength")
                     .and_then(|s| s.parse().ok()),
+                ..Default::default()
             });
         }
     }
@@ -2064,6 +2088,20 @@ mod tests {
     use std::fs;
     use std::io::Write;
 
+    /// Minimal Experiment → ExperimentBlocks → AcquisitionBlock → MultiTrackSetup
+    /// → TrackSetup → PalmSlider graph (ZeissCZIReader.checkPALM path) with a
+    /// `true` PalmSlider, i.e. a file that checkPALM should flag as PALM.
+    const PALM_EXPERIMENT_TRUE_XML: &str = "<Experiment><ExperimentBlocks>\
+        <AcquisitionBlock><MultiTrackSetup><TrackSetup>\
+        <PalmSlider>true</PalmSlider></TrackSetup></MultiTrackSetup>\
+        </AcquisitionBlock></ExperimentBlocks></Experiment>";
+
+    /// Same nested graph but with a `false` PalmSlider (not PALM).
+    const PALM_EXPERIMENT_FALSE_XML: &str = "<Experiment><ExperimentBlocks>\
+        <AcquisitionBlock><MultiTrackSetup><TrackSetup>\
+        <PalmSlider>false</PalmSlider></TrackSetup></MultiTrackSetup>\
+        </AcquisitionBlock></ExperimentBlocks></Experiment>";
+
     #[test]
     fn czi_12bit_camera_rejects_truncated_payload() {
         let err = decode_12bit_camera(&[0xab, 0xcd], 8).unwrap_err();
@@ -2848,18 +2886,36 @@ mod tests {
 
     #[test]
     fn czi_check_palm_detects_lsmtag_and_palmslider() {
-        // ZeissCZIReader.checkPALM: LsmTag Name starting with "palm" (case-insens.).
+        // ZeissCZIReader.checkPALM (1): a CustomAttributes/LsmTag whose Name starts
+        // with "palm" (case-insensitive) marks the file as PALM immediately.
         assert!(check_palm(
             r#"<CustomAttributes><LsmTag Name="PALMExperiment">x</LsmTag></CustomAttributes>"#
         ));
-        // ...or a PalmSlider element whose text content is "true".
-        assert!(check_palm(
+        // A non-"palm" LsmTag Name inside CustomAttributes is not enough.
+        assert!(!check_palm(
+            r#"<CustomAttributes><LsmTag Name="Gain">3</LsmTag></CustomAttributes>"#
+        ));
+        // An LsmTag *outside* a CustomAttributes block is ignored: Java scans only
+        // the descendants of the first CustomAttributes element.
+        assert!(!check_palm(r#"<LsmTag Name="PALMExperiment">x</LsmTag>"#));
+
+        // ZeissCZIReader.checkPALM (2): the full nested path must exist and the
+        // PalmSlider text must parse (Boolean.parseBoolean) as "true".
+        assert!(check_palm(PALM_EXPERIMENT_TRUE_XML));
+        // PalmSlider "false" => not PALM.
+        assert!(!check_palm(PALM_EXPERIMENT_FALSE_XML));
+        // A PalmSlider element *not* reachable via the Experiment/.../TrackSetup
+        // path does not count (Java only consults getFirstNode of the walk).
+        assert!(!check_palm(
             "<TrackSetup><PalmSlider>true</PalmSlider></TrackSetup>"
         ));
-        // Negative cases.
+        // Missing intermediate container (no MultiTrackSetup) => not PALM.
         assert!(!check_palm(
-            "<TrackSetup><PalmSlider>false</PalmSlider></TrackSetup>"
+            "<Experiment><ExperimentBlocks><AcquisitionBlock>\
+             <TrackSetup><PalmSlider>true</PalmSlider></TrackSetup>\
+             </AcquisitionBlock></ExperimentBlocks></Experiment>"
         ));
+        // No Experiment element at all => not PALM.
         assert!(!check_palm(r#"<LsmTag Name="Gain">3</LsmTag>"#));
         assert!(!check_palm(""));
     }
@@ -2883,7 +2939,7 @@ mod tests {
         // ZeissCZIReader PALM heuristic (1123-1193): <= 2 planes, imageCount <= 2,
         // checkPALM(xml) true, and the two planes have *different* stored sizes ->
         // split into two single-channel series, each sized to its own tile.
-        let palm_xml = "<TrackSetup><PalmSlider>true</PalmSlider></TrackSetup>";
+        let palm_xml = PALM_EXPERIMENT_TRUE_XML;
         // Both planes at C=0; PALM distinguishes the two series purely by the
         // stored tile size, not by channel (ZeissCZIReader recomputes planeIndex).
         let entries = vec![
@@ -2913,7 +2969,7 @@ mod tests {
     fn czi_palm_same_size_pair_is_not_palm() {
         // Same-size pair => not PALM; revert to a single 2-channel series
         // (ZeissCZIReader:1174-1192).
-        let palm_xml = "<TrackSetup><PalmSlider>true</PalmSlider></TrackSetup>";
+        let palm_xml = PALM_EXPERIMENT_TRUE_XML;
         let entries = vec![
             (directory_entry(0, 0, 0, 2, 1), vec![1, 2]),
             (directory_entry(0, 0, 1, 2, 1), vec![3, 4]),

@@ -460,6 +460,28 @@ assert_eq!(plane.len(), meta.size_y as usize * row_bytes);
 - **OME metadata**: `reader.ome_metadata()` returns baseline OME metadata for all readers and enriches it with structured physical sizes, channel names, and plane positions where supported; richer parsing (instrument, experimenter) is partial
 - **Pyramid writing** for tiled multi-resolution TIFF
 
+### Missing external codecs
+
+A few pixel formats are **not stubs by choice** — they require a codec for
+which there is no pure-Rust decoder in this tree, and which upstream Java
+Bio-Formats itself decodes by delegating to native/platform libraries
+(QuickTime/Java ImageIO). Metadata for these files is still read; only the pixel
+decode is unavailable. Wiring a Rust codec crate (or an optional feature flag)
+for each would close the gap:
+
+| Codec | Used by | Status |
+| --- | --- | --- |
+| **H.264 / AVC** (`avc1`, `h264`, …) | QuickTime `.mov` | no Rust decoder; metadata-only |
+| **H.265 / HEVC** (`hvc1`, `hev1`) | QuickTime `.mov` | no Rust decoder; metadata-only |
+| **Apple ProRes** (`apch`, `apcn`, …) | QuickTime `.mov` | no Rust decoder; metadata-only |
+| **Motion JPEG 2000** (`mjp2`, `mj2k`) | QuickTime `.mov` | no Rust decoder; metadata-only |
+| **DV** (`dvcp`, `dv25`, …) | QuickTime `.mov` | no Rust decoder; metadata-only |
+| **JPEG-XR** | CZI, some OME-TIFF | implemented but **feature-gated**: build with `--features jpegxr` |
+
+Codecs that **are** implemented in-tree (no external dependency): LZW, PackBits,
+Deflate/zlib, Zstd, LZ4, JPEG (baseline), JPEG 2000 (JP2/J2K), Cinepak,
+Apple RLE/Animation, PNG, and the standard TIFF compressions.
+
 ### Performance
 
 For broad translation audits, use the subset comparison harness. It runs Java

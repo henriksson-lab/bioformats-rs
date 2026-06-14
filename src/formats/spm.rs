@@ -53,6 +53,7 @@ struct PicoQuantRecordKind {
     label: &'static str,
     family: &'static str,
     acquisition_mode: &'static str,
+    record_layout: &'static str,
     hydraharp_layout: bool,
     marker_raster_layout: bool,
 }
@@ -186,38 +187,117 @@ impl PicoQuantReader {
     }
 
     fn tttr_record_kind(record_type: i64) -> Option<PicoQuantRecordKind> {
-        let (label, family, acquisition_mode, hydraharp_layout, marker_raster_layout) =
-            match record_type {
-                PTU_RECORD_PICOHARP_T2 => ("PicoHarp T2", "PicoHarp", "tttr_t2", false, false),
-                PTU_RECORD_PICOHARP_T3 => ("PicoHarp T3", "PicoHarp", "tttr_t3", false, false),
-                PTU_RECORD_HYDRAHARP_T2 => ("HydraHarp T2", "HydraHarp", "tttr_t2", true, true),
-                PTU_RECORD_HYDRAHARP_T3 => ("HydraHarp T3", "HydraHarp", "tttr_t3", true, true),
-                PTU_RECORD_TIMEHARP260N_T2 => {
-                    ("TimeHarp 260N T2", "TimeHarp 260N", "tttr_t2", false, true)
-                }
-                PTU_RECORD_TIMEHARP260N_T3 => {
-                    ("TimeHarp 260N T3", "TimeHarp 260N", "tttr_t3", false, true)
-                }
-                PTU_RECORD_TIMEHARP260P_T2 => {
-                    ("TimeHarp 260P T2", "TimeHarp 260P", "tttr_t2", false, true)
-                }
-                PTU_RECORD_TIMEHARP260P_T3 => {
-                    ("TimeHarp 260P T3", "TimeHarp 260P", "tttr_t3", false, true)
-                }
-                PTU_RECORD_MULTIHARP_T2 => ("MultiHarp T2", "MultiHarp", "tttr_t2", false, true),
-                PTU_RECORD_MULTIHARP_T3 => ("MultiHarp T3", "MultiHarp", "tttr_t3", false, true),
-                PTU_RECORD_HYDRAHARP2_T2 => {
-                    ("HydraHarp 2 T2", "HydraHarp 2", "tttr_t2", true, true)
-                }
-                PTU_RECORD_HYDRAHARP2_T3 => {
-                    ("HydraHarp 2 T3", "HydraHarp 2", "tttr_t3", true, true)
-                }
-                _ => return None,
-            };
+        let (
+            label,
+            family,
+            acquisition_mode,
+            record_layout,
+            hydraharp_layout,
+            marker_raster_layout,
+        ) = match record_type {
+            PTU_RECORD_PICOHARP_T2 => (
+                "PicoHarp T2",
+                "PicoHarp",
+                "tttr_t2",
+                "picoharp",
+                false,
+                false,
+            ),
+            PTU_RECORD_PICOHARP_T3 => (
+                "PicoHarp T3",
+                "PicoHarp",
+                "tttr_t3",
+                "picoharp",
+                false,
+                false,
+            ),
+            PTU_RECORD_HYDRAHARP_T2 => (
+                "HydraHarp T2",
+                "HydraHarp",
+                "tttr_t2",
+                "hydraharp",
+                true,
+                true,
+            ),
+            PTU_RECORD_HYDRAHARP_T3 => (
+                "HydraHarp T3",
+                "HydraHarp",
+                "tttr_t3",
+                "hydraharp",
+                true,
+                true,
+            ),
+            PTU_RECORD_TIMEHARP260N_T2 => (
+                "TimeHarp 260N T2",
+                "TimeHarp 260N",
+                "tttr_t2",
+                "hydraharp-compatible",
+                false,
+                true,
+            ),
+            PTU_RECORD_TIMEHARP260N_T3 => (
+                "TimeHarp 260N T3",
+                "TimeHarp 260N",
+                "tttr_t3",
+                "hydraharp-compatible",
+                false,
+                true,
+            ),
+            PTU_RECORD_TIMEHARP260P_T2 => (
+                "TimeHarp 260P T2",
+                "TimeHarp 260P",
+                "tttr_t2",
+                "hydraharp-compatible",
+                false,
+                true,
+            ),
+            PTU_RECORD_TIMEHARP260P_T3 => (
+                "TimeHarp 260P T3",
+                "TimeHarp 260P",
+                "tttr_t3",
+                "hydraharp-compatible",
+                false,
+                true,
+            ),
+            PTU_RECORD_MULTIHARP_T2 => (
+                "MultiHarp T2",
+                "MultiHarp",
+                "tttr_t2",
+                "hydraharp-compatible",
+                false,
+                true,
+            ),
+            PTU_RECORD_MULTIHARP_T3 => (
+                "MultiHarp T3",
+                "MultiHarp",
+                "tttr_t3",
+                "hydraharp-compatible",
+                false,
+                true,
+            ),
+            PTU_RECORD_HYDRAHARP2_T2 => (
+                "HydraHarp 2 T2",
+                "HydraHarp 2",
+                "tttr_t2",
+                "hydraharp",
+                true,
+                true,
+            ),
+            PTU_RECORD_HYDRAHARP2_T3 => (
+                "HydraHarp 2 T3",
+                "HydraHarp 2",
+                "tttr_t3",
+                "hydraharp",
+                true,
+                true,
+            ),
+            _ => return None,
+        };
         Some(PicoQuantRecordKind {
             label,
             family,
             acquisition_mode,
+            record_layout,
             hydraharp_layout,
             marker_raster_layout,
         })
@@ -227,6 +307,21 @@ impl PicoQuantReader {
         series_metadata: &mut HashMap<String, MetadataValue>,
         tttr_record_type: Option<i64>,
     ) -> Option<PicoQuantRecordKind> {
+        fn insert_layout_provenance(
+            series_metadata: &mut HashMap<String, MetadataValue>,
+            source: &str,
+            provenance: &str,
+        ) {
+            series_metadata.insert(
+                "ptu.tttr_record_layout_source".into(),
+                MetadataValue::String(source.into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_layout_provenance".into(),
+                MetadataValue::String(provenance.into()),
+            );
+        }
+
         let Some(record_type) = tttr_record_type else {
             series_metadata.insert(
                 "ptu.acquisition_mode".into(),
@@ -239,6 +334,15 @@ impl PicoQuantReader {
             series_metadata.insert(
                 "ptu.acquisition_mode_source".into(),
                 MetadataValue::String("missing TTResultFormat_TTTRRecType".into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_layout".into(),
+                MetadataValue::String("unspecified".into()),
+            );
+            insert_layout_provenance(
+                series_metadata,
+                "missing TTResultFormat_TTTRRecType",
+                "no TTTR record type tag is present, so record bit layout is not decoded",
             );
             return None;
         };
@@ -269,6 +373,22 @@ impl PicoQuantReader {
             series_metadata.insert(
                 "ptu.tttr_record_family".into(),
                 MetadataValue::String(record_kind.family.into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_layout".into(),
+                MetadataValue::String(record_kind.record_layout.into()),
+            );
+            let layout_provenance = if record_kind.family == "PicoHarp" {
+                "recognized from TTResultFormat_TTTRRecType metadata; PicoHarp marker-raster pixel reconstruction is disabled pending original-code evidence"
+            } else if record_kind.marker_raster_layout {
+                "recognized from TTResultFormat_TTTRRecType metadata; marker-raster reconstruction uses the supported local HydraHarp-compatible record path"
+            } else {
+                "recognized from TTResultFormat_TTTRRecType metadata; record layout is metadata-only until a reconstruction branch is translated"
+            };
+            insert_layout_provenance(
+                series_metadata,
+                "TTResultFormat_TTTRRecType",
+                layout_provenance,
             );
             series_metadata.insert(
                 "ptu.tttr_hydraharp_layout".into(),
@@ -305,6 +425,15 @@ impl PicoQuantReader {
                 MetadataValue::String("Unknown".into()),
             );
             series_metadata.insert(
+                "ptu.tttr_record_layout".into(),
+                MetadataValue::String("unknown".into()),
+            );
+            insert_layout_provenance(
+                series_metadata,
+                "unrecognized TTResultFormat_TTTRRecType",
+                "acquisition mode is inferred from the mode byte only; record bit layout is not decoded",
+            );
+            series_metadata.insert(
                 "ptu.tttr_hydraharp_layout".into(),
                 MetadataValue::Bool(false),
             );
@@ -328,6 +457,15 @@ impl PicoQuantReader {
             series_metadata.insert(
                 "ptu.tttr_record_family".into(),
                 MetadataValue::String("Unknown".into()),
+            );
+            series_metadata.insert(
+                "ptu.tttr_record_layout".into(),
+                MetadataValue::String("unknown".into()),
+            );
+            insert_layout_provenance(
+                series_metadata,
+                "unrecognized TTResultFormat_TTTRRecType",
+                "record type is unrecognized and no T2/T3 mode byte could be inferred; record bit layout is not decoded",
             );
             series_metadata.insert(
                 "ptu.tttr_hydraharp_layout".into(),
@@ -369,6 +507,238 @@ impl PicoQuantReader {
             })
     }
 
+    fn histogram_payload_header_bytes(
+        tags: &[PicoQuantTag],
+        payload_bytes: usize,
+    ) -> Result<usize> {
+        let Some(offset) = tags
+            .iter()
+            .find(|tag| {
+                tag.tag_type == PTU_TAG_INT8
+                    && tag.index < 0
+                    && Self::is_histogram_payload_offset_tag(&tag.ident)
+            })
+            .map(|tag| tag.value)
+        else {
+            return Ok(0);
+        };
+        if offset < 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant histogram payload offset must be non-negative".into(),
+            ));
+        }
+        let offset = usize::try_from(offset).map_err(|_| {
+            BioFormatsError::UnsupportedFormat(
+                "PicoQuant histogram payload offset is too large".into(),
+            )
+        })?;
+        if offset > payload_bytes {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "PicoQuant histogram payload offset {offset} exceeds payload size {payload_bytes}"
+            )));
+        }
+        Ok(offset)
+    }
+
+    fn histogram_sample_bytes_hint(tags: &[PicoQuantTag]) -> Option<usize> {
+        for tag in tags.iter().filter(|tag| tag.tag_type == PTU_TAG_INT8) {
+            match tag.ident.as_str() {
+                "HistResDscr_BitsPerBin"
+                | "HistResDscr_BitsPerPoint"
+                | "HistoResult_BitsPerBin"
+                | "HistoResult_BitsPerPoint" => match tag.value {
+                    8 => return Some(1),
+                    16 => return Some(2),
+                    32 => return Some(4),
+                    _ => {}
+                },
+                "HistResDscr_BytesPerBin"
+                | "HistResDscr_BytesPerPoint"
+                | "HistoResult_BytesPerBin"
+                | "HistoResult_BytesPerPoint" => match tag.value {
+                    1 => return Some(1),
+                    2 => return Some(2),
+                    4 => return Some(4),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn is_histogram_payload_offset_tag(ident: &str) -> bool {
+        matches!(
+            ident,
+            "HistResDscr_DataOffset"
+                | "HistResDscr_PayloadOffset"
+                | "HistoResult_DataOffset"
+                | "HistoResult_PayloadOffset"
+                | "HistoResultFormat_DataOffset"
+                | "HistoResultFormat_PayloadOffset"
+        )
+    }
+
+    fn histogram_indexed_payload_offsets(tags: &[PicoQuantTag]) -> Result<Vec<(u32, usize)>> {
+        let mut offsets = Vec::new();
+        for tag in tags.iter().filter(|tag| {
+            tag.tag_type == PTU_TAG_INT8
+                && tag.index >= 0
+                && Self::is_histogram_payload_offset_tag(&tag.ident)
+        }) {
+            if tag.value < 0 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "PicoQuant histogram indexed payload offset {} must be non-negative",
+                    Self::ptu_tag_name(tag)
+                )));
+            }
+            offsets.push((
+                u32::try_from(tag.index).map_err(|_| {
+                    BioFormatsError::UnsupportedFormat(
+                        "PicoQuant histogram indexed payload offset index is too large".into(),
+                    )
+                })?,
+                usize::try_from(tag.value).map_err(|_| {
+                    BioFormatsError::UnsupportedFormat(
+                        "PicoQuant histogram indexed payload offset is too large".into(),
+                    )
+                })?,
+            ));
+        }
+        offsets.sort_unstable_by_key(|(index, _)| *index);
+        offsets.dedup_by_key(|(index, _)| *index);
+        Ok(offsets)
+    }
+
+    fn ptu_tag_name(tag: &PicoQuantTag) -> String {
+        if tag.index >= 0 {
+            format!("{}[{}]", tag.ident, tag.index)
+        } else {
+            tag.ident.clone()
+        }
+    }
+
+    fn ptu_tag_value_text(tag: &PicoQuantTag) -> String {
+        match tag.tag_type {
+            PTU_TAG_BOOL8 => (tag.value != 0).to_string(),
+            PTU_TAG_FLOAT8 => f64::from_bits(tag.value as u64).to_string(),
+            PTU_TAG_ANSI_STRING | PTU_TAG_WIDE_STRING => {
+                Self::ptu_string_value(tag).unwrap_or_default()
+            }
+            PTU_TAG_BINARY_BLOB => format!("{} bytes", tag.payload.as_ref().map_or(0, Vec::len)),
+            _ => tag.value.to_string(),
+        }
+    }
+
+    fn histogram_compression_tag_is_enabled(tag: &PicoQuantTag) -> bool {
+        match tag.tag_type {
+            PTU_TAG_BOOL8 => tag.value != 0,
+            PTU_TAG_INT8 => tag.value != 0,
+            PTU_TAG_ANSI_STRING | PTU_TAG_WIDE_STRING => {
+                let value = Self::ptu_string_value(tag)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                !matches!(
+                    value.as_str(),
+                    "" | "0" | "false" | "no" | "none" | "plain" | "raw" | "uncompressed"
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn histogram_compression_hints(tags: &[PicoQuantTag]) -> Vec<String> {
+        tags.iter()
+            .filter(|tag| tag.ident.to_ascii_lowercase().contains("compress"))
+            .filter(|tag| Self::histogram_compression_tag_is_enabled(tag))
+            .map(|tag| {
+                format!(
+                    "{}={}",
+                    Self::ptu_tag_name(tag),
+                    Self::ptu_tag_value_text(tag)
+                )
+            })
+            .collect()
+    }
+
+    fn histogram_compression_codec(tags: &[PicoQuantTag]) -> Option<&'static str> {
+        let mut codec = None;
+        for tag in tags
+            .iter()
+            .filter(|tag| tag.ident.to_ascii_lowercase().contains("compress"))
+            .filter(|tag| Self::histogram_compression_tag_is_enabled(tag))
+        {
+            let value = Self::ptu_tag_value_text(tag)
+                .trim()
+                .to_ascii_lowercase()
+                .replace(['-', '_', ' '], "");
+            let candidate = match value.as_str() {
+                "zlib" | "zip" | "deflatezlib" => Some("zlib"),
+                "gzip" | "gz" => Some("gzip"),
+                "deflate" | "rawdeflate" | "inflate" => Some("deflate"),
+                _ => None,
+            };
+            let candidate = candidate?;
+            if codec.is_some_and(|existing| existing != candidate) {
+                return None;
+            }
+            codec = Some(candidate);
+        }
+        codec
+    }
+
+    fn decompress_histogram_payload(payload: &[u8], codec: &str) -> Result<Vec<u8>> {
+        use std::io::Read;
+
+        let mut decoded = Vec::new();
+        let result = match codec {
+            "zlib" => flate2::read::ZlibDecoder::new(payload).read_to_end(&mut decoded),
+            "gzip" => flate2::read::GzDecoder::new(payload).read_to_end(&mut decoded),
+            "deflate" => flate2::read::DeflateDecoder::new(payload).read_to_end(&mut decoded),
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "PicoQuant histogram compression {codec} is unsupported"
+                )))
+            }
+        };
+        result.map_err(BioFormatsError::Io)?;
+        Ok(decoded)
+    }
+
+    fn histogram_payload_signature(payload: &[u8]) -> &'static str {
+        if payload.is_empty() {
+            "empty payload"
+        } else if payload.starts_with(&[0x1f, 0x8b]) {
+            "gzip stream"
+        } else if payload.len() >= 2
+            && payload[0] & 0x0f == 8
+            && payload[0] >> 4 <= 7
+            && (((payload[0] as u16) << 8) | payload[1] as u16) % 31 == 0
+        {
+            "zlib stream"
+        } else if payload.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            "Zstandard frame"
+        } else if payload.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+            "XZ stream"
+        } else if payload.starts_with(b"BZh") {
+            "bzip2 stream"
+        } else if payload.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+            "LZ4 frame"
+        } else {
+            "unknown payload"
+        }
+    }
+
+    fn histogram_payload_prefix(payload: &[u8]) -> String {
+        payload
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn histogram_bins(tags: &[PicoQuantTag]) -> Option<u32> {
         Self::positive_int_tag_any_index(
             tags,
@@ -382,6 +752,55 @@ impl PicoQuantReader {
                 "HistoResult_DataBins",
             ],
         )
+    }
+
+    fn is_histogram_bin_count_tag(ident: &str) -> bool {
+        matches!(
+            ident,
+            "HistResDscr_HistogramBins"
+                | "HistResDscr_Bins"
+                | "HistResDscr_DataBins"
+                | "HistoResult_NumberOfBins"
+                | "HistoResult_HistogramBins"
+                | "HistoResult_Bins"
+                | "HistoResult_DataBins"
+        )
+    }
+
+    fn histogram_indexed_bin_counts(tags: &[PicoQuantTag]) -> Vec<(u32, u32)> {
+        let mut counts: Vec<(u32, u32)> = tags
+            .iter()
+            .filter(|tag| {
+                tag.tag_type == PTU_TAG_INT8
+                    && tag.index >= 0
+                    && tag.value > 0
+                    && Self::is_histogram_bin_count_tag(&tag.ident)
+            })
+            .filter_map(|tag| {
+                Some((
+                    u32::try_from(tag.index).ok()?,
+                    u32::try_from(tag.value).ok()?,
+                ))
+            })
+            .collect();
+        counts.sort_unstable_by_key(|(index, _)| *index);
+        counts.dedup_by_key(|(index, _)| *index);
+        counts
+    }
+
+    fn histogram_indexed_bin_counts_are_consistent(counts: &[(u32, u32)]) -> bool {
+        let Some((_, first_count)) = counts.first() else {
+            return true;
+        };
+        counts.iter().all(|(_, bin_count)| bin_count == first_count)
+    }
+
+    fn histogram_consistent_indexed_bin_count(counts: &[(u32, u32)]) -> Option<u32> {
+        if Self::histogram_indexed_bin_counts_are_consistent(counts) {
+            counts.first().map(|(_, bin_count)| *bin_count)
+        } else {
+            None
+        }
     }
 
     fn histogram_curve_count(tags: &[PicoQuantTag]) -> u32 {
@@ -403,12 +822,76 @@ impl PicoQuantReader {
             .map_or(1, |max_index| max_index.saturating_add(1))
     }
 
+    fn histogram_indexed_descriptors(tags: &[PicoQuantTag]) -> Vec<u32> {
+        let mut indices: Vec<u32> = tags
+            .iter()
+            .filter(|tag| Self::is_histogram_tag(&tag.ident) && tag.index >= 0)
+            .filter_map(|tag| u32::try_from(tag.index).ok())
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
+    fn histogram_indices_are_contiguous(indices: &[u32]) -> bool {
+        indices
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(expected, index)| {
+                u32::try_from(expected).is_ok_and(|expected| index == expected)
+            })
+    }
+
+    fn histogram_supported_expected_bytes(histogram_bins: u32, curve_count: u32) -> Result<String> {
+        let samples = (histogram_bins as usize)
+            .checked_mul(curve_count as usize)
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "PicoQuant histogram sample count overflows".into(),
+                )
+            })?;
+        let mut expected = Vec::with_capacity(3);
+        for sample_bytes in [1usize, 2, 4] {
+            let bytes = samples.checked_mul(sample_bytes).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "PicoQuant histogram payload size overflows".into(),
+                )
+            })?;
+            expected.push(bytes.to_string());
+        }
+        Ok(expected.join(", "))
+    }
+
     fn decode_histogram_payload(
         data: &[u8],
         data_offset: usize,
         tags: &[PicoQuantTag],
     ) -> Result<Option<PicoQuantReconstruction>> {
-        let Some(histogram_bins) = Self::histogram_bins(tags) else {
+        let Some(payload) = data.get(data_offset..) else {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant histogram payload offset is outside file".into(),
+            ));
+        };
+        Self::decode_histogram_payload_bytes(payload, tags)
+    }
+
+    fn decode_histogram_payload_bytes(
+        payload: &[u8],
+        tags: &[PicoQuantTag],
+    ) -> Result<Option<PicoQuantReconstruction>> {
+        let histogram_indices = Self::histogram_indexed_descriptors(tags);
+        if !Self::histogram_indices_are_contiguous(&histogram_indices) {
+            return Ok(None);
+        }
+        let indexed_bin_counts = Self::histogram_indexed_bin_counts(tags);
+        if !Self::histogram_indexed_bin_counts_are_consistent(&indexed_bin_counts) {
+            return Ok(None);
+        }
+        let Some(histogram_bins) =
+            Self::histogram_consistent_indexed_bin_count(&Self::histogram_indexed_bin_counts(tags))
+                .or_else(|| Self::histogram_bins(tags))
+        else {
             return Ok(None);
         };
         let curve_count = Self::histogram_curve_count(tags);
@@ -419,12 +902,8 @@ impl PicoQuantReader {
                     "PicoQuant histogram sample count overflows".into(),
                 )
             })?;
-        let Some(payload) = data.get(data_offset..) else {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "PicoQuant histogram payload offset is outside file".into(),
-            ));
-        };
 
+        let sample_bytes_hint = Self::histogram_sample_bytes_hint(tags);
         let mut matching_layouts = [
             (1usize, PixelType::Uint8, 8u8, "uint8 bins"),
             (2usize, PixelType::Uint16, 16u8, "little-endian uint16 bins"),
@@ -432,6 +911,9 @@ impl PicoQuantReader {
         ]
         .into_iter()
         .filter(|(sample_bytes, _, _, _)| {
+            if sample_bytes_hint.is_some_and(|hint| hint != *sample_bytes) {
+                return false;
+            }
             expected_samples
                 .checked_mul(*sample_bytes)
                 .is_some_and(|expected_bytes| expected_bytes == payload.len())
@@ -458,6 +940,122 @@ impl PicoQuantReader {
                 "PicoQuant histogram payload decoded as {curve_count} curves of {histogram_bins} {layout}"
             )
         };
+        Ok(Some(PicoQuantReconstruction {
+            pixels,
+            detector_channels: curve_count,
+            lifetime_bins: 1,
+            bidirectional: false,
+            pixel_type,
+            bits_per_pixel,
+            histogram_layout: Some(layout),
+            description,
+        }))
+    }
+
+    fn decode_indexed_offset_histogram_payload(
+        data: &[u8],
+        data_offset: usize,
+        tags: &[PicoQuantTag],
+    ) -> Result<Option<PicoQuantReconstruction>> {
+        let offsets = Self::histogram_indexed_payload_offsets(tags)?;
+        if offsets.is_empty() {
+            return Ok(None);
+        }
+        let histogram_indices = Self::histogram_indexed_descriptors(tags);
+        if !Self::histogram_indices_are_contiguous(&histogram_indices) {
+            return Ok(None);
+        }
+        let indexed_bin_counts = Self::histogram_indexed_bin_counts(tags);
+        if !Self::histogram_indexed_bin_counts_are_consistent(&indexed_bin_counts) {
+            return Ok(None);
+        }
+        let Some(histogram_bins) =
+            Self::histogram_consistent_indexed_bin_count(&indexed_bin_counts)
+                .or_else(|| Self::histogram_bins(tags))
+        else {
+            return Ok(None);
+        };
+        let curve_count = Self::histogram_curve_count(tags);
+        if offsets.len() != curve_count as usize
+            || offsets
+                .iter()
+                .enumerate()
+                .any(|(expected, (index, _))| u32::try_from(expected) != Ok(*index))
+        {
+            return Ok(None);
+        }
+        let Some(payload) = data.get(data_offset..) else {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant histogram payload offset is outside file".into(),
+            ));
+        };
+        if offsets.iter().any(|(_, offset)| *offset > payload.len()) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant histogram indexed payload offset is outside file".into(),
+            ));
+        }
+        let samples_per_curve = histogram_bins as usize;
+        let mut selected = None;
+        let sample_bytes_hint = Self::histogram_sample_bytes_hint(tags);
+        for (sample_bytes, pixel_type, bits_per_pixel, layout) in [
+            (1usize, PixelType::Uint8, 8u8, "indexed-offset uint8 bins"),
+            (
+                2usize,
+                PixelType::Uint16,
+                16u8,
+                "indexed-offset little-endian uint16 bins",
+            ),
+            (
+                4usize,
+                PixelType::Uint32,
+                32u8,
+                "indexed-offset little-endian uint32 bins",
+            ),
+        ] {
+            if sample_bytes_hint.is_some_and(|hint| hint != sample_bytes) {
+                continue;
+            }
+            let bytes_per_curve = samples_per_curve.checked_mul(sample_bytes).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "PicoQuant histogram payload size overflows".into(),
+                )
+            })?;
+            let fits = offsets.iter().enumerate().all(|(i, (_, start))| {
+                let end = offsets
+                    .get(i + 1)
+                    .map(|(_, offset)| *offset)
+                    .unwrap_or(payload.len());
+                *start <= end && end.saturating_sub(*start) >= bytes_per_curve
+            });
+            if fits {
+                selected = Some((sample_bytes, pixel_type, bits_per_pixel, layout));
+            }
+        }
+        let Some((sample_bytes, pixel_type, bits_per_pixel, layout)) = selected else {
+            return Ok(None);
+        };
+        let bytes_per_curve = samples_per_curve.checked_mul(sample_bytes).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("PicoQuant histogram payload size overflows".into())
+        })?;
+        let expected_bytes = bytes_per_curve
+            .checked_mul(curve_count as usize)
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "PicoQuant histogram payload size overflows".into(),
+                )
+            })?;
+        let mut pixels = Vec::with_capacity(expected_bytes);
+        for (_, start) in &offsets {
+            let end = start.checked_add(bytes_per_curve).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "PicoQuant histogram payload size overflows".into(),
+                )
+            })?;
+            pixels.extend_from_slice(&payload[*start..end]);
+        }
+        let description = format!(
+            "PicoQuant histogram payload decoded as {curve_count} indexed-offset curves of {histogram_bins} {layout}"
+        );
         Ok(Some(PicoQuantReconstruction {
             pixels,
             detector_channels: curve_count,
@@ -519,7 +1117,7 @@ impl PicoQuantReader {
         if !record_kind.marker_raster_layout {
             if record_kind.family == "PicoHarp" {
                 return Err(picoquant_event_stream_unsupported(&format!(
-                    "{record_label} record layout is recognized for metadata, but PicoHarp T2/T3 bit packing and marker encoding are not confirmed by local fixtures or specs; pixel reconstruction is fixture/spec-blocked"
+                    "{record_label} record layout is recognized for metadata only; PicoHarp T2/T3 marker-raster pixel reconstruction is not present in the local Bio-Formats Java reader set and is not inferred from HydraHarp-compatible bit packing"
                 )));
             }
             return Err(picoquant_event_stream_unsupported(&format!(
@@ -940,9 +1538,107 @@ impl FormatReader for PicoQuantReader {
                 "ptu.histogram_curves".into(),
                 MetadataValue::Int(i64::from(histogram_curve_count)),
             );
+            let histogram_indices = Self::histogram_indexed_descriptors(&tags);
+            if !histogram_indices.is_empty() {
+                let descriptor_indices = histogram_indices
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let descriptor_indices_contiguous =
+                    Self::histogram_indices_are_contiguous(&histogram_indices);
+                series_metadata.insert(
+                    "ptu.histogram_indexed_descriptor_indices".into(),
+                    MetadataValue::String(descriptor_indices),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_indexed_descriptors_contiguous".into(),
+                    MetadataValue::Bool(descriptor_indices_contiguous),
+                );
+                if !descriptor_indices_contiguous {
+                    series_metadata.insert(
+                        "ptu.histogram_descriptor_layout".into(),
+                        MetadataValue::String("non-contiguous indexed descriptors".into()),
+                    );
+                } else {
+                    series_metadata.insert(
+                        "ptu.histogram_descriptor_layout".into(),
+                        MetadataValue::String("contiguous indexed descriptors".into()),
+                    );
+                }
+            }
+            let indexed_bin_counts = Self::histogram_indexed_bin_counts(&tags);
+            let indexed_bin_counts_consistent =
+                Self::histogram_indexed_bin_counts_are_consistent(&indexed_bin_counts);
+            if !indexed_bin_counts.is_empty() {
+                let bin_counts = indexed_bin_counts
+                    .iter()
+                    .map(|(_, bin_count)| bin_count.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                series_metadata.insert(
+                    "ptu.histogram_indexed_bin_counts".into(),
+                    MetadataValue::String(bin_counts),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_indexed_bin_counts_consistent".into(),
+                    MetadataValue::Bool(indexed_bin_counts_consistent),
+                );
+                if !indexed_bin_counts_consistent {
+                    series_metadata.insert(
+                        "ptu.histogram_descriptor_layout".into(),
+                        MetadataValue::String("mixed indexed bin counts".into()),
+                    );
+                } else if !indexed_bin_counts.is_empty()
+                    && Self::histogram_indices_are_contiguous(&histogram_indices)
+                {
+                    series_metadata.insert(
+                        "ptu.histogram_descriptor_layout".into(),
+                        MetadataValue::String("contiguous equal-width indexed descriptors".into()),
+                    );
+                }
+            }
+            let indexed_payload_offsets = Self::histogram_indexed_payload_offsets(&tags)?;
+            if !indexed_payload_offsets.is_empty() {
+                let offset_indices = indexed_payload_offsets
+                    .iter()
+                    .map(|(index, _)| index.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let offsets = indexed_payload_offsets
+                    .iter()
+                    .map(|(_, offset)| offset.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let offset_indices_contiguous = indexed_payload_offsets
+                    .iter()
+                    .enumerate()
+                    .all(|(expected, (index, _))| u32::try_from(expected) == Ok(*index));
+                series_metadata.insert(
+                    "ptu.histogram_indexed_payload_offset_indices".into(),
+                    MetadataValue::String(offset_indices),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_indexed_payload_offsets".into(),
+                    MetadataValue::String(offsets),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_indexed_payload_offsets_contiguous".into(),
+                    MetadataValue::Bool(offset_indices_contiguous),
+                );
+            }
             let histogram_payload_actual_bytes = data
                 .get(data_offset..)
                 .map_or(0usize, |payload| payload.len());
+            let histogram_payload_header_bytes =
+                Self::histogram_payload_header_bytes(&tags, histogram_payload_actual_bytes)?;
+            let histogram_payload_sample_actual_bytes = histogram_payload_actual_bytes
+                .checked_sub(histogram_payload_header_bytes)
+                .ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat(
+                        "PicoQuant histogram payload offset exceeds payload size".into(),
+                    )
+                })?;
             let histogram_payload_actual_bytes_i64 = i64::try_from(histogram_payload_actual_bytes)
                 .map_err(|_| {
                     BioFormatsError::UnsupportedFormat(
@@ -953,6 +1649,28 @@ impl FormatReader for PicoQuantReader {
                 "ptu.histogram_payload_actual_bytes".into(),
                 MetadataValue::Int(histogram_payload_actual_bytes_i64),
             );
+            if histogram_payload_header_bytes > 0 {
+                let header_bytes_i64 =
+                    i64::try_from(histogram_payload_header_bytes).map_err(|_| {
+                        BioFormatsError::UnsupportedFormat(
+                            "PicoQuant histogram payload offset is too large".into(),
+                        )
+                    })?;
+                let sample_bytes_i64 = i64::try_from(histogram_payload_sample_actual_bytes)
+                    .map_err(|_| {
+                        BioFormatsError::UnsupportedFormat(
+                            "PicoQuant histogram payload byte count is too large".into(),
+                        )
+                    })?;
+                series_metadata.insert(
+                    "ptu.histogram_payload_header_bytes".into(),
+                    MetadataValue::Int(header_bytes_i64),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_payload_sample_actual_bytes".into(),
+                    MetadataValue::Int(sample_bytes_i64),
+                );
+            }
             if let Some(histogram_bins) = histogram_bins {
                 series_metadata.insert(
                     "ptu.histogram_bins".into(),
@@ -976,8 +1694,77 @@ impl FormatReader for PicoQuantReader {
                     "ptu.histogram_payload_expected_bytes".into(),
                     MetadataValue::Int(histogram_payload_expected_bytes_i64),
                 );
+                series_metadata.insert(
+                    "ptu.histogram_supported_payload_bytes".into(),
+                    MetadataValue::String(Self::histogram_supported_expected_bytes(
+                        histogram_bins,
+                        histogram_curve_count,
+                    )?),
+                );
             }
-            let reconstruction = Self::decode_histogram_payload(&data, data_offset, &tags)?;
+            let histogram_sample_data_offset = data_offset
+                .checked_add(histogram_payload_header_bytes)
+                .ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat(
+                        "PicoQuant histogram payload offset overflows".into(),
+                    )
+                })?;
+            let histogram_sample_payload =
+                data.get(histogram_sample_data_offset..).ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat(
+                        "PicoQuant histogram payload offset is outside file".into(),
+                    )
+                })?;
+            let histogram_compression_hints = Self::histogram_compression_hints(&tags);
+            let histogram_payload_signature =
+                Self::histogram_payload_signature(histogram_sample_payload);
+            if !histogram_compression_hints.is_empty() {
+                series_metadata
+                    .insert("ptu.histogram_compressed".into(), MetadataValue::Bool(true));
+                series_metadata.insert(
+                    "ptu.histogram_compression".into(),
+                    MetadataValue::String(histogram_compression_hints.join("; ")),
+                );
+            }
+            if !histogram_sample_payload.is_empty()
+                && (!histogram_compression_hints.is_empty()
+                    || histogram_payload_signature != "unknown payload")
+            {
+                series_metadata.insert(
+                    "ptu.histogram_payload_signature".into(),
+                    MetadataValue::String(histogram_payload_signature.into()),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_payload_first_bytes".into(),
+                    MetadataValue::String(Self::histogram_payload_prefix(histogram_sample_payload)),
+                );
+            }
+            let histogram_compression_codec = Self::histogram_compression_codec(&tags);
+            let mut decoded_histogram_payload = None;
+            let reconstruction = if let Some(codec) = histogram_compression_codec {
+                let decoded = Self::decompress_histogram_payload(histogram_sample_payload, codec)?;
+                series_metadata.insert(
+                    "ptu.histogram_compression_codec".into(),
+                    MetadataValue::String(codec.into()),
+                );
+                series_metadata.insert(
+                    "ptu.histogram_decompressed_payload_bytes".into(),
+                    MetadataValue::Int(i64::try_from(decoded.len()).map_err(|_| {
+                        BioFormatsError::UnsupportedFormat(
+                            "PicoQuant histogram decompressed byte count is too large".into(),
+                        )
+                    })?),
+                );
+                let reconstruction = Self::decode_histogram_payload_bytes(&decoded, &tags)?;
+                decoded_histogram_payload = Some(decoded);
+                reconstruction
+            } else if histogram_compression_hints.is_empty() {
+                Self::decode_indexed_offset_histogram_payload(&data, data_offset, &tags)?.or(
+                    Self::decode_histogram_payload(&data, histogram_sample_data_offset, &tags)?,
+                )
+            } else {
+                None
+            };
             if let Some(reconstruction) = reconstruction {
                 detector_channels = reconstruction.detector_channels;
                 lifetime_bins = reconstruction.lifetime_bins;
@@ -1025,10 +1812,46 @@ impl FormatReader for PicoQuantReader {
                     "ptu.histogram_payload_ambiguous".into(),
                     MetadataValue::Bool(true),
                 );
-                let message = if histogram_bins.is_some() {
-                    format!(
-                        "PicoQuant histogram acquisition image-plane decoding is unsupported; expected a complete u32 histogram payload matching descriptor bins and curves ({histogram_payload_actual_bytes} payload bytes found)"
-                    )
+                let message = if let Some(histogram_bins) = histogram_bins {
+                    let expected_bytes = Self::histogram_supported_expected_bytes(
+                        histogram_bins,
+                        histogram_curve_count,
+                    )?;
+                    let found_bytes = if histogram_payload_header_bytes > 0 {
+                        format!(
+                            "{histogram_payload_sample_actual_bytes} sample payload bytes found after {histogram_payload_header_bytes} header bytes"
+                        )
+                    } else {
+                        format!("{histogram_payload_actual_bytes} payload bytes found")
+                    };
+                    if !Self::histogram_indices_are_contiguous(&histogram_indices) {
+                        format!(
+                            "PicoQuant histogram acquisition image-plane decoding is unsupported; non-contiguous indexed histogram descriptors require structured payload interpretation before decoding ({expected_bytes} bytes supported for exact contiguous uint8, uint16, or uint32 payloads; {found_bytes})"
+                        )
+                    } else if !indexed_bin_counts_consistent {
+                        format!(
+                            "PicoQuant histogram acquisition image-plane decoding is unsupported; mixed indexed histogram bin counts require structured payload interpretation before decoding ({expected_bytes} bytes supported only for equal-width contiguous uint8, uint16, or uint32 payloads; {found_bytes})"
+                        )
+                    } else if !histogram_compression_hints.is_empty() {
+                        if let Some(decoded) = decoded_histogram_payload.as_ref() {
+                            format!(
+                                "PicoQuant histogram acquisition image-plane decoding is unsupported; compressed histogram payload decoded with {} to {} bytes, but did not match exact contiguous uint8, uint16, or uint32 histogram payload sizes ({expected_bytes} bytes supported; {found_bytes})",
+                                histogram_compression_codec.unwrap_or("unknown"),
+                                decoded.len()
+                            )
+                        } else {
+                            format!(
+                                "PicoQuant histogram acquisition image-plane decoding is unsupported; compressed histogram payload decoding is unsupported for declared compression {} (payload signature {}; first bytes [{}]; {expected_bytes} bytes supported only for exact contiguous uint8, uint16, or uint32 payloads; {found_bytes})",
+                                histogram_compression_hints.join("; "),
+                                histogram_payload_signature,
+                                Self::histogram_payload_prefix(histogram_sample_payload)
+                            )
+                        }
+                    } else {
+                        format!(
+                            "PicoQuant histogram acquisition image-plane decoding is unsupported; expected an exact contiguous uint8, uint16, or uint32 histogram payload matching descriptor bins and curves ({expected_bytes} bytes supported; {found_bytes})"
+                        )
+                    }
                 } else {
                     "PicoQuant histogram acquisition image-plane decoding is unsupported; missing bounded histogram bin descriptor".to_string()
                 };

@@ -133,6 +133,9 @@ struct AviParse {
     odml_frames: Vec<(u64, u32)>,
     /// Color palette (BGR(A) per entry) from the BITMAPINFOHEADER, if present.
     palette: Option<LookupTable>,
+    /// Named global metadata collected by the chunk parsers, mirroring the
+    /// `addGlobalMeta(key, value)` calls in Java `AVIReader` (avih/strh/strf).
+    series_metadata: HashMap<String, MetadataValue>,
 }
 
 impl AviParse {
@@ -154,6 +157,74 @@ fn parse_avi(buf: &[u8]) -> Result<AviParse> {
     Ok(parsed)
 }
 
+/// Mirror of Java `AVIReader.readTypeAndSize()`: read the chunk's 4-byte type
+/// (FourCC) and its little-endian u32 size at `pos`. Java reads these off the
+/// stream cursor; here we read them out of the in-memory buffer at `pos`.
+fn read_type_and_size(buf: &[u8], pos: usize) -> ([u8; 4], u32) {
+    let cc = fourcc(buf, pos);
+    let size = r_u32_le(buf, pos + 4);
+    (cc, size)
+}
+
+/// Mirror of Java `AVIReader.readChunkHeader()`: read the type and size, then
+/// the following FourCC (`fcc`) that LIST/RIFF container chunks use to name
+/// their list type. For non-container chunks the `fcc` is simply the first
+/// FourCC of the payload and is ignored by the caller.
+fn read_chunk_header(buf: &[u8], pos: usize) -> ([u8; 4], u32, [u8; 4]) {
+    let (cc, size) = read_type_and_size(buf, pos);
+    // The trailing FourCC is only meaningful for LIST/RIFF containers and is
+    // only consumed by the caller after a bounds check; read [0;4] if it would
+    // fall outside the buffer so this helper never reads out of bounds.
+    let fcc = if pos + 12 <= buf.len() {
+        fourcc(buf, pos + 8)
+    } else {
+        [0, 0, 0, 0]
+    };
+    (cc, size, fcc)
+}
+
+/// Mirror of Java `AVIReader.readChunk()`: parse a single RIFF chunk at `pos`,
+/// dispatching on its type and recursing into LIST/RIFF containers. Returns the
+/// position of the next chunk (padded to a 2-byte boundary), like Java advances
+/// its stream cursor past the chunk.
+fn read_chunk(buf: &[u8], pos: usize, limit: usize, parsed: &mut AviParse) -> Result<usize> {
+    let (cc, size, fcc) = read_chunk_header(buf, pos);
+    let payload = pos + 8;
+    let data_end = chunk_end(payload, size, limit)?;
+
+    match &cc {
+        b"LIST" => {
+            if payload + 4 <= data_end {
+                let list_type = fcc;
+                let list_data_start = payload + 4;
+                if &list_type == b"movi" {
+                    parsed.movi_data_start = Some(list_data_start);
+                    parsed.movi_data_end = Some(data_end);
+                }
+                parse_riff_chunks(buf, list_data_start, data_end, parsed)?;
+            }
+        }
+        b"RIFF" => {
+            if payload + 4 <= data_end {
+                parse_riff_chunks(buf, payload + 4, data_end, parsed)?;
+            }
+        }
+        b"avih" => parse_avih(buf, payload, data_end, parsed),
+        b"strh" => parse_strh(buf, payload, data_end, parsed),
+        b"strf" => parse_strf(buf, payload, data_end, parsed),
+        b"idx1" => parse_idx1(buf, payload, data_end, parsed)?,
+        _ if cc[0] == b'i' && cc[1] == b'x' => {
+            parse_odml_standard_index(buf, payload, data_end, parsed)?
+        }
+        _ if is_video_frame_chunk(cc) && size > 0 => {
+            parsed.frame_chunks.push((payload as u64, size));
+        }
+        _ => {}
+    }
+
+    padded_chunk_end(pos, size, limit)
+}
+
 fn parse_riff_chunks(
     buf: &[u8],
     mut pos: usize,
@@ -161,42 +232,7 @@ fn parse_riff_chunks(
     parsed: &mut AviParse,
 ) -> Result<()> {
     while pos + 8 <= limit {
-        let cc = fourcc(buf, pos);
-        let size = r_u32_le(buf, pos + 4);
-        let payload = pos + 8;
-        let data_end = chunk_end(payload, size, limit)?;
-
-        match &cc {
-            b"LIST" => {
-                if payload + 4 <= data_end {
-                    let list_type = fourcc(buf, payload);
-                    let list_data_start = payload + 4;
-                    if &list_type == b"movi" {
-                        parsed.movi_data_start = Some(list_data_start);
-                        parsed.movi_data_end = Some(data_end);
-                    }
-                    parse_riff_chunks(buf, list_data_start, data_end, parsed)?;
-                }
-            }
-            b"RIFF" => {
-                if payload + 4 <= data_end {
-                    parse_riff_chunks(buf, payload + 4, data_end, parsed)?;
-                }
-            }
-            b"avih" => parse_avih(buf, payload, data_end, parsed),
-            b"strh" => parse_strh(buf, payload, data_end, parsed),
-            b"strf" => parse_strf(buf, payload, data_end, parsed),
-            b"idx1" => parse_idx1(buf, payload, data_end, parsed)?,
-            _ if cc[0] == b'i' && cc[1] == b'x' => {
-                parse_odml_standard_index(buf, payload, data_end, parsed)?
-            }
-            _ if is_video_frame_chunk(cc) && size > 0 => {
-                parsed.frame_chunks.push((payload as u64, size));
-            }
-            _ => {}
-        }
-
-        pos = padded_chunk_end(pos, size, limit)?;
+        pos = read_chunk(buf, pos, limit, parsed)?;
     }
     Ok(())
 }
@@ -211,11 +247,74 @@ fn parse_avih(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse
         parsed.width = r_u32_le(buf, payload + 32);
         parsed.height = r_u32_le(buf, payload + 36);
     }
+    // Mirror Java AVIReader: emit the avih (AVIMAINHEADER) global metadata at the
+    // same field offsets it reads from the chunk cursor. Java reads these as
+    // signed ints. Require the full 56-byte main header before the last field
+    // (Length at offset 52) is read.
+    if data_end.saturating_sub(payload) >= 56 {
+        let m = &mut parsed.series_metadata;
+        m.insert(
+            "Microseconds per frame".into(),
+            MetadataValue::Int(r_i32_le(buf, payload) as i64),
+        );
+        m.insert(
+            "Max. bytes per second".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 4) as i64),
+        );
+        // skip 8 (offsets 8..16)
+        m.insert(
+            "Total frames".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 16) as i64),
+        );
+        m.insert(
+            "Initial frames".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 20) as i64),
+        );
+        // skip 8 (offsets 24..32); offset 32 is dwWidth (sizeX)
+        m.insert(
+            "Frame height".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 36) as i64),
+        );
+        m.insert(
+            "Scale factor".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 40) as i64),
+        );
+        m.insert(
+            "Frame rate".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 44) as i64),
+        );
+        m.insert(
+            "Start time".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 48) as i64),
+        );
+        m.insert(
+            "Length".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 52) as i64),
+        );
+        // Java: addGlobalMeta("Frame width", getSizeX()) — the dwWidth read above.
+        m.insert(
+            "Frame width".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 32) as i64),
+        );
+    }
 }
 
 fn parse_strh(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse) {
     if data_end.saturating_sub(payload) >= 8 && &buf[payload..payload + 4] == b"vids" {
         parsed.stream_handler = fourcc(buf, payload + 4);
+    }
+    // Mirror Java AVIReader strh branch: skip 40 bytes of the AVISTREAMHEADER,
+    // then read dwQuality and dwSampleSize as signed ints. Require the 48 bytes
+    // these two fields span.
+    if data_end.saturating_sub(payload) >= 48 {
+        parsed.series_metadata.insert(
+            "Stream quality".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 40) as i64),
+        );
+        parsed.series_metadata.insert(
+            "Stream sample size".into(),
+            MetadataValue::Int(r_i32_le(buf, payload + 44) as i64),
+        );
     }
 }
 
@@ -230,6 +329,35 @@ fn parse_strf(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse
         parsed.compression = fourcc(buf, payload + 16);
         parsed.compression_int = r_u32_le(buf, payload + 16);
         parsed.is_rgb = parsed.bit_count == 24 || parsed.bit_count == 32;
+
+        // Mirror Java AVIReader strf branch: emit the BITMAPINFOHEADER global
+        // metadata at the same offsets. biXPelsPerMeter/biYPelsPerMeter are at
+        // offsets 24/28; bmpCompression at 16; bmpColorsUsed (biClrUsed) at 32;
+        // bmpBitsPerPixel (biBitCount, signed short) at 14. Require the full
+        // 40-byte header.
+        if data_end.saturating_sub(payload) >= 40 {
+            let m = &mut parsed.series_metadata;
+            m.insert(
+                "Horizontal resolution".into(),
+                MetadataValue::Int(r_i32_le(buf, payload + 24) as i64),
+            );
+            m.insert(
+                "Vertical resolution".into(),
+                MetadataValue::Int(r_i32_le(buf, payload + 28) as i64),
+            );
+            m.insert(
+                "Bitmap compression value".into(),
+                MetadataValue::Int(r_i32_le(buf, payload + 16) as i64),
+            );
+            m.insert(
+                "Number of colors used".into(),
+                MetadataValue::Int(r_i32_le(buf, payload + 32) as i64),
+            );
+            m.insert(
+                "Bits per pixel".into(),
+                MetadataValue::Int(i16::from_le_bytes([buf[payload + 14], buf[payload + 15]]) as i64),
+            );
+        }
 
         // Read the color palette (LUT) that follows the 40-byte header, for
         // <= 8-bit images. biClrUsed is at header offset 32.
@@ -584,6 +712,9 @@ impl FormatReader for AviReader {
         // grayscale index is broadcast to RGB (per the Java rgb derivation).
         // Y8 decodes to single-channel 8-bit. 16-bit is UINT16 RGB (BGR swap).
         let palette = parsed.palette.clone();
+        // Move the named global metadata out so it can be folded into meta_map
+        // below (parsed is immutable and its frame vectors are moved out later).
+        let chunk_metadata = parsed.series_metadata;
         let (size_c, pixel_type, out_is_rgb, is_indexed) = if compression == AVI_JPEG {
             // Motion-JPEG. We deliberately do NOT decode frame 0 here to derive
             // sizeC (Java does, but that makes set_id fail on corrupt pixel data
@@ -652,6 +783,11 @@ impl FormatReader for AviReader {
             "Compression".into(),
             MetadataValue::String(fourcc_to_string(parsed.compression)),
         );
+        // Named global metadata gathered by the avih/strh/strf chunk parsers,
+        // mirroring Java AVIReader's addGlobalMeta calls.
+        for (k, v) in chunk_metadata {
+            meta_map.insert(k, v);
+        }
 
         // Java AVIReader places frames on the T axis (sizeT = imageCount,
         // sizeZ = 1) with dimension order XYTCZ.
@@ -1312,6 +1448,114 @@ mod tests {
             bits_per_pixel: 8,
             ..ImageMetadata::default()
         }
+    }
+
+    /// Build a minimal RIFF/AVI buffer with an avih main header, a vids strh
+    /// stream header, and a strf BITMAPINFOHEADER, so the chunk parsers run and
+    /// populate the named global metadata. Sizes are RIFF/LIST aware.
+    fn synthetic_avi() -> Vec<u8> {
+        fn chunk(cc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(cc);
+            v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            v.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                v.push(0);
+            }
+            v
+        }
+        fn list(fcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut inner = Vec::new();
+            inner.extend_from_slice(fcc);
+            inner.extend_from_slice(body);
+            chunk(b"LIST", &inner)
+        }
+
+        // avih (AVIMAINHEADER), 56 bytes.
+        let mut avih = vec![0u8; 56];
+        avih[0..4].copy_from_slice(&41666i32.to_le_bytes()); // Microseconds per frame
+        avih[4..8].copy_from_slice(&1_000_000i32.to_le_bytes()); // Max bytes/sec
+        avih[16..20].copy_from_slice(&7i32.to_le_bytes()); // Total frames
+        avih[20..24].copy_from_slice(&3i32.to_le_bytes()); // Initial frames
+        avih[32..36].copy_from_slice(&320i32.to_le_bytes()); // dwWidth -> Frame width
+        avih[36..40].copy_from_slice(&240i32.to_le_bytes()); // dwHeight -> Frame height
+        avih[40..44].copy_from_slice(&1i32.to_le_bytes()); // Scale factor
+        avih[44..48].copy_from_slice(&30i32.to_le_bytes()); // Frame rate
+        avih[48..52].copy_from_slice(&0i32.to_le_bytes()); // Start time
+        avih[52..56].copy_from_slice(&7i32.to_le_bytes()); // Length
+
+        // strh (AVISTREAMHEADER), 56 bytes, vids stream.
+        let mut strh = vec![0u8; 56];
+        strh[0..4].copy_from_slice(b"vids");
+        strh[4..8].copy_from_slice(b"DIB ");
+        strh[40..44].copy_from_slice(&5000i32.to_le_bytes()); // Stream quality
+        strh[44..48].copy_from_slice(&12345i32.to_le_bytes()); // Stream sample size
+
+        // strf (BITMAPINFOHEADER), 40 bytes, 24-bit uncompressed.
+        let mut strf = vec![0u8; 40];
+        strf[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        strf[4..8].copy_from_slice(&320i32.to_le_bytes()); // biWidth
+        strf[8..12].copy_from_slice(&240i32.to_le_bytes()); // biHeight
+        strf[14..16].copy_from_slice(&24i16.to_le_bytes()); // biBitCount -> Bits per pixel
+        strf[16..20].copy_from_slice(&0u32.to_le_bytes()); // biCompression
+        strf[24..28].copy_from_slice(&2835i32.to_le_bytes()); // biXPelsPerMeter -> Horizontal resolution
+        strf[28..32].copy_from_slice(&2836i32.to_le_bytes()); // biYPelsPerMeter -> Vertical resolution
+        strf[32..36].copy_from_slice(&0i32.to_le_bytes()); // biClrUsed -> Number of colors used
+
+        let mut strl_body = Vec::new();
+        strl_body.extend_from_slice(&chunk(b"strh", &strh));
+        strl_body.extend_from_slice(&chunk(b"strf", &strf));
+
+        let mut hdrl_body = Vec::new();
+        hdrl_body.extend_from_slice(&chunk(b"avih", &avih));
+        hdrl_body.extend_from_slice(&list(b"strl", &strl_body));
+
+        let hdrl = list(b"hdrl", &hdrl_body);
+
+        let mut riff_body = Vec::new();
+        riff_body.extend_from_slice(b"AVI ");
+        riff_body.extend_from_slice(&hdrl);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(riff_body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&riff_body);
+        out
+    }
+
+    #[test]
+    fn avi_parses_avih_strh_strf_global_metadata() {
+        let buf = synthetic_avi();
+        let parsed = parse_avi(&buf).expect("synthetic AVI should parse");
+        let m = &parsed.series_metadata;
+
+        let get = |k: &str| match m.get(k) {
+            Some(MetadataValue::Int(v)) => *v,
+            other => panic!("missing or non-int key {k:?}: {other:?}"),
+        };
+
+        // avih (Java avih branch)
+        assert_eq!(get("Microseconds per frame"), 41666);
+        assert_eq!(get("Max. bytes per second"), 1_000_000);
+        assert_eq!(get("Total frames"), 7);
+        assert_eq!(get("Initial frames"), 3);
+        assert_eq!(get("Frame width"), 320);
+        assert_eq!(get("Frame height"), 240);
+        assert_eq!(get("Scale factor"), 1);
+        assert_eq!(get("Frame rate"), 30);
+        assert_eq!(get("Start time"), 0);
+        assert_eq!(get("Length"), 7);
+
+        // strh (Java strh branch)
+        assert_eq!(get("Stream quality"), 5000);
+        assert_eq!(get("Stream sample size"), 12345);
+
+        // strf / BITMAPINFOHEADER (Java strf branch)
+        assert_eq!(get("Horizontal resolution"), 2835);
+        assert_eq!(get("Vertical resolution"), 2836);
+        assert_eq!(get("Bitmap compression value"), 0);
+        assert_eq!(get("Number of colors used"), 0);
+        assert_eq!(get("Bits per pixel"), 24);
     }
 
     #[test]
