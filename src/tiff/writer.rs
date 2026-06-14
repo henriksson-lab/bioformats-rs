@@ -1130,3 +1130,667 @@ impl FormatWriter for TiffWriter {
         true
     }
 }
+
+// =============================================================================
+// In-place TIFF metadata overwrite — faithful port of Java
+// loci.formats.tiff.TiffSaver: overwriteComment / overwriteIFDValue /
+// overwriteLastIFDOffset and the makeValidIFD helper.
+//
+// These functions surgically edit an EXISTING TIFF file's IFD entry (e.g. the
+// ImageDescription / OME-XML in IFD 0) in place: if the new value fits in the
+// original allocation it is overwritten at its offset; otherwise the new value
+// is appended at EOF and the entry's offset/count are rewritten to point there.
+// This lets you update OME-XML in a TIFF without rewriting the pixel data.
+//
+// Strictly additive — none of the existing TiffWriter write paths are touched.
+// =============================================================================
+
+use std::io::Read;
+
+/// A value to write into an IFD entry, mirroring the `Object` overloads handled
+/// by Java `TiffSaver.writeIFDValue`. Only the variants needed for metadata
+/// overwrite are modelled (this is the same set the Java method special-cases).
+#[derive(Debug, Clone)]
+pub enum TiffSaverValue {
+    /// ASCII string (IFD type 2). A trailing NUL is appended, exactly like Java.
+    Ascii(String),
+    /// BYTE array (IFD type 1) — the Java `short[]` branch emits one byte per
+    /// element via `writeByte`.
+    ByteArray(Vec<u8>),
+    /// SHORT array (IFD type 3).
+    Short(Vec<u16>),
+    /// LONG array (IFD type 4 in classic TIFF, LONG8/type 16 in BigTIFF).
+    Long(Vec<u64>),
+    /// FLOAT array (IFD type 11).
+    Float(Vec<f32>),
+    /// DOUBLE array (IFD type 12).
+    Double(Vec<f64>),
+}
+
+/// Byte-order / BigTIFF context for the overwrite routines.
+#[derive(Clone, Copy)]
+struct TiffSaverCtx {
+    little: bool,
+    big_tiff: bool,
+}
+
+impl TiffSaverCtx {
+    /// Mirrors Java `writeIntValue`: 8 bytes for BigTIFF, else 4.
+    fn int_value_bytes(&self, v: u64) -> Vec<u8> {
+        if self.big_tiff {
+            if self.little {
+                v.to_le_bytes().to_vec()
+            } else {
+                v.to_be_bytes().to_vec()
+            }
+        } else {
+            let v = v as u32;
+            if self.little {
+                v.to_le_bytes().to_vec()
+            } else {
+                v.to_be_bytes().to_vec()
+            }
+        }
+    }
+
+    fn u16_bytes(&self, v: u16) -> [u8; 2] {
+        if self.little {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        }
+    }
+
+    fn read_u16(&self, b: &[u8]) -> u16 {
+        if self.little {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            u16::from_be_bytes([b[0], b[1]])
+        }
+    }
+
+    fn read_u32(&self, b: &[u8]) -> u32 {
+        if self.little {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        }
+    }
+
+    fn read_u64(&self, b: &[u8]) -> u64 {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[..8]);
+        if self.little {
+            u64::from_le_bytes(a)
+        } else {
+            u64::from_be_bytes(a)
+        }
+    }
+}
+
+/// TIFF type element sizes in bytes — mirrors Java `IFDType.getBytesPerElement()`.
+fn tiff_type_bytes(typ: u16) -> Option<u32> {
+    Some(match typ {
+        1 | 2 | 6 | 7 => 1,              // BYTE, ASCII, SBYTE, UNDEFINED
+        3 | 8 => 2,                      // SHORT, SSHORT
+        4 | 9 | 11 | 13 => 4,            // LONG, SLONG, FLOAT, IFD
+        5 | 10 | 12 | 16 | 17 | 18 => 8, // RATIONAL, SRATIONAL, DOUBLE, LONG8, SLONG8, IFD8
+        _ => return None,
+    })
+}
+
+/// A parsed TIFF IFD directory entry (mirrors `TiffIFDEntry`): type, value
+/// count, and the offset where the value lives. For in-line values
+/// `value_offset` is the file position of the value field within the entry.
+struct ParsedEntry {
+    typ: u16,
+    value_count: u64,
+    value_offset: u64,
+}
+
+/// Mirror of Java `TiffParser.checkHeader`: returns (little_endian, big_tiff)
+/// or an error if the header is not a valid TIFF.
+fn check_tiff_header(buf: &[u8]) -> Result<(bool, bool)> {
+    if buf.len() < 4 {
+        return Err(BioFormatsError::Format("Invalid TIFF header".into()));
+    }
+    let little = match (buf[0], buf[1]) {
+        (0x49, 0x49) => true,  // "II"
+        (0x4D, 0x4D) => false, // "MM"
+        _ => return Err(BioFormatsError::Format("Invalid TIFF header".into())),
+    };
+    let magic = if little {
+        u16::from_le_bytes([buf[2], buf[3]])
+    } else {
+        u16::from_be_bytes([buf[2], buf[3]])
+    };
+    let big_tiff = match magic {
+        42 => false,
+        43 => true,
+        _ => return Err(BioFormatsError::Format("Invalid TIFF header".into())),
+    };
+    Ok((little, big_tiff))
+}
+
+/// Read the first-IFD offset from a TIFF header.
+fn first_ifd_offset(buf: &[u8], ctx: &TiffSaverCtx) -> Result<u64> {
+    if ctx.big_tiff {
+        if buf.len() < 16 {
+            return Err(BioFormatsError::Format("Truncated BigTIFF header".into()));
+        }
+        Ok(ctx.read_u64(&buf[8..16]))
+    } else {
+        if buf.len() < 8 {
+            return Err(BioFormatsError::Format("Truncated TIFF header".into()));
+        }
+        Ok(ctx.read_u32(&buf[4..8]) as u64)
+    }
+}
+
+/// Walk the IFD chain and return every IFD's file offset, mirroring
+/// `TiffParser.getIFDOffsets()`.
+fn ifd_offsets(data: &[u8], ctx: &TiffSaverCtx) -> Result<Vec<u64>> {
+    let bytes_per_entry: u64 = if ctx.big_tiff { 20 } else { 12 };
+    let mut offsets = Vec::new();
+    let mut offset = first_ifd_offset(data, ctx)?;
+    let mut seen = std::collections::HashSet::new();
+    while offset != 0 {
+        if !seen.insert(offset) {
+            // Defensive: avoid infinite loop on a cyclic/corrupt chain.
+            break;
+        }
+        let o = offset as usize;
+        if o + (if ctx.big_tiff { 8 } else { 2 }) > data.len() {
+            return Err(BioFormatsError::Format("IFD offset past EOF".into()));
+        }
+        let num = if ctx.big_tiff {
+            ctx.read_u64(&data[o..o + 8])
+        } else {
+            ctx.read_u16(&data[o..o + 2]) as u64
+        };
+        offsets.push(offset);
+        // next-IFD pointer follows the directory entries
+        let next_off =
+            o + (if ctx.big_tiff { 8 } else { 2 }) as usize + (bytes_per_entry * num) as usize;
+        if next_off + (if ctx.big_tiff { 8 } else { 4 }) > data.len() {
+            break;
+        }
+        offset = if ctx.big_tiff {
+            ctx.read_u64(&data[next_off..next_off + 8])
+        } else {
+            ctx.read_u32(&data[next_off..next_off + 4]) as u64
+        };
+    }
+    Ok(offsets)
+}
+
+/// Read a single IFD directory entry from `data` at `pos`, mirroring
+/// `TiffParser.readTiffIFDEntry`. The returned `value_offset` is, for in-line
+/// values, the file offset of the value field; for out-of-line values it is the
+/// offset the entry points to.
+fn read_ifd_entry(data: &[u8], pos: u64, ctx: &TiffSaverCtx) -> Result<(u16, ParsedEntry)> {
+    let p = pos as usize;
+    let bytes_per_entry = if ctx.big_tiff { 20 } else { 12 };
+    if p + bytes_per_entry > data.len() {
+        return Err(BioFormatsError::Format("IFD entry past EOF".into()));
+    }
+    let tag = ctx.read_u16(&data[p..p + 2]);
+    let typ = ctx.read_u16(&data[p + 2..p + 4]);
+    let bytes_per_elem = tiff_type_bytes(typ)
+        .ok_or_else(|| BioFormatsError::Format(format!("Unknown TIFF type {typ}")))?;
+    let (value_count, count_field_bytes) = if ctx.big_tiff {
+        (ctx.read_u64(&data[p + 4..p + 12]), 8usize)
+    } else {
+        (ctx.read_u32(&data[p + 4..p + 8]) as u64, 4usize)
+    };
+    let value_field_pos = pos + 4 + count_field_bytes as u64;
+    let inline_capacity = if ctx.big_tiff { 8u64 } else { 4u64 };
+    let total_bytes = value_count.saturating_mul(bytes_per_elem as u64);
+    let value_offset = if total_bytes > inline_capacity {
+        // out-of-line: the value field holds an offset
+        if ctx.big_tiff {
+            ctx.read_u64(&data[value_field_pos as usize..value_field_pos as usize + 8])
+        } else {
+            ctx.read_u32(&data[value_field_pos as usize..value_field_pos as usize + 4]) as u64
+        }
+    } else {
+        // in-line: value lives in the entry itself
+        value_field_pos
+    };
+    Ok((
+        tag,
+        ParsedEntry {
+            typ,
+            value_count,
+            value_offset,
+        },
+    ))
+}
+
+/// Serialize the value bytes + canonical (type, count) for an IFD value,
+/// mirroring Java `TiffSaver.writeIFDValue`. Returns `(new_type, new_count,
+/// serialized_bytes)`. `serialized_bytes` is the raw value payload (without
+/// padding); the caller decides in-line (fits inline capacity) vs out-of-line
+/// using the same `extraBuf.length()==0` test Java uses.
+fn serialize_ifd_value(ctx: &TiffSaverCtx, value: &TiffSaverValue) -> (u16, u64, Vec<u8>) {
+    match value {
+        TiffSaverValue::Ascii(s) => {
+            // ASCII — Java writes the bytes plus a concluding NUL; count = len+1.
+            let mut bytes = s.as_bytes().to_vec();
+            bytes.push(0);
+            let count = bytes.len() as u64;
+            (2, count, bytes)
+        }
+        TiffSaverValue::ByteArray(q) => (1, q.len() as u64, q.clone()),
+        TiffSaverValue::Short(q) => {
+            let mut bytes = Vec::with_capacity(q.len() * 2);
+            for &v in q {
+                bytes.extend_from_slice(&ctx.u16_bytes(v));
+            }
+            (3, q.len() as u64, bytes)
+        }
+        TiffSaverValue::Long(q) => {
+            let typ = if ctx.big_tiff { 16 } else { 4 };
+            let mut bytes = Vec::new();
+            for &v in q {
+                bytes.extend_from_slice(&ctx.int_value_bytes(v));
+            }
+            (typ, q.len() as u64, bytes)
+        }
+        TiffSaverValue::Float(q) => {
+            let mut bytes = Vec::with_capacity(q.len() * 4);
+            for &v in q {
+                if ctx.little {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                } else {
+                    bytes.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            (11, q.len() as u64, bytes)
+        }
+        TiffSaverValue::Double(q) => {
+            let mut bytes = Vec::with_capacity(q.len() * 8);
+            for &v in q {
+                if ctx.little {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                } else {
+                    bytes.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            (12, q.len() as u64, bytes)
+        }
+    }
+}
+
+/// Core in-place overwrite of one IFD entry, a faithful port of Java
+/// `TiffSaver.overwriteIFDValue(raf, ifdOffset, tag, value, skipHeaderCheck)`.
+///
+/// Locates the entry for `tag` within the IFD at `ifd_offset`, computes the new
+/// entry fields, decides in-place vs append-to-EOF using Java's exact branch
+/// logic, applies the edit to `data`, and writes the file back to `path`.
+fn overwrite_ifd_value_at_offset(
+    path: &Path,
+    data: &mut Vec<u8>,
+    ctx: &TiffSaverCtx,
+    ifd_offset: u64,
+    tag: u16,
+    value: &TiffSaverValue,
+) -> Result<()> {
+    let bytes_per_entry: u64 = if ctx.big_tiff { 20 } else { 12 };
+    let dir_count_bytes: u64 = if ctx.big_tiff { 8 } else { 2 };
+
+    let o = ifd_offset as usize;
+    if o + dir_count_bytes as usize > data.len() {
+        return Err(BioFormatsError::Format("IFD offset past EOF".into()));
+    }
+    let num = if ctx.big_tiff {
+        ctx.read_u64(&data[o..o + 8])
+    } else {
+        ctx.read_u16(&data[o..o + 2]) as u64
+    };
+
+    for i in 0..num {
+        let entry_pos = ifd_offset + dir_count_bytes + bytes_per_entry * i;
+        let (etag, entry) = read_ifd_entry(data, entry_pos, ctx)?;
+        if etag != tag {
+            continue;
+        }
+
+        // Build the new value's canonical fields + serialized bytes.
+        let (new_type, new_count, serialized) = serialize_ifd_value(ctx, value);
+
+        // In-line vs out-of-line, mirroring Java's `extraBuf.length() == 0`:
+        // a value is in-line iff its serialized size fits the inline capacity.
+        let inline_capacity: u64 = if ctx.big_tiff { 8 } else { 4 };
+        let is_inline = serialized.len() as u64 <= inline_capacity;
+        let extra: Vec<u8> = if is_inline {
+            Vec::new()
+        } else {
+            serialized.clone()
+        };
+
+        // First overwrite the original value with 0s if it was out-of-line,
+        // mirroring Java's `entry.getValueCount() > (offset / bytesPerElement)`
+        // where `offset` is the IFD-offset constant (8 for BigTIFF else 4).
+        let offset_const: u64 = if ctx.big_tiff { 8 } else { 4 };
+        let old_elem_bytes = tiff_type_bytes(entry.typ).unwrap_or(1) as u64;
+        if entry.value_count > (offset_const / old_elem_bytes.max(1)) {
+            let start = entry.value_offset as usize;
+            let zeros = (entry.value_count * old_elem_bytes) as usize;
+            let end = (start + zeros).min(data.len());
+            for b in data.iter_mut().take(end).skip(start) {
+                *b = 0;
+            }
+        }
+
+        // Determine the best way to overwrite the old entry (Java's branch).
+        let raf_len = data.len() as u64;
+        let mut new_offset = entry.value_offset;
+        if extra.is_empty() {
+            // new entry is inline; nothing to relocate.
+        } else if entry.value_offset + entry.value_count * old_elem_bytes == raf_len {
+            // old entry was already at EOF; overwrite it
+            new_offset = entry.value_offset;
+        } else if new_count <= entry.value_count {
+            // new entry is as small or smaller than old entry; overwrite it
+            new_offset = entry.value_offset;
+        } else {
+            // old entry was elsewhere; append to EOF, orphaning old entry
+            new_offset = raf_len;
+        }
+
+        // Overwrite the old entry: Java seeks `entry_pos + 2` (past the tag) and
+        // writes type(2), count(int), offset-or-inline-value(int).
+        let mut field = Vec::new();
+        field.extend_from_slice(&ctx.u16_bytes(new_type));
+        field.extend_from_slice(&ctx.int_value_bytes(new_count));
+        if extra.is_empty() {
+            // in-line: write the value bytes padded to inline capacity
+            let mut v = serialized;
+            v.resize(inline_capacity as usize, 0);
+            field.extend_from_slice(&v);
+        } else {
+            field.extend_from_slice(&ctx.int_value_bytes(new_offset));
+        }
+        let tail_len = bytes_per_entry as usize - 2;
+        debug_assert_eq!(field.len(), tail_len);
+        let fstart = (entry_pos + 2) as usize;
+        data[fstart..fstart + tail_len].copy_from_slice(&field[..tail_len]);
+
+        // Write out-of-line data at new_offset (may extend the file).
+        if !extra.is_empty() {
+            let start = new_offset as usize;
+            let end = start + extra.len();
+            if end > data.len() {
+                data.resize(end, 0);
+            }
+            data[start..end].copy_from_slice(&extra);
+        }
+
+        std::fs::write(path, &*data).map_err(BioFormatsError::Io)?;
+        return Ok(());
+    }
+
+    Err(BioFormatsError::Format(format!("Tag not found ({tag})")))
+}
+
+/// Surgically overwrite the value of `tag` in IFD number `ifd_index` of the TIFF
+/// at `path`. Faithful port of Java
+/// `TiffSaver.overwriteIFDValue(RandomAccessInputStream, int ifd, int tag, Object value)`.
+///
+/// If the new value fits in the original allocation it is written in place;
+/// otherwise it is appended at EOF and the entry's offset/count are repointed.
+pub fn overwrite_ifd_value(
+    path: &Path,
+    ifd_index: usize,
+    tag: u16,
+    value: TiffSaverValue,
+) -> Result<()> {
+    let mut data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    let (little, big_tiff) = check_tiff_header(&data)?;
+    let ctx = TiffSaverCtx { little, big_tiff };
+
+    let offsets = ifd_offsets(&data, &ctx)?;
+    if ifd_index >= offsets.len() {
+        return Err(BioFormatsError::Format(format!(
+            "No such IFD ({ifd_index} of {})",
+            offsets.len()
+        )));
+    }
+    let ifd_offset = offsets[ifd_index];
+    overwrite_ifd_value_at_offset(path, &mut data, &ctx, ifd_offset, tag, &value)
+}
+
+/// Convenience method for overwriting a file's first ImageDescription
+/// (tag 270, `IFD.IMAGE_DESCRIPTION`). Faithful port of Java
+/// `TiffSaver.overwriteComment(in, value)`.
+pub fn overwrite_comment(path: &Path, comment: &str) -> Result<()> {
+    overwrite_ifd_value(path, 0, 270, TiffSaverValue::Ascii(comment.to_string()))
+}
+
+/// Overwrite the last IFD's next-IFD pointer with 0, faithful port of Java
+/// `TiffSaver.overwriteLastIFDOffset`. After this call the IFD chain is
+/// terminated at whatever was previously the last IFD in the file.
+pub fn overwrite_last_ifd_offset(path: &Path) -> Result<()> {
+    let mut data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    let (little, big_tiff) = check_tiff_header(&data)?;
+    let ctx = TiffSaverCtx { little, big_tiff };
+    let bytes_per_entry: u64 = if ctx.big_tiff { 20 } else { 12 };
+    let dir_count_bytes: u64 = if ctx.big_tiff { 8 } else { 2 };
+
+    let offsets = ifd_offsets(&data, &ctx)?;
+    let last = *offsets
+        .last()
+        .ok_or_else(|| BioFormatsError::Format("No IFDs in file".into()))?;
+    let o = last as usize;
+    let num = if ctx.big_tiff {
+        ctx.read_u64(&data[o..o + 8])
+    } else {
+        ctx.read_u16(&data[o..o + 2]) as u64
+    };
+    // next-IFD pointer immediately follows the directory entries
+    let next_ptr_pos = (last + dir_count_bytes + bytes_per_entry * num) as usize;
+    let zero = ctx.int_value_bytes(0);
+    if next_ptr_pos + zero.len() > data.len() {
+        data.resize(next_ptr_pos + zero.len(), 0);
+    }
+    data[next_ptr_pos..next_ptr_pos + zero.len()].copy_from_slice(&zero);
+    std::fs::write(path, &data).map_err(BioFormatsError::Io)?;
+    Ok(())
+}
+
+/// Faithful port of Java `TiffSaver.makeValidIFD(ifd, pixelType, nChannels)`.
+/// Fills in the mandatory pixel-related IFD fields for a freshly-built IFD map.
+/// This operates on a tag→`IfdValue` map (the Rust analogue of Java's `IFD`),
+/// and is provided for parity; the existing TiffWriter does not use an IFD map
+/// for its own write path.
+pub fn make_valid_ifd(
+    ifd: &mut std::collections::HashMap<u16, crate::tiff::ifd::IfdValue>,
+    pixel_type: PixelType,
+    n_channels: u16,
+) {
+    use crate::tiff::ifd::IfdValue;
+    // Tag constants (mirroring loci.formats.tiff.IFD).
+    const BITS_PER_SAMPLE: u16 = 258;
+    const COMPRESSION: u16 = 259;
+    const PHOTOMETRIC_INTERPRETATION: u16 = 262;
+    const SAMPLES_PER_PIXEL: u16 = 277;
+    const X_RESOLUTION: u16 = 282;
+    const Y_RESOLUTION: u16 = 283;
+    const ROWS_PER_STRIP: u16 = 278;
+    const SAMPLE_FORMAT: u16 = 339;
+    const COLOR_MAP: u16 = 320;
+    const SOFTWARE: u16 = 305;
+    const IMAGE_DESCRIPTION: u16 = 270;
+    const EXTRA_SAMPLES: u16 = 338;
+    const TILE_WIDTH: u16 = 322;
+    const TILE_LENGTH: u16 = 323;
+
+    let bps = 8 * pixel_type.bytes_per_sample() as u16;
+    ifd.insert(
+        BITS_PER_SAMPLE,
+        IfdValue::Short(vec![bps; n_channels as usize]),
+    );
+
+    if matches!(pixel_type, PixelType::Float32 | PixelType::Float64) {
+        ifd.insert(SAMPLE_FORMAT, IfdValue::Short(vec![3]));
+    }
+    if !ifd.contains_key(&COMPRESSION) {
+        // TiffCompression.UNCOMPRESSED == 1
+        ifd.insert(COMPRESSION, IfdValue::Short(vec![1]));
+    }
+
+    // PhotoInterp: BLACK_IS_ZERO=1, RGB_PALETTE=3, RGB=2, Y_CB_CR=6
+    let mut pi: u16 = 1;
+    let compression_code = ifd.get(&COMPRESSION).and_then(|v| v.as_u16()).unwrap_or(1);
+    if n_channels == 1 && ifd.contains_key(&COLOR_MAP) {
+        pi = 3;
+    } else if n_channels == 3 || n_channels == 4 {
+        if compression_code == 7 {
+            // TiffCompression.JPEG == 7
+            pi = 6;
+        } else {
+            pi = 2;
+        }
+        if n_channels == 4 {
+            ifd.insert(EXTRA_SAMPLES, IfdValue::Short(vec![0]));
+        }
+    }
+    ifd.insert(PHOTOMETRIC_INTERPRETATION, IfdValue::Short(vec![pi]));
+    ifd.insert(SAMPLES_PER_PIXEL, IfdValue::Short(vec![n_channels]));
+
+    if !ifd.contains_key(&X_RESOLUTION) {
+        ifd.insert(X_RESOLUTION, IfdValue::Rational(vec![(1, 1)]));
+    }
+    if !ifd.contains_key(&Y_RESOLUTION) {
+        ifd.insert(Y_RESOLUTION, IfdValue::Rational(vec![(1, 1)]));
+    }
+    if !ifd.contains_key(&SOFTWARE) {
+        ifd.insert(SOFTWARE, IfdValue::Ascii("bioformats-rs".to_string()));
+    }
+    if !ifd.contains_key(&ROWS_PER_STRIP)
+        && !ifd.contains_key(&TILE_WIDTH)
+        && !ifd.contains_key(&TILE_LENGTH)
+    {
+        ifd.insert(ROWS_PER_STRIP, IfdValue::Long(vec![1]));
+    }
+    if !ifd.contains_key(&IMAGE_DESCRIPTION) {
+        ifd.insert(IMAGE_DESCRIPTION, IfdValue::Ascii(String::new()));
+    }
+}
+
+/// Read the ImageDescription (tag 270) string from IFD 0 of a TIFF file.
+/// Helper used by tests and callers verifying an overwrite round-trip.
+pub fn read_first_comment(path: &Path) -> Result<Option<String>> {
+    let mut data = Vec::new();
+    File::open(path)
+        .map_err(BioFormatsError::Io)?
+        .read_to_end(&mut data)
+        .map_err(BioFormatsError::Io)?;
+    let (little, big_tiff) = check_tiff_header(&data)?;
+    let ctx = TiffSaverCtx { little, big_tiff };
+    let offsets = ifd_offsets(&data, &ctx)?;
+    let Some(&ifd0) = offsets.first() else {
+        return Ok(None);
+    };
+    let dir_count_bytes: u64 = if ctx.big_tiff { 8 } else { 2 };
+    let bytes_per_entry: u64 = if ctx.big_tiff { 20 } else { 12 };
+    let o = ifd0 as usize;
+    let num = if ctx.big_tiff {
+        ctx.read_u64(&data[o..o + 8])
+    } else {
+        ctx.read_u16(&data[o..o + 2]) as u64
+    };
+    for i in 0..num {
+        let entry_pos = ifd0 + dir_count_bytes + bytes_per_entry * i;
+        let (tag, entry) = read_ifd_entry(&data, entry_pos, &ctx)?;
+        if tag == 270 {
+            let start = entry.value_offset as usize;
+            let mut len = entry.value_count as usize;
+            let raw = &data[start..(start + len).min(data.len())];
+            // strip trailing NUL(s)
+            while len > 0 && raw.get(len - 1) == Some(&0) {
+                len -= 1;
+            }
+            let s = String::from_utf8_lossy(&raw[..len.min(raw.len())]).into_owned();
+            return Ok(Some(s));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod overwrite_tests {
+    use super::*;
+    use crate::common::metadata::ImageMetadata;
+    use crate::common::pixel_type::PixelType;
+
+    fn write_basic_tiff(path: &Path, comment: &str) {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = 4;
+        meta.size_y = 4;
+        meta.size_c = 1;
+        meta.size_z = 1;
+        meta.size_t = 1;
+        meta.image_count = 1;
+        meta.pixel_type = PixelType::Uint8;
+        let mut w = TiffWriter::new().with_ome_xml(comment.to_string());
+        w.set_metadata(&meta).unwrap();
+        w.set_id(path).unwrap();
+        w.save_bytes(0, &[0u8; 16]).unwrap();
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn overwrite_comment_shorter_in_place() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("bfrs_overwrite_short_{}.tif", std::process::id()));
+        write_basic_tiff(&path, "ORIGINAL-LONG-COMMENT-STRING-HERE");
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        overwrite_comment(&path, "short").unwrap();
+        let got = read_first_comment(&path).unwrap();
+        assert_eq!(got.as_deref(), Some("short"));
+
+        // shorter string must NOT grow the file (overwritten in place)
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(before, after, "shorter comment should overwrite in place");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn overwrite_comment_longer_appends() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("bfrs_overwrite_long_{}.tif", std::process::id()));
+        write_basic_tiff(&path, "short");
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let long = "A-MUCH-LONGER-REPLACEMENT-COMMENT-THAT-WILL-NOT-FIT-IN-PLACE-".repeat(4);
+        overwrite_comment(&path, &long).unwrap();
+        let got = read_first_comment(&path).unwrap();
+        assert_eq!(got.as_deref(), Some(long.as_str()));
+
+        // longer string must grow the file (appended at EOF, entry repointed)
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after > before,
+            "longer comment should append at EOF (before={before}, after={after})"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn overwrite_value_general_roundtrip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("bfrs_overwrite_general_{}.tif", std::process::id()));
+        write_basic_tiff(&path, "x");
+        overwrite_ifd_value(&path, 0, 270, TiffSaverValue::Ascii("hello world".into())).unwrap();
+        assert_eq!(
+            read_first_comment(&path).unwrap().as_deref(),
+            Some("hello world")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}

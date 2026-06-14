@@ -49,6 +49,9 @@ pub struct OmeImage {
     pub physical_size_z: Option<f64>,
     /// Time between frames (seconds).
     pub time_increment: Option<f64>,
+    /// `<ImagingEnvironment>` temperature (degrees Celsius). Set by readers such
+    /// as MicroManager that record the detector/sample temperature.
+    pub imaging_environment_temperature: Option<f64>,
     pub channels: Vec<OmeChannel>,
     pub planes: Vec<OmePlane>,
     /// Reference to an instrument (index into `OmeMetadata::instruments`).
@@ -531,6 +534,12 @@ impl OmeMetadata {
                     xml,
                     "<AcquisitionDate>{}</AcquisitionDate>",
                     xml_escape(date)
+                );
+            }
+            if let Some(v) = img.imaging_environment_temperature {
+                let _ = write!(
+                    xml,
+                    r#"<ImagingEnvironment Temperature="{v}" TemperatureUnit="°C"/>"#
                 );
             }
 

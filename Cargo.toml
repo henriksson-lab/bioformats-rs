@@ -40,6 +40,7 @@ cfb          = "0.10"
 byteorder    = "1"
 image        = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "gif", "tga", "webp", "pnm", "hdr", "exr", "dds", "ff"] }
 jpeg2k       = { version = "0.10", default-features = false, features = ["openjp2"] }
+openjp2      = { version = "0.6", optional = true }
 serde         = { version = "1", features = ["derive"] }
 bincode       = "1"
 jpegxr        = { version = "0.3", optional = true }
@@ -50,8 +51,10 @@ zarrs         = { version = "0.23", features = ["filesystem"] }
 serde_json    = "1"
 
 [features]
+default = ["jpeg2000-write"]
 jpegxr = ["dep:jpegxr"]
 openslide = ["dep:openslide-pure-rs"]
+jpeg2000-write = ["dep:openjp2"]
 
 [[bin]]
 name = "bioformats-convert"

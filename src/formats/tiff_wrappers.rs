@@ -2283,7 +2283,10 @@ impl NikonElementsTiffReader {
             // Faithful ND2Handler translation: parse the embedded Nikon XML the
             // way Java's NikonElementsTiffReader does (qName -> key, value attr
             // -> value, routed through ND2Handler.parseKeyAndValue).
-            self.nd2_handler = nd2handler_parse_xml(&desc, &tags);
+            // nImages for ND2Handler == the number of planes in the backing
+            // TIFF (one IFD per plane), gating the Z/Time Loop direct setters.
+            let n_images = self.inner.ifd_count() as i32;
+            self.nd2_handler = nd2handler_parse_xml(&desc, &tags, n_images);
             nikon_insert_nd2handler_diagnostics(&mut vendor, &self.nd2_handler);
 
             self.nis_ome = nikon_elements_ome_projection(&tags);
@@ -2935,6 +2938,23 @@ struct Nd2Handler {
     /// Mirror of ND2Handler.imageMetadataLVExists (always false for embedded
     /// Nikon XML, which has no ImageMetadataLV stream).
     image_metadata_lv_exists: bool,
+    /// ms0.bitsPerPixel set from `uiBpcSignificant` (None = not yet set).
+    core_bits_per_pixel: Option<u32>,
+    /// Mirror of ND2Handler `dimensionOrder` for the single embedded series.
+    /// VirtualComponents / uiCount loops prepend Z/T/C when absent; carried so
+    /// those branches reproduce Java's `indexOf('C') == -1` guards exactly.
+    core_dimension_order: String,
+    /// Mirror of ND2Handler.ts — distinct timepoint stamps from `dTimeMSec`.
+    ts: Vec<i64>,
+    /// Mirror of ND2Handler.zs — distinct Z positions from `dZPos`.
+    zs: Vec<i64>,
+    /// Mirror of ND2Handler.nImages (the number of planes in the backing TIFF),
+    /// gating the `Z Stack Loop` / `Time Loop` direct dimension setters.
+    n_images: i32,
+    /// Mirror of ND2Handler.firstTimeLoop.
+    first_time_loop: bool,
+    /// Mirror of metadata "number of timepoints" — exposed for diagnostics.
+    number_of_timepoints: Option<usize>,
 }
 
 impl Default for Nd2Handler {
@@ -2975,6 +2995,14 @@ impl Default for Nd2Handler {
             core_size_c: 0,
             core_series_count: 1,
             image_metadata_lv_exists: false,
+            core_bits_per_pixel: None,
+            // CoreMetadata's default dimensionOrder ("XYCZT" in Bio-Formats).
+            core_dimension_order: "XYCZT".to_string(),
+            ts: Vec::new(),
+            zs: Vec::new(),
+            n_images: 0,
+            first_time_loop: true,
+            number_of_timepoints: None,
         }
     }
 }
@@ -3100,6 +3128,24 @@ impl Nd2Handler {
             }
         } else if key == "sDate" {
             self.date = Some(value.to_string());
+        } else if key.ends_with("dTimeMSec") {
+            // ND2Handler: collect distinct timepoint stamps; the count becomes
+            // the "number of timepoints" diagnostic. Java parses as a double and
+            // truncates to a long.
+            if let Ok(d) = value.parse::<f64>() {
+                let v = d as i64;
+                if !self.ts.contains(&v) {
+                    self.ts.push(v);
+                    self.number_of_timepoints = Some(self.ts.len());
+                }
+            }
+        } else if key.ends_with("dZPos") {
+            // ND2Handler: collect distinct Z positions.
+            if let Ok(v) = value.parse::<i64>() {
+                if !self.zs.contains(&v) {
+                    self.zs.push(v);
+                }
+            }
         } else if key.ends_with("uiCount") {
             // ND2Handler: runtype-gated dimension loops. Each loop type either
             // sets a single core dimension (Z/T) or multiplies the series count
@@ -3109,12 +3155,20 @@ impl Nd2Handler {
                     if self.core_size_z == 0 {
                         if let Ok(v) = value.parse::<u32>() {
                             self.core_size_z = v;
+                            if !self.core_dimension_order.contains('Z') {
+                                self.core_dimension_order =
+                                    format!("Z{}", self.core_dimension_order);
+                            }
                         }
                     }
                 } else if runtype.ends_with("TimeLoop") && !self.image_metadata_lv_exists {
                     if self.core_size_t == 0 {
                         if let Ok(v) = value.parse::<u32>() {
                             self.core_size_t = v;
+                            if !self.core_dimension_order.contains('T') {
+                                self.core_dimension_order =
+                                    format!("T{}", self.core_dimension_order);
+                            }
                         }
                     }
                 } else if runtype.ends_with("XYPosLoop") && self.core_series_count == 1 {
@@ -3123,6 +3177,56 @@ impl Nd2Handler {
                         self.core_series_count = len.max(1);
                     }
                 }
+            }
+        } else if key.ends_with("uiBpcSignificant") {
+            // ND2Handler: significant bits per pixel/colour for ms0.
+            if let Ok(v) = value.parse::<u32>() {
+                self.core_bits_per_pixel = Some(v);
+            }
+        } else if key == "VirtualComponents" {
+            // ND2Handler: virtual channel count. Sets sizeC only when still
+            // unset, and mirrors Java's quirky dimensionOrder concatenation
+            // (`dimensionOrder += "C" + dimensionOrder`).
+            if self.core_size_c == 0 {
+                if let Ok(v) = value.parse::<u32>() {
+                    self.core_size_c = v;
+                    if !self.core_dimension_order.contains('C') {
+                        self.core_dimension_order =
+                            format!("{0}C{0}", self.core_dimension_order);
+                    }
+                }
+            }
+        } else if key.starts_with("TextInfoItem") || key.ends_with("TextInfoItem") {
+            // ND2Handler: nested free-text metadata. Normalise CRLF entities,
+            // then split into lines and re-route each "k : v" pair (or "Line:..."
+            // run) back through parseKeyAndValue.
+            let normalized = value
+                .replace("&#x000d;", "")
+                .replace("#x000d;", "")
+                .replace("&#x000a;", "\n")
+                .replace("#x000a;", "\n");
+            for line in normalized.split('\n') {
+                let t = line.trim();
+                // Java's String.split(":") drops trailing empty fields.
+                let mut v: Vec<&str> = t.split(':').collect();
+                while v.len() > 1 && v.last() == Some(&"") {
+                    v.pop();
+                }
+                if v.is_empty() {
+                    continue;
+                } else if v.len() == 2 {
+                    self.parse_key_and_value(v[0].trim(), v[1].trim(), runtype);
+                } else if v[0] == "Line" {
+                    let rest = match t.find(':') {
+                        Some(c) => t[c + 1..].trim(),
+                        None => "",
+                    };
+                    self.parse_key_and_value(v[0], rest, runtype);
+                } else if v.len() > 1 {
+                    // metadata.put(v[0] sans braces, v[1]); diagnostic-only.
+                    let _ = v[0].replace('{', " ").replace('}', " ");
+                }
+                // (v.len() == 1: metadata.put(key, v[0]); diagnostic-only)
             }
         } else if Self::is_dimensions(key) && !self.image_metadata_lv_exists {
             // "Dimensions" string e.g. "XY(4) x T(10) x Z(3) x \u{3bb}(2)".
@@ -3156,7 +3260,55 @@ impl Nd2Handler {
                     self.core_size_c = v;
                 }
             }
+        } else if key.starts_with("Number of Picture Planes") {
+            // ND2Handler: alternate channel-count key (strip non-digits).
+            let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = digits.parse::<u32>() {
+                self.core_size_c = v;
+            }
+        } else if key == "Line" {
+            // ND2Handler: a ';'-separated list of "k: v" pairs, each re-routed.
+            for part in value.split(';') {
+                if let Some(colon) = part.find(':') {
+                    let next_key = part[..colon].trim().to_string();
+                    let next_value = part[colon + 1..].trim().to_string();
+                    self.parse_key_and_value(&next_key, &next_value, runtype);
+                }
+            }
+        } else if key.starts_with("- Step") {
+            // ND2Handler: physical Z step embedded in the key, "- Step <value>".
+            if let Some(step) = Self::parse_pixels_size_z_from_key(key) {
+                self.pixel_size_z = Some(step);
+            }
+        } else if key == "Z Stack Loop" {
+            // ND2Handler: direct Z setter, gated so it cannot exceed the plane
+            // count (unless nImages is unknown).
+            if let Ok(v) = value.parse::<i32>() {
+                if v <= self.n_images || self.n_images <= 0 {
+                    self.core_size_z = v.max(0) as u32;
+                }
+            }
+        } else if key == "Time Loop" {
+            // ND2Handler: direct T setter, applied only once (firstTimeLoop).
+            if let Ok(v) = value.parse::<i32>() {
+                if v <= self.n_images && self.first_time_loop {
+                    self.core_size_t = v.max(0) as u32;
+                    self.first_time_loop = false;
+                }
+            }
         }
+    }
+
+    /// Mirror of `ND2Handler.parsePixelsSizeZFromKey(String key)`. The key is
+    /// expected to be "- Step <value>"; returns the parsed value or None.
+    fn parse_pixels_size_z_from_key(key: &str) -> Option<f64> {
+        let step_pos = key.find("Step")?;
+        let space = key[step_pos + 1..].find(' ').map(|i| step_pos + 1 + i)?;
+        let last = key[space + 1..]
+            .find(' ')
+            .map(|i| space + 1 + i)
+            .unwrap_or(key.len());
+        key[space..last].trim().parse::<f64>().ok()
     }
 
     /// Mirror of `ND2Handler.isDimensions(String key)`.
@@ -3169,8 +3321,11 @@ impl Nd2Handler {
 /// and route each `qName`/`value` pair through `parse_key_and_value`, capturing
 /// stage-position item lists, ROIs (`HorizontalLine`/`VerticalLine`/`Text`), and
 /// the `dPinholeRadius` element. Returns the populated handler.
-fn nd2handler_parse_xml(xml: &str, tags: &[XmlTag]) -> Nd2Handler {
+fn nd2handler_parse_xml(xml: &str, tags: &[XmlTag], n_images: i32) -> Nd2Handler {
     let mut handler = Nd2Handler::default();
+    // Mirror ND2Handler's constructor `nImages`, gating the Z/Time Stack Loop
+    // direct dimension setters.
+    handler.n_images = n_images;
     // Track the active dPos{X,Y,Z} list element by recording when we enter one.
     let mut pos_list: Option<char> = None;
     let mut pos_list_end: usize = 0;
@@ -3507,6 +3662,24 @@ fn nikon_insert_nd2handler_diagnostics(
         metadata.insert(
             "nikon.nd2.roi_count".into(),
             MetadataValue::Int(handler.rois.len() as i64),
+        );
+    }
+    if let Some(v) = handler.core_bits_per_pixel {
+        metadata.insert(
+            "nikon.nd2.bits_per_pixel".into(),
+            MetadataValue::Int(v as i64),
+        );
+    }
+    if let Some(v) = handler.number_of_timepoints {
+        metadata.insert(
+            "nikon.nd2.number_of_timepoints".into(),
+            MetadataValue::Int(v as i64),
+        );
+    }
+    if !handler.zs.is_empty() {
+        metadata.insert(
+            "nikon.nd2.z_position_count".into(),
+            MetadataValue::Int(handler.zs.len() as i64),
         );
     }
 }
@@ -7912,5 +8085,139 @@ mod improvision_tests {
         // So directly assert the helper is a no-op without a series, matching
         // Java guarding on core.get(0,0).
         assert!(r.ome_images.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod nd2handler_key_value_tests {
+    use super::*;
+
+    // Exercises the parseKeyAndValue branches ported from ND2Handler that the
+    // embedded NIS-Elements Nikon XML drives. nImages is left at the default 0
+    // unless a test sets it, mirroring ND2Handler's nImages constructor arg.
+    fn handler() -> Nd2Handler {
+        Nd2Handler::default()
+    }
+
+    #[test]
+    fn dtimemsec_collects_distinct_timepoints() {
+        let mut h = handler();
+        h.parse_key_and_value("dTimeMSec", "10.5", None);
+        h.parse_key_and_value("dTimeMSec", "10.5", None); // duplicate ignored
+        h.parse_key_and_value("dTimeMSec", "21.0", None);
+        assert_eq!(h.ts, vec![10, 21]);
+        assert_eq!(h.number_of_timepoints, Some(2));
+    }
+
+    #[test]
+    fn dzpos_collects_distinct_positions() {
+        let mut h = handler();
+        h.parse_key_and_value("dZPos", "5", None);
+        h.parse_key_and_value("dZPos", "5", None); // duplicate ignored
+        h.parse_key_and_value("dZPos", "7", None);
+        assert_eq!(h.zs, vec![5, 7]);
+    }
+
+    #[test]
+    fn uibpcsignificant_sets_bits_per_pixel() {
+        let mut h = handler();
+        h.parse_key_and_value("uiBpcSignificant", "12", None);
+        assert_eq!(h.core_bits_per_pixel, Some(12));
+    }
+
+    #[test]
+    fn virtual_components_sets_size_c_once() {
+        let mut h = handler();
+        h.parse_key_and_value("VirtualComponents", "3", None);
+        assert_eq!(h.core_size_c, 3);
+        // dimensionOrder already contains C, so the quirky concat is skipped.
+        assert_eq!(h.core_dimension_order, "XYCZT");
+        // Second call is ignored because sizeC is no longer 0.
+        h.parse_key_and_value("VirtualComponents", "5", None);
+        assert_eq!(h.core_size_c, 3);
+    }
+
+    #[test]
+    fn number_of_picture_planes_sets_size_c() {
+        let mut h = handler();
+        h.parse_key_and_value("Number of Picture Planes: 4 planes", "4", None);
+        assert_eq!(h.core_size_c, 4);
+    }
+
+    #[test]
+    fn z_stack_loop_gated_by_n_images() {
+        let mut h = handler();
+        h.n_images = 10;
+        h.parse_key_and_value("Z Stack Loop", "5", None);
+        assert_eq!(h.core_size_z, 5);
+        // Exceeds nImages -> ignored.
+        h.parse_key_and_value("Z Stack Loop", "20", None);
+        assert_eq!(h.core_size_z, 5);
+        // nImages unknown (<=0) -> always applied.
+        let mut h2 = handler();
+        h2.n_images = 0;
+        h2.parse_key_and_value("Z Stack Loop", "99", None);
+        assert_eq!(h2.core_size_z, 99);
+    }
+
+    #[test]
+    fn time_loop_applied_only_once() {
+        let mut h = handler();
+        h.n_images = 100;
+        h.parse_key_and_value("Time Loop", "8", None);
+        assert_eq!(h.core_size_t, 8);
+        assert!(!h.first_time_loop);
+        // firstTimeLoop now false -> ignored.
+        h.parse_key_and_value("Time Loop", "16", None);
+        assert_eq!(h.core_size_t, 8);
+    }
+
+    #[test]
+    fn time_loop_ignored_when_exceeds_n_images() {
+        let mut h = handler();
+        h.n_images = 4;
+        h.parse_key_and_value("Time Loop", "8", None);
+        assert_eq!(h.core_size_t, 0);
+        assert!(h.first_time_loop);
+    }
+
+    #[test]
+    fn uicount_zstackloop_sets_z_and_order() {
+        let mut h = handler();
+        h.parse_key_and_value("uiCount", "6", Some("CLxModeBValue|ZStackLoop"));
+        assert_eq!(h.core_size_z, 6);
+        // Default order "XYCZT" already contains 'Z', so (faithful to Java's
+        // indexOf('Z') == -1 guard) the prepend is skipped.
+        assert_eq!(h.core_dimension_order, "XYCZT");
+        // Only the first ZStackLoop with sizeZ == 0 takes effect.
+        h.parse_key_and_value("uiCount", "99", Some("ZStackLoop"));
+        assert_eq!(h.core_size_z, 6);
+    }
+
+    #[test]
+    fn step_key_sets_pixel_size_z() {
+        let mut h = handler();
+        h.parse_key_and_value("- Step 1.5 um", "ignored value", None);
+        assert_eq!(h.pixel_size_z, Some(1.5));
+    }
+
+    #[test]
+    fn line_key_routes_subkeys() {
+        let mut h = handler();
+        // "Line" splits on ';' into "k: v" pairs routed back through the parser.
+        h.parse_key_and_value("Line", "Modality: Widefield; Name: DAPI", None);
+        assert_eq!(h.modality, vec!["Widefield".to_string()]);
+        assert_eq!(h.channel_names, vec!["DAPI".to_string()]);
+    }
+
+    #[test]
+    fn textinfoitem_routes_nested_pairs() {
+        let mut h = handler();
+        // Colon-separated pairs across CRLF entity-delimited lines, each routed
+        // back through parseKeyAndValue.
+        let value = "Camera Type: MyCam&#x000a;Modality: Confocal";
+        h.parse_key_and_value("TextInfoItem_0", value, None);
+        assert_eq!(h.camera_model, Some("MyCam".to_string()));
+        assert_eq!(h.modality, vec!["Confocal".to_string()]);
     }
 }

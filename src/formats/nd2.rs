@@ -276,6 +276,13 @@ struct Nd2LvValues {
     z_step: Option<f64>,
     channel_names: Vec<String>,
     emission_wavelengths: Vec<f64>,
+    /// Excitation wavelengths (Java ND2Handler: exWave). Populated only from the
+    /// text-annotation "Excitation wavelength" key; the LV/XML metadata block
+    /// does not carry these, mirroring upstream behaviour.
+    excitation_wavelengths: Vec<f64>,
+    /// `TextInfoItem*` annotation strings collected during the LV walk
+    /// (ND2Reader.iterateIn:2130-2133 → textInfos), later fed to parse_text.
+    text_infos: Vec<String>,
     /// dExposureTime per channel, converted from ms to seconds (Java: /1000).
     exposure_time: Vec<f64>,
     /// uiColor → sDescription channel name → packed BGR color, mirroring
@@ -438,6 +445,10 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
                     } else if name == "sObjective" && !s.is_empty() && out.objective_model.is_none()
                     {
                         out.objective_model = Some(s);
+                    } else if name.starts_with("TextInfoItem") && !s.is_empty() {
+                        // Collect text-annotation blobs for the backup handler
+                        // (ND2Reader.iterateIn:2130-2133 → textInfos).
+                        out.text_infos.push(s);
                     }
                     p = q;
                 }
@@ -664,6 +675,59 @@ fn parse_nd2_xml_metadata(xml: &str, out: &mut Nd2LvValues) {
     // dCompressionParam > 0 ⇒ lossless (ND2Handler:548-550).
     if let Some(param) = nd2_xml_f64_value(xml, "dCompressionParam") {
         out.is_lossless = param > 0.0;
+    }
+}
+
+/// Parse one text-annotation block into `out`, mirroring `ND2Reader.parseText`.
+///
+/// Java first tries to parse the string as XML through an `ND2Handler`
+/// (`XMLTools.parseXML`); on failure it falls back to a line-based
+/// `key: value` scan handed to `ND2Handler.parseKeyAndValue`. We reuse the
+/// existing XML metadata path (`parse_nd2_xml_metadata`) for the XML case and
+/// implement the `Name` / `Emission wavelength` / `Excitation wavelength`
+/// key handling for the line-based case (ND2Handler.parseKeyAndValue:830-894).
+/// The resulting `out` is the equivalent of Java's `backupHandler`.
+fn parse_text(text: &str, out: &mut Nd2LvValues) {
+    let trimmed = text.trim();
+    // XML case: reuse the same parser ND2Handler uses for metadata XML.
+    if trimmed.contains('<') && trimmed.contains('>') {
+        parse_nd2_xml_metadata(trimmed, out);
+    }
+
+    // Line-based fallback (ND2Handler.parseKeyAndValue). This runs regardless,
+    // matching how the text key/value pairs supply channel names and emission /
+    // excitation wavelengths that the XML form may not carry.
+    for line in text.split('\n') {
+        let Some(sep) = line.find(':') else { continue };
+        let key = line[..sep].trim();
+        let value = line[sep + 1..].trim();
+        if value.is_empty() {
+            continue;
+        }
+        if key == "Name" {
+            // ND2Handler:830-831 / 908-909 — channel name.
+            if !out.channel_names.contains(&value.to_string()) {
+                out.channel_names.push(value.to_string());
+            }
+        } else if key.eq_ignore_ascii_case("Emission wavelength") {
+            // ND2Handler:888-890 — first whitespace-delimited token as f64.
+            if let Some(v) = value
+                .split_whitespace()
+                .next()
+                .and_then(|t| t.parse::<f64>().ok())
+            {
+                out.emission_wavelengths.push(v);
+            }
+        } else if key.eq_ignore_ascii_case("Excitation wavelength") {
+            // ND2Handler:892-894 — first whitespace-delimited token as f64.
+            if let Some(v) = value
+                .split_whitespace()
+                .next()
+                .and_then(|t| t.parse::<f64>().ok())
+            {
+                out.excitation_wavelengths.push(v);
+            }
+        }
     }
 }
 
@@ -1694,6 +1758,15 @@ pub struct Nd2Reader {
     physical_size_z: Option<f64>,
     channel_names: Vec<String>,
     emission_wavelengths: Vec<f64>,
+    /// Excitation wavelengths from the primary metadata (Java handler.exWave).
+    excitation_wavelengths: Vec<f64>,
+    /// Backup-handler channel names / wavelengths recovered from the text
+    /// annotation block (Java: backupHandler). Used only as a fallback when the
+    /// primary metadata yields incomplete channel names or no wavelengths
+    /// (ND2Reader.populateMetadataStore:2276-2277, 2493-2498).
+    backup_channel_names: Vec<String>,
+    backup_emission_wavelengths: Vec<f64>,
+    backup_excitation_wavelengths: Vec<f64>,
     plane_delta_t: Vec<Option<f64>>,
     plane_position_z: Vec<Option<f64>>,
     // Data members mirroring the Java ND2Reader (see ND2Reader.java fields).
@@ -1739,6 +1812,10 @@ impl Nd2Reader {
             physical_size_z: None,
             channel_names: Vec::new(),
             emission_wavelengths: Vec::new(),
+            excitation_wavelengths: Vec::new(),
+            backup_channel_names: Vec::new(),
+            backup_emission_wavelengths: Vec::new(),
+            backup_excitation_wavelengths: Vec::new(),
             plane_delta_t: Vec::new(),
             plane_position_z: Vec::new(),
             exposure_time: Vec::new(),
@@ -2092,10 +2169,29 @@ impl FormatReader for Nd2Reader {
                 nd2_update_loop_descriptors_from_xml(&xml, &mut loop_descriptors);
             }
         }
+        // Build the backup handler from the text-annotation blocks, mirroring
+        // ND2Reader.parseText feeding `backupHandler` (java:2656-2674). Each
+        // TextInfoItem string is parsed independently into a fresh value bag,
+        // the equivalent of a separate ND2Handler. `backupHandler` is replaced
+        // only while it is still unset or has zero channel names
+        // (java:2670-2674), so the first text block with channel names wins.
+        let mut backup = Nd2LvValues::default();
+        for text in &lv.text_infos {
+            let mut candidate = Nd2LvValues::default();
+            parse_text(text, &mut candidate);
+            if backup.channel_names.is_empty() {
+                backup = candidate;
+            }
+        }
+        self.backup_channel_names = backup.channel_names;
+        self.backup_emission_wavelengths = backup.emission_wavelengths;
+        self.backup_excitation_wavelengths = backup.excitation_wavelengths;
+
         self.physical_size = lv.calibration;
         self.physical_size_z = lv.z_step;
         self.channel_names = lv.channel_names;
         self.emission_wavelengths = lv.emission_wavelengths;
+        self.excitation_wavelengths = lv.excitation_wavelengths;
         self.exposure_time = lv.exposure_time;
         self.channel_colors = lv.channel_colors;
         self.text_channel_names = lv.text_channel_names;
@@ -2126,11 +2222,19 @@ impl FormatReader for Nd2Reader {
 
         // Per-effective-channel colors: look each channel name up in the
         // channelColors map (ND2Reader.populateMetadataStore:2271-2288). Names
-        // come from sDescription, falling back to textChannelNames.
-        let color_names: &[String] = if self.channel_names.len() >= size_c as usize {
-            &self.channel_names
+        // come from sDescription, falling back to the backup handler and then
+        // textChannelNames, matching the channelNames fallback chain there.
+        let color_names: &[String] = if self.channel_names.len() < size_c as usize
+            && !self.backup_channel_names.is_empty()
+        {
+            &self.backup_channel_names
         } else {
+            &self.channel_names
+        };
+        let color_names: &[String] = if color_names.len() < size_c as usize {
             &self.text_channel_names
+        } else {
+            color_names
         };
         self.colors = (0..size_c as usize)
             .map(|c| {
@@ -2617,6 +2721,10 @@ impl FormatReader for Nd2Reader {
         self.physical_size_z = None;
         self.channel_names.clear();
         self.emission_wavelengths.clear();
+        self.excitation_wavelengths.clear();
+        self.backup_channel_names.clear();
+        self.backup_emission_wavelengths.clear();
+        self.backup_excitation_wavelengths.clear();
         self.plane_delta_t.clear();
         self.plane_position_z.clear();
         self.exposure_time.clear();
@@ -2829,13 +2937,48 @@ impl FormatReader for Nd2Reader {
             img.physical_size_z = Some(z);
         }
 
-        // Channel names, emission wavelengths and colors.
+        // Channel names, emission wavelengths and colors. The effective channel
+        // count is the per-series channel count.
+        let effective_size_c = img.channels.len();
+
+        // Channel-name fallback chain (ND2Reader.populateMetadataStore:2275-2281):
+        // primary channel names; if fewer than effectiveSizeC and a backup
+        // handler exists, use the backup's; if still short, use textChannelNames.
+        let channel_names: &[String] = if self.channel_names.len() < effective_size_c
+            && !self.backup_channel_names.is_empty()
+        {
+            &self.backup_channel_names
+        } else {
+            &self.channel_names
+        };
+        let channel_names: &[String] = if channel_names.len() < effective_size_c {
+            &self.text_channel_names
+        } else {
+            channel_names
+        };
+
+        // Wavelength fallback (ND2Reader.populateMetadataStore:2493-2499): use the
+        // backup handler only when the primary list is empty.
+        let emission_wavelengths: &[f64] = if self.emission_wavelengths.is_empty() {
+            &self.backup_emission_wavelengths
+        } else {
+            &self.emission_wavelengths
+        };
+        let excitation_wavelengths: &[f64] = if self.excitation_wavelengths.is_empty() {
+            &self.backup_excitation_wavelengths
+        } else {
+            &self.excitation_wavelengths
+        };
+
         for (c, channel) in img.channels.iter_mut().enumerate() {
-            if let Some(name) = self.channel_names.get(c) {
+            if let Some(name) = channel_names.get(c) {
                 channel.name = Some(name.clone());
             }
-            if let Some(em) = self.emission_wavelengths.get(c).filter(|v| **v > 0.0) {
+            if let Some(em) = emission_wavelengths.get(c).filter(|v| **v > 0.0) {
                 channel.emission_wavelength = Some(*em);
+            }
+            if let Some(ex) = excitation_wavelengths.get(c).filter(|v| **v > 0.0) {
+                channel.excitation_wavelength = Some(*ex);
             }
             // Java sets the channel color only when the recorded BGR color is
             // non-black (populateMetadataStore:2303-2313), packing it as RGBA.
@@ -3059,6 +3202,61 @@ mod tests {
         assert_eq!(lv.channel_colors.get("DAPI"), Some(&0x0000FF));
         assert_eq!(lv.exposure_time, vec![0.025]);
         assert_eq!(lv.position_count, 1);
+    }
+
+    #[test]
+    fn nd2_parse_text_recovers_channel_names_and_wavelengths() {
+        // Line-based text annotation (ND2Reader.parseText catch fallback →
+        // ND2Handler.parseKeyAndValue). "Name" supplies channel names; the
+        // emission/excitation keys supply wavelengths (first token parsed).
+        let text = "Metadata:\n\
+                    Name: DAPI\n\
+                    Emission wavelength: 461 nm\n\
+                    Excitation wavelength: 358 nm\n\
+                    Name: FITC\n\
+                    Emission wavelength: 519 nm\n\
+                    Excitation wavelength: 495 nm\n";
+        let mut backup = Nd2LvValues::default();
+        parse_text(text, &mut backup);
+        assert_eq!(
+            backup.channel_names,
+            vec!["DAPI".to_string(), "FITC".to_string()]
+        );
+        assert_eq!(backup.emission_wavelengths, vec![461.0, 519.0]);
+        assert_eq!(backup.excitation_wavelengths, vec![358.0, 495.0]);
+    }
+
+    #[test]
+    fn nd2_lv_collects_textinfo_for_backup_handler() {
+        // A TextInfoItem* string in the LV tree must be captured into text_infos
+        // so it can later seed the backup handler (ND2Reader.iterateIn:2130-2133).
+        fn entry(ty: u8, name: &str, value: &[u8]) -> Vec<u8> {
+            let mut e = vec![ty, name.chars().count() as u8];
+            for u in name.encode_utf16() {
+                e.extend_from_slice(&u.to_le_bytes());
+            }
+            e.extend_from_slice(value);
+            e
+        }
+        let mut info = Vec::new();
+        for u in "Name: TexasRed".encode_utf16() {
+            info.extend_from_slice(&u.to_le_bytes());
+        }
+        info.extend_from_slice(&0u16.to_le_bytes());
+
+        let data = entry(8, "TextInfoItem_5", &info);
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_lv(&data, &mut lv);
+        assert_eq!(lv.text_infos, vec!["Name: TexasRed".to_string()]);
+        // The primary LV channel names stay empty (no sDescription/uiColor pair).
+        assert!(lv.channel_names.is_empty());
+
+        // Feeding the collected text through parse_text recovers the channel name.
+        let mut backup = Nd2LvValues::default();
+        for t in &lv.text_infos {
+            parse_text(t, &mut backup);
+        }
+        assert_eq!(backup.channel_names, vec!["TexasRed".to_string()]);
     }
 
     #[test]

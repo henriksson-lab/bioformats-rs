@@ -14,9 +14,11 @@ pub struct ImageWriter {
 }
 
 fn writer_for(path: &Path) -> Option<Box<dyn FormatWriter>> {
-    let writers: Vec<Box<dyn FormatWriter>> = vec![
+    #[allow(unused_mut)]
+    let mut writers: Vec<Box<dyn FormatWriter>> = vec![
         Box::new(crate::tiff::TiffWriter::new()),
         Box::new(crate::formats::png::PngWriter::new()),
+        Box::new(crate::formats::extended::ApngWriter::new()),
         Box::new(crate::formats::jpeg::JpegWriter::new()),
         Box::new(crate::formats::bmp::BmpWriter::new()),
         Box::new(crate::formats::raster::TgaWriter::new()),
@@ -30,7 +32,12 @@ fn writer_for(path: &Path) -> Option<Box<dyn FormatWriter>> {
         Box::new(crate::formats::dicom::DicomWriter::new()),
         Box::new(crate::formats::avi::AviWriter::new()),
         Box::new(crate::formats::eps::EpsWriter::new()),
+        Box::new(crate::formats::v3draw::V3DrawWriter::new()),
+        Box::new(crate::formats::cellh5::CellH5Writer::new()),
+        Box::new(crate::formats::misc::QtWriter::new()),
     ];
+    #[cfg(feature = "jpeg2000-write")]
+    writers.push(Box::new(crate::formats::misc::Jpeg2000Writer::new()));
     writers.into_iter().find(|w| w.is_this_type(path))
 }
 

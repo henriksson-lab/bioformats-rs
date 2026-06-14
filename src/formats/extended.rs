@@ -11112,22 +11112,381 @@ fn lof_pixel_type_from_bytes(n_bytes: u64) -> PixelType {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Animated PNG — delegates to PngReader
+// 10. Animated PNG (APNG)
 // ---------------------------------------------------------------------------
-/// Animated PNG reader (`.apng`).
-///
-/// Tries to open the file as a regular PNG via `PngReader` (reads the first
-/// frame). Full APNG animation decoding is not supported.
+// Faithful translation of the upstream Java `APNGReader`
+// (components/formats-bsd/.../in/APNGReader.java). Each APNG frame becomes a
+// timepoint (sizeT == numFrames, dimensionOrder XYCTZ). Frame 0 is the default
+// image (the IDAT chunks); each subsequent frame `no` is the fdAT data for that
+// `fcTL`, pasted onto a fresh copy of frame 0 at the frame's (x, y) offset,
+// mirroring Java's `openBytes` compositing.
+
+/// One parsed PNG/APNG chunk: type + offset/length of its data payload.
+#[derive(Clone)]
+struct PngBlock {
+    offset: u64,
+    length: u32,
+    type_: [u8; 4],
+}
+
 pub struct ApngReader {
-    inner: crate::formats::png::PngReader,
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    data: Vec<u8>,
+    blocks: Vec<PngBlock>,
+    /// One [x, y, w, h] per frame (the default image plus each fcTL).
+    frame_coordinates: Vec<[u32; 4]>,
+    lut: Option<[[u8; 256]; 3]>,
+    color_type: u8,
+    bit_depth: u8,
+    interlace: u8,
 }
 
 impl ApngReader {
     pub fn new() -> Self {
         ApngReader {
-            inner: crate::formats::png::PngReader::new(),
+            path: None,
+            meta: None,
+            data: Vec::new(),
+            blocks: Vec::new(),
+            frame_coordinates: Vec::new(),
+            lut: None,
+            color_type: 0,
+            bit_depth: 0,
+            interlace: 0,
         }
     }
+
+    /// Scan a PNG byte stream for an `acTL` chunk (animation control), the
+    /// marker that distinguishes an animated PNG from a still PNG. Mirrors
+    /// `PngReader::contains_apng_animation_control` but operates on bytes.
+    fn has_actl(data: &[u8]) -> bool {
+        if !data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+            return false;
+        }
+        let mut offset = 8usize;
+        while offset + 8 <= data.len() {
+            let length = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            let chunk_type = &data[offset + 4..offset + 8];
+            if chunk_type == b"acTL" {
+                return true;
+            }
+            // The default image's IDAT always follows acTL when one is present,
+            // so an animated PNG is detected before the first IDAT/IEND.
+            if chunk_type == b"IEND" {
+                return false;
+            }
+            match offset.checked_add(12).and_then(|v| v.checked_add(length)) {
+                Some(next) => offset = next,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    fn read_be_i32(&self, off: usize) -> Result<i32> {
+        self.data
+            .get(off..off + 4)
+            .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or_else(|| BioFormatsError::Format("APNG: truncated chunk".into()))
+    }
+
+    /// `initFile`: parse the PNG signature and every chunk, building `blocks`,
+    /// `frame_coordinates`, the palette, and the core metadata.
+    fn init_file(&mut self, path: &Path) -> Result<()> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+
+        if !data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+            return Err(BioFormatsError::Format("Invalid PNG signature.".into()));
+        }
+        self.data = data;
+
+        let mut image_count: u32 = 0;
+        let mut size_x: u32 = 0;
+        let mut size_y: u32 = 0;
+        let mut size_c: u32 = 1;
+        let mut bits_per_pixel: u8 = 0;
+        let mut color_type: u8 = 0;
+        let mut interlace: u8 = 0;
+        let mut is_indexed = false;
+        let mut lut: Option<[[u8; 256]; 3]> = None;
+
+        let mut offset = 8usize;
+        let total = self.data.len();
+        while offset < total {
+            let length = self.read_be_i32(offset)? as i64;
+            if length < 0 {
+                return Err(BioFormatsError::Format("APNG: negative chunk length".into()));
+            }
+            let length = length as u32;
+            let type_bytes = self
+                .data
+                .get(offset + 4..offset + 8)
+                .ok_or_else(|| BioFormatsError::Format("APNG: truncated chunk type".into()))?;
+            let mut type_ = [0u8; 4];
+            type_.copy_from_slice(type_bytes);
+            let data_offset = (offset + 8) as u64;
+
+            self.blocks.push(PngBlock {
+                offset: data_offset,
+                length,
+                type_,
+            });
+
+            let d = data_offset as usize;
+            match &type_ {
+                b"acTL" => {
+                    image_count = self.read_be_i32(d)? as u32;
+                    // d + 4 is the loop count ("num_plays"); recorded as global
+                    // metadata in Java, not needed for pixel access.
+                }
+                b"fcTL" => {
+                    // Skip the 4-byte sequence number, then read w, h, x, y.
+                    let w = self.read_be_i32(d + 4)? as u32;
+                    let h = self.read_be_i32(d + 8)? as u32;
+                    let x = self.read_be_i32(d + 12)? as u32;
+                    let y = self.read_be_i32(d + 16)? as u32;
+                    self.frame_coordinates.push([x, y, w, h]);
+                }
+                b"IDAT" => {}
+                b"PLTE" => {
+                    is_indexed = true;
+                    let mut table = [[0u8; 256]; 3];
+                    let entries = (length / 3) as usize;
+                    for i in 0..entries.min(256) {
+                        for (c, row) in table.iter_mut().enumerate() {
+                            row[i] = self.data[d + i * 3 + c];
+                        }
+                    }
+                    lut = Some(table);
+                }
+                b"IHDR" => {
+                    size_x = self.read_be_i32(d)? as u32;
+                    size_y = self.read_be_i32(d + 4)? as u32;
+                    bits_per_pixel = self.data[d + 8];
+                    color_type = self.data[d + 9];
+                    // d + 10 is the compression method (only 0 is valid).
+                    let filter = self.data[d + 11];
+                    interlace = self.data[d + 12];
+
+                    if filter != 0 {
+                        return Err(BioFormatsError::Format(format!(
+                            "Invalid filter mode: {filter}"
+                        )));
+                    }
+
+                    size_c = match color_type {
+                        0 | 3 => 1, // GRAYSCALE / INDEXED
+                        4 => 2,     // GRAY_ALPHA
+                        2 => 3,     // TRUE_COLOR
+                        6 => 4,     // TRUE_ALPHA
+                        other => {
+                            return Err(BioFormatsError::Format(format!(
+                                "APNG: unsupported color type {other}"
+                            )));
+                        }
+                    };
+                }
+                b"IEND" => break,
+                _ => {}
+            }
+
+            // Advance past the data payload and the 4-byte CRC.
+            offset = offset
+                .checked_add(12)
+                .and_then(|v| v.checked_add(length as usize))
+                .ok_or_else(|| BioFormatsError::Format("APNG: chunk offset overflow".into()))?;
+        }
+
+        if image_count == 0 {
+            image_count = 1;
+        }
+
+        let pixel_type = if bits_per_pixel <= 8 {
+            PixelType::Uint8
+        } else {
+            PixelType::Uint16
+        };
+        let is_rgb = size_c > 1;
+
+        self.color_type = color_type;
+        self.bit_depth = bits_per_pixel;
+        self.interlace = interlace;
+        self.lut = lut;
+
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z: 1,
+            size_c,
+            size_t: image_count,
+            pixel_type,
+            bits_per_pixel,
+            image_count,
+            // APNGReader.java: dimensionOrder "XYCTZ".
+            dimension_order: DimensionOrder::XYCTZ,
+            is_rgb,
+            // interleaved == isRGB()
+            is_interleaved: is_rgb,
+            is_indexed,
+            // Core metadata defaults to big-endian (littleEndian = false).
+            is_little_endian: false,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        self.path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Rebuild a standalone PNG byte stream from the global IHDR/PLTE plus a
+    /// frame's compressed data (IDAT for frame 0, the fdAT chunks otherwise),
+    /// then decode it. Mirrors Java's `PNGInputStream` + `decode`: the per-frame
+    /// fdAT/IDAT chunks describe a sub-PNG of size (width, height).
+    fn decode_frame(&self, frame: usize) -> Result<(Vec<u8>, u32, u32)> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        let (sub_w, sub_h) = if frame == 0 {
+            (meta.size_x, meta.size_y)
+        } else {
+            let c = self.frame_coordinates[frame];
+            (c[2], c[3])
+        };
+
+        // Collect the compressed payload for this frame.
+        let payload = if frame == 0 {
+            // All IDAT chunks (the default image), concatenated.
+            let mut p = Vec::new();
+            for b in &self.blocks {
+                if &b.type_ == b"IDAT" {
+                    let s = b.offset as usize;
+                    p.extend_from_slice(&self.data[s..s + b.length as usize]);
+                }
+            }
+            p
+        } else {
+            // The fdAT chunks belonging to the frame-th fcTL. Each fdAT starts
+            // with a 4-byte sequence number which is stripped (Java skips 4
+            // bytes and shortens blockLength by 4).
+            let mut p = Vec::new();
+            let mut fctl_count: i32 = -1;
+            for b in &self.blocks {
+                if &b.type_ == b"fcTL" {
+                    fctl_count += 1;
+                } else if &b.type_ == b"fdAT" && fctl_count as usize == frame {
+                    let s = b.offset as usize + 4;
+                    let len = b.length.saturating_sub(4) as usize;
+                    p.extend_from_slice(&self.data[s..s + len]);
+                }
+            }
+            p
+        };
+
+        let png = self.build_sub_png(sub_w, sub_h, &payload);
+        let raw = decode_sub_png(&png, meta, sub_w, sub_h)?;
+        Ok((raw, sub_w, sub_h))
+    }
+
+    /// Assemble a minimal valid PNG: signature, an IHDR matching this frame's
+    /// dimensions (reusing the global bit depth / color type / interlace), the
+    /// optional PLTE, the frame payload as a single IDAT, and IEND.
+    fn build_sub_png(&self, width: u32, height: u32, idat: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(idat.len() + 64);
+        out.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+
+        // IHDR (13 bytes of data).
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.push(self.bit_depth);
+        ihdr.push(self.color_type);
+        ihdr.push(0); // compression method
+        ihdr.push(0); // filter method
+        ihdr.push(self.interlace);
+        write_png_chunk(&mut out, b"IHDR", &ihdr);
+
+        // PLTE, if the source was indexed.
+        if self.color_type == 3 {
+            if let Some(lut) = &self.lut {
+                let mut plte = Vec::with_capacity(768);
+                for ((&r, &g), &b) in lut[0].iter().zip(lut[1].iter()).zip(lut[2].iter()) {
+                    plte.push(r);
+                    plte.push(g);
+                    plte.push(b);
+                }
+                write_png_chunk(&mut out, b"PLTE", &plte);
+            }
+        }
+
+        write_png_chunk(&mut out, b"IDAT", idat);
+        write_png_chunk(&mut out, b"IEND", &[]);
+        out
+    }
+}
+
+/// Write one PNG chunk (length + type + data + CRC32 over type+data).
+fn write_png_chunk(out: &mut Vec<u8>, type_: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(type_);
+    out.extend_from_slice(data);
+    let mut crc = flate2::Crc::new();
+    crc.update(type_);
+    crc.update(data);
+    out.extend_from_slice(&crc.sum().to_be_bytes());
+}
+
+/// Decode a complete PNG byte stream into raw, planar/interleaved pixel bytes
+/// laid out to match `meta` (interleaved RGB samples, little-endian uint16).
+fn decode_sub_png(png: &[u8], meta: &ImageMetadata, w: u32, h: u32) -> Result<Vec<u8>> {
+    use image::GenericImageView;
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .map_err(|e| BioFormatsError::Format(format!("APNG frame decode failed: {e}")))?;
+    let (iw, ih) = img.dimensions();
+    if iw != w || ih != h {
+        return Err(BioFormatsError::Format(format!(
+            "APNG frame decoded to {iw}x{ih}, expected {w}x{h}"
+        )));
+    }
+
+    let spp = meta.size_c as usize;
+    let raw: Vec<u8> = match (meta.pixel_type, spp) {
+        (PixelType::Uint8, 1) => img.to_luma8().into_raw(),
+        (PixelType::Uint8, 2) => img.to_luma_alpha8().into_raw(),
+        (PixelType::Uint8, 3) => img.to_rgb8().into_raw(),
+        (PixelType::Uint8, 4) => img.to_rgba8().into_raw(),
+        (PixelType::Uint16, 1) => img
+            .to_luma16()
+            .into_raw()
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        (PixelType::Uint16, 3) => img
+            .to_rgb16()
+            .into_raw()
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        (PixelType::Uint16, 4) => img
+            .to_rgba16()
+            .into_raw()
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        (pt, c) => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "APNG: unsupported pixel layout {pt:?} spp={c}"
+            )));
+        }
+    };
+    Ok(raw)
 }
 
 impl Default for ApngReader {
@@ -11146,43 +11505,116 @@ impl FormatReader for ApngReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // PNG magic: 89 50 4E 47 0D 0A 1A 0A
-        header.len() >= 8 && header[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        // Claim only animated PNGs: PNG signature AND an acTL chunk. Still PNGs
+        // fall through to PngReader. (For very large files whose acTL lies
+        // beyond the peeked header, the extension/`set_id` paths still apply.)
+        Self::has_actl(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path).map_err(|err| match err {
-            BioFormatsError::UnsupportedFormat(_) => err,
-            _ => BioFormatsError::UnsupportedFormat(
-                "APNG file could not be opened as PNG (animated PNG may require dedicated parser)"
-                    .to_string(),
-            ),
-        })
+        self.close()?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if !Self::has_actl(&data) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "not an animated PNG (no acTL chunk); use PngReader for still PNGs".into(),
+            ));
+        }
+        self.init_file(path)
     }
 
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        self.path = None;
+        self.meta = None;
+        self.data = Vec::new();
+        self.blocks = Vec::new();
+        self.frame_coordinates = Vec::new();
+        self.lut = None;
+        self.color_type = 0;
+        self.bit_depth = 0;
+        self.interlace = 0;
+        Ok(())
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        if self.meta.is_none() || s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        0
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if p >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(p));
+        }
+        let bpp = meta.pixel_type.bytes_per_sample();
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        let rgb_channels = if meta.is_rgb { meta.size_c as usize } else { 1 };
+        let interleaved = meta.is_interleaved;
+
+        // Frame 0 is the default image (full size, no compositing).
+        let (frame0, _, _) = self.decode_frame(0)?;
+        if p == 0 {
+            return Ok(frame0);
+        }
+
+        // Paste frame `p` (a sub-image) onto a fresh copy of frame 0 at its
+        // (x, y) offset, mirroring APNGReader.openBytes.
+        let coords = self.frame_coordinates[p as usize];
+        let (new_image, _, _) = self.decode_frame(p as usize)?;
+
+        let mut last_image = frame0;
+        let cx = coords[0] as usize;
+        let cy = coords[1] as usize;
+        let cw = coords[2] as usize;
+        let ch = coords[3] as usize;
+
+        if !interleaved {
+            let len = cw * bpp;
+            let plane = size_x * size_y * bpp;
+            let new_plane = len * ch;
+            for c in 0..rgb_channels {
+                for row in 0..ch {
+                    let src = c * new_plane + row * len;
+                    let dst = c * plane + (cy + row) * size_x * bpp + cx * bpp;
+                    last_image[dst..dst + len].copy_from_slice(&new_image[src..src + len]);
+                }
+            }
+        } else {
+            let len = cw * bpp * rgb_channels;
+            for row in 0..ch {
+                let src = row * len;
+                let dst = (cy + row) * size_x * bpp * rgb_channels + cx * bpp * rgb_channels;
+                last_image[dst..dst + len].copy_from_slice(&new_image[src..src + len]);
+            }
+        }
+
+        Ok(last_image)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let full = self.open_bytes(p)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let channels = if meta.is_rgb { meta.size_c as usize } else { 1 };
+        crop_full_plane("APNG", &full, meta, channels, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(p, tx, ty, tw, th)
     }
     fn resolution_count(&self) -> usize {
         1
@@ -11196,6 +11628,296 @@ impl FormatReader for ApngReader {
         } else {
             Ok(())
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Animated PNG (APNG) writer
+// ---------------------------------------------------------------------------
+// Faithful translation of upstream Java `APNGWriter`
+// (components/formats-bsd/.../out/APNGWriter.java). Writes the PNG signature +
+// IHDR + acTL, then one fcTL + IDAT (first plane) / fdAT (subsequent planes)
+// per saved plane, and finally IEND with the frame count patched into acTL.
+//
+// Our `FormatWriter` trait delivers planes sequentially without a seekable
+// output handle, so the file is assembled in memory and flushed on `close`,
+// which reproduces the byte layout Java emits with its seek/footer logic.
+use crate::common::writer::FormatWriter;
+
+pub struct ApngWriter {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    /// Everything after the acTL data: fcTL/IDAT/fdAT chunks for each frame.
+    body: Vec<u8>,
+    num_frames: u32,
+    next_sequence_number: u32,
+    little_endian: bool,
+    /// fps / num_plays delay value (Java's `fps` field; default 0).
+    fps: u16,
+}
+
+impl ApngWriter {
+    pub fn new() -> Self {
+        ApngWriter {
+            path: None,
+            meta: None,
+            body: Vec::new(),
+            num_frames: 0,
+            next_sequence_number: 0,
+            little_endian: false,
+            fps: 0,
+        }
+    }
+
+    /// `writeFCTL`: frame control chunk (sequence#, w, h, x_off=0, y_off=0,
+    /// delay 1/fps, dispose=1, blend=0).
+    fn write_fctl(&mut self, width: u32, height: u32) {
+        let mut b = Vec::with_capacity(26);
+        b.extend_from_slice(&self.next_sequence_number.to_be_bytes());
+        self.next_sequence_number += 1;
+        b.extend_from_slice(&width.to_be_bytes());
+        b.extend_from_slice(&height.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes()); // x_offset
+        b.extend_from_slice(&0u32.to_be_bytes()); // y_offset
+        b.extend_from_slice(&1u16.to_be_bytes()); // delay_num
+        b.extend_from_slice(&self.fps.to_be_bytes()); // delay_den
+        b.push(1); // dispose_op
+        b.push(0); // blend_op
+        write_png_chunk(&mut self.body, b"fcTL", &b);
+    }
+
+    /// `writePLTE`: palette chunk (only when an indexed color model is present).
+    fn write_plte(&mut self) {
+        let Some(meta) = self.meta.as_ref() else {
+            return;
+        };
+        let Some(lut) = meta.lookup_table.as_ref() else {
+            return;
+        };
+        let mut b = Vec::with_capacity(768);
+        for i in 0..256 {
+            b.push(*lut.red.get(i).unwrap_or(&0) as u8);
+            b.push(*lut.green.get(i).unwrap_or(&0) as u8);
+            b.push(*lut.blue.get(i).unwrap_or(&0) as u8);
+        }
+        write_png_chunk(&mut self.body, b"PLTE", &b);
+    }
+
+    /// `writePixels`: deflate the plane row-by-row (filter byte 0 per row) into
+    /// an IDAT (first frame) or fdAT (with a leading sequence number).
+    fn write_pixels(&mut self, chunk: &[u8; 4], stream: &[u8]) -> Result<()> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let size_c = if meta.is_rgb { meta.size_c as usize } else { 1 };
+        let width = meta.size_x as usize;
+        let height = meta.size_y as usize;
+        let bytes_per_pixel = meta.pixel_type.bytes_per_sample();
+        let signed = matches!(
+            meta.pixel_type,
+            PixelType::Int8 | PixelType::Int16 | PixelType::Int32
+        );
+        let interleaved = meta.is_interleaved;
+        let little_endian = self.little_endian;
+
+        let plane_size = stream.len() / size_c;
+        let row_len = stream.len() / height;
+
+        // The chunk payload begins with the type tag, then (for fdAT) a 4-byte
+        // sequence number, then the zlib-compressed scanlines.
+        let mut payload: Vec<u8> = Vec::new();
+        if chunk == b"fdAT" {
+            payload.extend_from_slice(&self.next_sequence_number.to_be_bytes());
+            self.next_sequence_number += 1;
+        }
+
+        let mut deflater = ZlibEncoder::new(Vec::new(), Compression::default());
+        let mut row_buf = vec![0u8; row_len];
+        for i in 0..height {
+            deflater.write_all(&[0u8]).map_err(BioFormatsError::Io)?; // filter NONE
+            if interleaved {
+                if little_endian {
+                    for col in 0..width * size_c {
+                        let offset = (i * size_c * width + col) * bytes_per_pixel;
+                        let pixel = bytes_to_int(stream, offset, bytes_per_pixel, true);
+                        unpack_bytes_be(pixel, &mut row_buf, col * bytes_per_pixel, bytes_per_pixel);
+                    }
+                } else {
+                    row_buf.copy_from_slice(&stream[i * row_len..i * row_len + row_len]);
+                }
+            } else {
+                let max = 1i64 << (bytes_per_pixel * 8 - 1);
+                for col in 0..width {
+                    for c in 0..size_c {
+                        let offset = c * plane_size + (i * width + col) * bytes_per_pixel;
+                        let mut pixel =
+                            bytes_to_int(stream, offset, bytes_per_pixel, little_endian);
+                        if signed {
+                            if pixel < max {
+                                pixel += max;
+                            } else {
+                                pixel -= max;
+                            }
+                        }
+                        let output = (col * size_c + c) * bytes_per_pixel;
+                        unpack_bytes_be(pixel, &mut row_buf, output, bytes_per_pixel);
+                    }
+                }
+            }
+            deflater.write_all(&row_buf).map_err(BioFormatsError::Io)?;
+        }
+        let compressed = deflater.finish().map_err(BioFormatsError::Io)?;
+        payload.extend_from_slice(&compressed);
+
+        write_png_chunk(&mut self.body, chunk, &payload);
+        Ok(())
+    }
+}
+
+/// `DataTools.bytesToInt`: read `len` bytes as an integer with the given endian.
+fn bytes_to_int(data: &[u8], offset: usize, len: usize, little_endian: bool) -> i64 {
+    let mut total: i64 = 0;
+    for i in 0..len {
+        let shift = if little_endian { i } else { len - 1 - i } * 8;
+        total |= ((data[offset + i] as i64) & 0xff) << shift;
+    }
+    total
+}
+
+/// `DataTools.unpackBytes(value, buf, off, len, little=false)`: big-endian.
+fn unpack_bytes_be(value: i64, buf: &mut [u8], offset: usize, len: usize) {
+    for i in 0..len {
+        let shift = (len - 1 - i) * 8;
+        buf[offset + i] = ((value >> shift) & 0xff) as u8;
+    }
+}
+
+impl Default for ApngWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatWriter for ApngWriter {
+    fn is_this_type(&self, path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("apng"))
+            .unwrap_or(false)
+    }
+
+    fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        match meta.pixel_type {
+            PixelType::Int8 | PixelType::Uint8 | PixelType::Int16 | PixelType::Uint16 => {}
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "APNG writer supports int8/uint8/int16/uint16, got {other:?}"
+                )));
+            }
+        }
+        if meta.is_rgb && !matches!(meta.size_c, 1..=4) {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "APNG writer supports 1-4 channels, got {}",
+                meta.size_c
+            )));
+        }
+        self.meta = Some(meta.clone());
+        self.body.clear();
+        self.num_frames = 0;
+        self.next_sequence_number = 0;
+        self.little_endian = meta.is_little_endian;
+        Ok(())
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.meta
+            .as_ref()
+            .ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
+        self.path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let width = meta.size_x;
+        let height = meta.size_y;
+
+        // `saveBytes`: emit fcTL (and PLTE on the first frame), then the pixel
+        // chunk (IDAT for frame 0, fdAT afterwards).
+        let first = self.num_frames == 0;
+        self.write_fctl(width, height);
+        if first {
+            self.write_plte();
+        }
+        let chunk: &[u8; 4] = if first { b"IDAT" } else { b"fdAT" };
+        self.write_pixels(chunk, data)?;
+        self.num_frames += 1;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        // Only flush if a plane was written and an output path is set.
+        if let (Some(path), Some(meta)) = (self.path.clone(), self.meta.clone()) {
+            if self.num_frames > 0 {
+                let bytes_per_pixel = meta.pixel_type.bytes_per_sample();
+                let n_channels = if meta.is_rgb { meta.size_c } else { 1 };
+                let indexed = meta.is_indexed;
+
+                let mut out: Vec<u8> = Vec::with_capacity(self.body.len() + 64);
+                // 8-byte PNG signature.
+                out.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+
+                // IHDR.
+                let mut ihdr = Vec::with_capacity(13);
+                ihdr.extend_from_slice(&meta.size_x.to_be_bytes());
+                ihdr.extend_from_slice(&meta.size_y.to_be_bytes());
+                ihdr.push((bytes_per_pixel * 8) as u8);
+                let color_type: u8 = if indexed {
+                    3
+                } else {
+                    match n_channels {
+                        1 => 0,
+                        2 => 4,
+                        3 => 2,
+                        4 => 6,
+                        _ => 0,
+                    }
+                };
+                ihdr.push(color_type);
+                ihdr.push(0); // compression
+                ihdr.push(0); // filter
+                ihdr.push(0); // interlace
+                write_png_chunk(&mut out, b"IHDR", &ihdr);
+
+                // acTL (num_frames, num_plays=0).
+                let mut actl = Vec::with_capacity(8);
+                actl.extend_from_slice(&self.num_frames.to_be_bytes());
+                actl.extend_from_slice(&0u32.to_be_bytes());
+                write_png_chunk(&mut out, b"acTL", &actl);
+
+                // fcTL/IDAT/fdAT frame chunks.
+                out.extend_from_slice(&self.body);
+
+                // IEND.
+                write_png_chunk(&mut out, b"IEND", &[]);
+
+                std::fs::write(&path, &out).map_err(BioFormatsError::Io)?;
+            }
+        }
+
+        self.path = None;
+        self.meta = None;
+        self.body.clear();
+        self.num_frames = 0;
+        self.next_sequence_number = 0;
+        self.little_endian = false;
+        Ok(())
+    }
+
+    fn can_do_stacks(&self) -> bool {
+        true
     }
 }
 

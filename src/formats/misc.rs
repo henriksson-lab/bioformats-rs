@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::common::codec::{decompress_qtrle, decompress_rpza};
+use crate::common::codec::decompress_rpza;
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::ome_metadata::{OmeMetadata, OmePlane};
@@ -416,7 +416,7 @@ impl FormatReader for QuickTimeReader {
             }
             QuickTimeCodec::Jpeg => decode_quicktime_jpeg_sample(sample, meta, sample_index as u32),
             QuickTimeCodec::Png => decode_quicktime_png_sample(sample, meta, sample_index as u32),
-            QuickTimeCodec::Rpza => decode_quicktime_rpza_sample(sample, meta, sample_index as u32),
+            QuickTimeCodec::Rpza => quicktime_decompress_rpza(sample, meta, sample_index as u32),
             QuickTimeCodec::AnimationRle { depth } => {
                 let mut previous = None;
                 for current in 0..=sample_index {
@@ -431,7 +431,7 @@ impl FormatReader for QuickTimeReader {
                             "QuickTime sample {current} extends past end of file"
                         )));
                     }
-                    previous = Some(decode_quicktime_rle_sample(
+                    previous = Some(quicktime_decompress_qtrle(
                         &data[offset..end],
                         meta,
                         current as u32,
@@ -455,7 +455,7 @@ impl FormatReader for QuickTimeReader {
                             "QuickTime sample {current} extends past end of file"
                         )));
                     }
-                    previous = Some(decode_quicktime_cinepak_sample(
+                    previous = Some(quicktime_decompress_cinepak(
                         &data[offset..end],
                         meta,
                         current as u32,
@@ -842,7 +842,12 @@ fn decode_quicktime_png_sample(
     Ok(decoded)
 }
 
-fn decode_quicktime_rpza_sample(
+/// QuickTime RPZA codec entry point, mirroring Java `RPZACodec.decompress`.
+///
+/// Validates the requested output shape, then dispatches to the shared
+/// `decompress_rpza` block decoder in `common::codec` (the equivalent of
+/// `ome.codecs.RPZACodec`).
+fn quicktime_decompress_rpza(
     sample: &[u8],
     meta: &ImageMetadata,
     plane_index: u32,
@@ -859,7 +864,16 @@ fn decode_quicktime_rpza_sample(
     })
 }
 
-fn decode_quicktime_rle_sample(
+/// QuickTime Animation (QTRLE) codec entry point, mirroring Java
+/// `QTRLECodec.decompress`.
+///
+/// Java implements QTRLE as a single codec class with one `decompress`
+/// method that walks the per-line opcode stream, applying skip/repeat/literal
+/// runs against the previous frame (delta) or a fresh frame (key frame). This
+/// is the 1:1 Rust port of that method: it handles 16/24/32-bit RGB depths and
+/// both delta and key frames in one place, so the QTRLE decode logic is no
+/// longer split across the reader and `common::codec`.
+fn quicktime_decompress_qtrle(
     sample: &[u8],
     meta: &ImageMetadata,
     plane_index: u32,
@@ -871,76 +885,6 @@ fn decode_quicktime_rle_sample(
             "QuickTime Animation RLE sample {plane_index} only supports RGB Uint8 output"
         )));
     }
-    let expected = meta
-        .size_x
-        .checked_mul(meta.size_y)
-        .and_then(|px| (px as usize).checked_mul(3))
-        .ok_or_else(|| {
-            BioFormatsError::Format("QuickTime Animation RLE plane size overflows".into())
-        })?;
-    let is_delta = quicktime_rle_is_delta(sample)?;
-    let previous = if is_delta {
-        let previous = previous.ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat(format!(
-                "QuickTime Animation RLE sample {plane_index} is a partial/delta frame without a previous frame"
-            ))
-        })?;
-        if previous.len() != expected {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "QuickTime Animation RLE sample {plane_index} previous frame has {} bytes, expected {expected}",
-                previous.len()
-            )));
-        }
-        Some(previous)
-    } else {
-        None
-    };
-    match depth {
-        24 if !is_delta => {
-            let decoded =
-                decompress_qtrle(sample, meta.size_x, meta.size_y, 24).map_err(|err| {
-                    BioFormatsError::UnsupportedFormat(format!(
-                        "QuickTime Animation RLE sample {plane_index} failed to decode: {err}"
-                    ))
-                })?;
-            if decoded.len() != expected {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "QuickTime Animation RLE sample {plane_index} decoded to {} bytes, expected {expected}",
-                    decoded.len()
-                )));
-            }
-            Ok(decoded)
-        }
-        16 | 24 | 32 => decode_quicktime_rle_rgb_sample(sample, meta, depth, plane_index, previous),
-        other => Err(BioFormatsError::UnsupportedFormat(format!(
-            "QuickTime Animation RLE depth {other} is unsupported"
-        ))),
-    }
-}
-
-fn quicktime_rle_is_delta(sample: &[u8]) -> Result<bool> {
-    if sample.len() < 6 {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime Animation RLE sample is truncated".into(),
-        ));
-    }
-    let chunk_size = u32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]]) as usize;
-    if chunk_size < 6 || chunk_size > sample.len() {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime Animation RLE sample has invalid chunk size".into(),
-        ));
-    }
-    let header = u16::from_be_bytes([sample[4], sample[5]]);
-    Ok(header & 0x0008 != 0)
-}
-
-fn decode_quicktime_rle_rgb_sample(
-    sample: &[u8],
-    meta: &ImageMetadata,
-    depth: u16,
-    plane_index: u32,
-    previous: Option<&[u8]>,
-) -> Result<Vec<u8>> {
     if !matches!(depth, 16 | 24 | 32) {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "QuickTime Animation RLE depth {depth} is unsupported"
@@ -954,7 +898,16 @@ fn decode_quicktime_rle_rgb_sample(
         .ok_or_else(|| {
             BioFormatsError::Format("QuickTime Animation RLE plane size overflows".into())
         })?;
-    let mut out = if let Some(previous) = previous {
+
+    // Delta frames (header flag 0x0008) patch the previous frame; key frames
+    // start from a fresh buffer. Reject a delta frame that has no predecessor.
+    let is_delta = quicktime_rle_is_delta(sample)?;
+    let mut out = if is_delta {
+        let previous = previous.ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime Animation RLE sample {plane_index} is a partial/delta frame without a previous frame"
+            ))
+        })?;
         if previous.len() != expected {
             return Err(BioFormatsError::UnsupportedFormat(format!(
                 "QuickTime Animation RLE sample {plane_index} previous frame has {} bytes, expected {expected}",
@@ -965,6 +918,7 @@ fn decode_quicktime_rle_rgb_sample(
     } else {
         vec![0u8; expected]
     };
+
     if sample.len() < 6 {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "QuickTime Animation RLE sample {plane_index} is truncated"
@@ -1047,6 +1001,22 @@ fn decode_quicktime_rle_rgb_sample(
         }
     }
     Ok(out)
+}
+
+fn quicktime_rle_is_delta(sample: &[u8]) -> Result<bool> {
+    if sample.len() < 6 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime Animation RLE sample is truncated".into(),
+        ));
+    }
+    let chunk_size = u32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]]) as usize;
+    if chunk_size < 6 || chunk_size > sample.len() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime Animation RLE sample has invalid chunk size".into(),
+        ));
+    }
+    let header = u16::from_be_bytes([sample[4], sample[5]]);
+    Ok(header & 0x0008 != 0)
 }
 
 fn quicktime_rle_read_u16(sample: &[u8], i: &mut usize, limit: usize) -> Result<u16> {
@@ -1154,7 +1124,13 @@ fn quicktime_rgb555_to_rgb24(color: u16) -> [u8; 3] {
     ]
 }
 
-fn decode_quicktime_cinepak_sample(
+/// QuickTime Cinepak (`cvid`) codec entry point, mirroring Java
+/// `CinepakCodec.decompress`.
+///
+/// Validates the requested output shape and previous-frame buffer, then
+/// dispatches to the shared `decompress_cinepak` block decoder in
+/// `common::codec` (the equivalent of `ome.codecs.CinepakCodec`).
+fn quicktime_decompress_cinepak(
     sample: &[u8],
     meta: &ImageMetadata,
     plane_index: u32,
@@ -2680,7 +2656,7 @@ fn parse_quicktime_track(
                 modulo_c: None,
                 modulo_t: None,
             };
-            decode_quicktime_cinepak_sample(first_sample, &probe_meta, 0, depth, None)?;
+            quicktime_decompress_cinepak(first_sample, &probe_meta, 0, depth, None)?;
         }
         QuickTimeCodec::Rpza => {
             let probe_meta = ImageMetadata {
@@ -2704,7 +2680,7 @@ fn parse_quicktime_track(
                 modulo_c: None,
                 modulo_t: None,
             };
-            decode_quicktime_rpza_sample(first_sample, &probe_meta, 0)?;
+            quicktime_decompress_rpza(first_sample, &probe_meta, 0)?;
         }
         QuickTimeCodec::AnimationRle { depth } => {
             let probe_meta = ImageMetadata {
@@ -2728,7 +2704,7 @@ fn parse_quicktime_track(
                 modulo_c: None,
                 modulo_t: None,
             };
-            decode_quicktime_rle_sample(first_sample, &probe_meta, 0, depth, None)?;
+            quicktime_decompress_qtrle(first_sample, &probe_meta, 0, depth, None)?;
         }
         _ => {}
     }
@@ -3004,6 +2980,427 @@ fn parse_quicktime_track(
         samples_per_pixel,
         codec: qt_codec,
     })
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Apple QuickTime writer (port of loci.formats.out.QTWriter)
+// ---------------------------------------------------------------------------
+/// Apple QuickTime movie writer (`.mov`).
+///
+/// Faithful port of the Java `QTWriter` (formats-bsd) uncompressed/RAW path.
+/// Accumulates planes, then on [`close`](FormatWriter::close) writes a
+/// `wide`/`mdat` pixel container followed by the full `moov`/`trak`/`mdia`/
+/// `minf`/`stbl` atom tree (`stsd`/`stts`/`stsc`/`stsz`/`stco`), mirroring
+/// Java's atom layout and offsets byte-for-byte.
+///
+/// Only the RAW (`"raw "`) codec is implemented, matching Java's default
+/// `CODEC_RAW` path; the lossy/encoded codecs (Motion JPEG-B, Cinepak,
+/// Animation, H.263, Sorenson, Sorenson 3, MPEG-4) require encoders that this
+/// pure-Rust port does not provide and are rejected with an explicit
+/// "unsupported compression" error rather than faked.
+///
+/// As in Java, grayscale (single-channel) planes are written with each pixel
+/// inverted (`255 - p`) and rows padded to a multiple of 4 bytes; RGB planes
+/// are written verbatim with no padding. Note that the bundled
+/// [`QuickTimeReader`] maps the `"raw "` codec to interleaved RGB, so RGB
+/// output round-trips through it directly, whereas Java-style inverted
+/// grayscale would be re-read as 3-channel RGB.
+pub struct QtWriter {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    planes: Vec<Vec<u8>>,
+    /// Frames per second used for the duration / `stts` timing (default: 10).
+    fps: f64,
+}
+
+impl QtWriter {
+    pub fn new() -> Self {
+        QtWriter {
+            path: None,
+            meta: None,
+            planes: Vec::new(),
+            fps: 10.0,
+        }
+    }
+
+    /// Set frames per second (default: 10).
+    pub fn with_fps(mut self, fps: f64) -> Self {
+        self.fps = fps;
+        self
+    }
+}
+
+impl Default for QtWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Number of channels stored per pixel (`getSamplesPerPixel()` in Java).
+fn qt_writer_channels(meta: &ImageMetadata) -> usize {
+    if meta.is_rgb {
+        meta.size_c.max(1) as usize
+    } else {
+        1
+    }
+}
+
+/// Validate that the metadata is writable by the RAW path. Mirrors Java's
+/// `getPixelTypes` (UINT8 only) plus the codec restriction in `saveBytes`.
+fn validate_qt_writer_metadata(meta: &ImageMetadata) -> Result<()> {
+    if meta.pixel_type != PixelType::Uint8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime writer supports only 8-bit (UINT8) pixel data".into(),
+        ));
+    }
+    let nchannels = qt_writer_channels(meta);
+    if meta.is_rgb && nchannels != 3 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime writer supports grayscale or 3-channel RGB UINT8 data, got {nchannels} RGB channels"
+        )));
+    }
+    crate::formats::stack_writer::expected_plane_count("QuickTime", meta)?;
+    Ok(())
+}
+
+/// Write the 3x3 fixed-point matrix describing image rotation (identity).
+/// Port of `QTWriter.writeRotationMatrix`.
+fn qt_write_rotation_matrix(out: &mut Vec<u8>) {
+    out.extend_from_slice(&1i32.to_be_bytes());
+    out.extend_from_slice(&0i32.to_be_bytes());
+    out.extend_from_slice(&0i32.to_be_bytes());
+    out.extend_from_slice(&0i32.to_be_bytes());
+    out.extend_from_slice(&1i32.to_be_bytes());
+    out.extend_from_slice(&0i32.to_be_bytes());
+    out.extend_from_slice(&0i32.to_be_bytes());
+    out.extend_from_slice(&0i32.to_be_bytes());
+    out.extend_from_slice(&16384i32.to_be_bytes());
+}
+
+/// Write the atom length and 4-byte type. Port of `QTWriter.writeAtom`.
+fn qt_write_atom(out: &mut Vec<u8>, length: i32, atom_type: &str) {
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(atom_type.as_bytes());
+}
+
+impl crate::common::writer::FormatWriter for QtWriter {
+    fn is_this_type(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("mov"))
+    }
+
+    fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        validate_qt_writer_metadata(meta)?;
+        self.meta = Some(meta.clone());
+        self.planes.clear();
+        Ok(())
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "QuickTime",
+            meta,
+            self.planes.len(),
+            plane_index,
+            data.len(),
+        )?;
+        self.planes.push(data.to_vec());
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        // Nothing buffered and nothing to flush: allow idempotent close.
+        let meta = match self.meta.as_ref() {
+            Some(m) => m,
+            None => {
+                self.path = None;
+                self.planes.clear();
+                return Ok(());
+            }
+        };
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        validate_qt_writer_metadata(meta)?;
+        crate::formats::stack_writer::validate_complete("QuickTime", meta, self.planes.len())?;
+
+        let width = meta.size_x as i32;
+        let height = meta.size_y as i32;
+        let nchannels = qt_writer_channels(meta);
+
+        // pad = nChannels > 1 ? 0 : (4 - (width % 4)) % 4;  (QTWriter.setId)
+        let pad: i32 = if nchannels > 1 {
+            0
+        } else {
+            (4 - (width % 4)) % 4
+        };
+
+        let plane_size = (width * height * nchannels as i32) as i64;
+        let stored_plane = plane_size + (pad as i64) * (height as i64);
+        let num_written = self.planes.len() as i32;
+        // Total pixel bytes (Java `numBytes`).
+        let num_bytes = stored_plane * (num_written as i64);
+
+        // -- assemble the whole file in memory (Java seeks/streams via `out`) --
+        let mut out: Vec<u8> = Vec::new();
+
+        // -- write the first header (QTWriter.setId, fresh file branch) --
+        // writeAtom(8, "wide"); writeAtom(numBytes + 8, "mdat");
+        qt_write_atom(&mut out, 8, "wide");
+        qt_write_atom(&mut out, (num_bytes + 8) as i32, "mdat");
+        debug_assert_eq!(out.len(), 16);
+
+        // Plane offsets: 16 + i * (planeSize + pad * height).  (QTWriter.setId)
+        let offsets: Vec<i32> = (0..num_written)
+            .map(|i| 16 + i * (stored_plane as i32))
+            .collect();
+
+        // -- write the mdat pixel payload, plane by plane (QTWriter.saveBytes) --
+        // Java inverts single-channel pixels and pads each row to a 4-byte
+        // multiple; RGB is copied verbatim with pad == 0. Input is assumed to
+        // be a full interleaved plane (interleaved == true, full plane), so the
+        // generic x/y/w/h sub-region path collapses to a straight row copy.
+        let row_len = (nchannels as i32 * width) as usize;
+        for plane in &self.planes {
+            for row in 0..height as usize {
+                let src = &plane[row * row_len..row * row_len + row_len];
+                if nchannels == 1 {
+                    out.extend(src.iter().map(|&b| 255u8.wrapping_sub(b)));
+                } else {
+                    out.extend_from_slice(src);
+                }
+                for _ in 0..pad {
+                    out.push(0);
+                }
+            }
+        }
+        debug_assert_eq!(out.len() as i64, 16 + num_bytes);
+
+        // -- write footer (QTWriter.writeFooter) --
+        let time_scale: i32 = 1000;
+        let duration: i32 = (num_written as f64 * (time_scale as f64 / self.fps)) as i32;
+        let bits_per_pixel: i32 = if nchannels > 1 { 24 } else { 40 };
+        let channels: i32 = if bits_per_pixel >= 40 { 1 } else { 3 };
+        // `created` mirrors Java's `(int) System.currentTimeMillis()` truncation.
+        let created: i32 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i32)
+            .unwrap_or(0);
+        let modified: i32 = created;
+
+        // -- moov atom --
+        let mut atom_length: i32 = 685 + 8 * num_written;
+        qt_write_atom(&mut out, atom_length, "moov");
+
+        // -- mvhd atom --
+        qt_write_atom(&mut out, 108, "mvhd");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(&created.to_be_bytes()); // creation time
+        out.extend_from_slice(&modified.to_be_bytes());
+        out.extend_from_slice(&time_scale.to_be_bytes()); // time scale
+        out.extend_from_slice(&duration.to_be_bytes()); // duration
+        out.extend_from_slice(&[0, 1, 0, 0]); // preferred rate & volume
+        out.extend_from_slice(&[0, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]); // reserved (Java {0,-1,...})
+        qt_write_rotation_matrix(&mut out);
+        out.extend_from_slice(&0i16.to_be_bytes()); // not sure what this is
+        out.extend_from_slice(&0i32.to_be_bytes()); // preview duration
+        out.extend_from_slice(&0i32.to_be_bytes()); // preview time
+        out.extend_from_slice(&0i32.to_be_bytes()); // poster time
+        out.extend_from_slice(&0i32.to_be_bytes()); // selection time
+        out.extend_from_slice(&0i32.to_be_bytes()); // selection duration
+        out.extend_from_slice(&0i32.to_be_bytes()); // current time
+        out.extend_from_slice(&2i32.to_be_bytes()); // next track's id
+
+        // -- trak atom --
+        atom_length -= 116;
+        qt_write_atom(&mut out, atom_length, "trak");
+
+        // -- tkhd atom --
+        qt_write_atom(&mut out, 92, "tkhd");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&15i16.to_be_bytes()); // flags
+        out.extend_from_slice(&created.to_be_bytes()); // creation time
+        out.extend_from_slice(&modified.to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes()); // track id
+        out.extend_from_slice(&0i32.to_be_bytes()); // reserved
+        out.extend_from_slice(&duration.to_be_bytes()); // duration
+        out.extend_from_slice(&0i32.to_be_bytes()); // reserved
+        out.extend_from_slice(&0i32.to_be_bytes()); // reserved
+        out.extend_from_slice(&0i16.to_be_bytes()); // reserved
+        out.extend_from_slice(&0i32.to_be_bytes()); // unknown
+        qt_write_rotation_matrix(&mut out);
+        out.extend_from_slice(&width.to_be_bytes()); // image width
+        out.extend_from_slice(&height.to_be_bytes()); // image height
+        out.extend_from_slice(&0i16.to_be_bytes()); // reserved
+
+        // -- edts atom --
+        qt_write_atom(&mut out, 36, "edts");
+
+        // -- elst atom --
+        qt_write_atom(&mut out, 28, "elst");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(&1i32.to_be_bytes()); // number of entries in the table
+        out.extend_from_slice(&duration.to_be_bytes()); // duration
+        out.extend_from_slice(&0i16.to_be_bytes()); // time
+        out.extend_from_slice(&1i32.to_be_bytes()); // rate
+        out.extend_from_slice(&0i16.to_be_bytes()); // unknown
+
+        // -- mdia atom --
+        atom_length -= 136;
+        qt_write_atom(&mut out, atom_length, "mdia");
+
+        // -- mdhd atom --
+        qt_write_atom(&mut out, 32, "mdhd");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(&created.to_be_bytes()); // creation time
+        out.extend_from_slice(&modified.to_be_bytes());
+        out.extend_from_slice(&time_scale.to_be_bytes()); // time scale
+        out.extend_from_slice(&duration.to_be_bytes()); // duration
+        out.extend_from_slice(&0i16.to_be_bytes()); // language
+        out.extend_from_slice(&0i16.to_be_bytes()); // quality
+
+        // -- hdlr atom (media handler) --
+        qt_write_atom(&mut out, 58, "hdlr");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(b"mhlr");
+        out.extend_from_slice(b"vide");
+        out.extend_from_slice(b"appl");
+        out.extend_from_slice(&[16, 0, 0, 0, 0, 1, 1, 11, 25]);
+        out.extend_from_slice(b"Apple Video Media Handler");
+
+        // -- minf atom --
+        atom_length -= 98;
+        qt_write_atom(&mut out, atom_length, "minf");
+
+        // -- vmhd atom --
+        qt_write_atom(&mut out, 20, "vmhd");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&1i16.to_be_bytes()); // flags
+        out.extend_from_slice(&64i16.to_be_bytes()); // graphics mode
+        out.extend_from_slice(&(32768u16).to_be_bytes()); // opcolor 1
+        out.extend_from_slice(&(32768u16).to_be_bytes()); // opcolor 2
+        out.extend_from_slice(&(32768u16).to_be_bytes()); // opcolor 3
+
+        // -- hdlr atom (data handler) --
+        qt_write_atom(&mut out, 57, "hdlr");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(b"dhlr");
+        out.extend_from_slice(b"alis");
+        out.extend_from_slice(b"appl");
+        out.extend_from_slice(&[16, 0, 0, 1, 0, 1, 1, 31, 24]);
+        out.extend_from_slice(b"Apple Alias Data Handler");
+
+        // -- dinf atom --
+        qt_write_atom(&mut out, 36, "dinf");
+
+        // -- dref atom --
+        qt_write_atom(&mut out, 28, "dref");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(&0i16.to_be_bytes()); // version 2
+        out.extend_from_slice(&1i16.to_be_bytes()); // flags 2
+        out.extend_from_slice(&[0, 0, 0, 12]);
+        out.extend_from_slice(b"alis");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version 3
+        out.extend_from_slice(&1i16.to_be_bytes()); // flags 3
+
+        // -- stbl atom --
+        atom_length -= 121;
+        qt_write_atom(&mut out, atom_length, "stbl");
+
+        // -- stsd atom --
+        qt_write_atom(&mut out, 118, "stsd");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(&1i32.to_be_bytes()); // number of entries in the table
+        out.extend_from_slice(&[0, 0, 0, 102]);
+        out.extend_from_slice(b"raw "); // codec
+        out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // reserved
+        out.extend_from_slice(&1i16.to_be_bytes()); // data reference
+        out.extend_from_slice(&1i16.to_be_bytes()); // version
+        out.extend_from_slice(&1i16.to_be_bytes()); // revision
+        out.extend_from_slice(b"appl");
+        out.extend_from_slice(&0i32.to_be_bytes()); // temporal quality
+        out.extend_from_slice(&768i32.to_be_bytes()); // spatial quality
+        out.extend_from_slice(&(width as i16).to_be_bytes()); // image width
+        out.extend_from_slice(&(height as i16).to_be_bytes()); // image height
+        let dpi = [0u8, 72, 0, 0];
+        out.extend_from_slice(&dpi); // horizontal dpi
+        out.extend_from_slice(&dpi); // vertical dpi
+        out.extend_from_slice(&0i32.to_be_bytes()); // data size
+        out.extend_from_slice(&1i16.to_be_bytes()); // frames per sample
+        out.extend_from_slice(&12i16.to_be_bytes()); // length of compressor name
+        out.extend_from_slice(b"Uncompressed"); // compressor name
+        out.extend_from_slice(&bits_per_pixel.to_be_bytes());
+        out.extend_from_slice(&bits_per_pixel.to_be_bytes());
+        out.extend_from_slice(&bits_per_pixel.to_be_bytes());
+        out.extend_from_slice(&bits_per_pixel.to_be_bytes());
+        out.extend_from_slice(&bits_per_pixel.to_be_bytes());
+        out.extend_from_slice(&(bits_per_pixel as i16).to_be_bytes()); // bits per pixel
+        out.extend_from_slice(&65535i32.to_be_bytes()); // ctab ID
+        out.extend_from_slice(&[12, 103, 97, 108]); // gamma
+        out.extend_from_slice(&[97, 1, 0xCC, 0xCC, 0, 0, 0, 0]); // unknown (Java {97,1,-52,-52,...})
+
+        // -- stts atom --
+        qt_write_atom(&mut out, 24, "stts");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(&1i32.to_be_bytes()); // number of entries in the table
+        out.extend_from_slice(&num_written.to_be_bytes()); // number of planes
+        out.extend_from_slice(&((time_scale as f64 / self.fps) as i32).to_be_bytes()); // ms per frame
+
+        // -- stsc atom --
+        qt_write_atom(&mut out, 28, "stsc");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(&1i32.to_be_bytes()); // number of entries in the table
+        out.extend_from_slice(&1i32.to_be_bytes()); // chunk
+        out.extend_from_slice(&1i32.to_be_bytes()); // samples
+        out.extend_from_slice(&1i32.to_be_bytes()); // id
+
+        // -- stsz atom --
+        qt_write_atom(&mut out, 20 + 4 * num_written, "stsz");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(&0i32.to_be_bytes()); // sample size
+        out.extend_from_slice(&num_written.to_be_bytes()); // number of planes
+        for _ in 0..num_written {
+            out.extend_from_slice(&(channels * height * (width + pad)).to_be_bytes());
+        }
+
+        // -- stco atom --
+        qt_write_atom(&mut out, 16 + 4 * num_written, "stco");
+        out.extend_from_slice(&0i16.to_be_bytes()); // version
+        out.extend_from_slice(&0i16.to_be_bytes()); // flags
+        out.extend_from_slice(&num_written.to_be_bytes()); // number of planes
+        for off in &offsets {
+            out.extend_from_slice(&off.to_be_bytes());
+        }
+
+        std::fs::write(path, &out).map_err(BioFormatsError::Io)?;
+
+        self.path = None;
+        self.meta = None;
+        self.planes.clear();
+        Ok(())
+    }
+
+    fn can_do_stacks(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5917,6 +6314,136 @@ impl FormatReader for Jpeg2000Reader {
     }
 }
 
+/// JPEG 2000 writer (`.jp2`, `.j2k`).
+///
+/// Encodes a single 2D plane (1 grayscale or 3 RGB components) to a lossless
+/// JP2 file using the pure-Rust `openjp2` encoder, mirroring the lossless
+/// output of Java `JPEG2000Writer`. Gated behind the default-on
+/// `jpeg2000-write` feature.
+#[cfg(feature = "jpeg2000-write")]
+pub struct Jpeg2000Writer {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    wrote: bool,
+}
+
+#[cfg(feature = "jpeg2000-write")]
+impl Jpeg2000Writer {
+    pub fn new() -> Self {
+        Jpeg2000Writer {
+            path: None,
+            meta: None,
+            wrote: false,
+        }
+    }
+}
+
+#[cfg(feature = "jpeg2000-write")]
+impl Default for Jpeg2000Writer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "jpeg2000-write")]
+impl crate::common::writer::FormatWriter for Jpeg2000Writer {
+    fn is_this_type(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(
+            ext.as_deref(),
+            Some("jp2") | Some("j2k") | Some("j2c") | Some("jpc")
+        )
+    }
+
+    fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
+        let components = meta.size_c.max(1);
+        if components != 1 && components != 3 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "JPEG 2000 writer supports 1 (gray) or 3 (RGB) channels, got {components}"
+            )));
+        }
+        if meta.size_z.max(1) > 1 || meta.size_t.max(1) > 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "JPEG 2000 writer supports a single 2D plane only".into(),
+            ));
+        }
+        // Map pixel type to (precision, signed). JP2 stores integer samples.
+        match meta.pixel_type {
+            PixelType::Uint8
+            | PixelType::Int8
+            | PixelType::Uint16
+            | PixelType::Int16
+            | PixelType::Uint32
+            | PixelType::Int32 => {}
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "JPEG 2000 writer does not support pixel type {other:?}"
+                )));
+            }
+        }
+        self.meta = Some(meta.clone());
+        Ok(())
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.meta
+            .as_ref()
+            .ok_or_else(|| BioFormatsError::Format("set_metadata first".into()))?;
+        self.path = Some(path.to_path_buf());
+        self.wrote = false;
+        Ok(())
+    }
+
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
+        if plane_index != 0 || self.wrote {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        let components = meta.size_c.max(1);
+        let (precision, signed) = match meta.pixel_type {
+            PixelType::Uint8 => (8, false),
+            PixelType::Int8 => (8, true),
+            PixelType::Uint16 => (16, false),
+            PixelType::Int16 => (16, true),
+            PixelType::Uint32 => (32, false),
+            PixelType::Int32 => (32, true),
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "JPEG 2000 writer does not support pixel type {other:?}"
+                )));
+            }
+        };
+
+        crate::common::codec::compress_jpeg2000(
+            data,
+            meta.size_x,
+            meta.size_y,
+            components,
+            precision,
+            signed,
+            path,
+        )?;
+        self.wrote = true;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.wrote = false;
+        Ok(())
+    }
+
+    fn can_do_stacks(&self) -> bool {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 9. SM-Camera
 // ---------------------------------------------------------------------------
@@ -6347,5 +6874,138 @@ mod openlab_user_var_tests {
         let mut c = Cursor::new(&b, false);
         let mut vars = OpenlabUserVars::default();
         assert!(OpenlabLiffReader::read_variable(&mut c, &mut vars).is_err());
+    }
+}
+
+#[cfg(test)]
+mod qt_writer_tests {
+    use super::*;
+    use crate::common::writer::FormatWriter;
+
+    fn rgb_meta(width: u32, height: u32, planes: u32) -> ImageMetadata {
+        ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 3,
+            size_t: planes,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: planes,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: true,
+            is_interleaved: true,
+            is_little_endian: false,
+            resolution_count: 1,
+            ..ImageMetadata::default()
+        }
+    }
+
+    /// Write a small uncompressed RGB `.mov` with `QtWriter`, then re-open it
+    /// with `QuickTimeReader` and assert dimensions + pixels round-trip.
+    #[test]
+    fn round_trip_uncompressed_rgb() {
+        let (w, h, n) = (6u32, 4u32, 3u32);
+        let meta = rgb_meta(w, h, n);
+
+        // Distinct interleaved RGB pixel pattern per plane.
+        let plane_len = (w * h * 3) as usize;
+        let planes: Vec<Vec<u8>> = (0..n)
+            .map(|p| {
+                (0..plane_len)
+                    .map(|i| ((i as u32 + p * 17) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_qtwriter_rt_{}.mov",
+            std::process::id()
+        ));
+
+        let mut writer = QtWriter::new();
+        writer.set_metadata(&meta).unwrap();
+        writer.set_id(&path).unwrap();
+        for (i, plane) in planes.iter().enumerate() {
+            writer.save_bytes(i as u32, plane).unwrap();
+        }
+        writer.close().unwrap();
+
+        let mut reader = QuickTimeReader::new();
+        reader.set_id(&path).unwrap();
+        let rm = reader.metadata();
+        assert_eq!(rm.size_x, w);
+        assert_eq!(rm.size_y, h);
+        assert_eq!(rm.image_count, n);
+        assert_eq!(rm.size_c, 3);
+        assert!(rm.is_rgb);
+        assert_eq!(rm.pixel_type, PixelType::Uint8);
+
+        for (i, expected) in planes.iter().enumerate() {
+            let got = reader.open_bytes(i as u32).unwrap();
+            assert_eq!(&got, expected, "plane {i} pixels must round-trip");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The lossy/encoded codecs are encoder-blocked; non-UINT8 input is rejected
+    /// rather than faked.
+    #[test]
+    fn rejects_non_uint8() {
+        let mut meta = rgb_meta(4, 4, 1);
+        meta.pixel_type = PixelType::Uint16;
+        meta.bits_per_pixel = 16;
+        let mut writer = QtWriter::new();
+        assert!(writer.set_metadata(&meta).is_err());
+    }
+
+    /// Grayscale planes are written faithfully (inverted, row-padded to a
+    /// multiple of 4). The bundled reader maps `"raw "` to RGB, so this only
+    /// checks the writer produces a parseable file with the expected geometry.
+    #[test]
+    fn writes_grayscale_atoms() {
+        // width 6 is not a multiple of 4 -> pad = 2 per row.
+        let (w, h) = (6u32, 4u32);
+        let meta = ImageMetadata {
+            size_x: w,
+            size_y: h,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_little_endian: false,
+            resolution_count: 1,
+            ..ImageMetadata::default()
+        };
+        let plane: Vec<u8> = (0..(w * h) as usize).map(|i| i as u8).collect();
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_qtwriter_gray_{}.mov",
+            std::process::id()
+        ));
+        let mut writer = QtWriter::new();
+        writer.set_metadata(&meta).unwrap();
+        writer.set_id(&path).unwrap();
+        writer.save_bytes(0, &plane).unwrap();
+        writer.close().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        // wide + mdat container then moov.
+        assert_eq!(&bytes[4..8], b"wide");
+        assert_eq!(&bytes[12..16], b"mdat");
+        // pad = 2, stored plane = (6+2)*4 = 32 bytes; mdat length = 32 + 8.
+        let mdat_len = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(mdat_len, 32 + 8);
+        // First grayscale pixel inverted: 255 - 0 = 255.
+        assert_eq!(bytes[16], 255);
+        // moov atom follows the 32-byte pixel payload (16 header + 32 = 48).
+        assert_eq!(&bytes[48 + 4..48 + 8], b"moov");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -672,6 +672,12 @@ other_path = "SpiderReader.java"
 
 [[entries]]
 rust = "close"
+rust_class = "TargaReader"
+other = "close"
+other_path = "TargaReader.java"
+
+[[entries]]
+rust = "close"
 rust_class = "TecanReader"
 other = "close"
 other_path = "TecanReader.java"
@@ -791,6 +797,90 @@ other = "convertPixelType"
 other_path = "KLBReader.java"
 
 [[entries]]
+rust = "decompress_huffman"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "HuffmanCodec.java"
+
+[[entries]]
+rust = "decompress_jpeg"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "JPEGCodec.java"
+
+[[entries]]
+rust = "decompress_jpeg2000"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "JPEG2000Codec.java"
+
+[[entries]]
+rust = "decompress_jpegxr"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "JPEGXRCodec.java"
+
+[[entries]]
+rust = "decompress_lzo"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "LZOCodec.java"
+
+[[entries]]
+rust = "decompress_lzw"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "LZWCodec.java"
+
+[[entries]]
+rust = "decompress_mjpb"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "MJPBCodec.java"
+
+[[entries]]
+rust = "decompress_msrle"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "MSRLECodec.java"
+
+[[entries]]
+rust = "decompress_msvideo"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "MSVideoCodec.java"
+
+[[entries]]
+rust = "decompress_nikon"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "NikonCodec.java"
+
+[[entries]]
+rust = "decompress_packbits"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "PackbitsCodec.java"
+
+[[entries]]
+rust = "decompress_qtrle"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "QTRLECodec.java"
+
+[[entries]]
+rust = "decompress_rpza"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "RPZACodec.java"
+
+[[entries]]
+rust = "decompress_zstd"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "ZstdCodec.java"
+
+[[entries]]
 rust = "find_files"
 rust_class = "FlexReader"
 other = "findFiles"
@@ -825,6 +915,12 @@ rust = "group_files"
 rust_class = "FlexReader"
 other = "groupFiles"
 other_path = "FlexReader.java"
+
+[[entries]]
+rust = "init_file"
+rust_class = "ApngReader"
+other = "initFile"
+other_path = "APNGReader.java"
 
 [[entries]]
 rust = "init_file"
@@ -2268,6 +2364,12 @@ other_path = "SpiderReader.java"
 
 [[entries]]
 rust = "open_bytes"
+rust_class = "TargaReader"
+other = "openBytes"
+other_path = "TargaReader.java"
+
+[[entries]]
+rust = "open_bytes"
 rust_class = "TecanReader"
 other = "openBytes"
 other_path = "TecanReader.java"
@@ -2453,6 +2555,12 @@ other = "parseLogFile"
 other_path = "DeltavisionReader.java"
 
 [[entries]]
+rust = "parse_pixels_size_z_from_key"
+rust_class = "Nd2Handler"
+other = "parsePixelsSizeZFromKey"
+other_path = "ND2Handler.java"
+
+[[entries]]
 rust = "parse_res_file"
 rust_class = "FlexReader"
 other = "parseResFile"
@@ -2523,12 +2631,6 @@ rust = "set_id"
 rust_class = "AplReader"
 other = "initFile"
 other_path = "APLReader.java"
-
-[[entries]]
-rust = "set_id"
-rust_class = "ApngReader"
-other = "initFile"
-other_path = "APNGReader.java"
 
 [[entries]]
 rust = "set_id"
@@ -3162,6 +3264,12 @@ other_path = "SpiderReader.java"
 
 [[entries]]
 rust = "set_id"
+rust_class = "TargaReader"
+other = "initFile"
+other_path = "TargaReader.java"
+
+[[entries]]
+rust = "set_id"
 rust_class = "TecanReader"
 other = "initFile"
 other_path = "TecanReader.java"
@@ -3279,6 +3387,12 @@ rust = "set_series"
 rust_class = "LsmReader"
 other = "setSeries"
 other_path = "ZeissLSMReader.java"
+
+[[entries]]
+rust = "targa_rle_decompress"
+rust_path = "common/codec.rs"
+other = "decompress"
+other_path = "TargaRLECodec.java"
 
 [[entries]]
 rust = "within_pixels"

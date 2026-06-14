@@ -78,6 +78,7 @@ ImageWriter::save(Path::new("output.tif"), &meta, &planes)?;
 | FITS | `.fits` `.fit` `.fts` | 2880-byte blocks; big-endian; multi-plane |
 | NRRD | `.nrrd` `.nhdr` | Raw and gzip encodings |
 | MetaImage | `.mha` `.mhd` | ITK/VTK; inline and detached data file |
+| JPEG 2000 | `.jp2` `.j2k` `.j2c` `.jpc` | Read via `jpeg2k`; lossless write via `openjp2` (default-on `jpeg2000-write` feature; single 2D plane, 1/3 integer components) |
 
 ### Read only
 
@@ -130,7 +131,7 @@ still missing.
 | Format | Extensions | Status | Notes |
 |--------|-----------|:------:|-------|
 | TIFF / BigTIFF / OME-TIFF | `.tif` `.tiff` `.btf` `.tf8` | ✅ | Strips/tiles, planar, palette, YCbCr, LZW/Deflate/PackBits/JPEG/Zstd/JP2/fax, SubIFD pyramids |
-| PNG | `.png` | ✅ | 8/16-bit gray/RGB(A); animated APNG rejected |
+| PNG | `.png` | ✅ | 8/16-bit gray/RGB(A); animated APNG routed to APNG reader |
 | JPEG | `.jpg` `.jpeg` | ✅ | Decodes to 8-bit RGB |
 | BMP | `.bmp` | ✅ | RAW, RLE4/8, BITFIELDS, palette |
 | PCX | `.pcx` | ✅ | RLE, planar channels, v5 palette |
@@ -145,7 +146,7 @@ still missing.
 | Apple PICT | `.pict` `.pct` | ✅ | Bitmap/pixmap/packbits + JPEG-in-PICT |
 | ZIP container | `.zip` | ✅ | Delegates primary entry to any auto-detected reader |
 | FilePattern dataset | `.pattern` | 🟡 | Numeric/list/label/range blocks, shell-style bracket character classes, channel labels projected into OME channel names, recursive globs, confined parent-directory traversal after wildcard components, and explicit pattern/root/block metadata |
-| APNG | `.apng` | ⛔ | Animated PNG is explicitly rejected |
+| APNG | `.apng` | ✅ | Animated PNG read + write: each frame is a timepoint (sizeT == numFrames), per-frame fcTL composited onto the default image |
 | MNG | `.mng` | ✅ | Java-style MNG/JNG container parse with embedded PNG/JPEG frames |
 | AVI (video) | `.avi` | ✅ | Uncompressed/16-bit/Y8 + MSRLE, MS Video 1, Cinepak, JPEG/MJPEG |
 | QuickTime MOV/QT | `.mov` `.qt` | 🟡 | Uncompressed raw/gray/RGB plus JPEG/MJPEG and PNG layouts including gray, gray+alpha, RGB, and RGBA where decoder-supported; RPZA; Cinepak with prior-frame delta replay; 24-bit, 16-bit RGB555, and 32-bit ARGB Animation RLE including supported delta/partial-frame replay; sample/chunk table metadata, sample timing, codec-family diagnostics, simple edit-list timestamps, compatible multi-video-track series, OME plane DeltaT, and OME original-metadata annotations |
@@ -481,6 +482,14 @@ for each would close the gap:
 Codecs that **are** implemented in-tree (no external dependency): LZW, PackBits,
 Deflate/zlib, Zstd, LZ4, JPEG (baseline), JPEG 2000 (JP2/J2K), Cinepak,
 Apple RLE/Animation, PNG, and the standard TIFF compressions.
+
+On the **write** side, **JPEG 2000 writing** (`.jp2`/`.j2k`) is now supported via
+the pure-Rust `openjp2` encoder, behind the default-on `jpeg2000-write` feature
+(disable with `--no-default-features`). The `Jpeg2000Writer` emits lossless JP2
+(matching Java `JPEG2000Writer`'s `irreversible = 0` semantics) for single 2D
+planes with 1 (grayscale) or 3 (RGB) integer components. The QuickTime writer
+(`.mov`) still writes the uncompressed/RAW codec only; the lossy QuickTime codecs
+(Cinepak/Animation/Motion-JPEG/etc.) need encoders.
 
 ### Performance
 

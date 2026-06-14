@@ -63,6 +63,7 @@ pub mod tiff_wrappers;
 pub mod viff;
 pub mod visitech;
 pub mod volocity;
+pub mod v3draw;
 pub mod xrm;
 pub mod zarr;
 pub mod zip;

@@ -567,6 +567,9 @@ in-tree (LZW, PackBits, Deflate, Zstd, LZ4, JPEG, JPEG 2000, Cinepak, RLE, PNG).
 - Fabricated/non-upstream duplicate readers removed from registration:
   Bruker OPUS, ISS Vista FLIM, duplicate Lambert FLIM / Volocity variants, and
   the Sedat/Woolz inventions.
-- APNG explicit animation rejection with regression coverage.
+- APNG animation read + write ported (faithful translation of Java
+  `APNGReader`/`APNGWriter`): each frame is a timepoint (sizeT == numFrames,
+  XYCTZ), per-frame fcTL coordinates, fdAT/IDAT sub-PNG decode composited onto
+  the default image; `ApngWriter` emits acTL + fcTL + IDAT/fdAT with CRCs.
 - Native LIF/ND2/CZI writer requests explicitly reject with no-Java-writer
   rationale.

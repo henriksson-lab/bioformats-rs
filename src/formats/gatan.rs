@@ -141,6 +141,35 @@ impl DmValue {
     }
 }
 
+// ── Annotation/ROI shape types ────────────────────────────────────────────────
+// GatanReader shape-type codes (the "AnnotationType" leaf value), from
+// GatanReader.java:82-86.
+const SHAPE_LINE: i32 = 2;
+const SHAPE_RECTANGLE: i32 = 5;
+const SHAPE_ELLIPSE: i32 = 6;
+const SHAPE_TEXT: i32 = 13;
+
+/// Port of GatanReader's inner `ROIShape` class (GatanReader.java:873-882).
+///
+/// Annotation geometry collected from the DM tag tree under an
+/// "AnnotationGroupList"/"DocumentObjectList" group. The `text`, `font_size`
+/// and `stroke_color` fields mirror the Java members; they are captured for
+/// fidelity even though the repo's `OmeShape` model carries only geometry.
+#[derive(Debug, Clone, Default)]
+struct RoiShape {
+    /// Annotation type code (LINE / RECTANGLE / ELLIPSE / TEXT).
+    type_code: i32,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    text: Option<String>,
+    /// Font size in points ("FontSize" under a "TextFormat" group).
+    font_size: Option<f64>,
+    /// Stroke colour as (r, g, b) bytes ("ForegroundColor").
+    stroke_color: Option<(u8, u8, u8)>,
+}
+
 // ── Binary reader helpers ─────────────────────────────────────────────────────
 struct DmReader<R: Read + Seek> {
     r: R,
@@ -183,6 +212,9 @@ struct DmReader<R: Read + Seek> {
     stage_x: Vec<f64>,
     stage_y: Vec<f64>,
     stage_z: Vec<f64>,
+    /// `shapes` — annotation ROIs collected from "AnnotationGroupList" /
+    /// "DocumentObjectList" groups (GatanReader.java:113, 651-688).
+    shapes: Vec<RoiShape>,
 }
 
 impl<R: Read + Seek> DmReader<R> {
@@ -619,6 +651,12 @@ impl<R: Read + Seek> DmReader<R> {
                 _ => DmValue::Int(0),
             };
 
+            // Capture annotation ROI shapes, mirroring the first if/else-if
+            // chain in GatanReader.parseTags (GatanReader.java:651-688). This is
+            // an independent dispatch from the named-field one below — Java runs
+            // both for the same leaf — so it is called separately here.
+            self.capture_roi_shape(parent, &name, &val);
+
             // Capture named scalar/string leaf data fields, mirroring the
             // special-case label dispatch in GatanReader.parseTags
             // (GatanReader.java:719-749, 689-704). Java keys off the leaf's
@@ -661,6 +699,83 @@ impl<R: Read + Seek> DmReader<R> {
             DmValue::Uint(v) => Some(v.to_string()),
             DmValue::Float(v) => Some(v.to_string()),
             _ => None,
+        }
+    }
+
+    /// Extract the comma-separated component values of a struct leaf, the way
+    /// GatanReader builds the joined `value` string for struct tags and then
+    /// `value.split(",")`s it (GatanReader.java:584-591, 666-670, 676-679).
+    ///
+    /// "Rectangle" and "ForegroundColor" are DM structs, so in our parser they
+    /// arrive as `DmValue::Group`; a comma-joined string fallback mirrors Java's
+    /// purely string-based handling.
+    fn struct_values(val: &DmValue) -> Vec<f64> {
+        match val {
+            DmValue::Group(fields) => fields.iter().filter_map(|(_, v)| v.as_f64()).collect(),
+            DmValue::Str(s) => s
+                .split(',')
+                .filter_map(|p| p.trim().parse::<f64>().ok())
+                .collect(),
+            _ => val.as_f64().into_iter().collect(),
+        }
+    }
+
+    /// Mirror of the annotation-ROI dispatch in GatanReader.parseTags
+    /// (GatanReader.java:651-688). Shapes are accumulated into `self.shapes`:
+    /// an "AnnotationType" leaf under an "AnnotationGroupList"/"DocumentObjectList"
+    /// group starts a new shape; subsequent "Rectangle"/"Text"/"ForegroundColor"
+    /// leaves mutate the most recent shape; a "FontSize" leaf under a
+    /// "TextFormat" group sets its font size.
+    fn capture_roi_shape(&mut self, parent: &str, label: &str, val: &DmValue) {
+        if parent == "AnnotationGroupList" || parent == "DocumentObjectList" {
+            // A new ROI begins at the AnnotationType leaf; otherwise we edit the
+            // most recently started shape (Java: `shape = shapes.get(last)`).
+            if label == "AnnotationType" {
+                if let Some(v) = val.as_f64() {
+                    self.shapes.push(RoiShape {
+                        type_code: v as i32,
+                        ..Default::default()
+                    });
+                }
+                return;
+            }
+            let shape = match self.shapes.last_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            match label {
+                "Rectangle" => {
+                    // value.split(",") → y1, x1, y2, x2 (GatanReader.java:666-670).
+                    let pts = Self::struct_values(val);
+                    if pts.len() >= 4 {
+                        shape.y1 = pts[0];
+                        shape.x1 = pts[1];
+                        shape.y2 = pts[2];
+                        shape.x2 = pts[3];
+                    }
+                }
+                "Text" => {
+                    shape.text = Self::leaf_string(val);
+                }
+                "ForegroundColor" => {
+                    // value.split(",") → red, green, blue (& 0xff each).
+                    let colors = Self::struct_values(val);
+                    if colors.len() >= 3 {
+                        shape.stroke_color = Some((
+                            (colors[0] as i32 & 0xff) as u8,
+                            (colors[1] as i32 & 0xff) as u8,
+                            (colors[2] as i32 & 0xff) as u8,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        } else if parent == "TextFormat" && label == "FontSize" {
+            // FontSize applies to the most recently started shape
+            // (GatanReader.java:683-688).
+            if let (Some(shape), Some(v)) = (self.shapes.last_mut(), val.as_f64()) {
+                shape.font_size = Some(v);
+            }
         }
     }
 
@@ -920,6 +1035,73 @@ fn acquisition_mode_from_info(info: Option<&str>) -> Option<String> {
     None
 }
 
+/// Convert the parsed annotation `RoiShape`s into OME ROIs, porting the ROI
+/// emission switch in GatanReader.initFile (GatanReader.java:397-460).
+///
+/// Each shape becomes one `OmeROI` containing a single shape. The mapping is:
+/// LINE→Line, RECTANGLE→Rectangle (width/height = x2-x1, y2-y1), ELLIPSE→
+/// Ellipse (centre = x1+rx, y1+ry; radii = (x2-x1)/2, (y2-y1)/2), TEXT→Point
+/// (a label at x1,y1 — the repo `OmeShape` model has no Label/text variant).
+/// Unknown type codes are skipped, exactly as Java logs and skips them.
+fn roi_shapes_to_ome_rois(shapes: &[RoiShape]) -> Vec<crate::common::ome_metadata::OmeROI> {
+    use crate::common::ome_metadata::{create_lsid, OmeROI, OmeShape};
+    let mut rois = Vec::new();
+    // Java increments `nextROI` only for emitted shapes, and uses it both as the
+    // ROI index and as the ROI/Shape LSID index.
+    let mut next_roi: usize = 0;
+    for shape in shapes {
+        let ome_shape = match shape.type_code {
+            SHAPE_LINE => OmeShape::Line {
+                x1: shape.x1,
+                y1: shape.y1,
+                x2: shape.x2,
+                y2: shape.y2,
+                the_z: None,
+                the_t: None,
+                the_c: None,
+            },
+            SHAPE_TEXT => OmeShape::Point {
+                x: shape.x1,
+                y: shape.y1,
+                the_z: None,
+                the_t: None,
+                the_c: None,
+            },
+            SHAPE_ELLIPSE => {
+                let radius_x = (shape.x2 - shape.x1) / 2.0;
+                let radius_y = (shape.y2 - shape.y1) / 2.0;
+                OmeShape::Ellipse {
+                    x: shape.x1 + radius_x,
+                    y: shape.y1 + radius_y,
+                    radius_x,
+                    radius_y,
+                    the_z: None,
+                    the_t: None,
+                    the_c: None,
+                }
+            }
+            SHAPE_RECTANGLE => OmeShape::Rectangle {
+                x: shape.x1,
+                y: shape.y1,
+                width: shape.x2 - shape.x1,
+                height: shape.y2 - shape.y1,
+                the_z: None,
+                the_t: None,
+                the_c: None,
+            },
+            // Java logs "Unknown ROI type" and emits nothing.
+            _ => continue,
+        };
+        rois.push(OmeROI {
+            id: Some(create_lsid("ROI", &[next_roi])),
+            name: shape.text.clone(),
+            shapes: vec![ome_shape],
+        });
+        next_roi += 1;
+    }
+    rois
+}
+
 // ── Reader ────────────────────────────────────────────────────────────────────
 
 pub struct GatanReader {
@@ -959,6 +1141,9 @@ pub struct GatanReader {
     stage_z: Vec<f64>,
     /// Acquisition mode derived from `info` ("Microscope Info"), per Java.
     acquisition_mode: Option<String>,
+    /// `shapes` — annotation ROIs parsed from the DM tag tree
+    /// (GatanReader.java:113), emitted as OME ROIs in `ome_metadata`.
+    shapes: Vec<RoiShape>,
 }
 
 impl GatanReader {
@@ -987,6 +1172,7 @@ impl GatanReader {
             stage_y: Vec::new(),
             stage_z: Vec::new(),
             acquisition_mode: None,
+            shapes: Vec::new(),
         }
     }
 }
@@ -1124,6 +1310,7 @@ impl FormatReader for GatanReader {
             stage_x: Vec::new(),
             stage_y: Vec::new(),
             stage_z: Vec::new(),
+            shapes: Vec::new(),
         };
 
         // Seek past the file header to the root tag group
@@ -1153,6 +1340,7 @@ impl FormatReader for GatanReader {
         let stage_x = std::mem::take(&mut dm.stage_x);
         let stage_y = std::mem::take(&mut dm.stage_y);
         let stage_z = std::mem::take(&mut dm.stage_z);
+        let shapes = std::mem::take(&mut dm.shapes);
 
         let img = find_image_data(&root)?;
 
@@ -1290,6 +1478,7 @@ impl FormatReader for GatanReader {
         self.stage_y = stage_y;
         self.stage_z = stage_z;
         self.acquisition_mode = acquisition_mode_from_info(info.as_deref());
+        self.shapes = shapes;
         Ok(())
     }
 
@@ -1316,6 +1505,7 @@ impl FormatReader for GatanReader {
         self.stage_y.clear();
         self.stage_z.clear();
         self.acquisition_mode = None;
+        self.shapes.clear();
         Ok(())
     }
 
@@ -1526,6 +1716,12 @@ impl FormatReader for GatanReader {
                     position_z: pz,
                 })
                 .collect();
+        }
+
+        // Emit annotation ROIs (GatanReader.java:397-460). Java guards this on
+        // metadata level != NO_OVERLAYS; we emit them whenever any were parsed.
+        if !self.shapes.is_empty() {
+            ome.rois = roi_shapes_to_ome_rois(&self.shapes);
         }
 
         Some(ome)
@@ -2081,6 +2277,86 @@ mod tests {
             acquisition_mode_from_info(Some("(Mode TEM more")).as_deref(),
             Some("Other")
         );
+    }
+
+    // Pure-logic port of GatanReader's ROI emission switch
+    // (GatanReader.java:397-460): verifies the type-code → OmeShape mapping and
+    // the coordinate math for each annotation type, plus that unknown codes are
+    // skipped and `nextROI` only advances for emitted shapes.
+    #[test]
+    fn roi_shape_emission() {
+        use crate::common::ome_metadata::OmeShape;
+        let shapes = vec![
+            RoiShape {
+                type_code: SHAPE_LINE,
+                x1: 1.0,
+                y1: 2.0,
+                x2: 3.0,
+                y2: 4.0,
+                text: Some("L".into()),
+                ..Default::default()
+            },
+            RoiShape {
+                type_code: SHAPE_RECTANGLE,
+                // Java reads y1,x1,y2,x2 from the "Rectangle" struct.
+                x1: 10.0,
+                y1: 20.0,
+                x2: 30.0,
+                y2: 50.0,
+                ..Default::default()
+            },
+            RoiShape {
+                type_code: SHAPE_ELLIPSE,
+                x1: 0.0,
+                y1: 0.0,
+                x2: 8.0,
+                y2: 4.0,
+                ..Default::default()
+            },
+            RoiShape {
+                type_code: SHAPE_TEXT,
+                x1: 5.0,
+                y1: 6.0,
+                text: Some("hello".into()),
+                ..Default::default()
+            },
+            // Unknown code → skipped, must not advance the ROI index.
+            RoiShape {
+                type_code: 99,
+                ..Default::default()
+            },
+        ];
+
+        let rois = roi_shapes_to_ome_rois(&shapes);
+        assert_eq!(rois.len(), 4, "unknown ROI type is skipped");
+
+        assert_eq!(rois[0].id.as_deref(), Some("ROI:0"));
+        assert!(matches!(
+            rois[0].shapes[0],
+            OmeShape::Line { x1, y1, x2, y2, .. }
+                if x1 == 1.0 && y1 == 2.0 && x2 == 3.0 && y2 == 4.0
+        ));
+
+        assert_eq!(rois[1].id.as_deref(), Some("ROI:1"));
+        assert!(matches!(
+            rois[1].shapes[0],
+            OmeShape::Rectangle { x, y, width, height, .. }
+                if x == 10.0 && y == 20.0 && width == 20.0 && height == 30.0
+        ));
+
+        // Ellipse: centre = x1+rx, y1+ry; radii = (x2-x1)/2, (y2-y1)/2.
+        assert!(matches!(
+            rois[2].shapes[0],
+            OmeShape::Ellipse { x, y, radius_x, radius_y, .. }
+                if x == 4.0 && y == 2.0 && radius_x == 4.0 && radius_y == 2.0
+        ));
+
+        assert_eq!(rois[3].id.as_deref(), Some("ROI:3"));
+        assert_eq!(rois[3].name.as_deref(), Some("hello"));
+        assert!(matches!(
+            rois[3].shapes[0],
+            OmeShape::Point { x, y, .. } if x == 5.0 && y == 6.0
+        ));
     }
 
     // Real DM3 file: confirms the newly-captured scalar data fields (version,

@@ -31,6 +31,10 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::perkinelmer::OpenlabRawReader::new()),
         Box::new(crate::formats::incell::InCellReader::new()),
         Box::new(crate::tiff::TiffReader::new()),
+        // ApngReader must precede PngReader: both match the PNG byte signature,
+        // but ApngReader only claims animated PNGs (those with an acTL chunk),
+        // so still PNGs fall through to PngReader.
+        Box::new(crate::formats::extended::ApngReader::new()),
         Box::new(crate::formats::png::PngReader::new()),
         Box::new(crate::formats::jpeg::JpegReader::new()),
         Box::new(crate::formats::bmp::BmpReader::new()),
@@ -171,7 +175,6 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::extended::MrwReader::new()),
         Box::new(crate::formats::extended::YokogawaReader::new()),
         Box::new(crate::formats::extended::LeicaLofReader::new()),
-        Box::new(crate::formats::extended::ApngReader::new()),
         Box::new(crate::formats::extended::PovRayReader::new()),
         Box::new(crate::formats::extended::NafReader::new()),
         Box::new(crate::formats::extended::BurleighReader::new()),

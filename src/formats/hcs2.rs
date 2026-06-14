@@ -2419,6 +2419,31 @@ mod operetta {
         c: i32,
         x: u32,
         y: u32,
+        // Per-plane scalar metadata, mirroring OperettaReader.Plane.
+        channel_name: Option<String>,
+        /// ImageResolutionX/Y in micrometers (Java stores metres * 1e6).
+        resolution_x: Option<f64>,
+        resolution_y: Option<f64>,
+        /// PositionX/Y/Z as Length in metres (Java `Length(meters, METRE)`).
+        position_x: Option<f64>,
+        position_y: Option<f64>,
+        position_z: Option<f64>,
+        /// MainEmission/ExcitationWavelength (nm).
+        em_wavelength: Option<f64>,
+        ex_wavelength: Option<f64>,
+        /// ObjectiveMagnification / ObjectiveNA.
+        magnification: Option<f64>,
+        lens_na: Option<f64>,
+        /// ExposureTime / MeasurementTimeOffset in seconds.
+        exposure_time: Option<f64>,
+        delta_t: Option<f64>,
+        /// AbsTime timestamp text (Java `Timestamp`).
+        absolute_time: Option<String>,
+        /// AcquisitionType / ChannelType strings.
+        acq_type: Option<String>,
+        channel_type: Option<String>,
+        /// OrientationMatrix parsed from `[a b c][d e f][g h i]`.
+        orientation_matrix: Option<Vec<Vec<f64>>>,
     }
 
     #[derive(Clone, Default)]
@@ -2426,6 +2451,43 @@ mod operetta {
         channel_id: i32,
         x: u32,
         y: u32,
+        // V6 layout stores common metadata once per channel; copied into each
+        // plane via `Channel::copy` (OperettaReader.Channel).
+        channel_name: Option<String>,
+        acq_type: Option<String>,
+        channel_type: Option<String>,
+        resolution_x: Option<f64>,
+        resolution_y: Option<f64>,
+        em_wavelength: Option<f64>,
+        ex_wavelength: Option<f64>,
+        magnification: Option<f64>,
+        lens_na: Option<f64>,
+        exposure_time: Option<f64>,
+        orientation_matrix: Option<Vec<Vec<f64>>>,
+    }
+
+    impl Channel {
+        /// Copy data from this Channel to the given Plane
+        /// (OperettaReader.Channel.copy). Skipped if the channel looks empty.
+        fn copy(&self, p: &mut Plane) {
+            // don't copy if it looks like this is an empty channel
+            if self.channel_id < 0 || self.x == 0 || self.y == 0 {
+                return;
+            }
+            p.channel_name = self.channel_name.clone();
+            p.acq_type = self.acq_type.clone();
+            p.channel_type = self.channel_type.clone();
+            p.resolution_x = self.resolution_x;
+            p.resolution_y = self.resolution_y;
+            p.x = self.x;
+            p.y = self.y;
+            p.em_wavelength = self.em_wavelength;
+            p.ex_wavelength = self.ex_wavelength;
+            p.magnification = self.magnification;
+            p.lens_na = self.lens_na;
+            p.exposure_time = self.exposure_time;
+            p.orientation_matrix = self.orientation_matrix.clone();
+        }
     }
 
     /// Plate-level scalars captured by `OperettaHandler.endElement`
@@ -2456,6 +2518,10 @@ mod operetta {
         let mut active_plane: Option<Plane> = None;
         let mut active_channel: Option<Channel> = None;
         let mut active_channel_id: i32 = 0;
+        // `isHarmony` (from EvaluationInputData/@xmlns) and `InstrumentType`
+        // govern the PositionZ source element and whether applyMatrix runs.
+        let mut is_harmony = false;
+        let mut instrument_type: Option<String> = None;
 
         let mut current_name = String::new();
         let mut reader = quick_xml::Reader::from_str(&xml);
@@ -2473,6 +2539,7 @@ mod operetta {
                         &mut active_channel,
                         &mut active_channel_id,
                         &mut channels,
+                        &mut is_harmony,
                     );
                 }
                 Ok(quick_xml::events::Event::Empty(ref e)) => {
@@ -2484,6 +2551,7 @@ mod operetta {
                         &mut active_channel,
                         &mut active_channel_id,
                         &mut channels,
+                        &mut is_harmony,
                     );
                     handle_end(
                         &name,
@@ -2497,6 +2565,8 @@ mod operetta {
                         &mut plate_info,
                         &dir,
                         &images_dir,
+                        is_harmony,
+                        &mut instrument_type,
                     );
                     current_name.clear();
                 }
@@ -2522,6 +2592,8 @@ mod operetta {
                         &mut plate_info,
                         &dir,
                         &images_dir,
+                        is_harmony,
+                        &mut instrument_type,
                     );
                     // handle_end with element close ('Image'/'Entry') uses qName
                     handle_close(
@@ -2530,6 +2602,7 @@ mod operetta {
                         &mut active_channel,
                         &channels,
                         &mut planes,
+                        &instrument_type,
                     );
                     current_name.clear();
                     text_buf.clear();
@@ -2674,6 +2747,8 @@ mod operetta {
                     MetadataValue::String(v.clone()),
                 );
             }
+            // Per-channel + per-plane scalars (OperettaReader.populateMetadataStore).
+            project_series_metadata(&mut meta, sp, size_c, size_z);
             series.push(meta);
             asm_planes.push(
                 sp.iter()
@@ -2748,6 +2823,7 @@ mod operetta {
         active_channel: &mut Option<Channel>,
         active_channel_id: &mut i32,
         channels: &mut Map<i32, Channel>,
+        is_harmony: &mut bool,
     ) {
         match name {
             "Image" => {
@@ -2768,6 +2844,12 @@ mod operetta {
                     }
                 }
             }
+            "EvaluationInputData" => {
+                // isHarmony = xmlns.indexOf(HARMONY_MAGIC) > 0
+                if let Some(xmlns) = super::xmlutil::attr(e, "xmlns") {
+                    *is_harmony = xmlns.find("Harmony").map(|i| i > 0).unwrap_or(false);
+                }
+            }
             _ => {}
         }
     }
@@ -2785,9 +2867,14 @@ mod operetta {
         plate_info: &mut PlateInfo,
         dir: &Path,
         images_dir: &Path,
+        is_harmony: bool,
+        instrument_type: &mut Option<String>,
     ) {
         let v = value.trim();
         match current_name {
+            "InstrumentType" => {
+                *instrument_type = Some(v.to_string());
+            }
             "PlateRows" => {
                 if let Ok(n) = v.parse::<i32>() {
                     *plate_rows = n;
@@ -2843,6 +2930,136 @@ mod operetta {
                         }
                     }
                 }
+                "ChannelName" => {
+                    if let Some(p) = active_plane.as_mut() {
+                        p.channel_name = Some(v.to_string());
+                    } else if let Some(c) = active_channel.as_mut() {
+                        c.channel_name = Some(v.to_string());
+                        if let Some(stored) = channels.get_mut(&c.channel_id) {
+                            stored.channel_name = Some(v.to_string());
+                        }
+                    }
+                }
+                "ImageResolutionX" => {
+                    // resolution stored in meters -> micrometers (Java * 1e6).
+                    if let Ok(r) = v.parse::<f64>() {
+                        let res = r * 1_000_000.0;
+                        if let Some(p) = active_plane.as_mut() {
+                            p.resolution_x = Some(res);
+                        } else if let Some(c) = active_channel.as_mut() {
+                            c.resolution_x = Some(res);
+                            if let Some(stored) = channels.get_mut(&c.channel_id) {
+                                stored.resolution_x = Some(res);
+                            }
+                        }
+                    }
+                }
+                "ImageResolutionY" => {
+                    if let Ok(r) = v.parse::<f64>() {
+                        let res = r * 1_000_000.0;
+                        if let Some(p) = active_plane.as_mut() {
+                            p.resolution_y = Some(res);
+                        } else if let Some(c) = active_channel.as_mut() {
+                            c.resolution_y = Some(res);
+                            if let Some(stored) = channels.get_mut(&c.channel_id) {
+                                stored.resolution_y = Some(res);
+                            }
+                        }
+                    }
+                }
+                "ObjectiveMagnification" => {
+                    if let Ok(mag) = v.parse::<f64>() {
+                        if let Some(p) = active_plane.as_mut() {
+                            p.magnification = Some(mag);
+                        } else if let Some(c) = active_channel.as_mut() {
+                            c.magnification = Some(mag);
+                            if let Some(stored) = channels.get_mut(&c.channel_id) {
+                                stored.magnification = Some(mag);
+                            }
+                        }
+                    }
+                }
+                "ObjectiveNA" => {
+                    if let Ok(na) = v.parse::<f64>() {
+                        if let Some(p) = active_plane.as_mut() {
+                            p.lens_na = Some(na);
+                        } else if let Some(c) = active_channel.as_mut() {
+                            c.lens_na = Some(na);
+                            if let Some(stored) = channels.get_mut(&c.channel_id) {
+                                stored.lens_na = Some(na);
+                            }
+                        }
+                    }
+                }
+                "MainEmissionWavelength" => {
+                    if let Ok(w) = v.parse::<f64>() {
+                        if let Some(p) = active_plane.as_mut() {
+                            p.em_wavelength = Some(w);
+                        } else if let Some(c) = active_channel.as_mut() {
+                            c.em_wavelength = Some(w);
+                            if let Some(stored) = channels.get_mut(&c.channel_id) {
+                                stored.em_wavelength = Some(w);
+                            }
+                        }
+                    }
+                }
+                "MainExcitationWavelength" => {
+                    if let Ok(w) = v.parse::<f64>() {
+                        if let Some(p) = active_plane.as_mut() {
+                            p.ex_wavelength = Some(w);
+                        } else if let Some(c) = active_channel.as_mut() {
+                            c.ex_wavelength = Some(w);
+                            if let Some(stored) = channels.get_mut(&c.channel_id) {
+                                stored.ex_wavelength = Some(w);
+                            }
+                        }
+                    }
+                }
+                "ExposureTime" => {
+                    // Time in seconds (Java `Time(value, SECOND)`).
+                    if let Ok(t) = v.parse::<f64>() {
+                        if let Some(p) = active_plane.as_mut() {
+                            p.exposure_time = Some(t);
+                        } else if let Some(c) = active_channel.as_mut() {
+                            c.exposure_time = Some(t);
+                            if let Some(stored) = channels.get_mut(&c.channel_id) {
+                                stored.exposure_time = Some(t);
+                            }
+                        }
+                    }
+                }
+                "AcquisitionType" => {
+                    if let Some(p) = active_plane.as_mut() {
+                        p.acq_type = Some(v.to_string());
+                    } else if let Some(c) = active_channel.as_mut() {
+                        c.acq_type = Some(v.to_string());
+                        if let Some(stored) = channels.get_mut(&c.channel_id) {
+                            stored.acq_type = Some(v.to_string());
+                        }
+                    }
+                }
+                "ChannelType" => {
+                    if let Some(p) = active_plane.as_mut() {
+                        p.channel_type = Some(v.to_string());
+                    } else if let Some(c) = active_channel.as_mut() {
+                        c.channel_type = Some(v.to_string());
+                        if let Some(stored) = channels.get_mut(&c.channel_id) {
+                            stored.channel_type = Some(v.to_string());
+                        }
+                    }
+                }
+                "OrientationMatrix" => {
+                    if let Some(matrix) = parse_orientation_matrix(v) {
+                        if let Some(p) = active_plane.as_mut() {
+                            p.orientation_matrix = Some(matrix.clone());
+                        } else if let Some(c) = active_channel.as_mut() {
+                            c.orientation_matrix = Some(matrix.clone());
+                            if let Some(stored) = channels.get_mut(&c.channel_id) {
+                                stored.orientation_matrix = Some(matrix);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2885,8 +3102,67 @@ mod operetta {
                         p.c = n;
                     }
                 }
+                "PositionX" => {
+                    // position stored in meters (Java `Length(meters, METRE)`).
+                    if let Ok(m) = v.parse::<f64>() {
+                        p.position_x = Some(m);
+                    }
+                }
+                "PositionY" => {
+                    if let Ok(m) = v.parse::<f64>() {
+                        p.position_y = Some(m);
+                    }
+                }
+                // AbsPositionZ (non-Harmony) or PositionZ (Harmony).
+                "AbsPositionZ" if !is_harmony => {
+                    if let Ok(m) = v.parse::<f64>() {
+                        p.position_z = Some(m);
+                    }
+                }
+                "PositionZ" if is_harmony => {
+                    if let Ok(m) = v.parse::<f64>() {
+                        p.position_z = Some(m);
+                    }
+                }
+                "MeasurementTimeOffset" => {
+                    if let Ok(t) = v.parse::<f64>() {
+                        p.delta_t = Some(t);
+                    }
+                }
+                "AbsTime" => {
+                    if !v.is_empty() {
+                        p.absolute_time = Some(v.to_string());
+                    }
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// Parse an `OrientationMatrix` value of the form `[a b c][d e f][g h i]`.
+    /// Mirrors OperettaReader.endElement: split on ']', strip '[' and ','.
+    /// Returns `None` unless the matrix has at least 3 rows with the expected
+    /// minimum widths (Java's `matrix.length > 2 && ...` guard).
+    fn parse_orientation_matrix(value: &str) -> Option<Vec<Vec<f64>>> {
+        let rows: Vec<&str> = value.split(']').collect();
+        let mut matrix: Vec<Vec<f64>> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let cleaned = row.replace('[', "").replace(',', " ");
+            let cleaned = cleaned.trim();
+            let vals: Vec<f64> = cleaned
+                .split(' ')
+                .map(|s| s.trim().parse::<f64>().unwrap_or(f64::NAN))
+                .collect();
+            matrix.push(vals);
+        }
+        if matrix.len() > 2
+            && !matrix[0].is_empty()
+            && matrix[1].len() > 1
+            && matrix[2].len() > 2
+        {
+            Some(matrix)
+        } else {
+            None
         }
     }
 
@@ -2896,20 +3172,19 @@ mod operetta {
         active_channel: &mut Option<Channel>,
         channels: &Map<i32, Channel>,
         planes: &mut Vec<Plane>,
+        instrument_type: &Option<String>,
     ) {
         match qname {
             "Image" => {
                 if let Some(mut p) = active_plane.take() {
-                    // Copy channel-level dims into the plane if unset (V6 layout).
+                    // V6 layout: copy common per-channel metadata into the plane
+                    // (OperettaReader: `channels.get(c).copy(activePlane)`).
                     if let Some(c) = channels.get(&p.c) {
-                        if c.channel_id >= 0 && c.x != 0 && c.y != 0 {
-                            if p.x == 0 {
-                                p.x = c.x;
-                            }
-                            if p.y == 0 {
-                                p.y = c.y;
-                            }
-                        }
+                        c.copy(&mut p);
+                    }
+                    // applyMatrix unless the instrument is a Phenix.
+                    if instrument_type.as_deref() != Some("Phenix") {
+                        apply_matrix(&mut p);
                     }
                     planes.push(p);
                 }
@@ -2921,6 +3196,33 @@ mod operetta {
         }
     }
 
+    /// Apply `orientation_matrix` to (position_x, position_y, position_z),
+    /// mirroring OperettaReader.Plane.applyMatrix. Positions stay in metres.
+    fn apply_matrix(p: &mut Plane) {
+        let (Some(px), Some(py), Some(pz), Some(matrix)) = (
+            p.position_x,
+            p.position_y,
+            p.position_z,
+            p.orientation_matrix.as_ref(),
+        ) else {
+            return;
+        };
+        let v = [px, py, pz];
+        let mut new_values = [0.0f64; 3];
+        for (row, mrow) in matrix.iter().enumerate().take(3) {
+            for (col, &m) in mrow.iter().enumerate() {
+                if col < v.len() {
+                    new_values[row] += m * v[col];
+                } else {
+                    new_values[row] += m;
+                }
+            }
+        }
+        p.position_x = Some(new_values[0]);
+        p.position_y = Some(new_values[1]);
+        p.position_z = Some(new_values[2]);
+    }
+
     fn unique_sorted<I: Iterator<Item = i32>>(it: I) -> Vec<i32> {
         let mut v: Vec<i32> = Vec::new();
         for x in it {
@@ -2930,6 +3232,179 @@ mod operetta {
         }
         v.sort_unstable();
         v
+    }
+
+    /// Translate emission wavelength (nm) to an OME `Color` name, mirroring
+    /// OperettaReader.getColor (PerkinElmer photocell colour bands).
+    fn color_for_wavelength(em: Option<f64>) -> Option<&'static str> {
+        let em = em?;
+        Some(if em < 450.0 {
+            "magenta" // violet
+        } else if em < 500.0 {
+            "blue"
+        } else if em < 570.0 {
+            "green"
+        } else if em < 590.0 {
+            "yellow"
+        } else if em < 610.0 {
+            "orange"
+        } else {
+            "red"
+        })
+    }
+
+    /// Project per-channel + per-plane scalar metadata into one series'
+    /// metadata map, mirroring OperettaReader.populateMetadataStore
+    /// (channel name/acquisition mode/contrast/colour/emission/excitation,
+    /// plane positions/exposure/deltaT, physical sizes + Z step).
+    fn project_series_metadata(
+        meta: &mut ImageMetadata,
+        sp: &[Option<Plane>],
+        size_c: u32,
+        size_z: u32,
+    ) {
+        let m = &mut meta.series_metadata;
+        let n = sp.len();
+
+        // Objective magnification / NA from the first plane (planes[0][0]).
+        if let Some(Some(p0)) = sp.first() {
+            if let Some(mag) = p0.magnification {
+                m.insert(
+                    "operetta.ObjectiveMagnification".to_string(),
+                    MetadataValue::Float(mag),
+                );
+            }
+            if let Some(na) = p0.lens_na {
+                m.insert("operetta.ObjectiveNA".to_string(), MetadataValue::Float(na));
+            }
+        }
+
+        // Per-channel metadata. Java picks planes[i][c]; if null, advances by
+        // size_c to find the next plane acquired for that channel.
+        let mut first: Option<&Plane> = sp.first().and_then(|p| p.as_ref());
+        for c in 0..size_c as usize {
+            let mut plane: Option<&Plane> = sp.get(c).and_then(|p| p.as_ref());
+            if plane.is_none() {
+                let mut start = c;
+                while plane.is_none() && start < n {
+                    plane = sp.get(start).and_then(|p| p.as_ref());
+                    start += size_c as usize;
+                }
+            }
+            if let Some(p) = plane {
+                if first.is_none() {
+                    first = Some(p);
+                }
+                if let Some(name) = &p.channel_name {
+                    m.insert(
+                        format!("operetta.Channel{c}.Name"),
+                        MetadataValue::String(name.clone()),
+                    );
+                }
+                if let Some(acq) = &p.acq_type {
+                    m.insert(
+                        format!("operetta.Channel{c}.AcquisitionMode"),
+                        MetadataValue::String(acq.clone()),
+                    );
+                }
+                if let Some(ct) = &p.channel_type {
+                    m.insert(
+                        format!("operetta.Channel{c}.ContrastMethod"),
+                        MetadataValue::String(ct.clone()),
+                    );
+                }
+                if let Some(color) = color_for_wavelength(p.em_wavelength) {
+                    m.insert(
+                        format!("operetta.Channel{c}.Color"),
+                        MetadataValue::String(color.to_string()),
+                    );
+                }
+                if let Some(em) = p.em_wavelength {
+                    if em > 0.0 {
+                        m.insert(
+                            format!("operetta.Channel{c}.EmissionWavelength"),
+                            MetadataValue::Float(em),
+                        );
+                    }
+                }
+                if let Some(ex) = p.ex_wavelength {
+                    if ex > 0.0 {
+                        m.insert(
+                            format!("operetta.Channel{c}.ExcitationWavelength"),
+                            MetadataValue::Float(ex),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Per-plane positions / exposure / deltaT, tracking the last plane at
+        // the maximum Z (Java tracks `last` for the Z-step computation below).
+        let mut last: Option<&Plane> = None;
+        for (p_idx, slot) in sp.iter().enumerate() {
+            if let Some(p) = slot {
+                if let Some(x) = p.position_x {
+                    m.insert(
+                        format!("operetta.Plane{p_idx}.PositionX"),
+                        MetadataValue::Float(x),
+                    );
+                }
+                if let Some(y) = p.position_y {
+                    m.insert(
+                        format!("operetta.Plane{p_idx}.PositionY"),
+                        MetadataValue::Float(y),
+                    );
+                }
+                if let Some(z) = p.position_z {
+                    m.insert(
+                        format!("operetta.Plane{p_idx}.PositionZ"),
+                        MetadataValue::Float(z),
+                    );
+                }
+                if let Some(exp) = p.exposure_time {
+                    m.insert(
+                        format!("operetta.Plane{p_idx}.ExposureTime"),
+                        MetadataValue::Float(exp),
+                    );
+                }
+                if let Some(dt) = p.delta_t {
+                    m.insert(
+                        format!("operetta.Plane{p_idx}.DeltaT"),
+                        MetadataValue::Float(dt),
+                    );
+                }
+                // getZCTCoords(p)[0] == sizeZ - 1 : C is fastest, then Z.
+                let z_coord = (p_idx as u32 / size_c) % size_z;
+                if z_coord == size_z.saturating_sub(1) {
+                    last = Some(p);
+                }
+            }
+        }
+
+        // Physical pixel sizes from `first` (PhysicalSizeX/Y in micrometers),
+        // plus the average Z step (positions are in metres -> micrometers).
+        if let Some(first) = first {
+            if let Some(x) = first.resolution_x {
+                m.insert("operetta.PhysicalSizeX".to_string(), MetadataValue::Float(x));
+            }
+            if let Some(y) = first.resolution_y {
+                m.insert("operetta.PhysicalSizeY".to_string(), MetadataValue::Float(y));
+            }
+            if size_z > 1 {
+                if let (Some(last), Some(first_z)) = (last, first.position_z) {
+                    if let Some(last_z) = last.position_z {
+                        // metres -> micrometers, then average over the Z range.
+                        let first_um = first_z * 1_000_000.0;
+                        let last_um = last_z * 1_000_000.0;
+                        let avg = (last_um - first_um) / (size_z as f64 - 1.0);
+                        m.insert(
+                            "operetta.PhysicalSizeZ".to_string(),
+                            MetadataValue::Float(avg),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2968,6 +3443,13 @@ mod columbus {
         position_x: Option<f64>,
         position_y: Option<f64>,
         position_z: Option<f64>,
+        /// Per-channel colour (Java `Plane.channelColor`). ColumbusReader parses
+        /// `ChannelColor` but leaves the field unset, deferring to the emission
+        /// wavelength for colour, so this stays `None` to match.
+        channel_color: Option<u32>,
+        /// Owning well-sample index, assigned during metadata projection
+        /// (Java `Plane.series`).
+        series: i32,
     }
 
     pub fn parse(path: &Path) -> Result<HcsAssembly> {
@@ -3110,6 +3592,7 @@ mod columbus {
         let mut series = Vec::with_capacity(series_count);
         let mut asm_planes: Vec<Vec<PlaneRef>> = Vec::with_capacity(series_count);
 
+        let mut well_sample = 0i32;
         for &row in &unique_rows {
             for &col in &unique_cols {
                 if !unique_samples.contains(&(row * cols_for_sample + col)) {
@@ -3120,7 +3603,7 @@ mod columbus {
                     for t in 0..size_t {
                         for c in 0..size_c {
                             for z in 0..size_z {
-                                if let Some(p) = planes.iter().find(|p| {
+                                if let Some(p) = planes.iter_mut().find(|p| {
                                     p.row == row
                                         && p.col == col
                                         && p.field == field
@@ -3128,6 +3611,9 @@ mod columbus {
                                         && p.channel == c as i32
                                         && p.z == z as i32
                                 }) {
+                                    // Java assigns p.series = wellSample as each
+                                    // plane is projected into the store.
+                                    p.series = well_sample;
                                     let idx =
                                         super::get_index(order, size_z, size_c, size_t, z, c, t)
                                             as usize;
@@ -3168,6 +3654,7 @@ mod columbus {
                     }
                     series.push(meta);
                     asm_planes.push(sp);
+                    well_sample += 1;
                 }
             }
         }
@@ -3517,6 +4004,19 @@ mod columbus {
             "ChannelName" => {
                 if !value.is_empty() {
                     p.channel_name = Some(value.to_string());
+                }
+            }
+            "ChannelColor" => {
+                // Java decomposes BGRA but does NOT set p.channelColor (the
+                // assignment is commented out), deferring colour to the
+                // emission wavelength. We mirror that: parse, but leave unset.
+                if let Ok(color) = value.parse::<i64>() {
+                    let _blue = ((color >> 24) & 0xff) as u32;
+                    let _green = ((color >> 16) & 0xff) as u32;
+                    let _red = ((color >> 8) & 0xff) as u32;
+                    let _alpha = (color & 0xff) as u32;
+                    // p.channel_color intentionally left None (see field doc).
+                    let _ = &mut p.channel_color;
                 }
             }
             "MeasurementTimeOffset" => {

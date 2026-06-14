@@ -11463,20 +11463,96 @@ fn write_animated_gif(path: &Path) {
         .unwrap();
 }
 
-fn write_apng_header(path: &Path) {
+/// Build a synthetic 2-frame RGBA APNG by hand: a 2x2 default image (frame 0)
+/// that is all red, plus a 2x2 second frame that is all green, composited at
+/// (0,0). Chunk CRCs are computed with the same CRC32 the readers expect.
+fn write_two_frame_apng(path: &Path) {
+    fn crc(type_: &[u8], data: &[u8]) -> u32 {
+        let mut c = flate2::Crc::new();
+        c.update(type_);
+        c.update(data);
+        c.sum()
+    }
+    fn chunk(out: &mut Vec<u8>, type_: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(type_);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc(type_, data).to_be_bytes());
+    }
+    // Zlib-deflate a 2x2 RGBA image (filter byte 0 per row).
+    fn deflate_image(rgba: &[[u8; 4]; 4]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        // row 0: pixels 0,1
+        enc.write_all(&[0]).unwrap();
+        enc.write_all(&rgba[0]).unwrap();
+        enc.write_all(&rgba[1]).unwrap();
+        // row 1: pixels 2,3
+        enc.write_all(&[0]).unwrap();
+        enc.write_all(&rgba[2]).unwrap();
+        enc.write_all(&rgba[3]).unwrap();
+        enc.finish().unwrap()
+    }
+
+    let red = [255u8, 0, 0, 255];
+    let green = [0u8, 255, 0, 255];
+    let frame0 = [red, red, red, red];
+    let frame1 = [green, green, green, green];
+
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-    bytes.extend_from_slice(&13u32.to_be_bytes());
-    bytes.extend_from_slice(b"IHDR");
-    bytes.extend_from_slice(&1u32.to_be_bytes());
-    bytes.extend_from_slice(&1u32.to_be_bytes());
-    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
-    bytes.extend_from_slice(&0u32.to_be_bytes());
-    bytes.extend_from_slice(&8u32.to_be_bytes());
-    bytes.extend_from_slice(b"acTL");
-    bytes.extend_from_slice(&2u32.to_be_bytes());
-    bytes.extend_from_slice(&0u32.to_be_bytes());
-    bytes.extend_from_slice(&0u32.to_be_bytes());
+
+    // IHDR: 2x2, 8-bit, color type 6 (RGBA).
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&2u32.to_be_bytes());
+    ihdr.extend_from_slice(&2u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(&mut bytes, b"IHDR", &ihdr);
+
+    // acTL: 2 frames, 0 plays.
+    let mut actl = Vec::new();
+    actl.extend_from_slice(&2u32.to_be_bytes());
+    actl.extend_from_slice(&0u32.to_be_bytes());
+    chunk(&mut bytes, b"acTL", &actl);
+
+    // fcTL frame 0 (seq 0): full 2x2 at (0,0).
+    let mut fctl0 = Vec::new();
+    fctl0.extend_from_slice(&0u32.to_be_bytes()); // sequence
+    fctl0.extend_from_slice(&2u32.to_be_bytes()); // width
+    fctl0.extend_from_slice(&2u32.to_be_bytes()); // height
+    fctl0.extend_from_slice(&0u32.to_be_bytes()); // x
+    fctl0.extend_from_slice(&0u32.to_be_bytes()); // y
+    fctl0.extend_from_slice(&1u16.to_be_bytes()); // delay_num
+    fctl0.extend_from_slice(&0u16.to_be_bytes()); // delay_den
+    fctl0.push(0); // dispose
+    fctl0.push(0); // blend
+    chunk(&mut bytes, b"fcTL", &fctl0);
+
+    // IDAT (default image = frame 0, red).
+    chunk(&mut bytes, b"IDAT", &deflate_image(&frame0));
+
+    // fcTL frame 1 (seq 1): full 2x2 at (0,0).
+    let mut fctl1 = Vec::new();
+    fctl1.extend_from_slice(&1u32.to_be_bytes());
+    fctl1.extend_from_slice(&2u32.to_be_bytes());
+    fctl1.extend_from_slice(&2u32.to_be_bytes());
+    fctl1.extend_from_slice(&0u32.to_be_bytes());
+    fctl1.extend_from_slice(&0u32.to_be_bytes());
+    fctl1.extend_from_slice(&1u16.to_be_bytes());
+    fctl1.extend_from_slice(&0u16.to_be_bytes());
+    fctl1.push(0);
+    fctl1.push(0);
+    chunk(&mut bytes, b"fcTL", &fctl1);
+
+    // fdAT (frame 1, green): 4-byte sequence number then the frame's zlib data.
+    let mut fdat = Vec::new();
+    fdat.extend_from_slice(&2u32.to_be_bytes()); // sequence
+    fdat.extend_from_slice(&deflate_image(&frame1));
+    chunk(&mut bytes, b"fdAT", &fdat);
+
+    chunk(&mut bytes, b"IEND", &[]);
     std::fs::write(path, bytes).unwrap();
 }
 
@@ -11538,17 +11614,78 @@ fn animated_gif_reads_all_frames_as_image_stack() {
 }
 
 #[test]
-fn animated_png_is_rejected_instead_of_first_frame_flattened() {
+fn animated_png_reads_all_frames_as_image_stack() {
+    // The APNGReader port reads every APNG frame as a separate timepoint
+    // (sizeT == numFrames), compositing each frame onto the default image.
     let path = tmp("animated.apng");
-    write_apng_header(&path);
+    write_two_frame_apng(&path);
 
-    let err = match ImageReader::open(&path) {
-        Ok(_) => panic!("animated PNG should be rejected"),
-        Err(err) => err,
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 2);
+    assert_eq!(meta.size_c, 4); // RGBA
+    assert_eq!(meta.size_t, 2);
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(meta.dimension_order, DimensionOrder::XYCTZ);
+    assert_eq!(reader.series_count(), 1);
+
+    // Frame 0 is the default image (all red), frame 1 is composited green.
+    let frame0 = reader.open_bytes(0).unwrap();
+    let frame1 = reader.open_bytes(1).unwrap();
+    assert_eq!(frame0.len(), 2 * 2 * 4);
+    assert_eq!(frame1.len(), 2 * 2 * 4);
+    assert_eq!(&frame0[..4], &[255, 0, 0, 255]);
+    assert_eq!(&frame1[..4], &[0, 255, 0, 255]);
+    // Every pixel of each frame matches.
+    for px in frame0.chunks_exact(4) {
+        assert_eq!(px, &[255, 0, 0, 255]);
+    }
+    for px in frame1.chunks_exact(4) {
+        assert_eq!(px, &[0, 255, 0, 255]);
+    }
+}
+
+#[test]
+fn animated_png_round_trip_two_frames() {
+    // Write a 2-frame RGBA stack with ApngWriter, then read it back with
+    // ApngReader and verify both frames survive.
+    let path = tmp("roundtrip.apng");
+
+    let meta = ImageMetadata {
+        size_x: 2,
+        size_y: 2,
+        size_z: 1,
+        size_c: 4,
+        size_t: 2,
+        pixel_type: PixelType::Uint8,
+        bits_per_pixel: 8,
+        image_count: 2,
+        dimension_order: DimensionOrder::XYCTZ,
+        is_rgb: true,
+        is_interleaved: true,
+        is_indexed: false,
+        is_little_endian: false,
+        resolution_count: 1,
+        ..Default::default()
     };
-    assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("animated PNG"))
-    );
+
+    // Frame 0: blue; frame 1: white.
+    let blue: Vec<u8> = std::iter::repeat([0u8, 0, 255, 255]).take(4).flatten().collect();
+    let white: Vec<u8> = std::iter::repeat([255u8, 255, 255, 255]).take(4).flatten().collect();
+
+    ImageWriter::save(&path, &meta, &[blue.clone(), white.clone()]).expect("apng write failed");
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let rmeta = reader.metadata();
+    assert_eq!(rmeta.size_t, 2);
+    assert_eq!(rmeta.image_count, 2);
+    assert_eq!(rmeta.size_c, 4);
+
+    let f0 = reader.open_bytes(0).unwrap();
+    let f1 = reader.open_bytes(1).unwrap();
+    assert_eq!(f0, blue);
+    assert_eq!(f1, white);
 }
 
 #[test]
@@ -12714,17 +12851,27 @@ fn quicktime_reports_unsupported_codec_fourcc() {
 }
 
 #[test]
-fn paletted_tga_is_expanded_to_rgb_samples() {
+fn paletted_tga_keeps_indices_with_lookup_table() {
+    // The faithful TargaReader port (matching Java) reports color-mapped images
+    // as 8-bit indexed data with a separate color map, rather than expanding
+    // the palette to RGB samples.
     let path = tmp("palette.tga");
     write_paletted_tga(&path);
 
     let mut reader = ImageReader::open(&path).unwrap();
-    let meta = reader.metadata();
+    let meta = reader.metadata().clone();
     assert_eq!(meta.size_x, 2);
     assert_eq!(meta.size_y, 1);
-    assert_eq!(meta.size_c, 3);
-    assert!(!meta.is_indexed);
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![255, 0, 0, 0, 255, 0]);
+    assert_eq!(meta.size_c, 1);
+    assert!(meta.is_indexed);
+    assert!(!meta.is_rgb);
+    // raw palette indices for the two pixels
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1]);
+    // color map reconstructs RGB (red, green)
+    let lut = meta.lookup_table.expect("indexed image exposes a lookup table");
+    assert_eq!(lut.red, vec![255, 0]);
+    assert_eq!(lut.green, vec![0, 255]);
+    assert_eq!(lut.blue, vec![0, 0]);
 }
 
 #[test]

@@ -14,7 +14,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -346,8 +346,429 @@ impl FormatReader for GifReader {
 }
 
 pub fn tga_reader() -> impl FormatReader {
-    // TGA has no reliable magic; extension-only detection
-    GenericReader::new(&["tga", "tpic"], |_| false, RasterBehavior::Still)
+    TargaReader::new()
+}
+
+// ---- Truevision Targa reader ------------------------------------------------
+//
+// Faithful port of Java `loci.formats.in.TargaReader` (and the
+// `loci.formats.codec.TargaRLECodec` used for the RLE image types).
+//
+// Targa image types:
+//   1  = uncompressed color-mapped (indexed)
+//   2  = uncompressed truecolor (RGB)
+//   3  = uncompressed grayscale
+//   9  = RLE color-mapped (indexed)
+//   10 = RLE truecolor (RGB)
+//   11 = RLE grayscale
+
+/// State captured during `init_file`, mirroring the Java reader's fields.
+///
+/// (Java's `colorMap` field is exposed here through `ImageMetadata.lookup_table`
+/// rather than a per-state copy, so it is not duplicated on this struct.)
+struct TargaState {
+    /// File offset of the pixel data (after header + color map).
+    offset: usize,
+    /// True for RLE image types (9/10/11).
+    compressed: bool,
+    /// Origin/orientation bits from the image descriptor (0..=3).
+    orientation: i32,
+    /// Bits per pixel (8/16/24/32).
+    bits: i32,
+}
+
+struct TargaReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    /// Whole-file bytes, read at `set_id` (Java seeks within the open stream).
+    data: Vec<u8>,
+    state: Option<TargaState>,
+}
+
+impl TargaReader {
+    fn new() -> Self {
+        TargaReader {
+            path: None,
+            meta: None,
+            data: Vec::new(),
+            state: None,
+        }
+    }
+}
+
+/// Targa RLE decompression — port of `TargaRLECodec.decompress`.
+///
+/// `data` is the byte stream starting at the first RLE packet; `max_bytes` is
+/// the decompressed plane size; `bits_per_sample` is the pixel depth in bits.
+///
+/// Each packet begins with a count byte `n` read as a signed value:
+///   * `n >= 0`           — raw packet: the next `(n + 1)` pixels are literal.
+///   * `n < 0`            — run packet: one pixel repeated `(n & 0x7f) + 1` times.
+///
+/// Deviation from Java: the upstream `TargaRLECodec` treats `n == -128` (`0x80`)
+/// as a no-op (it falls through both branches). Per the Targa specification a
+/// `0x80` count byte is a valid one-pixel run packet, and spec-compliant
+/// encoders (e.g. the `image` crate's TGA writer) emit it. We therefore handle
+/// it as a run packet so such files decode correctly; for any encoder that
+/// never emits `0x80` the output is identical to Java's.
+fn targa_rle_decompress(data: &[u8], max_bytes: usize, bits_per_sample: i32) -> Vec<u8> {
+    let mut output: Vec<u8> = Vec::with_capacity(max_bytes);
+    let bpp = (bits_per_sample / 8) as usize;
+    let mut pos = 0usize;
+    while output.len() < max_bytes {
+        if pos >= data.len() {
+            break;
+        }
+        // Java reads a signed byte `n`.
+        let n = data[pos] as i8;
+        pos += 1;
+        if n >= 0 {
+            // 0 <= n <= 127: raw packet of (n + 1) pixels.
+            let count = bpp * (n as usize + 1);
+            for _ in 0..count {
+                if pos >= data.len() {
+                    break;
+                }
+                output.push(data[pos]);
+                pos += 1;
+            }
+        } else {
+            // -128 <= n <= -1: run packet of (n & 0x7f) + 1 repeats of one pixel.
+            let len = ((n as i32) & 0x7f) as usize + 1;
+            if pos + bpp > data.len() {
+                break;
+            }
+            let pixel = &data[pos..pos + bpp];
+            pos += bpp;
+            for _ in 0..len {
+                output.extend_from_slice(pixel);
+            }
+        }
+    }
+    output
+}
+
+/// Parse the Targa header + color map — port of the field-reading portion of
+/// `TargaReader.initFile`. Returns the populated state, metadata, and the
+/// `identification` string.
+fn targa_init_file(data: &[u8]) -> Result<(TargaState, ImageMetadata, String)> {
+    if data.len() < 18 {
+        return Err(BioFormatsError::Format("TGA file too short".into()));
+    }
+    let little_endian = true;
+    let read_u8 = |p: usize| -> u32 { data[p] as u32 };
+    let read_u16 = |p: usize| -> u32 { u16::from_le_bytes([data[p], data[p + 1]]) as u32 };
+
+    let n_identification_chars = read_u8(0) as usize;
+    let _has_color_map = read_u8(1) == 1; // color map type byte
+    let image_type = data[2] as i8 as i32;
+    let compressed = image_type == 9 || image_type == 10 || image_type == 11;
+
+    // color map definition
+    let color_map_origin = read_u16(3);
+    let color_map_length = read_u16(5) as usize;
+    let bits_per_entry = read_u8(7) as usize;
+
+    // skip 4 bytes (x/y origin), then image spec
+    let size_x = read_u16(12);
+    let size_y = read_u16(14);
+    let bits = read_u8(16) as i32;
+
+    let image_descriptor = read_u8(17);
+    let orientation = ((image_descriptor & 0x30) >> 4) as i32;
+
+    let mut pos = 18usize;
+    let id_end = (pos + n_identification_chars).min(data.len());
+    let identification = String::from_utf8_lossy(&data[pos..id_end]).into_owned();
+    pos = id_end;
+
+    let mut color_map: Option<[Vec<u8>; 3]> = None;
+    if color_map_length > 0 && bits_per_entry > 0 {
+        let mut cm: [Vec<u8>; 3] = [
+            vec![0u8; color_map_length],
+            vec![0u8; color_map_length],
+            vec![0u8; color_map_length],
+        ];
+        let entry_bytes = bits_per_entry / 8;
+        for i in 0..color_map_length {
+            if pos + entry_bytes > data.len() {
+                break;
+            }
+            let v = &data[pos..pos + entry_bytes];
+            pos += entry_bytes;
+            if v.len() == 4 || v.len() == 3 {
+                cm[0][i] = v[2];
+                cm[1][i] = v[1];
+                cm[2][i] = v[0];
+            } else if v.len() == 2 {
+                let pixel = if little_endian {
+                    u16::from_le_bytes([v[0], v[1]])
+                } else {
+                    u16::from_be_bytes([v[0], v[1]])
+                } as u32;
+                cm[0][i] = ((pixel & 0x7c00) >> 10) as u8;
+                cm[1][i] = ((pixel & 0x3e0) >> 5) as u8;
+                cm[2][i] = (pixel & 0x1f) as u8;
+            }
+        }
+        color_map = Some(cm);
+    }
+
+    let offset = pos;
+
+    // core metadata (mirrors the second half of Java initFile)
+    let is_rgb = image_type == 2 || image_type == 10;
+    let size_c: u32 = if is_rgb { 3 } else { 1 };
+    let is_indexed = color_map.is_some() && !is_rgb;
+    // Java: m.bitsPerPixel = bits == 32 ? 8 : bits / sizeC
+    let bits_per_pixel: u8 = if bits == 32 {
+        8
+    } else {
+        (bits / size_c as i32) as u8
+    };
+
+    let mut meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z: 1,
+        size_c,
+        size_t: 1,
+        pixel_type: PixelType::Uint8,
+        bits_per_pixel,
+        image_count: 1,
+        dimension_order: DimensionOrder::XYCZT,
+        is_rgb,
+        is_interleaved: true,
+        is_indexed,
+        is_little_endian: true,
+        resolution_count: 1,
+        ..Default::default()
+    };
+
+    // populate metadata hashtable (exact Java key names)
+    let m = &mut meta.series_metadata;
+    m.insert("Color map present".into(), MetadataValue::Bool(_has_color_map));
+    m.insert("Image type".into(), MetadataValue::Int(image_type as i64));
+    m.insert(
+        "Color map origin".into(),
+        MetadataValue::Int(color_map_origin as i64),
+    );
+    m.insert(
+        "Color map length".into(),
+        MetadataValue::Int(color_map_length as i64),
+    );
+    m.insert(
+        "Bits per color map entry".into(),
+        MetadataValue::Int(bits_per_entry as i64),
+    );
+    m.insert("Image width".into(), MetadataValue::Int(size_x as i64));
+    m.insert("Image height".into(), MetadataValue::Int(size_y as i64));
+    m.insert("Bits per pixel".into(), MetadataValue::Int(bits as i64));
+    m.insert(
+        "Identification".into(),
+        MetadataValue::String(identification.clone()),
+    );
+    m.insert(
+        "Image orientation".into(),
+        MetadataValue::Int(orientation as i64),
+    );
+    m.insert("Pixel offset".into(), MetadataValue::Int(offset as i64));
+
+    // expose color map as a lookup table for indexed images
+    if is_indexed {
+        if let Some(cm) = &color_map {
+            meta.lookup_table = Some(LookupTable {
+                red: cm[0].iter().map(|&b| b as u16).collect(),
+                green: cm[1].iter().map(|&b| b as u16).collect(),
+                blue: cm[2].iter().map(|&b| b as u16).collect(),
+            });
+        }
+    }
+
+    let state = TargaState {
+        offset,
+        compressed,
+        orientation,
+        bits,
+    };
+    Ok((state, meta, identification))
+}
+
+/// Unpack one plane, applying RLE decompression, orientation flips, and
+/// channel reordering — port of `TargaReader.openBytes`.
+fn targa_open_plane(data: &[u8], meta: &ImageMetadata, state: &TargaState) -> Vec<u8> {
+    let size_x = meta.size_x as i64;
+    let size_y = meta.size_y as i64;
+    let size_c = meta.size_c as i64;
+    let bits = state.bits;
+    let orientation = state.orientation;
+
+    let plane_size = (size_x * size_y * size_c) as usize;
+    let mut buf = vec![0u8; plane_size];
+
+    // bytes per pixel, rounded up to a multiple of 8 bits (Java's bpp loop)
+    let mut bpp_bits = bits;
+    while bpp_bits % 8 != 0 {
+        bpp_bits += 1;
+    }
+    let bpp = (bpp_bits / 8) as i64;
+
+    // source bytes for this plane
+    let src: Vec<u8> = if state.compressed {
+        targa_rle_decompress(&data[state.offset..], plane_size, bits)
+    } else {
+        data[state.offset.min(data.len())..].to_vec()
+    };
+
+    // full requested region is the whole plane
+    let (x, y, w, h) = (0i64, 0i64, size_x, size_y);
+
+    let row_skip = if orientation < 2 { size_y - h - y } else { y };
+    let col_skip = if orientation % 2 == 1 { size_x - w - x } else { x };
+
+    // sequential cursor into the (decompressed) source
+    let mut sp: usize = 0;
+    let read_byte = |sp: &mut usize| -> u8 {
+        let v = if *sp < src.len() { src[*sp] } else { 0 };
+        *sp += 1;
+        v
+    };
+    let read_short = |sp: &mut usize| -> i32 {
+        // little-endian, matching the Java stream order
+        let lo = if *sp < src.len() { src[*sp] } else { 0 } as i32;
+        let hi = if *sp + 1 < src.len() { src[*sp + 1] } else { 0 } as i32;
+        *sp += 2;
+        (hi << 8) | lo
+    };
+    let skip = |sp: &mut usize, n: i64| {
+        if n > 0 {
+            *sp = sp.saturating_add(n as usize);
+        }
+    };
+
+    skip(&mut sp, row_skip * size_x * bpp);
+    for row in 0..h {
+        if sp >= src.len() {
+            break;
+        }
+        skip(&mut sp, col_skip * bpp);
+        for col in 0..w {
+            if sp >= src.len() {
+                break;
+            }
+            let row_index = if orientation < 2 { h - row - 1 } else { row };
+            let col_index = if orientation % 2 == 1 { w - col - 1 } else { col };
+            let index = (size_c * (row_index * w + col_index)) as usize;
+            if bpp == 2 {
+                let v = read_short(&mut sp);
+                if index + 2 < buf.len() {
+                    buf[index] = ((v & 0x7c00) >> 10) as u8;
+                    buf[index + 1] = ((v & 0x3e0) >> 5) as u8;
+                    buf[index + 2] = (v & 0x1f) as u8;
+                }
+            } else if bpp == 4 {
+                let b2 = read_byte(&mut sp);
+                let b1 = read_byte(&mut sp);
+                let b0 = read_byte(&mut sp);
+                skip(&mut sp, 1);
+                if index + 2 < buf.len() {
+                    buf[index + 2] = b2;
+                    buf[index + 1] = b1;
+                    buf[index] = b0;
+                }
+            } else {
+                let mut c = size_c - 1;
+                while c >= 0 {
+                    let b = read_byte(&mut sp);
+                    let bi = index + c as usize;
+                    if bi < buf.len() {
+                        buf[bi] = b;
+                    }
+                    c -= 1;
+                }
+            }
+        }
+        skip(&mut sp, bpp * (size_x - w - col_skip));
+    }
+    buf
+}
+
+impl FormatReader for TargaReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("tga") | Some("tpic"))
+    }
+
+    /// Byte-level heuristic mirroring Java `TargaReader.isThisType(stream)`:
+    /// the Java base reader only validates the suffix here (there is no
+    /// override), so accept any header — detection relies on the extension.
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        let data = std::fs::read(path)?;
+        let (state, meta, _identification) = targa_init_file(&data)?;
+        self.path = Some(path.to_path_buf());
+        self.data = data;
+        self.meta = Some(meta);
+        self.state = Some(state);
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.data = Vec::new();
+        self.state = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        usize::from(self.meta.is_some())
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() || s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, idx: u32) -> Result<Vec<u8>> {
+        if idx != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(idx));
+        }
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let state = self.state.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        Ok(targa_open_plane(&self.data, meta, state))
+    }
+
+    fn open_bytes_region(&mut self, idx: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let full = self.open_bytes(idx)?;
+        let meta = self.meta.as_ref().unwrap();
+        crop_full_plane("tga", &full, meta, meta.size_c as usize, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, idx: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
+        let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
+        self.open_bytes_region(idx, tx, ty, tw, th)
+    }
 }
 
 pub fn webp_reader() -> impl FormatReader {
@@ -686,5 +1107,163 @@ impl FormatWriter for PnmWriter {
 
     fn can_do_stacks(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod targa_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_tga_{name}_{nanos}.tga"))
+    }
+
+    /// Build a minimal Targa header.
+    ///
+    /// `descriptor` controls orientation; `0x20` selects a top-left origin so
+    /// stored rows are already top-to-bottom (orientation bits == 2, no flip).
+    fn header(
+        id_len: u8,
+        cmap_type: u8,
+        image_type: u8,
+        cmap_len: u16,
+        cmap_entry_bits: u8,
+        w: u16,
+        h: u16,
+        bits: u8,
+        descriptor: u8,
+    ) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(id_len);
+        v.push(cmap_type);
+        v.push(image_type);
+        v.extend_from_slice(&0u16.to_le_bytes()); // cmap origin
+        v.extend_from_slice(&cmap_len.to_le_bytes());
+        v.push(cmap_entry_bits);
+        v.extend_from_slice(&[0u8; 4]); // x/y origin (skipped)
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v.push(bits);
+        v.push(descriptor);
+        v
+    }
+
+    fn write_and_read(name: &str, bytes: &[u8]) -> (ImageMetadata, Vec<u8>) {
+        let p = tmp_path(name);
+        std::fs::File::create(&p).unwrap().write_all(bytes).unwrap();
+        let mut r = tga_reader();
+        r.set_id(&p).unwrap();
+        let meta = r.metadata().clone();
+        let px = r.open_bytes(0).unwrap();
+        let _ = std::fs::remove_file(&p);
+        (meta, px)
+    }
+
+    /// A 2x2 truecolor image: pixels stored in BGR, top-left origin.
+    /// Expected decoded RGB (row-major):
+    ///   (0,0) red, (1,0) green, (0,1) blue, (1,1) white
+    fn uncompressed_truecolor() -> Vec<u8> {
+        let mut v = header(0, 0, 2, 0, 0, 2, 2, 24, 0x20);
+        // BGR order on disk
+        v.extend_from_slice(&[0x00, 0x00, 0xFF]); // red
+        v.extend_from_slice(&[0x00, 0xFF, 0x00]); // green
+        v.extend_from_slice(&[0xFF, 0x00, 0x00]); // blue
+        v.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // white
+        v
+    }
+
+    #[test]
+    fn truecolor_uncompressed() {
+        let (meta, px) = write_and_read("tc", &uncompressed_truecolor());
+        assert_eq!((meta.size_x, meta.size_y), (2, 2));
+        assert_eq!(meta.size_c, 3);
+        assert!(meta.is_rgb);
+        assert!(!meta.is_indexed);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        // decoded as interleaved RGB, row-major
+        assert_eq!(
+            px,
+            vec![
+                0xFF, 0x00, 0x00, // red
+                0x00, 0xFF, 0x00, // green
+                0x00, 0x00, 0xFF, // blue
+                0xFF, 0xFF, 0xFF, // white
+            ]
+        );
+    }
+
+    #[test]
+    fn truecolor_rle_matches_uncompressed() {
+        // Same 4 pixels as the uncompressed case, RLE-encoded (type 10).
+        // Each pixel differs, so encode as a single raw packet of 4 pixels.
+        let mut v = header(0, 0, 10, 0, 0, 2, 2, 24, 0x20);
+        v.push(3); // raw packet: count = n + 1 = 4
+        v.extend_from_slice(&[0x00, 0x00, 0xFF]); // red (BGR)
+        v.extend_from_slice(&[0x00, 0xFF, 0x00]); // green
+        v.extend_from_slice(&[0xFF, 0x00, 0x00]); // blue
+        v.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // white
+
+        let (_, rle_px) = write_and_read("rle", &v);
+        let (_, raw_px) = write_and_read("rle_ref", &uncompressed_truecolor());
+        assert_eq!(rle_px, raw_px);
+    }
+
+    #[test]
+    fn truecolor_rle_run_packet() {
+        // 4 identical red pixels via a run packet, plus correctness of the
+        // run-length expansion in targa_rle_decompress.
+        let mut v = header(0, 0, 10, 0, 0, 2, 2, 24, 0x20);
+        // run packet: high bit set, len = (n & 0x7f) + 1 = 4
+        v.push(0x83);
+        v.extend_from_slice(&[0x00, 0x00, 0xFF]); // red (BGR)
+
+        let (_, px) = write_and_read("run", &v);
+        assert_eq!(
+            px,
+            vec![
+                0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn color_mapped() {
+        // 2x2 indexed image (type 1), 4-entry 24-bit palette.
+        // Palette stored BGR; decoded LUT is RGB.
+        let mut v = header(0, 1, 1, 4, 24, 2, 2, 8, 0x20);
+        // palette entries (BGR on disk)
+        v.extend_from_slice(&[0x00, 0x00, 0xFF]); // index 0 -> red
+        v.extend_from_slice(&[0x00, 0xFF, 0x00]); // index 1 -> green
+        v.extend_from_slice(&[0xFF, 0x00, 0x00]); // index 2 -> blue
+        v.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // index 3 -> white
+        // pixel indices, top-left origin
+        v.extend_from_slice(&[0, 1, 2, 3]);
+
+        let (meta, px) = write_and_read("cmap", &v);
+        assert_eq!((meta.size_x, meta.size_y), (2, 2));
+        assert_eq!(meta.size_c, 1);
+        assert!(!meta.is_rgb);
+        assert!(meta.is_indexed);
+        // pixel data are the raw indices
+        assert_eq!(px, vec![0, 1, 2, 3]);
+        // lookup table reconstructs RGB
+        let lut = meta.lookup_table.expect("indexed image has a LUT");
+        assert_eq!(lut.red, vec![0xFF, 0x00, 0x00, 0xFF]);
+        assert_eq!(lut.green, vec![0x00, 0xFF, 0x00, 0xFF]);
+        assert_eq!(lut.blue, vec![0x00, 0x00, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn rle_decompress_unit() {
+        // raw packet of 2 pixels (1 byte each) followed by a run of 3.
+        // bytes: [0x01, A, B, 0x82, C] with bpp=1
+        let data = [0x01u8, 0x10, 0x20, 0x82, 0x30];
+        let out = targa_rle_decompress(&data, 5, 8);
+        assert_eq!(out, vec![0x10, 0x20, 0x30, 0x30, 0x30]);
     }
 }
