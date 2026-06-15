@@ -83,6 +83,13 @@ pub struct CellWorxReader {
     serial_number: Option<String>,
     /// Resolved `Z Map File` path parsed from the plate `scan.log`, if present.
     z_map_file: Option<PathBuf>,
+    /// Set when the per-well file lists were resolved from a nested
+    /// `TimePoint_<t>/ZStep_<z>/` directory walk (Java `getTiffFiles`
+    /// `subdirectories` branch) rather than the flat `<plate><well>_..` naming.
+    /// In that case `get_file` indexes the list by ZCT coordinate instead of by
+    /// `field * imageCount + no`, mirroring `CellWorxReader.getFile`. Defaults to
+    /// `false`, so the normal CellWorx/ScanR/Operetta path is unaffected.
+    subdirectories: bool,
     tiff_reader: crate::tiff::TiffReader,
     tiff_loaded: bool,
 }
@@ -102,6 +109,7 @@ impl CellWorxReader {
             do_channels: false,
             serial_number: None,
             z_map_file: None,
+            subdirectories: false,
             tiff_reader: crate::tiff::TiffReader::new(),
             tiff_loaded: false,
         }
@@ -136,6 +144,23 @@ impl CellWorxReader {
         let image_count = files.len() / self.field_count.max(1);
         let idx = field * image_count + no as usize;
         if idx < files.len() {
+            // Java getFile: when the per-well list came from the nested
+            // TimePoint/ZStep walk (`subdirectories`), the files are ordered by
+            // ZCT coordinate rather than `field * imageCount + no`, so index by
+            // the rasterized (c, field, z, t) position. `get_dimension_order` is
+            // always present here (series metadata is XYCZT), mirroring the
+            // Java `getDimensionOrder() != null` guard.
+            if self.subdirectories {
+                let meta = self.series.get(series)?;
+                let (z, c, t) = zct_coords(meta, no);
+                let size_c = meta.size_c.max(1) as usize;
+                let size_z = meta.size_z.max(1) as usize;
+                let mut plane_index = c as usize;
+                plane_index += size_c * field;
+                plane_index += size_c * self.field_count * z as usize;
+                plane_index += size_c * self.field_count * size_z * t as usize;
+                return files.get(plane_index).cloned();
+            }
             files.get(idx).cloned()
         } else if field < files.len() {
             files.get(field).cloned()
@@ -145,12 +170,259 @@ impl CellWorxReader {
             None
         }
     }
+
+    /// Drive the standard well x field x T x Z series assembly, optionally with
+    /// an externally-resolved per-well file list.
+    ///
+    /// This is the body of the former `set_id`, lifted verbatim except for the
+    /// per-well file-list source: when `resolver` is `Some`, each selected
+    /// well's list comes from the caller (Java's overridden `getTiffFiles`
+    /// result flowing into `wellFiles[row][col]`) and `subdirectories` is set so
+    /// `get_file` switches to ZCT-coordinate indexing; when `None`, the flat
+    /// `build_well_files` naming is used exactly as before. Mirrors how
+    /// `CellWorxReader.findPixelsFiles` calls the (overridable) `getTiffFiles`.
+    fn set_id_impl(
+        &mut self,
+        path: &Path,
+        mut resolver: Option<&mut dyn FnMut(usize, usize, &WellResolveDims) -> Vec<PathBuf>>,
+    ) -> Result<()> {
+        self.close()?;
+
+        let htd = find_htd(path)?;
+        let info = parse_htd(&htd)?;
+
+        // Field (site) count = number of selected sites in the field map.
+        let field_count = info
+            .field_map
+            .iter()
+            .flatten()
+            .filter(|&&b| b)
+            .count()
+            .max(1);
+
+        // Enumerate selected wells in row-major order and build their file lists.
+        let plate = plate_base(&htd);
+        let channels = info.wavelengths.len();
+        let dims = WellResolveDims {
+            plate: plate.clone(),
+            field_count,
+            channels,
+            n_timepoints: info.n_timepoints,
+            z_steps: info.z_steps,
+            do_channels: info.do_channels,
+        };
+        let mut well_files: Vec<Vec<Option<Vec<PathBuf>>>> =
+            vec![vec![None; info.x_wells]; info.y_wells];
+        let mut selected_wells: Vec<(usize, usize)> = Vec::new();
+        for row in 0..info.y_wells {
+            for col in 0..info.x_wells {
+                if info.well_selected[row][col] {
+                    let files = match resolver.as_mut() {
+                        // Subclass-supplied list (e.g. MetaXpress nested-dir walk),
+                        // mirroring the overridden getTiffFiles result.
+                        Some(f) => f(row, col, &dims),
+                        // Flat `<plate><well>_s_w_t.tif` naming (normal CellWorx).
+                        None => build_well_files(
+                            &plate,
+                            row,
+                            col,
+                            field_count,
+                            channels,
+                            info.n_timepoints,
+                            info.do_channels,
+                        ),
+                    };
+                    well_files[row][col] = Some(files);
+                    selected_wells.push((row, col));
+                }
+            }
+        }
+
+        let well_count = selected_wells.len();
+        let series_count = field_count * well_count;
+        if series_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "CellWorX HTD declares no selected wells".into(),
+            ));
+        }
+
+        // Store enough state for `get_file` so we can probe for a real TIFF.
+        self.htd_path = Some(htd);
+        self.well_files = well_files;
+        self.selected_wells = selected_wells;
+        self.field_count = field_count;
+        self.n_wavelengths = channels;
+        self.n_timepoints = info.n_timepoints;
+        self.z_steps = info.z_steps;
+        self.do_channels = info.do_channels;
+        // ZCT-coordinate indexing in get_file only when a resolver supplied the
+        // (nested-directory) lists; the flat path keeps the original behavior.
+        self.subdirectories = resolver.is_some();
+
+        // Find the first companion TIFF that actually exists on disk.
+        let planes_per = (info.z_steps as usize) * (info.n_timepoints as usize) * channels;
+        let mut series_idx = 0usize;
+        let mut plane_idx = 0u32;
+        let mut probe: Option<PathBuf> = None;
+        loop {
+            if let Some(f) = self.get_file(series_idx, plane_idx) {
+                if f.exists() {
+                    probe = Some(f);
+                    break;
+                }
+            }
+            if (plane_idx as usize) < planes_per {
+                plane_idx += 1;
+            } else if series_idx < series_count - 1 {
+                plane_idx = 0;
+                series_idx += 1;
+            } else {
+                break;
+            }
+        }
+        let probe = probe.ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "CellWorX/MetaXpress: no companion pixel files found on disk".into(),
+            )
+        })?;
+
+        self.tiff_reader.set_id(&probe)?;
+        let tm = self.tiff_reader.metadata();
+        let size_x = tm.size_x;
+        let size_y = tm.size_y;
+        let pixel_type = tm.pixel_type;
+        let bits = tm.bits_per_pixel;
+        let little_endian = tm.is_little_endian;
+        let interleaved = tm.is_interleaved;
+        let _ = self.tiff_reader.close();
+
+        // Parse the plate-level scan.log for instrument scalars (Scanner SN,
+        // Z Map File), following the head of Java populateMetadata. The plate
+        // log is "<plate>scan.log" (plate_base already ends with '_').
+        let plate_log = PathBuf::from(format!("{}scan.log", plate));
+        let htd_path = self.htd_path.clone().unwrap_or_else(|| PathBuf::from(&plate));
+        let plate_info = parse_plate_log(&plate_log, &htd_path);
+        self.serial_number = plate_info.serial_number.clone();
+        self.z_map_file = plate_info.z_map_file.clone();
+
+        let image_count = info.z_steps * channels as u32 * info.n_timepoints;
+        let mut series = Vec::with_capacity(series_count);
+        for s in 0..series_count {
+            let (row, col) = self.selected_wells[s / field_count];
+            let mut md = HashMap::new();
+            md.insert(
+                "format".into(),
+                MetadataValue::String("MetaXpress/CellWorX".into()),
+            );
+            md.insert("Well".into(), MetadataValue::String(well_name(row, col)));
+            for (i, w) in info.wavelengths.iter().enumerate() {
+                if let Some(name) = w {
+                    md.insert(
+                        format!("Wavelength {}", i + 1),
+                        MetadataValue::String(name.clone()),
+                    );
+                }
+            }
+            // Plate-wide instrument scalars (Java sets MicroscopeSerialNumber on
+            // the single instrument; we surface it on each series' metadata).
+            if let Some(sn) = &plate_info.serial_number {
+                md.insert(
+                    "Microscope Serial Number".into(),
+                    MetadataValue::String(sn.clone()),
+                );
+            }
+            if let Some(zmap) = &plate_info.z_map_file {
+                md.insert(
+                    "Z Map File".into(),
+                    MetadataValue::String(zmap.to_string_lossy().into_owned()),
+                );
+            }
+            // Per-well scan.log: capture every "key: value" line as series
+            // metadata (Java parseWellLogFile -> addSeriesMeta). The log file is
+            // "<plate><well>_scan.log".
+            let well_log = PathBuf::from(format!("{}{}_scan.log", plate, well_name(row, col)));
+            parse_well_log(&well_log, &mut md);
+            series.push(ImageMetadata {
+                size_x,
+                size_y,
+                size_z: info.z_steps,
+                size_c: channels as u32,
+                size_t: info.n_timepoints,
+                pixel_type,
+                bits_per_pixel: bits,
+                image_count,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb: false,
+                is_interleaved: interleaved,
+                is_indexed: false,
+                is_little_endian: little_endian,
+                resolution_count: 1,
+                series_metadata: md,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            });
+        }
+
+        self.series = series;
+        self.current_series = 0;
+        self.tiff_loaded = false;
+        Ok(())
+    }
+
+    /// Subclass hook: run the standard CellWorx well x field x T x Z series
+    /// assembly from an externally-resolved per-well TIFF list.
+    ///
+    /// `resolver(row, col, dims)` returns the file list for the selected well at
+    /// `(row, col)` (Java's overridden `getTiffFiles(plateName, rowLetter, col,
+    /// channels, nTimepoints, zSteps)` result, which Java writes back into
+    /// `wellFiles[row][col]`). The list is consumed by `get_file` using
+    /// ZCT-coordinate indexing (the `subdirectories` branch of Java
+    /// `CellWorxReader.getFile`).
+    ///
+    /// This is additive: it shares all assembly logic with the normal
+    /// `set_id` path and changes nothing for callers that do not use it
+    /// (CellWorx/ScanR/Operetta keep the flat-naming `None` path).
+    pub(crate) fn set_id_with_resolver(
+        &mut self,
+        path: &Path,
+        resolver: &mut dyn FnMut(usize, usize, &WellResolveDims) -> Vec<PathBuf>,
+    ) -> Result<()> {
+        self.set_id_impl(path, Some(resolver))
+    }
 }
 
 impl Default for CellWorxReader {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Dimensions a subclass-style file-list resolver needs, mirroring the
+/// arguments Java `CellWorxReader.findPixelsFiles` passes to the (overridable)
+/// `getTiffFiles(plateName, rowLetter, col, channels, nTimepoints, zSteps)`.
+///
+/// Exposed via [`CellWorxReader::set_id_with_resolver`] so a subclass such as
+/// `MetaxpressTiffReader` can supply an externally-resolved per-well TIFF list
+/// (e.g. from the nested `TimePoint_<t>/ZStep_<z>/` walk) while the standard
+/// well x field x T x Z series assembly proceeds unchanged.
+pub(crate) struct WellResolveDims {
+    /// Plate-name prefix (HTD path minus extension, plus `_`).
+    pub plate: String,
+    /// Number of selected sites/fields. Part of the faithful Java
+    /// `getTiffFiles(...)` argument set; the nested-dir resolver does not need
+    /// it (it filters by name prefix), but a flat-naming resolver would.
+    #[allow(dead_code)]
+    pub field_count: usize,
+    /// Number of wavelengths/channels (see `field_count`).
+    #[allow(dead_code)]
+    pub channels: usize,
+    pub n_timepoints: u32,
+    pub z_steps: u32,
+    /// Java `doChannels` flag (see `field_count`).
+    #[allow(dead_code)]
+    pub do_channels: bool,
 }
 
 /// Parsed contents of a CellWorX / MetaXpress `.HTD` plate-index file.
@@ -460,6 +732,17 @@ fn z_coord(meta: &ImageMetadata, no: u32) -> u32 {
     (no / sc) % sz
 }
 
+/// `(z, c, t)` coordinates of a plane index under an `XYCZT` dimension order
+/// (matching the `int[] {z, c, t}` returned by Java `getZCTCoords`).
+fn zct_coords(meta: &ImageMetadata, no: u32) -> (u32, u32, u32) {
+    let sc = meta.size_c.max(1);
+    let sz = meta.size_z.max(1);
+    let c = no % sc;
+    let z = (no / sc) % sz;
+    let t = no / (sc * sz);
+    (z, c, t)
+}
+
 impl FormatReader for CellWorxReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -474,172 +757,9 @@ impl FormatReader for CellWorxReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.close()?;
-
-        let htd = find_htd(path)?;
-        let info = parse_htd(&htd)?;
-
-        // Field (site) count = number of selected sites in the field map.
-        let field_count = info
-            .field_map
-            .iter()
-            .flatten()
-            .filter(|&&b| b)
-            .count()
-            .max(1);
-
-        // Enumerate selected wells in row-major order and build their file lists.
-        let plate = plate_base(&htd);
-        let channels = info.wavelengths.len();
-        let mut well_files: Vec<Vec<Option<Vec<PathBuf>>>> =
-            vec![vec![None; info.x_wells]; info.y_wells];
-        let mut selected_wells: Vec<(usize, usize)> = Vec::new();
-        for row in 0..info.y_wells {
-            for col in 0..info.x_wells {
-                if info.well_selected[row][col] {
-                    let files = build_well_files(
-                        &plate,
-                        row,
-                        col,
-                        field_count,
-                        channels,
-                        info.n_timepoints,
-                        info.do_channels,
-                    );
-                    well_files[row][col] = Some(files);
-                    selected_wells.push((row, col));
-                }
-            }
-        }
-
-        let well_count = selected_wells.len();
-        let series_count = field_count * well_count;
-        if series_count == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "CellWorX HTD declares no selected wells".into(),
-            ));
-        }
-
-        // Store enough state for `get_file` so we can probe for a real TIFF.
-        self.htd_path = Some(htd);
-        self.well_files = well_files;
-        self.selected_wells = selected_wells;
-        self.field_count = field_count;
-        self.n_wavelengths = channels;
-        self.n_timepoints = info.n_timepoints;
-        self.z_steps = info.z_steps;
-        self.do_channels = info.do_channels;
-
-        // Find the first companion TIFF that actually exists on disk.
-        let planes_per = (info.z_steps as usize) * (info.n_timepoints as usize) * channels;
-        let mut series_idx = 0usize;
-        let mut plane_idx = 0u32;
-        let mut probe: Option<PathBuf> = None;
-        loop {
-            if let Some(f) = self.get_file(series_idx, plane_idx) {
-                if f.exists() {
-                    probe = Some(f);
-                    break;
-                }
-            }
-            if (plane_idx as usize) < planes_per {
-                plane_idx += 1;
-            } else if series_idx < series_count - 1 {
-                plane_idx = 0;
-                series_idx += 1;
-            } else {
-                break;
-            }
-        }
-        let probe = probe.ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat(
-                "CellWorX/MetaXpress: no companion pixel files found on disk".into(),
-            )
-        })?;
-
-        self.tiff_reader.set_id(&probe)?;
-        let tm = self.tiff_reader.metadata();
-        let size_x = tm.size_x;
-        let size_y = tm.size_y;
-        let pixel_type = tm.pixel_type;
-        let bits = tm.bits_per_pixel;
-        let little_endian = tm.is_little_endian;
-        let interleaved = tm.is_interleaved;
-        let _ = self.tiff_reader.close();
-
-        // Parse the plate-level scan.log for instrument scalars (Scanner SN,
-        // Z Map File), following the head of Java populateMetadata. The plate
-        // log is "<plate>scan.log" (plate_base already ends with '_').
-        let plate_log = PathBuf::from(format!("{}scan.log", plate));
-        let htd_path = self.htd_path.clone().unwrap_or_else(|| PathBuf::from(&plate));
-        let plate_info = parse_plate_log(&plate_log, &htd_path);
-        self.serial_number = plate_info.serial_number.clone();
-        self.z_map_file = plate_info.z_map_file.clone();
-
-        let image_count = info.z_steps * channels as u32 * info.n_timepoints;
-        let mut series = Vec::with_capacity(series_count);
-        for s in 0..series_count {
-            let (row, col) = self.selected_wells[s / field_count];
-            let mut md = HashMap::new();
-            md.insert(
-                "format".into(),
-                MetadataValue::String("MetaXpress/CellWorX".into()),
-            );
-            md.insert("Well".into(), MetadataValue::String(well_name(row, col)));
-            for (i, w) in info.wavelengths.iter().enumerate() {
-                if let Some(name) = w {
-                    md.insert(
-                        format!("Wavelength {}", i + 1),
-                        MetadataValue::String(name.clone()),
-                    );
-                }
-            }
-            // Plate-wide instrument scalars (Java sets MicroscopeSerialNumber on
-            // the single instrument; we surface it on each series' metadata).
-            if let Some(sn) = &plate_info.serial_number {
-                md.insert(
-                    "Microscope Serial Number".into(),
-                    MetadataValue::String(sn.clone()),
-                );
-            }
-            if let Some(zmap) = &plate_info.z_map_file {
-                md.insert(
-                    "Z Map File".into(),
-                    MetadataValue::String(zmap.to_string_lossy().into_owned()),
-                );
-            }
-            // Per-well scan.log: capture every "key: value" line as series
-            // metadata (Java parseWellLogFile -> addSeriesMeta). The log file is
-            // "<plate><well>_scan.log".
-            let well_log = PathBuf::from(format!("{}{}_scan.log", plate, well_name(row, col)));
-            parse_well_log(&well_log, &mut md);
-            series.push(ImageMetadata {
-                size_x,
-                size_y,
-                size_z: info.z_steps,
-                size_c: channels as u32,
-                size_t: info.n_timepoints,
-                pixel_type,
-                bits_per_pixel: bits,
-                image_count,
-                dimension_order: DimensionOrder::XYCZT,
-                is_rgb: false,
-                is_interleaved: interleaved,
-                is_indexed: false,
-                is_little_endian: little_endian,
-                resolution_count: 1,
-                series_metadata: md,
-                lookup_table: None,
-                modulo_z: None,
-                modulo_c: None,
-                modulo_t: None,
-            });
-        }
-
-        self.series = series;
-        self.current_series = 0;
-        self.tiff_loaded = false;
-        Ok(())
+        // Normal path: per-well file lists come from the flat `<plate><well>_..`
+        // naming (`build_well_files`). No external resolver, no subdirectories.
+        self.set_id_impl(path, None)
     }
 
     fn close(&mut self) -> Result<()> {
@@ -655,6 +775,7 @@ impl FormatReader for CellWorxReader {
         self.do_channels = false;
         self.serial_number = None;
         self.z_map_file = None;
+        self.subdirectories = false;
         if self.tiff_loaded {
             let _ = self.tiff_reader.close();
             self.tiff_loaded = false;

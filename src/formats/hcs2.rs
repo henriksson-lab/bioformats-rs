@@ -126,41 +126,32 @@ macro_rules! tiff_wrapper {
 /// through the shared TIFF engine here).
 pub struct MetaxpressTiffReader {
     inner: crate::formats::mias::CellWorxReader,
-    /// Subdirectory-layout fallback (Java `getTiffFiles` `subdirectories` branch).
-    /// When the flat `<plate><well>_s_w_t.tif` naming finds nothing on disk, the
-    /// MetaXpress data may instead live under nested `TimePoint_<t>/ZStep_<z>/`
-    /// directories. We resolve those files here and drive a plain `TiffReader`
-    /// over them, since `CellWorxReader`'s flat resolution does not cover the
-    /// nested layout. `None` when the normal (flat) delegate path is in use.
-    subdir: Option<MetaxpressSubdir>,
-}
-
-/// State for the MetaXpress nested-directory fallback. Holds the resolved TIFF
-/// list (one logical plane each, in Java's `TimePoint`/`ZStep` walk order) and a
-/// `TiffReader` opened on the currently-selected plane's file.
-struct MetaxpressSubdir {
-    files: Vec<PathBuf>,
-    reader: crate::tiff::TiffReader,
-    /// Index into `files` currently loaded into `reader`.
-    loaded: Option<usize>,
 }
 
 impl MetaxpressTiffReader {
     pub fn new() -> Self {
         MetaxpressTiffReader {
             inner: crate::formats::mias::CellWorxReader::new(),
-            subdir: None,
         }
     }
 
+    /// Well label as used in MetaXpress TIFF names, e.g. row 0 col 0 -> "A01".
+    /// Mirrors `rowLetter + String.format("%02d", col + 1)` in Java
+    /// `getTiffFiles` (the `mias::well_name` helper is private to that module).
+    fn well_name(row: usize, col: usize) -> String {
+        let letter = (b'A' + (row as u8 % 26)) as char;
+        format!("{}{:02}", letter, col + 1)
+    }
+
     /// Faithful port of the `subdirectories` branch of
-    /// `MetaxpressTiffReader.getTiffFiles`. Given the HTD path and its parsed
-    /// `nTimepoints`/`zSteps`, walk `TimePoint_<i+1>/ZStep_<z+1>/` (falling back
-    /// to the `TimePoint_<i+1>` directory itself when `zSteps == 1`) and collect
-    /// every entry whose name starts with `base` (the bare `plate_<well>` prefix)
-    /// and does not contain `_thumb` (case-insensitive), sorted within each
-    /// directory. `base` here is the filename-only prefix (Java strips the path
-    /// up to the last separator). Returns the ordered file list.
+    /// `MetaxpressTiffReader.getTiffFiles` for a single well. Given the parent
+    /// directory, the bare filename prefix `base` (Java's `plateName + well`
+    /// stripped to the last path segment) and the parsed `nTimepoints`/`zSteps`,
+    /// walk `TimePoint_<i+1>/ZStep_<z+1>/` (falling back to the `TimePoint_<i+1>`
+    /// directory itself when `zSteps == 1`) and collect every entry whose name
+    /// starts with `base` and does not contain `_thumb` (case-insensitive),
+    /// sorted within each directory (`Arrays.sort` on `list(true)`). Returns the
+    /// ordered file list that Java writes back into `wellFiles[row][col]`.
     fn collect_subdir_tiff_files(
         parent: &Path,
         base: &str,
@@ -198,9 +189,8 @@ impl MetaxpressTiffReader {
         files
     }
 
-    /// `Location.list(true)` analogue: directory entry names, sorted, files only
-    /// excluded? Java `list(true)` returns names of all entries (no hidden). We
-    /// return entry file-names sorted ascending (matching `Arrays.sort`).
+    /// `Location.list(true)` analogue: directory entry file-names sorted
+    /// ascending (matching the `Arrays.sort(zList)` in Java).
     fn list_dir_sorted(dir: &Path) -> Vec<std::ffi::OsString> {
         let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(dir) {
             Ok(rd) => rd.flatten().map(|e| e.file_name()).collect(),
@@ -208,30 +198,6 @@ impl MetaxpressTiffReader {
         };
         names.sort();
         names
-    }
-
-    /// Minimal HTD scan for the two scalars the subdirectory walk needs
-    /// (`TimePoints`, `ZSteps`). Mirrors the same keys `parse_htd` reads; kept
-    /// local because that parser lives in `mias.rs` (read-only for this task).
-    fn parse_htd_dims(htd: &Path) -> (u32, u32) {
-        let mut n_timepoints = 1u32;
-        let mut z_steps = 1u32;
-        if let Ok(content) = std::fs::read_to_string(htd) {
-            for line in content.split('\n') {
-                let line = line.trim();
-                let Some((key, value)) = line.split_once(',') else {
-                    continue;
-                };
-                let key = key.trim().trim_matches('"');
-                let value = value.trim().trim_matches('"').trim();
-                if key == "TimePoints" {
-                    n_timepoints = value.parse().unwrap_or(1).max(1);
-                } else if key == "ZSteps" {
-                    z_steps = value.parse().unwrap_or(1).max(1);
-                }
-            }
-        }
-        (n_timepoints, z_steps)
     }
 
     /// Resolve the HTD path from the dataset id (the id is either the `.htd`
@@ -264,75 +230,17 @@ impl MetaxpressTiffReader {
         None
     }
 
-    /// Attempt the nested-directory fallback. Returns `Ok(Some(subdir))` when a
-    /// `TimePoint_*` layout is found and yields at least one TIFF, `Ok(None)`
-    /// when no such layout applies (so the original delegate error stands).
-    fn try_subdir_fallback(path: &Path) -> Result<Option<MetaxpressSubdir>> {
-        let Some(htd) = Self::resolve_htd(path) else {
-            return Ok(None);
-        };
-        let parent = htd
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        // Quick structural gate: only proceed if at least one TimePoint_* dir
-        // exists (Java only enters this branch after the flat naming fails).
-        let has_timepoint = std::fs::read_dir(&parent)
-            .ok()
-            .map(|rd| {
-                rd.flatten().any(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with("TimePoint_")
-                })
-            })
-            .unwrap_or(false);
-        if !has_timepoint {
-            return Ok(None);
-        }
-
-        let (n_timepoints, z_steps) = Self::parse_htd_dims(&htd);
-
-        // `plate` prefix = HTD path minus extension, plus '_' (Java plateName).
-        let s = htd.to_string_lossy();
-        let cut = s.rfind('.').unwrap_or(s.len());
-        let plate = format!("{}_", &s[..cut]);
-
-        // Collect across every well that has a TimePoint subtree. Java resolves
-        // per (rowLetter, col); without the private well selection we scan the
-        // plausible well prefixes that actually produce files. We derive the
-        // bare base prefix per directory entry by matching `plate_<well>` where
-        // `<well>` is any [A-Z][0-9][0-9] token; falling back to the plate
-        // prefix when wells are not encoded in the filenames.
-        let plate_file_prefix = Path::new(&plate)
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| plate.clone());
-
-        let files =
-            Self::collect_subdir_tiff_files(&parent, &plate_file_prefix, n_timepoints, z_steps);
-        if files.is_empty() {
-            return Ok(None);
-        }
-
-        let mut reader = crate::tiff::TiffReader::new();
-        reader.set_id(&files[0])?;
-        Ok(Some(MetaxpressSubdir {
-            files,
-            reader,
-            loaded: Some(0),
-        }))
-    }
-
-    /// Ensure the subdir `TiffReader` has the file for logical plane `p` loaded.
-    fn ensure_subdir_plane(sd: &mut MetaxpressSubdir, p: u32) -> Result<()> {
-        let idx = (p as usize).min(sd.files.len().saturating_sub(1));
-        if sd.loaded != Some(idx) {
-            sd.reader.close()?;
-            sd.reader.set_id(&sd.files[idx])?;
-            sd.loaded = Some(idx);
-        }
-        Ok(())
+    /// Does a `TimePoint_*` directory exist beside the HTD? Java only reaches the
+    /// `subdirectories` branch after the flat naming finds nothing; we use this
+    /// as the structural gate before retrying the inner assembly via the hook.
+    fn has_timepoint_layout(path: &Path) -> Option<PathBuf> {
+        let htd = Self::resolve_htd(path)?;
+        let parent = htd.parent()?.to_path_buf();
+        let found = std::fs::read_dir(&parent)
+            .ok()?
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("TimePoint_"));
+        found.then_some(htd)
     }
 }
 
@@ -361,106 +269,83 @@ impl FormatReader for MetaxpressTiffReader {
         // CellWorxReader inherits the HTD parse + well/field series assembly.
         // MetaXpress overrides `parseWellLogFile` to a no-op, which CellWorxReader
         // already skips here (no per-well scan.log parsing on the MetaXpress path).
-        self.subdir = None;
         match self.inner.set_id(path) {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Java `getTiffFiles` falls back to a nested
+                // Java `MetaxpressTiffReader.getTiffFiles` falls back to a nested
                 // TimePoint_<t>/ZStep_<z> directory layout when the flat naming
                 // resolves no files on disk (the delegate errors in exactly that
-                // case). Try that fallback before surfacing the error.
-                match Self::try_subdir_fallback(path) {
-                    Ok(Some(sd)) => {
-                        self.subdir = Some(sd);
-                        Ok(())
-                    }
-                    _ => Err(e),
-                }
+                // case). Java writes that resolved list into wellFiles[row][col]
+                // and lets the normal CellWorx series assembly proceed; we mirror
+                // that by re-running the assembly through the CellWorxReader hook
+                // with a per-well subdir resolver, so the full well x field x T x Z
+                // series grid is produced instead of a flat single series.
+                let Some(htd) = Self::has_timepoint_layout(path) else {
+                    return Err(e);
+                };
+                let parent = htd
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                // Per-well resolver: build `base = plateName + well`, stripped to
+                // its last path segment (Java: base.substring(lastIndexOf(sep)+1)),
+                // then walk TimePoint/ZStep collecting that well's TIFFs.
+                let mut resolver =
+                    |row: usize, col: usize, dims: &crate::formats::mias::WellResolveDims| {
+                        let base = format!("{}{}", dims.plate, Self::well_name(row, col));
+                        let file_base = Path::new(&base)
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or(base);
+                        Self::collect_subdir_tiff_files(
+                            &parent,
+                            &file_base,
+                            dims.n_timepoints,
+                            dims.z_steps,
+                        )
+                    };
+                self.inner.set_id_with_resolver(path, &mut resolver)
             }
         }
     }
 
     fn close(&mut self) -> Result<()> {
-        self.subdir = None;
         self.inner.close()
     }
 
     fn series_count(&self) -> usize {
-        if self.subdir.is_some() {
-            // Nested-layout fallback exposes a single series spanning the
-            // resolved TIFF list as logical planes.
-            1
-        } else {
-            self.inner.series_count()
-        }
+        self.inner.series_count()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.subdir.is_some() {
-            if s == 0 {
-                return Ok(());
-            }
-            return Err(BioFormatsError::SeriesOutOfRange(s));
-        }
         self.inner.set_series(s)
     }
 
     fn series(&self) -> usize {
-        if self.subdir.is_some() {
-            0
-        } else {
-            self.inner.series()
-        }
+        self.inner.series()
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        if let Some(sd) = &self.subdir {
-            return sd.reader.metadata();
-        }
         self.inner.metadata()
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        if let Some(sd) = self.subdir.as_mut() {
-            Self::ensure_subdir_plane(sd, p)?;
-            return sd.reader.open_bytes(0);
-        }
         self.inner.open_bytes(p)
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        if let Some(sd) = self.subdir.as_mut() {
-            Self::ensure_subdir_plane(sd, p)?;
-            return sd.reader.open_bytes_region(0, x, y, w, h);
-        }
         self.inner.open_bytes_region(p, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        if let Some(sd) = self.subdir.as_mut() {
-            Self::ensure_subdir_plane(sd, p)?;
-            return sd.reader.open_thumb_bytes(0);
-        }
         self.inner.open_thumb_bytes(p)
     }
 
     fn resolution_count(&self) -> usize {
-        if self.subdir.is_some() {
-            1
-        } else {
-            self.inner.resolution_count()
-        }
+        self.inner.resolution_count()
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if self.subdir.is_some() {
-            if level == 0 {
-                return Ok(());
-            }
-            return Err(BioFormatsError::Format(format!(
-                "resolution level {level} out of range"
-            )));
-        }
         self.inner.set_resolution(level)
     }
 }
@@ -9183,6 +9068,65 @@ mod tests {
             matches!(md.get("PlanePositionX"), Some(MetadataValue::Float(v)) if (*v - 10.0).abs() < 1e-9),
             "plane position X not captured: {md:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MetaXpress nested `TimePoint_<t>/ZStep_<z>/` layout must produce the full
+    /// well x field x T x Z series grid (via the CellWorxReader hook), not a flat
+    /// single plane series, and route each plane to the correct subdir TIFF.
+    #[test]
+    fn metaxpress_subdir_layout_builds_well_grid() {
+        let dir = temp_path("metaxpress_subdir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1x1 well plate, single field, 2 timepoints x 2 z-steps, 1 wavelength.
+        let htd = dir.join("Plate.HTD");
+        std::fs::write(
+            &htd,
+            "\"XWells\", 1\n\
+             \"YWells\", 1\n\
+             \"WellsSelection1\", true\n\
+             \"XSites\", 1\n\
+             \"YSites\", 1\n\
+             \"TimePoints\", 2\n\
+             \"ZSteps\", 2\n\
+             \"NWavelengths\", 1\n\
+             \"WaveName1\", \"DAPI\"\n",
+        )
+        .unwrap();
+
+        // Walk order is TimePoint_1/ZStep_1, .._2, TimePoint_2/ZStep_1, .._2.
+        // The flat naming finds nothing on disk, so the subdir fallback drives
+        // the hook. Per-plane pixel values let us check the ZCT routing.
+        let meta = test_meta(1, 1);
+        let plane_values: [(u32, u32, u8); 4] = [(1, 1, 10), (1, 2, 20), (2, 1, 30), (2, 2, 40)];
+        for (t, z, value) in plane_values {
+            let zdir = dir.join(format!("TimePoint_{t}")).join(format!("ZStep_{z}"));
+            std::fs::create_dir_all(&zdir).unwrap();
+            // Filename must start with the well prefix "Plate_A01".
+            let tiff = zdir.join(format!("Plate_A01_w1_t{t}_z{z}.tif"));
+            write_tiff(&tiff, &meta, &[value]);
+        }
+
+        let mut reader = MetaxpressTiffReader::new();
+        reader.set_id(&htd).expect("subdir layout opens");
+
+        // Full grid: one well x one field = one series, but with Z=2, T=2.
+        assert_eq!(reader.series_count(), 1, "expected single well x field series");
+        let m = reader.metadata();
+        assert_eq!(m.size_z, 2, "Z grid from HTD ZSteps");
+        assert_eq!(m.size_t, 2, "T grid from HTD TimePoints");
+        assert_eq!(m.size_c, 1);
+        assert_eq!(m.image_count, 4, "Z*C*T planes");
+
+        // Each plane routes to its subdir TIFF via getFile ZCT indexing.
+        // Plane p under XYCZT (C=1): c=0, z=p%2, t=p/2 -> files[z + 2t].
+        let expected = [10u8, 20u8, 30u8, 40u8];
+        for (p, &want) in expected.iter().enumerate() {
+            let bytes = reader.open_bytes(p as u32).expect("plane reads");
+            assert_eq!(bytes.first().copied(), Some(want), "plane {p} routed wrong");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

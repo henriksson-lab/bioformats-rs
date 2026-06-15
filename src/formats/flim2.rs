@@ -8473,37 +8473,67 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
                 ),
             });
     }
-    if meta
-        .series_metadata
-        .keys()
-        .any(|k| k.starts_with("xlef.lms.detector.0."))
+    // Instrument-level detector array (MetadataStoreInitializer.initDetectorModels):
+    // one OmeDetector per `xlef.lms.detector.N.*` group, N = 0, 1, 2, ...
     {
-        instrument
-            .detectors
-            .push(crate::common::ome_metadata::OmeDetector {
-                id: Some(crate::common::ome_metadata::create_lsid("Detector", &[0, 0])),
-                model: xlef_lms_metadata_string(meta, "xlef.lms.detector.0.name"),
-                manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.detector.0.manufacturer"),
-                detector_type: xlef_lms_metadata_string(meta, "xlef.lms.detector.0.type"),
-                gain: xlef_lms_metadata_float(meta, "xlef.lms.detector.0.gain"),
-                offset: xlef_lms_metadata_float(meta, "xlef.lms.detector.0.offset"),
-            });
+        let mut n = 0usize;
+        while meta
+            .series_metadata
+            .keys()
+            .any(|k| k.starts_with(&format!("xlef.lms.detector.{n}.")))
+        {
+            instrument
+                .detectors
+                .push(crate::common::ome_metadata::OmeDetector {
+                    id: Some(crate::common::ome_metadata::create_lsid(
+                        "Detector",
+                        &[0, n],
+                    )),
+                    model: xlef_lms_metadata_string(meta, &format!("xlef.lms.detector.{n}.name")),
+                    manufacturer: xlef_lms_metadata_string(
+                        meta,
+                        &format!("xlef.lms.detector.{n}.manufacturer"),
+                    ),
+                    detector_type: xlef_lms_metadata_string(
+                        meta,
+                        &format!("xlef.lms.detector.{n}.type"),
+                    ),
+                    gain: xlef_lms_metadata_float(meta, &format!("xlef.lms.detector.{n}.gain")),
+                    offset: xlef_lms_metadata_float(meta, &format!("xlef.lms.detector.{n}.offset")),
+                });
+            n += 1;
+        }
     }
-    if meta
-        .series_metadata
-        .keys()
-        .any(|k| k.starts_with("xlef.lms.laser.0."))
+    // Instrument-level laser array (MetadataStoreInitializer.initLasers):
+    // one OmeLightSource per `xlef.lms.laser.N.*` group, N = 0, 1, 2, ...
     {
-        instrument
-            .light_sources
-            .push(crate::common::ome_metadata::OmeLightSource {
-                id: Some(crate::common::ome_metadata::create_lsid("LightSource", &[0, 0])),
-                model: xlef_lms_metadata_string(meta, "xlef.lms.laser.0.name"),
-                manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.laser.0.manufacturer"),
-                light_source_type: Some("Laser".into()),
-                power: xlef_lms_metadata_float(meta, "xlef.lms.laser.0.power"),
-                wavelength: xlef_lms_metadata_float(meta, "xlef.lms.laser.0.wavelength"),
-            });
+        let mut n = 0usize;
+        while meta
+            .series_metadata
+            .keys()
+            .any(|k| k.starts_with(&format!("xlef.lms.laser.{n}.")))
+        {
+            instrument
+                .light_sources
+                .push(crate::common::ome_metadata::OmeLightSource {
+                    id: Some(crate::common::ome_metadata::create_lsid(
+                        "LightSource",
+                        &[0, n],
+                    )),
+                    model: xlef_lms_metadata_string(meta, &format!("xlef.lms.laser.{n}.name")),
+                    manufacturer: xlef_lms_metadata_string(
+                        meta,
+                        &format!("xlef.lms.laser.{n}.manufacturer"),
+                    ),
+                    light_source_type: Some("Laser".into()),
+                    power: xlef_lms_metadata_float(meta, &format!("xlef.lms.laser.{n}.power")),
+                    wavelength: xlef_lms_metadata_float(
+                        meta,
+                        &format!("xlef.lms.laser.{n}.wavelength"),
+                    ),
+                });
+            n += 1;
+        }
     }
     if meta
         .series_metadata

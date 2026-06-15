@@ -2543,31 +2543,77 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
         buffer.serial_number.as_deref(),
     );
 
-    // Detector (MetadataStoreInitializer.initDetectorModels). The simplified
-    // consumer model carries a single detector; emit the last (active) one with
-    // its zoom-derived type and the first channel's gain/offset.
-    if let Some(model) = buffer.detector_models.last() {
-        put_str(meta, "xlef.lms.detector.0.name", Some(model));
-        meta.series_metadata.insert(
-            "xlef.lms.detector.0.type".into(),
-            MetadataValue::String("PMT".into()),
-        );
-        put_f64(
-            meta,
-            "xlef.lms.detector.0.gain",
-            buffer.gains.iter().flatten().next().copied(),
-        );
-        put_f64(
-            meta,
-            "xlef.lms.detector.0.offset",
-            buffer.detector_offsets.iter().flatten().next().copied(),
-        );
+    // Detector (MetadataStoreInitializer.initDetectorModels): the instrument-level
+    // detector array. Java loops `detector` from `start = detectors.size() -
+    // getEffectiveSizeC()` (clamped to 0) up to `detectors.size()`, with
+    // `dIndex = detector - start`, emitting setDetectorID/Model/Zoom/Type(PMT) for
+    // every detector. Offsets follow the active-detector / nextChannel walk.
+    {
+        let detectors = &buffer.detector_models;
+        if !detectors.is_empty() {
+            let effective_c = extractor.get_effective_size_c().max(0) as usize;
+            let mut start = detectors.len().saturating_sub(effective_c);
+            if start > detectors.len() {
+                start = 0;
+            }
+            // nextChannel walks the detectorOffsets array for active detectors.
+            let mut next_channel = 0usize;
+            for detector in start..detectors.len() {
+                let d_index = detector - start;
+                let prefix = format!("xlef.lms.detector.{d_index}");
+                put_str(meta, &format!("{prefix}.name"), Some(&detectors[detector]));
+                meta.series_metadata.insert(
+                    format!("{prefix}.type"),
+                    MetadataValue::String("PMT".into()),
+                );
+                // store.setDetectorZoom(zooms[index]).
+                put_f64(meta, &format!("{prefix}.zoom"), buffer.zoom);
+
+                // Offset: only emitted for active detectors, mirroring the
+                // detectorIndex / nextChannel guards in Java.
+                if !buffer.active_detector.is_empty() {
+                    let active_len = buffer.active_detector.len();
+                    let detector_index =
+                        active_len as isize - effective_c as isize + d_index as isize;
+                    if detector_index >= 0
+                        && (detector_index as usize) < active_len
+                        && buffer.active_detector[detector_index as usize]
+                        && next_channel < buffer.detector_offsets.len()
+                    {
+                        let offset = buffer.detector_offsets[next_channel];
+                        next_channel += 1;
+                        put_f64(meta, &format!("{prefix}.offset"), offset);
+                    }
+                }
+                // Gain: not set by initDetectorModels in Java; preserve the
+                // first-channel gain on detector 0 only (consumer compatibility).
+                if d_index == 0 {
+                    put_f64(
+                        meta,
+                        &format!("{prefix}.gain"),
+                        buffer.gains.iter().flatten().next().copied(),
+                    );
+                }
+            }
+        }
     }
 
-    // Laser (MetadataStoreInitializer.initLasers): first non-zero wavelength.
-    if let Some(&wavelength) = buffer.laser_wavelength.iter().find(|&&w| w != 0.0) {
-        put_str(meta, "xlef.lms.laser.0.name", Some("Laser"));
-        put_f64(meta, "xlef.lms.laser.0.wavelength", Some(wavelength));
+    // Laser (MetadataStoreInitializer.initLasers): the instrument-level laser
+    // array. Java first removes zero-wavelength entries from `lasers`, then loops
+    // `laser` from 0 to `lasers.size()` emitting setLaserID/Type(OTHER)/Medium
+    // (OTHER)/Wavelength for each.
+    {
+        let lasers: Vec<f64> = buffer
+            .laser_wavelength
+            .iter()
+            .copied()
+            .filter(|&w| w != 0.0)
+            .collect();
+        for (laser, &wavelength) in lasers.iter().enumerate() {
+            let prefix = format!("xlef.lms.laser.{laser}");
+            put_str(meta, &format!("{prefix}.name"), Some("Laser"));
+            put_f64(meta, &format!("{prefix}.wavelength"), Some(wavelength));
+        }
     }
 
     // Filter (MetadataStoreInitializer.initFilterModels): first cut-in/out pair.
