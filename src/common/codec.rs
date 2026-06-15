@@ -1378,8 +1378,19 @@ pub fn decompress_nikon(data: &[u8], width: u32, height: u32, bpp: u32) -> Resul
 /// This decodes the raw LZO1X block format used inside container codecs. It
 /// does not parse lzop file headers.
 pub fn decompress_lzo(data: &[u8]) -> Result<Vec<u8>> {
+    decompress_lzo_with_consumed(data).map(|(out, _)| out)
+}
+
+/// LZO1X decompression that also reports how many input bytes were consumed.
+///
+/// Returns the decoded bytes plus the number of bytes read from `data` up to
+/// and including the LZO1X end marker. This is needed by container formats
+/// (e.g. Volocity clipping planes) that pack multiple raw LZO1X blocks
+/// back-to-back and must advance the input cursor past each decoded block.
+pub fn decompress_lzo_with_consumed(data: &[u8]) -> Result<(Vec<u8>, usize)> {
     let mut decoder = Lzo1xDecoder::new(data);
-    decoder.decode()
+    let out = decoder.decode()?;
+    Ok((out, decoder.ip))
 }
 
 /// Standard Base64 decoding.
@@ -1512,12 +1523,14 @@ impl<'a> Lzo1xDecoder<'a> {
                 let pair = self.read_le_u16()? as usize;
                 let offset = 0x4000 + ((token & 0x08) << 11) + (pair >> 2);
                 if offset == 0x4000 {
-                    if self.ip == self.input.len() {
-                        return Ok(std::mem::take(&mut self.output));
-                    }
-                    return Err(BioFormatsError::InvalidData(
-                        "LZO1X: trailing data after end marker".into(),
-                    ));
+                    // End-of-stream marker (0x11 0x00 0x00). The stream is
+                    // complete; stop here and leave `ip` positioned just past
+                    // the marker regardless of any trailing bytes, so callers
+                    // that pack blocks back-to-back (e.g. Volocity clipping
+                    // planes, which skip a 4-byte trailer between blocks) can
+                    // resume decoding from `decoder.ip`. Java's LZOCodec also
+                    // terminates at the marker and ignores trailing input.
+                    return Ok(std::mem::take(&mut self.output));
                 }
                 self.copy_match(offset + 1, len)?;
                 pair & 0x03
@@ -2854,6 +2867,50 @@ mod tests {
         let out = decompress_lzo(&data).expect("LZO1X decode");
 
         assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn lzo1x_with_consumed_reports_block_length() {
+        // A single "hello" literal block is 9 bytes (5 initial literals + the
+        // 3-byte end marker, preceded by the token byte).
+        let block = [
+            22, b'h', b'e', b'l', b'l', b'o', // five initial literals
+            0x11, 0x00, 0x00, // end marker
+        ];
+
+        let (out, consumed) =
+            decompress_lzo_with_consumed(&block).expect("LZO1X decode with consumed");
+        assert_eq!(out, b"hello");
+        assert_eq!(consumed, block.len());
+    }
+
+    #[test]
+    fn lzo1x_with_consumed_decodes_back_to_back_blocks() {
+        // Two raw LZO1X blocks packed back-to-back, each separated from the
+        // next by a 4-byte trailer (as Volocity clipping planes store them).
+        let block_a = [22, b'h', b'e', b'l', b'l', b'o', 0x11, 0x00, 0x00];
+        let block_b = [21, b'w', b'o', b'r', b'l', 0x11, 0x00, 0x00];
+        let trailer = [0xde, 0xad, 0xbe, 0xef];
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&block_a);
+        data.extend_from_slice(&trailer);
+        data.extend_from_slice(&block_b);
+
+        let mut pos = 0usize;
+        let mut decoded = Vec::new();
+        let (out_a, consumed_a) =
+            decompress_lzo_with_consumed(&data[pos..]).expect("first block");
+        decoded.extend_from_slice(&out_a);
+        assert_eq!(consumed_a, block_a.len());
+        pos += consumed_a + trailer.len(); // mirror Java's skipBytes(4)
+
+        let (out_b, consumed_b) =
+            decompress_lzo_with_consumed(&data[pos..]).expect("second block");
+        decoded.extend_from_slice(&out_b);
+        assert_eq!(consumed_b, block_b.len());
+
+        assert_eq!(decoded, b"helloworl");
     }
 
     #[test]

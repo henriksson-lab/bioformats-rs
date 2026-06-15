@@ -46,12 +46,16 @@ mdbtools      = { package = "mdbtools-pure-rs", version = "0.1" }
 bzip2 = "0.6"
 zarrs         = { version = "0.23", features = ["filesystem"] }
 serde_json    = "1"
+rusqlite      = { version = "0.32", features = ["bundled"], optional = true }
 
 [features]
 default = ["jpeg2000-write"]
 jpegxr = ["dep:jpegxr"]
 openslide = ["dep:openslide-pure-rs"]
 jpeg2000-write = ["dep:openjp2"]
+# TissueFAXS (.aqproj/.tfcyto) reads SQLite project databases; off by default
+# to keep the default build free of the bundled libsqlite3 C dependency.
+tissuefaxs = ["dep:rusqlite"]
 
 [[bin]]
 name = "bioformats-convert"

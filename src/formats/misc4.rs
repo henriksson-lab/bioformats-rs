@@ -9,7 +9,7 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue, ModuloAnnotation};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::stitcher::{FilePattern, FileStitcher};
@@ -4814,6 +4814,14 @@ struct ObfStack {
     flush_block_size: u64,
     chunk_logical_positions: Option<Vec<u64>>,
     chunk_file_positions: Option<Vec<u64>>,
+    /// True when this stack is a FLIM stack (first label starts with `SPCM`);
+    /// its lifetime dimension is read interleaved (see `readFlimFrame` in Java).
+    is_flim: bool,
+}
+
+/// True if `label` is a FLIM (SPCM-prefixed) dimension label.
+fn obf_is_flim_label(label: &str) -> bool {
+    label.starts_with("SPCM")
 }
 
 /// Little-endian sequential reader over the OBF file used during parsing.
@@ -5170,6 +5178,49 @@ impl ObfReadState {
         }
         Ok(())
     }
+
+    /// FLIM read path (Java OBFReader.readFlimFrame). The lifetime dimension is
+    /// stored interleaved per pixel, so the whole stack is decoded once and the
+    /// requested lifetime slice `no` is de-interleaved into `region`.
+    #[allow(clippy::too_many_arguments)]
+    fn read_flim_frame(
+        &mut self,
+        stack: &ObfStack,
+        size_x: u32,
+        size_y: u32,
+        size_z: u32,
+        no: u32,
+        region: &mut [u8],
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<()> {
+        let bps = stack.bytes_per_sample;
+        let width = size_x as usize;
+        let lifetime_count = size_z as usize;
+
+        // Decode the whole stack once (mirrors state.wholeStackBuffer).
+        let whole_stack_size = (size_x as usize) * (size_y as usize) * lifetime_count * bps;
+        let mut whole = vec![0u8; whole_stack_size];
+        self.seek_to_frame_start(stack, 0)?;
+        let to_read = (stack.samples_written as usize) * bps;
+        let to_read = to_read.min(whole.len());
+        self.read_from_stack(stack, &mut whole[0..to_read])?;
+
+        let no = no as usize;
+        for yy in y..y + h {
+            for xx in x..x + w {
+                let source = lifetime_count * bps * ((yy as usize) * width + xx as usize)
+                    + no * bps;
+                let dest = ((yy - y) as usize) * (w as usize) * bps + ((xx - x) as usize) * bps;
+                if source + bps <= whole.len() {
+                    region[dest..dest + bps].copy_from_slice(&whole[source..source + bps]);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// OBF / MSR (Imspector / Abberior STED) format reader.
@@ -5266,12 +5317,15 @@ impl ObfReader {
             }
         }
 
-        let size_x = sizes[0].max(0) as u32;
-        let size_y = sizes[1].max(0) as u32;
-        let size_z = sizes[2].max(0) as u32;
+        let mut size_x = sizes[0].max(0) as u32;
+        let mut size_y = sizes[1].max(0) as u32;
+        let mut size_z = sizes[2].max(0) as u32;
         let size_c = sizes[3].max(0) as u32;
         let size_t = sizes[4].max(0) as u32;
-        let image_count = size_z * size_c * size_t;
+        let mut image_count = size_z * size_c * size_t;
+        // FLIM moduloZ, populated below when an SPCM label is encountered.
+        let mut modulo_z: Option<ModuloAnnotation> = None;
+        let mut is_flim = false;
 
         // lengths (15 doubles) and offsets (15 doubles) - parsed but unused.
         for _ in 0..OBF_MAX_DIMS {
@@ -5320,6 +5374,7 @@ impl ObfReader {
             flush_block_size: 0,
             chunk_logical_positions: None,
             chunk_file_positions: None,
+            is_flim: false,
         };
 
         if stack_version >= 1 {
@@ -5370,10 +5425,41 @@ impl ObfReader {
 
             input.seek(footer + offset.max(0) as u64)?;
 
-            // labels (one length-prefixed string per real dimension).
-            for _ in 0..num_dims {
+            // labels (one length-prefixed string per real dimension). The FLIM
+            // detection mirrors Java OBFReader.initStack lines 509-531: an
+            // SPCM-prefixed first label promotes dim 1/2 to X/Y and the
+            // SPCM-labelled dimension to a lifetime moduloZ.
+            let mut labels: Vec<String> = Vec::with_capacity(num_dims);
+            for dimension in 0..num_dims {
                 let length = input.i32()?;
-                input.skip(length.max(0) as u64)?;
+                let bytes = input.read_n(length.max(0) as usize)?;
+                let label = String::from_utf8_lossy(&bytes).into_owned();
+                labels.push(label.clone());
+
+                let first_is_flim = !labels.is_empty() && obf_is_flim_label(&labels[0]);
+                if (label.ends_with('X') && size_x == 0) || (dimension == 1 && first_is_flim) {
+                    size_x = sizes[dimension].max(0) as u32;
+                } else if (label.ends_with('Y') && size_y == 0)
+                    || (dimension == 2 && first_is_flim)
+                {
+                    size_y = sizes[dimension].max(0) as u32;
+                } else if obf_is_flim_label(&label) {
+                    size_z = sizes[dimension].max(0) as u32;
+                    is_flim = true;
+                    modulo_z = Some(ModuloAnnotation {
+                        // Java sets moduloZ.typeDescription = label; our
+                        // ModuloAnnotation has no typeDescription, so the
+                        // label is preserved in `labels` instead.
+                        parent_dimension: "Z".to_string(),
+                        modulo_type: "lifetime".to_string(),
+                        start: 0.0,
+                        step: 1.0,
+                        end: (size_z as f64) - 1.0,
+                        unit: String::new(),
+                        labels: vec![label.clone()],
+                    });
+                    image_count = size_z * size_c * size_t;
+                }
             }
 
             // steps (doubles) per dimension when present.
@@ -5424,6 +5510,7 @@ impl ObfReader {
             ));
         }
 
+        stack.is_flim = is_flim;
         self.stacks.push(stack);
         self.metas.push(ImageMetadata {
             size_x,
@@ -5442,7 +5529,7 @@ impl ObfReader {
             resolution_count: 1,
             series_metadata: HashMap::new(),
             lookup_table: None,
-            modulo_z: None,
+            modulo_z,
             modulo_c: None,
             modulo_t: None,
         });
@@ -5476,21 +5563,35 @@ impl ObfReader {
             .ok_or_else(|| BioFormatsError::Format("OBF region too large".to_string()))?;
         let mut region = vec![0u8; region_bytes];
 
-        let columns = meta.size_x as i64;
-        let rows = meta.size_y as i64;
-        let frame_start_sample_offset =
-            (plane_index as i64) * rows * columns + (y as i64) * columns + x as i64;
-
         let mut state = ObfReadState::new(file);
-        state.read_stack_frame(
-            stack,
-            meta.size_x,
-            meta.size_y,
-            frame_start_sample_offset,
-            &mut region,
-            w,
-            h,
-        )?;
+        if stack.is_flim {
+            state.read_flim_frame(
+                stack,
+                meta.size_x,
+                meta.size_y,
+                meta.size_z,
+                plane_index,
+                &mut region,
+                x,
+                y,
+                w,
+                h,
+            )?;
+        } else {
+            let columns = meta.size_x as i64;
+            let rows = meta.size_y as i64;
+            let frame_start_sample_offset =
+                (plane_index as i64) * rows * columns + (y as i64) * columns + x as i64;
+            state.read_stack_frame(
+                stack,
+                meta.size_x,
+                meta.size_y,
+                frame_start_sample_offset,
+                &mut region,
+                w,
+                h,
+            )?;
+        }
         Ok(region)
     }
 }

@@ -7058,6 +7058,22 @@ fn cellomics_well_row_col(metadata: &CellomicsFilenameMetadata) -> Option<(u32, 
     }
 }
 
+/// Port of `FormatTools.getWellName(row, col)`: a row letter (A, ..., Z, AA, ...)
+/// followed by the 1-based column zero-padded to at least two digits.
+fn cellomics_well_name(row: i32, col: i32) -> String {
+    let mut r = row.max(0);
+    let mut letters = String::new();
+    loop {
+        let rem = (r % 26) as u8;
+        letters.insert(0, (b'A' + rem) as char);
+        r = r / 26 - 1;
+        if r < 0 {
+            break;
+        }
+    }
+    format!("{}{:02}", letters, col.max(0) + 1)
+}
+
 fn cellomics_headers_match_for_plate_assembly(
     left: &CellomicsParsedHeader,
     right: &CellomicsParsedHeader,
@@ -8016,6 +8032,101 @@ fn cellomics_matching_channel_sources(
     (sources, planes, metadata)
 }
 
+/// Port of the plate/well portion of Java `CellomicsReader.initFile`.
+///
+/// Java derives a single Plate whose row/column count is snapped to a standard
+/// plate size based on the maximum well row/column observed across every series
+/// and the total series count:
+///   - 1 series                -> 1x1 (the lone well is placed at its own row/col)
+///   - <= 8 rows and <= 12 cols -> 96-well (8x12)
+///   - otherwise               -> 384-well (16x24)
+/// Each series maps to a WellSample (field index) inside its well. We stamp the
+/// resulting per-series plate placement into the series metadata so that
+/// `ome_metadata` can rebuild the OME Plate/Well/WellSample tree faithfully.
+fn cellomics_finalize_plate_metadata(
+    metas: &mut [ImageMetadata],
+    filename_metadata: &CellomicsFilenameMetadata,
+) {
+    let series_count = metas.len();
+    if series_count == 0 {
+        return;
+    }
+
+    // wellRows / wellColumns are the maxima over all files (Java tracks them in
+    // the file loop). When the plate could not be parsed the metadata simply
+    // carries zero, matching Java's defaults.
+    let mut well_rows = 0u32;
+    let mut well_columns = 0u32;
+    for meta in metas.iter() {
+        if let Some(row) = cellomics_metadata_i64(&meta.series_metadata, "cellomics.well_row") {
+            well_rows = well_rows.max(row.max(0) as u32);
+        }
+        if let Some(col) = cellomics_metadata_i64(&meta.series_metadata, "cellomics.well_column") {
+            well_columns = well_columns.max(col.max(0) as u32);
+        }
+    }
+
+    let (real_rows, real_cols) = if series_count == 1 {
+        (1u32, 1u32)
+    } else if well_rows + 1 <= 8 && well_columns + 1 <= 12 {
+        (8, 12)
+    } else {
+        (16, 24)
+    };
+
+    let plate_name = filename_metadata
+        .plate
+        .clone()
+        .or_else(|| {
+            cellomics_metadata_string(&metas[0].series_metadata, "cellomics.plate")
+        })
+        .unwrap_or_default();
+
+    for (series_index, meta) in metas.iter_mut().enumerate() {
+        meta.series_metadata.insert(
+            "cellomics.plate.real_rows".into(),
+            MetadataValue::Int(real_rows as i64),
+        );
+        meta.series_metadata.insert(
+            "cellomics.plate.real_columns".into(),
+            MetadataValue::Int(real_cols as i64),
+        );
+        meta.series_metadata.insert(
+            "cellomics.plate.series_count".into(),
+            MetadataValue::Int(series_count as i64),
+        );
+        if !plate_name.is_empty() {
+            meta.series_metadata.insert(
+                "cellomics.plate.name".into(),
+                MetadataValue::String(plate_name.clone()),
+            );
+        }
+
+        // Java places the lone well of a single-series plate at its own row/col
+        // (the 1x1 case sets row=files.get(0).row, col=files.get(0).col), but
+        // resets the *image* row/col to 0 when computing the well index.
+        let row = cellomics_metadata_i64(&meta.series_metadata, "cellomics.well_row")
+            .map(|v| v.max(0) as u32)
+            .unwrap_or(0);
+        let col = cellomics_metadata_i64(&meta.series_metadata, "cellomics.well_column")
+            .map(|v| v.max(0) as u32)
+            .unwrap_or(0);
+        let (image_row, image_col) = if series_count == 1 { (0, 0) } else { (row, col) };
+
+        if image_row < real_rows && image_col < real_cols {
+            let well_index = image_row * real_cols + image_col;
+            meta.series_metadata.insert(
+                "cellomics.plate.well_index".into(),
+                MetadataValue::Int(well_index as i64),
+            );
+            meta.series_metadata.insert(
+                "cellomics.plate.well_sample_index".into(),
+                MetadataValue::Int(series_index as i64),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod cellomics_mdb_tests {
     use super::{
@@ -8471,7 +8582,7 @@ impl FormatReader for CellomicsReader {
                     pixel_type: header.pixel_type,
                     bits_per_pixel: header.bits_per_pixel,
                     image_count: image_count.max(1),
-                    dimension_order: DimensionOrder::XYZCT,
+                    dimension_order: DimensionOrder::XYCZT,
                     is_rgb: false,
                     is_interleaved: false,
                     is_indexed: false,
@@ -8501,16 +8612,25 @@ impl FormatReader for CellomicsReader {
                 header.dib_compression,
                 header.dib_top_down,
             );
+            // Java initFile sets sizeZ = nPlanes (the DIB plane count) and
+            // sizeC = uniqueChannels.size(); imageCount = sizeZ*sizeT*sizeC.
+            // When sibling channel files were assembled, the per-channel planes
+            // become C; otherwise the file's own planes are Z (single channel).
+            let (size_z, size_c) = if assembled_channels {
+                (1, image_count)
+            } else {
+                (image_count, 1)
+            };
             metas.push(ImageMetadata {
                 size_x: header.width,
                 size_y: header.height,
-                size_z: 1,
-                size_c: if assembled_channels { image_count } else { 1 },
+                size_z,
+                size_c,
                 size_t: 1,
                 pixel_type: header.pixel_type,
                 bits_per_pixel: header.bits_per_pixel,
                 image_count,
-                dimension_order: DimensionOrder::XYZCT,
+                dimension_order: DimensionOrder::XYCZT,
                 is_rgb: false,
                 is_interleaved: false,
                 is_indexed: false,
@@ -8525,6 +8645,8 @@ impl FormatReader for CellomicsReader {
             series_sources.push(sources);
             series_planes.push(planes);
         }
+
+        cellomics_finalize_plate_metadata(&mut metas, &filename_metadata);
 
         self.path = Some(path.to_path_buf());
         self.current_series = 0;
@@ -8574,7 +8696,22 @@ impl FormatReader for CellomicsReader {
         let meta = self.metas.get(self.current_series)?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
         if let Some(image) = ome.images.get_mut(0) {
-            if let Some(plate) = cellomics_metadata_string(&meta.series_metadata, "cellomics.plate")
+            // Java initFile names every image "Well %s, Field #%02d" using
+            // FormatTools.getWellName(row, col) (zero-padded column) and the
+            // field index. We fall back to the plate/well metadata only when the
+            // row/column could not be parsed.
+            let row = cellomics_metadata_i64(&meta.series_metadata, "cellomics.well_row");
+            let col = cellomics_metadata_i64(&meta.series_metadata, "cellomics.well_column");
+            let field =
+                cellomics_metadata_i64(&meta.series_metadata, "cellomics.field_index").unwrap_or(0);
+            if let (Some(row), Some(col)) = (row, col) {
+                image.name = Some(format!(
+                    "Well {}, Field #{:02}",
+                    cellomics_well_name(row.max(0) as i32, col.max(0) as i32),
+                    field
+                ));
+            } else if let Some(plate) =
+                cellomics_metadata_string(&meta.series_metadata, "cellomics.plate")
             {
                 let well = cellomics_metadata_string(&meta.series_metadata, "cellomics.well")
                     .map(|well| format!(" {well}"))
@@ -8616,6 +8753,44 @@ impl FormatReader for CellomicsReader {
                 .and_then(cellomics_ome_color);
             }
         }
+
+        // Port of the OME Plate/Well/WellSample population from Java initFile.
+        // The plate is global in Java; here each series exposes the plate frame
+        // (id, name, snapped rows/columns) plus the single well/well-sample that
+        // this series populates, with the well sample referencing image 0.
+        if let (Some(real_rows), Some(real_cols)) = (
+            cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.real_rows"),
+            cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.real_columns"),
+        ) {
+            let mut plate = OmePlate {
+                id: Some(create_lsid("Plate", &[0])),
+                name: cellomics_metadata_string(&meta.series_metadata, "cellomics.plate.name"),
+                rows: real_rows.max(0) as u32,
+                columns: real_cols.max(0) as u32,
+                wells: Vec::new(),
+            };
+            if let (Some(well_index), Some(well_sample_index)) = (
+                cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.well_index"),
+                cellomics_metadata_i64(&meta.series_metadata, "cellomics.plate.well_sample_index"),
+            ) {
+                let cols = plate.columns.max(1);
+                let well = well_index.max(0) as u32;
+                plate.wells.push(OmeWell {
+                    id: Some(create_lsid("Well", &[0, well as usize])),
+                    row: well / cols,
+                    column: well % cols,
+                    well_samples: vec![OmeWellSample {
+                        id: Some(create_lsid("WellSample", &[0, well as usize, 0])),
+                        index: well_sample_index.max(0) as u32,
+                        image_ref: Some(0),
+                        position_x: None,
+                        position_y: None,
+                    }],
+                });
+            }
+            ome.plates.push(plate);
+        }
+
         let _ = ome.add_original_metadata_annotations(meta, 0);
         Some(ome)
     }

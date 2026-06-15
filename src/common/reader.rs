@@ -1,5 +1,5 @@
 use super::ome_metadata::OmeMetadata;
-use crate::common::metadata::{ImageMetadata, MetadataOptions};
+use crate::common::metadata::{ImageMetadata, LookupTable, MetadataOptions};
 use crate::error::Result;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -43,6 +43,18 @@ pub trait FormatReader: Send + Sync {
     }
     fn resolution(&self) -> usize {
         0
+    }
+
+    /// Return the colour lookup table that applies to `plane_index`'s channel,
+    /// if the image is indexed.
+    ///
+    /// The default implementation returns the single LUT stored in
+    /// [`FormatReader::metadata`] (ignoring the plane). Indexed readers that
+    /// carry a distinct palette per channel (e.g. Imaris) override this to
+    /// select the LUT for the plane's channel. Mirrors Java's
+    /// `get8BitLookupTable`/`get16BitLookupTable` per-`lastChannel` selection.
+    fn lookup_table(&mut self, _plane_index: u32) -> Result<Option<LookupTable>> {
+        Ok(self.metadata().lookup_table.clone())
     }
 
     /// Set metadata parsing options. Must be called before `set_id`.

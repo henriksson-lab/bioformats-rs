@@ -102,6 +102,11 @@ pub struct OmeChannel {
     pub detector_settings_binning: Option<String>,
     /// Referenced detector ID for `<DetectorSettings>`.
     pub detector_ref: Option<String>,
+    /// Referenced LightSource LSID for `<LightSourceSettings>`.
+    pub light_source_settings_id: Option<String>,
+    /// `<LightSourceSettings>` attenuation as a 0.0..1.0 fraction
+    /// (Java `PercentFraction(intensity / 100f)`).
+    pub light_source_settings_attenuation: Option<f64>,
 }
 
 /// Instrument metadata (microscope, objectives, detectors, light sources).
@@ -159,6 +164,9 @@ pub struct OmeLightSource {
     pub light_source_type: Option<String>,
     /// Power (milliwatts).
     pub power: Option<f64>,
+    /// Laser line wavelength (nm). Only meaningful for `Laser` light sources;
+    /// serialized as the OME `Laser/@Wavelength` attribute.
+    pub wavelength: Option<f64>,
 }
 
 /// Optical filter metadata.
@@ -470,6 +478,12 @@ impl OmeMetadata {
                 if let Some(v) = ls.power {
                     let _ = write!(xml, r#" Power="{v}""#);
                 }
+                // Wavelength is only valid on the OME <Laser> element.
+                if ls_tag == "Laser" {
+                    if let Some(v) = ls.wavelength {
+                        let _ = write!(xml, r#" Wavelength="{v}""#);
+                    }
+                }
                 xml.push_str("/>");
             }
 
@@ -628,6 +642,8 @@ impl OmeMetadata {
                 if let Some(s) = &ch.acquisition_mode {
                     let _ = write!(xml, r#" AcquisitionMode="{}""#, xml_escape(s));
                 }
+                let has_light_source_settings = ch.light_source_settings_id.is_some()
+                    || ch.light_source_settings_attenuation.is_some();
                 let has_detector_settings = ch.detector_settings_gain.is_some()
                     || ch.detector_settings_offset.is_some()
                     || ch.detector_settings_voltage.is_some()
@@ -638,8 +654,21 @@ impl OmeMetadata {
                         || path.dichroic_id.is_some()
                         || !path.emission_filter_ids.is_empty()
                 });
-                if has_detector_settings || has_light_path {
+                if has_light_source_settings || has_detector_settings || has_light_path {
                     xml.push('>');
+                    if has_light_source_settings {
+                        let _ = write!(
+                            xml,
+                            r#"<LightSourceSettings ID="{}""#,
+                            xml_escape(
+                                ch.light_source_settings_id.as_deref().unwrap_or("LightSource:0")
+                            )
+                        );
+                        if let Some(v) = ch.light_source_settings_attenuation {
+                            let _ = write!(xml, r#" Attenuation="{v}""#);
+                        }
+                        xml.push_str("/>");
+                    }
                     if has_detector_settings {
                         let _ = write!(
                             xml,
@@ -1398,6 +1427,21 @@ fn parse_channels(pixels_xml: &str) -> Vec<OmeChannel> {
         .into_iter()
         .map(|pos| {
             let tag = start_tag_at(pixels_xml, pos);
+            // Round-trip the `<LightSourceSettings>` child element if present.
+            let body_start = pos + tag.len();
+            let body_end = find_end_tag(pixels_xml, "Channel", body_start).unwrap_or(body_start);
+            let body = pixels_xml.get(pos..body_end.max(pos)).unwrap_or("");
+            let (lss_id, lss_atten) = all_tag_positions(body, "LightSourceSettings")
+                .into_iter()
+                .next()
+                .map(|lp| {
+                    let lt = start_tag_at(body, lp);
+                    (
+                        xml_attr(lt, "ID"),
+                        xml_attr(lt, "Attenuation").and_then(|s| s.parse::<f64>().ok()),
+                    )
+                })
+                .unwrap_or((None, None));
             OmeChannel {
                 name: xml_attr(tag, "Name"),
                 samples_per_pixel: xml_attr(tag, "SamplesPerPixel")
@@ -1408,6 +1452,8 @@ fn parse_channels(pixels_xml: &str) -> Vec<OmeChannel> {
                     .and_then(|s| s.parse().ok()),
                 excitation_wavelength: xml_attr(tag, "ExcitationWavelength")
                     .and_then(|s| s.parse().ok()),
+                light_source_settings_id: lss_id,
+                light_source_settings_attenuation: lss_atten,
                 ..Default::default()
             }
         })
@@ -1617,6 +1663,7 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
                         manufacturer: xml_attr(t, "Manufacturer"),
                         light_source_type: Some(ls_tag.to_string()),
                         power: xml_attr(t, "Power").and_then(|s| s.parse().ok()),
+                        wavelength: xml_attr(t, "Wavelength").and_then(|s| s.parse().ok()),
                     });
                 }
             }
@@ -2701,6 +2748,18 @@ fn generic_light_source_from_metadata(meta: &ImageMetadata) -> Option<OmeLightSo
                 "laser.power",
                 "illumination.power",
                 "illumination.0.power",
+            ],
+            &excluded_prefixes,
+        ),
+        wavelength: metadata_positive_f64_by_suffix_filtered(
+            metadata,
+            &[
+                "light_source.wavelength",
+                "light_source.0.wavelength",
+                "lightsource.wavelength",
+                "laser.wavelength",
+                "illumination.wavelength",
+                "illumination.0.wavelength",
             ],
             &excluded_prefixes,
         ),

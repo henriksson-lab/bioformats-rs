@@ -412,11 +412,27 @@ impl FormatReader for QuickTimeReader {
                         "QuickTime sample {sample_index} has {sample_size} bytes, expected {expected} for uncompressed pixels"
                     )));
                 }
-                Ok(sample.to_vec())
+                let mut out = sample.to_vec();
+                // Java QTReader inverts 8-bit (and "40-bit"/grayscale-with-alpha)
+                // uncompressed planes: `buf[i] = 255 - buf[i]` (QTReader.java
+                // lines 269-274), gated on the codec not being mjpb. Uncompressed
+                // RGB (raw, 24-bit) is not inverted; only single-channel 8-bit is.
+                if matches!(series.codec, QuickTimeCodec::UncompressedGray) {
+                    quicktime_invert_pixels(&mut out);
+                }
+                Ok(out)
             }
             QuickTimeCodec::Jpeg => decode_quicktime_jpeg_sample(sample, meta, sample_index as u32),
             QuickTimeCodec::Png => decode_quicktime_png_sample(sample, meta, sample_index as u32),
-            QuickTimeCodec::Rpza => quicktime_decompress_rpza(sample, meta, sample_index as u32),
+            QuickTimeCodec::Rpza => {
+                // Java QTReader inverts the RPZA-decoded plane in place
+                // (`t[i] = 255 - t[i]`, QTReader.java lines 204-210) before
+                // returning, a quirk specific to QTReader (the shared
+                // RPZACodec does not invert).
+                let mut out = quicktime_decompress_rpza(sample, meta, sample_index as u32)?;
+                quicktime_invert_pixels(&mut out);
+                Ok(out)
+            }
             QuickTimeCodec::AnimationRle { depth } => {
                 let mut previous = None;
                 for current in 0..=sample_index {
@@ -645,6 +661,16 @@ fn be_u32_at(data: &[u8], offset: usize) -> Option<u32> {
 fn be_i32_at(data: &[u8], offset: usize) -> Option<i32> {
     data.get(offset..offset + 4)
         .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Inverts every byte of a decoded plane in place (`b = 255 - b`).
+///
+/// Mirrors the `255 - x` inversion loops in Java `QTReader.openBytes`
+/// (RPZA: lines 204-210; 8-bit/grayscale uncompressed: lines 269-274).
+fn quicktime_invert_pixels(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 255u8.wrapping_sub(*b);
+    }
 }
 
 fn quicktime_codec_from_fourcc(fourcc: &[u8], depth: u16) -> Result<QuickTimeCodec> {

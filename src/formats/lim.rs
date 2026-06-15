@@ -2026,52 +2026,72 @@ fn parse_tillvision_cimage_record(
     })
 }
 
+/// Faithful translation of TillVisionReader.findImages (java lines ~681-722).
+/// Java scans the Contents stream for the four-int signature
+/// `0xf03fff00, 0, 0, 0xff00` (each read big-endian, i.e. the literal byte
+/// sequences below), then computes a fixed pointer (i+22), optionally skips an
+/// inline "CImage" class name, and verifies the big-endian `0x08000400` marker.
+/// The returned offsets point at the per-image name-length byte. Java's
+/// sliding 8192-byte buffer with a 128-byte overlap is collapsed here to a
+/// single in-memory scan over `contents` (the OLE stream is already fully
+/// resident), which yields the same offsets.
 fn find_tillvision_cimage_offsets(contents: &[u8]) -> Vec<usize> {
     let mut offsets = Vec::new();
-    if contents.len() < 32 {
+    if contents.len() < 16 {
         return offsets;
     }
-    for i in 0..=contents.len() - 32 {
-        let marker = (&contents[i..i + 4] == b"\xf0\x3f\xff\x00"
-            || &contents[i..i + 4] == b"\x00\xff\x3f\xf0")
-            && contents[i + 4..i + 12] == [0; 8]
-            && (&contents[i + 12..i + 16] == b"\x00\x00\xff\x00"
-                || &contents[i + 12..i + 16] == b"\x00\xff\x00\x00");
+    // i + 22 + 10 (CImage skip) + 4 (0x08000400) + 5 (name length byte + 1) is
+    // the furthest position touched; bound the scan so all reads stay in range.
+    let limit = contents.len().saturating_sub(16);
+    for i in 0..limit {
+        // DataTools.bytesToInt(buf, i, 4, false) == 0xf03fff00 && ... == 0 &&
+        // ... == 0 && DataTools.bytesToInt(buf, i + 12, 4, false) == 0xff00
+        let marker = &contents[i..i + 4] == b"\xf0\x3f\xff\x00"
+            && contents[i + 4..i + 12] == [0u8; 8]
+            && &contents[i + 12..i + 16] == b"\x00\x00\xff\x00";
         if !marker {
             continue;
         }
 
-        if let Some(offset) = find_tillvision_cimage_record_offset_after_marker(contents, i) {
-            let name_len = contents[offset] as usize;
-            let name_start = offset + 1;
-            let name_end = name_start.saturating_add(name_len);
-            if name_end <= contents.len() {
-                let name = String::from_utf8_lossy(&contents[name_start..name_end]);
-                if !name.contains("Palette") && !offsets.contains(&offset) {
-                    offsets.push(offset);
-                }
+        let mut pointer = i + 22;
+        if pointer + 2 > contents.len() {
+            continue;
+        }
+        // int length = DataTools.bytesToShort(buf, pointer, 2, true); (LE)
+        let length = read_le_u16(contents, pointer) as usize;
+        if length == 6 {
+            let name_start = pointer + 2;
+            let name_end = name_start + length;
+            if name_end <= contents.len() && &contents[name_start..name_end] == b"CImage" {
+                pointer += length + 4;
             }
+        }
+
+        // if (DataTools.bytesToInt(buf, pointer, 4, false) == 0x08000400)
+        if pointer + 4 > contents.len() || &contents[pointer..pointer + 4] != b"\x08\x00\x04\x00" {
+            continue;
+        }
+        let offset = pointer + 4;
+        if offsets.contains(&offset) || offset >= contents.len() {
+            continue;
+        }
+        // int len = buf[pointer + 4]; -> signed byte cast to int
+        let name_len = contents[pointer + 4] as i8 as i32;
+        if name_len < 0 {
+            continue;
+        }
+        let name_len = name_len as usize;
+        let name_start = pointer + 5;
+        let name_end = name_start.saturating_add(name_len);
+        if name_end > contents.len() {
+            continue;
+        }
+        let name = String::from_utf8_lossy(&contents[name_start..name_end]);
+        if !name.contains("Palette") {
+            offsets.push(offset);
         }
     }
     offsets
-}
-
-fn find_tillvision_cimage_record_offset_after_marker(
-    contents: &[u8],
-    marker_offset: usize,
-) -> Option<usize> {
-    let scan_start = marker_offset.checked_add(16)?;
-    let scan_end = marker_offset.checked_add(96)?.min(contents.len());
-    let mut pointer = scan_start;
-    while pointer + 5 <= scan_end {
-        if &contents[pointer..pointer + 4] == b"\x08\x00\x04\x00"
-            || &contents[pointer..pointer + 4] == b"\x00\x04\x00\x08"
-        {
-            return Some(pointer + 4);
-        }
-        pointer += 1;
-    }
-    None
 }
 
 fn find_bytes_from(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {

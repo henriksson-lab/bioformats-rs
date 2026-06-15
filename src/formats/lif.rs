@@ -17,14 +17,17 @@
 //! sample groups; other payload variants return precise `UnsupportedFormat`
 //! errors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use quick_xml::events::Event;
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
-use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
+use crate::common::ome_metadata::{
+    create_lsid, OmeChannel, OmeDetector, OmeFilter, OmeImage, OmeInstrument, OmeLightSource,
+    OmeMetadata, OmeObjective, OmePlane, OmeROI, OmeShape,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 
@@ -48,7 +51,17 @@ struct SeriesInfo {
     /// OME-level metadata (image name, physical sizes, channel names) derived
     /// from the LIF XML, mirroring Java `LIFReader`.
     ome: OmeImage,
+    /// Instrument (objective, detectors, lasers, filters) for this series,
+    /// mirroring the per-series `<Instrument>` Java builds in `initMetadata`.
+    instrument: OmeInstrument,
+    /// Regions of interest parsed from `<Annotation>` / `<ROISingle>` nodes.
+    rois: Vec<OmeROI>,
     layout: PixelLayout,
+    /// Per-channel laser index for the channel's `<LightSourceSettings>` (Java
+    /// `laser` in `setChannelLightSourceSettingsID`). `None` means no light
+    /// source settings were assigned to that channel. Used by `ome_metadata`
+    /// to build the series-qualified `LightSource:i:laser` LSID.
+    light_source_settings_laser: Vec<Option<usize>>,
 }
 
 /// Byte strides declared by Leica's `<ChannelDescription>` and
@@ -379,8 +392,39 @@ impl FormatReader for LifReader {
         if self.series.is_empty() {
             return None;
         }
+        // Each series owns its own instrument and ROI set; collect them globally
+        // and link each image to its instrument and ROIs by index, mirroring the
+        // per-series Instrument/ROI the Java reader registers in `initMetadata`.
+        let mut images: Vec<OmeImage> = Vec::with_capacity(self.series.len());
+        let mut instruments: Vec<OmeInstrument> = Vec::new();
+        let mut rois: Vec<OmeROI> = Vec::new();
+        for (i, s) in self.series.iter().enumerate() {
+            let mut image = s.ome.clone();
+            // Finalize each channel's <LightSourceSettings> ID now that the
+            // series index `i` is known (Java MetadataTools.createLSID(
+            // "LightSource", i, laser)).
+            for (c, channel) in image.channels.iter_mut().enumerate() {
+                if let Some(Some(laser)) = s.light_source_settings_laser.get(c) {
+                    channel.light_source_settings_id =
+                        Some(create_lsid("LightSource", &[i, *laser]));
+                }
+            }
+            let instrument_id = create_lsid("Instrument", &[i]);
+            let mut instrument = s.instrument.clone();
+            instrument.id = Some(instrument_id.clone());
+            image.instrument_ref = Some(instruments.len());
+            instruments.push(instrument);
+            for roi in &s.rois {
+                let mut roi = roi.clone();
+                roi.id = Some(create_lsid("ROI", &[rois.len()]));
+                rois.push(roi);
+            }
+            images.push(image);
+        }
         Some(OmeMetadata {
-            images: self.series.iter().map(|s| s.ome.clone()).collect(),
+            images,
+            instruments,
+            rois,
             ..OmeMetadata::default()
         })
     }
@@ -1146,6 +1190,9 @@ struct Node {
     attrs: BTreeMap<String, String>,
     children: Vec<usize>,
     parent: Option<usize>,
+    /// Concatenated text content directly inside this element (mirrors
+    /// `getTextContent()`, used by the LAS AF 3.1 `<TimeStampList>` path).
+    text: String,
 }
 
 struct Dom {
@@ -1178,6 +1225,7 @@ impl Dom {
                     attrs,
                     children: Vec::new(),
                     parent,
+                    text: String::new(),
                 });
                 if let Some(p) = parent {
                     nodes[p].children.push(idx);
@@ -1196,6 +1244,13 @@ impl Dom {
                 }
                 Ok(Event::End(_)) => {
                     stack.pop();
+                }
+                Ok(Event::Text(t)) => {
+                    if let Some(&top) = stack.last() {
+                        if let Ok(value) = t.unescape() {
+                            nodes[top].text.push_str(value.as_ref());
+                        }
+                    }
                 }
                 Ok(Event::Eof) => break,
                 Ok(_) => {}
@@ -1545,10 +1600,20 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
     m.size_c = channel_nodes.len().max(1) as u32;
 
     // bytesPerAxis: sorted map nBytes -> axis, used to derive dimension order.
+    // lutNames mirrors Java's per-channel LUTName collection, used below to
+    // build the realChannel colour mapping.
     let mut bytes_per_axis: BTreeMap<u64, char> = BTreeMap::new();
     let mut channel_offsets: Vec<u64> = Vec::with_capacity(channel_nodes.len());
+    let mut lut_names: Vec<String> = Vec::with_capacity(channel_nodes.len());
     let mut c_stride: Option<u64> = None;
     for &ch in &channel_nodes {
+        lut_names.push(
+            dom.nodes[ch]
+                .attrs
+                .get("LUTName")
+                .cloned()
+                .unwrap_or_default(),
+        );
         if let Some(bi) = dom.nodes[ch].attrs.get("BytesInc") {
             if let Ok(b) = bi.trim().parse::<u64>() {
                 channel_offsets.push(b);
@@ -1776,20 +1841,107 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
     // non-RGB, or the RGB group count otherwise.
     let effective_c = effective_size_c.max(1) as usize;
     let ch_names = channel_names(dom, img, effective_c);
-    let channels: Vec<OmeChannel> = ch_names
-        .into_iter()
-        .map(|name| OmeChannel {
-            name,
-            samples_per_pixel: rgb_channel_count.max(1),
-            ..OmeChannel::default()
+
+    // realChannel mapping (Java initMetadata): map each channel's LUTName to a
+    // CHANNEL_PRIORITIES rank, then derive the OME channel colour. The Java
+    // `nextLut` counter advances across all series, but because LUT names are
+    // appended per image in channel order, each image consumes exactly its own
+    // channel LUT names in order — so the mapping is computable locally.
+    let real_channel: Vec<i32> = (0..(m.size_c as usize))
+        .map(|q| {
+            let lut = lut_names
+                .get(q)
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            channel_priority(&lut)
         })
         .collect();
 
+    let mut channels: Vec<OmeChannel> = ch_names
+        .into_iter()
+        .enumerate()
+        .map(|(c, name)| {
+            // Java only sets the channel colour when the image is not stored as
+            // RGB (channel colouring is implicit for RGB).
+            let color = if !is_rgb {
+                real_channel.get(c).map(|code| channel_color(*code))
+            } else {
+                None
+            };
+            OmeChannel {
+                name,
+                samples_per_pixel: rgb_channel_count.max(1),
+                color,
+                ..OmeChannel::default()
+            }
+        })
+        .collect();
+
+    // -- remaining metadata (mirrors Java translate* + initMetadata store) --
+    // Build the per-image accumulator the way Java's translate* methods fill the
+    // per-image arrays, then assemble the OME instrument / planes / ROIs below.
+    let image_count = m.image_count;
+    let mut acc = LifMetaAcc::new(effective_c);
+    translate_scanner_settings(dom, img, &mut acc);
+    translate_filter_settings(dom, img, &mut acc);
+    translate_timestamps(dom, img, image_count as usize, &mut acc);
+    translate_laser_lines(dom, img, &mut acc);
+    let lif_rois = translate_rois(dom, img, &mut acc, &m, physical_size_x, physical_size_y);
+    translate_detectors(dom, img, effective_c, &mut acc);
+
+    // Channel names: Java fills channelNames in scanner/filter/detector passes.
+    // The earlier `channel_names()`-based names take priority; fill blanks.
+    for (c, channel) in channels.iter_mut().enumerate() {
+        if channel.name.is_none() {
+            if let Some(Some(name)) = acc.channel_names.get(c) {
+                if !name.trim().is_empty() {
+                    channel.name = Some(name.clone());
+                }
+            }
+        }
+        // Java applies a single pinhole value to every channel.
+        if let Some(pinhole) = acc.pinhole {
+            channel.pinhole_size = Some(pinhole);
+        }
+        // WFC...WaveLength excitation wavelengths, per channel.
+        if let Some(Some(ex)) = acc.excitation_wavelengths.get(c) {
+            if *ex > 1.0 {
+                channel.excitation_wavelength = Some(*ex);
+            }
+        }
+        // Detector settings gain/offset, per channel.
+        if let Some(Some(gain)) = acc.gains.get(c) {
+            channel.detector_settings_gain = Some(*gain);
+        }
+        if let Some(Some(offset)) = acc.detector_offsets.get(c) {
+            channel.detector_settings_offset = Some(*offset);
+        }
+    }
+
+    // Per-channel laser <LightSourceSettings> (Java initMetadata ~746-893,
+    // the live validIntensities algorithm). Fills channel attenuation and
+    // returns the per-channel laser index used to build the LSID later.
+    let light_source_settings_laser =
+        apply_laser_light_source_settings(&acc, effective_c, &mut channels);
+
+    let z_step = acc.z_step;
+    let instrument = build_instrument(&acc, effective_c);
+    let planes = build_planes(&acc, &m);
+    let acquisition_date = acc.acquired_date.filter(|d| *d > 0.0).map(cobol_iso8601);
+
+    // ROI shapes need the series sizeX/sizeY (centre point); convert now that
+    // we have the final core dimensions.
+    let rois = lif_rois_to_ome(&lif_rois, &acc, m.size_x, m.size_y);
+
     let ome = OmeImage {
+        description: image_description(dom, img),
+        acquisition_date,
         physical_size_x: physical_size_x.filter(|v| *v > 0.0),
         physical_size_y: physical_size_y.filter(|v| *v > 0.0),
-        physical_size_z: physical_size_z.filter(|v| *v > 0.0),
+        physical_size_z: z_step.filter(|v| *v > 0.0).or(physical_size_z.filter(|v| *v > 0.0)),
+        time_increment: acc.time_increment,
         channels,
+        planes,
         ..OmeImage::default()
     };
 
@@ -1809,8 +1961,161 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
         meta: m,
         tile_count,
         ome,
+        instrument,
+        rois,
         layout,
+        light_source_settings_laser,
     })
+}
+
+/// Port of the live laser `<LightSourceSettings>` block in Java
+/// `LIFReader.initMetadata` (~746-893). Builds `validIntensities`, applies the
+/// active/two-wavelength `toRemove` dedup and the noNames/FRAP logic, then walks
+/// `nextChannel` forward, setting each surviving channel's attenuation
+/// (`PercentFraction(intensity / 100)`) and recording its laser index for the
+/// `LightSource:i:laser` LSID (built by `ome_metadata`, where the series index
+/// `i` is known).
+///
+/// The channel excitation wavelength (Java ~862-865) is handled separately in
+/// `translate_image`, and the emission/filter cross-walk (Java ~867-890) is
+/// `//`-commented out upstream (`setLightPathEmissionFilterRef`), so neither is
+/// reproduced here.
+fn apply_laser_light_source_settings(
+    acc: &LifMetaAcc,
+    effective_c: usize,
+    channels: &mut [OmeChannel],
+) -> Vec<Option<usize>> {
+    let mut per_channel_laser: Vec<Option<usize>> = vec![None; channels.len()];
+
+    // final List<Double> lasers = laserWavelength[index];  (zero wavelengths
+    // removed in place, Java ~755-762)
+    let lasers: Vec<f64> = acc
+        .laser_wavelength
+        .iter()
+        .copied()
+        .filter(|w| *w != 0.0)
+        .collect();
+    let laser_intensities = &acc.laser_intensity;
+    let active = &acc.laser_active;
+    let frap = &acc.laser_frap;
+
+    if lasers.is_empty() {
+        return per_channel_laser;
+    }
+
+    let size = lasers.len();
+
+    // validIntensities + ignoredChannels (Java ~776-792)
+    let mut ignored_channels: HashSet<i64> = HashSet::new();
+    let mut valid_intensities: Vec<usize> = Vec::new();
+    let mut channels_set: HashSet<i64> = HashSet::new();
+    for (laser, &intensity) in laser_intensities.iter().enumerate() {
+        let channel = (laser / size) as i64;
+        if intensity < 100.0 {
+            valid_intensities.push(laser);
+            channels_set.insert(channel);
+        }
+        ignored_channels.insert(channel);
+    }
+    // ignoredChannels.removeAll(channels);
+    ignored_channels.retain(|c| !channels_set.contains(c));
+
+    // remove entries if channel has 2 wavelengths (Java ~793-818)
+    let s = valid_intensities.len();
+    let mut to_remove: HashSet<usize> = HashSet::new();
+    let as_len = active.len();
+    for j in 0..s {
+        if j < as_len && !active[j] {
+            to_remove.insert(valid_intensities[j]);
+        }
+        let jj = j + 1;
+        if jj < s {
+            let v = valid_intensities[j] / size;
+            let vv = valid_intensities[jj] / size;
+            if vv == v {
+                // do not consider that channel.
+                to_remove.insert(valid_intensities[j]);
+                to_remove.insert(valid_intensities[jj]);
+                ignored_channels.insert(j as i64);
+            }
+        }
+    }
+    if !to_remove.is_empty() {
+        valid_intensities.retain(|vi| !to_remove.contains(vi));
+    }
+
+    // noNames / FRAP logic (Java ~820-836)
+    let mut no_names = true;
+    for name in channels_iter_names(acc, effective_c) {
+        if let Some(name) = name {
+            if !name.is_empty() {
+                no_names = false;
+                break;
+            }
+        }
+    }
+    if !no_names && !frap.is_empty() {
+        // only use name for frap.
+        for &is_frap in frap {
+            if !is_frap {
+                no_names = true;
+                break;
+            }
+        }
+    }
+
+    // nextChannel-advancement loop (Java ~838-893). The commented-out
+    // `nextFilter = cutIns[i].size() - getEffectiveSizeC()` is ignored; the
+    // live `int nextFilter = 0;` (unused once the filter cross-walk is dropped).
+    let mut next_channel: usize = 0;
+    for &laser_array_index in &valid_intensities {
+        let intensity = laser_intensities.get(laser_array_index).copied().unwrap_or(0.0);
+        let laser = laser_array_index % lasers.len();
+        let wavelength = lasers[laser];
+        if wavelength != 0.0 {
+            while ignored_channels.contains(&(next_channel as i64)) {
+                next_channel += 1;
+            }
+            while next_channel < effective_c && {
+                let nm = channel_name_at(acc, next_channel);
+                (nm.is_none() || nm.as_deref() == Some("")) && !no_names
+            } {
+                next_channel += 1;
+            }
+            if next_channel < effective_c {
+                if let Some(channel) = channels.get_mut(next_channel) {
+                    // PercentFraction((float) intensity / 100f)
+                    channel.light_source_settings_attenuation = Some(intensity / 100.0);
+                    per_channel_laser[next_channel] = Some(laser);
+                }
+            }
+        }
+        next_channel += 1;
+    }
+
+    per_channel_laser
+}
+
+/// Channel names as Java's `channelNames[index]` array: prefer the parsed
+/// `OmeChannel.name`, falling back to the scanner/filter accumulator names,
+/// padded to `getEffectiveSizeC()`.
+fn channels_iter_names<'a>(
+    acc: &'a LifMetaAcc,
+    effective_c: usize,
+) -> impl Iterator<Item = Option<&'a str>> + 'a {
+    (0..effective_c).map(move |c| {
+        acc.channel_names
+            .get(c)
+            .and_then(|n| n.as_deref())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn channel_name_at(acc: &LifMetaAcc, c: usize) -> Option<String> {
+    acc.channel_names
+        .get(c)
+        .and_then(|n| n.clone())
+        .filter(|s| !s.is_empty())
 }
 
 fn annotate_lif_color_layout(meta: &mut ImageMetadata, layout: &PixelLayout) {
@@ -2001,6 +2306,1203 @@ fn channel_names(dom: &Dom, img: usize, effective_c: usize) -> Vec<Option<String
     names
 }
 
+/// Mirror of Java `LIFReader.CHANNEL_PRIORITIES`: map a (lower-cased) LUT name
+/// to its colour priority. Unknown names map to the empty-name priority (8),
+/// matching Java's `if (!CHANNEL_PRIORITIES.containsKey(lut)) lut = ""`.
+fn channel_priority(lut: &str) -> i32 {
+    match lut {
+        "red" => 0,
+        "green" => 1,
+        "blue" => 2,
+        "cyan" => 3,
+        "magenta" => 4,
+        "yellow" => 5,
+        "black" => 6,
+        "gray" => 7,
+        _ => 8,
+    }
+}
+
+/// Mirror of Java `LIFReader.getChannelColor`: map a CHANNEL_PRIORITIES colour
+/// code to a packed RGBA colour (`R<<24 | G<<16 | B<<8 | A`), matching OME
+/// `Color.getValue()`. Codes outside 0..=5 fall back to opaque white.
+fn channel_color(color_code: i32) -> i32 {
+    let (r, g, b, a): (i32, i32, i32, i32) = match color_code {
+        0 => (255, 0, 0, 255),   // red
+        1 => (0, 255, 0, 255),   // green
+        2 => (0, 0, 255, 255),   // blue
+        3 => (0, 255, 255, 255), // cyan
+        4 => (255, 0, 255, 255), // magenta
+        5 => (255, 255, 0, 255), // yellow
+        _ => (255, 255, 255, 255),
+    };
+    (r << 24) | (g << 16) | (b << 8) | a
+}
+
+/// Derive the image description, mirroring the attribute-based portion of Java
+/// `LIFReader.translateAttachmentNodes`: the `<Attachment Name="ContextDescription">`
+/// element's `Content` attribute. (Java's `addUserCommentMeta` text-content
+/// fallback is not ported here because the lightweight DOM does not retain
+/// element text content.)
+fn image_description(dom: &Dom, img: usize) -> Option<String> {
+    let mut attachments: Vec<usize> = Vec::new();
+    dom.descendants(img, "Attachment", &mut attachments);
+    for &att in &attachments {
+        if dom.nodes[att].attrs.get("Name").map(String::as_str) == Some("ContextDescription") {
+            if let Some(content) = dom.nodes[att].attrs.get("Content") {
+                return Some(content.clone());
+            }
+        }
+    }
+    None
+}
+
+const LIF_METER_MULTIPLY: f64 = 1_000_000.0;
+
+/// One ROI parsed from the LIF XML, mirroring the Java inner `ROI` class.
+/// Vertices and the centre-point translation are in physical (metre) units until
+/// `normalize()` scales them by `METER_MULTIPLY`.
+#[derive(Default, Clone)]
+struct LifRoi {
+    roi_type: i32,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    trans_x: f64,
+    trans_y: f64,
+    scale_x: f64,
+    scale_y: f64,
+    rotation: f64,
+    color: i64,
+    linewidth: i32,
+    text: Option<String>,
+    font_size: Option<String>,
+    name: Option<String>,
+}
+
+/// Per-image accumulator mirroring the per-image LIFReader arrays populated by
+/// the `translate*` methods, in the form needed to build OME metadata.
+struct LifMetaAcc {
+    // scanner settings
+    time_increment: Option<f64>,
+    pinhole: Option<f64>,
+    zoom: Option<f64>,
+    z_step: Option<f64>,
+    microscope_model: Option<String>,
+    flip_x: bool,
+    flip_y: bool,
+    swap_xy: bool,
+    excitation_wavelengths: Vec<Option<f64>>,
+    exp_times: Vec<Option<f64>>,
+    detector_models: Vec<String>,
+    // filter settings
+    lens_na: Option<f64>,
+    serial_number: Option<String>,
+    magnification: Option<f64>,
+    immersion: Option<String>,
+    correction: Option<String>,
+    objective_model: Option<String>,
+    refractive_index: Option<f64>,
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    pos_z: Option<f64>,
+    cut_ins: Vec<f64>,
+    cut_outs: Vec<f64>,
+    filter_models: Vec<String>,
+    active_detector: Vec<bool>,
+    detector_indexes: BTreeMap<i64, String>,
+    // detectors / scanner
+    gains: Vec<Option<f64>>,
+    detector_offsets: Vec<Option<f64>>,
+    channel_names: Vec<Option<String>>,
+    // lasers
+    laser_wavelength: Vec<f64>,
+    /// Per-laser-line `IntensityDev`-derived intensity (Java `laserIntensity`).
+    laser_intensity: Vec<f64>,
+    /// Per-AotfList FRAP-master flag (Java `laserFrap`).
+    laser_frap: Vec<bool>,
+    /// Per-non-master detector definition: whether any detector was active
+    /// (Java `laserActive`).
+    laser_active: Vec<bool>,
+    // timestamps
+    timestamps: Vec<Option<f64>>,
+    acquired_date: Option<f64>,
+    // alternate ROI centre flag (set when an <ROI> sibling exists)
+    alternate_center: bool,
+}
+
+impl LifMetaAcc {
+    fn new(effective_c: usize) -> Self {
+        LifMetaAcc {
+            time_increment: None,
+            pinhole: None,
+            zoom: None,
+            z_step: None,
+            microscope_model: None,
+            flip_x: false,
+            flip_y: false,
+            swap_xy: false,
+            excitation_wavelengths: vec![None; effective_c],
+            exp_times: vec![None; effective_c],
+            detector_models: Vec::new(),
+            lens_na: None,
+            serial_number: None,
+            magnification: None,
+            immersion: None,
+            correction: None,
+            objective_model: None,
+            refractive_index: None,
+            pos_x: None,
+            pos_y: None,
+            pos_z: None,
+            cut_ins: Vec::new(),
+            cut_outs: Vec::new(),
+            filter_models: Vec::new(),
+            active_detector: Vec::new(),
+            detector_indexes: BTreeMap::new(),
+            gains: vec![None; effective_c],
+            detector_offsets: vec![None; effective_c],
+            channel_names: vec![None; effective_c],
+            laser_wavelength: Vec::new(),
+            laser_intensity: Vec::new(),
+            laser_frap: Vec::new(),
+            laser_active: Vec::new(),
+            timestamps: Vec::new(),
+            acquired_date: None,
+            alternate_center: false,
+        }
+    }
+}
+
+/// Port of Java `LIFReader.translateScannerSettings`. Reads
+/// `<ScannerSettingRecord>` and the `<ATLConfocalSettingDefinition>` reachable
+/// from the `HardwareSetting` attachment, populating the scanner-related fields.
+fn translate_scanner_settings(dom: &Dom, img: usize, acc: &mut LifMetaAcc) {
+    let mut records: Vec<usize> = Vec::new();
+    dom.descendants(img, "ScannerSettingRecord", &mut records);
+
+    let mut attachments: Vec<usize> = Vec::new();
+    dom.descendants(img, "Attachment", &mut attachments);
+    if attachments.is_empty() {
+        return;
+    }
+    let mut confocal_settings: Vec<usize> = Vec::new();
+    for &att in &attachments {
+        if dom.nodes[att].attrs.get("Name").map(String::as_str) == Some("HardwareSetting") {
+            dom.descendants(att, "ATLConfocalSettingDefinition", &mut confocal_settings);
+        }
+    }
+
+    if records.is_empty() && confocal_settings.is_empty() {
+        return;
+    }
+    let effective_c = acc.excitation_wavelengths.len();
+
+    for &rec in &records {
+        let attrs = &dom.nodes[rec].attrs;
+        let id = attrs.get("Identifier").map(String::as_str).unwrap_or("");
+        let value = attrs.get("Variant").map(|s| s.trim()).unwrap_or("");
+        if value.is_empty() {
+            continue;
+        }
+
+        if id == "SystemType" {
+            acc.microscope_model = Some(value.to_string());
+        } else if id == "dblPinhole" {
+            if let Ok(v) = value.parse::<f64>() {
+                acc.pinhole = Some(v * LIF_METER_MULTIPLY);
+            }
+        } else if id == "dblZoom" {
+            acc.zoom = value.parse::<f64>().ok();
+        } else if id == "dblStepSize" {
+            if let Ok(v) = value.parse::<f64>() {
+                acc.z_step = Some(v * LIF_METER_MULTIPLY);
+            }
+        } else if id == "nDelayTime_s" {
+            acc.time_increment = value.parse::<f64>().ok();
+        } else if id == "CameraName" {
+            acc.detector_models.push(value.to_string());
+        } else if id.find("WFC") == Some(1) {
+            // Channel index from the digits in the identifier.
+            let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+            let c: i32 = digits.parse().unwrap_or(0);
+            if c < 0 || c as usize >= effective_c {
+                continue;
+            }
+            let c = c as usize;
+            if id.ends_with("ExposureTime") {
+                acc.exp_times[c] = value.parse::<f64>().ok();
+            } else if id.ends_with("Gain") {
+                acc.gains[c] = value.parse::<f64>().ok();
+            } else if id.ends_with("WaveLength") {
+                if let Ok(ex) = value.parse::<f64>() {
+                    if ex > 0.0 {
+                        acc.excitation_wavelengths[c] = Some(ex);
+                    }
+                }
+            } else if (id.ends_with("UesrDefName") || id.ends_with("UserDefName"))
+                && value != "None"
+            {
+                if acc.channel_names[c]
+                    .as_ref()
+                    .map(|n| n.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    acc.channel_names[c] = Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    for &cs in &confocal_settings {
+        let attrs = &dom.nodes[cs].attrs;
+        if let Some(v) = attrs.get("Pinhole").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Ok(v) = v.parse::<f64>() {
+                acc.pinhole = Some(v * LIF_METER_MULTIPLY);
+            }
+        }
+        if let Some(v) = attrs.get("Zoom").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            acc.zoom = v.parse::<f64>().ok();
+        }
+        if let Some(v) = attrs
+            .get("ObjectiveName")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            acc.objective_model = Some(v.to_string());
+        }
+        if let Some(v) = attrs.get("FlipX").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            acc.flip_x = v == "1";
+        }
+        if let Some(v) = attrs.get("FlipY").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            acc.flip_y = v == "1";
+        }
+        if let Some(v) = attrs.get("SwapXY").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            acc.swap_xy = v == "1";
+        }
+    }
+}
+
+/// Java `getChannelIndex`: returns `data - 1` (or `-1` when `data < 0`).
+fn get_channel_index(attrs: &BTreeMap<String, String>) -> i64 {
+    let data = attrs
+        .get("data")
+        .filter(|s| !s.is_empty())
+        .or_else(|| attrs.get("Data"))
+        .map(String::as_str)
+        .unwrap_or("");
+    let channel: i64 = if data.is_empty() {
+        0
+    } else {
+        data.parse().unwrap_or(0)
+    };
+    if channel < 0 {
+        return -1;
+    }
+    channel - 1
+}
+
+/// Port of Java `LIFReader.translateFilterSettings`. Reads
+/// `<FilterSettingRecord>` nodes to populate objective, stage position, filter
+/// cut-in/out, and detector-index metadata.
+fn translate_filter_settings(dom: &Dom, img: usize, acc: &mut LifMetaAcc) {
+    let mut filter_settings: Vec<usize> = Vec::new();
+    dom.descendants(img, "FilterSettingRecord", &mut filter_settings);
+    if filter_settings.is_empty() {
+        return;
+    }
+
+    acc.active_detector.clear();
+    acc.cut_ins.clear();
+    acc.cut_outs.clear();
+    acc.filter_models.clear();
+    acc.detector_indexes.clear();
+
+    let mut next_channel = 0usize;
+    let channel_count = acc.channel_names.len();
+
+    for &fs in &filter_settings {
+        let attrs = &dom.nodes[fs].attrs;
+        let object = attrs.get("ObjectName").cloned().unwrap_or_default();
+        let attribute = attrs.get("Attribute").map(String::as_str).unwrap_or("");
+        let object_class = attrs.get("ClassName").map(String::as_str).unwrap_or("");
+        let variant = attrs.get("Variant").cloned().unwrap_or_default();
+        let data = attrs.get("Data").cloned().unwrap_or_default();
+
+        if attribute == "NumericalAperture" {
+            if !variant.trim().is_empty() {
+                acc.lens_na = variant.trim().parse::<f64>().ok();
+            }
+        } else if attribute == "OrderNumber" {
+            if !variant.trim().is_empty() {
+                acc.serial_number = Some(variant.trim().to_string());
+            }
+        } else if object_class == "CDetectionUnit" {
+            if attribute == "State" {
+                let channel = get_channel_index(attrs);
+                if channel < 0 {
+                    continue;
+                }
+                if let Ok(d) = data.parse::<i64>() {
+                    acc.detector_indexes.insert(d, object.clone());
+                }
+                acc.active_detector.push(variant.trim() == "Active");
+            }
+        } else if attribute == "Objective" {
+            // Tokenise on spaces; find the "<mag>x<na>" token, then immersion and
+            // correction tokens, mirroring the Java StringTokenizer walk.
+            let tokens: Vec<&str> = variant.split(' ').filter(|t| !t.is_empty()).collect();
+            let mut model = String::new();
+            let mut idx = 0usize;
+            let mut found_mag = false;
+            while !found_mag && idx < tokens.len() {
+                let token = tokens[idx];
+                idx += 1;
+                if let Some(x) = token.find('x') {
+                    found_mag = true;
+                    let na = &token[x + 1..];
+                    if !na.trim().is_empty() {
+                        acc.lens_na = na.trim().parse::<f64>().ok();
+                    }
+                    let mag = &token[..x];
+                    if !mag.trim().is_empty() {
+                        acc.magnification = mag.trim().parse::<f64>().ok();
+                    }
+                } else {
+                    model.push_str(token);
+                    model.push(' ');
+                }
+            }
+            let mut immersion = "Other".to_string();
+            if idx < tokens.len() {
+                let t = tokens[idx];
+                idx += 1;
+                if !t.trim().is_empty() {
+                    immersion = t.to_string();
+                }
+            }
+            acc.immersion = Some(immersion);
+            let mut correction = "Other".to_string();
+            if idx < tokens.len() {
+                let t = tokens[idx];
+                if !t.trim().is_empty() {
+                    correction = t.to_string();
+                }
+            }
+            acc.correction = Some(correction);
+            acc.objective_model = Some(model.trim().to_string());
+        } else if attribute == "RefractionIndex" {
+            if !variant.trim().is_empty() {
+                acc.refractive_index = variant.trim().parse::<f64>().ok();
+            }
+        } else if attribute == "XPos" {
+            if !variant.trim().is_empty() {
+                acc.pos_x = variant.trim().parse::<f64>().ok();
+            }
+        } else if attribute == "YPos" {
+            if !variant.trim().is_empty() {
+                acc.pos_y = variant.trim().parse::<f64>().ok();
+            }
+        } else if attribute == "ZPos" {
+            if !variant.trim().is_empty() {
+                acc.pos_z = variant.trim().parse::<f64>().ok();
+            }
+        } else if object_class == "CSpectrophotometerUnit" {
+            let v = variant.trim().parse::<f64>().ok();
+            let description = attrs.get("Description").map(String::as_str).unwrap_or("");
+            if description.ends_with("(left)") {
+                acc.filter_models.push(object.clone());
+                if let Some(v) = v {
+                    if v > 0.0 {
+                        acc.cut_ins.push(v.round());
+                    }
+                }
+            } else if description.ends_with("(right)") {
+                if let Some(v) = v {
+                    if v > 0.0 {
+                        acc.cut_outs.push(v.round());
+                    }
+                }
+            } else if attribute == "Stain" && next_channel < channel_count {
+                acc.channel_names[next_channel] = Some(variant.clone());
+                next_channel += 1;
+            }
+        }
+    }
+}
+
+/// Port of Java `LIFReader.translateLaserLines`. Reads `<AotfList>` /
+/// `<LaserLineSetting>` to collect laser wavelengths.
+fn translate_laser_lines(dom: &Dom, img: usize, acc: &mut LifMetaAcc) {
+    let mut aotf_lists: Vec<usize> = Vec::new();
+    dom.descendants(img, "AotfList", &mut aotf_lists);
+    if aotf_lists.is_empty() {
+        return;
+    }
+    acc.laser_wavelength.clear();
+    acc.laser_intensity.clear();
+    acc.laser_frap.clear();
+
+    let mut base_intensity_index: usize = 0;
+
+    for &aotf in &aotf_lists {
+        let mut laser_lines: Vec<usize> = Vec::new();
+        dom.descendants(aotf, "LaserLineSetting", &mut laser_lines);
+        // grandparent name: parent.parent of the AotfList.
+        let gp_name = dom.nodes[aotf]
+            .parent
+            .and_then(|p| dom.nodes[p].parent)
+            .map(|gp| dom.nodes[gp].name.as_str())
+            .unwrap_or("");
+        let is_master =
+            gp_name.ends_with("Sequential_Master") || gp_name.ends_with("Attachment");
+        acc.laser_frap.push(gp_name.ends_with("FRAP_Master"));
+        for &ll in &laser_lines {
+            if is_master {
+                continue;
+            }
+            let attrs = &dom.nodes[ll].attrs;
+            let line_index = attrs
+                .get("LineIndex")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let qualifier = attrs
+                .get("Qualifier")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let index = line_index + (2 - (qualifier / 10));
+            if index < 0 {
+                continue;
+            }
+            let index = index as usize;
+            let wavelength = attrs
+                .get("LaserLine")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            if index < acc.laser_wavelength.len() {
+                acc.laser_wavelength[index] = wavelength;
+            } else {
+                while acc.laser_wavelength.len() < index {
+                    acc.laser_wavelength.push(0.0);
+                }
+                acc.laser_wavelength.push(wavelength);
+            }
+
+            // IntensityDev → laserIntensity (Java ~1717-1736). Java stores
+            // 100 - IntensityDev at realIndex = baseIntensityIndex + index.
+            let real_intensity = 100.0
+                - acc_attr_intensity(&dom.nodes[ll].attrs);
+            let real_index = base_intensity_index + index;
+            if real_index < acc.laser_intensity.len() {
+                acc.laser_intensity[real_index] = real_intensity;
+            } else {
+                while real_index < acc.laser_intensity.len() {
+                    acc.laser_intensity.push(100.0);
+                }
+                acc.laser_intensity.push(real_intensity);
+            }
+        }
+
+        base_intensity_index += acc.laser_wavelength.len();
+    }
+}
+
+/// Parse the `IntensityDev` attribute of a `<LaserLineSetting>` (Java ~1717-1724,
+/// before the `100 -` inversion). Missing/blank/unparseable → 0.
+fn acc_attr_intensity(attrs: &BTreeMap<String, String>) -> f64 {
+    attrs
+        .get("IntensityDev")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// Port of Java `LIFReader.translateTimestamps`. Supports both the LAS AF 3.1+
+/// space-separated `<TimeStampList>` text content and the older per-element
+/// `<TimeStamp HighInteger=.. LowInteger=..>` form.
+fn translate_timestamps(dom: &Dom, img: usize, image_count: usize, acc: &mut LifMetaAcc) {
+    let mut time_stamp_lists: Vec<usize> = Vec::new();
+    dom.descendants(img, "TimeStampList", &mut time_stamp_lists);
+    if time_stamp_lists.is_empty() {
+        return;
+    }
+    let list = time_stamp_lists[0];
+    acc.timestamps = vec![None; image_count];
+
+    let number_of = dom.nodes[list]
+        .attrs
+        .get("NumberOfTimeStamps")
+        .cloned()
+        .unwrap_or_default();
+    if !number_of.is_empty() {
+        // LAS AF 3.1 (or newer): timestamps in the element text content.
+        let raw = dom.nodes[list].text.clone();
+        for (stamp, ts) in raw.split(' ').enumerate() {
+            if stamp < image_count {
+                acc.timestamps[stamp] = Some(translate_single_timestamp_hex(ts));
+            }
+        }
+    } else {
+        let mut timestamp_nodes: Vec<usize> = Vec::new();
+        dom.descendants(img, "TimeStamp", &mut timestamp_nodes);
+        if timestamp_nodes.is_empty() {
+            return;
+        }
+        for (stamp, &node) in timestamp_nodes.iter().enumerate() {
+            if stamp < image_count {
+                acc.timestamps[stamp] = Some(translate_single_timestamp_attrs(&dom.nodes[node].attrs));
+            }
+        }
+    }
+
+    acc.acquired_date = acc.timestamps.first().copied().flatten();
+}
+
+/// Java `translateSingleTimestamp(String)`: split the trailing 8 hex digits as
+/// the low word, the remainder as the high word, both base-16.
+fn translate_single_timestamp_hex(timestamp: &str) -> f64 {
+    let timestamp = timestamp.trim();
+    let stamp_low_start = timestamp.len().saturating_sub(8);
+    let stamp_high = &timestamp[..stamp_low_start];
+    let stamp_low = &timestamp[stamp_low_start..];
+    let high = if stamp_high.trim().is_empty() {
+        0
+    } else {
+        i64::from_str_radix(stamp_high.trim(), 16).unwrap_or(0)
+    };
+    let low = if stamp_low.trim().is_empty() {
+        0
+    } else {
+        i64::from_str_radix(stamp_low.trim(), 16).unwrap_or(0)
+    };
+    millis_from_ticks(high, low) as f64 / 1000.0
+}
+
+/// Java `translateSingleTimestamp(Element)`: the high/low words are decimal
+/// `HighInteger`/`LowInteger` attributes.
+fn translate_single_timestamp_attrs(attrs: &BTreeMap<String, String>) -> f64 {
+    let high = attrs
+        .get("HighInteger")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let low = attrs
+        .get("LowInteger")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    millis_from_ticks(high, low) as f64 / 1000.0
+}
+
+/// Port of `DateTools.getMillisFromTicks`: combine high/low 32-bit words into a
+/// 64-bit Windows FILETIME (100-ns ticks since 1601), convert to Unix millis.
+fn millis_from_ticks(high: i64, low: i64) -> i64 {
+    let ticks = (high << 32) | (low & 0xffff_ffff);
+    ticks / 10_000 - 11_644_473_600_000
+}
+
+/// Convert a COBOL-epoch second value (Java `acquiredDate`) to an ISO-8601
+/// timestamp string. `DateTools.COBOL` is the millisecond offset of the COBOL
+/// epoch (1582-10-15) relative to the Unix epoch; convertDate adds it.
+fn cobol_iso8601(acquired_seconds: f64) -> String {
+    const COBOL_OFFSET_MS: i64 = -12_219_292_800_000;
+    let unix_ms = (acquired_seconds * 1000.0) as i64 + COBOL_OFFSET_MS;
+    format_iso8601(unix_ms)
+}
+
+/// Format Unix milliseconds as an ISO-8601 `YYYY-MM-DDTHH:MM:SS` string (UTC),
+/// matching `DateTools.ISO8601_FORMAT` without milliseconds/zone.
+fn format_iso8601(unix_ms: i64) -> String {
+    let mut secs = unix_ms.div_euclid(1000);
+    let mut days = secs.div_euclid(86_400);
+    secs = secs.rem_euclid(86_400);
+    let hour = secs / 3600;
+    let minute = (secs % 3600) / 60;
+    let second = secs % 60;
+
+    // Civil-from-days (Howard Hinnant's algorithm), days since 1970-01-01.
+    days += 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        year, month, day, hour, minute, second
+    )
+}
+
+/// Port of Java `LIFReader.translateROIs` and `translateSingleROIs`. Reads
+/// `<Annotation>` nodes (or `<ROISingle>` children) into `LifRoi`s, which are
+/// finalised into OME shapes in `finalize_rois`.
+fn translate_rois(
+    dom: &Dom,
+    img: usize,
+    acc: &mut LifMetaAcc,
+    _meta: &ImageMetadata,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+) -> Vec<LifRoi> {
+    let mut annotations: Vec<usize> = Vec::new();
+    dom.descendants(img, "Annotation", &mut annotations);
+    if !annotations.is_empty() {
+        let mut roi_nodes: Vec<usize> = Vec::new();
+        dom.descendants(img, "ROI", &mut roi_nodes);
+        if !roi_nodes.is_empty() {
+            acc.alternate_center = true;
+        }
+        let mut out = Vec::with_capacity(annotations.len());
+        for &node in &annotations {
+            let attrs = &dom.nodes[node].attrs;
+            let mut roi = LifRoi::default();
+            if let Some(t) = attrs.get("type").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                roi.roi_type = t.parse().unwrap_or(0);
+            }
+            if let Some(c) = attrs.get("color").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                roi.color = c.parse().unwrap_or(0);
+            }
+            roi.name = attrs.get("name").cloned();
+            roi.font_size = attrs.get("fontSize").cloned();
+            if let Some(v) = parse_attr_f64(attrs, "transTransX") {
+                roi.trans_x = v;
+            }
+            if let Some(v) = parse_attr_f64(attrs, "transTransY") {
+                roi.trans_y = v;
+            }
+            if let Some(v) = parse_attr_f64(attrs, "transScalingX") {
+                roi.scale_x = v;
+            }
+            if let Some(v) = parse_attr_f64(attrs, "transScalingY") {
+                roi.scale_y = v;
+            }
+            if let Some(v) = parse_attr_f64(attrs, "transRotation") {
+                roi.rotation = v;
+            }
+            if let Some(lw) = attrs.get("linewidth").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if let Ok(v) = lw.parse::<i32>() {
+                    roi.linewidth = v;
+                }
+            }
+            roi.text = attrs.get("text").cloned();
+
+            let mut vertices: Vec<usize> = Vec::new();
+            dom.descendants(node, "Vertex", &mut vertices);
+            if vertices.is_empty() {
+                continue;
+            }
+            for &v in &vertices {
+                let vattrs = &dom.nodes[v].attrs;
+                if let Some(x) = parse_attr_f64(vattrs, "x") {
+                    roi.x.push(x);
+                }
+                if let Some(y) = parse_attr_f64(vattrs, "y") {
+                    roi.y.push(y);
+                }
+            }
+            out.push(roi);
+        }
+        return out;
+    }
+
+    // translateSingleROIs path: <ROI><Children><Element><ROISingle>.
+    let size_x = physical_size_x.unwrap_or(0.0);
+    let size_y = physical_size_y.unwrap_or(0.0);
+    let mut roi_nodes: Vec<usize> = Vec::new();
+    dom.descendants(img, "ROI", &mut roi_nodes);
+    if roi_nodes.is_empty() {
+        return Vec::new();
+    }
+    let mut children: Vec<usize> = Vec::new();
+    dom.descendants(roi_nodes[0], "Children", &mut children);
+    if children.is_empty() {
+        return Vec::new();
+    }
+    let mut elements: Vec<usize> = Vec::new();
+    dom.descendants(children[0], "Element", &mut elements);
+    if elements.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(elements.len());
+    for &elem in &elements {
+        let mut singles: Vec<usize> = Vec::new();
+        dom.descendants(elem, "ROISingle", &mut singles);
+        let roi_node = match singles.first() {
+            Some(&n) => n,
+            None => continue,
+        };
+        let attrs = &dom.nodes[roi_node].attrs;
+        let mut roi = LifRoi::default();
+        if let Some(t) = attrs.get("RoiType").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            roi.roi_type = t.parse().unwrap_or(0);
+        }
+        if let Some(c) = attrs.get("Color").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            roi.color = c.parse().unwrap_or(0);
+        }
+        // name = roiNode.parent.parent.Name
+        roi.name = dom.nodes[roi_node]
+            .parent
+            .and_then(|p| dom.nodes[p].parent)
+            .and_then(|gp| dom.nodes[gp].attrs.get("Name").cloned());
+
+        let mut vertices: Vec<usize> = Vec::new();
+        dom.descendants(roi_node, "P", &mut vertices);
+        for &v in &vertices {
+            let vattrs = &dom.nodes[v].attrs;
+            if let Some(x) = parse_attr_f64(vattrs, "X") {
+                if size_x != 0.0 {
+                    roi.x.push(x / size_x);
+                }
+            }
+            if let Some(y) = parse_attr_f64(vattrs, "Y") {
+                if size_y != 0.0 {
+                    roi.y.push(y / size_y);
+                }
+            }
+        }
+
+        let mut transforms: Vec<usize> = Vec::new();
+        dom.descendants(roi_node, "Transformation", &mut transforms);
+        if let Some(&transform) = transforms.first() {
+            if let Some(v) = parse_attr_f64(&dom.nodes[transform].attrs, "Rotation") {
+                roi.rotation = v;
+            }
+            let mut scalings: Vec<usize> = Vec::new();
+            dom.descendants(transform, "Scaling", &mut scalings);
+            if let Some(&scaling) = scalings.first() {
+                if let Some(v) = parse_attr_f64(&dom.nodes[scaling].attrs, "XScale") {
+                    roi.scale_x = v;
+                }
+                if let Some(v) = parse_attr_f64(&dom.nodes[scaling].attrs, "YScale") {
+                    roi.scale_y = v;
+                }
+            }
+            let mut translations: Vec<usize> = Vec::new();
+            dom.descendants(transform, "Translation", &mut translations);
+            if let Some(&translation) = translations.first() {
+                if let Some(v) = parse_attr_f64(&dom.nodes[translation].attrs, "X") {
+                    if size_x != 0.0 {
+                        roi.trans_x = v / size_x;
+                    }
+                }
+                if let Some(v) = parse_attr_f64(&dom.nodes[translation].attrs, "Y") {
+                    if size_y != 0.0 {
+                        roi.trans_y = v / size_y;
+                    }
+                }
+            }
+        }
+
+        out.push(roi);
+    }
+    out
+}
+
+fn parse_attr_f64(attrs: &BTreeMap<String, String>, key: &str) -> Option<f64> {
+    attrs
+        .get(key)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<f64>().ok())
+}
+
+/// Port of Java `LIFReader.translateDetectors`: walks
+/// `<ATLConfocalSettingDefinition>` / `<Detector>` / `<MultiBand>` to fill in
+/// per-channel gains/offsets, cut-in/out filter ranges, detector models, and
+/// channel names (dye names).
+fn translate_detectors(dom: &Dom, img: usize, effective_c: usize, acc: &mut LifMetaAcc) {
+    let mut definitions: Vec<usize> = Vec::new();
+    dom.descendants(img, "ATLConfocalSettingDefinition", &mut definitions);
+    if definitions.is_empty() {
+        return;
+    }
+
+    let mut channels: Vec<String> = Vec::new();
+    let mut next_channel = 0usize;
+    acc.laser_active.clear();
+
+    for &definition in &definitions {
+        let parent_name = dom.nodes[definition]
+            .parent
+            .map(|p| dom.nodes[p].name.as_str())
+            .unwrap_or("");
+        let is_master = parent_name.ends_with("Master");
+        let mut detectors: Vec<usize> = Vec::new();
+        dom.descendants(definition, "Detector", &mut detectors);
+        if detectors.is_empty() {
+            return;
+        }
+        let mut count = 0usize;
+        let mut multibands: Vec<usize> = Vec::new();
+        if !is_master {
+            dom.descendants(definition, "MultiBand", &mut multibands);
+        }
+
+        for &det in &detectors {
+            let attrs = &dom.nodes[det].attrs;
+            let gain = attrs
+                .get("Gain")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<f64>().ok());
+            let offset = attrs
+                .get("Offset")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<f64>().ok());
+            let active = attrs.get("IsActive").map(String::as_str) == Some("1");
+            let channel: i64 = attrs
+                .get("Channel")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+
+            if active {
+                if let Some(model) = acc.detector_indexes.get(&channel).cloned() {
+                    acc.detector_models.push(model);
+                }
+
+                let mut multiband: Option<usize> = None;
+                if !is_master {
+                    for &mb in &multibands {
+                        let mc: i64 = dom.nodes[mb]
+                            .attrs
+                            .get("Channel")
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        if channel == mc {
+                            multiband = Some(mb);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(mb) = multiband {
+                    let mattrs = &dom.nodes[mb].attrs;
+                    let dye = mattrs.get("DyeName").cloned().unwrap_or_default();
+                    if !channels.contains(&dye) {
+                        channels.push(dye);
+                    }
+                    let cut_in = parse_attr_f64(mattrs, "LeftWorld");
+                    let cut_out = parse_attr_f64(mattrs, "RightWorld");
+                    if let Some(ci) = cut_in {
+                        if ci as i64 > 0 {
+                            acc.cut_ins.push(ci.round());
+                        }
+                    }
+                    if let Some(co) = cut_out {
+                        if co as i64 > 0 {
+                            acc.cut_outs.push(co.round());
+                        }
+                    }
+                } else {
+                    channels.push(String::new());
+                }
+
+                if !is_master {
+                    if channel < next_channel as i64 {
+                        next_channel = 0;
+                    }
+                    if next_channel < effective_c {
+                        if let Some(g) = gain {
+                            acc.gains[next_channel] = Some(g);
+                        }
+                        if let Some(o) = offset {
+                            acc.detector_offsets[next_channel] = Some(o);
+                        }
+                    }
+                    next_channel += 1;
+                }
+            } else {
+                count += 1;
+            }
+            if active {
+                acc.active_detector.push(active);
+            }
+        }
+        // Store whether this (non-master) definition had any active detector.
+        if !is_master {
+            acc.laser_active.push(count < detectors.len());
+        }
+    }
+
+    // Assign trailing dye names to channels lacking names.
+    if !channels.is_empty() {
+        for i in 0..effective_c {
+            let index = i as isize + channels.len() as isize - effective_c as isize;
+            if index >= 0 && (index as usize) < channels.len() {
+                let blank = acc.channel_names[i]
+                    .as_ref()
+                    .map(|n| n.trim().is_empty())
+                    .unwrap_or(true);
+                if blank {
+                    acc.channel_names[i] = Some(channels[index as usize].clone());
+                }
+            }
+        }
+    }
+}
+
+/// Build the per-series OME instrument from the accumulated metadata, mirroring
+/// the `MetadataStore` population in Java `initMetadata`: objective (NA, model,
+/// magnification, immersion, correction), filters (cut-in/out), lasers
+/// (wavelengths), and detectors (model, zoom, gain/offset).
+fn build_instrument(acc: &LifMetaAcc, effective_c: usize) -> OmeInstrument {
+    let mut inst = OmeInstrument {
+        microscope_model: acc.microscope_model.clone(),
+        ..OmeInstrument::default()
+    };
+
+    // Objective.
+    let objective = OmeObjective {
+        lens_na: acc.lens_na,
+        nominal_magnification: acc.magnification,
+        immersion: acc.immersion.clone(),
+        correction: acc.correction.clone(),
+        model: acc.objective_model.clone(),
+        ..OmeObjective::default()
+    };
+    inst.objectives.push(objective);
+
+    // Filters: trim cut-ins to filterModels.size() the way Java does, then emit.
+    let mut cut_ins = acc.cut_ins.clone();
+    if !acc.filter_models.is_empty() && cut_ins.len() >= acc.filter_models.len() * 2 {
+        let diff = cut_ins.len() - acc.filter_models.len();
+        for _ in 0..diff {
+            if acc.filter_models.len() < cut_ins.len() {
+                cut_ins.remove(acc.filter_models.len());
+            }
+        }
+    }
+    for filter in 0..cut_ins.len() {
+        inst.filters.push(OmeFilter {
+            model: acc.filter_models.get(filter).cloned(),
+            cut_in: cut_ins.get(filter).copied(),
+            cut_out: acc.cut_outs.get(filter).copied(),
+            ..OmeFilter::default()
+        });
+    }
+
+    // Lasers: drop zero wavelengths, then one light source per remaining laser.
+    let lasers: Vec<f64> = acc
+        .laser_wavelength
+        .iter()
+        .copied()
+        .filter(|w| *w != 0.0)
+        .collect();
+    for w in &lasers {
+        // Java sets LaserWavelength on the <Laser> light source.
+        inst.light_sources.push(OmeLightSource {
+            light_source_type: Some("Laser".to_string()),
+            model: None,
+            wavelength: Some(*w),
+            ..OmeLightSource::default()
+        });
+    }
+
+    // Detectors: the trailing effectiveC entries, with zoom + per-channel offset.
+    let detectors = &acc.detector_models;
+    let start = detectors.len().saturating_sub(effective_c);
+    let mut next_channel = 0usize;
+    for detector in start..detectors.len() {
+        let d_index = detector - start;
+        let mut det = OmeDetector {
+            model: Some(detectors[detector].clone()),
+            detector_type: Some("PMT".to_string()),
+            ..OmeDetector::default()
+        };
+        let _ = d_index;
+        if !acc.active_detector.is_empty() {
+            let detector_index =
+                acc.active_detector.len() as isize - effective_c as isize + d_index as isize;
+            if detector_index >= 0
+                && (detector_index as usize) < acc.active_detector.len()
+                && acc.active_detector[detector_index as usize]
+                && next_channel < acc.detector_offsets.len()
+            {
+                det.offset = acc.detector_offsets[next_channel];
+                next_channel += 1;
+            }
+        }
+        inst.detectors.push(det);
+    }
+
+    inst
+}
+
+/// Build the per-plane OME metadata (positions, deltaT, exposure time),
+/// mirroring the `image=0..getImageCount()` loop in Java `initMetadata`.
+fn build_planes(acc: &LifMetaAcc, meta: &ImageMetadata) -> Vec<OmePlane> {
+    let image_count = meta.image_count;
+    if image_count == 0 {
+        return Vec::new();
+    }
+
+    // Stage position, with swapXY and flip applied (Java checkFlip negates).
+    let mut x_pos = acc.pos_x;
+    let mut y_pos = acc.pos_y;
+    if acc.swap_xy {
+        std::mem::swap(&mut x_pos, &mut y_pos);
+    }
+    let x_pos = check_flip(acc.flip_x, x_pos);
+    let y_pos = check_flip(acc.flip_y, y_pos);
+    let z_pos = acc.pos_z;
+
+    let mut planes = Vec::with_capacity(image_count as usize);
+    for image in 0..image_count {
+        let (z, c, t) = zct_for_plane(image, meta);
+        let mut plane = OmePlane {
+            the_z: z,
+            the_c: c,
+            the_t: t,
+            position_x: x_pos,
+            position_y: y_pos,
+            position_z: z_pos,
+            ..OmePlane::default()
+        };
+
+        // DeltaT: Java subtracts the acquisition date when the first timestamp
+        // equals it, else clamps to the first timestamp.
+        if !acc.timestamps.is_empty() {
+            if let Some(Some(ts)) = acc.timestamps.get(image as usize) {
+                let mut timestamp = *ts;
+                let first = acc.timestamps.first().copied().flatten();
+                let acquired = acc.acquired_date;
+                if first == acquired {
+                    if let Some(a) = acquired {
+                        timestamp -= a;
+                    }
+                } else if Some(timestamp) == acquired && image > 0 {
+                    if let Some(f) = first {
+                        timestamp = f;
+                    }
+                }
+                plane.delta_t = Some(timestamp);
+            }
+        }
+
+        // Exposure time: per-channel.
+        if let Some(Some(exp)) = acc.exp_times.get(c as usize) {
+            plane.exposure_time = Some(*exp);
+        }
+
+        planes.push(plane);
+    }
+    planes
+}
+
+/// Java `LIFReader.checkFlip`: negate the position when the flip flag is set.
+fn check_flip(flip: bool, pos: Option<f64>) -> Option<f64> {
+    match (flip, pos) {
+        (true, Some(p)) => Some(-p),
+        _ => pos,
+    }
+}
+
+/// Convert parsed `LifRoi`s into OME ROIs (one ROI, one shape) mirroring
+/// `ROI.normalize()` + `ROI.storeROI`. `size_x`/`size_y` are the series core
+/// pixel dimensions used to compute the ROI centre point.
+fn lif_rois_to_ome(rois: &[LifRoi], acc: &LifMetaAcc, size_x: u32, size_y: u32) -> Vec<OmeROI> {
+    const POLYGON: i32 = 32;
+    const RECTANGLE: i32 = 16;
+    const TEXT: i32 = 512;
+    const LINE: i32 = 256;
+    const ARROW: i32 = 2;
+    const SCALE_BAR: i32 = 8192;
+
+    let mut out = Vec::new();
+    for roi in rois {
+        // normalize(): scale vertices and translation by METER_MULTIPLY.
+        let trans_x = roi.trans_x * LIF_METER_MULTIPLY;
+        let trans_y = roi.trans_y * LIF_METER_MULTIPLY;
+        let xs: Vec<f64> = roi.x.iter().map(|v| v * LIF_METER_MULTIPLY).collect();
+        let ys: Vec<f64> = roi.y.iter().map(|v| v * LIF_METER_MULTIPLY).collect();
+        if xs.is_empty() || ys.is_empty() {
+            continue;
+        }
+
+        let corner_x = xs[0];
+        let corner_y = ys[0];
+        let center_x = (size_x as f64 / 2.0) - 1.0;
+        let center_y = (size_y as f64 / 2.0) - 1.0;
+        let (roi_x, roi_y) = if acc.alternate_center {
+            (trans_x - 2.0 * corner_x, trans_y - 2.0 * corner_y)
+        } else {
+            (center_x + trans_x, center_y + trans_y)
+        };
+
+        let shape = match roi.roi_type {
+            POLYGON => {
+                let points: Vec<(f64, f64)> = xs
+                    .iter()
+                    .zip(ys.iter())
+                    .map(|(x, y)| (x * roi.scale_x + roi_x, y * roi.scale_y + roi_y))
+                    .collect();
+                Some(OmeShape::Polygon {
+                    points,
+                    the_z: None,
+                    the_t: None,
+                    the_c: None,
+                })
+            }
+            TEXT | RECTANGLE => Some(OmeShape::Rectangle {
+                x: roi_x - corner_x.abs(),
+                y: roi_y - corner_y.abs(),
+                width: 2.0 * corner_x.abs(),
+                height: 2.0 * corner_y.abs(),
+                the_z: None,
+                the_t: None,
+                the_c: None,
+            }),
+            SCALE_BAR | ARROW | LINE => {
+                if xs.len() >= 2 && ys.len() >= 2 {
+                    Some(OmeShape::Line {
+                        x1: roi_x + xs[0],
+                        y1: roi_y + ys[0],
+                        x2: roi_x + xs[1],
+                        y2: roi_y + ys[1],
+                        the_z: None,
+                        the_t: None,
+                        the_c: None,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(shape) = shape {
+            out.push(OmeROI {
+                id: None,
+                name: roi.text.clone().or_else(|| roi.name.clone()),
+                shapes: vec![shape],
+            });
+        } else {
+            out.push(OmeROI {
+                id: None,
+                name: roi.text.clone().or_else(|| roi.name.clone()),
+                shapes: Vec::new(),
+            });
+        }
+    }
+    out
+}
+
 /// Java `FormatTools.pixelTypeFromBytes(nBytes, signed=false, fp=true)`:
 /// LIF channels are unsigned integer.
 fn pixel_type_from_bytes(n_bytes: u64) -> PixelType {
@@ -2037,6 +3539,32 @@ mod tests {
             out.extend_from_slice(&unit.to_le_bytes());
         }
         out
+    }
+
+    #[test]
+    fn light_source_settings_attenuation_is_percent_fraction() {
+        use super::{apply_laser_light_source_settings, LifMetaAcc, OmeChannel};
+
+        let effective_c = 2;
+        let mut acc = LifMetaAcc::new(effective_c);
+        // Two non-zero lasers → size == 2.
+        acc.laser_wavelength = vec![488.0, 561.0];
+        // Channel 0 uses laser 0 at 70% intensity (<100 → valid), channel 1
+        // uses laser 1 at full power (==100 → ignored).
+        acc.laser_intensity = vec![70.0, 100.0, 100.0, 100.0];
+        acc.laser_active = vec![true, true];
+        acc.laser_frap = vec![false];
+        acc.channel_names = vec![None, None];
+
+        let mut channels = vec![OmeChannel::default(), OmeChannel::default()];
+        let lasers = apply_laser_light_source_settings(&acc, effective_c, &mut channels);
+
+        // Channel 0: 70% → PercentFraction 0.70, laser index 0.
+        assert_eq!(channels[0].light_source_settings_attenuation, Some(0.7));
+        assert_eq!(lasers[0], Some(0));
+        // Channel 1: intensity 100 was filtered out (not < 100).
+        assert_eq!(channels[1].light_source_settings_attenuation, None);
+        assert_eq!(lasers[1], None);
     }
 
     fn synthetic_lif_bytes() -> Vec<u8> {

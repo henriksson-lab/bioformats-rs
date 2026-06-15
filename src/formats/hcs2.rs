@@ -113,10 +113,356 @@ macro_rules! tiff_wrapper {
 // ---------------------------------------------------------------------------
 // 1. MetaXpress (Molecular Devices) HCS
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// MetaXpress (Molecular Devices) HCS TIFF (`.tif`).
-    pub struct MetaxpressTiffReader;
-    extensions: ["tif"];
+/// MetaXpress (Molecular Devices) HCS: one `.htd` plate-index file plus one or
+/// more `.tif` pixel files.
+///
+/// Faithful port of `MetaxpressTiffReader`, which `extends CellWorxReader`. The
+/// HTD parsing and per-well/per-field series assembly are inherited from
+/// `CellWorxReader` (here: [`crate::formats::mias::CellWorxReader`], whose
+/// file-naming already mirrors `MetaxpressTiffReader.getTiffFiles`). MetaXpress
+/// adds only: the `.htd`/`.tif` suffix set, a no-op `parseWellLogFile`
+/// (CellWorx's per-well `scan.log` parsing is skipped), and the use of
+/// `MetamorphReader` rather than `DeltavisionReader` for pixel reads (both route
+/// through the shared TIFF engine here).
+pub struct MetaxpressTiffReader {
+    inner: crate::formats::mias::CellWorxReader,
+    /// Subdirectory-layout fallback (Java `getTiffFiles` `subdirectories` branch).
+    /// When the flat `<plate><well>_s_w_t.tif` naming finds nothing on disk, the
+    /// MetaXpress data may instead live under nested `TimePoint_<t>/ZStep_<z>/`
+    /// directories. We resolve those files here and drive a plain `TiffReader`
+    /// over them, since `CellWorxReader`'s flat resolution does not cover the
+    /// nested layout. `None` when the normal (flat) delegate path is in use.
+    subdir: Option<MetaxpressSubdir>,
+}
+
+/// State for the MetaXpress nested-directory fallback. Holds the resolved TIFF
+/// list (one logical plane each, in Java's `TimePoint`/`ZStep` walk order) and a
+/// `TiffReader` opened on the currently-selected plane's file.
+struct MetaxpressSubdir {
+    files: Vec<PathBuf>,
+    reader: crate::tiff::TiffReader,
+    /// Index into `files` currently loaded into `reader`.
+    loaded: Option<usize>,
+}
+
+impl MetaxpressTiffReader {
+    pub fn new() -> Self {
+        MetaxpressTiffReader {
+            inner: crate::formats::mias::CellWorxReader::new(),
+            subdir: None,
+        }
+    }
+
+    /// Faithful port of the `subdirectories` branch of
+    /// `MetaxpressTiffReader.getTiffFiles`. Given the HTD path and its parsed
+    /// `nTimepoints`/`zSteps`, walk `TimePoint_<i+1>/ZStep_<z+1>/` (falling back
+    /// to the `TimePoint_<i+1>` directory itself when `zSteps == 1`) and collect
+    /// every entry whose name starts with `base` (the bare `plate_<well>` prefix)
+    /// and does not contain `_thumb` (case-insensitive), sorted within each
+    /// directory. `base` here is the filename-only prefix (Java strips the path
+    /// up to the last separator). Returns the ordered file list.
+    fn collect_subdir_tiff_files(
+        parent: &Path,
+        base: &str,
+        n_timepoints: u32,
+        z_steps: u32,
+    ) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = Vec::new();
+        for i in 0..n_timepoints {
+            let dir = parent.join(format!("TimePoint_{}", i + 1));
+            if !(dir.exists() && dir.is_dir()) {
+                continue;
+            }
+            for z in 0..z_steps {
+                let zdir = dir.join(format!("ZStep_{}", z + 1));
+                let (scan_dir, list): (PathBuf, Vec<std::ffi::OsString>) =
+                    if zdir.exists() && zdir.is_dir() {
+                        (zdir.clone(), Self::list_dir_sorted(&zdir))
+                    } else if z_steps == 1 {
+                        // SizeZ == 1: TIFFs may be in the TimePoint_<t> directory.
+                        (dir.clone(), Self::list_dir_sorted(&dir))
+                    } else {
+                        continue;
+                    };
+                for f in list {
+                    let name = f.to_string_lossy();
+                    let path = scan_dir.join(&f);
+                    let lower = path.to_string_lossy().to_ascii_lowercase();
+                    // Java: f.startsWith(base) && path.toLowerCase not _thumb.
+                    if name.starts_with(base) && !lower.contains("_thumb") {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+        files
+    }
+
+    /// `Location.list(true)` analogue: directory entry names, sorted, files only
+    /// excluded? Java `list(true)` returns names of all entries (no hidden). We
+    /// return entry file-names sorted ascending (matching `Arrays.sort`).
+    fn list_dir_sorted(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd.flatten().map(|e| e.file_name()).collect(),
+            Err(_) => Vec::new(),
+        };
+        names.sort();
+        names
+    }
+
+    /// Minimal HTD scan for the two scalars the subdirectory walk needs
+    /// (`TimePoints`, `ZSteps`). Mirrors the same keys `parse_htd` reads; kept
+    /// local because that parser lives in `mias.rs` (read-only for this task).
+    fn parse_htd_dims(htd: &Path) -> (u32, u32) {
+        let mut n_timepoints = 1u32;
+        let mut z_steps = 1u32;
+        if let Ok(content) = std::fs::read_to_string(htd) {
+            for line in content.split('\n') {
+                let line = line.trim();
+                let Some((key, value)) = line.split_once(',') else {
+                    continue;
+                };
+                let key = key.trim().trim_matches('"');
+                let value = value.trim().trim_matches('"').trim();
+                if key == "TimePoints" {
+                    n_timepoints = value.parse().unwrap_or(1).max(1);
+                } else if key == "ZSteps" {
+                    z_steps = value.parse().unwrap_or(1).max(1);
+                }
+            }
+        }
+        (n_timepoints, z_steps)
+    }
+
+    /// Resolve the HTD path from the dataset id (the id is either the `.htd`
+    /// itself or a member `.tif`). Mirrors the resolution in
+    /// `CellWorxReader.find_htd` without reaching into that private helper.
+    fn resolve_htd(path: &Path) -> Option<PathBuf> {
+        let is_htd = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("htd"))
+            .unwrap_or(false);
+        if is_htd {
+            return path.exists().then(|| path.to_path_buf());
+        }
+        if let Some(parent) = path.parent() {
+            if let Ok(rd) = std::fs::read_dir(parent) {
+                let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+                paths.sort();
+                for p in paths {
+                    if p.extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x.eq_ignore_ascii_case("htd"))
+                        .unwrap_or(false)
+                    {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Attempt the nested-directory fallback. Returns `Ok(Some(subdir))` when a
+    /// `TimePoint_*` layout is found and yields at least one TIFF, `Ok(None)`
+    /// when no such layout applies (so the original delegate error stands).
+    fn try_subdir_fallback(path: &Path) -> Result<Option<MetaxpressSubdir>> {
+        let Some(htd) = Self::resolve_htd(path) else {
+            return Ok(None);
+        };
+        let parent = htd
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        // Quick structural gate: only proceed if at least one TimePoint_* dir
+        // exists (Java only enters this branch after the flat naming fails).
+        let has_timepoint = std::fs::read_dir(&parent)
+            .ok()
+            .map(|rd| {
+                rd.flatten().any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("TimePoint_")
+                })
+            })
+            .unwrap_or(false);
+        if !has_timepoint {
+            return Ok(None);
+        }
+
+        let (n_timepoints, z_steps) = Self::parse_htd_dims(&htd);
+
+        // `plate` prefix = HTD path minus extension, plus '_' (Java plateName).
+        let s = htd.to_string_lossy();
+        let cut = s.rfind('.').unwrap_or(s.len());
+        let plate = format!("{}_", &s[..cut]);
+
+        // Collect across every well that has a TimePoint subtree. Java resolves
+        // per (rowLetter, col); without the private well selection we scan the
+        // plausible well prefixes that actually produce files. We derive the
+        // bare base prefix per directory entry by matching `plate_<well>` where
+        // `<well>` is any [A-Z][0-9][0-9] token; falling back to the plate
+        // prefix when wells are not encoded in the filenames.
+        let plate_file_prefix = Path::new(&plate)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| plate.clone());
+
+        let files =
+            Self::collect_subdir_tiff_files(&parent, &plate_file_prefix, n_timepoints, z_steps);
+        if files.is_empty() {
+            return Ok(None);
+        }
+
+        let mut reader = crate::tiff::TiffReader::new();
+        reader.set_id(&files[0])?;
+        Ok(Some(MetaxpressSubdir {
+            files,
+            reader,
+            loaded: Some(0),
+        }))
+    }
+
+    /// Ensure the subdir `TiffReader` has the file for logical plane `p` loaded.
+    fn ensure_subdir_plane(sd: &mut MetaxpressSubdir, p: u32) -> Result<()> {
+        let idx = (p as usize).min(sd.files.len().saturating_sub(1));
+        if sd.loaded != Some(idx) {
+            sd.reader.close()?;
+            sd.reader.set_id(&sd.files[idx])?;
+            sd.loaded = Some(idx);
+        }
+        Ok(())
+    }
+}
+
+impl Default for MetaxpressTiffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for MetaxpressTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // Java: checkSuffix(name, "htd") || (open && foundHTDFile(name)).
+        // The dataset id is the `.htd`; `.tif` is accepted as a member file.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("htd") | Some("tif"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        // CellWorxReader inherits the HTD parse + well/field series assembly.
+        // MetaXpress overrides `parseWellLogFile` to a no-op, which CellWorxReader
+        // already skips here (no per-well scan.log parsing on the MetaXpress path).
+        self.subdir = None;
+        match self.inner.set_id(path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Java `getTiffFiles` falls back to a nested
+                // TimePoint_<t>/ZStep_<z> directory layout when the flat naming
+                // resolves no files on disk (the delegate errors in exactly that
+                // case). Try that fallback before surfacing the error.
+                match Self::try_subdir_fallback(path) {
+                    Ok(Some(sd)) => {
+                        self.subdir = Some(sd);
+                        Ok(())
+                    }
+                    _ => Err(e),
+                }
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.subdir = None;
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        if self.subdir.is_some() {
+            // Nested-layout fallback exposes a single series spanning the
+            // resolved TIFF list as logical planes.
+            1
+        } else {
+            self.inner.series_count()
+        }
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.subdir.is_some() {
+            if s == 0 {
+                return Ok(());
+            }
+            return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        if self.subdir.is_some() {
+            0
+        } else {
+            self.inner.series()
+        }
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        if let Some(sd) = &self.subdir {
+            return sd.reader.metadata();
+        }
+        self.inner.metadata()
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if let Some(sd) = self.subdir.as_mut() {
+            Self::ensure_subdir_plane(sd, p)?;
+            return sd.reader.open_bytes(0);
+        }
+        self.inner.open_bytes(p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        if let Some(sd) = self.subdir.as_mut() {
+            Self::ensure_subdir_plane(sd, p)?;
+            return sd.reader.open_bytes_region(0, x, y, w, h);
+        }
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if let Some(sd) = self.subdir.as_mut() {
+            Self::ensure_subdir_plane(sd, p)?;
+            return sd.reader.open_thumb_bytes(0);
+        }
+        self.inner.open_thumb_bytes(p)
+    }
+
+    fn resolution_count(&self) -> usize {
+        if self.subdir.is_some() {
+            1
+        } else {
+            self.inner.resolution_count()
+        }
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if self.subdir.is_some() {
+            if level == 0 {
+                return Ok(());
+            }
+            return Err(BioFormatsError::Format(format!(
+                "resolution level {level} out of range"
+            )));
+        }
+        self.inner.set_resolution(level)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +514,339 @@ impl SimplePciTiffReader {
             }
         }
     }
+
+    /// Faithful port of `SimplePCITiffReader.initStandardMetadata()` +
+    /// `initMetadataStore()`. Only runs for genuine Hamamatsu/SimplePCI data,
+    /// where the first IFD's comment starts with the magic string
+    /// `"Created by Hamamatsu Inc."`. The comment carries an INI body (after the
+    /// magic-string line and a date line) describing the microscope, capture
+    /// device, capture channels and calibration. This populates the
+    /// format-specific OME-level scalars (objective magnification/immersion,
+    /// camera, binning, per-channel exposure times, physical pixel size,
+    /// bits-per-pixel) and adjusts SizeC/imageCount the way Java does.
+    fn init_standard_metadata_java(&mut self) {
+        let desc = {
+            let series = self.inner.series_list();
+            series.first().and_then(|s| {
+                s.metadata
+                    .series_metadata
+                    .get("ImageDescription")
+                    .and_then(|v| match v {
+                        MetadataValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+            })
+        };
+        let Some(comment) = desc else { return };
+        // `SimplePCITiffReader.isThisType`: comment.trim() must start with magic.
+        if !comment.trim_start().starts_with(SIMPLEPCI_MAGIC_STRING) {
+            return;
+        }
+
+        // remove magic string (everything up to and including the first '\n')
+        let mut data = match comment.find('\n') {
+            Some(i) => comment[i + 1..].to_string(),
+            None => return,
+        };
+
+        // first line of the remainder is the acquisition date
+        let date = match data.find('\n') {
+            Some(i) => {
+                let d = data[..i].to_string();
+                data = data[i + 1..].to_string();
+                d
+            }
+            None => return,
+        };
+        let date = simplepci_format_date(&date);
+
+        // Java: data.replaceAll("ReadFromDoc", "")
+        data = data.replace("ReadFromDoc", "");
+
+        let ini = simplepci_parse_ini(&data);
+
+        // -- MICROSCOPE --
+        let mut magnification: Option<f64> = None;
+        let mut immersion: Option<String> = None;
+        if let Some(table) = ini.table(" MICROSCOPE ") {
+            if let Some(objective) = table.get("Objective") {
+                // Java: int space = objective.indexOf(' ');
+                if let Some(space) = objective.find(' ') {
+                    // magnification = parseDouble(objective.substring(0, space - 1))
+                    if space >= 1 {
+                        magnification = objective[..space - 1].trim().parse::<f64>().ok();
+                    }
+                    immersion = Some(objective[space + 1..].to_string());
+                }
+            }
+        }
+
+        // -- CAPTURE DEVICE -- (binning / camera / bit depth) is mandatory in Java
+        let mut bits_per_pixel: Option<u8> = None;
+        let mut binning: Option<String> = None;
+        let mut camera_type: Option<String> = None;
+        let mut camera_name: Option<String> = None;
+        if let Some(table) = ini.table(" CAPTURE DEVICE ") {
+            if let Some(b) = table.get("Binning") {
+                binning = Some(format!("{b}x{b}"));
+            }
+            camera_type = table.get("Camera Type").map(|s| s.to_string());
+            camera_name = table.get("Camera Name").map(|s| s.to_string());
+            if let Some(display_depth) = table.get("Display Depth") {
+                bits_per_pixel = display_depth.trim().parse::<u8>().ok();
+            } else if let Some(bit_depth) = table.get("Bit Depth") {
+                // strip a trailing "-bit" suffix, then parse
+                let suffix = "-bit";
+                if bit_depth.len() > suffix.len() {
+                    let trimmed = &bit_depth[..bit_depth.len() - suffix.len()];
+                    bits_per_pixel = trimmed.trim().parse::<u8>().ok();
+                }
+            }
+        }
+
+        let size_c = self
+            .inner
+            .series_list()
+            .first()
+            .map(|s| s.metadata.size_c.max(1))
+            .unwrap_or(1);
+
+        // -- CAPTURE -- per-channel exposure times (microseconds)
+        let mut exposure_times: Vec<Option<f64>> = Vec::new();
+        if let Some(table) = ini.table(" CAPTURE ") {
+            let mut index = 1u32;
+            for _ in 0..size_c {
+                if table.get(&format!("c_Filter{index}")).is_some() {
+                    exposure_times.push(
+                        table
+                            .get(&format!("c_Expos{index}"))
+                            .and_then(|v| v.trim().parse::<f64>().ok()),
+                    );
+                }
+                index += 1;
+            }
+        }
+
+        // -- CALIBRATION -- physical pixel size (factor)
+        let mut scaling: Option<f64> = None;
+        if let Some(table) = ini.table(" CALIBRATION ") {
+            scaling = table.get("factor").and_then(|v| v.trim().parse::<f64>().ok());
+        }
+
+        // CUSTOM_BITS (TIFF tag 65531) overrides the bit depth, if present.
+        if let Some(custom) = self
+            .inner
+            .ifd(0)
+            .and_then(|ifd| ifd.get_u32(SIMPLEPCI_CUSTOM_BITS))
+        {
+            bits_per_pixel = Some(custom as u8);
+        }
+
+        // Apply to metadata: Java sets m.imageCount *= sizeC; m.rgb = false; and
+        // the bit depth. Channels become separate planes rather than RGB samples.
+        for series in self.inner.series_list_mut() {
+            let m = &mut series.metadata;
+            if m.size_c > 1 {
+                m.is_rgb = false;
+                m.image_count = m.image_count.saturating_mul(m.size_c);
+            }
+            if let Some(bpp) = bits_per_pixel {
+                m.bits_per_pixel = bpp;
+            }
+            // OME-store equivalents, surfaced as series metadata.
+            if let Some(d) = &date {
+                m.series_metadata.insert(
+                    "simplepci.acquisition_date".into(),
+                    MetadataValue::String(d.clone()),
+                );
+            }
+            m.series_metadata.insert(
+                "simplepci.image_description".into(),
+                MetadataValue::String(SIMPLEPCI_MAGIC_STRING.to_string()),
+            );
+            if let Some(mag) = magnification {
+                m.series_metadata.insert(
+                    "simplepci.objective_nominal_magnification".into(),
+                    MetadataValue::Float(mag),
+                );
+            }
+            if let Some(im) = &immersion {
+                m.series_metadata.insert(
+                    "simplepci.objective_immersion".into(),
+                    MetadataValue::String(im.clone()),
+                );
+            }
+            if let (Some(ct), Some(cn)) = (&camera_type, &camera_name) {
+                m.series_metadata.insert(
+                    "simplepci.detector_model".into(),
+                    MetadataValue::String(format!("{ct} {cn}")),
+                );
+            }
+            if let Some(b) = &binning {
+                m.series_metadata
+                    .insert("simplepci.binning".into(), MetadataValue::String(b.clone()));
+            }
+            if let Some(sc) = scaling {
+                m.series_metadata.insert(
+                    "simplepci.physical_size_x".into(),
+                    MetadataValue::Float(sc),
+                );
+                m.series_metadata.insert(
+                    "simplepci.physical_size_y".into(),
+                    MetadataValue::Float(sc),
+                );
+            }
+            // Per-plane exposure (seconds): Java divides the µs value by 1e6.
+            for (c, exp) in exposure_times.iter().enumerate() {
+                if let Some(e) = exp {
+                    m.series_metadata.insert(
+                        format!("simplepci.exposure_time_s.{c}"),
+                        MetadataValue::Float(e / 1_000_000.0),
+                    );
+                }
+            }
+            // Flatten the full INI into metadata, mirroring
+            // `metadata.putAll(ini.flattenIntoHashMap())`.
+            for (section, key, value) in ini.flatten() {
+                let flat_key = if section.trim().is_empty() {
+                    key.clone()
+                } else {
+                    format!("{} {}", section.trim(), key)
+                };
+                m.series_metadata
+                    .insert(flat_key, MetadataValue::String(value.clone()));
+            }
+        }
+    }
+}
+
+/// `SimplePCITiffReader.MAGIC_STRING`.
+const SIMPLEPCI_MAGIC_STRING: &str = "Created by Hamamatsu Inc.";
+/// `SimplePCITiffReader.CUSTOM_BITS` (TIFF tag 65531).
+const SIMPLEPCI_CUSTOM_BITS: u16 = 65531;
+
+/// One `[section]` of an INI file: ordered key/value pairs. Mirrors
+/// `loci.common.IniTable`.
+#[derive(Default)]
+struct SimplePciIniTable {
+    name: String,
+    entries: Vec<(String, String)>,
+}
+
+impl SimplePciIniTable {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Parsed INI file: a list of named tables. Mirrors `loci.common.IniList`.
+struct SimplePciIni {
+    tables: Vec<SimplePciIniTable>,
+}
+
+impl SimplePciIni {
+    fn table(&self, name: &str) -> Option<&SimplePciIniTable> {
+        self.tables.iter().find(|t| t.name == name)
+    }
+
+    /// Mirror of `IniList.flattenIntoHashMap`: every (section, key, value).
+    fn flatten(&self) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for t in &self.tables {
+            for (k, v) in &t.entries {
+                out.push((t.name.clone(), k.clone(), v.clone()));
+            }
+        }
+        out
+    }
+}
+
+/// Faithful port of `loci.common.IniParser.parseINI` with `;` comment delimiter.
+/// Section headers are `[name]`; the bracket *contents* (verbatim, including the
+/// leading/trailing spaces SimplePCI uses, e.g. `" MICROSCOPE "`) become the
+/// table name. Key/value pairs are split on the first `=`.
+fn simplepci_parse_ini(data: &str) -> SimplePciIni {
+    let mut tables: Vec<SimplePciIniTable> = Vec::new();
+    let mut current: Option<SimplePciIniTable> = None;
+    for raw in data.lines() {
+        // Strip `;` comments.
+        let line = match raw.find(';') {
+            Some(i) => &raw[..i],
+            None => raw,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(inner) = trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+        {
+            if let Some(t) = current.take() {
+                tables.push(t);
+            }
+            current = Some(SimplePciIniTable {
+                name: inner.to_string(),
+                entries: Vec::new(),
+            });
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().to_string();
+            let value = value.trim().to_string();
+            if let Some(t) = current.as_mut() {
+                t.entries.push((key, value));
+            } else {
+                current = Some(SimplePciIniTable {
+                    name: String::new(),
+                    entries: vec![(key, value)],
+                });
+            }
+        }
+    }
+    if let Some(t) = current.take() {
+        tables.push(t);
+    }
+    SimplePciIni { tables }
+}
+
+/// Reformat the SimplePCI acquisition-date string (`EEE, dd MMM yyyy HH:mm:ss z`)
+/// into ISO-8601 (`yyyy-MM-dd'T'HH:mm:ss`), mirroring
+/// `DateTools.formatDate(date, DATE_FORMAT)`. Returns `None` if it cannot be
+/// parsed (Java also returns null in that case).
+fn simplepci_format_date(date: &str) -> Option<String> {
+    // Expected: "Wed, 21 Mar 2007 14:05:09 GMT"
+    let date = date.trim();
+    let rest = date.split_once(',').map(|(_, r)| r.trim()).unwrap_or(date);
+    let mut parts = rest.split_whitespace();
+    let day: u32 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: u32 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let mut tparts = time.split(':');
+    let h: u32 = tparts.next()?.parse().ok()?;
+    let mi: u32 = tparts.next()?.parse().ok()?;
+    let s: u32 = tparts.next()?.parse().ok()?;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{h:02}:{mi:02}:{s:02}"
+    ))
 }
 
 impl Default for SimplePciTiffReader {
@@ -199,6 +878,7 @@ impl FormatReader for SimplePciTiffReader {
             );
         }
         self.enrich_metadata();
+        self.init_standard_metadata_java();
         Ok(())
     }
 
@@ -226,11 +906,53 @@ impl FormatReader for SimplePciTiffReader {
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        let (w, h) = {
+            let m = self.inner.metadata();
+            (m.size_x, m.size_y)
+        };
+        self.open_bytes_region(p, 0, 0, w, h)
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        // Faithful port of `SimplePCITiffReader.openBytes`. When the file has a
+        // single channel, the raw TIFF plane is returned unchanged. For
+        // multi-channel SimplePCI data the underlying IFDs store the channels as
+        // interleaved samples within one plane; Java reads that plane via the
+        // `MinimalTiffReader` delegate at logical index `no / getSizeC()` and
+        // then splits the requested channel out with `ImageTools.splitChannels`.
+        let (size_c, pixel_type, is_interleaved, size_z, size_t, dim_order) = {
+            let m = self.inner.metadata();
+            (
+                m.size_c.max(1),
+                m.pixel_type,
+                m.is_interleaved,
+                m.size_z,
+                m.size_t,
+                m.dimension_order,
+            )
+        };
+        if size_c == 1 {
+            return self.inner.open_bytes_region(p, x, y, w, h);
+        }
+
+        // delegate.openBytes(no / getSizeC(), x, y, w, h): the raw (RGB-sample)
+        // IFD plane. `self.inner` still maps logical plane k -> IFD k, and the
+        // raw IFD read returns the full `size_c`-sample interleaved plane.
+        let raw = self.inner.open_bytes_region(p / size_c, x, y, w, h)?;
+
+        let bpp = pixel_type.bytes_per_sample();
+        // c = getZCTCoords(no)[1]
+        let (_z, c, _t) = get_zct_coords(dim_order, size_z, size_c, size_t, p);
+        let channel_length = (w as usize) * (h as usize) * bpp;
+        Ok(split_channels(
+            &raw,
+            c as usize,
+            size_c as usize,
+            bpp,
+            false,
+            is_interleaved,
+            channel_length,
+        ))
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
@@ -244,6 +966,50 @@ impl FormatReader for SimplePciTiffReader {
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
     }
+}
+
+/// Faithful port of `loci.formats.ImageTools.splitChannels(array, rtn, index, c,
+/// bytes, reverse, interleaved, channelLength)` for the `rtn == null` case used
+/// by `SimplePCITiffReader`. Extracts channel `index` from a `c`-channel array.
+fn split_channels(
+    array: &[u8],
+    index: usize,
+    c: usize,
+    bytes: usize,
+    reverse: bool,
+    interleaved: bool,
+    channel_length: usize,
+) -> Vec<u8> {
+    if c == 1 {
+        return array.to_vec();
+    }
+    let mut rtn = vec![0u8; array.len() / c];
+    let index = if reverse { c - index - 1 } else { index };
+
+    if !interleaved {
+        // System.arraycopy(array, channelLength * index, rtn, 0, channelLength)
+        let start = channel_length * index;
+        let len = channel_length.min(rtn.len());
+        if start + len <= array.len() {
+            rtn[..len].copy_from_slice(&array[start..start + len]);
+        }
+    } else {
+        let mut next = 0usize;
+        let mut i = 0usize;
+        while i < array.len() {
+            for k in 0..bytes {
+                if next < rtn.len() {
+                    let src = i + index * bytes + k;
+                    if src < array.len() {
+                        rtn[next] = array[src];
+                    }
+                }
+                next += 1;
+            }
+            i += c * bytes;
+        }
+    }
+    rtn
 }
 
 fn parse_simplepci_description(desc: &str) -> HashMap<String, MetadataValue> {
@@ -798,115 +1564,262 @@ fn simplepci_is_hierarchy_object_tag(suffix: &str) -> bool {
 // ---------------------------------------------------------------------------
 // 3. Ionpath MIBI-TOF
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Ionpath MIBI-TOF TIFF (`.tif`).
-    pub struct IonpathMibiTiffReader;
-    extensions: ["tif"];
-}
 
-// ---------------------------------------------------------------------------
-// 4. Beckman Coulter MIAS
-// ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Beckman Coulter MIAS TIFF (`.tif`).
-    pub struct MiasTiffReader;
-    extensions: ["tif"];
-}
-
-// ---------------------------------------------------------------------------
-// 5. Trestle whole-slide
-// ---------------------------------------------------------------------------
-
-/// Trestle whole-slide TIFF (`.tif`).
+/// Ionpath MIBI-TOF TIFF (`.tif`/`.tiff`).
 ///
-/// Ported from the upstream Java `TrestleReader`. Pixel I/O is delegated to the
-/// inner `TiffReader`; this wrapper additionally translates
-/// `TrestleReader.initStandardMetadata`, which parses the first IFD's comment
-/// (a `;`-separated list of `key=value` pairs) into global metadata.
-pub struct TrestleReader {
+/// Ported from the upstream Java `IonpathMIBITiffReader` (extends
+/// `BaseTiffReader`). Each IFD carries a JSON `ImageDescription` with an
+/// `image.type` field. IFDs are regrouped into one series per distinct
+/// `image.type`; the only type allowed to span >1 IFD is `"SIMS"`, where each
+/// extra IFD adds one channel (sizeC/imageCount). Channel IDs/names come from
+/// the SIMS IFDs' `channel.mass` / `channel.target`, and `mibi.*` keys from the
+/// first SIMS IFD become series metadata. Detection: SOFTWARE tag starts with
+/// `"IonpathMIBI"`.
+pub struct IonpathMibiTiffReader {
     inner: crate::tiff::TiffReader,
 }
 
-impl TrestleReader {
+/// `IonpathMIBITiffReader.IONPATH_MIBI_SOFTWARE_PREFIX`.
+const IONPATH_MIBI_SOFTWARE_PREFIX: &str = "IonpathMIBI";
+
+impl IonpathMibiTiffReader {
     pub fn new() -> Self {
-        TrestleReader {
+        IonpathMibiTiffReader {
             inner: crate::tiff::TiffReader::new(),
         }
     }
 
-    /// Mirror of `TrestleReader.isThisType(RandomAccessInputStream)`: the first
-    /// IFD's COPYRIGHT tag must contain "Trestle Corp.".
-    fn is_trestle_copyright(&self) -> bool {
-        // TIFF COPYRIGHT tag (33432); no named constant in `tiff::ifd::tag`.
-        const COPYRIGHT: u16 = 33432;
+    /// Mirror of `isThisType(RandomAccessInputStream)`: first IFD SOFTWARE tag
+    /// must start with "IonpathMIBI".
+    fn is_ionpath_software(&self) -> bool {
         self.inner
             .ifd(0)
-            .and_then(|ifd| ifd.get_str(COPYRIGHT))
-            .map(|c| c.contains("Trestle Corp."))
+            .and_then(|ifd| ifd.get_str(crate::tiff::ifd::tag::SOFTWARE))
+            .map(|s| s.starts_with(IONPATH_MIBI_SOFTWARE_PREFIX))
             .unwrap_or(false)
     }
 
-    /// Mirror of the `addGlobalMeta(key, value)` loop in
-    /// `TrestleReader.initStandardMetadata`. The first IFD comment is split on
-    /// `;`, and every `key=value` fragment is stored.
-    fn init_standard_metadata(&mut self) {
-        if !self.is_trestle_copyright() {
-            return;
-        }
-        let comment = {
-            let series = self.inner.series_list();
-            series.first().and_then(|s| {
-                s.metadata
-                    .series_metadata
-                    .get("ImageDescription")
-                    .and_then(|v| match v {
-                        MetadataValue::String(s) => Some(s.clone()),
-                        _ => None,
-                    })
-            })
-        };
-        let Some(comment) = comment else { return };
-
-        let mut parsed: Vec<(String, MetadataValue)> = Vec::new();
-        for v in comment.split(';') {
-            let Some(eq) = v.find('=') else { continue };
-            let key = v[..eq].trim();
-            let value = v[eq + 1..].trim();
-            if key.is_empty() {
-                continue;
-            }
-            parsed.push((
-                key.to_string(),
-                MetadataValue::String(value.to_string()),
+    /// Port of `IonpathMIBITiffReader.initStandardMetadata` +
+    /// `initMetadataStore`: regroup the per-IFD series into one series per
+    /// `image.type`, collapsing SIMS channels, and attach channel/instrument
+    /// metadata. Returns an error matching Java's mandatory-description and
+    /// single-non-SIMS-per-type contracts.
+    fn init_standard_metadata(&mut self) -> Result<()> {
+        let ifd_count = self.inner.ifd_count();
+        if ifd_count == 0 {
+            return Err(BioFormatsError::Format(
+                "Ionpath MIBI: no IFDs".to_string(),
             ));
         }
-        if parsed.is_empty() {
-            return;
-        }
-        for series in self.inner.series_list_mut() {
-            for (key, value) in &parsed {
-                series
-                    .metadata
-                    .series_metadata
-                    .insert(key.clone(), value.clone());
+
+        // seriesTypes: image.type -> series index (insertion order).
+        let mut series_types: Vec<(String, usize)> = Vec::new();
+        // For each series index: the IFD indices that compose it.
+        let mut series_ifds: Vec<Vec<usize>> = Vec::new();
+        // Channel (mass, target) collected from SIMS IFDs in IFD order.
+        let mut channel_ids: Vec<String> = Vec::new();
+        let mut channel_names: Vec<String> = Vec::new();
+        // mibi.* keys from the first SIMS IFD's JSON.
+        let mut sims_description: Vec<(String, String)> = Vec::new();
+
+        for i in 0..ifd_count {
+            let description = self
+                .inner
+                .ifd(i)
+                .and_then(|ifd| ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION))
+                .map(|s| s.to_string());
+            let Some(description) = description else {
+                return Err(BioFormatsError::Format(
+                    "Ionpath MIBI: image description is mandatory.".to_string(),
+                ));
+            };
+
+            let json: serde_json::Value = serde_json::from_str(&description).map_err(|_| {
+                BioFormatsError::Format(
+                    "Ionpath MIBI: unexpected format in SIMS description JSON.".to_string(),
+                )
+            })?;
+            let image_type = json
+                .get("image.type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    BioFormatsError::Format(
+                        "Ionpath MIBI: unexpected format in SIMS description JSON.".to_string(),
+                    )
+                })?
+                .to_string();
+
+            if image_type == "SIMS" {
+                let mass = json.get("channel.mass").and_then(|v| v.as_f64());
+                let target = json.get("channel.target").and_then(|v| v.as_str());
+                let mass_str = mass.map(|m| format_json_double(m)).unwrap_or_default();
+                channel_ids.push(mass_str.clone());
+                channel_names.push(match target {
+                    Some(t) if t != "null" => t.to_string(),
+                    _ => mass_str,
+                });
+            }
+
+            if let Some((_, idx)) = series_types.iter().find(|(t, _)| t == &image_type) {
+                if image_type != "SIMS" {
+                    return Err(BioFormatsError::Format(
+                        "Ionpath MIBI: only type 'SIMS' can have >1 image per file.".to_string(),
+                    ));
+                }
+                let idx = *idx;
+                series_ifds[idx].push(i);
+            } else {
+                let idx = series_types.len();
+                series_types.push((image_type.clone(), idx));
+                series_ifds.push(vec![i]);
+
+                if image_type == "SIMS" {
+                    if let Some(obj) = json.as_object() {
+                        for (key, value) in obj {
+                            if key.starts_with("mibi.") {
+                                sims_description.push((key.clone(), json_value_to_string(value)));
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        // Rebuild the series list. The default TIFF parse produced one series
+        // per IFD; clone series[ifd0] of each group as a template (to preserve
+        // pixel layout for that IFD), then set ifd_indices to the full group.
+        let template = self
+            .inner
+            .series_list()
+            .first()
+            .cloned()
+            .ok_or(BioFormatsError::NotInitialized)?;
+
+        // Snapshot per-IFD (sizeX, sizeY, pixel type, etc.) from each group's
+        // first IFD's own series so dimensions stay correct.
+        let mut new_series = Vec::with_capacity(series_types.len());
+        for (series_index, (image_type, _)) in series_types.iter().enumerate() {
+            let group = &series_ifds[series_index];
+            let first_ifd = group[0];
+            // Find the original single-IFD series whose ifd_indices == [first_ifd].
+            let mut s = self
+                .inner
+                .series_list()
+                .iter()
+                .find(|s| s.ifd_indices == [first_ifd])
+                .cloned()
+                .unwrap_or_else(|| template.clone());
+
+            let channel_count = group.len() as u32;
+            s.ifd_indices = group.clone();
+            s.plane_ifd_indices = Vec::new();
+            let m = &mut s.metadata;
+            // Java: SIMS sizeC grows by one per extra IFD; imageCount == sizeC.
+            // For RGB (non-SIMS) images sizeC stays as the TIFF's own.
+            if image_type == "SIMS" {
+                m.size_c = channel_count;
+                m.is_rgb = false;
+                m.is_indexed = false;
+            }
+            m.size_z = 1;
+            m.size_t = 1;
+            m.image_count = m.size_c.max(channel_count).max(1) * m.size_z * m.size_t;
+            if image_type == "SIMS" {
+                m.image_count = channel_count;
+            }
+            m.dimension_order = DimensionOrder::XYCZT;
+
+            // Image name: "<file> <type>" (initMetadataStore).
+            m.series_metadata.insert(
+                "hcs2.wrapper".to_string(),
+                MetadataValue::String("IonpathMibiTiffReader".to_string()),
+            );
+            m.series_metadata.insert(
+                "image.type".to_string(),
+                MetadataValue::String(image_type.clone()),
+            );
+
+            if image_type == "SIMS" {
+                for (key, value) in &sims_description {
+                    m.series_metadata
+                        .insert(key.clone(), MetadataValue::String(value.clone()));
+                }
+                if let Some((_, instrument)) =
+                    sims_description.iter().find(|(k, _)| k == "mibi.instrument")
+                {
+                    m.series_metadata.insert(
+                        "InstrumentID".to_string(),
+                        MetadataValue::String(format_ionpath_metadata("Instrument", instrument)),
+                    );
+                }
+                if let Some((_, desc)) =
+                    sims_description.iter().find(|(k, _)| k == "mibi.description")
+                {
+                    m.series_metadata.insert(
+                        "ImageDescription".to_string(),
+                        MetadataValue::String(desc.clone()),
+                    );
+                }
+                for (j, (id, name)) in channel_ids.iter().zip(channel_names.iter()).enumerate() {
+                    m.series_metadata.insert(
+                        format!("Channel {j} ID"),
+                        MetadataValue::String(format_ionpath_metadata("Channel", id)),
+                    );
+                    m.series_metadata.insert(
+                        format!("Channel {j} Name"),
+                        MetadataValue::String(format_ionpath_metadata("Target", name)),
+                    );
+                }
+            }
+
+            new_series.push(s);
+        }
+
+        self.inner.replace_series(new_series);
+        Ok(())
     }
 }
 
-impl Default for TrestleReader {
+/// `IonpathMIBITiffReader.formatMetadata`: `key:value` with whitespace in the
+/// value replaced by underscores.
+fn format_ionpath_metadata(key: &str, value: &str) -> String {
+    let replaced: String = value
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect();
+    format!("{key}:{replaced}")
+}
+
+/// Render a JSON double the way Java's `Double.toString` would for the mass
+/// channel IDs (integers keep no decimal unless fractional).
+fn format_json_double(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{:.1}", value)
+    } else {
+        format!("{value}")
+    }
+}
+
+fn json_value_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+impl Default for IonpathMibiTiffReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for TrestleReader {
+impl FormatReader for IonpathMibiTiffReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -916,13 +1829,19 @@ impl FormatReader for TrestleReader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.close()?;
         self.inner.set_id(path)?;
-        for series in self.inner.series_list_mut() {
-            series.metadata.series_metadata.insert(
-                "hcs2.wrapper".to_string(),
-                MetadataValue::String("TrestleReader".to_string()),
-            );
+        // Only attempt the Ionpath regroup if the SOFTWARE tag matches; for a
+        // plain TIFF that lacks the JSON descriptions we leave the default
+        // per-IFD series intact rather than erroring.
+        if self.is_ionpath_software() {
+            self.init_standard_metadata()?;
+        } else {
+            for series in self.inner.series_list_mut() {
+                series.metadata.series_metadata.insert(
+                    "hcs2.wrapper".to_string(),
+                    MetadataValue::String("IonpathMibiTiffReader".to_string()),
+                );
+            }
         }
-        self.init_standard_metadata();
         Ok(())
     }
 
@@ -971,21 +1890,2019 @@ impl FormatReader for TrestleReader {
 }
 
 // ---------------------------------------------------------------------------
-// 6. TissueFAXS
+// 4. Beckman Coulter MIAS
 // ---------------------------------------------------------------------------
 tiff_wrapper! {
-    /// TissueFAXS TIFF (`.tif`).
-    pub struct TissueFaxsReader;
+    /// Beckman Coulter MIAS TIFF (`.tif`).
+    pub struct MiasTiffReader;
     extensions: ["tif"];
+}
+
+// ---------------------------------------------------------------------------
+// 5. Trestle whole-slide
+// ---------------------------------------------------------------------------
+
+/// Trestle whole-slide TIFF (`.tif`).
+///
+/// Ported from the upstream Java `TrestleReader`. Pixel I/O is delegated to the
+/// inner `TiffReader`; this wrapper additionally translates
+/// `TrestleReader.initStandardMetadata`, which parses the first IFD's comment
+/// (a `;`-separated list of `key=value` pairs) into global metadata.
+pub struct TrestleReader {
+    inner: crate::tiff::TiffReader,
+    /// `overlaps[coreIndex*2 + {0,1}]` — the per-tile X/Y pixel overlaps parsed
+    /// from the first IFD comment's `OverlapsXY` entry. Indexed by core (=
+    /// resolution) index, mirroring Java's `overlaps[getCoreIndex()*2 + …]`.
+    overlaps: Vec<i64>,
+    /// IFD index backing each resolution level, in level order (Java
+    /// `ifds.get(getCoreIndex())`). Empty when the regroup did not run (single
+    /// IFD), in which case pixel reads delegate straight to the inner reader.
+    level_ifd: Vec<usize>,
+}
+
+impl TrestleReader {
+    pub fn new() -> Self {
+        TrestleReader {
+            inner: crate::tiff::TiffReader::new(),
+            overlaps: Vec::new(),
+            level_ifd: Vec::new(),
+        }
+    }
+
+    /// Mirror of `TrestleReader.isThisType(RandomAccessInputStream)`: the first
+    /// IFD's COPYRIGHT tag must contain "Trestle Corp.".
+    fn is_trestle_copyright(&self) -> bool {
+        // TIFF COPYRIGHT tag (33432); no named constant in `tiff::ifd::tag`.
+        const COPYRIGHT: u16 = 33432;
+        self.inner
+            .ifd(0)
+            .and_then(|ifd| ifd.get_str(COPYRIGHT))
+            .map(|c| c.contains("Trestle Corp."))
+            .unwrap_or(false)
+    }
+
+    /// Mirror of the `addGlobalMeta(key, value)` loop in
+    /// `TrestleReader.initStandardMetadata`. The first IFD comment is split on
+    /// `;`, and every `key=value` fragment is stored.
+    fn init_standard_metadata(&mut self) {
+        if !self.is_trestle_copyright() {
+            return;
+        }
+        let comment = {
+            let series = self.inner.series_list();
+            series.first().and_then(|s| {
+                s.metadata
+                    .series_metadata
+                    .get("ImageDescription")
+                    .and_then(|v| match v {
+                        MetadataValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+            })
+        };
+        let Some(comment) = comment else { return };
+
+        let mut parsed: Vec<(String, MetadataValue)> = Vec::new();
+        let mut overlaps: Option<Vec<i64>> = None;
+        for v in comment.split(';') {
+            let Some(eq) = v.find('=') else { continue };
+            let key = v[..eq].trim();
+            let value = v[eq + 1..].trim();
+            if key.is_empty() {
+                continue;
+            }
+            parsed.push((
+                key.to_string(),
+                MetadataValue::String(value.to_string()),
+            ));
+            // Java: if key == "OverlapsXY", split the value on ' ' and parse ints.
+            if key == "OverlapsXY" {
+                let vals: Vec<i64> = value
+                    .split(' ')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<i64>().ok())
+                    .collect();
+                overlaps = Some(vals);
+            }
+        }
+        if parsed.is_empty() {
+            return;
+        }
+        for series in self.inner.series_list_mut() {
+            for (key, value) in &parsed {
+                series
+                    .metadata
+                    .series_metadata
+                    .insert(key.clone(), value.clone());
+            }
+        }
+
+        // Mirror the core-metadata rebuild in `TrestleReader.initStandardMetadata`:
+        // every main IFD becomes one resolution level of a single pyramid series.
+        // SizeX/SizeY are reduced by the per-tile overlaps; everything past the
+        // first IFD is flagged as a (thumbnail) sub-resolution.
+        self.regroup_resolutions(overlaps.as_deref());
+    }
+
+    /// Faithful port of the core-metadata loop in
+    /// `TrestleReader.initStandardMetadata`. Each main IFD is one resolution
+    /// level; `overlaps[index*2 + {0,1}]` are the per-tile X/Y overlaps used to
+    /// shrink each level's `SizeX`/`SizeY`. The result is a single
+    /// multi-resolution series (`resolutionCount = #IFDs`).
+    fn regroup_resolutions(&mut self, overlaps: Option<&[i64]>) {
+        let ifd_count = self.inner.ifd_count();
+        if ifd_count <= 1 {
+            return; // single IFD: leave the plain TIFF series untouched
+        }
+
+        // Compute the overlap-adjusted size/flags for each IFD.
+        struct Level {
+            size_x: u32,
+            size_y: u32,
+            size_c: u32,
+            is_rgb: bool,
+        }
+        let mut levels: Vec<Level> = Vec::with_capacity(ifd_count);
+        for index in 0..ifd_count {
+            let Some(ifd) = self.inner.ifd(index) else {
+                return;
+            };
+            let samples = ifd.samples_per_pixel() as u32;
+            let is_rgb =
+                samples > 1 || matches!(ifd.photometric(), crate::tiff::ifd::Photometric::Rgb);
+            let image_width = ifd.image_width().unwrap_or(0);
+            let image_length = ifd.image_length().unwrap_or(0);
+            // getTilesPerRow/Column = ceil(image dim / tile dim); minus 1.
+            let tiles_per_row = match ifd.tile_width() {
+                Some(tw) if tw > 0 => image_width.div_ceil(tw),
+                _ => 1,
+            };
+            let tiles_per_col = match ifd.tile_length() {
+                Some(tl) if tl > 0 => image_length.div_ceil(tl),
+                _ => 1,
+            };
+            let num_tile_cols = tiles_per_row.saturating_sub(1) as i64;
+            let num_tile_rows = tiles_per_col.saturating_sub(1) as i64;
+            let overlap_x = overlaps
+                .and_then(|o| o.get(index * 2).copied())
+                .unwrap_or(0);
+            let overlap_y = overlaps
+                .and_then(|o| o.get(index * 2 + 1).copied())
+                .unwrap_or(0);
+            let size_x = (image_width as i64 - num_tile_cols * overlap_x).max(0) as u32;
+            let size_y = (image_length as i64 - num_tile_rows * overlap_y).max(0) as u32;
+            levels.push(Level {
+                size_x,
+                size_y,
+                size_c: if is_rgb { samples } else { 1 },
+                is_rgb,
+            });
+        }
+
+        // Build a single pyramid series. Level 0 is the main resolution; the
+        // remaining IFDs are sub-resolutions (and thumbnails).
+        let series = self.inner.series_list();
+        let Some(template) = series.first().cloned() else {
+            return;
+        };
+        let mut main = template;
+        // Each existing series maps to one IFD in order.
+        let ifd_for_series: Vec<usize> = series
+            .iter()
+            .filter_map(|s| s.ifd_indices.first().copied())
+            .collect();
+        if ifd_for_series.len() != ifd_count {
+            // Series<->IFD mapping isn't 1:1; don't risk a bad regroup.
+            return;
+        }
+
+        let l0 = &levels[0];
+        main.ifd_indices = vec![ifd_for_series[0]];
+        main.metadata.size_x = l0.size_x;
+        main.metadata.size_y = l0.size_y;
+        main.metadata.size_z = 1;
+        main.metadata.size_t = 1;
+        main.metadata.size_c = l0.size_c;
+        main.metadata.is_rgb = l0.is_rgb;
+        main.metadata.image_count = 1;
+        main.metadata.is_interleaved = false;
+        main.metadata.dimension_order = DimensionOrder::XYCZT;
+        main.metadata.resolution_count = ifd_count as u32;
+        main.sub_resolutions = ifd_for_series[1..].iter().map(|&i| vec![i]).collect();
+
+        // Record the per-level IFD mapping and the (per-core-index) overlaps so
+        // `openBytes` can replicate Java's overlap-aware `tiffParser.getSamples`.
+        self.level_ifd = ifd_for_series.clone();
+        self.overlaps = overlaps.map(|o| o.to_vec()).unwrap_or_default();
+
+        self.inner.replace_series(vec![main]);
+    }
+}
+
+impl Default for TrestleReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for TrestleReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("tif"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.close()?;
+        self.overlaps.clear();
+        self.level_ifd.clear();
+        self.inner.set_id(path)?;
+        for series in self.inner.series_list_mut() {
+            series.metadata.series_metadata.insert(
+                "hcs2.wrapper".to_string(),
+                MetadataValue::String("TrestleReader".to_string()),
+            );
+        }
+        self.init_standard_metadata();
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.overlaps.clear();
+        self.level_ifd.clear();
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.inner.series_count() == 0 {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        let (w, h) = {
+            let m = self.inner.metadata();
+            (m.size_x, m.size_y)
+        };
+        self.open_bytes_region(p, 0, 0, w, h)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        // Java `TrestleReader.openBytes`:
+        //   if (core.size() == 1 && core.size(0) == 1) return super.openBytes(...);
+        //   else tiffParser.getSamples(ifd, buf, x, y, w, h, overlapX, overlapY);
+        //
+        // The single-series/single-resolution case (the regroup did not run, so
+        // `level_ifd` is empty) is a plain TIFF read. Otherwise we must remove
+        // the per-tile overlap. The shared TIFF engine's `getSamples` has no
+        // overlap parameter, so we reconstruct it here: read the full stored IFD
+        // plane (overlaps still present) and copy each tile's non-overlapping
+        // (tileWidth-overlapX) x (tileLength-overlapY) portion into the output,
+        // replicating the tile-placement arithmetic of `TiffParser.getSamples`.
+        if self.level_ifd.is_empty() {
+            return self.inner.open_bytes_region(p, x, y, w, h);
+        }
+        let core_index = self.inner.resolution();
+        let ifd_index = match self.level_ifd.get(core_index) {
+            Some(&i) => i,
+            None => return self.inner.open_bytes_region(p, x, y, w, h),
+        };
+        let overlap_x = self
+            .overlaps
+            .get(core_index * 2)
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u32;
+        let overlap_y = self
+            .overlaps
+            .get(core_index * 2 + 1)
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u32;
+
+        // No overlap declared: behaves identically to a plain region read.
+        if overlap_x == 0 && overlap_y == 0 {
+            return self.inner.open_bytes_region(p, x, y, w, h);
+        }
+
+        // Geometry of the stored (overlap-inclusive) IFD plane.
+        let (raw_w, raw_h, tile_w, tile_h, bytes_per_sample, eff_channels) = {
+            let ifd = self
+                .inner
+                .ifd(ifd_index)
+                .ok_or(BioFormatsError::PlaneOutOfRange(p))?;
+            let raw_w = ifd.image_width().unwrap_or(0);
+            let raw_h = ifd.image_length().unwrap_or(0);
+            // TiffParser: tileLength <= 0 -> height; tileWidth defaults likewise.
+            let tile_w = ifd.tile_width().filter(|&t| t > 0).unwrap_or(raw_w);
+            let tile_h = ifd.tile_length().filter(|&t| t > 0).unwrap_or(raw_h);
+            let samples = ifd.samples_per_pixel().max(1) as u32;
+            let planar = ifd.planar_configuration() == 2;
+            let eff_channels = if planar { 1 } else { samples };
+            // Trestle pixel data is 8-bit per sample in practice; derive from the
+            // metadata pixel type to stay faithful to BitsPerSample[0]/8.
+            let bps = self.inner.metadata().pixel_type.bytes_per_sample() as u32;
+            (raw_w, raw_h, tile_w, tile_h, bps.max(1), eff_channels)
+        };
+
+        // Decode the full stored plane once (interleaved samples, stored dims).
+        let plane = self
+            .inner
+            .read_physical_ifd_region(ifd_index, 0, 0, raw_w, raw_h)?;
+
+        let pixel = (bytes_per_sample * eff_channels) as i64;
+        let out_w = w as i64;
+        let out_h = h as i64;
+        let mut buf = vec![0u8; (out_w * out_h * pixel).max(0) as usize];
+
+        let tile_w = tile_w as i64;
+        let tile_h = tile_h as i64;
+        let overlap_x = overlap_x as i64;
+        let overlap_y = overlap_y as i64;
+        let raw_w_i = raw_w as i64;
+        let raw_h_i = raw_h as i64;
+        let step_x = (tile_w - overlap_x).max(1);
+        let step_y = (tile_h - overlap_y).max(1);
+        let x = x as i64;
+        let y = y as i64;
+        let end_x = x + out_w;
+        let end_y = y + out_h;
+        // src plane stride in bytes (interleaved samples across the row).
+        let src_row_len = raw_w_i * pixel;
+        let out_row_len = out_w * pixel;
+
+        // Java iterates numTileRows x numTileCols (= ceil(raw/tile)).
+        let num_tile_rows = (raw_h_i + tile_h - 1) / tile_h;
+        let num_tile_cols = (raw_w_i + tile_w - 1) / tile_w;
+
+        for row in 0..num_tile_rows {
+            // first row is shortened by overlapY (Java tileBounds.height).
+            let tb_h = if row == 0 { tile_h - overlap_y } else { tile_h };
+            for col in 0..num_tile_cols {
+                let tb_w = if col == 0 { tile_w - overlap_x } else { tile_w };
+                let tb_x = col * step_x;
+                let tb_y = row * step_y;
+
+                if tb_x > x + out_w {
+                    break;
+                }
+                // intersects(imageBounds, tileBounds)
+                if tb_x >= end_x || tb_y >= end_y || tb_x + tb_w <= x || tb_y + tb_h <= y {
+                    continue;
+                }
+
+                let tile_x = tb_x.max(x);
+                let tile_y = tb_y.max(y);
+                let real_x = tile_x.rem_euclid(step_x);
+                let real_y = tile_y.rem_euclid(step_y);
+
+                let mut twidth = (end_x - tile_x).min(tile_w - real_x);
+                if twidth <= 0 {
+                    twidth = (end_x - tile_x).max(tile_w - real_x);
+                }
+                let mut theight = (end_y - tile_y).min(tile_h - real_y);
+                if theight <= 0 {
+                    theight = (end_y - tile_y).max(tile_h - real_y);
+                }
+
+                let copy = pixel * twidth;
+                // Source within the stored plane: the tile's pixel (real_x,real_y)
+                // lives at stored column (col*tileW + real_x), stored row
+                // (row*tileH + real_y).
+                let src_col = col * tile_w + real_x;
+                let src_row0 = row * tile_h + real_y;
+                let mut dest = pixel * (tile_x - x) + out_row_len * (tile_y - y);
+
+                for tr in 0..theight {
+                    let src_row = src_row0 + tr;
+                    if src_row >= raw_h_i {
+                        break;
+                    }
+                    let src = src_row * src_row_len + src_col * pixel;
+                    let (s, d) = (src, dest);
+                    if s >= 0 && d >= 0 {
+                        let (s, d, c) = (s as usize, d as usize, copy.max(0) as usize);
+                        // clamp the copy length to both buffers and the row.
+                        let max_src = plane.len().saturating_sub(s);
+                        let max_dst = buf.len().saturating_sub(d);
+                        let n = c.min(max_src).min(max_dst);
+                        if n > 0 {
+                            buf[d..d + n].copy_from_slice(&plane[s..s + n]);
+                        }
+                    }
+                    dest += out_row_len;
+                }
+            }
+        }
+        Ok(buf)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. TissueFAXS
+// ---------------------------------------------------------------------------
+/// TissueFAXS (TissueGnostics): an `.aqproj` project file plus one or more
+/// `.tfcyto` SQLite databases.
+///
+/// Partial port of `TissueFAXSReader`. Detection is faithful — Java declares
+/// suffixes `{"aqproj", "tfcyto"}` with `suffixSufficient = true` — but the
+/// reader body is **not** ported: unlike the other readers in this module,
+/// TissueFAXS is not a vendor-TIFF format. Pixels and all structural metadata
+/// live inside SQLite `.tfcyto` databases (tiles stored as JPEG/JPEG-XR BLOBs in
+/// `images`/`correction_images` tables, region/FOV/channel geometry in JSON), so
+/// the shared TIFF engine cannot supply them. Reading requires a SQLite driver
+/// (no crate dependency exists) plus JPEG-XR tile decode and the multi-
+/// resolution FOV-stitching pipeline from `openBytes`/`copyRegionToBuffer`.
+///
+/// The real reader is implemented behind the optional `tissuefaxs` cargo
+/// feature (which pulls in `rusqlite`). With the feature **off**, `set_id`
+/// reports `UnsupportedFormat`.
+pub struct TissueFaxsReader {
+    initialized: bool,
+    /// Flattened "core" list, mirroring Java's `core`: one entry per resolution
+    /// per pyramid, optionally followed by a correction-image entry.
+    core: Vec<ImageMetadata>,
+    /// Parsed scan regions (one or more per pyramid; see `ScanRegion`).
+    regions: Vec<ScanRegion>,
+    /// Resolved `.tfcyto` database file paths.
+    pixels_files: Vec<PathBuf>,
+    /// Indexes into `core` that begin a new series (full-resolution images +
+    /// correction images), in order. Used to map series→core index.
+    series_starts: Vec<usize>,
+    /// Number of resolutions in each series (1 for correction images).
+    series_resolutions: Vec<usize>,
+    /// Index into `regions` that supplies the descriptive metadata for each
+    /// series (the pyramid's first region; same region for its correction
+    /// image). Used by `ome_metadata` to mirror Java `initFile`'s store loop.
+    series_regions: Vec<usize>,
+    current_series: usize,
+    current_resolution: usize,
+}
+
+/// One field-of-view rectangle (Java `loci.common.Region`).
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
+struct Region {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+}
+
+#[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
+impl Region {
+    fn new(x: i64, y: i64, width: i64, height: i64) -> Self {
+        Region {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Mirrors Java `Region.intersection`.
+    fn intersection(&self, other: &Region) -> Region {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let w = (self.x + self.width).min(other.x + other.width) - x;
+        let h = (self.y + self.height).min(other.y + other.height) - y;
+        Region::new(x, y, w.max(0), h.max(0))
+    }
+}
+
+/// Java inner class `Channel`.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
+struct Channel {
+    #[allow(dead_code)]
+    id: i64,
+    name: Option<String>,
+    #[allow(dead_code)]
+    color: i64,
+    ex_wave: i64,
+    em_wave: i64,
+}
+
+#[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
+impl Channel {
+    /// Java `Channel.getColor`. The DB returns ARGB; the OME model is RGBA.
+    /// Returns the packed RGBA integer (the value OME-XML stores as `Color`).
+    fn get_color(&self) -> i32 {
+        let color = self.color;
+        let alpha = ((color >> 24) & 0xff) as i64;
+        let red = ((color >> 16) & 0xff) as i64;
+        let green = ((color >> 8) & 0xff) as i64;
+        let blue = (color & 0xff) as i64;
+        // ome.xml.model.primitives.Color packs as (r<<24)|(g<<16)|(b<<8)|a.
+        ((red << 24) | (green << 16) | (blue << 8) | alpha) as i32
+    }
+}
+
+/// Java inner class `ScanRegion`.
+#[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
+struct ScanRegion {
+    file: PathBuf,
+    region_metadata: serde_json::Value,
+    id: i64,
+
+    full_resolution_core_index: usize,
+    correction_image_core_index: Option<usize>,
+    resolutions: Vec<i64>,
+
+    tile_size_x: i64,
+    tile_size_y: i64,
+    overlap_x: i64,
+    overlap_y: i64,
+    scale_factor: i64,
+    tile_range_x: [i64; 2],
+    tile_range_y: [i64; 2],
+    z_steps: Vec<i64>,
+    timepoint: i64,
+    channels: Vec<Channel>,
+    fovs: HashMap<String, Region>,
+    correction_image_ids: HashMap<String, i64>,
+
+    tma_x: Option<i64>,
+    tma_y: Option<i64>,
+}
+
+#[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
+impl ScanRegion {
+    fn new() -> Self {
+        ScanRegion {
+            file: PathBuf::new(),
+            region_metadata: serde_json::Value::Null,
+            id: 0,
+            full_resolution_core_index: 0,
+            correction_image_core_index: None,
+            resolutions: Vec::new(),
+            tile_size_x: 0,
+            tile_size_y: 0,
+            overlap_x: 0,
+            overlap_y: 0,
+            scale_factor: 0,
+            tile_range_x: [i64::MAX, 0],
+            tile_range_y: [i64::MAX, 0],
+            z_steps: Vec::new(),
+            timepoint: 0,
+            channels: Vec::new(),
+            fovs: HashMap::new(),
+            correction_image_ids: HashMap::new(),
+            tma_x: None,
+            tma_y: None,
+        }
+    }
+
+    /// Java `ScanRegion.parseJSON`.
+    fn parse_json(&mut self) {
+        let m = &self.region_metadata;
+        self.tile_size_x = json_get_int(m, "ImageWidth");
+        self.tile_size_y = json_get_int(m, "ImageHeight");
+        self.overlap_x = json_get_int(m, "OverlapWidth");
+        self.overlap_y = json_get_int(m, "OverlapHeight");
+        self.scale_factor = json_get_int(m, "CacheStep");
+
+        if m.get("LocationOnTMABlockX").is_some() {
+            self.tma_x = Some(json_get_int(m, "LocationOnTMABlockX"));
+        }
+        if m.get("LocationOnTMABlockY").is_some() {
+            self.tma_y = Some(json_get_int(m, "LocationOnTMABlockY"));
+        }
+    }
+}
+
+/// Helper: read an integer field from JSON (matches Java `JSONObject.getInt`,
+/// which coerces numeric strings).
+#[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
+fn json_get_int(value: &serde_json::Value, key: &str) -> i64 {
+    match value.get(key) {
+        Some(serde_json::Value::Number(n)) => {
+            n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64)
+        }
+        Some(serde_json::Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Helper: read a string field from JSON (matches Java `JSONObject.getString`,
+/// returning `None` for a missing/null key).
+#[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
+fn json_get_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value.get(key) {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Helper: read a floating-point field from JSON (matches Java
+/// `JSONObject.getDouble`, which coerces numeric strings).
+#[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
+fn json_get_double(value: &serde_json::Value, key: &str) -> Option<f64> {
+    match value.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+impl TissueFaxsReader {
+    pub fn new() -> Self {
+        TissueFaxsReader {
+            initialized: false,
+            core: Vec::new(),
+            regions: Vec::new(),
+            pixels_files: Vec::new(),
+            series_starts: Vec::new(),
+            series_resolutions: Vec::new(),
+            series_regions: Vec::new(),
+            current_series: 0,
+            current_resolution: 0,
+        }
+    }
+
+    /// Current flattened core index (full-resolution core + resolution offset).
+    fn core_index(&self) -> usize {
+        self.series_starts
+            .get(self.current_series)
+            .copied()
+            .unwrap_or(0)
+            + self.current_resolution
+    }
+}
+
+impl Default for TissueFaxsReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for TissueFaxsReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // Java: suffixes {"aqproj", "tfcyto"}, suffixSufficient = true.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("aqproj") | Some("tfcyto"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    #[cfg(not(feature = "tissuefaxs"))]
+    fn set_id(&mut self, _path: &Path) -> Result<()> {
+        self.initialized = false;
+        Err(BioFormatsError::UnsupportedFormat(
+            "TissueFAXS (.aqproj/.tfcyto) requires the 'tissuefaxs' cargo feature \
+             (SQLite-backed reader): cargo build --features tissuefaxs"
+                .into(),
+        ))
+    }
+
+    #[cfg(feature = "tissuefaxs")]
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        self.init_file(path)?;
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.initialized = false;
+        self.core.clear();
+        self.regions.clear();
+        self.pixels_files.clear();
+        self.series_starts.clear();
+        self.series_resolutions.clear();
+        self.series_regions.clear();
+        self.current_series = 0;
+        self.current_resolution = 0;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        self.series_starts.len()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if !self.initialized {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        if s >= self.series_starts.len() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
+        self.current_series = s;
+        self.current_resolution = 0;
+        Ok(())
+    }
+
+    fn series(&self) -> usize {
+        self.current_series
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        if !self.initialized {
+            return crate::common::reader::uninitialized_metadata();
+        }
+        self.core
+            .get(self.core_index())
+            .unwrap_or_else(|| crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if !self.initialized {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        let (w, h) = {
+            let m = self.metadata();
+            (m.size_x, m.size_y)
+        };
+        self.open_bytes_region(p, 0, 0, w, h)
+    }
+
+    #[cfg(not(feature = "tissuefaxs"))]
+    fn open_bytes_region(
+        &mut self,
+        _p: u32,
+        _x: u32,
+        _y: u32,
+        _w: u32,
+        _h: u32,
+    ) -> Result<Vec<u8>> {
+        Err(BioFormatsError::NotInitialized)
+    }
+
+    #[cfg(feature = "tissuefaxs")]
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        if !self.initialized {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        self.open_bytes_impl(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, _p: u32) -> Result<Vec<u8>> {
+        Err(BioFormatsError::NotInitialized)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.series_resolutions
+            .get(self.current_series)
+            .copied()
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if !self.initialized {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        if level >= self.resolution_count() {
+            return Err(BioFormatsError::SeriesOutOfRange(level));
+        }
+        self.current_resolution = level;
+        Ok(())
+    }
+
+    fn resolution(&self) -> usize {
+        self.current_resolution
+    }
+
+    #[cfg(feature = "tissuefaxs")]
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if !self.initialized {
+            return None;
+        }
+        Some(self.build_ome_metadata())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TissueFAXS: SQLite-backed reader body (feature-gated)
+// ---------------------------------------------------------------------------
+#[cfg(feature = "tissuefaxs")]
+mod tissuefaxs_impl {
+    use super::*;
+    use crate::common::ome_metadata::{
+        create_lsid, OmeImage, OmeInstrument, OmeMetadata, OmeObjective,
+    };
+    use rusqlite::{Connection, OpenFlags};
+
+    /// Per-region overlap range for the tile range.
+    const I32_MAX: i64 = i32::MAX as i64;
+
+    /// Java `FormatTools.getPhysicalSizeX`/`getPhysicalSizeY`: a physical size is
+    /// only valid when present, finite, and strictly positive.
+    fn get_physical_size(value: Option<f64>) -> Option<f64> {
+        match value {
+            Some(v) if v.is_finite() && v > 0.0 => Some(v),
+            _ => None,
+        }
+    }
+    // per specification, wavelengths outside this range should be ignored
+    const WAVE_MIN: i64 = 300;
+    const WAVE_MAX: i64 = 800;
+
+    /// Bytes per pixel for the current pixel type (Java
+    /// `FormatTools.getBytesPerPixel`).
+    fn bytes_per_pixel(pt: PixelType) -> usize {
+        pt.bytes_per_sample()
+    }
+
+    /// Number of RGB samples per pixel for a core entry (Java
+    /// `getRGBChannelCount`).
+    fn rgb_channel_count(m: &ImageMetadata) -> usize {
+        if m.is_rgb {
+            m.size_c as usize
+        } else {
+            1
+        }
+    }
+
+    impl TissueFaxsReader {
+        /// Java `initFile`.
+        pub(super) fn init_file(&mut self, id: &Path) -> Result<()> {
+            self.current_id_setup(id)?;
+            self.find_db_files(id)?;
+            self.core.clear();
+
+            for file_index in 0..self.pixels_files.len() {
+                let file = self.pixels_files[file_index].clone();
+                let mut m = ImageMetadata {
+                    pixel_type: PixelType::Uint8,
+                    is_little_endian: true,
+                    dimension_order: DimensionOrder::XYCZT,
+                    size_z: 1,
+                    size_c: 0,
+                    size_t: 1,
+                    resolution_count: 1,
+                    ..Default::default()
+                };
+
+                let start_region_index = self.regions.len();
+
+                let conn = open_connection(&file)?;
+                // mirror Java's try/catch(SQLException) around init: log + continue
+                if let Err(e) = self.init_one_db(&conn, &file, start_region_index, &mut m) {
+                    eprintln!("TissueFAXS: failed to initialize {}: {e}", file.display());
+                }
+
+                // m.sizeZ = number of z steps of the first region
+                m.size_z = self.regions[start_region_index].z_steps.len().max(1) as u32;
+
+                // m.sizeT = max timepoint + 1 over this file's regions
+                let mut size_t = 1i64;
+                for r in &self.regions[start_region_index..] {
+                    size_t = size_t.max(r.timepoint + 1);
+                }
+                m.size_t = size_t as u32;
+
+                m.image_count = m.size_z * m.size_c.max(1) * m.size_t;
+
+                // TODO (Java): bad assumption in general?
+                if m.size_c == 1 && m.pixel_type == PixelType::Uint8 {
+                    m.size_c = 3;
+                    m.is_rgb = true;
+                    m.is_interleaved = true;
+                }
+                m.image_count = m.size_z
+                    * (if m.is_rgb { 1 } else { m.size_c.max(1) })
+                    * m.size_t;
+
+                let res_count = m.resolution_count.max(1);
+                m.resolution_count = res_count;
+
+                self.core.push(m.clone());
+                let start = &self.regions[start_region_index];
+                let scale_factor = start.scale_factor;
+                let correction = start.correction_image_core_index.is_some();
+                let tile_size_x = start.tile_size_x;
+                let tile_size_y = start.tile_size_y;
+
+                for r in 1..res_count {
+                    let mut res = m.clone();
+                    let scale = (scale_factor as f64).powi(r as i32) as u32;
+                    let scale = scale.max(1);
+                    res.size_x /= scale;
+                    res.size_y /= scale;
+                    res.resolution_count = 1;
+                    res.image_count = res.size_z
+                        * (if res.is_rgb { 1 } else { res.size_c.max(1) })
+                        * res.size_t;
+                    self.core.push(res);
+                }
+
+                if correction {
+                    let mut corr = m.clone();
+                    corr.size_x = tile_size_x as u32;
+                    corr.size_y = tile_size_y as u32;
+                    corr.pixel_type = PixelType::Float32;
+                    corr.resolution_count = 1;
+                    corr.is_little_endian = true;
+                    corr.image_count = corr.size_z
+                        * (if corr.is_rgb { 1 } else { corr.size_c.max(1) })
+                        * corr.size_t;
+                    self.core.push(corr);
+                }
+            }
+
+            // Build series mapping over the flattened core list.
+            self.build_series_map();
+
+            self.current_series = 0;
+            self.current_resolution = 0;
+            Ok(())
+        }
+
+        /// Records the current file as a `.tfcyto` path placeholder; the real
+        /// resolution happens in `find_db_files`. (Java `super.initFile`.)
+        fn current_id_setup(&mut self, _id: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        /// Body of `initFile`'s per-database loop. Separated so SQL errors can
+        /// be caught and logged like Java's `catch (SQLException)`.
+        fn init_one_db(
+            &mut self,
+            conn: &Connection,
+            file: &Path,
+            start_region_index: usize,
+            m: &mut ImageMetadata,
+        ) -> rusqlite::Result<()> {
+            // region query (expect one row per timepoint)
+            {
+                let mut stmt =
+                    conn.prepare("SELECT id, data, is_timelapse FROM region ORDER BY id")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let region_id: i64 = row.get(0)?;
+                    let json: String = row.get(1)?;
+                    let is_timelapse: bool = row.get::<_, i64>(2)? != 0;
+
+                    let mut region = ScanRegion::new();
+                    region.id = region_id;
+                    region.file = file.to_path_buf();
+
+                    // expect trailing whitespace/line breaks in AcquisitionSettings
+                    let json = json.trim().replace("\r\n", "_");
+                    region.region_metadata = serde_json::from_str(&json)
+                        .unwrap_or(serde_json::Value::Null);
+
+                    region.parse_json();
+
+                    if is_timelapse {
+                        region.timepoint = (self.regions.len() - start_region_index) as i64;
+                    } else if self.regions.len() != start_region_index {
+                        // part of the full resolution in a TMA
+                        region.resolutions.push(0);
+                    }
+                    self.regions.push(region);
+                }
+            }
+
+            // per-region FOV / z-step / resolution / correction-image setup
+            for region_index in start_region_index..self.regions.len() {
+                let region_db_id = self.regions[region_index].id;
+
+                // fovs
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT row, column, stitch_rectangle_x, stitch_rectangle_y, \
+                         stitch_rectangle_w, stitch_rectangle_h FROM fovs WHERE region_id=?",
+                    )?;
+                    let mut rows = stmt.query([region_db_id])?;
+                    while let Some(row) = rows.next()? {
+                        let r: i64 = row.get(0)?;
+                        let c: i64 = row.get(1)?;
+                        let x: f64 = row.get(2)?;
+                        let y: f64 = row.get(3)?;
+                        let w: f64 = row.get(4)?;
+                        let h: f64 = row.get(5)?;
+                        let cur = &mut self.regions[region_index];
+                        cur.tile_range_y[0] = cur.tile_range_y[0].min(r);
+                        cur.tile_range_y[1] = cur.tile_range_y[1].max(r);
+                        cur.tile_range_x[0] = cur.tile_range_x[0].min(c);
+                        cur.tile_range_x[1] = cur.tile_range_x[1].max(c);
+                        let fov = Region::new(x as i64, y as i64, w as i64, h as i64);
+                        cur.fovs.insert(format!("{r}-{c}"), fov);
+                    }
+                }
+
+                // z steps
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT DISTINCT is_zstack,z_position FROM images WHERE region=? \
+                         ORDER BY is_zstack,z_position",
+                    )?;
+                    let mut rows = stmt.query([region_db_id])?;
+                    let mut tmp_z = Vec::new();
+                    while let Some(row) = rows.next()? {
+                        let _is_z: bool = row.get::<_, i64>(0)? != 0;
+                        let z_pos: i64 = row.get(1)?;
+                        tmp_z.push(z_pos);
+                    }
+                    self.regions[region_index].z_steps = tmp_z;
+                }
+
+                self.regions[region_index].full_resolution_core_index = self.core.len();
+
+                if !self.regions[region_index].resolutions.is_empty() {
+                    continue;
+                }
+
+                let (x_tiles, y_tiles, tsx, tsy, ox, oy) = {
+                    let cur = &self.regions[region_index];
+                    (
+                        cur.tile_range_x[1] - cur.tile_range_x[0] + 1,
+                        cur.tile_range_y[1] - cur.tile_range_y[0] + 1,
+                        cur.tile_size_x,
+                        cur.tile_size_y,
+                        cur.overlap_x,
+                        cur.overlap_y,
+                    )
+                };
+                m.size_x = (x_tiles * (tsx - ox)).max(0) as u32;
+                m.size_y = (y_tiles * (tsy - oy)).max(0) as u32;
+
+                // max/min level → resolutionCount + resolutions list
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT level FROM images WHERE region=? ORDER BY level DESC",
+                    )?;
+                    let mut rows = stmt.query([region_db_id])?;
+                    let mut max = 0i64;
+                    let mut min = I32_MAX;
+                    let mut first = true;
+                    while let Some(row) = rows.next()? {
+                        let level: i64 = row.get(0)?;
+                        if first {
+                            max = level;
+                            first = false;
+                        }
+                        if level >= m.resolution_count as i64 {
+                            m.resolution_count = (level + 1) as u32;
+                        }
+                        min = level;
+                    }
+                    let cur = &mut self.regions[region_index];
+                    let mut r = min;
+                    while r <= max {
+                        cur.resolutions.push(r);
+                        r += 1;
+                    }
+                }
+
+                // correction images (best-effort; older data lacks these tables)
+                self.init_correction_images(conn, region_index, m.resolution_count as usize);
+            }
+
+            // channels
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT id, name, color, save_16bit, excitation_wavelength, \
+                     emission_wavelength FROM channels ORDER BY id",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    m.size_c += 1;
+
+                    let mut ch = Channel::default();
+                    ch.id = row.get(0)?;
+                    ch.name = row.get::<_, Option<String>>(1)?;
+                    ch.color = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+
+                    let save16: bool = row.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0;
+                    if save16 {
+                        m.pixel_type = PixelType::Uint16;
+                    }
+                    ch.ex_wave = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                    ch.em_wave = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
+
+                    self.regions[start_region_index].channels.push(ch);
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Java: the two correction-image queries inside the inner `try`.
+        fn init_correction_images(
+            &mut self,
+            conn: &Connection,
+            region_index: usize,
+            resolution_count: usize,
+        ) {
+            let region_db_id = self.regions[region_index].id;
+            let full_res = self.regions[region_index].full_resolution_core_index;
+
+            let mut found: Vec<(String, i64, usize)> = Vec::new();
+            let q1 = conn.prepare(
+                "SELECT correction_images.id, channel_zstack.channel_id, channel_zstack.position \
+                 FROM correction_images JOIN channel_zstack \
+                 ON correction_images.id = channel_zstack.cor_img_id \
+                 WHERE channel_zstack.region_id=?",
+            );
+            if let Ok(mut stmt) = q1 {
+                if let Ok(mut rows) = stmt.query([region_db_id]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        let correction_id: i64 = row.get(0).unwrap_or(0);
+                        let channel: i64 = row.get(1).unwrap_or(0);
+                        let z: i64 = row.get(2).unwrap_or(0);
+                        found.push((
+                            format!("{}-{}", channel - 1, z - 1),
+                            correction_id,
+                            full_res + resolution_count,
+                        ));
+                    }
+                }
+            }
+            let q2 = conn.prepare(
+                "SELECT correction_images.id, channels.id \
+                 FROM correction_images JOIN channels \
+                 ON correction_images.id = channels.cor_img_id \
+                 WHERE channels.region_id=?",
+            );
+            if let Ok(mut stmt) = q2 {
+                if let Ok(mut rows) = stmt.query([region_db_id]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        let correction_id: i64 = row.get(0).unwrap_or(0);
+                        let channel_id: i64 = row.get(1).unwrap_or(0);
+                        found.push((
+                            format!("{}-0", channel_id - 1),
+                            correction_id,
+                            full_res + resolution_count,
+                        ));
+                    }
+                }
+            }
+
+            let cur = &mut self.regions[region_index];
+            for (key, id, core_idx) in found {
+                cur.correction_image_core_index = Some(core_idx);
+                cur.correction_image_ids.insert(key, id);
+            }
+        }
+
+        /// Build `series_starts` / `series_resolutions` from the flattened
+        /// `core` list and per-region resolution counts. Mirrors the non-
+        /// flattened series enumeration in Java's `initFile` metadata loop.
+        fn build_series_map(&mut self) {
+            self.series_starts.clear();
+            self.series_resolutions.clear();
+            self.series_regions.clear();
+
+            let mut populated: Vec<usize> = Vec::new();
+            let mut i = 0usize;
+            while i < self.regions.len() {
+                let full_res = self.regions[i].full_resolution_core_index;
+                if populated.contains(&full_res) {
+                    i += 1;
+                    continue;
+                }
+                populated.push(full_res);
+
+                let res_count = self.core[full_res].resolution_count.max(1) as usize;
+                self.series_starts.push(full_res);
+                self.series_resolutions.push(res_count);
+                self.series_regions.push(i);
+
+                if let Some(corr) = self.regions[i].correction_image_core_index {
+                    self.series_starts.push(corr);
+                    self.series_resolutions.push(1);
+                    self.series_regions.push(i);
+                }
+
+                // advance past remaining TMA regions for this pyramid: skip
+                // sizeT regions (Java: i += core.get(fullRes).sizeT)
+                let size_t = self.core[full_res].size_t.max(1) as usize;
+                i += size_t;
+            }
+        }
+
+        /// Java `initFile` metadata-store loop (lines ~441-519): populate the
+        /// descriptive OME store from the per-region AcquisitionSettings JSON.
+        ///
+        /// One OME `Image` is emitted per series in `series_starts` order, which
+        /// mirrors Java's non-flattened `nextImage` enumeration (objective +
+        /// full-resolution image, optionally followed by a correction image).
+        pub(super) fn build_ome_metadata(&self) -> OmeMetadata {
+            // store = makeFilterMetadata(); MetadataTools.populatePixels(store).
+            // Build the per-series baseline (channel counts / samples-per-pixel)
+            // from each series' full-resolution core entry.
+            let mut ome = OmeMetadata::default();
+            for &core_idx in &self.series_starts {
+                let m = &self.core[core_idx];
+                let mut img = OmeImage::default();
+                // populatePixels: one channel per (non-RGB) C, samples-per-pixel.
+                let mut tmp = OmeMetadata::default();
+                let _ = tmp.populate_pixels(m, 0);
+                img.channels = tmp.images.into_iter().next().unwrap_or_default().channels;
+                ome.images.push(img);
+            }
+
+            // store.setInstrumentID(createLSID("Instrument", 0), 0).
+            let instrument = create_lsid("Instrument", &[0]);
+            let mut inst = OmeInstrument {
+                id: Some(instrument.clone()),
+                ..Default::default()
+            };
+
+            // for (int i=0, index=0; i<regions.size(); index++)  — replayed over
+            // the already-computed series map (series_regions holds each
+            // pyramid's first region; correction-image series reuse it).
+            //
+            // `index` advances once per distinct pyramid (objective slot); the
+            // correction-image series does not consume a new objective.
+            let mut objective_index = 0usize;
+            let mut series = 0usize;
+            while series < self.series_starts.len() {
+                let region_idx = self.series_regions[series];
+                let region = &self.regions[region_idx];
+                let rm = &region.region_metadata;
+                let full_res = region.full_resolution_core_index;
+
+                // Objective:0:index
+                let objective_id = create_lsid("Objective", &[0, objective_index]);
+                let mut objective = OmeObjective {
+                    id: Some(objective_id.clone()),
+                    ..Default::default()
+                };
+                objective.lens_na = json_get_double(rm, "ObjectiveLensNA");
+                objective.immersion =
+                    Self::get_immersion(json_get_string(rm, "ObjectiveImmersion").as_deref());
+                objective.nominal_magnification =
+                    json_get_double(rm, "ObjectiveNominalMagnification");
+                objective.model = json_get_string(rm, "ObjectiveName");
+                inst.objectives.push(objective);
+
+                // Full-resolution image (current `series`).
+                {
+                    let img = &mut ome.images[series];
+                    img.name = json_get_string(rm, "Name");
+                    img.instrument_ref = Some(0);
+                    img.objective_ref = Some(objective_index);
+
+                    img.physical_size_x =
+                        get_physical_size(json_get_double(rm, "PhysicalSizeX"));
+                    img.physical_size_y =
+                        get_physical_size(json_get_double(rm, "PhysicalSizeY"));
+
+                    let mode = Self::get_acquisition_mode(
+                        json_get_string(rm, "AcquisitionMode").as_deref(),
+                    );
+                    let is_rgb = self.core[full_res].is_rgb;
+
+                    for (c, ch) in region.channels.iter().enumerate() {
+                        if c >= img.channels.len() {
+                            break;
+                        }
+                        let och = &mut img.channels[c];
+                        och.name = ch.name.clone();
+                        if mode.is_some() {
+                            och.acquisition_mode = mode.clone();
+                        }
+                        if ch.em_wave >= WAVE_MIN && ch.em_wave <= WAVE_MAX {
+                            och.emission_wavelength = Some(ch.em_wave as f64);
+                        }
+                        if ch.ex_wave >= WAVE_MIN && ch.ex_wave <= WAVE_MAX {
+                            och.excitation_wavelength = Some(ch.ex_wave as f64);
+                        }
+                        // don't set a channel color for brightfield data
+                        // the channel color is expected to be white in that case
+                        if !is_rgb {
+                            och.color = Some(ch.get_color());
+                        }
+                    }
+                }
+                series += 1;
+
+                // Optional correction image: the next series reuses this
+                // objective and is named "<Name> Correction Image".
+                if region.correction_image_core_index.is_some()
+                    && series < self.series_starts.len()
+                    && self.series_regions[series] == region_idx
+                {
+                    let name = json_get_string(rm, "Name").unwrap_or_default();
+                    let corr = &mut ome.images[series];
+                    corr.name = Some(format!("{name} Correction Image"));
+                    corr.instrument_ref = Some(0);
+                    corr.objective_ref = Some(objective_index);
+                    series += 1;
+                }
+
+                objective_index += 1;
+            }
+
+            ome.instruments.push(inst);
+            ome
+        }
+
+        /// Java `MetadataTools.getImmersion` (enum lookup). The OME model stores
+        /// the immersion as a controlled-vocabulary string; this crate keeps the
+        /// raw value, mirroring the other readers in this module.
+        fn get_immersion(value: Option<&str>) -> Option<String> {
+            value.map(|s| s.to_string())
+        }
+
+        /// Java `MetadataTools.getAcquisitionMode` (enum lookup); see
+        /// `get_immersion` for the string-passthrough rationale.
+        fn get_acquisition_mode(value: Option<&str>) -> Option<String> {
+            value.map(|s| s.to_string())
+        }
+
+        /// Java `findDBFiles`.
+        fn find_db_files(&mut self, id: &Path) -> Result<()> {
+            let lower = id
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            if lower.as_deref() == Some("tfcyto") {
+                self.pixels_files.push(id.to_path_buf());
+                return Ok(());
+            }
+
+            let dir = id.parent().unwrap_or_else(|| Path::new("."));
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+                .map_err(BioFormatsError::Io)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect();
+            entries.sort();
+            for slide in entries {
+                let name = slide
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if name.starts_with("Slide ") && slide.is_dir() {
+                    let mut db_files: Vec<PathBuf> = std::fs::read_dir(&slide)
+                        .map_err(BioFormatsError::Io)?
+                        .filter_map(|e| e.ok().map(|e| e.path()))
+                        .collect();
+                    db_files.sort();
+                    for db in db_files {
+                        let ext = db
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| e.to_ascii_lowercase());
+                        if ext.as_deref() == Some("tfcyto") {
+                            self.pixels_files.push(db);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        // -- openBytes pipeline --
+
+        /// Java `openBytes(no, buf, x, y, w, h)`.
+        pub(super) fn open_bytes_impl(
+            &mut self,
+            no: u32,
+            x: u32,
+            y: u32,
+            w: u32,
+            h: u32,
+        ) -> Result<Vec<u8>> {
+            let core_index = self.core_index();
+            let m = self.core[core_index].clone();
+            let bpp = bytes_per_pixel(m.pixel_type);
+            let pixel = bpp * rgb_channel_count(&m);
+            let buf_len = (w as usize) * (h as usize) * pixel;
+            let mut buf = vec![0u8; buf_len];
+
+            let zct = self.get_zct_coords(no, &m);
+            let plane_regions = self.get_all_regions(zct[2], core_index);
+            let level = self.current_resolution;
+
+            let dest = Region::new(x as i64, y as i64, w as i64, h as i64);
+
+            for region_idx in plane_regions {
+                if self.is_correction_image(region_idx, core_index) {
+                    self.copy_correction_image_to_buffer(region_idx, &dest, zct, &mut buf, &m)?;
+                } else {
+                    self.copy_region_to_buffer(region_idx, level, &dest, zct, &mut buf, &m)?;
+                }
+            }
+            Ok(buf)
+        }
+
+        /// Compute Z/C/T from the plane index for the current core's dim order
+        /// (XYCZT, optionally RGB). Java `FormatTools.getZCTCoords`.
+        fn get_zct_coords(&self, no: u32, m: &ImageMetadata) -> [usize; 3] {
+            let c_count = if m.is_rgb { 1 } else { m.size_c.max(1) } as usize;
+            let z = m.size_z.max(1) as usize;
+            let no = no as usize;
+            // XYCZT
+            let c = no % c_count;
+            let z_idx = (no / c_count) % z;
+            let t = no / (c_count * z);
+            [z_idx, c, t]
+        }
+
+        /// Java `getAllRegions(t)` — returns indexes into `self.regions`.
+        fn get_all_regions(&self, t: usize, index: usize) -> Vec<usize> {
+            let t = t as i64;
+            let mut plane = Vec::new();
+            for i in (0..self.regions.len()).rev() {
+                let r = &self.regions[i];
+                if r.timepoint == t
+                    && r.correction_image_core_index == Some(index)
+                {
+                    plane.push(i);
+                    continue;
+                }
+                if r.timepoint == t && r.full_resolution_core_index <= index {
+                    let res = (index - r.full_resolution_core_index) as i64;
+                    if r.resolutions.contains(&res) {
+                        plane.push(i);
+                    }
+                }
+            }
+            plane
+        }
+
+        /// Java `getRegion()` (t=0). Used by `getOptimalTileWidth/Height` and
+        /// `getSeriesUsedFiles` in Java; retained here as a faithful port even
+        /// though those optional trait methods are not yet wired up.
+        #[allow(dead_code)]
+        pub(super) fn get_region(&self) -> Result<usize> {
+            self.get_region_t(0)
+        }
+
+        /// Java `getRegion(t)` — returns an index into `self.regions`.
+        #[allow(dead_code)]
+        fn get_region_t(&self, t: i64) -> Result<usize> {
+            let index = self.core_index();
+            for i in (0..self.regions.len()).rev() {
+                let r = &self.regions[i];
+                if r.timepoint == t && r.correction_image_core_index == Some(index) {
+                    return Ok(i);
+                }
+                if r.timepoint == t && r.full_resolution_core_index <= index {
+                    let res = (index - r.full_resolution_core_index) as i64;
+                    if r.resolutions.contains(&res) {
+                        return Ok(i);
+                    }
+                }
+            }
+            Err(BioFormatsError::Format(format!(
+                "Could not find ScanRegion (core index {index}, t={t})"
+            )))
+        }
+
+        /// Java `isCorrectionImage`.
+        fn is_correction_image(&self, region_idx: usize, core_index: usize) -> bool {
+            match self.regions[region_idx].correction_image_core_index {
+                None => false,
+                Some(c) => core_index == c,
+            }
+        }
+
+        /// Java `getCodecOptions` (only the fields the codecs need here).
+        fn codec_options(&self, region_idx: usize, _m: &ImageMetadata) -> (usize, usize) {
+            let r = &self.regions[region_idx];
+            (r.tile_size_x as usize, r.tile_size_y as usize)
+        }
+
+        /// Java `getCodec` + decompress, returning raw tile bytes.
+        fn decode_tile(
+            &self,
+            compression: i64,
+            data: &[u8],
+            _width: usize,
+            _height: usize,
+        ) -> Result<Vec<u8>> {
+            match compression {
+                0 | 1 => Ok(data.to_vec()), // PassthroughCodec
+                6 => crate::common::codec::decompress_jpegxr(data),
+                7 => crate::common::codec::decompress_jpeg(data),
+                other => Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Unsupported TissueFAXS tile compression: {other}"
+                ))),
+            }
+        }
+
+        /// Java `splitFOVs`.
+        fn split_fovs(
+            &self,
+            region_idx: usize,
+            tile: &[u8],
+            scale: usize,
+            m: &ImageMetadata,
+        ) -> Vec<Vec<u8>> {
+            let r = &self.regions[region_idx];
+            let bpp = bytes_per_pixel(m.pixel_type);
+            let channels = rgb_channel_count(m);
+            let pixel = bpp * channels;
+
+            let tile_size_x = r.tile_size_x as usize;
+            let tile_size_y = r.tile_size_y as usize;
+            let src_width = tile_size_x * pixel;
+            let dest_width = (tile_size_x / scale) * pixel;
+            let dest_height = tile_size_y / scale;
+
+            let mut fovs: Vec<Vec<u8>> = Vec::with_capacity(scale * scale);
+            for fov in 0..(scale * scale) {
+                let fov_row = fov / scale;
+                let fov_col = fov % scale;
+                // Java allocates destWidth*destHeight*pixel but copies destWidth
+                // bytes per row for destHeight rows; destWidth already includes
+                // `pixel`, so the usable region is destWidth*destHeight.
+                let mut out = vec![0u8; dest_width * dest_height * pixel];
+                for row in 0..dest_height {
+                    let src_offset =
+                        (((fov_row * dest_height) + row) * src_width) + (fov_col * dest_width);
+                    let dest_offset = row * dest_width;
+                    if src_offset + dest_width <= tile.len()
+                        && dest_offset + dest_width <= out.len()
+                    {
+                        out[dest_offset..dest_offset + dest_width]
+                            .copy_from_slice(&tile[src_offset..src_offset + dest_width]);
+                    }
+                }
+                fovs.push(out);
+            }
+            fovs
+        }
+
+        /// Java `copyRegion`.
+        #[allow(clippy::too_many_arguments)]
+        fn copy_region(
+            &self,
+            src_region: &Region,
+            src: &[u8],
+            dest_region: &Region,
+            dest: &mut [u8],
+            tile_width: i64,
+            m: &ImageMetadata,
+        ) {
+            let intersection = src_region.intersection(dest_region);
+            let bpp = bytes_per_pixel(m.pixel_type) as i64;
+            let pixel = bpp * rgb_channel_count(m) as i64;
+            let output_row_len = dest_region.width * pixel;
+            let intersection_x = (dest_region.x - src_region.x).max(0);
+            let row_len = pixel * intersection.width.min(src_region.width);
+
+            let output_row = intersection.y - dest_region.y;
+            let output_col = intersection.x - dest_region.x;
+            let output_offset = output_row * output_row_len + output_col * pixel;
+
+            if row_len <= 0 {
+                return;
+            }
+            for copy_row in 0..intersection.height {
+                let real_row = copy_row + intersection.y - src_region.y;
+                let input_offset = pixel * (real_row * tile_width + intersection_x);
+                let dst_start = output_offset + copy_row * output_row_len;
+                let (i0, d0, len) = (input_offset, dst_start, row_len);
+                if i0 < 0 || d0 < 0 {
+                    continue;
+                }
+                let (i0, d0, len) = (i0 as usize, d0 as usize, len as usize);
+                if i0 + len <= src.len() && d0 + len <= dest.len() {
+                    dest[d0..d0 + len].copy_from_slice(&src[i0..i0 + len]);
+                }
+            }
+        }
+
+        /// Java `copyRegionToBuffer`.
+        #[allow(clippy::too_many_arguments)]
+        fn copy_region_to_buffer(
+            &self,
+            region_idx: usize,
+            level: usize,
+            dest: &Region,
+            zct: [usize; 3],
+            buf: &mut [u8],
+            m: &ImageMetadata,
+        ) -> Result<()> {
+            let (region_id, scale_factor, overlap_x, overlap_y, tma_x, tma_y, file, z_step) = {
+                let r = &self.regions[region_idx];
+                (
+                    r.id,
+                    r.scale_factor,
+                    r.overlap_x,
+                    r.overlap_y,
+                    r.tma_x,
+                    r.tma_y,
+                    r.file.clone(),
+                    *r.z_steps.get(zct[0]).unwrap_or(&0),
+                )
+            };
+            let scale = (scale_factor as f64).powi(level as i32) as i64;
+            let scale = scale.max(1);
+            let scaled_overlap_x = overlap_x / scale;
+            let scaled_overlap_y = overlap_y / scale;
+            let (opt_w, opt_h) = self.codec_options(region_idx, m);
+            let opt_w = opt_w as i64;
+            let opt_h = opt_h as i64;
+
+            let conn = open_connection(&file)?;
+
+            // list of tiles for this plane
+            let tile_coords: Vec<(i64, i64)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT row, column FROM images WHERE region=? AND level=? AND \
+                         channel=? AND is_zstack=? AND z_position=? ORDER BY row,column",
+                    )
+                    .map_err(sql_err)?;
+                let params = rusqlite::params![
+                    region_id,
+                    level as i64,
+                    zct[1] as i64 + 1,
+                    if zct[0] > 0 { 1i64 } else { 0i64 },
+                    z_step,
+                ];
+                let mut rows = stmt.query(params).map_err(sql_err)?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().map_err(sql_err)? {
+                    out.push((row.get(0).map_err(sql_err)?, row.get(1).map_err(sql_err)?));
+                }
+                out
+            };
+
+            let (tile_range_x0, tile_range_y0) = {
+                let r = &self.regions[region_idx];
+                (r.tile_range_x[0], r.tile_range_y[0])
+            };
+
+            for (row, column) in tile_coords {
+                let mut region_row = row;
+                let mut region_column = column;
+                if let Some(tx) = tma_x {
+                    region_column += tx * scale_factor;
+                }
+                if let Some(ty) = tma_y {
+                    region_row += ty * scale_factor;
+                }
+
+                let relative_column =
+                    region_column - (tile_range_x0 as f64 / scale as f64).floor() as i64;
+                let relative_row =
+                    region_row - (tile_range_y0 as f64 / scale as f64).floor() as i64;
+
+                let mut pixel_column = relative_column * opt_w;
+                let mut pixel_row = relative_row * opt_h;
+
+                let count = (scale * scale) as usize;
+                let mut fov_positions: Vec<Option<Region>> = vec![None; count];
+
+                if level == 0 {
+                    let fov = self.regions[region_idx]
+                        .fovs
+                        .get(&format!("{row}-{column}"))
+                        .copied()
+                        .unwrap_or_default();
+                    pixel_row -= fov.y;
+                    pixel_column -= fov.x;
+                    if tma_x.is_none() || tma_y.is_none() {
+                        pixel_row -= relative_row * overlap_y;
+                        pixel_column -= relative_column * overlap_x;
+                    } else {
+                        pixel_row -= region_row * overlap_y;
+                        pixel_column -= region_column * overlap_x;
+                    }
+                    fov_positions[0] = Some(Region::new(pixel_column, pixel_row, opt_w, opt_h));
+                } else {
+                    for f in 0..count {
+                        let fov_row = row * scale + (f as i64 / scale);
+                        let fov_column = column * scale + (f as i64 % scale);
+                        if let Some(fov) = self.regions[region_idx]
+                            .fovs
+                            .get(&format!("{fov_row}-{fov_column}"))
+                            .copied()
+                        {
+                            let relative_fov_row = fov_row - tile_range_y0;
+                            let relative_fov_column = fov_column - tile_range_x0;
+                            let xx = (relative_fov_column * opt_w / scale)
+                                - (fov.x / scale)
+                                - (relative_fov_column * scaled_overlap_x);
+                            let yy = (relative_fov_row * opt_h / scale)
+                                - (fov.y / scale)
+                                - (relative_fov_row * scaled_overlap_y);
+                            fov_positions[f] =
+                                Some(Region::new(xx, yy, opt_w / scale, opt_h / scale));
+                        }
+                    }
+                }
+
+                let mut fovs: Option<Vec<Vec<u8>>> = None;
+                for f in 0..count {
+                    let fp = match fov_positions[f] {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let intersection = fp.intersection(dest);
+                    if intersection.width > 0 && intersection.height > 0 {
+                        if fovs.is_none() {
+                            // fetch + decompress this tile
+                            let mut stmt = conn
+                                .prepare(
+                                    "SELECT data, compression FROM images WHERE region=? AND \
+                                     level=? AND channel=? AND is_zstack=? AND z_position=? AND \
+                                     row=? AND column=?",
+                                )
+                                .map_err(sql_err)?;
+                            let params = rusqlite::params![
+                                region_id,
+                                level as i64,
+                                zct[1] as i64 + 1,
+                                if zct[0] > 0 { 1i64 } else { 0i64 },
+                                z_step,
+                                row,
+                                column,
+                            ];
+                            let mut rows = stmt.query(params).map_err(sql_err)?;
+                            if let Some(r) = rows.next().map_err(sql_err)? {
+                                let data: Vec<u8> = r.get(0).map_err(sql_err)?;
+                                let compression: i64 = r.get(1).map_err(sql_err)?;
+                                let tile = self.decode_tile(
+                                    compression,
+                                    &data,
+                                    opt_w as usize,
+                                    opt_h as usize,
+                                )?;
+                                // applyTransformation is a no-op in Java
+                                if level == 0 {
+                                    fovs = Some(vec![tile]);
+                                } else {
+                                    fovs =
+                                        Some(self.split_fovs(region_idx, &tile, scale as usize, m));
+                                }
+                            } else {
+                                return Err(BioFormatsError::Format(format!(
+                                    "Could not get tile for row={row}, column={column}"
+                                )));
+                            }
+                        }
+
+                        if let Some(fovs_ref) = &fovs {
+                            if let Some(src) = fovs_ref.get(f) {
+                                self.copy_region(
+                                    &fp,
+                                    src,
+                                    dest,
+                                    buf,
+                                    self.regions[region_idx].tile_size_x / scale,
+                                    m,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Java `copyCorrectionImageToBuffer`.
+        fn copy_correction_image_to_buffer(
+            &self,
+            region_idx: usize,
+            dest: &Region,
+            zct: [usize; 3],
+            buf: &mut [u8],
+            m: &ImageMetadata,
+        ) -> Result<()> {
+            if self.regions[region_idx].timepoint != zct[2] as i64 {
+                return Ok(());
+            }
+            let file = self.regions[region_idx].file.clone();
+            let conn = open_connection(&file)?;
+
+            let correction_id = self.regions[region_idx]
+                .correction_image_ids
+                .get(&format!("{}-{}", zct[1], zct[0]))
+                .or_else(|| {
+                    self.regions[region_idx]
+                        .correction_image_ids
+                        .get(&format!("{}-0", zct[1]))
+                })
+                .copied();
+            let correction_id = match correction_id {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+
+            let (opt_w, opt_h) = self.codec_options(region_idx, m);
+
+            let mut stmt = conn
+                .prepare("SELECT compression, data FROM correction_images WHERE id=?")
+                .map_err(sql_err)?;
+            let mut rows = stmt.query([correction_id]).map_err(sql_err)?;
+            if let Some(row) = rows.next().map_err(sql_err)? {
+                let compression: i64 = row.get(0).map_err(sql_err)?;
+                let data: Vec<u8> = row.get(1).map_err(sql_err)?;
+                let mut data = self.decode_tile(compression, &data, opt_w, opt_h)?;
+                let bpp = bytes_per_pixel(m.pixel_type);
+
+                // found 4 channels, remove extras to match channel count
+                if data.len() == opt_w * opt_h * bpp * 4 {
+                    let src_stride = bpp * 4;
+                    let dest_stride = bpp * rgb_channel_count(m);
+                    let mut tmp = vec![0u8; opt_w * opt_h * dest_stride];
+                    if m.is_interleaved {
+                        for pix in 0..(opt_w * opt_h) {
+                            let s = pix * src_stride;
+                            let d = pix * dest_stride;
+                            if s + dest_stride <= data.len() && d + dest_stride <= tmp.len() {
+                                tmp[d..d + dest_stride]
+                                    .copy_from_slice(&data[s..s + dest_stride]);
+                            }
+                        }
+                    } else {
+                        let n = tmp.len().min(data.len());
+                        tmp[..n].copy_from_slice(&data[..n]);
+                    }
+                    data = tmp;
+                }
+
+                let correction = Region::new(0, 0, opt_w as i64, opt_h as i64);
+                self.copy_region(&correction, &data, dest, buf, opt_w as i64, m);
+            }
+            Ok(())
+        }
+    }
+
+    fn sql_err(e: rusqlite::Error) -> BioFormatsError {
+        BioFormatsError::Format(format!("TissueFAXS SQLite error: {e}"))
+    }
+
+    /// Java `openConnection` (read-only SQLite connection).
+    fn open_connection(file: &Path) -> Result<Connection> {
+        Connection::open_with_flags(
+            file,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| {
+            BioFormatsError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Could not read from database {}: {e}", file.display()),
+            ))
+        })
+    }
+
+    // silence unused-constant warnings when only part of the module is exercised
+    #[allow(dead_code)]
+    const _WAVE_RANGE: (i64, i64) = (WAVE_MIN, WAVE_MAX);
 }
 
 // ---------------------------------------------------------------------------
 // 7. Mikroscan
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Mikroscan TIFF (`.tif`).
-    pub struct MikroscanTiffReader;
-    extensions: ["tif"];
+
+/// Mikroscan TIFF (`.tif`/`.tiff`).
+///
+/// Ported from the upstream Java `MikroscanTiffReader`, which extends
+/// `SVSReader`. The only behavior `MikroscanTiffReader` adds over `SVSReader`
+/// is the `isThisType(name, open)` override: a valid TIFF whose first IFD's
+/// `IMAGE_DESCRIPTION` starts with `"Mikroscan Image"`. All series/pyramid
+/// assembly is inherited from `SVSReader` (here: `regroup_as_svs_pyramid`).
+pub struct MikroscanTiffReader {
+    inner: crate::tiff::TiffReader,
+}
+
+/// `MikroscanTiffReader.MIKROSCAN_IMAGE_DESCRIPTION_PREFIX`.
+const MIKROSCAN_IMAGE_DESCRIPTION_PREFIX: &str = "Mikroscan Image";
+
+impl MikroscanTiffReader {
+    pub fn new() -> Self {
+        MikroscanTiffReader {
+            inner: crate::tiff::TiffReader::new(),
+        }
+    }
+
+    /// Mirror of `MikroscanTiffReader.isThisType(String, boolean)`: the first
+    /// IFD's IMAGE_DESCRIPTION must start with "Mikroscan Image".
+    fn is_mikroscan_description(&self) -> bool {
+        self.inner
+            .ifd(0)
+            .and_then(|ifd| ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION))
+            .map(|d| d.starts_with(MIKROSCAN_IMAGE_DESCRIPTION_PREFIX))
+            .unwrap_or(false)
+    }
+}
+
+impl Default for MikroscanTiffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for MikroscanTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.close()?;
+        self.inner.set_id(path)?;
+        // SVSReader stores its pyramid as the main IFD chain; regroup into a
+        // single multi-resolution series (+ label/macro), mirroring SVSReader.
+        let _ = self.inner.regroup_as_svs_pyramid();
+        let detected = self.is_mikroscan_description();
+        for series in self.inner.series_list_mut() {
+            series.metadata.series_metadata.insert(
+                "hcs2.wrapper".to_string(),
+                MetadataValue::String("MikroscanTiffReader".to_string()),
+            );
+            if detected {
+                series.metadata.series_metadata.insert(
+                    "mikroscan.detected".to_string(),
+                    MetadataValue::Bool(true),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.inner.series_count() == 0 {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(p)
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
 }
 
 // ===========================================================================

@@ -246,6 +246,98 @@ fn read_chunk_map(f: &mut BufReader<File>) -> std::io::Result<Option<Vec<Nd2Chun
     Ok(Some(chunks))
 }
 
+/// Read the `CustomData|AcqTimesCache` per-plane acquisition timestamps.
+///
+/// Mirrors `ND2Reader.initFile` (java:1105-1108, 1789-1812): the first
+/// `CustomData|AcqTimesCache` block carries one `double` per image plane as an
+/// undelimited stream of milliseconds at the *end* of the block, which are
+/// divided by 1000 to obtain seconds and stored in `tsT`. Java seeks to
+/// `fp + (len - imageCount*8)` where `fp = helper + 24` (after the 12-byte name
+/// length / data length header plus the 12-byte block-type peek) and
+/// `len = nameLength + dataLength`. Re-expressed with the fields available here
+/// (`data_offset = chunkStart + 16 + nameLength`), the tail begins at
+/// `data_offset + data_length + 8 - imageCount*8`; the trailing `+8` faithfully
+/// reproduces Java's `helper+24` versus block-end (`helper+12+len`) offset quirk.
+fn read_acq_times_cache(
+    f: &mut BufReader<File>,
+    chunk: &Nd2Chunk,
+    image_count: usize,
+) -> std::io::Result<Vec<f64>> {
+    if image_count == 0 {
+        return Ok(Vec::new());
+    }
+    let timestamp_bytes = (image_count as u64) * 8;
+    let tail_start = chunk
+        .data_offset
+        .saturating_add(chunk.data_length)
+        .saturating_add(8)
+        .saturating_sub(timestamp_bytes);
+    let file_len = f.get_ref().metadata()?.len();
+    if tail_start >= file_len || tail_start + timestamp_bytes > file_len {
+        return Ok(Vec::new());
+    }
+    f.seek(SeekFrom::Start(tail_start))?;
+    let mut buf = vec![0u8; timestamp_bytes as usize];
+    f.read_exact(&mut buf)?;
+    let mut out = Vec::with_capacity(image_count);
+    for i in 0..image_count {
+        let bytes: [u8; 8] = buf[i * 8..i * 8 + 8].try_into().unwrap();
+        // timestamps are stored in ms; we want them in seconds (java:1804-1805).
+        out.push(f64::from_le_bytes(bytes) / 1000.0);
+    }
+    Ok(out)
+}
+
+/// Read `count` little-endian f64 values starting at `offset` (ND2Reader.initFile
+/// java:1555-1597, the binary posX/posY/posZ fallback reads at xOffset/yOffset/
+/// zOffset). Returns an empty vec if the requested range is out of bounds.
+fn read_doubles_at(
+    f: &mut BufReader<File>,
+    offset: u64,
+    count: usize,
+) -> std::io::Result<Vec<f64>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let need = (count as u64) * 8;
+    let file_len = f.get_ref().metadata()?.len();
+    if offset >= file_len || offset + need > file_len {
+        return Ok(Vec::new());
+    }
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; need as usize];
+    f.read_exact(&mut buf)?;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let bytes: [u8; 8] = buf[i * 8..i * 8 + 8].try_into().unwrap();
+        out.push(f64::from_le_bytes(bytes));
+    }
+    Ok(out)
+}
+
+/// Read `count` little-endian i32 values starting at `offset` (ND2Reader.initFile
+/// java:1599-1610, the PFS Offset / PFS Status global-metadata lists). Returns an
+/// empty vec if the requested range is out of bounds.
+fn read_ints_at(f: &mut BufReader<File>, offset: u64, count: usize) -> std::io::Result<Vec<i32>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let need = (count as u64) * 4;
+    let file_len = f.get_ref().metadata()?.len();
+    if offset >= file_len || offset + need > file_len {
+        return Ok(Vec::new());
+    }
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; need as usize];
+    f.read_exact(&mut buf)?;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let bytes: [u8; 4] = buf[i * 4..i * 4 + 4].try_into().unwrap();
+        out.push(i32::from_le_bytes(bytes));
+    }
+    Ok(out)
+}
+
 fn read_chunk_data(f: &mut BufReader<File>, chunk: &Nd2Chunk) -> std::io::Result<Vec<u8>> {
     f.seek(SeekFrom::Start(chunk.data_offset))?;
     let mut buf = vec![0u8; chunk.data_length as usize];
@@ -491,6 +583,339 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
     }
 
     walk(data, 0, data.len(), 0, out);
+}
+
+/// Result of the binary `ImageMetadataLV` eType/uiCount walk
+/// (ND2Reader.initFile java:967-1062, 1135-1141).
+///
+/// Faithfully reproduces the flat byte scan over the binary image-metadata block
+/// that builds `imageMetadataLVOrder` and the per-axis counts (M/T/Z) directly,
+/// rather than inferring dimensions from the XML loop heuristic.
+#[derive(Default, Clone)]
+struct ImageMetadataLv {
+    /// Concatenated axis order, e.g. "MTZ" / "TZ" (Java: imageMetadataLVOrder).
+    order: String,
+    /// XY (multi-point / series) count (Java: XYCount).
+    xy_count: i32,
+    /// Time count (Java: timeCount).
+    time_count: i32,
+    /// Z count (Java: zCount).
+    z_count: i32,
+    /// Whether the walk actually set a count (Java: currentCountSetted).
+    current_count_set: bool,
+    /// Whether the LV block was processed (Java: imageMetadataLVProcessed).
+    processed: bool,
+}
+
+/// Port of the `blockType.startsWith("ImageMetadat")` binary walk in
+/// `ND2Reader.initFile` (java:967-1062). `data` is the raw chunk data, i.e. the
+/// bytes Java sees starting at `in.getFilePointer()` after the block name has
+/// been consumed. Java then does `skipBytes(6)` and a `while (in.read() == 0)`
+/// zero-skip before the attribute scan; we mirror that on the byte buffer.
+///
+/// Returns `None` if the block does not look like a parseable LV experiment.
+fn parse_image_metadata_lv(data: &[u8]) -> Option<ImageMetadataLv> {
+    // strip_string equivalent: drop trailing NUL units. Java's
+    // DataTools.stripString trims the string at the first embedded null.
+    fn strip_string(units: &[u16]) -> String {
+        let trimmed: Vec<u16> = units
+            .iter()
+            .copied()
+            .take_while(|&u| u != 0)
+            .collect();
+        String::from_utf16_lossy(&trimmed)
+    }
+    fn read_i32(d: &[u8], p: usize) -> Option<i32> {
+        d.get(p..p + 4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    let mut state = ImageMetadataLv {
+        order: String::new(),
+        xy_count: 1,
+        time_count: 1,
+        z_count: 1,
+        current_count_set: false,
+        processed: false,
+    };
+
+    // Java: in.skipBytes(6); then while (in.read() == 0); — the read consumes one
+    // byte past the trailing zero, so scanning resumes at that non-zero byte.
+    let start_file_pointer = 0usize;
+    let mut p = 6usize;
+    while p < data.len() && data[p] == 0 {
+        p += 1;
+    }
+    // `in.read()` consumes the first non-zero byte too; the next loop re-seeks to
+    // `currentFilePointer`, so the post-zero non-zero byte is where the name-length
+    // scan begins (Java reads it as nameLen on the first iteration).
+    let end_fp = data.len(); // endFP = fp + len - 18; the chunk data is already that bounded slice
+    let mut current_file_pointer = p;
+
+    let mut e_type: i32 = 0;
+    let mut next_experiment = true;
+
+    loop {
+        // in.seek(currentFilePointer)
+        let mut q = current_file_pointer;
+        if q >= data.len() {
+            break;
+        }
+        // int nameLen = in.read();
+        let name_len = data[q] as i32;
+        q += 1;
+        if name_len == 0 {
+            current_file_pointer += 1;
+            if current_file_pointer > end_fp {
+                break;
+            }
+            continue;
+        }
+
+        // String attributeName = stripString(in.readString(nameLen * 2));
+        let read_bytes = (name_len as usize) * 2;
+        if q + read_bytes > data.len() {
+            // Java's readString would hit EOF; treat as end of block.
+            break;
+        }
+        let units: Vec<u16> = (0..name_len as usize)
+            .map(|i| u16::from_le_bytes([data[q + i * 2], data[q + i * 2 + 1]]))
+            .collect();
+        let attribute_name = strip_string(&units);
+        let after_name = q + read_bytes;
+
+        // if (attributeName.length() != nameLen - 1) { currentFilePointer++; continue; }
+        if attribute_name.chars().count() as i32 != name_len - 1 {
+            current_file_pointer += 1;
+            if current_file_pointer > end_fp {
+                break;
+            }
+            continue;
+        }
+
+        // `in` is now positioned at `after_name` (the readString advanced it).
+        let mut file_pointer = after_name;
+
+        if attribute_name == "SLxExperiment" {
+            current_file_pointer += (name_len as usize) * 2;
+            state.processed = true;
+            state.order = String::new();
+        }
+
+        if attribute_name == "eType" {
+            current_file_pointer += (name_len as usize) * 2;
+            if next_experiment {
+                if let Some(v) = read_i32(data, file_pointer) {
+                    e_type = v;
+                }
+                file_pointer += 4;
+            }
+            next_experiment = false;
+        } else if attribute_name == "uiCount" {
+            current_file_pointer += (name_len as usize) * 2;
+            if !state.current_count_set {
+                if e_type == 2 {
+                    state.order = format!("M{}", state.order);
+                    if let Some(v) = read_i32(data, file_pointer) {
+                        state.xy_count = v;
+                    }
+                    file_pointer += 4;
+                } else if e_type == 1 {
+                    state.order = format!("T{}", state.order);
+                    if let Some(v) = read_i32(data, file_pointer) {
+                        state.time_count = v;
+                    }
+                    file_pointer += 4;
+                }
+                if e_type == 4 {
+                    state.order = format!("Z{}", state.order);
+                    if let Some(v) = read_i32(data, file_pointer) {
+                        state.z_count = v;
+                    }
+                    file_pointer += 4;
+                }
+                state.current_count_set = true;
+            }
+        } else if attribute_name == "bKeepObject" {
+            current_file_pointer += (name_len as usize) * 2;
+        } else if attribute_name == "uiRepeatCount" {
+            current_file_pointer += (name_len as usize) * 2;
+        } else if attribute_name == "vectStimulationConfigurationsSize" {
+            current_file_pointer += (name_len as usize) * 2;
+        } else if attribute_name == "uiNextLevelCount" {
+            current_file_pointer += (name_len as usize) * 2;
+            let ui_next_level_count = read_i32(data, file_pointer).unwrap_or(0);
+            file_pointer += 4;
+            if ui_next_level_count == 0 {
+                break;
+            }
+            state.current_count_set = false;
+            next_experiment = true;
+        }
+
+        // if (in.getFilePointer() > endFP) { in.seek(startFilePointer); break; }
+        if file_pointer > end_fp {
+            let _ = start_file_pointer;
+            break;
+        }
+
+        current_file_pointer += 1;
+        if current_file_pointer > end_fp {
+            break;
+        }
+    }
+
+    Some(state)
+}
+
+/// FormatTools.rasterToPosition: block 0 varies fastest (Java
+/// loci.formats.FormatTools.rasterToPosition).
+fn raster_to_position(lengths: &[i32], mut raster: i32) -> Vec<i32> {
+    let mut pos = vec![0i32; lengths.len()];
+    let mut offset = 1i32;
+    for i in 0..lengths.len() {
+        let offset1 = offset.saturating_mul(lengths[i]);
+        let q = if i < lengths.len() - 1 {
+            if offset1 != 0 {
+                raster % offset1
+            } else {
+                0
+            }
+        } else {
+            raster
+        };
+        pos[i] = if offset != 0 { q / offset } else { 0 };
+        raster -= q;
+        offset = offset1;
+    }
+    pos
+}
+
+/// FormatTools.positionToRaster: inverse of rasterToPosition.
+fn position_to_raster(lengths: &[i32], pos: &[i32]) -> i32 {
+    let mut offset = 1i32;
+    let mut raster = 0i32;
+    for i in 0..lengths.len() {
+        raster += offset.saturating_mul(pos[i]);
+        offset = offset.saturating_mul(lengths[i]);
+    }
+    raster
+}
+
+/// Build the plane → (series, plane) mapping from the binary ImageMetadataLV
+/// order (ND2Reader.initFile java:1624-1718, the `imageMetadataLVProcessed`
+/// branch). `image_sequence_indices` carries each ImageDataSeq frame's parsed
+/// index (the `ndx` in Java's image-name loop), in the same order as
+/// `image_chunks`.
+///
+/// Returns `(series_count, source_planes)` where `source_planes[series]` lists
+/// the global image-chunk positions that belong to that series, ordered by the
+/// computed in-series plane index. Returns `None` if the LV order yields no
+/// usable M (series) axis or the layout is degenerate.
+struct Nd2RasterMapping {
+    series_count: usize,
+    source_planes: Vec<Vec<usize>>,
+    field_index: usize,
+    /// Fixed in-series plane count (the collapsed zctLengths product). Equals
+    /// `offsets[i].length` in Java (the per-series offsets array length, before
+    /// the invalid-slot count is subtracted).
+    in_series_planes: usize,
+    /// Per-series flag: was plane slot 0 filled? Mirrors Java's
+    /// `offsets[i][0] > 0` test used by the tmpOffsets compaction (java:1708-1713).
+    first_slot_filled: Vec<bool>,
+}
+
+fn nd2_raster_mapping(
+    lv: &ImageMetadataLv,
+    size_z: u32,
+    size_t: u32,
+    series_count: usize,
+    image_sequence_indices: &[usize],
+) -> Option<Nd2RasterMapping> {
+    // Java builds lengths[4] from imageMetadataLVOrder (java:1638-1668).
+    let mut lengths = [1i32; 4];
+    let mut field_index: usize = 3;
+    let mut curr_pos: i32 = 1;
+    for c in lv.order.chars() {
+        let idx = curr_pos.clamp(0, 3) as usize;
+        match c {
+            'Z' => lengths[idx] = size_z as i32,
+            'M' => {
+                field_index = idx;
+                lengths[idx] = series_count as i32;
+            }
+            'T' => lengths[idx] = size_t as i32,
+            _ => {
+                curr_pos -= 1;
+            }
+        }
+        curr_pos += 1;
+    }
+    if !lv.order.contains('M') {
+        field_index = 3;
+    }
+    if field_index >= 4 {
+        return None;
+    }
+
+    // zctLengths = lengths with the field (series) axis collapsed to 1.
+    let mut zct_lengths = lengths;
+    zct_lengths[field_index] = 1;
+
+    let in_series_planes: usize = zct_lengths.iter().map(|&l| l.max(1) as usize).product();
+    let n_series = lengths[field_index].max(1) as usize;
+
+    let mut source_planes: Vec<Vec<usize>> = vec![Vec::new(); n_series];
+    // Track plane index per series so we can place chunks in raster order.
+    let mut placed: Vec<Vec<Option<usize>>> = vec![vec![None; in_series_planes]; n_series];
+
+    // oneIndexed detection (java:1690-1695): if the first frame's parsed index is
+    // 1, all indices are decremented.
+    let mut one_indexed = false;
+    for (i, &ndx_raw) in image_sequence_indices.iter().enumerate() {
+        let mut ndx = ndx_raw as i32;
+        if ndx == 1 && i == 0 {
+            one_indexed = true;
+        }
+        if one_indexed {
+            ndx -= 1;
+        }
+        if ndx < 0 {
+            continue;
+        }
+        let mut pos = raster_to_position(&lengths, ndx);
+        let series_index = pos[field_index];
+        pos[field_index] = 0;
+        let plane = position_to_raster(&zct_lengths, &pos);
+        if series_index >= 0
+            && (series_index as usize) < n_series
+            && plane >= 0
+            && (plane as usize) < in_series_planes
+        {
+            placed[series_index as usize][plane as usize] = Some(i);
+        }
+    }
+
+    // Flatten each series' placement table into a dense, raster-ordered plane list,
+    // skipping unfilled slots. Track whether slot 0 was filled (Java's
+    // `offsets[i][0] > 0`) for the tmpOffsets compaction in the caller.
+    let mut first_slot_filled = vec![false; n_series];
+    for (s, table) in placed.into_iter().enumerate() {
+        first_slot_filled[s] = table.first().map(|slot| slot.is_some()).unwrap_or(false);
+        for slot in table {
+            if let Some(global_plane) = slot {
+                source_planes[s].push(global_plane);
+            }
+        }
+    }
+
+    Some(Nd2RasterMapping {
+        series_count: n_series,
+        source_planes,
+        field_index,
+        in_series_planes,
+        first_slot_filled,
+    })
 }
 
 /// Very lightweight XML value extractor — just grab the first occurrence of a tag.
@@ -1769,6 +2194,9 @@ pub struct Nd2Reader {
     backup_excitation_wavelengths: Vec<f64>,
     plane_delta_t: Vec<Option<f64>>,
     plane_position_z: Vec<Option<f64>>,
+    /// Per-plane acquisition timestamps (seconds) from CustomData|AcqTimesCache
+    /// (Java: tsT). One entry per global image plane, in ImageDataSeq order.
+    ts_t: Vec<f64>,
     // Data members mirroring the Java ND2Reader (see ND2Reader.java fields).
     /// dExposureTime per channel, seconds (Java: exposureTime).
     exposure_time: Vec<f64>,
@@ -1818,6 +2246,7 @@ impl Nd2Reader {
             backup_excitation_wavelengths: Vec::new(),
             plane_delta_t: Vec::new(),
             plane_position_z: Vec::new(),
+            ts_t: Vec::new(),
             exposure_time: Vec::new(),
             channel_colors: HashMap::new(),
             text_channel_names: Vec::new(),
@@ -1958,6 +2387,7 @@ impl Nd2Reader {
         self.chunks.clear();
         self.plane_delta_t.clear();
         self.plane_position_z.clear();
+        self.ts_t.clear();
         self.exposure_time.clear();
         self.channel_colors.clear();
         self.text_channel_names.clear();
@@ -2187,6 +2617,30 @@ impl FormatReader for Nd2Reader {
         self.backup_emission_wavelengths = backup.emission_wavelengths;
         self.backup_excitation_wavelengths = backup.excitation_wavelengths;
 
+        // Binary ImageMetadataLV eType/uiCount walk (ND2Reader.initFile
+        // java:967-1062). Builds imageMetadataLVOrder (M/T/Z) and the T/Z/M counts
+        // directly from the binary metadata. Java guards this with
+        // `!imageMetadataLVProcessed`, so only the FIRST block whose name starts
+        // with "ImageMetadat" is walked. We scan chunks in their natural order and
+        // stop at the first that yields a processed LV experiment.
+        let mut image_metadata_lv = ImageMetadataLv::default();
+        for mc in chunks
+            .iter()
+            .filter(|c| c.name.starts_with("ImageMetadat"))
+        {
+            if image_metadata_lv.processed {
+                break;
+            }
+            if let Ok(data) = read_chunk_data(&mut reader, mc) {
+                if let Some(result) = parse_image_metadata_lv(&data) {
+                    if result.processed {
+                        image_metadata_lv = result;
+                        break;
+                    }
+                }
+            }
+        }
+
         self.physical_size = lv.calibration;
         self.physical_size_z = lv.z_step;
         self.channel_names = lv.channel_names;
@@ -2207,18 +2661,91 @@ impl FormatReader for Nd2Reader {
         // ND2Reader caps an implausible field count to zero (>6 ⇒ 0).
         self.n_x_fields = if lv.n_x_fields > 6 { 0 } else { lv.n_x_fields };
 
-        // PFS focus/state offsets come from the first two CustomData|P chunks
-        // (ND2Reader:1121-1128). Use each chunk's payload start as the offset.
+        // CustomData|X/Y/Z/P offsets (ND2Reader.initFile java:1109-1128). Java
+        // points these at the *last* imageOffsets.size() values within each
+        // block's payload: doubleOffset = fp + 8*(len/8 - imageOffsets.size())
+        // for X/Y/Z (doubles), intOffset = fp + 4*(len/4 - imageOffsets.size())
+        // for the PFS P-blocks (ints). `fp` is the payload start (chunk.data_offset)
+        // and `len` is the payload length (chunk.data_length).
+        let n_image_offsets = image_chunks.len() as u64;
+        let double_offset = |chunk: &Nd2Chunk| -> u64 {
+            let n_doubles = chunk.data_length / 8;
+            chunk.data_offset + 8 * n_doubles.saturating_sub(n_image_offsets)
+        };
+        let int_offset = |chunk: &Nd2Chunk| -> u64 {
+            let n_ints = chunk.data_length / 4;
+            chunk.data_offset + 4 * n_ints.saturating_sub(n_image_offsets)
+        };
+
+        // zOffset takes the first CustomData|Z block (java:1109-1112).
+        let mut x_offset = 0u64;
+        let mut y_offset = 0u64;
+        let mut z_offset = 0u64;
         self.pfs_offset = 0;
         self.pfs_state_offset = 0;
-        for chunk in chunks.iter().filter(|c| c.name.starts_with("CustomData|P")) {
-            if self.pfs_offset == 0 {
-                self.pfs_offset = chunk.data_offset;
-            } else if self.pfs_state_offset == 0 {
-                self.pfs_state_offset = chunk.data_offset;
-                break;
+        for chunk in &chunks {
+            if chunk.name.starts_with("CustomData|Z") {
+                if z_offset == 0 {
+                    z_offset = double_offset(chunk);
+                }
+            } else if chunk.name.starts_with("CustomData|X") {
+                x_offset = double_offset(chunk);
+            } else if chunk.name.starts_with("CustomData|Y") {
+                y_offset = double_offset(chunk);
+            } else if chunk.name.starts_with("CustomData|P") {
+                if self.pfs_offset == 0 {
+                    self.pfs_offset = int_offset(chunk);
+                } else if self.pfs_state_offset == 0 {
+                    self.pfs_state_offset = int_offset(chunk);
+                }
             }
         }
+
+        // Binary posX/posY/posZ fallback (ND2Reader.initFile java:1554-1598). When
+        // the XML handler yielded no stage positions but a CustomData|X/Y/Z block
+        // exists, read imageOffsets.size() doubles (µm) from the computed offset.
+        // The uniqueX/uniqueY/uniqueZ counters Java derives here feed only the
+        // positionCount heuristic at java:1258 (already settled upstream), so we
+        // simply populate the position lists.
+        let n_offsets = image_chunks.len();
+        if self.pos_x.is_empty() && x_offset != 0 {
+            self.pos_x =
+                read_doubles_at(&mut reader, x_offset, n_offsets).map_err(BioFormatsError::Io)?;
+        }
+        if self.pos_y.is_empty() && y_offset != 0 {
+            self.pos_y =
+                read_doubles_at(&mut reader, y_offset, n_offsets).map_err(BioFormatsError::Io)?;
+        }
+        if self.pos_z.is_empty() && z_offset != 0 {
+            self.pos_z =
+                read_doubles_at(&mut reader, z_offset, n_offsets).map_err(BioFormatsError::Io)?;
+        }
+
+        // PFS Offset / PFS Status global-metadata lists (ND2Reader.initFile
+        // java:1599-1610): imageOffsets.size() ints read from pfsOffset/
+        // pfsStateOffset. Stored as comma-joined nd2_pfs_offsets / nd2_pfs_status.
+        let pfs_offsets = if self.pfs_offset != 0 {
+            read_ints_at(&mut reader, self.pfs_offset, n_offsets).map_err(BioFormatsError::Io)?
+        } else {
+            Vec::new()
+        };
+        let pfs_status = if self.pfs_state_offset != 0 {
+            read_ints_at(&mut reader, self.pfs_state_offset, n_offsets)
+                .map_err(BioFormatsError::Io)?
+        } else {
+            Vec::new()
+        };
+
+        // Per-plane acquisition timestamps from the first CustomData|AcqTimesCache
+        // block (ND2Reader.initFile:1105-1108, 1789-1812 → tsT). The stream holds
+        // one millisecond double per global ImageDataSeq plane.
+        self.ts_t = chunks
+            .iter()
+            .find(|c| c.name.starts_with("CustomData|AcqTimesCache"))
+            .map(|chunk| read_acq_times_cache(&mut reader, chunk, image_chunks.len()))
+            .transpose()
+            .map_err(BioFormatsError::Io)?
+            .unwrap_or_default();
 
         // Per-effective-channel colors: look each channel name up in the
         // channelColors map (ND2Reader.populateMetadataStore:2271-2288). Names
@@ -2256,25 +2783,48 @@ impl FormatReader for Nd2Reader {
         };
 
         let image_count = image_chunks.len() as u32;
-        let position_count = loop_series_count.filter(|&count| count > 1).unwrap_or(1);
+        let mut position_count = loop_series_count.filter(|&count| count > 1).unwrap_or(1);
         let mut size_t = 1u32;
-        if let Some(z) = loop_size_z {
-            size_z = z.max(1);
-        }
-        if let Some(t) = loop_size_t {
-            size_t = t.max(1);
-        }
-        let expected_planes = size_z
-            .saturating_mul(size_t)
-            .saturating_mul(position_count.max(1));
-        if image_count > 0 && expected_planes != image_count {
-            if size_t > 1 && image_count % size_t == 0 {
-                size_z = (image_count / size_t).max(1);
-            } else if size_z > 1 && image_count % size_z == 0 {
-                size_t = (image_count / size_z).max(1);
-            } else if loop_size_z.is_some() || loop_size_t.is_some() {
-                size_z = 1;
-                size_t = image_count.max(1);
+
+        // Validate the binary ImageMetadataLV result (ND2Reader.initFile
+        // java:1135-1141): apply it only when a count was actually set, an order
+        // was produced, and either there are no image offsets or
+        // timeCount * zCount * XYCount equals the offset count. Otherwise Java
+        // clears imageMetadataLVProcessed and falls back to the XML/heuristic path.
+        if image_metadata_lv.current_count_set
+            && !image_metadata_lv.order.is_empty()
+            && (image_count == 0
+                || (image_metadata_lv.time_count.max(0) as u64)
+                    .saturating_mul(image_metadata_lv.z_count.max(0) as u64)
+                    .saturating_mul(image_metadata_lv.xy_count.max(0) as u64)
+                    == image_count as u64)
+        {
+            // setDimensions(timeCount, zCount, XYCount): sizeT=numT, sizeZ=numZ,
+            // and when numSeries>1 the file is split into numSeries series
+            // (java:2810-2839).
+            size_t = (image_metadata_lv.time_count.max(0) as u32).max(1);
+            size_z = (image_metadata_lv.z_count.max(0) as u32).max(1);
+            position_count = (image_metadata_lv.xy_count.max(0) as u32).max(1);
+        } else {
+            image_metadata_lv.processed = false;
+            if let Some(z) = loop_size_z {
+                size_z = z.max(1);
+            }
+            if let Some(t) = loop_size_t {
+                size_t = t.max(1);
+            }
+            let expected_planes = size_z
+                .saturating_mul(size_t)
+                .saturating_mul(position_count.max(1));
+            if image_count > 0 && expected_planes != image_count {
+                if size_t > 1 && image_count % size_t == 0 {
+                    size_z = (image_count / size_t).max(1);
+                } else if size_z > 1 && image_count % size_z == 0 {
+                    size_t = (image_count / size_z).max(1);
+                } else if loop_size_z.is_some() || loop_size_t.is_some() {
+                    size_z = 1;
+                    size_t = image_count.max(1);
+                }
             }
         }
         let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
@@ -2504,8 +3054,120 @@ impl FormatReader for Nd2Reader {
         let mut series_size_z = size_z;
         let mut series_size_t = size_t;
         let mut series_handling = "single_series";
+        // Per-series overrides for size_z / size_t / image_count. When empty, the
+        // scalar series_size_z / series_size_t / series_image_count are broadcast
+        // to every series. Populated only by the ND2Reader.initFile (java:1720-1763)
+        // `offsets.length != getSeriesCount()` rebuild, which derives sizeT per
+        // series from each series' valid (non-zero) offset count.
+        let mut series_size_z_overrides: Vec<u32> = Vec::new();
+        let mut series_size_t_overrides: Vec<u32> = Vec::new();
+        let mut series_image_count_overrides: Vec<u32> = Vec::new();
 
-        if let Some(position_count) = loop_series_count.filter(|&count| count > 1) {
+        // When the binary ImageMetadataLV was processed, drive series/plane mapping
+        // from the faithful FormatTools.rasterToPosition layout (ND2Reader.initFile
+        // java:1624-1718) rather than the XML loop-order heuristic. `lv_mapping`
+        // carries the result so the heuristic block below is skipped.
+        let lv_mapping = if image_metadata_lv.processed {
+            nd2_raster_mapping(
+                &image_metadata_lv,
+                size_z,
+                size_t,
+                position_count as usize,
+                &image_sequence_indices,
+            )
+        } else {
+            None
+        };
+
+        // Apply the tmpOffsets compaction (ND2Reader.initFile java:1708-1718) up
+        // front: keep only series whose offsets array is non-empty and whose slot 0
+        // was filled (offsets[i][0] > 0). We require the compacted result to retain
+        // a genuine multi-series split before taking this path, preserving the
+        // prior `series_count > 1` invariant (a degenerate 0/1-series compaction
+        // falls through to the single-series defaults / heuristic path).
+        let lv_mapping = lv_mapping.and_then(|mapping| {
+            if mapping.series_count <= 1 {
+                return None;
+            }
+            let kept: Vec<Vec<usize>> = mapping
+                .source_planes
+                .iter()
+                .enumerate()
+                .filter(|(s, _)| {
+                    mapping.in_series_planes > 0
+                        && mapping.first_slot_filled.get(*s).copied().unwrap_or(false)
+                })
+                .map(|(_, planes)| planes.clone())
+                .collect();
+            if kept.len() > 1 {
+                Some((mapping, kept))
+            } else {
+                None
+            }
+        });
+
+        if let Some((mapping, kept_source_planes)) = lv_mapping {
+            // The series count derived from the LV M-axis == getSeriesCount() in
+            // Java at this point (setDimensions split the file into numSeries).
+            let java_series_count = mapping.series_count;
+
+            series_count = kept_source_planes.len();
+            series_source_planes = kept_source_planes;
+            series_image_chunks = series_source_planes
+                .iter()
+                .map(|planes| planes.iter().map(|&plane| image_chunks[plane]).collect())
+                .collect();
+            series_plane_offsets = series_source_planes
+                .iter()
+                .map(|planes| planes.first().copied().unwrap_or(0))
+                .collect();
+            // Per-series plane count = sizeZ*sizeT (the collapsed zctLengths
+            // product); size_z / size_t already reflect setDimensions.
+            series_image_count = series_source_planes
+                .iter()
+                .map(|p| p.len())
+                .max()
+                .unwrap_or(0) as u32;
+            series_size_z = size_z;
+            series_size_t = size_t;
+
+            // Post-mapping rebuild (ND2Reader.initFile java:1720-1763). If the
+            // compacted series count no longer matches getSeriesCount(), Java
+            // rebuilds CoreMetadata per series: sizeZ forced to 1, imageCount set
+            // to the count of valid (non-zero) offsets, and sizeT derived as
+            // imageCount / (rgb ? 1 : sizeC) (min 1). Otherwise every series keeps
+            // the uniform getSizeZ/getSizeT/getImageCount (the scalar broadcast).
+            if series_count != java_series_count {
+                let is_rgb = size_c == 3;
+                let denom = if is_rgb { 1 } else { size_c.max(1) };
+                series_size_z_overrides = vec![1u32; series_count];
+                series_image_count_overrides = Vec::with_capacity(series_count);
+                series_size_t_overrides = Vec::with_capacity(series_count);
+                for planes in &series_source_planes {
+                    // offsets[i].length - invalid == number of filled slots; our
+                    // source_planes already holds only the filled slots.
+                    let image_count_series = planes.len() as u32;
+                    let mut size_t_series = image_count_series / denom;
+                    if size_t_series == 0 {
+                        size_t_series = 1;
+                    }
+                    series_image_count_overrides.push(image_count_series);
+                    series_size_t_overrides.push(size_t_series);
+                }
+                series_handling = "image_metadata_lv_raster_mapping_rebuilt_series";
+            } else {
+                series_handling = "image_metadata_lv_raster_mapping";
+            }
+            series_metadata.insert(
+                "nd2_image_metadata_lv_order".into(),
+                MetadataValue::String(image_metadata_lv.order.clone()),
+            );
+            series_metadata.insert(
+                "nd2_image_metadata_lv_field_index".into(),
+                MetadataValue::Int(mapping.field_index as i64),
+            );
+        } else if !image_metadata_lv.processed {
+            if let Some(position_count) = loop_series_count.filter(|&count| count > 1) {
             let position_count = position_count as usize;
             if image_count as usize == position_count {
                 // Java exposes simple XY-position loops as separate series. The
@@ -2568,6 +3230,7 @@ impl FormatReader for Nd2Reader {
             } else if image_count > 0 {
                 series_handling = "unsupported_multi_position_layout_kept_flat";
             }
+            }
         }
 
         series_metadata.insert(
@@ -2601,6 +3264,66 @@ impl FormatReader for Nd2Reader {
                 MetadataValue::Int(self.pfs_state_offset as i64),
             );
         }
+        if !pfs_offsets.is_empty() {
+            series_metadata.insert(
+                "nd2_pfs_offsets".into(),
+                MetadataValue::String(
+                    pfs_offsets
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            );
+        }
+        if !pfs_status.is_empty() {
+            series_metadata.insert(
+                "nd2_pfs_status".into(),
+                MetadataValue::String(
+                    pfs_status
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            );
+        }
+        if !self.pos_x.is_empty() {
+            series_metadata.insert(
+                "nd2_pos_x".into(),
+                MetadataValue::String(
+                    self.pos_x
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            );
+        }
+        if !self.pos_y.is_empty() {
+            series_metadata.insert(
+                "nd2_pos_y".into(),
+                MetadataValue::String(
+                    self.pos_y
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            );
+        }
+        if !self.pos_z.is_empty() {
+            series_metadata.insert(
+                "nd2_pos_z".into(),
+                MetadataValue::String(
+                    self.pos_z
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            );
+        }
         if let Some(ri) = self.refractive_index {
             series_metadata.insert(
                 "nd2_refractive_index".into(),
@@ -2627,6 +3350,18 @@ impl FormatReader for Nd2Reader {
                 "nd2_exposure_times".into(),
                 MetadataValue::String(
                     self.exposure_time
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            );
+        }
+        if !self.ts_t.is_empty() {
+            series_metadata.insert(
+                "nd2_acq_times".into(),
+                MetadataValue::String(
+                    self.ts_t
                         .iter()
                         .map(|t| t.to_string())
                         .collect::<Vec<_>>()
@@ -2668,15 +3403,29 @@ impl FormatReader for Nd2Reader {
                     );
                 }
             }
+            // Per-series sizes when the java:1720-1763 rebuild produced overrides,
+            // otherwise the uniform scalar values broadcast to every series.
+            let this_size_z = series_size_z_overrides
+                .get(series_index)
+                .copied()
+                .unwrap_or(series_size_z);
+            let this_size_t = series_size_t_overrides
+                .get(series_index)
+                .copied()
+                .unwrap_or(series_size_t);
+            let this_image_count = series_image_count_overrides
+                .get(series_index)
+                .copied()
+                .unwrap_or(series_image_count);
             metas.push(ImageMetadata {
                 size_x,
                 size_y,
-                size_z: series_size_z,
+                size_z: this_size_z,
                 size_c,
-                size_t: series_size_t,
+                size_t: this_size_t,
                 pixel_type,
                 bits_per_pixel: bpp,
-                image_count: series_image_count,
+                image_count: this_image_count,
                 dimension_order,
                 is_rgb: size_c == 3,
                 is_interleaved: true,
@@ -2727,6 +3476,7 @@ impl FormatReader for Nd2Reader {
         self.backup_excitation_wavelengths.clear();
         self.plane_delta_t.clear();
         self.plane_position_z.clear();
+        self.ts_t.clear();
         self.exposure_time.clear();
         self.channel_colors.clear();
         self.text_channel_names.clear();
@@ -3014,8 +3764,15 @@ impl FormatReader for Nd2Reader {
             .then(|| self.exposure_time[0])
             .filter(|t| *t > 0.0);
 
+        // The CustomData|AcqTimesCache stream is the authoritative per-plane
+        // DeltaT when it covers every global plane (Java: tsT, used directly as
+        // stampIndex = n when tsT.size() == getImageCount()).
+        let ts_t_global = (self.ts_t.len() == self.image_chunks.len() && !self.ts_t.is_empty())
+            .then_some(self.ts_t.as_slice());
+
         if self.plane_delta_t.iter().any(Option::is_some)
             || self.plane_position_z.iter().any(Option::is_some)
+            || ts_t_global.is_some()
             || plane_pos_x.is_some()
             || plane_pos_y.is_some()
             || plane_pos_z_value.is_some()
@@ -3052,7 +3809,9 @@ impl FormatReader for Nd2Reader {
                         the_z: z,
                         the_c: c,
                         the_t: t,
-                        delta_t: self.plane_delta_t.get(source_plane).copied().flatten(),
+                        delta_t: ts_t_global
+                            .and_then(|ts| ts.get(source_plane).copied())
+                            .or_else(|| self.plane_delta_t.get(source_plane).copied().flatten()),
                         position_x: plane_pos_x,
                         position_y: plane_pos_y,
                         position_z: self

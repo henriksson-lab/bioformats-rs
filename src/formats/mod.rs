@@ -30,6 +30,7 @@ pub mod incell;
 pub mod jpeg;
 pub mod legacy;
 pub mod lei;
+pub mod leica_lms;
 pub mod lif;
 pub mod lim;
 pub mod lsm;

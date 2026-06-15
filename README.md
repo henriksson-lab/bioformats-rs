@@ -5,6 +5,7 @@ A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-form
 
 **This package has limited real data testing, not all features are yet included**
 
+* 2026-06-15: Some more stragglers found. Definitely need a final audit, but using a different LLM
 * 2026-06-14: Translation theoretically as complete as it can get. Testing on more data is however needed; if the code does not work on some file you have, please provide if possible
 * 2026-05-27: Further progress but incomplete. See status of translation below. However, more test data is needed for audit
 * 2026-05-26: 60-70% there. see list of libraries below. translation of mdbtools underway to support key file formats
@@ -129,7 +130,9 @@ been tested against real-world files.
 
 Most registered readers are now complete; the remaining partial/stub rows below
 call out the specific native payload, metadata, or multi-file behavior that is
-still missing.
+still missing. Readers with **no Bio-Formats counterpart** are *added code*, not
+translations, so they are not rated here — see
+[Added (non-upstream) readers](#added-non-upstream-readers) for that list.
 
 ### Standard image formats
 
@@ -190,7 +193,9 @@ still missing.
 | ScanR / CellVoyager / BD Pathway | `.xml` `.mlf` `.exp` | ✅ | Sparse-well compaction, CellVoyager tile stitching, BD montage field split |
 | Tecan plate ASCII | `.asc` | ✅ | Tab-separated plate → Float32 |
 | Yokogawa CV7000/8000 | `.wpi` `.mlf` `.mrf` | ✅ | `.wpi`/`.mlf`/`.mrf` XML index → well/field series + OME plate |
-| MetaXpress / SimplePCI / MIAS / Trestle / TissueFAXS / Mikroscan / Ionpath MIBI TIFFs | `.tif` | 🟡 | Extension-only TIFF delegate; no format-specific assembly |
+| MetaXpress | `.htd` `.tif` | ✅ | CellWorX-based HCS: HTD index → per-well/field TIFF series |
+| SimplePCI / Trestle / Mikroscan / Ionpath MIBI / MIAS TIFFs | `.tif` | 🟡 | TIFF pixels via shared engine + format-specific metadata (SimplePCI comment INI, Trestle overlap pyramid, Ionpath/Mikroscan tags); some openBytes channel-split / overlap-crop pending |
+| TissueFAXS | `.aqproj` `.tfcyto` | 🟡 | SQLite project DB (requires `tissuefaxs` feature); region/FOV stitching, JPEG tiles, JPEG-XR via `jpegxr` feature |
 | Cellomics | `.c01` `.dib` | 🟡 | zlib + DIB decoded; sibling `.mdb` channel metadata via `mdbtools-rs` |
 | CellWorX | `.htd` `.pnl` | ✅ | HTD index + TIFF delegation with plate/well metadata |
 
@@ -205,7 +210,6 @@ still missing.
 | Ventana/Roche BIF | `.bif` | ✅ | BIF tile reassembly (overlap-averaged stitching) |
 | Hamamatsu NDPIS | `.ndpis` | ✅ | `.ndpis` multi-file channel index |
 | Olympus cellSens VSI | `.vsi` | ✅ | `.ets` pyramid + RAW/JPEG/J2K/PNG/BMP tiles, tag-tree dims/crop, orphan-ETS matching, dim collision-shift, prefix-gated value metadata, ETS-level acquisition metadata, and OME original-metadata annotations |
-| OpenSlide (MRXS/VMS/BIF) | `.mrxs` `.vms` `.bif` | 🟡 | Feature-gated; multi-resolution |
 
 ### Vendor microscopy & cameras
 
@@ -219,15 +223,13 @@ still missing.
 | Li-Cor L2D | `.l2d` `.scn` | ✅ | Manifest + companion TIFF |
 | PCO B16 | `.b16` | ✅ | Raw uint16 |
 | Openlab Raw | `.raw` | ✅ | LBLB header + raw plane |
-| Photon Dynamics | `.hdr` `.img` `.pds` | ✅ | Header + companion IMG |
 | SM-Camera | `.smc` | ✅ | 548-byte header |
 | Andor SIF | `.sif` | ✅ | SIFReader parity (Java has no v3 XML-footer path) |
 | Princeton SPE | `.spe` | ✅ | SPE 2.x + 3.x detection (Java keeps binary dims; matches Java) |
 | Gatan DM2 | `.dm2` | ✅ | GatanDM2Reader parity (header + tag metadata) |
 | Lab Imaging LIM | `.lim` | ✅ | Matches Java (Java also rejects compressed LIM) |
 | Hasselblad Imacon / Image-Pro IPW | `.fff` `.ipw` | ✅ | Imacon XML tag; IPW OLE2 multi-TIFF |
-| Hamamatsu DCIMG | `.dcimg` | 🟡 | v0/v1 + four-corner correction and OME original-metadata annotations (no Java reference) |
-| Norpix StreamPix | `.seq` | 🟡 | Raw/JPEG frames, timestamps, bounded compressed-frame diagnostics, and OME original-metadata annotations (no Java reference) |
+| Hamamatsu DCIMG | `.dcimg` | 🟡 | v0/v1 + four-corner correction and OME original-metadata annotations (incomplete translation of `DCIMGReader`) |
 | TillVision | `.vws` `.pst` | 🟡 | PST+INF sidecar plus bounded native VWS OLE/CImage uncompressed, zlib-wrapped deflate, or raw-deflate planes; shifted CImage layout discovery, offset/fragments, explicit fragment offset+size metadata, inferred padded fragments, description metadata, normalized exposure/acquisition metadata, OME physical/channel/plane enrichment, and ISO-like acquisition date-time metadata with two-digit-year pivoting |
 | Canon RAW / Minolta MRW / DNG (CFA) | `.cr2` `.crw` `.mrw` `.dng` | ✅ | CFA Bayer interpolation + bit unpacking + DNG EXIF/maker-note white-balance |
 | Photoshop / QPTIFF / NIS TIFF wrappers | `.tif` `.qptiff` `.nif` | 🟡 | Plain TIFF delegate; vendor metadata not parsed |
@@ -238,7 +240,6 @@ still missing.
 | Format | Extensions | Status | Notes |
 |--------|-----------|:------:|-------|
 | MRC / CCP4 | `.mrc` `.mrcs` `.ccp4` `.map` `.rec` | ✅ | Endian detect, EMAN2/IMOD fixes, Y-flip |
-| MetaImage (ITK/VTK) | `.mha` `.mhd` | ✅ | Inline/detached, zlib, endian swap |
 | NIfTI-1 / Analyze 7.5 | `.nii` `.nii.gz` `.hdr` `.img` | ✅ | Single/paired/gz, color datatypes |
 | ICS / ICS2 | `.ics` | ✅ | gzip, endianness rules, dim ordering |
 | Siemens Inveon | `.hdr` (+`.img`) | ✅ | All data-type codes + endianness |
@@ -269,12 +270,11 @@ still missing.
 | Hitachi SEM | `.txt` | ✅ | `[SemImageFile]` INI + companion image (HitachiReader parity) |
 | LEO/Zeiss SEM | `.tif` | ✅ | TIFF tag 34118 + AP_/DP_/SV_ metadata |
 | RHK SPM | `.sm2` `.sm3` `.sm4` | ✅ | Real binary page header (XPM/text), scales, invertX/Y |
-| TopoMetrix AFM | `.tfr` `.zfr` | 🟡 | No Java reference; best-effort header parse |
+| TopoMetrix AFM | `.tfr` `.zfr` | 🟡 | Incomplete translation of `TopometrixReader`; header parse |
 | IMOD mesh | `.mod` | ✅ | Java-style model metadata and blank RGB plane |
 | JEOL | `.dat` `.img` `.par` | ✅ | Native MG/IM/DAT paths plus `.par` companion resolution |
 | Zeiss LMS (LMSFile) | `.lms` | ✅ | Marker/LUT parse with main indexed stack and RGB thumbnail series |
 | Quesant AFM | `.afm` | ✅ | Native variable-table parse plus strict raw fallback |
-| PicoQuant | `.ptu` `.pqres` | 🟡 | Header/tag metadata plus bounded marker-raster T2/T3 reconstruction for HydraHarp, TimeHarp 260, and MultiHarp synthetic records, metadata labels with safe T2/T3 inference, lifetime calibration metadata, exact `Uint8`/`Uint16`/`Uint32` histogram payloads including `HistoResult_*` variants, and explicit histogram payload ambiguity metadata; PicoHarp reconstruction is fixture/spec-blocked because its bit packing and marker encoding are not confirmed locally, and broader TTTR reconstruction needs fixtures/layout work |
 
 ### FLIM / lifetime / flow / HDF5
 
@@ -287,9 +287,8 @@ still missing.
 | Amnis FlowSight CIF | `.cif` | ✅ | TIFF + greyscale/bitmask codecs |
 | CellH5 | `.ch5` | ✅ | HDF5; multi-position/well series (two-pass structure) |
 | Aperio AFI / Bio-Rad SCN | `.afi` `.scn` | ✅ | AFI channel XML; SCN MIME-multipart parse |
-| Bruker MicroCT / Imaris TIFF / SlideBook TIFF | `.ctf` `.ims` `.tif` | 🟡 | TIFF delegate; some companion metadata skipped |
-| SimFCS | `.b64` `.r64` `.i64` | 🟡 | Fixed 256×256 frames with captured payload metadata and OME original-metadata annotations (no Java reference) |
-| BigDataViewer | `.h5` | 🟡 | HDF5; single series with companion XML/core metadata and OME original-metadata annotations (no Java reference) |
+| Imaris TIFF / SlideBook TIFF | `.ims` `.tif` | 🟡 | TIFF delegate; some companion metadata skipped |
+| BigDataViewer | `.h5` | 🟡 | HDF5; single series with companion XML/core metadata and OME original-metadata annotations (incomplete translation of `BDVReader`) |
 | Olympus OIR / Volocity clipping | `.oir` `.acff` | ✅ | Native payload readers with explicit clipping/plane bounds |
 | Amnis IM3 | `.im3` | 🟡 | Bounded native Uint16 XYC dataset decode with multi-dataset series, safe scalar native metadata, interpreted channel/wavelength/instrument/acquisition metadata, modulo-C wavelength annotations, OME original-metadata annotations, and bounded unsupported-record diagnostics including nested non-pixel containers; complex spectral/object records unsupported |
 | SlideBook 7 | `.sld` `.sldy` `.sldyz` | 🟡 | Bounded native `.sldy` directory and `.sldyz` ZIP layouts, including nested archive roots, with uncompressed NPY and compressed NPYZ byte-stream planes, multi-digit channels, scalar channel/time/position YAML metadata, typed top-level scalar keys, safe flattened nested YAML scalars, shallow scalar flow maps/lists, and OME original-metadata annotations; rich YAML object graph semantics unsupported |
@@ -321,18 +320,26 @@ metadata.
 > invention) were **removed** — this project is a translation of Bio-Formats, not
 > a superset.
 
-### Non-upstream extensions (deliberate extras)
+### Added (non-upstream) readers
 
-A few readers have **no counterpart in Bio-Formats** but read a real format and
-are kept as documented extensions rather than removed:
+These readers have **no counterpart in Bio-Formats** — they are *added code*,
+written for this crate (or ported from a separate project), **not translations**
+of a Bio-Formats reader. They read real formats and are kept as documented
+extensions rather than removed. They are listed here, separately from the
+per-reader translation-status tables above, because there is no Java reader to be
+faithful to. Where Bio-Formats *does* have a reader for a similar-but-different
+format (so the name collides), that is noted.
 
 | Reader | Extensions | Note |
 |--------|-----------|------|
-| MetaImage (ITK) | `.mha` `.mhd` | ITK/MetaIO volume; not a Bio-Formats format |
-| OME-Zarr / NGFF | `.zarr` | Translated from the separate `ome/ZarrReader`, not core Bio-Formats |
-| OpenSlide | `.mrxs` `.vms` … | Optional `openslide` feature; wraps the OpenSlide library |
-| SimFCS | `.r64` `.ref` | Globals SimFCS raw 256×256 FLIM frames |
-| Photon Dynamics | `.img` | Header + raw pixel sidecar |
+| MetaImage (ITK) | `.mha` `.mhd` | ITK/MetaIO volume; not a Bio-Formats format. Inline/detached, zlib, endian swap |
+| OME-Zarr / NGFF | `.zarr` | Ported from the separate `ome/ZarrReader`, not core Bio-Formats |
+| OpenSlide | `.mrxs` `.vms` `.bif` | Optional `openslide` feature; wraps the OpenSlide library; multi-resolution |
+| SimFCS | `.b64` `.r64` `.i64` | Globals SimFCS raw 256×256 FLIM frames + captured payload + OME original-metadata |
+| Photon Dynamics | `.hdr` `.img` `.pds` | Header + companion IMG / raw pixel sidecar |
+| Norpix StreamPix | `.seq` | Raw/JPEG frames, timestamps, bounded compressed-frame diagnostics, OME original-metadata. (Bio-Formats' `SEQReader` is the unrelated *Image-Pro Sequence* `.seq`/`.ips`.) |
+| Bruker MicroCT | `.ctf` | Header + TIFF delegate. (Bio-Formats' `MicroCTReader` reads `.vff` only — that one *is* translated, separately, as `MicroCtVffReader`.) |
+| PicoQuant | `.ptu` `.pqres` | PTU/PQRes tag headers + bounded T2/T3 marker-raster reconstruction (HydraHarp/TimeHarp 260/MultiHarp) + exact histogram payloads; PicoHarp reconstruction fixture-blocked. (Bio-Formats only has `PQBinReader` for the unrelated `.bin` format.) |
 
 ## API overview
 

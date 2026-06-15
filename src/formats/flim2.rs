@@ -9,6 +9,7 @@ use std::io::{BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::common::codec::{decompress_deflate, decompress_lzw, decompress_packbits};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::read_bytes_at;
 use crate::common::metadata::{ImageMetadata, MetadataValue, ModuloAnnotation};
@@ -4351,12 +4352,20 @@ impl SlideBook7Reader {
         }
 
         let first = parse_slidebook7_npy_header(&files[0].path)?;
-        let pixel_type = first.pixel_type;
+        // Java SlideBook7Reader.initFile derives the reported pixel type from
+        // CImageGroup.GetBytesPerPixel(), which is hard-coded to return 2, then
+        // calls FormatTools.pixelTypeFromBytes(2, false, true) -> UINT16, and sets
+        // ms.littleEndian = true unconditionally. So the reader always reports
+        // unsigned little-endian 16-bit samples regardless of the NPY descriptor
+        // (e.g. an "i2" descriptor is still surfaced as UINT16). The actual NPY
+        // byte width still drives the on-disk plane stride (Java ReadPlane uses
+        // mNpyHeader.mBytesPerPixel), which we preserve via `bytes_per_sample`.
+        let pixel_type = PixelType::Uint16;
         let bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
-        let bytes_per_sample = pixel_type.bytes_per_sample();
+        let bytes_per_sample = first.pixel_type.bytes_per_sample();
         for file in &files[1..] {
             let npy = parse_slidebook7_npy_header(&file.path)?;
-            if npy.pixel_type != pixel_type {
+            if npy.pixel_type != first.pixel_type {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "SlideBook 7 mixed NPY pixel types are unsupported in {}: {} has descriptor {:?} ({:?}), {} has descriptor {:?} ({:?})",
                     group.display(),
@@ -4418,7 +4427,8 @@ impl SlideBook7Reader {
             pixel_type,
             bits_per_pixel,
             image_count,
-            is_little_endian: first.little_endian,
+            // Java sets ms.littleEndian = true unconditionally in initFile.
+            is_little_endian: true,
             is_interleaved: true,
             ..ImageMetadata::default()
         };
@@ -6707,13 +6717,139 @@ impl FormatReader for AfiFluorescenceReader {
 /// per-channel planes are exposed at IFD granularity.
 pub struct ImarisTiffReader {
     inner: crate::tiff::TiffReader,
+    path: Option<PathBuf>,
+    /// Reshaped plane table: one entry per (channel-IFD, strip) pair, in the
+    /// same order Java builds `tmp` (outer loop over IFDs, inner over strips).
+    /// `None` when the file does not look like a tiled-strip Imaris stack and the
+    /// reader falls back to plain `TiffReader` plane semantics.
+    planes: Option<Vec<ImarisPlane>>,
+}
+
+/// One reshaped Imaris plane: a single strip of one channel IFD, decoded as a
+/// full sizeX×sizeY image (Java moves each strip into its own one-strip IFD via
+/// `TILE_OFFSETS`/`TILE_BYTE_COUNTS`).
+#[derive(Clone)]
+struct ImarisPlane {
+    offset: u64,
+    byte_count: usize,
+    compression: Compression,
+    predictor: u16,
+    samples_per_pixel: u16,
+    bits_per_sample: u16,
+    width: u32,
+    /// Rows covered by this strip (RowsPerStrip, clamped to the remaining rows).
+    rows: u32,
 }
 
 impl ImarisTiffReader {
     pub fn new() -> Self {
         ImarisTiffReader {
             inner: crate::tiff::TiffReader::new(),
+            path: None,
+            planes: None,
         }
+    }
+
+    /// Port of `ImarisTiffReader.initFile`'s IFD-reshape + core-metadata block.
+    ///
+    /// Imaris TIFFs store a thumbnail in the first IFD (already dropped by the
+    /// minimal-TIFF init) and then one IFD per channel, each IFD being a stack of
+    /// strips where every strip is a full Z plane. Java explodes the IFD list so
+    /// that each strip becomes its own one-strip IFD (`tmp`), then sets
+    /// `sizeC = #originalIFDs`, `sizeZ = tmp.size()/sizeC`, `sizeT = 1`.
+    fn reshape_ifds(&mut self) {
+        let ifd_count = self.inner.ifd_count();
+        if ifd_count == 0 {
+            return;
+        }
+        // Build `tmp`: outer loop over channel IFDs, inner over their strips.
+        let mut planes: Vec<ImarisPlane> = Vec::new();
+        let mut size_x = 0u32;
+        let mut size_y = 0u32;
+        let mut ok = true;
+
+        for i in 0..ifd_count {
+            let Some(ifd) = self.inner.ifd(i) else {
+                ok = false;
+                break;
+            };
+            // Java IFD.getStripByteCounts/getStripOffsets: strips, not tiles.
+            let offsets = ifd.get_vec_u64(tag::STRIP_OFFSETS);
+            let byte_counts = ifd.get_vec_u64(tag::STRIP_BYTE_COUNTS);
+            if offsets.is_empty() || offsets.len() != byte_counts.len() {
+                ok = false;
+                break;
+            }
+            let width = ifd.image_width().unwrap_or(0);
+            let length = ifd.image_length().unwrap_or(0);
+            let bps_vec = ifd.bits_per_sample();
+            let bps = *bps_vec.first().unwrap_or(&8);
+            let spp = ifd.samples_per_pixel();
+            let compression = ifd.compression();
+            let predictor = ifd.predictor();
+            // RowsPerStrip (default = full image height = single strip).
+            let rows_per_strip = ifd.get_u32(tag::ROWS_PER_STRIP).unwrap_or(length).max(1);
+
+            if i == 0 {
+                size_x = width;
+                size_y = length;
+            }
+
+            for (s, (&offset, &byte_count)) in offsets.iter().zip(byte_counts.iter()).enumerate() {
+                let row_start = (s as u32).saturating_mul(rows_per_strip);
+                if row_start >= length && length != 0 {
+                    break;
+                }
+                let rows = if length == 0 {
+                    rows_per_strip
+                } else {
+                    rows_per_strip.min(length - row_start)
+                };
+                planes.push(ImarisPlane {
+                    offset,
+                    byte_count: byte_count as usize,
+                    compression,
+                    predictor,
+                    samples_per_pixel: spp,
+                    bits_per_sample: bps,
+                    width,
+                    rows,
+                });
+            }
+        }
+
+        if !ok || planes.is_empty() {
+            return;
+        }
+
+        let size_c = ifd_count as u32;
+        let total = planes.len() as u32;
+        // Java: sizeZ = tmp.size() / sizeC. If strips do not divide evenly across
+        // channels the file is not a clean Imaris stack; fall back to TiffReader.
+        if size_c == 0 || total % size_c != 0 {
+            return;
+        }
+        let size_z = total / size_c;
+
+        if let Some(s) = self.inner.series_list_mut().first_mut() {
+            let m = &mut s.metadata;
+            m.size_c = size_c;
+            m.size_z = size_z;
+            m.size_t = 1;
+            if size_x > 0 {
+                m.size_x = size_x;
+            }
+            if size_y > 0 {
+                m.size_y = size_y;
+            }
+            m.image_count = size_c * size_z;
+            m.dimension_order = crate::common::metadata::DimensionOrder::XYZCT;
+            m.is_interleaved = false;
+            // Java: rgb = imageCount != sizeZ*sizeC*sizeT, which is false here.
+            m.is_rgb = false;
+        }
+
+        self.planes = Some(planes);
     }
 
     fn enrich_metadata(&mut self) {
@@ -6760,9 +6896,12 @@ impl ImarisTiffReader {
         }
 
         let ifd_count = self.inner.ifd_count() as u32;
+        let reshaped = self.planes.is_some();
         if let Some(s) = self.inner.series_list_mut().first_mut() {
-            // sizeC equals the number of IFDs (channels), per Java.
-            if ifd_count > 0 {
+            // sizeC equals the number of IFDs (channels), per Java. When the IFDs
+            // were already reshaped into per-strip planes, sizeC/sizeZ are set by
+            // `reshape_ifds`; only patch them here for the non-reshaped fallback.
+            if ifd_count > 0 && !reshaped {
                 s.metadata.size_c = ifd_count;
                 s.metadata.is_rgb = false;
             }
@@ -6796,6 +6935,141 @@ impl ImarisTiffReader {
             }
         }
     }
+
+    /// Read one reshaped plane (a single strip of one channel IFD) and decode it
+    /// into a full sizeX×sizeY image. Mirrors how Java reads each per-strip IFD:
+    /// the strip's compressed bytes are decompressed with the IFD's compression,
+    /// predictor and sample layout to yield exactly one XY plane.
+    fn open_reshaped_plane(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let plane = self
+            .planes
+            .as_ref()
+            .and_then(|planes| planes.get(plane_index as usize))
+            .cloned()
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
+        let little_endian = self.inner.is_little_endian();
+
+        let mut reader = BufReader::new(File::open(&path).map_err(BioFormatsError::Io)?);
+        let raw = read_bytes_at(&mut reader, plane.offset, plane.byte_count)?;
+
+        let bytes_per_sample = (plane.bits_per_sample.div_ceil(8)).max(1) as usize;
+        let expected_len = (plane.width as usize)
+            .saturating_mul(plane.rows as usize)
+            .saturating_mul(plane.samples_per_pixel as usize)
+            .saturating_mul(bytes_per_sample);
+
+        // Imaris 3 TIFF strips use the baseline TIFF compressions. JPEG-compressed
+        // Imaris stacks are not known to occur; reject them clearly rather than
+        // mis-decode.
+        let mut out = match plane.compression {
+            Compression::None => raw,
+            Compression::Lzw => decompress_lzw(&raw)?,
+            Compression::Deflate | Compression::DeflateOld => decompress_deflate(&raw)?,
+            Compression::PackBits => decompress_packbits(&raw)?,
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Imaris TIFF strip compression {other:?} is not supported"
+                )));
+            }
+        };
+
+        // Predictor (TIFF tag 317): 1 = none, 2 = horizontal differencing.
+        match plane.predictor {
+            1 => {}
+            2 => imaris_undo_horizontal_differencing(
+                &mut out,
+                plane.width as usize,
+                plane.samples_per_pixel as usize,
+                plane.bits_per_sample,
+                little_endian,
+            )?,
+            other => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Imaris TIFF predictor {other} is not supported"
+                )));
+            }
+        }
+
+        if out.len() > expected_len {
+            out.truncate(expected_len);
+        }
+        Ok(out)
+    }
+}
+
+/// TIFF horizontal differencing predictor (tag 317 == 2), replicated locally for
+/// the Imaris reshape path. Mirrors `TiffCompression.undifference`: each sample is
+/// a `bytes_per_sample`-wide integer (honouring endianness); the same-channel
+/// sample one pixel to the left is added with wrapping overflow, per row.
+fn imaris_undo_horizontal_differencing(
+    data: &mut [u8],
+    row_width: usize,
+    samples_per_pixel: usize,
+    bits_per_sample: u16,
+    little_endian: bool,
+) -> Result<()> {
+    if row_width == 0 || samples_per_pixel == 0 {
+        return Ok(());
+    }
+    let bytes_per_sample = match bits_per_sample {
+        8 => 1usize,
+        16 => 2usize,
+        32 => 4usize,
+        64 => 8usize,
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Imaris TIFF horizontal predictor for {other}-bit samples not supported"
+            )));
+        }
+    };
+    let channel_stride = samples_per_pixel;
+    let row_stride_bytes = row_width * samples_per_pixel * bytes_per_sample;
+    if row_stride_bytes == 0 {
+        return Ok(());
+    }
+    for row in data.chunks_mut(row_stride_bytes) {
+        let sample_count = row.len() / bytes_per_sample;
+        let usable = sample_count / samples_per_pixel * samples_per_pixel;
+        for i in channel_stride..usable {
+            let cur = i * bytes_per_sample;
+            let prev = (i - channel_stride) * bytes_per_sample;
+            imaris_add_sample(row, cur, prev, bytes_per_sample, little_endian);
+        }
+    }
+    Ok(())
+}
+
+/// Adds the `bytes_per_sample`-wide integers at `cur` and `prev` with wrapping
+/// overflow and stores the result at `cur`, honouring the IFD byte order.
+fn imaris_add_sample(
+    row: &mut [u8],
+    cur: usize,
+    prev: usize,
+    bytes_per_sample: usize,
+    little_endian: bool,
+) {
+    let read = |off: usize| -> u64 {
+        let mut buf = [0u8; 8];
+        if little_endian {
+            buf[..bytes_per_sample].copy_from_slice(&row[off..off + bytes_per_sample]);
+            u64::from_le_bytes(buf)
+        } else {
+            buf[8 - bytes_per_sample..].copy_from_slice(&row[off..off + bytes_per_sample]);
+            u64::from_be_bytes(buf)
+        }
+    };
+    let value = read(cur).wrapping_add(read(prev));
+    let bytes = if little_endian {
+        value.to_le_bytes()
+    } else {
+        value.to_be_bytes()
+    };
+    if little_endian {
+        row[cur..cur + bytes_per_sample].copy_from_slice(&bytes[..bytes_per_sample]);
+    } else {
+        row[cur..cur + bytes_per_sample].copy_from_slice(&bytes[8 - bytes_per_sample..]);
+    }
 }
 
 impl Default for ImarisTiffReader {
@@ -6817,10 +7091,14 @@ impl FormatReader for ImarisTiffReader {
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
+        self.path = Some(path.to_path_buf());
+        self.reshape_ifds();
         self.enrich_metadata();
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.planes = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -6836,12 +7114,29 @@ impl FormatReader for ImarisTiffReader {
         self.inner.metadata()
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if self.planes.is_some() {
+            return self.open_reshaped_plane(p);
+        }
         self.inner.open_bytes(p)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        if self.planes.is_some() {
+            let full = self.open_reshaped_plane(p)?;
+            let meta = self.inner.metadata();
+            let ch = if meta.is_rgb { meta.size_c as usize } else { 1 };
+            return crop_full_plane("Imaris TIFF", &full, meta, ch, x, y, w, h);
+        }
         self.inner.open_bytes_region(p, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if self.planes.is_some() {
+            let meta = self.inner.metadata();
+            let tw = meta.size_x.min(256);
+            let th = meta.size_y.min(256);
+            let tx = (meta.size_x - tw) / 2;
+            let ty = (meta.size_y - th) / 2;
+            return self.open_bytes_region(p, tx, ty, tw, th);
+        }
         self.inner.open_thumb_bytes(p)
     }
     fn resolution_count(&self) -> usize {
@@ -6867,6 +7162,10 @@ pub struct XlefReader {
     series_map: Vec<XlefSeriesRef>,
     project_metadata: Vec<ImageMetadata>,
     current_series: usize,
+    /// LMS metadata derived from the XLEF/XLIF document graph (faithful
+    /// translation of LMSMetadataExtractor), keyed by referenced image file path.
+    /// Used to overlay dims/order/pixel-type onto delegate-derived metadata.
+    xlif_lms_by_image: std::collections::HashMap<PathBuf, ImageMetadata>,
 }
 
 struct XlefDelegate {
@@ -6895,6 +7194,7 @@ impl XlefReader {
             series_map: Vec::new(),
             project_metadata: Vec::new(),
             current_series: 0,
+            xlif_lms_by_image: std::collections::HashMap::new(),
         }
     }
 
@@ -6921,6 +7221,64 @@ impl XlefReader {
             )));
         }
         Ok(refs)
+    }
+
+    /// Faithful translation of the XLEF document-graph traversal
+    /// (XlefDocument/XlcfDocument/XlifDocument + LMSMetadataExtractor): build the
+    /// LMS-derived ImageMetadata for each XLIF-referenced image, keyed by the
+    /// (canonicalised) image file path so it can be overlaid onto the matching
+    /// pixel delegate's metadata.
+    fn build_xlif_lms_map(&mut self, project_path: &Path) {
+        self.xlif_lms_by_image.clear();
+        let Ok(project) = crate::formats::leica_lms::XlefDocument::new(project_path) else {
+            return;
+        };
+        for xlif in project.get_xlifs() {
+            let Ok(meta) = crate::formats::leica_lms::image_metadata_from_xlif(xlif) else {
+                continue;
+            };
+            // An xlif may reference one image (TIF/LOF) or several frames; apply
+            // the same image-level LMS metadata to each referenced image path.
+            for image_path in &xlif.image_paths {
+                let key = std::fs::canonicalize(image_path)
+                    .unwrap_or_else(|_| image_path.clone());
+                self.xlif_lms_by_image.insert(key, meta.clone());
+            }
+        }
+    }
+
+    /// Overlay the LMS-derived core dimensions (sizes / dimension order / pixel
+    /// type / physical sizes / channel colours) onto a delegate's metadata when
+    /// the delegate's source image is referenced by an XLIF in the project graph.
+    /// Mirrors XLEFReader using XLIF metadata for its referenced images rather
+    /// than the delegate's own guesses.
+    fn overlay_xlif_lms(&self, meta: &mut ImageMetadata, source_path: &str) {
+        let path = PathBuf::from(source_path);
+        let key = std::fs::canonicalize(&path).unwrap_or(path);
+        let Some(lms) = self.xlif_lms_by_image.get(&key) else {
+            return;
+        };
+        if lms.size_x > 0 {
+            meta.size_x = lms.size_x;
+        }
+        if lms.size_y > 0 {
+            meta.size_y = lms.size_y;
+        }
+        meta.size_z = lms.size_z.max(1);
+        meta.size_c = lms.size_c.max(1);
+        meta.size_t = lms.size_t.max(1);
+        meta.dimension_order = lms.dimension_order;
+        meta.pixel_type = lms.pixel_type;
+        meta.bits_per_pixel = lms.bits_per_pixel;
+        meta.is_rgb = lms.is_rgb;
+        meta.is_interleaved = lms.is_interleaved;
+        meta.is_indexed = lms.is_indexed;
+        meta.image_count = lms.image_count.max(1);
+        for (key, value) in &lms.series_metadata {
+            meta.series_metadata
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
     }
 
     fn current_delegate_mut(&mut self) -> Result<&mut (dyn FormatReader + '_)> {
@@ -7089,12 +7447,17 @@ impl XlefReader {
             );
             meta.series_metadata.insert(
                 "xlef.project.source_path".into(),
-                MetadataValue::String(source_path),
+                MetadataValue::String(source_path.clone()),
             );
             meta.series_metadata.insert(
                 "xlef.project.source_kind".into(),
                 MetadataValue::String(source_kind.into()),
             );
+            // For pixel-delegate series, prefer LMS metadata graph dimensions
+            // over the delegate's guesses (XLEFReader uses xlif metadata).
+            if source_kind == "pixel_delegate" {
+                self.overlay_xlif_lms(&mut meta, &source_path);
+            }
             if let Some(tile) = tile {
                 meta.series_metadata.insert(
                     "xlef.project.tile_index".into(),
@@ -7999,6 +8362,72 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
             {
                 channel.color = Some(*packed as i32);
             }
+
+            // Per-channel light-source/detector settings (Java initLasers /
+            // initDetectorModels per-channel assignment loops).
+            channel.light_source_settings_id =
+                xlef_lms_metadata_string(meta, &format!("{prefix}.light_source_settings_id"));
+            channel.light_source_settings_attenuation =
+                xlef_lms_metadata_float(meta, &format!("{prefix}.light_source_settings_attenuation"));
+            channel.detector_ref =
+                xlef_lms_metadata_string(meta, &format!("{prefix}.detector_ref"));
+            channel.detector_settings_gain =
+                xlef_lms_metadata_float(meta, &format!("{prefix}.detector_settings_gain"));
+            channel.detector_settings_offset =
+                xlef_lms_metadata_float(meta, &format!("{prefix}.detector_settings_offset"));
+            channel.pinhole_size =
+                xlef_lms_metadata_float(meta, &format!("{prefix}.pinhole_size"));
+        }
+
+        // Per-channel emission-filter light paths (Java initDetectorModels'
+        // live setLightPathEmissionFilterRef call).
+        let channel_count = image.channels.len();
+        let mut light_paths: Vec<crate::common::ome_metadata::OmeLightPath> = Vec::new();
+        let mut any_light_path = false;
+        for channel_index in 0..channel_count {
+            let prefix = format!("xlef.lms.channel.{channel_index}");
+            let mut light_path = crate::common::ome_metadata::OmeLightPath::default();
+            if let Some(filter_ref) =
+                xlef_lms_metadata_string(meta, &format!("{prefix}.emission_filter_ref"))
+            {
+                light_path.emission_filter_ids.push(filter_ref);
+                any_light_path = true;
+            }
+            light_paths.push(light_path);
+        }
+        if any_light_path {
+            image.light_paths = light_paths;
+        }
+
+        // Per-plane metadata (Java initImageDetails plane loop): positions, deltaT,
+        // exposure times. One OmePlane per image plane, in plane index order.
+        let mut plane_index = 0usize;
+        while meta
+            .series_metadata
+            .keys()
+            .any(|k| k.starts_with(&format!("xlef.lms.plane.{plane_index}.")))
+        {
+            plane_index += 1;
+        }
+        if plane_index > 0 {
+            let mut planes = Vec::with_capacity(plane_index);
+            for index in 0..plane_index {
+                let prefix = format!("xlef.lms.plane.{index}");
+                planes.push(crate::common::ome_metadata::OmePlane {
+                    the_z: 0,
+                    the_c: 0,
+                    the_t: 0,
+                    delta_t: xlef_lms_metadata_float(meta, &format!("{prefix}.delta_t")),
+                    exposure_time: xlef_lms_metadata_float(
+                        meta,
+                        &format!("{prefix}.exposure_time"),
+                    ),
+                    position_x: xlef_lms_metadata_float(meta, &format!("{prefix}.position_x")),
+                    position_y: xlef_lms_metadata_float(meta, &format!("{prefix}.position_y")),
+                    position_z: xlef_lms_metadata_float(meta, &format!("{prefix}.position_z")),
+                });
+            }
+            image.planes = planes;
         }
     }
 
@@ -8073,6 +8502,7 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
                 manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.laser.0.manufacturer"),
                 light_source_type: Some("Laser".into()),
                 power: xlef_lms_metadata_float(meta, "xlef.lms.laser.0.power"),
+                wavelength: xlef_lms_metadata_float(meta, "xlef.lms.laser.0.wavelength"),
             });
     }
     if meta
@@ -8157,6 +8587,12 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
             let radius_x = xlef_lms_metadata_float(meta, &format!("{prefix}.radius_x"));
             let radius_y = xlef_lms_metadata_float(meta, &format!("{prefix}.radius_y"));
 
+            let points_raw = xlef_lms_metadata_string(meta, &format!("{prefix}.points"));
+            let is_polygon = shape_kind
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("Polygon"))
+                .unwrap_or(false)
+                || points_raw.is_some();
             let is_line = shape_kind
                 .as_deref()
                 .map(|s| s.eq_ignore_ascii_case("Line"))
@@ -8168,7 +8604,31 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
                 .unwrap_or(false)
                 || (radius_x.is_some() && radius_y.is_some());
 
-            let shape = if is_line {
+            let shape = if is_polygon {
+                let points: Vec<(f64, f64)> = points_raw
+                    .as_deref()
+                    .map(|raw| {
+                        raw.split_whitespace()
+                            .filter_map(|pair| {
+                                let mut it = pair.split(',');
+                                let px = it.next()?.parse::<f64>().ok()?;
+                                let py = it.next()?.parse::<f64>().ok()?;
+                                Some((px, py))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if points.is_empty() {
+                    None
+                } else {
+                    Some(crate::common::ome_metadata::OmeShape::Polygon {
+                        points,
+                        the_z,
+                        the_t,
+                        the_c,
+                    })
+                }
+            } else if is_line {
                 match (x1, y1, x2, y2) {
                     (Some(x1), Some(y1), Some(x2), Some(y2)) => {
                         Some(crate::common::ome_metadata::OmeShape::Line {
@@ -8317,6 +8777,7 @@ impl FormatReader for XlefReader {
             }
         }
         self.current_series = 0;
+        self.build_xlif_lms_map(path);
         self.rebuild_project_metadata(path)?;
         self.set_delegate_series_for_current()?;
         Ok(())
@@ -8329,6 +8790,7 @@ impl FormatReader for XlefReader {
         self.lms_metadata.clear();
         self.series_map.clear();
         self.project_metadata.clear();
+        self.xlif_lms_by_image.clear();
         self.current_series = 0;
         Ok(())
     }

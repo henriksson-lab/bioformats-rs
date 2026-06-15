@@ -143,6 +143,7 @@ fn extract_int(s: &str) -> Option<u32> {
     last
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_sdt_raw_plane(
     f: &mut File,
     size_x: usize,
@@ -150,12 +151,14 @@ fn read_sdt_raw_plane(
     time_bins: usize,
     time_bin: usize,
     plane_bytes: usize,
+    padded_width: usize,
 ) -> Result<Vec<u8>> {
     // SDTReader.java:176 — rows are stored at a width padded up to a multiple
     // of 4 pixels. Each disk row holds `paddedWidth` pixels worth of decays,
     // but the output plane only contains the unpadded `size_x` columns
-    // (SDTReader.java:185-190 drops the padding columns).
-    let padded_width = padded_width(size_x);
+    // (SDTReader.java:185-190 drops the padding columns). The caller computes
+    // the effective `padded_width`, which may collapse to `size_x` when the
+    // block length indicates the data is not actually padded.
     let row_len = padded_width
         .checked_mul(time_bins)
         .and_then(|v| v.checked_mul(2))
@@ -184,6 +187,50 @@ fn padded_width(size_x: usize) -> usize {
     size_x + ((4 - (size_x % 4)) % 4)
 }
 
+/// Effective on-disk row width, replicating the padding-removal heuristic in
+/// SDTReader.java:176-190. Rows are normally stored at a width padded up to a
+/// multiple of 4 pixels, but if the padded plane would overrun the block while
+/// the unpadded plane fits, the padding is dropped and `size_x` is used.
+fn effective_padded_width(
+    size_x: usize,
+    size_y: usize,
+    times: usize,
+    size_c: usize,
+    block_size: u64,
+) -> usize {
+    const BPP: usize = 2;
+    let padded = padded_width(size_x);
+    let plane_size = (padded * size_y * times * BPP) as u64;
+    if padded > size_x
+        && plane_size.saturating_mul(size_c as u64) > block_size
+        && ((plane_size / padded as u64) * size_x as u64 * size_c as u64) <= block_size
+    {
+        size_x
+    } else {
+        padded
+    }
+}
+
+/// Apply the Becker & Hickl count-increment division (SDTReader.java:278-295).
+/// When `incr > 1`, each 16-bit little-endian sample is divided by `incr`;
+/// negative values (sign bit set) are treated as unsigned before dividing.
+fn apply_sdt_incr(buf: &mut [u8], incr: u16) {
+    if incr <= 1 {
+        return;
+    }
+    let incr = incr as i32;
+    for chunk in buf.chunks_exact_mut(2) {
+        let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+        let result: i16 = if s > 0 {
+            (s as i32 / incr) as i16
+        } else {
+            let ii = (s as u16) as i32; // s & 0xffff
+            (ii / incr) as i16
+        };
+        chunk.copy_from_slice(&result.to_le_bytes());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_sdt_zip_plane(
     f: &mut File,
@@ -193,6 +240,7 @@ fn read_sdt_zip_plane(
     time_bins: usize,
     time_bin: usize,
     channel: usize,
+    padded_width: usize,
 ) -> Result<Vec<u8>> {
     let compressed_len = compressed_block_len(f, block)?;
     let mut compressed = vec![0u8; compressed_len];
@@ -201,8 +249,8 @@ fn read_sdt_zip_plane(
     let mut decoder = flate2::read::DeflateDecoder::new(Cursor::new(payload));
 
     // Output plane is unpadded (size_x columns); disk rows are padded_width
-    // wide (SDTReader.java:176,185-190).
-    let padded_width = padded_width(size_x);
+    // wide (SDTReader.java:176,185-190). The effective padded_width is supplied
+    // by the caller.
     let plane_bytes = size_x
         .checked_mul(size_y)
         .and_then(|v| v.checked_mul(2))
@@ -1263,6 +1311,11 @@ struct SdtSeries {
     unsupported_layout_reason: Option<String>,
     raw_curve_payload_len: Option<usize>,
     compressed_curve_payload_len: Option<usize>,
+    /// Becker & Hickl block length (`info.allBlockLengths[series]`), needed by
+    /// openBytes to replicate the SDTReader.java:185-190 padding heuristic.
+    block_length: u64,
+    /// `info.incr` count increment; values > 1 are divided out (SDTReader.java:278-295).
+    incr: u16,
 }
 
 pub struct SdtReader {
@@ -1410,6 +1463,8 @@ impl FormatReader for SdtReader {
                 unsupported_layout_reason: None,
                 raw_curve_payload_len: None,
                 compressed_curve_payload_len: None,
+                block_length: 0,
+                incr: 1,
             }];
             self.current_series = 0;
             self.path = Some(path.to_path_buf());
@@ -1778,6 +1833,8 @@ impl FormatReader for SdtReader {
                 unsupported_layout_reason,
                 raw_curve_payload_len,
                 compressed_curve_payload_len,
+                block_length: block_len,
+                incr: info.incr,
             });
         }
 
@@ -1842,6 +1899,20 @@ impl FormatReader for SdtReader {
             .map(|s| s.block.clone())
             .or_else(|| self.blocks.first().cloned())
             .ok_or_else(|| BioFormatsError::Format("SDT plane has no data block".into()))?;
+        // Becker & Hickl block length and count-increment for this series
+        // (SDTReader.java:174,278). Used by the padding heuristic and incr
+        // division below.
+        let series_block_length = self
+            .series
+            .get(self.current_series)
+            .map(|s| s.block_length)
+            .unwrap_or(0);
+        let series_incr = self
+            .series
+            .get(self.current_series)
+            .map(|s| s.incr)
+            .unwrap_or(1);
+        let series_size_c = meta.size_c as usize;
         if let Some(curve_len) = self
             .series
             .get(self.current_series)
@@ -1893,22 +1964,44 @@ impl FormatReader for SdtReader {
 
         // planeSize for one channel = paddedWidth * sizeY * times * bpp
         // (SDTReader.java:181). Rows on disk are padded to a multiple of 4
-        // pixels in width, so the per-channel stride must use paddedWidth too.
-        let padded_width = padded_width(size_x);
+        // pixels in width, but the padding may be dropped when the block length
+        // shows the data is unpadded (SDTReader.java:185-190).
+        let padded_width =
+            effective_padded_width(size_x, size_y, times, series_size_c, series_block_length);
         let channel_plane_size = (padded_width * size_y * times * 2) as u64;
 
-        if &signature == b"PK" {
+        let mut plane = if &signature == b"PK" {
             // For ZIP blocks we cannot random-seek; decode and skip preceding
             // channels by reading from the start of the decompressed stream.
-            read_sdt_zip_plane(&mut f, &block, size_x, size_y, times, time_bin, channel)
+            read_sdt_zip_plane(
+                &mut f,
+                &block,
+                size_x,
+                size_y,
+                times,
+                time_bin,
+                channel,
+                padded_width,
+            )?
         } else {
             // Skip to the requested channel within the block.
             f.seek(SeekFrom::Current(
                 channel as i64 * channel_plane_size as i64,
             ))
             .map_err(BioFormatsError::Io)?;
-            read_sdt_raw_plane(&mut f, size_x, size_y, times, time_bin, plane_bytes)
-        }
+            read_sdt_raw_plane(
+                &mut f,
+                size_x,
+                size_y,
+                times,
+                time_bin,
+                plane_bytes,
+                padded_width,
+            )?
+        };
+        // Divide out the count increment if > 1 (SDTReader.java:278-295).
+        apply_sdt_incr(&mut plane, series_incr);
+        Ok(plane)
     }
 
     fn open_bytes_region(

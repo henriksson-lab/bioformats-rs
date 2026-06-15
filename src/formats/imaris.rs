@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::ome_metadata::{
     create_lsid, OmeDetector, OmeInstrument, OmeLightSource, OmeObjective, OmeROI, OmeShape,
 };
@@ -29,8 +29,18 @@ const IMARIS_SURPASS_STATISTICS_TABLE_VALUE_LIMIT: u64 = 4096;
 pub struct ImarisReader {
     path: Option<PathBuf>,
     file: Option<hdf5_pure_rust::File>,
-    // One ImageMetadata per resolution level. Index 0 is full-resolution.
+    // One ImageMetadata per Imaris ResolutionLevel_N. Index 0 is full-resolution.
+    // This is the flat, file-order list; the `series` grouping below references
+    // these by absolute Imaris level so that (series, resolution) coordinates can
+    // be mapped back to the on-disk ResolutionLevel path for I/O.
     resolutions: Vec<ImageMetadata>,
+    // Java SubResolutionFormatReader series model (ImarisHDFReader.initFile
+    // ~287-311): each series is a list of absolute Imaris ResolutionLevel indices
+    // (its resolutions, finest first). Resolution levels whose Z/C/T match
+    // level 0 collapse into one pyramid series; mismatched levels split off into
+    // their own series.
+    series: Vec<Vec<usize>>,
+    current_series: usize,
     current_resolution: usize,
     // pixel type for raw reads
     bytes_per_sample: usize,
@@ -42,6 +52,11 @@ pub struct ImarisReader {
     // Per-channel names from DataSetInfo/Channel N.
     channel_names: Vec<Option<String>>,
     channel_colors: Vec<Option<i32>>,
+    // Original per-channel `Color` attribute as the 0..1 RGB doubles Java keeps
+    // in its `colors` list. Retained (in addition to the packed RGBA in
+    // `channel_colors`) because the get8BitLookupTable/get16BitLookupTable ramp
+    // computation needs the raw double components, not the rounded bytes.
+    channel_colors_normalized: Vec<Option<[f64; 3]>>,
     channel_emission_wavelengths: Vec<Option<f64>>,
     channel_excitation_wavelengths: Vec<Option<f64>>,
     instrument: ImarisInstrumentMetadata,
@@ -68,6 +83,8 @@ impl ImarisReader {
             path: None,
             file: None,
             resolutions: Vec::new(),
+            series: Vec::new(),
+            current_series: 0,
             current_resolution: 0,
             bytes_per_sample: 1,
             extents: None,
@@ -75,11 +92,22 @@ impl ImarisReader {
             image_description: None,
             channel_names: Vec::new(),
             channel_colors: Vec::new(),
+            channel_colors_normalized: Vec::new(),
             channel_emission_wavelengths: Vec::new(),
             channel_excitation_wavelengths: Vec::new(),
             instrument: ImarisInstrumentMetadata::default(),
             cache: None,
         }
+    }
+
+    /// Map the active (series, resolution) coordinate to the absolute Imaris
+    /// ResolutionLevel index used for the on-disk DataSet path. Mirrors Java's
+    /// getCoreIndex(): the resolution within the current series.
+    fn current_imaris_level(&self) -> Option<usize> {
+        self.series
+            .get(self.current_series)
+            .and_then(|group| group.get(self.current_resolution))
+            .copied()
     }
 }
 
@@ -576,6 +604,7 @@ struct ImsParse {
     image_description: Option<String>,
     channel_names: Vec<Option<String>>,
     channel_colors: Vec<Option<i32>>,
+    channel_colors_normalized: Vec<Option<[f64; 3]>>,
     channel_emission_wavelengths: Vec<Option<f64>>,
     channel_excitation_wavelengths: Vec<Option<f64>>,
     instrument: ImarisInstrumentMetadata,
@@ -800,6 +829,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     insert_ims_dataset_metadata(&file, &data_path, &mut meta_map);
     let mut channel_names: Vec<Option<String>> = vec![None; size_c as usize];
     let mut channel_colors: Vec<Option<i32>> = vec![None; size_c as usize];
+    let mut channel_colors_normalized: Vec<Option<[f64; 3]>> = vec![None; size_c as usize];
     let mut channel_emission_wavelengths: Vec<Option<f64>> = vec![None; size_c as usize];
     let mut channel_excitation_wavelengths: Vec<Option<f64>> = vec![None; size_c as usize];
     for c in 0..size_c {
@@ -824,6 +854,12 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
                 if let Some(parsed) = parse_imaris_channel_color(&color) {
                     insert_imaris_channel_color_metadata(&mut meta_map, c, parsed);
                     channel_colors[c as usize] = Some(pack_rgba_color(parsed));
+                }
+                // Mirror ImarisHDFReader.parseAttributes()'s `colors` list: the
+                // raw 0..1 RGB doubles from the `Color` attribute, kept verbatim
+                // for the get8BitLookupTable/get16BitLookupTable ramp.
+                if let Some(rgb) = parse_imaris_channel_color_doubles(&color) {
+                    channel_colors_normalized[c as usize] = Some(rgb);
                 }
                 meta_map.insert(format!("channel_{c}_color"), MetadataValue::String(color));
             }
@@ -898,6 +934,38 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     // (level 0 uses the DataSetInfo/Image dimensions). sizeC and sizeT are
     // shared across all levels.
     let image_count0 = checked_image_count(size_z, size_c, size_t, "base")?;
+
+    // Java ImarisHDFReader.initFile() line 353: ms.indexed = colors.size() >=
+    // getSizeC(). Java's `colors` list reaches sizeC entries only when a Color
+    // attribute was parsed for every channel index; mirror that by requiring a
+    // colour for every channel.
+    let colored_channels = channel_colors_normalized
+        .iter()
+        .filter(|c| c.is_some())
+        .count();
+    let is_indexed = size_c > 0 && colored_channels >= size_c as usize;
+
+    // Java surfaces the per-channel ramp LUT through get8/16BitLookupTable, which
+    // only returns a table for UINT8/UINT16 indexed data and uses lastChannel
+    // (default 0). Build that channel-0 ramp once so callers reading the single
+    // ImageMetadata.lookup_table slot see the same table Java's lastChannel=0
+    // default would yield.
+    let lookup_table = if is_indexed {
+        match pixel_type {
+            PixelType::Uint8 => channel_colors_normalized
+                .first()
+                .and_then(|c| *c)
+                .map(imaris_8bit_lookup_table),
+            PixelType::Uint16 => channel_colors_normalized
+                .first()
+                .and_then(|c| *c)
+                .map(imaris_16bit_lookup_table),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let base_meta = ImageMetadata {
         size_x,
         size_y,
@@ -910,11 +978,11 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         dimension_order: DimensionOrder::XYZCT,
         is_rgb: false,
         is_interleaved: false,
-        is_indexed: false,
+        is_indexed,
         is_little_endian: true,
         resolution_count: n_resolutions as u32,
         series_metadata: meta_map,
-        lookup_table: None,
+        lookup_table,
         modulo_z: None,
         modulo_c: None,
         modulo_t: None,
@@ -956,6 +1024,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         image_description,
         channel_names,
         channel_colors,
+        channel_colors_normalized,
         channel_emission_wavelengths,
         channel_excitation_wavelengths,
         instrument,
@@ -998,6 +1067,61 @@ fn parse_imaris_channel_color(value: &str) -> Option<[u8; 4]> {
         to_u8(components[2]),
         components.get(3).map(|v| to_u8(*v)).unwrap_or(255),
     ])
+}
+
+/// Mirror ImarisHDFReader.parseAttributes()'s per-channel `Color` parse for the
+/// `colors` list: split the value on spaces and parse each token as a double,
+/// keeping the raw 0..1 RGB components (Java fills a `double[3]`, parsing up to
+/// the number of tokens present and leaving any missing component at 0.0).
+fn parse_imaris_channel_color_doubles(value: &str) -> Option<[f64; 3]> {
+    let mut color = [0.0f64; 3];
+    let mut any = false;
+    for (i, token) in value.split(' ').filter(|t| !t.is_empty()).enumerate() {
+        if i >= 3 {
+            break;
+        }
+        color[i] = token.parse::<f64>().ok()?;
+        any = true;
+    }
+    if any {
+        Some(color)
+    } else {
+        None
+    }
+}
+
+/// Java ImarisHDFReader.get8BitLookupTable(): build a 3x256 ramp LUT for one
+/// channel from its 0..1 colour, where `lut[c][p] = (p/255)*(color[c]*255)`.
+/// Returned as a [`LookupTable`] with the 8-bit ramp widened into u16 slots
+/// (the crate's LUT element type), preserving the 0..255 ramp values.
+fn imaris_8bit_lookup_table(color: [f64; 3]) -> LookupTable {
+    let ramp = |component: f64| -> Vec<u16> {
+        let max = component * 255.0;
+        (0..256)
+            .map(|p| (((p as f64) / 255.0) * max) as u8 as u16)
+            .collect()
+    };
+    LookupTable {
+        red: ramp(color[0]),
+        green: ramp(color[1]),
+        blue: ramp(color[2]),
+    }
+}
+
+/// Java ImarisHDFReader.get16BitLookupTable(): build a 3x65536 ramp LUT for one
+/// channel from its 0..1 colour, where `lut[c][p] = (p/65535)*(color[c]*65535)`.
+fn imaris_16bit_lookup_table(color: [f64; 3]) -> LookupTable {
+    let ramp = |component: f64| -> Vec<u16> {
+        let max = component * 65535.0;
+        (0..65536)
+            .map(|p| (((p as f64) / 65535.0) * max) as u16)
+            .collect()
+    };
+    LookupTable {
+        red: ramp(color[0]),
+        green: ramp(color[1]),
+        blue: ramp(color[2]),
+    }
 }
 
 fn parse_imaris_f64(value: &str) -> Option<f64> {
@@ -2352,6 +2476,7 @@ fn imaris_ome_instrument(instrument: &ImarisInstrumentMetadata) -> Option<OmeIns
             manufacturer: instrument.light_source_manufacturer.clone(),
             light_source_type: instrument.light_source_type.clone(),
             power: instrument.light_source_power,
+            wavelength: None,
         });
     }
 
@@ -2373,6 +2498,43 @@ fn join_u64s(values: &[u64]) -> String {
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Group the flat per-ResolutionLevel metadata into series, mirroring
+/// ImarisHDFReader.initFile() lines ~287-311.
+///
+/// Java only runs the loop when `seriesCount > 1` (i.e. there is more than one
+/// ResolutionLevel). Level 0 always seeds series 0 (`core.get(0,0)` / `ms0`).
+/// For each subsequent level `i`, Java compares its sizeZ/sizeC/sizeT against
+/// `ms0` (level 0, always). On a match it appends the level as a resolution of
+/// the *current* series (`core.add(currentSeries, ms)`); on a mismatch it opens
+/// a fresh series (`core.add(ms); currentSeries++`). The returned outer Vec is
+/// the series list; each inner Vec holds that series' absolute Imaris levels,
+/// finest first.
+fn imaris_group_series(resolutions: &[ImageMetadata]) -> Vec<Vec<usize>> {
+    if resolutions.is_empty() {
+        return Vec::new();
+    }
+    // Series 0 is seeded by level 0 (ms0), independent of how many levels exist.
+    let mut series: Vec<Vec<usize>> = vec![vec![0]];
+    if resolutions.len() <= 1 {
+        return series;
+    }
+    let ms0 = &resolutions[0];
+    let mut current_series = 0usize;
+    for (level, ms) in resolutions.iter().enumerate().skip(1) {
+        if ms.size_z == ms0.size_z && ms.size_c == ms0.size_c && ms.size_t == ms0.size_t {
+            // core.add(currentSeries, ms): append as a resolution of the
+            // current series.
+            series[current_series].push(level);
+        } else {
+            // core.add(ms); currentSeries++: this mismatched level becomes the
+            // sole resolution of a brand-new series.
+            series.push(vec![level]);
+            current_series += 1;
+        }
+    }
+    series
 }
 
 fn checked_image_count(size_z: u32, size_c: u32, size_t: u32, label: &str) -> Result<u32> {
@@ -2545,9 +2707,24 @@ impl FormatReader for ImarisReader {
         let parsed = parse_ims(path)?;
         let file = hdf5_pure_rust::File::open(path)
             .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
-        self.resolutions = parsed.resolutions;
+        let mut resolutions = parsed.resolutions;
+        // Build the Java series grouping, then fix up each level's reported
+        // resolution_count to its series' resolution count (Java's per-series
+        // core.size(series)) rather than the global ResolutionLevel total.
+        let series = imaris_group_series(&resolutions);
+        for group in &series {
+            let count = group.len() as u32;
+            for &level in group {
+                if let Some(meta) = resolutions.get_mut(level) {
+                    meta.resolution_count = count;
+                }
+            }
+        }
+        self.resolutions = resolutions;
+        self.series = series;
         self.file = Some(file);
         self.path = Some(path.to_path_buf());
+        self.current_series = 0;
         self.current_resolution = 0;
         self.bytes_per_sample = parsed.bytes_per_sample;
         self.extents = parsed.extents;
@@ -2555,6 +2732,7 @@ impl FormatReader for ImarisReader {
         self.image_description = parsed.image_description;
         self.channel_names = parsed.channel_names;
         self.channel_colors = parsed.channel_colors;
+        self.channel_colors_normalized = parsed.channel_colors_normalized;
         self.channel_emission_wavelengths = parsed.channel_emission_wavelengths;
         self.channel_excitation_wavelengths = parsed.channel_excitation_wavelengths;
         self.instrument = parsed.instrument;
@@ -2565,12 +2743,15 @@ impl FormatReader for ImarisReader {
         self.path = None;
         self.file = None;
         self.resolutions.clear();
+        self.series.clear();
+        self.current_series = 0;
         self.current_resolution = 0;
         self.extents = None;
         self.recording_spacing = [None; 3];
         self.image_description = None;
         self.channel_names.clear();
         self.channel_colors.clear();
+        self.channel_colors_normalized.clear();
         self.channel_emission_wavelengths.clear();
         self.channel_excitation_wavelengths.clear();
         self.instrument = ImarisInstrumentMetadata::default();
@@ -2579,37 +2760,47 @@ impl FormatReader for ImarisReader {
     }
 
     fn series_count(&self) -> usize {
-        usize::from(!self.resolutions.is_empty())
+        self.series.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.resolutions.is_empty() {
+        if self.series.is_empty() {
             return Err(BioFormatsError::NotInitialized);
         }
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
+        if s >= self.series.len() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
         }
+        self.current_series = s;
+        // Java setSeries resets the active resolution to the finest level.
+        self.current_resolution = 0;
+        Ok(())
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.resolutions
-            .get(self.current_resolution)
+        self.current_imaris_level()
+            .and_then(|level| self.resolutions.get(level))
             .or_else(|| self.resolutions.first())
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn resolution_count(&self) -> usize {
-        self.resolutions.len()
+        self.series
+            .get(self.current_series)
+            .map(Vec::len)
+            .unwrap_or(0)
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        if level >= self.resolutions.len() {
+        let count = self
+            .series
+            .get(self.current_series)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if level >= count {
             return Err(BioFormatsError::Format(format!(
                 "resolution {level} out of range"
             )));
@@ -2618,8 +2809,47 @@ impl FormatReader for ImarisReader {
         Ok(())
     }
 
+    /// Java ImarisHDFReader.get8BitLookupTable()/get16BitLookupTable(): return
+    /// the ramp LUT for the plane's channel. openBytes() sets `lastChannel =
+    /// getZCTCoords(no)[1]` before reading, and the LUT getters key off
+    /// `lastChannel`. We fold that into this accessor: decode the channel from
+    /// `plane_index` (XYZCT) and build that channel's ramp.
+    ///
+    /// Mirrors Java's guards exactly: only UINT8/UINT16 indexed data yields a
+    /// table; otherwise (or if the channel has no colour) return None.
+    fn lookup_table(&mut self, plane_index: u32) -> Result<Option<LookupTable>> {
+        let level = match self.current_imaris_level() {
+            Some(level) => level,
+            None => return Ok(None),
+        };
+        let Some(meta) = self.resolutions.get(level) else {
+            return Ok(None);
+        };
+        // get8/16BitLookupTable bail unless the data is indexed and UINT8/UINT16.
+        if !meta.is_indexed {
+            return Ok(None);
+        }
+        // Decode the channel (lastChannel = getZCTCoords(no)[1]) for XYZCT order.
+        let sz = meta.size_z.max(1) as usize;
+        let sc = meta.size_c.max(1) as usize;
+        let c = (plane_index as usize / sz) % sc;
+        // Java: `if (lastChannel < 0 || lastChannel >= colors.size() ...)` → null.
+        // colors.get(lastChannel) being null also yields null (16-bit path).
+        let color = match self.channel_colors_normalized.get(c).copied().flatten() {
+            Some(color) => color,
+            None => return Ok(None),
+        };
+        Ok(match meta.pixel_type {
+            PixelType::Uint8 => Some(imaris_8bit_lookup_table(color)),
+            PixelType::Uint16 => Some(imaris_16bit_lookup_table(color)),
+            _ => None,
+        })
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let res = self.current_resolution;
+        let res = self
+            .current_imaris_level()
+            .ok_or(BioFormatsError::NotInitialized)?;
         let meta = self
             .resolutions
             .get(res)
@@ -2709,7 +2939,9 @@ impl FormatReader for ImarisReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let res = self.current_resolution;
+        let res = self
+            .current_imaris_level()
+            .ok_or(BioFormatsError::NotInitialized)?;
         let meta = self
             .resolutions
             .get(res)
@@ -2797,9 +3029,12 @@ impl FormatReader for ImarisReader {
             }
         }
         // Fall back to center crop of plane 0
+        let level = self
+            .current_imaris_level()
+            .ok_or(BioFormatsError::NotInitialized)?;
         let meta = self
             .resolutions
-            .get(self.current_resolution)
+            .get(level)
             .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
@@ -2809,7 +3044,8 @@ impl FormatReader for ImarisReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        let meta = self.resolutions.get(self.current_resolution)?;
+        let level = self.current_imaris_level()?;
+        let meta = self.resolutions.get(level)?;
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
         if let Some(instrument) = imaris_ome_instrument(&self.instrument) {
             ome.instruments.push(instrument);
@@ -2824,9 +3060,11 @@ impl FormatReader for ImarisReader {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                // Java sets store.setImageName(name + " Resolution Level " +
+                // (s + 1), s) per series s (initFile ~361-363).
                 img.name = Some(format!(
                     "{base} Resolution Level {}",
-                    self.current_resolution + 1
+                    self.current_series + 1
                 ));
             }
             img.description = self.image_description.clone();

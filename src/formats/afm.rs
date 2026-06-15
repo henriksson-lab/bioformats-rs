@@ -25,6 +25,15 @@ pub struct TopoMetrixReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
+    /// OME `Image/Description` — the header comment (Java L203).
+    comment: Option<String>,
+    /// OME `Image/AcquisitionDate`, ISO-8601, or `None` when the raw header
+    /// date did not match either expected pattern (Java L185-189).
+    acquisition_date: Option<String>,
+    /// OME `PhysicalSizeX` in micrometres: `xSize / sizeX` (Java L192-199).
+    physical_size_x: Option<f64>,
+    /// OME `PhysicalSizeY` in micrometres: `ySize / sizeY` (Java L194-201).
+    physical_size_y: Option<f64>,
 }
 
 impl TopoMetrixReader {
@@ -33,6 +42,10 @@ impl TopoMetrixReader {
             path: None,
             meta: None,
             data_offset: 0,
+            comment: None,
+            acquisition_date: None,
+            physical_size_x: None,
+            physical_size_y: None,
         }
     }
 }
@@ -74,6 +87,99 @@ fn java_trim(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
+/// Read a little-endian `f32` from `data` at `*pos`, advancing `*pos` by 4.
+/// Mirrors `RandomAccessInputStream.readFloat()`; errors past EOF where Java
+/// would raise an `IOException`.
+fn read_le_float(data: &[u8], pos: &mut usize) -> Result<f32> {
+    let end = *pos + 4;
+    if end > data.len() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TopoMetrix header truncated reading a float field".into(),
+        ));
+    }
+    let bytes = [data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]];
+    *pos = end;
+    Ok(f32::from_le_bytes(bytes))
+}
+
+/// Read a little-endian `f64` from `data` at `*pos`, advancing `*pos` by 8.
+/// Mirrors `RandomAccessInputStream.readDouble()`; errors past EOF where Java
+/// would raise an `IOException`.
+fn read_le_double(data: &[u8], pos: &mut usize) -> Result<f64> {
+    let end = *pos + 8;
+    if end > data.len() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TopoMetrix header truncated reading a double field".into(),
+        ));
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&data[*pos..end]);
+    *pos = end;
+    Ok(f64::from_le_bytes(bytes))
+}
+
+/// Port of `FormatTools.getPhysicalSize(value, MICROMETER)` for the common
+/// case: a value of `0` (or non-finite) yields `None`; otherwise the value is
+/// kept as micrometres (Java L192-195 wrap this around `xSize / sizeX`).
+fn get_physical_size(value: f64) -> Option<f64> {
+    if value != 0.0 && value.is_finite() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Port of `DateTools.formatDate(date, ["MM/dd/yy HH:mm:ss",
+/// "MM/dd/yyyy HH:mm:ss"])` (Java L185-186): produce an ISO-8601 timestamp, or
+/// `None` when the raw string matches neither pattern.
+fn format_topometrix_date(date: &str) -> Option<String> {
+    let date = date.trim();
+    let (d, t) = date.split_once(' ')?;
+    let date_parts: Vec<&str> = d.split('/').collect();
+    if date_parts.len() != 3 {
+        return None;
+    }
+    let month: u32 = date_parts[0].parse().ok()?;
+    let day: u32 = date_parts[1].parse().ok()?;
+    // Accept both 2-digit ("MM/dd/yy") and 4-digit ("MM/dd/yyyy") years.
+    let year_raw = date_parts[2];
+    let year: i32 = match year_raw.len() {
+        // Java SimpleDateFormat "yy" maps a 2-digit year into the 80-year window
+        // centred on the current date; for these legacy STM files that resolves
+        // to the 2000s. We follow the common 2000-offset interpretation.
+        2 => 2000 + year_raw.parse::<i32>().ok()?,
+        4 => year_raw.parse::<i32>().ok()?,
+        _ => return None,
+    };
+    let time_parts: Vec<&str> = t.split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let minute: u32 = time_parts[1].parse().ok()?;
+    let second: u32 = time_parts[2].parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
+    ))
+}
+
+struct TopoMetrixHeader {
+    meta: ImageMetadata,
+    pixel_offset: u64,
+    comment: Option<String>,
+    acquisition_date: Option<String>,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+}
+
 /// Parse the binary TopoMetrix header, faithfully ported from the Java
 /// `TopometrixReader.initFile` (java-bioformats .../in/TopometrixReader.java,
 /// lines 100-205).
@@ -95,8 +201,9 @@ fn java_trim(bytes: &[u8]) -> &[u8] {
 ///   sizeX = readShort (2 bytes)                              (Java L126)
 ///   skip 2 bytes                                             (Java L127)
 ///   sizeY = readShort (2 bytes)                              (Java L129)
+///   metadata block: scaling fields, version-dependent layout (Java L130-173)
 ///   pixelType = UINT16, pixels read from `pixelOffset`.      (Java L175, L84)
-fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
+fn parse_topometrix(path: &Path) -> Result<TopoMetrixHeader> {
     let content = std::fs::read(path).map_err(BioFormatsError::Io)?;
 
     // Need at least through the version/pixelOffset ASCII fields.
@@ -181,6 +288,7 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
     }
     let size_x = i16::from_le_bytes([content[pos], content[pos + 1]]);
     let size_y = i16::from_le_bytes([content[pos + 4], content[pos + 5]]);
+    pos += 6; // sizeX (2) + skip (2) + sizeY (2), matching the Java reads.
 
     // Java does not validate the dimensions, but a non-positive size cannot
     // describe a real plane; reject it rather than producing a zero/garbage
@@ -192,6 +300,80 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
     }
     let width = size_x as u32;
     let height = size_y as u32;
+
+    // Metadata-level block (Java L130-204). We always run it (the Rust readers
+    // do not expose a MINIMUM metadata level); this reads the scaling fields
+    // with a version-dependent layout and populates the global metadata table.
+    // Java pre-initialises these to 0 (L130-131); every branch below overwrites
+    // them, so we bind them per branch instead.
+    let x_size: f64;
+    let y_size: f64;
+    let adc: f64;
+    let dac_to_world_zero: f64;
+    let mut metadata_block: Vec<(String, MetadataValue)> = Vec::new();
+
+    // skipBytes(10) (Java L134).
+    pos += 10;
+    if version == 5 {
+        // skipBytes(4) (Java L136).
+        pos += 4;
+        x_size = read_le_double(&content, &mut pos)?;
+        // skipBytes(8) (Java L138).
+        pos += 8;
+        y_size = read_le_double(&content, &mut pos)?;
+        adc = read_le_double(&content, &mut pos)?;
+        dac_to_world_zero = read_le_double(&content, &mut pos)?;
+
+        // skipBytes(1176) (Java L143).
+        pos += 1176;
+
+        let sample_volts = read_le_double(&content, &mut pos)?;
+        let tunnel_current = read_le_double(&content, &mut pos)?;
+        // skipBytes(16) (Java L147).
+        pos += 16;
+        let time_per_pixel = read_le_double(&content, &mut pos)?;
+        // skipBytes(40) (Java L149).
+        pos += 40;
+        let scan_angle = read_le_double(&content, &mut pos)?;
+
+        metadata_block.push(("Sample volts".into(), MetadataValue::Float(sample_volts)));
+        metadata_block.push(("Tunnel current".into(), MetadataValue::Float(tunnel_current)));
+        metadata_block.push(("Scan rate".into(), MetadataValue::Float(time_per_pixel)));
+        metadata_block.push(("Scan angle".into(), MetadataValue::Float(scan_angle)));
+    } else {
+        x_size = read_le_float(&content, &mut pos)? as f64;
+        // skipBytes(4) (Java L159).
+        pos += 4;
+        y_size = read_le_float(&content, &mut pos)? as f64;
+        adc = read_le_float(&content, &mut pos)? as f64;
+        // skipBytes(764) (Java L162).
+        pos += 764;
+        dac_to_world_zero = read_le_float(&content, &mut pos)? as f64;
+    }
+
+    metadata_block.push(("Version".into(), MetadataValue::Int(version as i64)));
+    metadata_block.push(("X size (in um)".into(), MetadataValue::Float(x_size)));
+    metadata_block.push(("Y size (in um)".into(), MetadataValue::Float(y_size)));
+    metadata_block.push(("ADC".into(), MetadataValue::Float(adc)));
+    metadata_block.push((
+        "DAC to world zero".into(),
+        MetadataValue::Float(dac_to_world_zero),
+    ));
+    metadata_block.push(("Comment".into(), MetadataValue::String(comment.clone())));
+    metadata_block.push(("Acquisition date".into(), MetadataValue::String(date.clone())));
+
+    // Physical sizes: xSize/sizeX and ySize/sizeY in micrometres (Java L192-201),
+    // filtered through FormatTools.getPhysicalSize (rejects value == 0).
+    let physical_size_x = get_physical_size(x_size / width as f64);
+    let physical_size_y = get_physical_size(y_size / height as f64);
+
+    // Acquisition date parsed via DateTools.formatDate (Java L185-189).
+    let acquisition_date = format_topometrix_date(&date);
+    let description = if comment.is_empty() {
+        None
+    } else {
+        Some(comment.clone())
+    };
 
     // pixelType = UINT16 (Java L175); pixels read from pixelOffset (Java L84).
     let pixel_type = PixelType::Uint16;
@@ -209,13 +391,12 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
         ));
     }
 
+    // Global metadata table, mirroring the Java `addGlobalMeta` calls
+    // (Java L152-172). Later inserts win, matching Java's LinkedHashMap
+    // overwrite semantics for duplicate keys.
     let mut series_metadata = HashMap::new();
-    series_metadata.insert("Version".to_string(), MetadataValue::Int(version as i64));
-    if !comment.is_empty() {
-        series_metadata.insert("Comment".to_string(), MetadataValue::String(comment));
-    }
-    if !date.is_empty() {
-        series_metadata.insert("Acquisition date".to_string(), MetadataValue::String(date));
+    for (k, v) in metadata_block {
+        series_metadata.insert(k, v);
     }
 
     let meta = ImageMetadata {
@@ -240,7 +421,14 @@ fn parse_topometrix(path: &Path) -> Result<(ImageMetadata, u64)> {
         modulo_t: None,
     };
 
-    Ok((meta, pixel_offset))
+    Ok(TopoMetrixHeader {
+        meta,
+        pixel_offset,
+        comment: description,
+        acquisition_date,
+        physical_size_x,
+        physical_size_y,
+    })
 }
 
 fn kv_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -277,10 +465,14 @@ impl FormatReader for TopoMetrixReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let (meta, data_offset) = parse_topometrix(path)?;
+        let header = parse_topometrix(path)?;
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
-        self.data_offset = data_offset;
+        self.meta = Some(header.meta);
+        self.data_offset = header.pixel_offset;
+        self.comment = header.comment;
+        self.acquisition_date = header.acquisition_date;
+        self.physical_size_x = header.physical_size_x;
+        self.physical_size_y = header.physical_size_y;
         Ok(())
     }
 
@@ -288,7 +480,29 @@ impl FormatReader for TopoMetrixReader {
         self.path = None;
         self.meta = None;
         self.data_offset = 0;
+        self.comment = None;
+        self.acquisition_date = None;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
         Ok(())
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::OmeMetadata;
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        let img = ome.images.get_mut(0)?;
+        // Java sets ImageDescription = comment (L203), AcquisitionDate (L185-189)
+        // and PhysicalSizeX/Y in micrometres (L197-202).
+        if let Some(comment) = &self.comment {
+            img.description = Some(comment.clone());
+        }
+        if let Some(date) = &self.acquisition_date {
+            img.acquisition_date = Some(date.clone());
+        }
+        img.physical_size_x = self.physical_size_x;
+        img.physical_size_y = self.physical_size_y;
+        Some(ome)
     }
 
     fn series_count(&self) -> usize {
@@ -682,9 +896,19 @@ mod tests {
     ///   [406..408)  sizeX (i16 LE)
     ///   [408..410)  skipped
     ///   [410..412)  sizeY (i16 LE)
+    ///   metadata block (skip 10, xSize/skip/ySize/adc floats, skip 764, dac)
     ///   [pixel_offset..)  width*height UINT16 LE pixels
     fn build_fixture(size_x: i16, size_y: i16, pixel_offset: u32, pixels: &[u16]) -> Vec<u8> {
-        let header_len = 412usize;
+        // dims at 406; metadata block runs:
+        //   406+6 = 412 (after sizeX/skip/sizeY)
+        //   +10 skip            -> 422
+        //   +4 xSize float      -> 426
+        //   +4 skip             -> 430
+        //   +4 ySize float      -> 434
+        //   +4 adc float        -> 438
+        //   +764 skip           -> 1202
+        //   +4 dacToWorldZero   -> 1206
+        let header_len = 1206usize;
         let plane_bytes = (size_x as usize) * (size_y as usize) * 2;
         let total = (pixel_offset as usize + plane_bytes).max(header_len);
         let mut buf = vec![0u8; total];
@@ -699,11 +923,15 @@ mod tests {
         // date line at offset 14, terminated by '\n'.
         let date = b"05/29/26 12:00:00\n";
         buf[14..14 + date.len()].copy_from_slice(date);
-        // Comment region [32..254) left as NUL padding (trims to empty).
+        // Comment region left as NUL padding (trims to empty).
 
         // sizeX / sizeY in the dims block.
         buf[406..408].copy_from_slice(&size_x.to_le_bytes());
         buf[410..412].copy_from_slice(&size_y.to_le_bytes());
+
+        // metadata block: xSize at 422, ySize at 430, adc at 434.
+        buf[422..426].copy_from_slice(&10.0f32.to_le_bytes());
+        buf[430..434].copy_from_slice(&20.0f32.to_le_bytes());
 
         // pixel data
         let mut p = pixel_offset as usize;
@@ -725,9 +953,9 @@ mod tests {
 
     #[test]
     fn topometrix_reads_binary_fixture() {
-        // 2x2 plane = 4 UINT16 pixels, placed right after the 412-byte header.
+        // 2x2 plane = 4 UINT16 pixels, placed after the metadata block.
         let pixels: [u16; 4] = [0x0102, 0x0304, 0x0506, 0x0708];
-        let bytes = build_fixture(2, 2, 412, &pixels);
+        let bytes = build_fixture(2, 2, 1206, &pixels);
         let path = write_temp("ok", &bytes);
 
         let mut reader = TopoMetrixReader::new();
@@ -743,12 +971,33 @@ mod tests {
         assert_eq!(meta.image_count, 1);
         assert!(meta.is_little_endian);
 
+        // Metadata table fields ported from Java's addGlobalMeta calls.
+        // MetadataValue has no PartialEq, so match the variant payload directly.
+        assert!(
+            matches!(meta.series_metadata.get("Version"), Some(MetadataValue::Int(1)))
+        );
+        assert!(
+            matches!(meta.series_metadata.get("X size (in um)"), Some(MetadataValue::Float(v)) if *v == 10.0)
+        );
+        assert!(
+            matches!(meta.series_metadata.get("Y size (in um)"), Some(MetadataValue::Float(v)) if *v == 20.0)
+        );
+        assert!(meta.series_metadata.contains_key("ADC"));
+        assert!(meta.series_metadata.contains_key("DAC to world zero"));
+
+        // OME metadata: physical sizes (xSize/sizeX, ySize/sizeY) + date.
+        let ome = reader.ome_metadata().unwrap();
+        let img = &ome.images[0];
+        assert_eq!(img.physical_size_x, Some(5.0)); // 10 / 2
+        assert_eq!(img.physical_size_y, Some(10.0)); // 20 / 2
+        assert_eq!(img.acquisition_date.as_deref(), Some("2026-05-29T12:00:00"));
+
         let plane = reader.open_bytes(0).unwrap();
         let expected: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
         assert_eq!(plane, expected);
 
         // Sanity-check the recorded pixel offset.
-        assert_eq!(reader.data_offset, 412);
+        assert_eq!(reader.data_offset, 1206);
 
         std::fs::remove_file(&path).ok();
     }
@@ -756,7 +1005,7 @@ mod tests {
     #[test]
     fn topometrix_rejects_truncated_pixels() {
         // Declare a 4x4 plane (32 bytes) but only provide pixels for part of it.
-        let mut bytes = build_fixture(2, 2, 412, &[1, 2, 3, 4]);
+        let mut bytes = build_fixture(2, 2, 1206, &[1, 2, 3, 4]);
         // Rewrite the declared dimensions to 4x4 without enlarging the payload.
         bytes[406..408].copy_from_slice(&4i16.to_le_bytes());
         bytes[410..412].copy_from_slice(&4i16.to_le_bytes());
@@ -775,6 +1024,20 @@ mod tests {
         let mut reader = TopoMetrixReader::new();
         assert!(reader.set_id(&path).is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn topometrix_date_parsing() {
+        assert_eq!(
+            format_topometrix_date("05/29/26 12:00:00"),
+            Some("2026-05-29T12:00:00".to_string())
+        );
+        assert_eq!(
+            format_topometrix_date("12/31/2015 08:09:10"),
+            Some("2015-12-31T08:09:10".to_string())
+        );
+        assert_eq!(format_topometrix_date("garbage"), None);
+        assert_eq!(format_topometrix_date(""), None);
     }
 
     #[test]
