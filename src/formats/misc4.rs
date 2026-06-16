@@ -862,6 +862,7 @@ impl FormatReader for ArfReader {
             is_indexed: false,
             is_little_endian: little,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
@@ -1101,6 +1102,7 @@ impl FormatReader for I2iReader {
             is_indexed: false,
             is_little_endian: little_endian,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
@@ -1506,6 +1508,7 @@ impl FormatReader for JdceReader {
                     is_indexed: false,
                     is_little_endian: little_endian,
                     resolution_count: 1,
+                    thumbnail: false,
                     series_metadata: HashMap::new(),
                     lookup_table: None,
                     modulo_z: None,
@@ -2257,6 +2260,7 @@ impl FormatReader for PciReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: None,
@@ -2620,6 +2624,7 @@ impl FormatReader for PdsReader {
             is_indexed,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
@@ -3031,6 +3036,7 @@ impl FormatReader for HisReader {
                 is_indexed: false,
                 is_little_endian: true,
                 resolution_count: 1,
+                thumbnail: false,
                 series_metadata,
                 lookup_table: None,
                 modulo_z: None,
@@ -5527,6 +5533,7 @@ impl ObfReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z,
@@ -6005,5 +6012,454 @@ mod pci_tests {
             Some(MetadataValue::String(s)) if s == "0.5; um"
         ));
         assert!(meta.contains_key("magnification"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Molecular Imaging STP
+// ---------------------------------------------------------------------------
+/// Molecular Imaging reader (`.stp`).
+///
+/// Faithful port of Bio-Formats `loci.formats.in.MolecularImagingReader`.
+/// STP files begin with a 16-byte block containing the `UK SOFT` magic string
+/// (at an offset > 0). The header is an ASCII key/value section terminated by
+/// the literal `Data_section  \r\n` marker; UINT16 little-endian pixel data
+/// follows immediately. Header keys `samples_x`/`samples_y` give the plane
+/// dimensions; each `buffer_id` line adds one Z slice (one image). `Date` +
+/// `time`, `length_x`/`length_y` populate the acquisition date and physical
+/// pixel sizes.
+pub struct MolecularImagingReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    pixel_offset: u64,
+}
+
+/// Marker (Java `MAGIC_STRING`).
+const MOLECULAR_IMAGING_MAGIC: &str = "UK SOFT";
+/// Java `DATE_FORMAT = "dd.MM.yyyy HH:mm:ss"`.
+const MOLECULAR_IMAGING_DATE_MARKER: &str = "Data_section  \r\n";
+
+impl MolecularImagingReader {
+    pub fn new() -> Self {
+        MolecularImagingReader {
+            path: None,
+            meta: None,
+            pixel_offset: 0,
+        }
+    }
+
+    /// Port of `DateTools.formatDate(date, "dd.MM.yyyy HH:mm:ss")`: combines the
+    /// `Date` and `time` header values ("dd.MM.yyyy" + " " + "HH:mm:ss") into an
+    /// ISO-8601 timestamp, or `None` when the string does not match the pattern.
+    fn format_date(date: &str) -> Option<String> {
+        let date = date.trim();
+        let (d, t) = date.split_once(' ')?;
+        let date_parts: Vec<&str> = d.split('.').collect();
+        if date_parts.len() != 3 {
+            return None;
+        }
+        let day: u32 = date_parts[0].parse().ok()?;
+        let month: u32 = date_parts[1].parse().ok()?;
+        let year: i32 = date_parts[2].parse().ok()?;
+        let time_parts: Vec<&str> = t.split(':').collect();
+        if time_parts.len() != 3 {
+            return None;
+        }
+        let hour: u32 = time_parts[0].parse().ok()?;
+        let minute: u32 = time_parts[1].parse().ok()?;
+        let second: u32 = time_parts[2].parse().ok()?;
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 59
+        {
+            return None;
+        }
+        Some(format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
+        ))
+    }
+}
+
+impl Default for MolecularImagingReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for MolecularImagingReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("stp"))
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Java: readString(16).indexOf("UK SOFT") > 0 — the magic must occur
+        // within the first 16 bytes at an offset strictly greater than 0.
+        const BLOCK_LEN: usize = 16;
+        if header.len() < BLOCK_LEN {
+            return false;
+        }
+        let block = String::from_utf8_lossy(&header[..BLOCK_LEN]);
+        match block.find(MOLECULAR_IMAGING_MAGIC) {
+            Some(idx) => idx > 0,
+            None => false,
+        }
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.pixel_offset = 0;
+
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+
+        // findString("Data_section  \r\n"): read forward from the start until the
+        // marker is found; `data` is everything up to and including the marker,
+        // and the file pointer lands immediately after it (= pixelOffset).
+        let mut data = Vec::new();
+        let marker = MOLECULAR_IMAGING_DATE_MARKER.as_bytes();
+        let mut byte = [0u8; 1];
+        loop {
+            match f.read(&mut byte).map_err(BioFormatsError::Io)? {
+                0 => {
+                    return Err(BioFormatsError::UnsupportedFormat(
+                        "Molecular Imaging: missing Data_section marker".to_string(),
+                    ));
+                }
+                _ => {
+                    data.push(byte[0]);
+                    if data.len() >= marker.len() && data.ends_with(marker) {
+                        break;
+                    }
+                }
+            }
+        }
+        let pixel_offset = f.stream_position().map_err(BioFormatsError::Io)?;
+
+        let mut size_x: u32 = 0;
+        let mut size_y: u32 = 0;
+        let mut size_z: u32 = 0;
+        let mut date: Option<String> = None;
+        let mut pixel_size_x: f64 = 0.0;
+        let mut pixel_size_y: f64 = 0.0;
+        let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
+
+        let data = String::from_utf8_lossy(&data);
+        for line in data.split('\n') {
+            let line = line.trim();
+            if let Some(space) = line.find(' ') {
+                let key = line[..space].trim();
+                let value = line[space + 1..].trim();
+                series_metadata.insert(key.to_string(), MetadataValue::String(value.to_string()));
+
+                match key {
+                    "samples_x" => {
+                        size_x = value.parse().map_err(|_| {
+                            BioFormatsError::Format("Molecular Imaging: invalid samples_x".into())
+                        })?;
+                    }
+                    "samples_y" => {
+                        size_y = value.parse().map_err(|_| {
+                            BioFormatsError::Format("Molecular Imaging: invalid samples_y".into())
+                        })?;
+                    }
+                    "buffer_id" => {
+                        size_z += 1;
+                    }
+                    "Date" => {
+                        date = Some(value.to_string());
+                    }
+                    "time" => {
+                        date = date.map(|d| format!("{d} {value}"));
+                    }
+                    "length_x" => {
+                        let length: f64 = value.parse().map_err(|_| {
+                            BioFormatsError::Format("Molecular Imaging: invalid length_x".into())
+                        })?;
+                        if size_x != 0 {
+                            pixel_size_x = length / size_x as f64;
+                        }
+                    }
+                    "length_y" => {
+                        let length: f64 = value.parse().map_err(|_| {
+                            BioFormatsError::Format("Molecular Imaging: invalid length_y".into())
+                        })?;
+                        if size_y != 0 {
+                            pixel_size_y = length / size_y as f64;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if size_x == 0 || size_y == 0 || size_z == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Molecular Imaging: header declares no images or zero dimensions".to_string(),
+            ));
+        }
+
+        // Java stores acquisition date and physical pixel sizes into the OME
+        // MetadataStore; capture them as named global metadata.
+        if let Some(raw) = &date {
+            if let Some(iso) = Self::format_date(raw) {
+                series_metadata
+                    .insert("Acquisition Date".to_string(), MetadataValue::String(iso));
+            }
+        }
+        if pixel_size_x > 0.0 {
+            series_metadata.insert(
+                "PhysicalSizeX".to_string(),
+                MetadataValue::Float(pixel_size_x),
+            );
+        }
+        if pixel_size_y > 0.0 {
+            series_metadata.insert(
+                "PhysicalSizeY".to_string(),
+                MetadataValue::Float(pixel_size_y),
+            );
+        }
+
+        self.path = Some(path.to_path_buf());
+        self.pixel_offset = pixel_offset;
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count: size_z,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            thumbnail: false,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.pixel_offset = 0;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        usize::from(self.meta.is_some())
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let n_bytes = checked_plane_len(meta)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        // Java: in.seek(pixelOffset + no * getPlaneSize()).
+        let offset = self
+            .pixel_offset
+            .checked_add((plane_index as u64).checked_mul(n_bytes as u64).ok_or_else(
+                || BioFormatsError::Format("Molecular Imaging plane offset overflows".into()),
+            )?)
+            .ok_or_else(|| {
+                BioFormatsError::Format("Molecular Imaging plane offset overflows".into())
+            })?;
+        f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; n_bytes];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        Ok(buf)
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_plane(&plane, &meta, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod molecular_imaging_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_path(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("bioformats_mi_{tag}_{nanos}_{n}.stp"))
+    }
+
+    /// Build a synthetic `UK SOFT` STP fixture: a 16-byte magic block, an ASCII
+    /// header terminated by the `Data_section  \r\n` marker, then UINT16 LE
+    /// pixels for `size_z` planes.
+    fn write_fixture(
+        tag: &str,
+        size_x: u32,
+        size_y: u32,
+        buffers: usize,
+        planes: &[Vec<u16>],
+    ) -> PathBuf {
+        let path = unique_path(tag);
+        let mut bytes: Vec<u8> = Vec::new();
+        // 16-byte block with magic at offset > 0 (offset 4 here), then a
+        // newline so the magic line does not merge with the first key/value.
+        bytes.extend_from_slice(b"MI__UK SOFT 1.0X\r\n");
+        let mut header = String::new();
+        header.push_str("Date 13.06.2026\r\n");
+        header.push_str("time 09:41:07\r\n");
+        header.push_str(&format!("samples_x {size_x}\r\n"));
+        header.push_str(&format!("samples_y {size_y}\r\n"));
+        header.push_str("length_x 200\r\n");
+        header.push_str("length_y 100\r\n");
+        for _ in 0..buffers {
+            header.push_str("buffer_id 1\r\n");
+        }
+        header.push_str("Data_section  \r\n");
+        bytes.extend_from_slice(header.as_bytes());
+        for plane in planes {
+            for s in plane {
+                bytes.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn detect_magic_and_name() {
+        let r = MolecularImagingReader::new();
+        assert!(r.is_this_type_by_bytes(b"MI__UK SOFT 1.0X"));
+        // Magic at offset 0 is rejected (Java requires index > 0).
+        assert!(!r.is_this_type_by_bytes(b"UK SOFT_________"));
+        assert!(!r.is_this_type_by_bytes(b"no magic here !!"));
+        assert!(r.is_this_type_by_name(Path::new("/tmp/scan.stp")));
+        assert!(r.is_this_type_by_name(Path::new("/tmp/scan.STP")));
+        assert!(!r.is_this_type_by_name(Path::new("/tmp/scan.tif")));
+    }
+
+    #[test]
+    fn set_id_metadata_and_pixels() {
+        let size_x = 3u32;
+        let size_y = 2u32;
+        let plane0: Vec<u16> = vec![10, 20, 30, 40, 50, 60];
+        let plane1: Vec<u16> = vec![11, 21, 31, 41, 51, 61];
+        let path = write_fixture("rw", size_x, size_y, 2, &[plane0.clone(), plane1.clone()]);
+
+        let mut r = MolecularImagingReader::new();
+        r.set_id(&path).unwrap();
+
+        let meta = r.metadata();
+        assert_eq!(meta.size_x, size_x);
+        assert_eq!(meta.size_y, size_y);
+        assert_eq!(meta.size_z, 2); // two buffer_id lines
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert!(meta.is_little_endian);
+        assert!(!meta.is_rgb);
+
+        // Global metadata captured key/value pairs.
+        assert!(matches!(
+            meta.series_metadata.get("samples_x"),
+            Some(MetadataValue::String(s)) if s == "3"
+        ));
+        // Acquisition date: "13.06.2026" + " " + "09:41:07" -> ISO-8601.
+        assert!(matches!(
+            meta.series_metadata.get("Acquisition Date"),
+            Some(MetadataValue::String(s)) if s == "2026-06-13T09:41:07"
+        ));
+        // PhysicalSizeX = length_x / samples_x = 200 / 3.
+        assert!(matches!(
+            meta.series_metadata.get("PhysicalSizeX"),
+            Some(MetadataValue::Float(v)) if (*v - 200.0 / 3.0).abs() < 1e-9
+        ));
+        // PhysicalSizeY = length_y / samples_y = 100 / 2 = 50.
+        assert!(matches!(
+            meta.series_metadata.get("PhysicalSizeY"),
+            Some(MetadataValue::Float(v)) if (*v - 50.0).abs() < 1e-9
+        ));
+
+        // open_bytes round-trips each plane's UINT16 LE payload.
+        let expect = |p: &[u16]| -> Vec<u8> {
+            let mut v = Vec::new();
+            for s in p {
+                v.extend_from_slice(&s.to_le_bytes());
+            }
+            v
+        };
+        assert_eq!(r.open_bytes(0).unwrap(), expect(&plane0));
+        assert_eq!(r.open_bytes(1).unwrap(), expect(&plane1));
+        assert!(matches!(
+            r.open_bytes(2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+
+        // Region crop: top-left 2x1 of plane 0.
+        let region = r.open_bytes_region(0, 0, 0, 2, 1).unwrap();
+        assert_eq!(region, expect(&[10, 20]));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

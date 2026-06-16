@@ -1382,6 +1382,7 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
         is_indexed: false,
         is_little_endian: a.little_endian,
         resolution_count: 1,
+        thumbnail: false,
         series_metadata: a
             .extra
             .iter()

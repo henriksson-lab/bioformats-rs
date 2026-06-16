@@ -815,6 +815,7 @@ impl FormatReader for AviReader {
             is_indexed,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table: if is_indexed { palette } else { None },
             modulo_z: None,

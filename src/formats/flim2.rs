@@ -13672,6 +13672,841 @@ impl FormatReader for SlidebookTiffReader {
     }
 }
 
+// ===========================================================================
+// SPCReader — Becker & Hickl SPC-Image SPC FIFO files
+//
+// Faithful port of
+// java-bioformats/components/formats-gpl/src/loci/formats/in/SPCReader.java
+//
+// The dataset is a pair of similarly named files: one `.spc` (FIFO photon
+// stream) and one `.set` (ASCII setup describing the SPC module and the TAC
+// range/gain that fix the lifetime time base). The `.spc` stream is parsed
+// one 32-bit word at a time; pixel/line/frame clock marker words carry the
+// scan geometry, while photon words accumulate into a per-timebin histogram.
+//
+// This is a 1:1 translation: each Java method has a matching Rust fn, the
+// mutable instance fields of the Java reader become struct fields, and the
+// constants `TAC_RANGE`, `TAC_GAIN` and `adcResShift` are preserved.
+// ===========================================================================
+
+/// Setup file text field strings. (Java: `TAC_RANGE`.)
+const SPC_TAC_RANGE: &str = "SP_TAC_R";
+/// Setup file text field strings. (Java: `TAC_GAIN`.)
+const SPC_TAC_GAIN: &str = "SP_TAC_G";
+
+/// Number of bits by which the ADC value is shifted. There are 12 bits in the
+/// file format so shifting by 6 bits leaves 6 bits of resolution, i.e. 64
+/// timebins. (Java: `adcResShift`.)
+const SPC_ADC_RES_SHIFT: i32 = 6;
+
+/// Becker & Hickl SPC FIFO reader. (Java: `class SPCReader`.)
+pub struct SpcReader {
+    /// List of all files to open. (Java: `allFiles`.)
+    all_files: Vec<PathBuf>,
+
+    /// Number of time bins in lifetime histogram. (Java: `nTimebins`.)
+    n_timebins: i32,
+
+    /// Number of spectral channels. (Java: `nChannels`.)
+    n_channels: i32,
+
+    /// Re-ordered data for all the timebins in one channel at one real-time
+    /// point. (Java: `Tstore` / `tstoreb`.)
+    tstore: Option<Vec<u8>>,
+
+    /// Currently stored channel. (Java: `storedChannel`.)
+    stored_channel: i32,
+
+    /// Currently stored real-time data-cube. (Java: `storedT`.)
+    stored_t: i32,
+
+    /// Current position in image. (Java: `currentPixel`, `currentLine`,
+    /// `currentFrame`.)
+    current_pixel: i32,
+    current_line: i32,
+    current_frame: i32,
+
+    /// Buffer for reading from files. (Java: `bufLength`, `rawBuf`,
+    /// `nBuffers`.)
+    buf_length: i32,
+    raw_buf: Vec<u8>,
+    n_buffers: i32,
+
+    /// Image size. (Java: `nLines`, `nFrames`, `nPixels`.)
+    n_lines: i32,
+    n_frames: i32,
+    n_pixels: i32,
+
+    /// Flag indicating that a frame clock has been detected; true until the
+    /// first line clock in that frame is detected. (Java: `endOfFrameFlag`.)
+    end_of_frame_flag: bool,
+
+    /// Bits per pixel. (Java: `bpp`.)
+    bpp: i32,
+
+    /// Length in bytes of data in a single timebin. (Java: `binSize`.)
+    bin_size: i32,
+
+    /// Requested channel — photons in other channels are ignored.
+    /// (Java: `channel`.)
+    channel: i32,
+
+    /// Position of each frame clock in the `.spc` file. (Java: `frameClockList`.)
+    frame_clock_list: Vec<i32>,
+
+    /// Position of the end of each frame in the `.spc` file.
+    /// (Java: `endOfFrameList`.)
+    end_of_frame_list: Vec<i32>,
+
+    /// Flag to indicate single-line mode. (Java: `lineMode`.)
+    line_mode: bool,
+
+    /// `.spc` file id. (Java: `spcId`.)
+    spc_id: Option<PathBuf>,
+
+    /// Open `.spc` stream. (Java: `in`, after `reopenFile`.)
+    spc_in: Option<File>,
+
+    /// Core metadata for the single series. (Java: `core.get(0)`.)
+    meta: ImageMetadata,
+
+    /// Global metadata table. (Java: `addGlobalMeta`.)
+    global_meta: HashMap<String, MetadataValue>,
+}
+
+impl SpcReader {
+    /// Constructs a new SPC reader. (Java: `SPCReader()`.)
+    pub fn new() -> Self {
+        SpcReader {
+            all_files: Vec::new(),
+            n_timebins: 0,
+            n_channels: 0,
+            tstore: None,
+            stored_channel: -1,
+            stored_t: -1,
+            current_pixel: 0,
+            current_line: -1,
+            current_frame: -1,
+            buf_length: 0,
+            raw_buf: Vec::new(),
+            n_buffers: 0,
+            n_lines: 0,
+            n_frames: 0,
+            n_pixels: 0,
+            end_of_frame_flag: false,
+            bpp: 0,
+            bin_size: 0,
+            channel: 0,
+            frame_clock_list: Vec::new(),
+            end_of_frame_list: Vec::new(),
+            line_mode: false,
+            spc_id: None,
+            spc_in: None,
+            meta: ImageMetadata::default(),
+            global_meta: HashMap::new(),
+        }
+    }
+
+    /// (Java: `getSeriesUsedFiles(boolean)`.)
+    pub fn series_used_files(&self) -> Vec<PathBuf> {
+        self.all_files.clone()
+    }
+
+    /// Re-open the `.spc` stream. (Java: `reopenFile()`.)
+    fn reopen_file(&mut self) -> Result<()> {
+        self.spc_in = None;
+        let id = self
+            .spc_id
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        self.spc_in = Some(File::open(id).map_err(BioFormatsError::Io)?);
+        Ok(())
+    }
+
+    /// Initialise from the dataset. (Java: `initFile(String)`.)
+    fn init_file(&mut self, id: &Path) -> Result<()> {
+        self.all_files = Vec::new();
+
+        // Resolve the working directory and locate the matching .set/.spc pair.
+        let tmp_file = std::fs::canonicalize(id).unwrap_or_else(|_| id.to_path_buf());
+        let working_dir = tmp_file
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let name = tmp_file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| BioFormatsError::Format("SPC: invalid file name".into()))?
+            .to_owned();
+
+        // generate the name of the two matching files
+        let mut set_name: Option<PathBuf> = None;
+        let mut spc_name: Option<PathBuf> = None;
+        if let Some(pos) = name.rfind('.') {
+            let base = &name[..pos];
+            let want_set = format!("{base}.set");
+            let want_spc = format!("{base}.spc");
+            if let Ok(entries) = std::fs::read_dir(&working_dir) {
+                for entry in entries.flatten() {
+                    if let Some(l) = entry.file_name().to_str() {
+                        if l.eq_ignore_ascii_case(&want_set) {
+                            set_name = Some(working_dir.join(l));
+                        }
+                        if l.eq_ignore_ascii_case(&want_spc) {
+                            spc_name = Some(working_dir.join(l));
+                        }
+                    }
+                }
+            }
+        }
+
+        let set_name = set_name
+            .ok_or_else(|| BioFormatsError::Format("Failed to find a matching .set file!".into()))?;
+        let spc_name = spc_name
+            .ok_or_else(|| BioFormatsError::Format("Failed to find a matching .spc file!".into()))?;
+
+        self.frame_clock_list = Vec::new();
+        self.end_of_frame_list = Vec::new();
+
+        self.all_files.push(set_name.clone());
+        self.all_files.push(spc_name.clone());
+
+        // ---- Read info from .set file ----
+        let mut set_file = File::open(&set_name).map_err(BioFormatsError::Io)?;
+
+        spc_skip(&mut set_file, 8)?;
+
+        let setuppos = spc_read_i32_le(&mut set_file)?;
+        let setupcount = spc_read_i16_le(&mut set_file)?;
+        let mut module = String::new();
+
+        // Arbitrary length established by trial and error
+        if let Ok(header) = spc_read_string(&mut set_file, 600) {
+            if let Some(index) = header.find("module SPC-") {
+                // Java: header.substring(index + 7, index + 14)
+                let start = index + 7;
+                let end = index + 14;
+                if end <= header.len() {
+                    module = header[start..end].to_owned();
+                }
+            }
+        }
+
+        if !module.eq_ignore_ascii_case("SPC-134")
+            && !module.eq_ignore_ascii_case("SPC-144")
+            && !module.eq_ignore_ascii_case("SPC-154")
+            && !module.eq_ignore_ascii_case("SPC-830")
+        {
+            return Err(BioFormatsError::Format(
+                "Failed to find a matching .set file!".into(),
+            ));
+        }
+
+        // goto start of setup information
+        spc_seek(&mut set_file, setuppos as u64)?;
+
+        let setup = spc_read_string(&mut set_file, setupcount.max(0) as usize)?;
+        drop(set_file);
+
+        // get the tac range from the setup information
+        let tac_range = self.parse_setup(SPC_TAC_RANGE, &setup)?;
+        // get the tac gain from the setup information
+        let tac_gain = self.parse_setup(SPC_TAC_GAIN, &setup)?;
+
+        let time_base: f64;
+        if tac_gain != 0.0 && tac_range != 0.0 {
+            let mut tb = 4095.0 * tac_range / (tac_gain * 4096.0);
+            // convert from s to ps
+            tb *= 1.000e12;
+            time_base = tb;
+        } else {
+            return Err(BioFormatsError::Format("Failed to parse setup file!".into()));
+        }
+
+        // ---- Now read .spc file ----
+        self.spc_id = Some(spc_name.clone());
+        let mut spc_file = File::open(&spc_name).map_err(BioFormatsError::Io)?;
+
+        // The first 3 bytes contain macro-time clock info; skip them.
+        spc_skip(&mut spc_file, 3)?;
+
+        // The 4th byte contains the number of routing channels in bits 3..6.
+        // Bits 0..2 reserved, bit 7 = 1 ("Data invalid").
+        let routing = spc_read_i8(&mut spc_file)?;
+
+        if (routing & 0x10) != 0 {
+            return Err(BioFormatsError::Format("Invalid data!".into()));
+        }
+
+        self.n_channels = ((routing as i32) & 0x78) >> 3;
+
+        self.current_pixel = 0;
+        self.current_line = -1;
+        self.current_frame = -1;
+        self.end_of_frame_flag = false;
+        self.n_buffers = 0;
+
+        self.buf_length = 1024;
+        self.raw_buf = vec![0u8; self.buf_length as usize];
+        self.n_buffers = 0;
+
+        // Stream the whole .spc file in buf_length-sized buffers, discovering
+        // geometry through the marker words.
+        loop {
+            let no_of_bytes = spc_read(&mut spc_file, &mut self.raw_buf)?;
+            if no_of_bytes == -1 {
+                break;
+            }
+            let mut bb = 3;
+            while bb < no_of_bytes {
+                let adc_l = self.raw_buf[bb as usize] as i8; // upper byte w/ ADC data
+                let adc_lm = (adc_l as u8) & 0xF0; // mask out upper 4 bits
+
+                // at this point only the various clocks are of interest
+                match adc_lm {
+                    0x90 => self.invalid_and_mark_init(bb),
+                    // Invalid, Mark and MTOV all set. Not well documented.
+                    0xd0 => self.invalid_and_mark_init(bb),
+                    _ => {}
+                }
+                bb += 4;
+            }
+            self.n_buffers += 1;
+        }
+
+        self.n_timebins = (0xFFF >> SPC_ADC_RES_SHIFT) + 1;
+        self.n_frames = self.current_frame - 1;
+
+        self.add_global_meta("time bins", MetadataValue::Int(self.n_timebins as i64));
+        self.add_global_meta("nChannels", MetadataValue::Int(self.n_channels as i64));
+        self.add_global_meta("time base", MetadataValue::Float(time_base));
+
+        // ---- Populate metadata ----
+        let mut m = ImageMetadata::default();
+
+        // Undocumented and possibly system specific; duplicates U.Lorenzo's
+        // Matlab behaviour.
+        if self.n_lines < 530 {
+            self.line_mode = false;
+            m.size_y = self.n_lines.max(0) as u32;
+        } else {
+            self.line_mode = true; // return a single line
+            m.size_y = 1;
+        }
+
+        let mut max_frame_length: i32 = 0;
+        let mut t = 0;
+        while t < self.n_frames {
+            let frame_length = self.end_of_frame_list[(t + 1) as usize]
+                - self.frame_clock_list[t as usize];
+            if frame_length > max_frame_length {
+                max_frame_length = frame_length;
+            }
+            t += 1;
+        }
+
+        self.raw_buf = vec![0u8; max_frame_length.max(0) as usize];
+
+        m.size_x = self.n_pixels.max(0) as u32;
+        m.size_z = 1;
+        m.size_t = (self.n_timebins * self.n_frames).max(0) as u32;
+        m.size_c = self.n_channels.max(0) as u32;
+        m.dimension_order = crate::common::metadata::DimensionOrder::XYZTC;
+        m.pixel_type = PixelType::Uint16;
+        m.bits_per_pixel = 16;
+        m.is_rgb = false;
+        m.is_little_endian = true;
+        m.image_count = m.size_z * m.size_c * m.size_t;
+        m.is_indexed = false;
+
+        // moduloT: lifetime sub-dimension within T.
+        let step = if self.n_timebins != 0 {
+            time_base / self.n_timebins as f64
+        } else {
+            0.0
+        };
+        m.modulo_t = Some(ModuloAnnotation {
+            parent_dimension: "T".to_owned(),
+            modulo_type: "lifetime".to_owned(),
+            start: 0.0,
+            step,
+            end: step * (self.n_timebins - 1) as f64,
+            unit: "ps".to_owned(),
+            labels: Vec::new(),
+        });
+
+        self.meta = m;
+
+        // Open the .spc stream for openBytes seeks.
+        self.spc_in = Some(spc_file);
+        Ok(())
+    }
+
+    /// Decode marker/photon words for one frame buffer, accumulating photons
+    /// into `Tstore`. (Java: `processBuffer(int)`.)
+    fn process_buffer(&mut self, no_of_bytes: i32) {
+        let mut bb = 3;
+        while bb < no_of_bytes {
+            let adc_l = self.raw_buf[bb as usize] as i8;
+            let adc_lm = (adc_l as u8) & 0xF0;
+
+            match adc_lm {
+                0xA0 => {} // gap
+                0x20 => {} // Got GAP but not invalid
+                0x40 => self.photon(bb), // photon + ovfl
+                0x00 => self.photon(bb), // photon
+                0x80 => {} // invalid photon
+                0x90 => self.invalid_and_mark(bb),
+                // Invalid, Mark and MTOV all set. Not well documented.
+                0xd0 => self.invalid_and_mark(bb),
+                0xC0 => {
+                    // timer overflow; Java reads rawBuf[bb-3] into routLM (unused)
+                    let _rout_lm = self.raw_buf[(bb - 3) as usize];
+                }
+                _ => {} // Unrecognised pattern
+            }
+            bb += 4;
+        }
+    }
+
+    /// Process a marker word during `openBytes`. (Java: `invalidAndMark(int)`.)
+    fn invalid_and_mark(&mut self, block_ptr: i32) {
+        let rout_m = (self.raw_buf[(block_ptr - 2) as usize] as u8) & 0xf0;
+
+        match rout_m {
+            0x10 => {
+                // pixel clock
+                self.current_pixel += 1;
+            }
+            0x20 => {
+                // line clock
+                if self.end_of_frame_flag {
+                    self.current_line = -1;
+                    self.end_of_frame_flag = false;
+                    self.current_frame += 1;
+                }
+                self.current_line += 1;
+                self.current_pixel = 0;
+            }
+            0x40 => {
+                // frame clock
+                self.end_of_frame_flag = true;
+            }
+            0x60 => {
+                // frame and line clock — shouldn't happen
+            }
+            _ => {
+                // unknown mark
+            }
+        }
+    }
+
+    /// Process a marker word during the `initFile` geometry pass, recording
+    /// frame-clock and end-of-frame positions. (Java: `invalidAndMarkInit(int)`.)
+    fn invalid_and_mark_init(&mut self, block_ptr: i32) {
+        let rout_m = (self.raw_buf[(block_ptr - 2) as usize] as u8) & 0xf0;
+
+        match rout_m {
+            0x10 => {
+                // pixel clock
+                self.current_pixel += 1;
+            }
+            0x20 => {
+                // line clock
+                if self.current_frame == 0 && self.current_line == 1 {
+                    self.n_pixels = self.current_pixel;
+                }
+
+                if self.end_of_frame_flag {
+                    self.current_line = -1;
+                    self.end_of_frame_flag = false;
+                    self.current_frame += 1;
+                    let position = (block_ptr - 3) + (self.buf_length * self.n_buffers);
+                    self.end_of_frame_list.push(position);
+                }
+
+                self.current_line += 1;
+                self.current_pixel = 0;
+            }
+            0x40 => {
+                // frame clock
+                if self.current_frame == 0 {
+                    self.n_lines = self.current_line + 1;
+                }
+                // Store position of start of word containing frame clock.
+                let position = (block_ptr - 3) + (self.buf_length * self.n_buffers);
+                self.frame_clock_list.push(position);
+
+                self.end_of_frame_flag = true;
+            }
+            0x60 => {
+                // frame and line clock — shouldn't happen
+            }
+            _ => {
+                // unknown mark
+            }
+        }
+    }
+
+    /// Accumulate one photon into the per-timebin histogram. (Java: `photon(int)`.)
+    fn photon(&mut self, block_ptr: i32) {
+        let current_channel =
+            ((self.raw_buf[(block_ptr - 2) as usize] as u8 & 0xF0) >> 4) as i32;
+
+        if current_channel == self.channel || self.n_channels == 1 {
+            if self.current_pixel < self.n_pixels
+                && self.current_line > -1
+                && self.current_line < (self.n_lines + 1)
+            {
+                let pix = self.bpp * ((self.current_line * self.n_pixels) + self.current_pixel);
+
+                // 4 bottom bits are 4 MSBs of 12-bit ADC.
+                let mut adc_m = ((self.raw_buf[block_ptr as usize] as i32) & 0x0F) << 8;
+                adc_m |= (self.raw_buf[(block_ptr - 1) as usize] as i32) & 0x0FF;
+                let micro_time = 4095 - adc_m;
+                let current_bin = micro_time >> SPC_ADC_RES_SHIFT;
+                let pix = pix + current_bin * self.bin_size;
+
+                if let Some(ref mut tstore) = self.tstore {
+                    let idx = pix as usize;
+                    if idx + 1 < tstore.len() {
+                        let mut intensity = u16::from_le_bytes([tstore[idx], tstore[idx + 1]]);
+                        intensity = intensity.wrapping_add(1);
+                        let b = intensity.to_le_bytes();
+                        tstore[idx] = b[0];
+                        tstore[idx + 1] = b[1];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parse one tagged field from the `.set` setup text. (Java: `parseSetup`.)
+    fn parse_setup(&self, tag: &str, setup: &str) -> Result<f64> {
+        // Fields in setup text consist of a tag, followed by a type ("I" or
+        // "F") followed by a text value, e.g. #SP [SP_TAC_G,I,4]
+        let tag_offset = setup
+            .find(tag)
+            .ok_or_else(|| BioFormatsError::Format("Failed to parse setup file!".into()))?;
+        let end = (tag_offset + 30).min(setup.len());
+        let tagged_string = &setup[tag_offset..end];
+        let comma = tagged_string
+            .find(',')
+            .ok_or_else(|| BioFormatsError::Format("Failed to parse setup file!".into()))?;
+        let tag_type = &tagged_string[comma + 1..comma + 2];
+        let close = tagged_string
+            .find(']')
+            .ok_or_else(|| BioFormatsError::Format("Failed to parse setup file!".into()))?;
+        let value_txt = &tagged_string[comma + 3..close];
+        let mut value = 0.0_f64;
+        if tag_type == "I" {
+            value = value_txt
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| BioFormatsError::Format("Failed to parse setup file!".into()))?
+                as f64;
+        }
+        if tag_type == "F" {
+            value = value_txt
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| BioFormatsError::Format("Failed to parse setup file!".into()))?;
+        }
+        Ok(value)
+    }
+
+    /// (Java: `addGlobalMeta`.)
+    fn add_global_meta(&mut self, key: &str, value: MetadataValue) {
+        self.global_meta.insert(key.to_owned(), value);
+    }
+}
+
+impl Default for SpcReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// -- Little-endian stream helpers mirroring RandomAccessInputStream(order=true).
+
+fn spc_skip(f: &mut File, n: u64) -> Result<()> {
+    use std::io::Seek;
+    f.seek(std::io::SeekFrom::Current(n as i64))
+        .map_err(BioFormatsError::Io)?;
+    Ok(())
+}
+
+fn spc_seek(f: &mut File, pos: u64) -> Result<()> {
+    use std::io::Seek;
+    f.seek(std::io::SeekFrom::Start(pos))
+        .map_err(BioFormatsError::Io)?;
+    Ok(())
+}
+
+fn spc_read_i32_le(f: &mut File) -> Result<i32> {
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b).map_err(BioFormatsError::Io)?;
+    Ok(i32::from_le_bytes(b))
+}
+
+fn spc_read_i16_le(f: &mut File) -> Result<i16> {
+    let mut b = [0u8; 2];
+    f.read_exact(&mut b).map_err(BioFormatsError::Io)?;
+    Ok(i16::from_le_bytes(b))
+}
+
+fn spc_read_i8(f: &mut File) -> Result<i8> {
+    let mut b = [0u8; 1];
+    f.read_exact(&mut b).map_err(BioFormatsError::Io)?;
+    Ok(b[0] as i8)
+}
+
+/// Read up to `len` bytes as an ASCII string. (Java: `readString(int)`.)
+fn spc_read_string(f: &mut File, len: usize) -> Result<String> {
+    let mut b = vec![0u8; len];
+    let n = f.read(&mut b).map_err(BioFormatsError::Io)?;
+    b.truncate(n);
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Read into `buf`, returning the number of bytes read, or -1 at EOF.
+/// (Java: `RandomAccessInputStream.read(byte[])`.)
+fn spc_read(f: &mut File, buf: &mut [u8]) -> Result<i32> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = f.read(&mut buf[filled..]).map_err(BioFormatsError::Io)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    if filled == 0 {
+        Ok(-1)
+    } else {
+        Ok(filled as i32)
+    }
+}
+
+impl FormatReader for SpcReader {
+    /// (Java: `isThisType(String, boolean)`.)
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if !matches!(ext.as_deref(), Some("spc") | Some("set")) {
+            return false;
+        }
+        // Java requires both base.spc and base.set to exist.
+        let base = match (path.parent(), path.file_stem().and_then(|s| s.to_str())) {
+            (Some(dir), Some(stem)) => dir.join(stem),
+            _ => return false,
+        };
+        let spc = base.with_extension("spc");
+        let set = base.with_extension("set");
+        spc.exists() && set.exists()
+    }
+
+    /// The SPC FIFO format has no reliable magic bytes; detection is by name
+    /// plus the companion-file check above. (Java has no byte-magic check;
+    /// `isThisType(byte[])` is not overridden.)
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.init_file(path)
+    }
+
+    /// (Java: `close(boolean)`.)
+    fn close(&mut self) -> Result<()> {
+        self.tstore = None;
+        self.stored_channel = -1;
+        self.stored_t = -1;
+        self.all_files = Vec::new();
+        self.frame_clock_list = Vec::new();
+        self.spc_in = None;
+        self.spc_id = None;
+        self.meta = ImageMetadata::default();
+        self.global_meta = HashMap::new();
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        1
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        &self.meta
+    }
+
+    /// (Java: `openBytes(int, byte[], int, int, int, int)`.)
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let w = self.meta.size_x;
+        let h = self.meta.size_y;
+        self.open_bytes_region(plane_index, 0, 0, w, h)
+    }
+
+    /// (Java: `openBytes(int, byte[], int, int, int, int)`.)
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        if plane_index >= self.meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+
+        let size_t = self.meta.size_t as i32;
+        let mut no = plane_index as i32;
+
+        self.channel = if size_t != 0 { no / size_t } else { 0 };
+        no -= self.channel * size_t;
+
+        let t = if self.n_timebins != 0 {
+            no / self.n_timebins
+        } else {
+            0
+        };
+        no -= t * self.n_timebins;
+
+        let timebin = no;
+
+        self.bpp = 2;
+        self.bin_size = self.n_pixels * self.n_lines * self.bpp;
+
+        if self.tstore.is_none() {
+            self.tstore = Some(vec![
+                0u8;
+                (self.n_pixels * self.n_lines * self.bpp * self.n_timebins).max(0)
+                    as usize
+            ]);
+        }
+
+        // if the pre-stored data doesn't match that requested then read it.
+        if self.stored_t != t || self.stored_channel != self.channel {
+            let frame_clock_pos = *self
+                .frame_clock_list
+                .get(t as usize)
+                .ok_or_else(|| BioFormatsError::Format("SPC: frame clock index out of range".into()))?;
+            let end_of_frame_pos = *self
+                .end_of_frame_list
+                .get((t + 1) as usize)
+                .ok_or_else(|| BioFormatsError::Format("SPC: end-of-frame index out of range".into()))?;
+
+            let frame_length = end_of_frame_pos - frame_clock_pos;
+
+            // Clear and size the histogram buffer for this frame.
+            if let Some(ref mut tstore) = self.tstore {
+                for b in tstore.iter_mut() {
+                    *b = 0;
+                }
+            }
+
+            self.reopen_file()?;
+            let no_of_bytes = {
+                let f = self.spc_in.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+                spc_seek(f, frame_clock_pos as u64)?;
+                if self.raw_buf.len() < frame_length.max(0) as usize {
+                    self.raw_buf = vec![0u8; frame_length.max(0) as usize];
+                }
+                let mut tmp = vec![0u8; frame_length.max(0) as usize];
+                let n = spc_read(f, &mut tmp)?;
+                if n > 0 {
+                    self.raw_buf[..n as usize].copy_from_slice(&tmp[..n as usize]);
+                }
+                n
+            };
+
+            if no_of_bytes == frame_length {
+                self.current_line = -1;
+                self.current_frame = -1;
+                self.end_of_frame_flag = false;
+
+                self.process_buffer(no_of_bytes);
+                self.stored_t = t;
+                self.stored_channel = self.channel;
+            }
+        }
+
+        // copy 2D plane from Tstore into buf
+        let i_line_size = self.n_pixels * self.bpp;
+        let o_line_size = (w as i32) * self.bpp;
+
+        let tstore = self.tstore.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut buf = vec![0u8; (h as usize) * (o_line_size as usize)];
+
+        if !self.line_mode {
+            // image Mode
+            let mut input = (self.bin_size * timebin) + (y as i32 * i_line_size) + (x as i32 * self.bpp);
+            let mut output = 0i32;
+            for _line in 0..h as i32 {
+                let src = input as usize;
+                let dst = output as usize;
+                if src + o_line_size as usize <= tstore.len() {
+                    buf[dst..dst + o_line_size as usize]
+                        .copy_from_slice(&tstore[src..src + o_line_size as usize]);
+                }
+                input += i_line_size;
+                output += o_line_size;
+            }
+        } else {
+            // line Mode: copy first line, then sum all other lines.
+            let mut input = (self.bin_size * timebin) + (x as i32 * self.bpp);
+            let output = 0i32;
+            let src = input as usize;
+            if src + o_line_size as usize <= tstore.len() {
+                buf[output as usize..output as usize + o_line_size as usize]
+                    .copy_from_slice(&tstore[src..src + o_line_size as usize]);
+            }
+            input += i_line_size;
+            for _line in 1..self.n_lines {
+                let mut p = 0i32;
+                while p < o_line_size {
+                    let out_idx = (output + p) as usize;
+                    let in_idx = (input + p) as usize;
+                    if out_idx + 1 < buf.len() && in_idx + 1 < tstore.len() {
+                        let s = i16::from_le_bytes([buf[out_idx], buf[out_idx + 1]]);
+                        let ts = i16::from_le_bytes([tstore[in_idx], tstore[in_idx + 1]]);
+                        let sum = s.wrapping_add(ts);
+                        let b = sum.to_le_bytes();
+                        buf[out_idx] = b[0];
+                        buf[out_idx + 1] = b[1];
+                    }
+                    p += 2;
+                }
+                input += i_line_size;
+            }
+        }
+
+        Ok(buf)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let tw = self.meta.size_x.min(256);
+        let th = self.meta.size_y.min(256);
+        let tx = (self.meta.size_x - tw) / 2;
+        let ty = (self.meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17227,5 +18062,224 @@ EndClass: 0
         );
         assert_eq!(m.default_exposure_time, Some(3000), "last prefixed wins");
         assert_eq!(m.other_exposure_times, vec![2000, 3000]);
+    }
+
+    // -- SPCReader (Becker & Hickl SPC FIFO) ---------------------------------
+
+    /// One 32-bit FIFO word. `b3` is the byte examined at offset `bb` (its
+    /// high nibble selects photon/marker); `b1` is `bb-2` (its high nibble is
+    /// the routing/mark nibble or the photon channel).
+    fn spc_word(b0: u8, b1: u8, b2: u8, b3: u8) -> [u8; 4] {
+        [b0, b1, b2, b3]
+    }
+
+    /// Frame-clock marker word (0x90 init pattern, rout nibble 0x40).
+    fn spc_frame() -> [u8; 4] {
+        spc_word(0, 0x40, 0, 0x90)
+    }
+    /// Line-clock marker word (0x90 init pattern, rout nibble 0x20).
+    fn spc_line() -> [u8; 4] {
+        spc_word(0, 0x20, 0, 0x90)
+    }
+    /// Pixel-clock marker word (0x90 init pattern, rout nibble 0x10).
+    fn spc_pixel() -> [u8; 4] {
+        spc_word(0, 0x10, 0, 0x90)
+    }
+
+    /// Build a synthetic .spc FIFO stream tracing a 2-line x 2-pixel x 2-frame
+    /// geometry (so nFrames = currentFrame - 1 = 1).
+    fn build_spc_stream() -> Vec<u8> {
+        // 3 macro-time bytes + 1 routing byte (nChannels=1 => routing 0x08).
+        let mut data = vec![0u8, 0u8, 0u8, 0x08u8];
+        // Pixel-clock markers (not photons) advance currentPixel, which fixes
+        // nPixels when the (frame==0, line==1) line clock is reached.
+        let words: Vec<[u8; 4]> = vec![
+            spc_frame(), // word0  frameClock[0]=0
+            spc_line(),  // word1  endOfFrame[0]
+            spc_pixel(), // word2
+            spc_pixel(), // word3
+            spc_line(),  // word4
+            spc_pixel(), // word5
+            spc_pixel(), // word6
+            spc_frame(), // word7  frameClock[1], sets nLines=2
+            spc_line(),  // word8  endOfFrame[1], sets nPixels=2
+            spc_pixel(), // word9
+            spc_pixel(), // word10
+            spc_line(),  // word11
+            spc_pixel(), // word12
+            spc_pixel(), // word13
+            spc_frame(), // word14 frameClock[2]
+            spc_line(),  // word15 endOfFrame[2], currentFrame -> 2
+        ];
+        for w in words {
+            data.extend_from_slice(&w);
+        }
+        data
+    }
+
+    /// Build a matching .set file: 8-byte pad, i32 setuppos, i16 setupcount,
+    /// a 600-byte region containing "module SPC-830", then the setup text with
+    /// SP_TAC_R / SP_TAC_G tags at `setuppos`.
+    fn build_set_file() -> Vec<u8> {
+        let setup_text = b"#SP [SP_TAC_R,F,50.000] [SP_TAC_G,I,4]";
+        let setup_count = setup_text.len() as i16;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 8]); // skipped
+                                          // placeholder for setuppos (i32) -- fill later
+        let setuppos_field = buf.len();
+        buf.extend_from_slice(&[0u8; 4]);
+        buf.extend_from_slice(&setup_count.to_le_bytes());
+
+        // 600-byte header region containing the module string.
+        let mut header = vec![b' '; 600];
+        let tagstr = b"FIFO_IMAGE measurement with module SPC-830";
+        header[..tagstr.len()].copy_from_slice(tagstr);
+        buf.extend_from_slice(&header);
+
+        // setup text begins here.
+        let setuppos = buf.len() as i32;
+        buf.extend_from_slice(setup_text);
+
+        // backfill setuppos.
+        buf[setuppos_field..setuppos_field + 4].copy_from_slice(&setuppos.to_le_bytes());
+        buf
+    }
+
+    fn unique_spc_base() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bfrs_spc_{nanos}"))
+    }
+
+    #[test]
+    fn spc_set_id_and_metadata() {
+        let base = unique_spc_base();
+        let spc_path = base.with_extension("spc");
+        let set_path = base.with_extension("set");
+        File::create(&spc_path)
+            .unwrap()
+            .write_all(&build_spc_stream())
+            .unwrap();
+        File::create(&set_path)
+            .unwrap()
+            .write_all(&build_set_file())
+            .unwrap();
+
+        let mut reader = SpcReader::new();
+        reader.set_id(&spc_path).expect("SPC set_id should succeed");
+
+        let m = reader.metadata();
+        // nTimebins = (0xFFF >> 6) + 1 = 64.
+        assert_eq!(reader.n_timebins, 64);
+        // nFrames = currentFrame - 1 = 1.
+        assert_eq!(reader.n_frames, 1);
+        assert_eq!(reader.n_lines, 2);
+        assert_eq!(reader.n_pixels, 2);
+        assert_eq!(reader.n_channels, 1);
+
+        assert_eq!(m.size_x, 2);
+        assert_eq!(m.size_y, 2); // nLines < 530 -> image mode
+        assert_eq!(m.size_c, 1);
+        assert_eq!(m.size_t, 64 * 1);
+        assert_eq!(m.size_z, 1);
+        assert_eq!(m.image_count, 64);
+        assert_eq!(m.pixel_type, PixelType::Uint16);
+        assert!(m.is_little_endian);
+        assert_eq!(
+            m.dimension_order,
+            crate::common::metadata::DimensionOrder::XYZTC
+        );
+
+        let modulo = m.modulo_t.as_ref().expect("moduloT should be set");
+        assert_eq!(modulo.parent_dimension, "T");
+        assert_eq!(modulo.modulo_type, "lifetime");
+        assert_eq!(modulo.unit, "ps");
+        assert_eq!(modulo.start, 0.0);
+
+        // timeBase = 4095 * 50 / (4 * 4096) * 1e12 ; step = timeBase / 64.
+        let time_base = 4095.0 * 50.0 / (4.0 * 4096.0) * 1.000e12;
+        let expected_step = time_base / 64.0;
+        assert!((modulo.step - expected_step).abs() < 1e-3);
+
+        // Global metadata captured.
+        assert!(matches!(
+            reader.global_meta.get("nChannels"),
+            Some(MetadataValue::Int(1))
+        ));
+        assert!(matches!(
+            reader.global_meta.get("time bins"),
+            Some(MetadataValue::Int(64))
+        ));
+
+        // open_bytes for plane 0 returns a correctly sized uint16 plane.
+        let expected_plane_len = (m.size_x * m.size_y * 2) as usize;
+        let plane = reader.open_bytes(0).expect("open_bytes should succeed");
+        assert_eq!(plane.len(), expected_plane_len);
+
+        // used files are the .set and .spc pair.
+        let used = reader.series_used_files();
+        assert_eq!(used.len(), 2);
+
+        reader.close().unwrap();
+        let _ = std::fs::remove_file(&spc_path);
+        let _ = std::fs::remove_file(&set_path);
+    }
+
+    #[test]
+    fn spc_rejects_wrong_module() {
+        // A .set with an unrecognised module string must be rejected.
+        let base = unique_spc_base();
+        let spc_path = base.with_extension("spc");
+        let set_path = base.with_extension("set");
+        File::create(&spc_path)
+            .unwrap()
+            .write_all(&build_spc_stream())
+            .unwrap();
+
+        let mut set = build_set_file();
+        // Corrupt "SPC-830" -> "SPC-999" inside the header region.
+        if let Some(pos) = set
+            .windows(7)
+            .position(|w| w == b"SPC-830")
+        {
+            set[pos..pos + 7].copy_from_slice(b"SPC-999");
+        }
+        File::create(&set_path).unwrap().write_all(&set).unwrap();
+
+        let mut reader = SpcReader::new();
+        let err = reader.set_id(&spc_path).unwrap_err();
+        assert!(matches!(err, BioFormatsError::Format(_)));
+
+        let _ = std::fs::remove_file(&spc_path);
+        let _ = std::fs::remove_file(&set_path);
+    }
+
+    #[test]
+    fn spc_is_this_type_by_name_requires_companion() {
+        let base = unique_spc_base();
+        let spc_path = base.with_extension("spc");
+        let set_path = base.with_extension("set");
+        let reader = SpcReader::new();
+
+        // Neither file exists yet.
+        assert!(!reader.is_this_type_by_name(&spc_path));
+
+        File::create(&spc_path).unwrap().write_all(b"x").unwrap();
+        // .spc present but .set missing -> not detected.
+        assert!(!reader.is_this_type_by_name(&spc_path));
+
+        File::create(&set_path).unwrap().write_all(b"x").unwrap();
+        // Both present -> detected by either extension.
+        assert!(reader.is_this_type_by_name(&spc_path));
+        assert!(reader.is_this_type_by_name(&set_path));
+
+        // SPC FIFO has no byte magic.
+        assert!(!reader.is_this_type_by_bytes(b"SPC-830 Data File "));
+
+        let _ = std::fs::remove_file(&spc_path);
+        let _ = std::fs::remove_file(&set_path);
     }
 }

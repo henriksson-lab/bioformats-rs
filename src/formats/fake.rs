@@ -637,6 +637,7 @@ fn build_metadata(mut p: FakeParams) -> Result<Vec<ImageMetadata>> {
             is_indexed: p.indexed,
             is_little_endian: p.little,
             resolution_count: p.resolution_count,
+            thumbnail: false,
             series_metadata: sm,
             lookup_table: None,
             modulo_z: None,

@@ -4248,6 +4248,483 @@ impl FormatReader for OlympusSisTiffReader {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. Nikon TIFF (EZ-C1 confocal) — enriched reader
+// ---------------------------------------------------------------------------
+/// Nikon TIFF (`.tif` / `.tiff`).
+///
+/// Faithful port of Java `loci.formats.in.NikonTiffReader`
+/// (`extends BaseTiffReader`). Pixels come from the crate's TIFF engine; the
+/// EZ-C1 confocal acquisition metadata is scraped from the first IFD's
+/// ImageDescription comment. Detection is by the TIFF SOFTWARE tag containing
+/// the substring `EZ-C1`, so this reader only claims genuine Nikon EZ-C1 TIFFs.
+///
+/// Note: this is the Nikon EZ-C1 generic-confocal reader, distinct from
+/// `NikonElementsTiffReader` (NIS-Elements/ND2 XML), `NikonNisReader`, and the
+/// camera-RAW maker-note reader in `crate::tiff::nikon`.
+pub struct NikonTiffReader {
+    inner: crate::tiff::TiffReader,
+
+    // -- Fields -- (mirror Java NikonTiffReader fields)
+    physical_size_x: f64,
+    physical_size_y: f64,
+    physical_size_z: f64,
+    filter_models: Vec<String>,
+    dichroic_models: Vec<String>,
+    laser_ids: Vec<String>,
+    magnification: Option<f64>,
+    lens_na: f64,
+    working_distance: f64,
+    pinhole_size: f64,
+    correction: Option<String>,
+    immersion: Option<String>,
+    gain: Vec<f64>,
+    wavelength: Vec<f64>,
+    em_wave: Vec<f64>,
+    ex_wave: Vec<f64>,
+}
+
+/// Mirrors Java `NikonTiffReader.TOP_LEVEL_KEYS`.
+const NIKON_TIFF_TOP_LEVEL_KEYS: &[&str] = &[
+    "document document",
+    "document",
+    "history Acquisition",
+    "history objective",
+    "history history",
+    "history laser",
+    "history step",
+    "history",
+    "sensor s_params",
+    "sensor",
+    "view",
+];
+
+impl NikonTiffReader {
+    pub fn new() -> Self {
+        NikonTiffReader {
+            inner: crate::tiff::TiffReader::new(),
+            physical_size_x: 0.0,
+            physical_size_y: 0.0,
+            physical_size_z: 0.0,
+            filter_models: Vec::new(),
+            dichroic_models: Vec::new(),
+            laser_ids: Vec::new(),
+            magnification: None,
+            lens_na: 0.0,
+            working_distance: 0.0,
+            pinhole_size: 0.0,
+            correction: None,
+            immersion: None,
+            gain: Vec::new(),
+            wavelength: Vec::new(),
+            em_wave: Vec::new(),
+            ex_wave: Vec::new(),
+        }
+    }
+
+    /// Mirror Java `NikonTiffReader.isThisType(RandomAccessInputStream)`:
+    /// parse the first IFD, read its SOFTWARE tag, and require that it contains
+    /// the substring `EZ-C1`. Operates on whatever header bytes are available;
+    /// if the SOFTWARE value lies beyond the supplied window the parse fails
+    /// gracefully and detection returns `false`.
+    fn is_this_type_from_bytes(header: &[u8]) -> bool {
+        let cursor = std::io::Cursor::new(header);
+        let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let offset = parser.first_ifd_offset;
+        let ifd = match parser.read_ifd(offset) {
+            Ok((ifd, _)) => ifd,
+            Err(_) => return false,
+        };
+        match ifd
+            .get(crate::tiff::ifd::tag::SOFTWARE)
+            .and_then(|v| v.as_str())
+        {
+            Some(software) => software.contains("EZ-C1"),
+            None => false,
+        }
+    }
+
+    /// Mirror Java `NikonTiffReader.initStandardMetadata()`: parse the
+    /// tab-separated key/value pairs in the first IFD's comment
+    /// (ImageDescription) into the typed acquisition fields and the global
+    /// metadata table.
+    fn init_standard_metadata(&mut self) {
+        let comment = {
+            let series = self.inner.series_list();
+            if series.is_empty() {
+                return;
+            }
+            series[0]
+                .metadata
+                .series_metadata
+                .get("ImageDescription")
+                .and_then(|v| {
+                    if let crate::common::metadata::MetadataValue::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+        };
+        let Some(comment) = comment else { return };
+
+        let mut vendor: std::collections::HashMap<
+            String,
+            crate::common::metadata::MetadataValue,
+        > = std::collections::HashMap::new();
+
+        // Java removes the raw "Comment" entry before re-parsing it.
+        let lines: Vec<&str> = comment.split('\n').collect();
+
+        let mut dimension_labels: Option<Vec<String>> = None;
+        let mut dimension_sizes: Option<Vec<String>> = None;
+
+        for line in lines {
+            let tokens: Vec<&str> = line.split('\t').collect();
+            // Java `initStandardMetadata`: `line = line.replaceAll("\t", " ")`
+            // before the TOP_LEVEL_KEYS startsWith check. EZ-C1 comment lines are
+            // tab-delimited between every token, but the keys contain spaces, so
+            // the check must run against the space-normalized line.
+            let normalized_line = line.replace('\t', " ");
+
+            let mut n_tokens_in_key = 0usize;
+            for key in NIKON_TIFF_TOP_LEVEL_KEYS {
+                if normalized_line.starts_with(key) {
+                    n_tokens_in_key = if key.contains(' ') { 3 } else { 2 };
+                    break;
+                }
+            }
+
+            let mut k = String::new();
+            for i in 0..n_tokens_in_key {
+                if i >= tokens.len() {
+                    break;
+                }
+                k.push_str(tokens[i]);
+                if i < n_tokens_in_key - 1 {
+                    k.push(' ');
+                }
+            }
+            let mut v = String::new();
+            for i in n_tokens_in_key..tokens.len() {
+                v.push_str(tokens[i]);
+                if i < tokens.len() - 1 {
+                    v.push(' ');
+                }
+            }
+            let key = k;
+            let value = v;
+
+            if key == "document label" {
+                dimension_labels = Some(
+                    value
+                        .to_lowercase()
+                        .split(' ')
+                        .map(|s| s.to_string())
+                        .collect(),
+                );
+            } else if key == "document scale" {
+                dimension_sizes =
+                    Some(value.split(' ').map(|s| s.to_string()).collect());
+            } else if key.starts_with("history Acquisition") && key.contains("Filter") {
+                self.filter_models.push(value.clone());
+            } else if key.starts_with("history Acquisition") && key.contains("Dichroic") {
+                self.dichroic_models.push(value.clone());
+            } else if key == "history objective Type" {
+                self.correction = Some(value.clone());
+            } else if key == "history objective Magnification" {
+                self.magnification = nikon_tiff_parse_double(&value);
+            } else if key == "history objective NA" {
+                if let Some(d) = nikon_tiff_parse_double(&value) {
+                    self.lens_na = d;
+                }
+            } else if key == "history objective WorkingDistance" {
+                if let Some(d) = nikon_tiff_parse_double(&value) {
+                    self.working_distance = d;
+                }
+            } else if key == "history objective Immersion" {
+                self.immersion = Some(value.clone());
+            } else if key.starts_with("history gain") {
+                if let Some(d) = nikon_tiff_parse_double(&value) {
+                    self.gain.push(d);
+                }
+            } else if key == "history pinhole" {
+                if let Some(idx) = value.find(' ') {
+                    if let Some(d) = nikon_tiff_parse_double(&value[..idx]) {
+                        self.pinhole_size = d;
+                    }
+                }
+            } else if key.starts_with("history laser") && key.ends_with("wavelength") {
+                // Java: parseDouble(value.replaceAll("\\D", "")) — strip non-digits.
+                let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
+                if let Some(d) = nikon_tiff_parse_double(&digits) {
+                    self.wavelength.push(d);
+                }
+            } else if key.starts_with("history laser") && key.ends_with("name") {
+                self.laser_ids.push(value.clone());
+            } else if key == "sensor s_params LambdaEx" {
+                for i in n_tokens_in_key..tokens.len() {
+                    if let Some(d) = nikon_tiff_parse_double(tokens[i]) {
+                        self.ex_wave.push(d);
+                    }
+                }
+            } else if key == "sensor s_params LambdaEm" {
+                for i in n_tokens_in_key..tokens.len() {
+                    if let Some(d) = nikon_tiff_parse_double(tokens[i]) {
+                        self.em_wave.push(d);
+                    }
+                }
+            }
+
+            // Java: addGlobalMeta(key, value) for every parsed line.
+            if !key.is_empty() {
+                vendor.insert(
+                    key,
+                    crate::common::metadata::MetadataValue::String(value),
+                );
+            }
+        }
+
+        self.parse_dimension_sizes(
+            dimension_labels.as_deref(),
+            dimension_sizes.as_deref(),
+        );
+
+        let series = self.inner.series_list_mut();
+        if let Some(s) = series.first_mut() {
+            // Java removes "Comment" from the global metadata before re-parsing.
+            s.metadata.series_metadata.remove("Comment");
+            for (k, v) in vendor {
+                s.metadata.series_metadata.insert(k, v);
+            }
+        }
+    }
+
+    /// Mirror Java `NikonTiffReader.parseDimensionSizes(String[], String[])`.
+    fn parse_dimension_sizes(&mut self, labels: Option<&[String]>, sizes: Option<&[String]>) {
+        let (Some(labels), Some(sizes)) = (labels, sizes) else {
+            return;
+        };
+        for (i, label) in labels.iter().enumerate() {
+            let Some(size) = sizes.get(i) else { continue };
+            if label.starts_with('z') {
+                if let Some(d) = nikon_tiff_parse_double(size) {
+                    self.physical_size_z = d;
+                }
+            } else if label == "x" {
+                if let Some(d) = nikon_tiff_parse_double(size) {
+                    self.physical_size_x = d;
+                }
+            } else if label == "y" {
+                if let Some(d) = nikon_tiff_parse_double(size) {
+                    self.physical_size_y = d;
+                }
+            }
+        }
+    }
+
+    /// Mirror Java `NikonTiffReader.initMetadataStore()`: project the typed
+    /// acquisition fields onto an OME object graph (physical sizes, objective,
+    /// lasers, detectors, per-channel pinhole/ex/em, filters, dichroics).
+    fn build_ome(&self) -> crate::common::ome_metadata::OmeMetadata {
+        use crate::common::ome_metadata::{
+            create_lsid, OmeChannel, OmeDetector, OmeDichroic, OmeFilter, OmeImage,
+            OmeInstrument, OmeLightSource, OmeMetadata, OmeObjective,
+        };
+
+        let meta = self.inner.metadata();
+        let effective_size_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) } as usize;
+
+        let mut image = OmeImage {
+            description: Some(String::new()),
+            ..Default::default()
+        };
+        if self.physical_size_x > 0.0 {
+            image.physical_size_x = Some(self.physical_size_x);
+        }
+        if self.physical_size_y > 0.0 {
+            image.physical_size_y = Some(self.physical_size_y);
+        }
+        if self.physical_size_z > 0.0 {
+            image.physical_size_z = Some(self.physical_size_z);
+        }
+
+        // Objective.
+        let correction = self
+            .correction
+            .clone()
+            .unwrap_or_else(|| "Other".to_string());
+        let immersion = self
+            .immersion
+            .clone()
+            .unwrap_or_else(|| "Other".to_string());
+        let objective = OmeObjective {
+            id: Some(create_lsid("Objective", &[0, 0])),
+            nominal_magnification: self.magnification,
+            correction: Some(correction),
+            lens_na: Some(self.lens_na),
+            working_distance: Some(self.working_distance),
+            immersion: Some(immersion),
+            ..Default::default()
+        };
+
+        // Lasers (light sources).
+        let mut light_sources = Vec::new();
+        for i in 0..self.wavelength.len() {
+            let wave = self.wavelength[i];
+            light_sources.push(OmeLightSource {
+                id: Some(create_lsid("LightSource", &[0, i])),
+                model: self.laser_ids.get(i).cloned(),
+                light_source_type: Some("Other".to_string()),
+                wavelength: if wave > 0.0 { Some(wave) } else { None },
+                ..Default::default()
+            });
+        }
+
+        // Detectors.
+        let mut detectors = Vec::new();
+        for i in 0..self.gain.len() {
+            detectors.push(OmeDetector {
+                id: Some(create_lsid("Detector", &[0, i])),
+                gain: Some(self.gain[i]),
+                detector_type: Some("Other".to_string()),
+                ..Default::default()
+            });
+        }
+
+        // Filters / dichroics.
+        let mut filters = Vec::new();
+        for (i, model) in self.filter_models.iter().enumerate() {
+            filters.push(OmeFilter {
+                id: Some(create_lsid("Filter", &[0, i])),
+                model: Some(model.clone()),
+                ..Default::default()
+            });
+        }
+        let mut dichroics = Vec::new();
+        for (i, model) in self.dichroic_models.iter().enumerate() {
+            dichroics.push(OmeDichroic {
+                id: Some(create_lsid("Dichroic", &[0, i])),
+                model: Some(model.clone()),
+                ..Default::default()
+            });
+        }
+
+        // Per-channel pinhole / excitation / emission.
+        for c in 0..effective_size_c {
+            let mut channel = OmeChannel {
+                samples_per_pixel: 1,
+                pinhole_size: Some(self.pinhole_size),
+                ..Default::default()
+            };
+            if let Some(&wave) = self.ex_wave.get(c) {
+                if wave > 0.0 {
+                    channel.excitation_wavelength = Some(wave);
+                }
+            }
+            if let Some(&wave) = self.em_wave.get(c) {
+                if wave > 0.0 {
+                    channel.emission_wavelength = Some(wave);
+                }
+            }
+            image.channels.push(channel);
+        }
+
+        let instrument = OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            objectives: vec![objective],
+            detectors,
+            light_sources,
+            filters,
+            dichroics,
+            ..Default::default()
+        };
+        image.instrument_ref = Some(0);
+        image.objective_ref = Some(0);
+
+        OmeMetadata {
+            images: vec![image],
+            instruments: vec![instrument],
+            ..Default::default()
+        }
+    }
+}
+
+/// Mirror Java `DataTools.parseDouble`: trim, then parse, returning `None`
+/// (Java `null`) on failure rather than panicking.
+fn nikon_tiff_parse_double(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok()
+}
+
+impl Default for NikonTiffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for NikonTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::is_this_type_from_bytes(header)
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)?;
+        self.init_standard_metadata();
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        self.inner.set_series(s)
+    }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(p)
+    }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if self.inner.series_list().is_empty() {
+            return None;
+        }
+        Some(self.build_ome())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 7. Improvision/Volocity annotated TIFF — enriched reader
 // ---------------------------------------------------------------------------
 /// Improvision/Volocity annotated TIFF (`.tif`).
@@ -5175,6 +5652,7 @@ impl MolecularDevicesTiffReader {
                 is_indexed: false,
                 is_little_endian: little_endian,
                 resolution_count: 1,
+                thumbnail: false,
                 series_metadata: md,
                 lookup_table: None,
                 modulo_z: None,
@@ -8219,5 +8697,186 @@ mod nd2handler_key_value_tests {
         h.parse_key_and_value("TextInfoItem_0", value, None);
         assert_eq!(h.camera_model, Some("MyCam".to_string()));
         assert_eq!(h.modality, vec!["Confocal".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod nikon_tiff_tests {
+    use super::*;
+    use crate::common::metadata::MetadataValue;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bioformats_nikon_tiff_{name}_{}_{}.tiff",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    fn tiff_entry(tag: u16, typ: u16, count: u32, value: u32) -> [u8; 12] {
+        let mut entry = [0u8; 12];
+        entry[0..2].copy_from_slice(&tag.to_le_bytes());
+        entry[2..4].copy_from_slice(&typ.to_le_bytes());
+        entry[4..8].copy_from_slice(&count.to_le_bytes());
+        entry[8..12].copy_from_slice(&value.to_le_bytes());
+        entry
+    }
+
+    /// Build a tiny synthetic single-IFD TIFF carrying SOFTWARE (tag 305) and
+    /// ImageDescription (tag 270) values, both stored out-of-line.
+    fn write_minimal_tiff_with_software_and_description(
+        path: &Path,
+        software: &str,
+        description: &str,
+    ) {
+        let mut soft = software.as_bytes().to_vec();
+        soft.push(0);
+        let mut desc = description.as_bytes().to_vec();
+        desc.push(0);
+
+        let ifd_entry_count = 12u32;
+        let ifd_start = 8u32;
+        let soft_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let desc_start = soft_start + soft.len() as u32;
+        let pixel_start = desc_start + desc.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),                      // ImageWidth
+            tiff_entry(257, 4, 1, 1),                      // ImageLength
+            tiff_entry(258, 3, 1, 8),                      // BitsPerSample
+            tiff_entry(259, 3, 1, 1),                      // Compression
+            tiff_entry(262, 3, 1, 1),                      // Photometric
+            tiff_entry(270, 2, desc.len() as u32, desc_start), // ImageDescription
+            tiff_entry(273, 4, 1, pixel_start),            // StripOffsets
+            tiff_entry(277, 3, 1, 1),                      // SamplesPerPixel
+            tiff_entry(278, 4, 1, 1),                      // RowsPerStrip
+            tiff_entry(279, 4, 1, 1),                      // StripByteCounts
+            tiff_entry(284, 3, 1, 1),                      // PlanarConfiguration
+            tiff_entry(305, 2, soft.len() as u32, soft_start), // Software
+        ];
+
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        // TIFF requires IFD entries sorted by tag; tag 305 sorts after 284.
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&soft);
+        bytes.extend_from_slice(&desc);
+        bytes.push(7);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// EZ-C1 acquisition comment: tab-separated key/value lines exercising the
+    /// top-level-key tokenisation that `init_standard_metadata` mirrors.
+    // Real EZ-C1 comments are tab-delimited between every token (the key phrase
+    // spans the first 2-3 tab fields). Mirrors the format Java's tokenizer expects.
+    const EZC1_DESCRIPTION: &str = concat!(
+        "document\tlabel\tx\ty\tz\n",
+        "document\tscale\t0.25\t0.25\t1.5\n",
+        "history\tobjective\tType\tPlanApo\n",
+        "history\tobjective\tMagnification\t60\n",
+        "history\tobjective\tNA\t1.4\n",
+        "history\tobjective\tWorkingDistance\t0.21\n",
+        "history\tobjective\tImmersion\tOil\n",
+        "history\tgain\t1.5\n",
+        "history\tpinhole\t30 um\n",
+        "history\tlaser0\twavelength\t488 nm\n",
+        "history\tlaser0\tname\tArgon\n",
+        "history\tAcquisition\tFilter\tBA515\n",
+        "history\tAcquisition\tDichroic\tDM510\n",
+        "sensor\ts_params\tLambdaEx\t488\n",
+        "sensor\ts_params\tLambdaEm\t520\n",
+    );
+
+    #[test]
+    fn nikon_tiff_detects_ezc1_software_tag() {
+        let path = temp_path("detect");
+        write_minimal_tiff_with_software_and_description(&path, "EZ-C1 3.90", EZC1_DESCRIPTION);
+
+        // Whole-file header so the out-of-line SOFTWARE value is reachable.
+        let header = std::fs::read(&path).unwrap();
+        let reader = NikonTiffReader::new();
+        assert!(reader.is_this_type_by_bytes(&header));
+
+        // A non-EZ-C1 SOFTWARE tag must be rejected.
+        let path2 = temp_path("reject");
+        write_minimal_tiff_with_software_and_description(&path2, "ImageJ 1.53", EZC1_DESCRIPTION);
+        let header2 = std::fs::read(&path2).unwrap();
+        assert!(!reader.is_this_type_by_bytes(&header2));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&path2).ok();
+    }
+
+    #[test]
+    fn nikon_tiff_scrapes_ezc1_metadata() {
+        let path = temp_path("metadata");
+        write_minimal_tiff_with_software_and_description(&path, "EZ-C1 3.90", EZC1_DESCRIPTION);
+
+        let mut reader = NikonTiffReader::new();
+        reader.set_id(&path).unwrap();
+
+        let metadata = &reader.metadata().series_metadata;
+        // Global key/value pairs (addGlobalMeta) with top-level-key tokenisation.
+        assert!(matches!(
+            metadata.get("history objective Type"),
+            Some(MetadataValue::String(v)) if v == "PlanApo"
+        ));
+        assert!(matches!(
+            metadata.get("history objective Magnification"),
+            Some(MetadataValue::String(v)) if v == "60"
+        ));
+
+        // OME projection from the typed acquisition fields.
+        let ome = reader.ome_metadata().expect("ome metadata");
+        let image = &ome.images[0];
+        let inst = &ome.instruments[0];
+
+        // physicalSize{X,Y,Z} from "document scale".
+        assert_eq!(image.physical_size_x, Some(0.25));
+        assert_eq!(image.physical_size_y, Some(0.25));
+        assert_eq!(image.physical_size_z, Some(1.5));
+
+        // Objective.
+        let obj = &inst.objectives[0];
+        assert_eq!(obj.nominal_magnification, Some(60.0));
+        assert_eq!(obj.lens_na, Some(1.4));
+        assert_eq!(obj.working_distance, Some(0.21));
+        assert_eq!(obj.correction.as_deref(), Some("PlanApo"));
+        assert_eq!(obj.immersion.as_deref(), Some("Oil"));
+
+        // Laser light source.
+        assert_eq!(inst.light_sources.len(), 1);
+        assert_eq!(inst.light_sources[0].wavelength, Some(488.0));
+        assert_eq!(inst.light_sources[0].model.as_deref(), Some("Argon"));
+
+        // Detector from gain.
+        assert_eq!(inst.detectors.len(), 1);
+        assert_eq!(inst.detectors[0].gain, Some(1.5));
+
+        // Filter / dichroic.
+        assert_eq!(inst.filters[0].model.as_deref(), Some("BA515"));
+        assert_eq!(inst.dichroics[0].model.as_deref(), Some("DM510"));
+
+        // Per-channel pinhole / excitation / emission.
+        assert!(!image.channels.is_empty());
+        assert_eq!(image.channels[0].pinhole_size, Some(30.0));
+        assert_eq!(image.channels[0].excitation_wavelength, Some(488.0));
+        assert_eq!(image.channels[0].emission_wavelength, Some(520.0));
+
+        std::fs::remove_file(&path).ok();
     }
 }

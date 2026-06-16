@@ -117,6 +117,11 @@ pub struct ImageMetadata {
     pub is_indexed: bool,
     pub is_little_endian: bool,
     pub resolution_count: u32,
+    /// True if this series is a low-resolution thumbnail/preview rather than a
+    /// full-resolution image. Mirrors Bio-Formats `CoreMetadata.thumbnail`
+    /// (exposed via [`crate::common::reader::FormatReader::is_thumbnail_series`]).
+    /// Set e.g. by the Imaris reader on collapsed sub-resolution series.
+    pub thumbnail: bool,
     pub series_metadata: HashMap<String, MetadataValue>,
     pub lookup_table: Option<LookupTable>,
     /// Modulo annotation for Z dimension (sub-dimensions within Z).
@@ -144,6 +149,7 @@ impl Default for ImageMetadata {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,

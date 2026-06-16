@@ -830,6 +830,7 @@ impl FormatReader for NrrdReader {
             // header omits `endian:` (single-byte types never declare it).
             is_little_endian: hdr.endian,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: None,

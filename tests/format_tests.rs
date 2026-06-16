@@ -235,8 +235,19 @@ fn tillvision_native_cimage_contents() -> Vec<u8> {
 }
 
 fn tillvision_native_cimage_contents_with_shifted_object_marker() -> Vec<u8> {
+    // Java TillVisionReader.findImages relocates the object marker only through
+    // the inline "CImage" class-name skip: at pointer = i + 22 it reads a
+    // little-endian u16 length, and if length == 6 and the next 6 bytes spell
+    // "CImage" it advances pointer by length + 4 (= 10) before checking the
+    // 0x08000400 marker. Encode exactly that case: insert [06 00] "CImage" plus
+    // two padding bytes (the "+4" beyond the name) so the original marker at
+    // byte 22 is pushed to byte 32, where the faithful port expects it.
     let mut contents = tillvision_native_cimage_contents();
-    contents.splice(22..22, [0x55; 8]);
+    let mut shift = Vec::with_capacity(10);
+    shift.extend_from_slice(&6u16.to_le_bytes());
+    shift.extend_from_slice(b"CImage");
+    shift.extend_from_slice(&[0x00, 0x00]);
+    contents.splice(22..22, shift);
     contents
 }
 
@@ -1203,13 +1214,19 @@ fn imagic_ome_image_name_uses_last_header_record_like_java() {
 // Build a binary TopoMetrix fixture matching the Java TopometrixReader layout:
 // "#R" magic in the 2-byte pad, version ASCII at [2..6), pixelOffset ASCII at
 // [8..12), an empty date line at offset 14 (so the comment region ends at 254),
-// then sizeX@406 / sizeY@410, with UINT16 LE pixels at the declared pixelOffset
-// (412 = the fixed header size used here).
+// then sizeX@406 / sizeY@410. The (non version-5) metadata block then reads the
+// scaling fields the Java reader always reads at MetadataLevel != MINIMUM
+// (TopometrixReader.java L130-164): skip 10 -> xSize float @422, skip 4,
+// ySize float @430, adc float @434, skip 764, dacToWorldZero float @1202. That
+// makes the smallest faithful header 1206 bytes, so the pixel payload starts at
+// the declared pixelOffset of 1206 (matching the afm.rs unit-test fixture).
 fn topometrix_fixture(version: &[u8; 4], size_x: i16, size_y: i16, pixels: &[u16]) -> Vec<u8> {
-    let mut data = vec![0u8; 412];
+    // 1206 = end of the dacToWorldZero float read in the non-5 metadata block.
+    let mut data = vec![0u8; 1206];
     data[0..2].copy_from_slice(b"#R");
     data[2..6].copy_from_slice(version);
-    data[8..12].copy_from_slice(b"412 ");
+    // pixelOffset ASCII; 4 chars, space-padded ("1206").
+    data[8..12].copy_from_slice(b"1206");
     data[14] = b'\n';
     data[406..408].copy_from_slice(&size_x.to_le_bytes());
     data[410..412].copy_from_slice(&size_y.to_le_bytes());
@@ -3141,9 +3158,14 @@ fn cellomics_dib_records_safe_header_and_filename_metadata() {
     ));
 
     let ome = reader.ome_metadata().unwrap();
+    // Java CellomicsReader.initFile sets every image name via
+    //   store.setImageName(String.format("Well %s, Field #%02d",
+    //       FormatTools.getWellName(row, col), field), image);
+    // For well A03 (row 0, col 2) getWellName -> "A03" and field 0 -> "00",
+    // so the faithful name is "Well A03, Field #00" (not the plate+well string).
     assert_eq!(
         ome.images[0].name.as_deref(),
-        Some("AS_09125_050118150001 A03")
+        Some("Well A03, Field #00")
     );
     assert!(ome.annotations.iter().any(|annotation| {
         matches!(

@@ -490,6 +490,7 @@ impl FormatReader for AmiraReader {
             is_indexed: false,
             is_little_endian: little_endian,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
@@ -816,6 +817,7 @@ impl FormatReader for SpiderReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: {
                 let mut m = read_spider_metadata(path)?;
                 m.insert("format".into(), MetadataValue::String("Spider EM".into()));

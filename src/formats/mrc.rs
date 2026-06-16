@@ -579,6 +579,7 @@ impl FormatReader for MrcReader {
             is_indexed: false,
             is_little_endian: hdr.little_endian,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: None,

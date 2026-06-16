@@ -753,6 +753,7 @@ impl FormatReader for Ecat7Reader {
             is_indexed: false,
             is_little_endian: false, // ECAT7 is big-endian
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table: None,
             modulo_z: None,
@@ -1344,6 +1345,7 @@ impl FormatReader for InveonReader {
             is_indexed: false,
             is_little_endian: little_endian,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table: None,
             modulo_z: None,
@@ -1673,6 +1675,7 @@ impl FormatReader for FdfReader {
             is_indexed: false,
             is_little_endian: little_endian,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table: None,
             modulo_z: None,

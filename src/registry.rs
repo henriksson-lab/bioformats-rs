@@ -69,8 +69,14 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::andor::AndorSifReader::new()),
         Box::new(crate::formats::amira::AmiraReader::new()),
         Box::new(crate::formats::amira::SpiderReader::new()),
+        // Fuji LAS gel (.img + .inf companion); detected via the .inf sibling,
+        // so it must precede the other extension-only .img readers below.
+        Box::new(crate::formats::legacy::FujiReader::new()),
         Box::new(crate::formats::imagic::ImagicReader::new()),
         Box::new(crate::formats::flim::SdtReader::new()),
+        // Becker & Hickl SPC FIFO photon stream (.spc/.set); distinct format
+        // from SdtReader's SDT container (.sdt).
+        Box::new(crate::formats::flim2::SpcReader::new()),
         Box::new(crate::formats::flim::LiFlimReader::new()),
         Box::new(crate::formats::clinical::Ecat7Reader::new()),
         Box::new(crate::formats::clinical::FdfReader::new()),
@@ -83,6 +89,8 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::pcx::PcxReader::new()),
         Box::new(crate::formats::photoshop::PsdReader::new()),
         Box::new(crate::formats::aim::AimReader::new()),
+        // Molecular Imaging STP (.stp) — distinctive "UK SOFT" magic string.
+        Box::new(crate::formats::misc4::MolecularImagingReader::new()),
         // Prairie/Leica XML+TIFF series (magic-byte detection via XML content)
         Box::new(crate::formats::prairie::PrairieReader::new()),
         Box::new(crate::formats::prairie::LeicaTcsReader::new()),
@@ -206,6 +214,9 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::sem::ImodReader::new()),
         // SPM — scanning probe / AFM
         Box::new(crate::formats::spm::PicoQuantReader::new()),
+        // PicoQuant .bin time-resolved histogram cube; strict length-magic in
+        // set_id keeps it from claiming arbitrary .bin files.
+        Box::new(crate::formats::spm::PqBinReader::new()),
         Box::new(crate::formats::spm::RhkReader::new()),
         Box::new(crate::formats::spm::QuesantReader::new()),
         Box::new(crate::formats::spm::JpkReader::new()),
@@ -231,6 +242,9 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::flim2::AfiFluorescenceReader::new()),
         Box::new(crate::formats::flim2::ImarisTiffReader::new()),
         Box::new(crate::formats::flim2::XlefReader::new()),
+        // Olympus OMP2 tiled mosaic (.omp2info); delegates tile pixels to the
+        // OIR/VSI readers. Distinct XML magic, so it claims .omp2info first.
+        Box::new(crate::formats::olympus::OlympusTileReader::new()),
         Box::new(crate::formats::flim2::OirReader::new()),
         Box::new(crate::formats::flim2::CellSensReader::new()),
         Box::new(crate::formats::flim2::VolocityClippingReader::new()),
@@ -547,6 +561,17 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
             // mode/z/t naming), so ordinary .tif files still fall through.
             let mut readers = generic_tiff_name_wrappers(path, header);
 
+            // Nikon EZ-C1 confocal TIFFs are plain TIFFs identified only by a
+            // SOFTWARE tag containing "EZ-C1". Gate on that tag (mirroring the
+            // ImageDescription gating below) so ordinary TIFFs are untouched.
+            if let Some(software) = tiff_software_tag(path) {
+                if software.contains("EZ-C1") {
+                    readers.push(boxed_reader(
+                        crate::formats::tiff_wrappers::NikonTiffReader::new(),
+                    ));
+                }
+            }
+
             if let Some(description) = tiff_image_description(path) {
                 readers.extend(generic_tiff_wrappers_for_description(
                     ext.as_deref().unwrap_or_default(),
@@ -674,6 +699,20 @@ fn tiff_image_description(path: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Read the first IFD's SOFTWARE (tag 305) value from a TIFF, if present.
+/// Reads a generous header window so out-of-line tag values are usually
+/// covered; used to gate the Nikon EZ-C1 wrapper without a full open.
+fn tiff_software_tag(path: &Path) -> Option<String> {
+    let header = peek_header(path, 64 * 1024).ok()?;
+    let cursor = std::io::Cursor::new(header);
+    let mut parser = crate::tiff::parser::TiffParser::new(cursor).ok()?;
+    let offset = parser.first_ifd_offset;
+    let (ifd, _) = parser.read_ifd(offset).ok()?;
+    ifd.get(crate::tiff::ifd::tag::SOFTWARE)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn generic_tiff_wrappers_for_description(

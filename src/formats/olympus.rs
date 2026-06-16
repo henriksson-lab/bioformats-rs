@@ -874,6 +874,7 @@ impl OifReader {
             is_indexed: false,
             is_little_endian,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table: None,
             modulo_z: None,
@@ -1232,6 +1233,810 @@ impl FormatReader for OifReader {
         Some(ome)
     }
 }
+// ===========================================================================
+// OlympusTileReader — Olympus `.omp2info` tiled-acquisition reader.
+//
+// Faithful port of java-bioformats
+// components/formats-gpl/src/loci/formats/in/OlympusTileReader.java.
+//
+// The `.omp2info` file is a small XML document describing a grid of image
+// tiles. Each `matl:area` element names a tile image file (an Olympus `.oir`
+// or `.vsi`) and its (xIndex, yIndex) position in the mosaic. The reader
+// delegates all pixel access to a "helper" reader chosen by tile suffix:
+//   - `.oir`  -> crate::formats::flim2::OirReader   (Java OIRReader)
+//   - `.vsi`  -> crate::formats::flim2::CellSensReader (Java CellSensReader)
+// openBytes stitches the requested region together from the intersecting
+// tiles, exactly as the Java implementation does.
+// ===========================================================================
+
+/// A read-only DOM node, mirroring the `org.w3c.dom.Element`/`Node` operations
+/// the Java reader relies on (`getElementsByTagName`, `getTextContent`,
+/// `getAttribute`, attribute/child traversal).
+#[derive(Default, Clone)]
+struct DomNode {
+    /// Qualified element name as written (e.g. `matl:area`).
+    name: String,
+    /// Concatenated direct text content (Java getTextContent on a leaf-ish node).
+    text: String,
+    attrs: Vec<(String, String)>,
+    children: Vec<DomNode>,
+}
+
+impl DomNode {
+    /// Java `Element.getAttribute(name)` — returns "" when absent.
+    fn attribute(&self, name: &str) -> String {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// Java `Element.getElementsByTagName(name)` — every *descendant* (not just
+    /// direct child) element with the given qualified name, in document order.
+    fn elements_by_tag_name<'a>(&'a self, name: &str, out: &mut Vec<&'a DomNode>) {
+        for child in &self.children {
+            if child.name == name {
+                out.push(child);
+            }
+            child.elements_by_tag_name(name, out);
+        }
+    }
+}
+
+/// Java `OlympusTileReader.Tile` — one mosaic tile.
+#[derive(Clone)]
+struct Tile {
+    file: String,
+    files: Vec<String>,
+    region: Region,
+}
+
+impl Tile {
+    /// Java `Tile.compareTo`: sort by y, then x.
+    fn compare_to(&self, o: &Tile) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if self.region == o.region {
+            return Ordering::Equal;
+        }
+        let y_diff = self.region.y - o.region.y;
+        if y_diff != 0 {
+            return y_diff.cmp(&0);
+        }
+        (self.region.x - o.region.x).cmp(&0)
+    }
+}
+
+/// Port of `loci.common.Region` (the subset used here).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Region {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+}
+
+impl Region {
+    fn new(x: i64, y: i64, width: i64, height: i64) -> Region {
+        Region {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Java `Region.intersects`.
+    fn intersects(&self, other: &Region) -> bool {
+        let tw = self.width;
+        let th = self.height;
+        let rw = other.width;
+        let rh = other.height;
+        if rw <= 0 || rh <= 0 || tw <= 0 || th <= 0 {
+            return false;
+        }
+        let tx = self.x;
+        let ty = self.y;
+        let rx = other.x;
+        let ry = other.y;
+        let rw = rx + rw;
+        let rh = ry + rh;
+        let tw = tx + tw;
+        let th = ty + th;
+        (rw < rx || rw > tx)
+            && (rh < ry || rh > ty)
+            && (tw < tx || tw > rx)
+            && (th < ty || th > ry)
+    }
+
+    /// Java `Region.intersection`.
+    fn intersection(&self, other: &Region) -> Region {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let w = (self.x + self.width).min(other.x + other.width) - x;
+        let h = (self.y + self.height).min(other.y + other.height) - y;
+        Region::new(x, y, w.max(0), h.max(0))
+    }
+}
+
+/// The pixel-data helper reader, chosen by tile suffix (Java `helperReader`).
+enum TileHelper {
+    /// `.oir` tiles — Java `OIRReader`.
+    Oir(Box<crate::formats::flim2::OirReader>),
+    /// `.vsi` tiles — Java `CellSensReader`.
+    CellSens(Box<crate::formats::flim2::CellSensReader>),
+}
+
+impl TileHelper {
+    fn set_id(&mut self, file: &str) -> Result<()> {
+        match self {
+            TileHelper::Oir(r) => r.set_id(Path::new(file)),
+            TileHelper::CellSens(r) => r.set_id(Path::new(file)),
+        }
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        match self {
+            TileHelper::Oir(r) => r.metadata(),
+            TileHelper::CellSens(r) => r.metadata(),
+        }
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        no: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        match self {
+            TileHelper::Oir(r) => r.open_bytes_region(no, x, y, w, h),
+            TileHelper::CellSens(r) => r.open_bytes_region(no, x, y, w, h),
+        }
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        match self {
+            TileHelper::Oir(r) => r.ome_metadata(),
+            TileHelper::CellSens(r) => r.ome_metadata(),
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        match self {
+            TileHelper::Oir(r) => r.close(),
+            TileHelper::CellSens(r) => r.close(),
+        }
+    }
+}
+
+/// Olympus `.omp2info` reader.
+pub struct OlympusTileReader {
+    current_id: Option<PathBuf>,
+    helper_reader: Option<TileHelper>,
+    tiles: Vec<Tile>,
+    all_pixels_files: Option<Vec<String>>,
+    extra_files: Vec<String>,
+    meta: Option<ImageMetadata>,
+    /// Per-tile physical sizes (µm) carried over from the helper for OME.
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    /// Global metadata accumulated by `read_metadata` (Java addGlobalMeta*).
+    global_meta: HashMap<String, MetadataValue>,
+}
+
+impl OlympusTileReader {
+    pub fn new() -> Self {
+        OlympusTileReader {
+            current_id: None,
+            helper_reader: None,
+            tiles: Vec::new(),
+            all_pixels_files: None,
+            extra_files: Vec::new(),
+            meta: None,
+            physical_size_x: None,
+            physical_size_y: None,
+            global_meta: HashMap::new(),
+        }
+    }
+
+    /// Java `getCurrentFile()`.
+    fn get_current_file(&self) -> &Path {
+        self.current_id.as_deref().unwrap_or_else(|| Path::new(""))
+    }
+
+    /// Java `initFile(String)`.
+    fn init_file(&mut self, id: &Path) -> Result<()> {
+        self.current_id = Some(id.to_path_buf());
+
+        let xml = decode_text(&std::fs::read(id).map_err(BioFormatsError::Io)?);
+        let xml = sanitize_xml(&xml);
+        self.read_metadata(&xml)?;
+
+        // tiles.sort(null) — Java natural ordering via Tile.compareTo.
+        self.tiles.sort_by(|a, b| a.compare_to(b));
+
+        if self.tiles.is_empty() {
+            return Err(BioFormatsError::Format(
+                "Olympus .omp2info references no tiles".into(),
+            ));
+        }
+
+        // helperReader.setId(tiles.get(0).file); core comes from helper plane 0.
+        let first_file = self.tiles[0].file.clone();
+        let helper = self
+            .helper_reader
+            .as_mut()
+            .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: no helper reader".into()))?;
+        helper.set_id(&first_file)?;
+
+        // CoreMetadata copied from helper, with sizeX/sizeY grown to cover tiles.
+        let mut ms = helper.metadata().clone();
+        let mut size_x = ms.size_x as i64;
+        let mut size_y = ms.size_y as i64;
+        for t in &self.tiles {
+            let r = &t.region;
+            size_x = size_x.max(r.width + r.x);
+            size_y = size_y.max(r.height + r.y);
+        }
+        ms.size_x = size_x.max(0) as u32;
+        ms.size_y = size_y.max(0) as u32;
+
+        // Carry physical pixel sizes from the helper's OME for our own OME.
+        if let Some(ome) = helper.ome_metadata() {
+            if let Some(img) = ome.images.first() {
+                self.physical_size_x = img.physical_size_x;
+                self.physical_size_y = img.physical_size_y;
+            }
+        }
+
+        self.meta = Some(ms);
+        Ok(())
+    }
+
+    /// Java `getMetadataRoot(String)`.
+    fn get_metadata_root(&self, xml: &str) -> Result<DomNode> {
+        parse_dom(xml)
+            .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: malformed XML".into()))
+    }
+
+    /// Java `getChildNode(Element, String)` — first descendant with that name.
+    fn get_child_node<'a>(&self, root: &'a DomNode, name: &str) -> Option<&'a DomNode> {
+        let mut out = Vec::new();
+        root.elements_by_tag_name(name, &mut out);
+        out.into_iter().next()
+    }
+
+    /// Java `getChildValue(Element, String)`.
+    fn get_child_value(&self, root: &DomNode, name: &str) -> Option<String> {
+        self.get_child_node(root, name).map(|n| n.text.clone())
+    }
+
+    /// Java `getName(Node)` — strip the namespace prefix.
+    fn get_name(&self, name: &str) -> String {
+        match name.find(':') {
+            Some(i) => name[i + 1..].to_string(),
+            None => name.to_string(),
+        }
+    }
+
+    /// Java `readMetadata(String)`.
+    fn read_metadata(&mut self, xml: &str) -> Result<()> {
+        let parent_dir = self
+            .get_current_file()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let root = self.get_metadata_root(xml)?;
+
+        let tile_group = self
+            .get_child_node(&root, "matl:group")
+            .cloned()
+            .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: no matl:group".into()))?;
+        let region_info = self.get_child_node(&tile_group, "marker:regionInfo");
+        let coordinates = region_info.and_then(|ri| self.get_child_node(ri, "marker:coordinates"));
+
+        let area_info = self
+            .get_child_node(&tile_group, "matl:areaInfo")
+            .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: no matl:areaInfo".into()))?;
+        let rows: i64 = self
+            .get_child_value(area_info, "matl:numOfYAreas")
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: bad numOfYAreas".into()))?;
+        let cols: i64 = self
+            .get_child_value(area_info, "matl:numOfXAreas")
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: bad numOfXAreas".into()))?;
+
+        // nanometers
+        let mut stitched_width: Option<f64> = None;
+        let mut stitched_height: Option<f64> = None;
+        if let Some(coords) = coordinates {
+            stitched_width = parse_double(&coords.attribute("width"));
+            stitched_height = parse_double(&coords.attribute("height"));
+        }
+
+        let mut all_tiles = Vec::new();
+        tile_group.elements_by_tag_name("matl:area", &mut all_tiles);
+
+        let mut adjust_width: i64 = 0;
+        let mut adjust_height: i64 = 0;
+        let stage = self.get_child_node(&root, "matl:stage").cloned();
+        let mut stage_overlap: i64 = 0;
+        if let Some(stage) = &stage {
+            stage_overlap = self
+                .get_child_value(stage, "matl:overlap")
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+        }
+
+        for tile in &all_tiles {
+            let tile_file_rel = self
+                .get_child_value(tile, "matl:image")
+                .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: tile without image".into()))?;
+            let tile_file = parent_dir.join(&tile_file_rel);
+            let tile_file = tile_file.to_string_lossy().to_string();
+
+            if self.helper_reader.is_none() {
+                // Choose the helper by tile suffix (Java OIRReader/CellSensReader).
+                if check_suffix(&tile_file, "oir") {
+                    self.helper_reader = Some(TileHelper::Oir(Box::new(
+                        crate::formats::flim2::OirReader::new(),
+                    )));
+                } else if check_suffix(&tile_file, "vsi") {
+                    self.helper_reader = Some(TileHelper::CellSens(Box::new(
+                        crate::formats::flim2::CellSensReader::new(),
+                    )));
+                } else {
+                    return Err(BioFormatsError::Format(format!(
+                        "Unsupported tile file {tile_file}"
+                    )));
+                }
+
+                let helper = self.helper_reader.as_mut().unwrap();
+                helper.set_id(&tile_file)?;
+
+                let helper_meta = helper.metadata().clone();
+                let width_with_overlaps = helper_meta.size_x as i64 * cols;
+                let height_with_overlaps = helper_meta.size_y as i64 * rows;
+
+                // physicalSizeX/Y in nanometers (OME stores micrometers).
+                let physical_size_x = helper
+                    .ome_metadata()
+                    .and_then(|o| o.images.first().and_then(|i| i.physical_size_x))
+                    .map(|um| um * 1000.0);
+                let physical_size_y = helper
+                    .ome_metadata()
+                    .and_then(|o| o.images.first().and_then(|i| i.physical_size_y))
+                    .map(|um| um * 1000.0);
+
+                let mut diff_x = stage_overlap * cols * 4;
+                let mut diff_y = stage_overlap * rows * 4;
+
+                if let (Some(sw), Some(sh), Some(px), Some(py)) =
+                    (stitched_width, stitched_height, physical_size_x, physical_size_y)
+                {
+                    let actual_width = (sw / px) as i64;
+                    let actual_height = (sh / py) as i64;
+                    diff_x = width_with_overlaps - actual_width;
+                    diff_y = height_with_overlaps - actual_height;
+                }
+
+                adjust_width = helper_meta.size_x as i64;
+                if cols > 1 {
+                    adjust_width -= diff_x / (cols - 1);
+                }
+                adjust_height = helper_meta.size_y as i64;
+                if rows > 1 {
+                    adjust_height -= diff_y / (rows - 1);
+                }
+            } else {
+                self.helper_reader.as_mut().unwrap().set_id(&tile_file)?;
+            }
+
+            let helper = self.helper_reader.as_mut().unwrap();
+            // Java: currentTile.files = helperReader.getUsedFiles();
+            // The Rust helpers don't expose a used-files list; the tile's own
+            // file is the single companion file we track.
+            let files = vec![tile_file.clone()];
+            let helper_meta = helper.metadata().clone();
+
+            let x_index: i64 = self
+                .get_child_value(tile, "matl:xIndex")
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: bad xIndex".into()))?;
+            let y_index: i64 = self
+                .get_child_value(tile, "matl:yIndex")
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: bad yIndex".into()))?;
+
+            let region = Region::new(
+                x_index * adjust_width,
+                y_index * adjust_height,
+                helper_meta.size_x as i64,
+                helper_meta.size_y as i64,
+            );
+            self.tiles.push(Tile {
+                file: tile_file,
+                files,
+                region,
+            });
+
+            self.add_global_meta_list("tile X index", MetadataValue::Int(x_index));
+            self.add_global_meta_list("tile Y index", MetadataValue::Int(y_index));
+            self.add_global_meta_list(
+                "tile bounding box (pixels)",
+                MetadataValue::String(format!(
+                    "x={}, y={}, w={}, h={}",
+                    region.x, region.y, region.width, region.height
+                )),
+            );
+        }
+        if let Some(helper) = self.helper_reader.as_mut() {
+            helper.close()?;
+        }
+
+        if let Some(stage) = &stage {
+            self.parse_original_metadata(stage);
+        }
+
+        if let Some(cycle) = self.get_child_node(&root, "matl:cycle").cloned() {
+            self.parse_original_metadata(&cycle);
+        }
+
+        if let Some(map) = self.get_child_node(&root, "matl:map") {
+            if let Some(map_file) = self.get_child_value(map, "matl:image") {
+                let map_file = parent_dir.join(&map_file);
+                self.extra_files
+                    .push(map_file.to_string_lossy().to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Java `parseOriginalMetadata(Node)` — recursively flatten attributes and
+    /// text into the global metadata table.
+    fn parse_original_metadata(&mut self, node: &DomNode) {
+        let value = node.text.trim();
+        if !value.is_empty() {
+            // Java keys text by "<grandparent> <parent>". Our DomNode does not
+            // carry parent links during recursion, so we approximate Java's
+            // intent by keying leaf text under the node's own (stripped) name.
+            let key = self.get_name(&node.name);
+            self.add_global_meta(&key, MetadataValue::String(value.to_string()));
+        } else {
+            for (k, v) in &node.attrs {
+                let key = format!("{} {}", self.get_name(&node.name), k);
+                self.add_global_meta(&key, MetadataValue::String(v.clone()));
+            }
+            for child in &node.children {
+                self.parse_original_metadata(child);
+            }
+        }
+    }
+
+    /// Java `addGlobalMeta`.
+    fn add_global_meta(&mut self, key: &str, value: MetadataValue) {
+        self.global_meta.insert(key.to_string(), value);
+    }
+
+    /// Java `addGlobalMetaList` — append-with-index so repeated keys survive.
+    fn add_global_meta_list(&mut self, key: &str, value: MetadataValue) {
+        let idx = self
+            .global_meta
+            .keys()
+            .filter(|k| k.starts_with(key))
+            .count();
+        self.global_meta.insert(format!("{key} {idx}"), value);
+    }
+
+    /// Java `getSeriesUsedFiles(boolean noPixels)`.
+    pub fn get_series_used_files(&mut self, no_pixels: bool) -> Vec<String> {
+        let current = self
+            .current_id
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if no_pixels {
+            let mut all = vec![current];
+            all.extend(self.extra_files.iter().cloned());
+            return all;
+        }
+        if self.all_pixels_files.is_none() {
+            let mut all = vec![current];
+            all.extend(self.extra_files.iter().cloned());
+            for t in &self.tiles {
+                for f in &t.files {
+                    all.push(f.clone());
+                }
+            }
+            self.all_pixels_files = Some(all);
+        }
+        self.all_pixels_files.clone().unwrap_or_default()
+    }
+
+    /// Read-only view of the accumulated global metadata (Java getGlobalMetadata).
+    pub fn global_metadata(&self) -> &HashMap<String, MetadataValue> {
+        &self.global_meta
+    }
+}
+
+impl Default for OlympusTileReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Java `XMLTools.sanitizeXML` (the subset relevant here): strip control
+/// characters that are illegal in XML 1.0 so the parser does not choke.
+fn sanitize_xml(s: &str) -> String {
+    s.chars()
+        .filter(|&c| {
+            c == '\t'
+                || c == '\n'
+                || c == '\r'
+                || (c >= '\u{20}' && c <= '\u{D7FF}')
+                || (c >= '\u{E000}' && c <= '\u{FFFD}')
+                || c >= '\u{10000}'
+        })
+        .collect()
+}
+
+/// Java `DataTools.parseDouble`.
+fn parse_double(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        t.parse::<f64>().ok()
+    }
+}
+
+/// Java `FormatReader.checkSuffix(name, suffix)`.
+fn check_suffix(name: &str, suffix: &str) -> bool {
+    name.to_ascii_lowercase()
+        .ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
+}
+
+/// Build a read-only DOM from XML, returning the document element (Java
+/// `XMLTools.parseDOM(xml).getDocumentElement()`).
+fn parse_dom(xml: &str) -> Option<DomNode> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    fn qualified(name: &[u8]) -> String {
+        String::from_utf8_lossy(name).to_string()
+    }
+    fn collect_attrs(e: &quick_xml::events::BytesStart) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for a in e.attributes().flatten() {
+            let k = qualified(a.key.as_ref());
+            let v = a
+                .unescape_value()
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
+            out.push((k, v));
+        }
+        out
+    }
+
+    // Synthetic document root; its single child is the document element.
+    let mut stack: Vec<DomNode> = vec![DomNode {
+        name: "#document".to_string(),
+        ..Default::default()
+    }];
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                stack.push(DomNode {
+                    name: qualified(e.name().as_ref()),
+                    attrs: collect_attrs(e),
+                    ..Default::default()
+                });
+            }
+            Ok(Event::Empty(ref e)) => {
+                let n = DomNode {
+                    name: qualified(e.name().as_ref()),
+                    attrs: collect_attrs(e),
+                    ..Default::default()
+                };
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(n);
+                }
+            }
+            Ok(Event::Text(ref t)) => {
+                if let Ok(s) = t.unescape() {
+                    if let Some(top) = stack.last_mut() {
+                        top.text.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::CData(ref t)) => {
+                if let Some(top) = stack.last_mut() {
+                    top.text.push_str(&String::from_utf8_lossy(t.as_ref()));
+                }
+            }
+            Ok(Event::End(_)) => {
+                if stack.len() > 1 {
+                    let mut node = stack.pop().unwrap();
+                    node.text = node.text.trim().to_string();
+                    if let Some(parent) = stack.last_mut() {
+                        parent.children.push(node);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+    let doc = stack.pop()?;
+    doc.children.into_iter().next()
+}
+
+impl FormatReader for OlympusTileReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        check_suffix(&path.to_string_lossy(), "omp2info")
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // The `.omp2info` document is XML rooted at a `matl:` element. Sniff for
+        // the Olympus tile-metadata namespace tokens.
+        let s = std::str::from_utf8(&header[..header.len().min(1024)]).unwrap_or("");
+        s.contains("matl:") || s.contains("marker:regionInfo")
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        self.init_file(path)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if let Some(helper) = self.helper_reader.as_mut() {
+            helper.close()?;
+        }
+        self.helper_reader = None;
+        self.tiles.clear();
+        self.all_pixels_files = None;
+        self.extra_files.clear();
+        self.current_id = None;
+        self.meta = None;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
+        self.global_meta.clear();
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        usize::from(self.meta.is_some())
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    /// Java `openBytes(int no, byte[] buf, int x, int y, int w, int h)`.
+    fn open_bytes_region(
+        &mut self,
+        no: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let pixel = {
+            let rgb = if meta.is_rgb { meta.size_c.max(1) } else { 1 } as usize;
+            rgb * meta.pixel_type.bytes_per_sample()
+        };
+        let w_us = w as usize;
+        let h_us = h as usize;
+        let mut buf = vec![0u8; w_us * h_us * pixel];
+
+        let image_region = Region::new(x as i64, y as i64, w as i64, h as i64);
+
+        // Take ownership of tiles to avoid borrowing self while mutating helper.
+        let tiles = std::mem::take(&mut self.tiles);
+        let mut result: Result<()> = Ok(());
+        for t in &tiles {
+            if t.region.intersects(&image_region) {
+                let helper = match self.helper_reader.as_mut() {
+                    Some(h) => h,
+                    None => {
+                        result = Err(BioFormatsError::NotInitialized);
+                        break;
+                    }
+                };
+                if let Err(e) = helper.set_id(&t.file) {
+                    result = Err(e);
+                    break;
+                }
+
+                let intersection = t.region.intersection(&image_region);
+                let src = match helper.open_bytes_region(
+                    no,
+                    (intersection.x - t.region.x) as u32,
+                    (intersection.y - t.region.y) as u32,
+                    intersection.width as u32,
+                    intersection.height as u32,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                };
+                for row in 0..intersection.height as usize {
+                    let src_index = row * intersection.width as usize * pixel;
+                    let dest_index = pixel
+                        * (((intersection.y - y as i64) as usize + row) * w_us
+                            + (intersection.x - x as i64) as usize);
+                    let len = intersection.width as usize * pixel;
+                    if src_index + len <= src.len() && dest_index + len <= buf.len() {
+                        buf[dest_index..dest_index + len]
+                            .copy_from_slice(&src[src_index..src_index + len]);
+                    }
+                }
+            }
+        }
+        self.tiles = tiles;
+        result?;
+        Ok(buf)
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let (w, h) = {
+            let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            (meta.size_x, meta.size_y)
+        };
+        self.open_bytes_region(plane_index, 0, 0, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
+        let (tx, ty) = (
+            (meta.size_x.saturating_sub(tw)) / 2,
+            (meta.size_y.saturating_sub(th)) / 2,
+        );
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::OmeMetadata;
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        if let Some(img) = ome.images.get_mut(0) {
+            if let Some(x) = self.physical_size_x {
+                img.physical_size_x = Some(x);
+            }
+            if let Some(y) = self.physical_size_y {
+                img.physical_size_y = Some(y);
+            }
+        }
+        Some(ome)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1360,5 +2165,136 @@ mod tests {
         let _ = std::fs::remove_file(pty);
         let _ = std::fs::remove_file(tiff);
         let _ = std::fs::remove_dir(companion);
+    }
+
+    // -- OlympusTileReader tests --
+
+    /// Write a single-plane 8-bit TIFF body to `path` (any extension). The TIFF
+    /// is produced via the registered `.tif` writer, then copied to the desired
+    /// name so the Olympus helper picks it up by its `.oir` suffix.
+    fn write_tile_tiff(path: &Path, w: u32, h: u32, fill: u8) {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = w;
+        meta.size_y = h;
+        meta.size_c = 1;
+        meta.size_z = 1;
+        meta.size_t = 1;
+        meta.image_count = 1;
+        meta.pixel_type = PixelType::Uint8;
+        meta.bits_per_pixel = 8;
+        let plane = vec![fill; (w * h) as usize];
+
+        let tif = path.with_extension("tif");
+        ImageWriter::save(&tif, &meta, &[plane]).unwrap();
+        let bytes = std::fs::read(&tif).unwrap();
+        std::fs::write(path, &bytes).unwrap();
+        let _ = std::fs::remove_file(&tif);
+    }
+
+    #[test]
+    fn region_intersection_and_intersects_match_java() {
+        let a = Region::new(0, 0, 4, 4);
+        let b = Region::new(2, 0, 4, 4);
+        assert!(a.intersects(&b));
+        let inter = a.intersection(&b);
+        assert_eq!((inter.x, inter.y, inter.width, inter.height), (2, 0, 2, 4));
+
+        let far = Region::new(100, 100, 4, 4);
+        assert!(!a.intersects(&far));
+    }
+
+    #[test]
+    fn dom_get_elements_by_tag_name_is_recursive() {
+        let xml = "<matl:group xmlns:matl=\"x\"><matl:areaInfo>\
+            <matl:numOfXAreas>2</matl:numOfXAreas></matl:areaInfo>\
+            <matl:area><matl:xIndex>0</matl:xIndex></matl:area>\
+            <matl:area><matl:xIndex>1</matl:xIndex></matl:area></matl:group>";
+        let root = parse_dom(xml).unwrap();
+        let mut areas = Vec::new();
+        root.elements_by_tag_name("matl:area", &mut areas);
+        assert_eq!(areas.len(), 2);
+        let mut x = Vec::new();
+        root.elements_by_tag_name("matl:numOfXAreas", &mut x);
+        assert_eq!(x.len(), 1);
+        assert_eq!(x[0].text, "2");
+    }
+
+    #[test]
+    fn omp2info_set_id_metadata_and_stitched_pixels() {
+        // Build a 2 (cols) x 1 (row) mosaic of 4x4 8-bit tiles saved as `.oir`
+        // (TIFF exports), referenced by a synthetic `.omp2info`.
+        let root = temp_path("tile.omp2info");
+        let dir = root.parent().unwrap().to_path_buf();
+        let stem = root.file_stem().unwrap().to_string_lossy().to_string();
+
+        let tile0 = dir.join(format!("{stem}_tile0.oir"));
+        let tile1 = dir.join(format!("{stem}_tile1.oir"));
+        write_tile_tiff(&tile0, 4, 4, 10);
+        write_tile_tiff(&tile1, 4, 4, 20);
+
+        // No stage overlap / coordinates -> adjustWidth == helper sizeX (4),
+        // so tile 1 lands at x=4 and the stitched image is 8x4.
+        let xml = format!(
+            "<?xml version=\"1.0\"?>\n\
+             <matl:properties xmlns:matl=\"http://olympus/matl\" xmlns:marker=\"http://olympus/marker\">\n\
+               <matl:group>\n\
+                 <matl:areaInfo>\n\
+                   <matl:numOfXAreas>2</matl:numOfXAreas>\n\
+                   <matl:numOfYAreas>1</matl:numOfYAreas>\n\
+                 </matl:areaInfo>\n\
+                 <matl:area>\n\
+                   <matl:image>{t0}</matl:image>\n\
+                   <matl:xIndex>0</matl:xIndex>\n\
+                   <matl:yIndex>0</matl:yIndex>\n\
+                 </matl:area>\n\
+                 <matl:area>\n\
+                   <matl:image>{t1}</matl:image>\n\
+                   <matl:xIndex>1</matl:xIndex>\n\
+                   <matl:yIndex>0</matl:yIndex>\n\
+                 </matl:area>\n\
+               </matl:group>\n\
+             </matl:properties>\n",
+            t0 = tile0.file_name().unwrap().to_string_lossy(),
+            t1 = tile1.file_name().unwrap().to_string_lossy(),
+        );
+        std::fs::write(&root, xml).unwrap();
+
+        let mut reader = OlympusTileReader::new();
+        assert!(reader.is_this_type_by_name(&root));
+        reader.set_id(&root).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 8, "stitched width should span both tiles");
+        assert_eq!(meta.size_y, 4);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert_eq!(reader.series_count(), 1);
+
+        // Tile bounding boxes recorded in global metadata.
+        assert!(reader
+            .global_metadata()
+            .keys()
+            .any(|k| k.starts_with("tile bounding box")));
+
+        // getSeriesUsedFiles(false) lists the omp2info plus both tiles.
+        let used = reader.get_series_used_files(false);
+        assert!(used.iter().any(|f| f.ends_with("tile0.oir")));
+        assert!(used.iter().any(|f| f.ends_with("tile1.oir")));
+
+        // Full-plane stitch: left half == 10, right half == 20.
+        let buf = reader.open_bytes(0).unwrap();
+        assert_eq!(buf.len(), 8 * 4);
+        for row in 0..4 {
+            for col in 0..8 {
+                let expected = if col < 4 { 10 } else { 20 };
+                assert_eq!(
+                    buf[row * 8 + col], expected,
+                    "pixel ({col},{row}) mismatch"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_file(&tile0);
+        let _ = std::fs::remove_file(&tile1);
     }
 }

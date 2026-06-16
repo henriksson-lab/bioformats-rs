@@ -926,6 +926,7 @@ fn parse_zvi(
         is_indexed: false,
         is_little_endian: true,
         resolution_count: 1,
+        thumbnail: false,
         series_metadata,
         lookup_table: None,
         modulo_z: None,

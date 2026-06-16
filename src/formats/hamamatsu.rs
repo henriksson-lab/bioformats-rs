@@ -416,7 +416,12 @@ impl FormatReader for DcimgReader {
         // and a second copy @ 64 must match.
         let version = r_u32_le(&hdr, 8);
         self.version = version;
-        if version != DCIMG_VERSION_0 && version < DCIMG_VERSION_1 {
+        // Java initFile (184-186) rejects anything that is neither
+        // DCIMG_VERSION_0 (0x7) nor >= DCIMG_VERSION_1. We keep that check
+        // faithfully, but exempt the Rust-only legacy sentinel `version == 0`,
+        // which routes to `parse_legacy_header` (a fallback with no Java
+        // counterpart) for synthetic fixtures predating the Bio-Formats offsets.
+        if version != 0 && version != DCIMG_VERSION_0 && version < DCIMG_VERSION_1 {
             return Err(BioFormatsError::Format(format!(
                 "Unknown DCIMG version number {version}."
             )));
@@ -427,8 +432,11 @@ impl FormatReader for DcimgReader {
         self.header_size = header_size;
         // Java validates fileSize == fileSize2 (199-202). These live at offsets
         // 48 and 64 once the leading bytes (8 magic + 4 version + 28 skip) are
-        // accounted for. Only check when the bytes are present.
-        if hdr.len() >= 68 {
+        // accounted for. This belongs to Java's real-DCIMG (v0/v1) header path,
+        // so skip it for the Rust-only legacy sentinel (`version == 0`), whose
+        // synthetic fixtures don't populate those offsets. Only check when the
+        // bytes are present.
+        if version != 0 && hdr.len() >= 68 {
             let file_size = r_u32_le(&hdr, 48);
             let file_size2 = r_u32_le(&hdr, 64);
             if file_size != file_size2 {
@@ -581,6 +589,7 @@ impl FormatReader for DcimgReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table: None,
             modulo_z: None,

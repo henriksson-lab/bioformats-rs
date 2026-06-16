@@ -934,6 +934,7 @@ impl FormatReader for BioRadReader {
             is_indexed,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table,
             modulo_z: None,

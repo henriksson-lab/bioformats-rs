@@ -187,6 +187,7 @@ fn load_pcx(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         is_indexed,
         is_little_endian: true,
         resolution_count: 1,
+        thumbnail: false,
         series_metadata,
         lookup_table,
         modulo_z: None,

@@ -1445,6 +1445,7 @@ impl FormatReader for GatanReader {
             // (GatanReader.initFile line 242); pixel data is always little-endian.
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table: None,
             modulo_z: None,
@@ -2165,6 +2166,7 @@ impl FormatReader for Dm2Reader {
             // GatanDM2Reader sets m.littleEndian = false.
             is_little_endian: false,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table: None,
             modulo_z: None,

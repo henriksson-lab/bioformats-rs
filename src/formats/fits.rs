@@ -181,6 +181,7 @@ fn fits_series_from_hdu(hdu: FitsHdu) -> FitsSeries {
             is_indexed: false,
             is_little_endian: false, // FITS is big-endian per spec
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: hdu.series_metadata,
             lookup_table: None,
             modulo_z: None,

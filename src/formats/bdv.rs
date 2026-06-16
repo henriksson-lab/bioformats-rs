@@ -42,16 +42,19 @@ use crate::common::reader::FormatReader;
 
 use hdf5_pure_rust::{HyperslabDim, Selection};
 
-/// One core series: a single resolution level of one (series-)setup.
+/// One core series: a single resolution level of one setup at one timepoint.
 ///
-/// Mirrors a `CoreMetadata` entry created in Java `parseStructure`. The
-/// `series_setup_index` is the index of the owning setup within the ordered
-/// list of series-creating setups (Java's `seriesIndex`); `level` is the
-/// resolution level (Java's `requiredResolution`).
+/// Resolutions *and timepoints* are flattened (the default pure-Rust
+/// `ImageReader` configuration): every existing `(setup × timepoint × level)`
+/// coordinate that has a `cells` dataset is exposed as its own single-plane-set
+/// series with `sizeT = 1`. `setup` is the `sNN` group id and `timepoint` is
+/// the `tNNNNN` group number; `level` is the resolution level.
 #[derive(Clone)]
 struct SeriesInfo {
-    /// Index of the owning setup among the series-creating setups.
-    series_setup_index: usize,
+    /// The owning setup's `sNN` id.
+    setup: u32,
+    /// The timepoint (`tNNNNN`) this series belongs to.
+    timepoint: u32,
     /// Resolution level (the `{level}` group number).
     level: u32,
     /// Core metadata for this series.
@@ -99,11 +102,7 @@ pub struct BdvReader {
     timepoint_increment: u32,
     timepoint_use_pattern: bool,
 
-    /// Number of mipmap levels for each series-creating setup, in series order
-    /// (Java `setupResolutionCounts`, but only the kept setups).
-    setup_resolution_counts: Vec<(u32, usize)>,
-
-    /// Flattened series list (one per (setup, level)).
+    /// Flattened series list (one per (setup, timepoint, level)).
     series: Vec<SeriesInfo>,
     current_series: usize,
 }
@@ -121,68 +120,22 @@ impl BdvReader {
             last_timepoint: 0,
             timepoint_increment: 1,
             timepoint_use_pattern: false,
-            setup_resolution_counts: Vec::new(),
             series: Vec::new(),
             current_series: 0,
         }
     }
 
-    /// Map the index of a series-setup back to its actual setup id.
-    /// (Java: `setupAttributeList.keySet().toArray()[seriesIndex]`.)
-    fn setup_id_for_series_setup(&self, series_setup_index: usize) -> Option<u32> {
-        self.setup_attribute_list
-            .get(series_setup_index)
-            .map(|s| s.id)
-    }
-
-    /// Locate the actual `cells` dataset path for plane `no` of the current
-    /// series. Faithful port of Java `getImageData`'s path-resolution logic
-    /// (the channel/timepoint/resolution → setup mapping); the actual pixel
-    /// slicing is then done by the caller against `t.../s.../level/cells`.
-    fn image_data_path(&self, no: u32) -> Result<String> {
+    /// The `cells` dataset path for the current series. Each series corresponds
+    /// to a single concrete `(timepoint, setup, level)` coordinate, so the path
+    /// is fixed regardless of the plane index within the series.
+    fn image_data_path(&self, _no: u32) -> Result<String> {
         let si = self
             .series
             .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?;
-        let meta = &si.meta;
-        let (_z, c, t) =
-            get_zct_coords(meta.dimension_order, meta.size_z, meta.size_c, meta.size_t, no);
-
-        let series_setup_index = si.series_setup_index;
-        let required_resolution = si.level;
-
-        // Java starts from the seriesIndex-th key of setupAttributeList.
-        let mut current_setup = self
-            .setup_id_for_series_setup(series_setup_index)
-            .ok_or_else(|| BioFormatsError::Format("BDV: no setup for series".into()))?;
-
-        if self.size_c > 1 {
-            // Locate the correct setup for the given channel: the
-            // `series_setup_index`-th setup whose "channel" attribute equals
-            // the requested channel's index in `channel_indexes`.
-            let want_channel = self
-                .channel_indexes
-                .get(c as usize)
-                .copied()
-                .ok_or_else(|| BioFormatsError::Format("BDV: channel out of range".into()))?;
-            let mut num_channel_setup_found = 0usize;
-            for setup in &self.setup_attribute_list {
-                if let Some(value) = setup.attribute("channel") {
-                    if value.trim().parse::<u32>().ok() == Some(want_channel) {
-                        if num_channel_setup_found == series_setup_index {
-                            current_setup = setup.id;
-                            break;
-                        }
-                        num_channel_setup_found += 1;
-                    }
-                }
-            }
-        }
-
-        let timepoint = self.first_timepoint + self.timepoint_increment * t;
         Ok(format!(
             "t{:05}/s{:02}/{}/cells",
-            timepoint, current_setup, required_resolution
+            si.timepoint, si.setup, si.level
         ))
     }
 }
@@ -441,19 +394,26 @@ fn get_zct_coords(
 
 /// Resolve `(h5_path, xml_path, xml_string)` from the file the user opened.
 ///
-/// If the user opens the `.xml`, the HDF5 path comes from the `<hdf5>` element
-/// (resolved relative to the XML's directory, mirroring the Java handler which
-/// builds `parent + File.separator + hdf5Contents`). If the user opens the
-/// `.h5`, the companion XML is `basename.xml` in the same directory (Java
-/// `fetchXMLId`).
+/// Two entry points, mirroring Java `initFile`/`fetchXMLId` but more lenient so
+/// a bare `.h5` (no companion XML, or an XML lacking `<hdf5>`) stays usable —
+/// the pure-Rust reader infers structure from the HDF5 groups in that case:
+///
+///   * Opening the `.h5`: that file *is* the HDF5 pixel store. The companion
+///     `basename.xml` (Java `fetchXMLId`) is read for metadata when present but
+///     is optional, as is its `<hdf5>` element.
+///   * Opening the `.xml`: the HDF5 path comes from the `<hdf5>` element
+///     (resolved relative to the XML's directory, mirroring the Java handler
+///     which builds `parent + File.separator + hdf5Contents`). Here the XML and
+///     its `<hdf5>` element are required.
 fn resolve_bdv_paths(path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<String>)> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
 
-    let xml_path = if matches!(ext.as_deref(), Some("h5")) {
-        // fetchXMLId: basename up to the first '.', plus ".xml", same dir.
+    if matches!(ext.as_deref(), Some("h5")) {
+        // The opened .h5 is the pixel store; look for the optional companion
+        // XML (basename up to the first '.', plus ".xml", same dir).
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let base = path
             .file_name()
@@ -464,18 +424,17 @@ fn resolve_bdv_paths(path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<St
             })
             .unwrap_or("");
         let candidate = parent.join(format!("{base}.xml"));
-        if candidate.exists() {
-            candidate
+        let (xml_path, xml_str) = if candidate.exists() {
+            let xml = std::fs::read_to_string(&candidate).ok();
+            (Some(candidate), xml)
         } else {
-            return Err(BioFormatsError::Format(format!(
-                "Unable to locate associated BDV XML: {}",
-                candidate.display()
-            )));
-        }
-    } else {
-        path.to_path_buf()
-    };
+            (None, None)
+        };
+        return Ok((path.to_path_buf(), xml_path, xml_str));
+    }
 
+    // Opening the .xml: the HDF5 location is taken from <hdf5>.
+    let xml_path = path.to_path_buf();
     let xml = std::fs::read_to_string(&xml_path).map_err(BioFormatsError::Io)?;
 
     // The Java handler reads <hdf5> and resolves it relative to the XML dir.
@@ -569,7 +528,6 @@ impl FormatReader for BdvReader {
         self.last_timepoint = 0;
         self.timepoint_increment = 1;
         self.timepoint_use_pattern = false;
-        self.setup_resolution_counts.clear();
         self.series.clear();
         self.current_series = 0;
         Ok(())
@@ -689,13 +647,10 @@ impl FormatReader for BdvReader {
         }
         let mut ome = OmeMetadata::default();
         for si in &self.series {
-            let setup = self.setup_attribute_list.get(si.series_setup_index);
+            let setup = self.setup_attribute_list.iter().find(|s| s.id == si.setup);
             let name = match setup {
-                Some(s) => format!(
-                    "P_t{:05}, W_s{:02}_{}",
-                    self.first_timepoint, s.id, si.level
-                ),
-                None => format!("P_t{:05}, W_s??_{}", self.first_timepoint, si.level),
+                Some(s) => format!("P_t{:05}, W_s{:02}_{}", si.timepoint, s.id, si.level),
+                None => format!("P_t{:05}, W_s{:02}_{}", si.timepoint, si.setup, si.level),
             };
             let (psx, psy, psz) = match si.voxel_size {
                 Some((x, y, z)) => (Some(x), Some(y), Some(z)),
@@ -755,10 +710,14 @@ impl BdvReader {
         self.timepoint_use_pattern = use_pattern;
     }
 
-    /// Faithful port of Java `parseStructure`: walk the HDF5 group tree, count
-    /// resolution levels per setup, and build one core series per
-    /// `(series-setup × resolution-level)` with `sizeT = numTimepoints` and
-    /// `sizeC` collapsed across channel setups. Resolutions are flattened.
+    /// Walk the HDF5 group tree (`tNNNNN/sNN/{level}/cells`) and build one core
+    /// series per existing `(timepoint × setup × resolution-level)` coordinate.
+    ///
+    /// Resolutions *and* timepoints are flattened in the pure-Rust reader's
+    /// default configuration: each series is a single (`sizeT = 1`) volume whose
+    /// dimensions come from its own `cells` dataset shape `[z, y, x]`, not from
+    /// the companion XML's `<size>`. Setups come from the companion XML
+    /// `<ViewSetup>` blocks when present, else from the HDF5 `sNN` groups.
     fn parse_structure(&mut self) -> Result<()> {
         // If no XML setups were parsed, fall back to enumerating root groups.
         if self.setup_attribute_list.is_empty() {
@@ -767,156 +726,100 @@ impl BdvReader {
 
         let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
-        // numTimepoints.
-        let num_timepoints = self.compute_num_timepoints();
-
-        // Walk t/s/level and collect coordinates + per-setup resolution counts.
-        // setup_resolution_counts holds counts for setups seen at firstTimepoint.
-        let mut all_setup_res_counts: Vec<(u32, usize)> = Vec::new();
-        // List of (timepoint, setup_id, level), in t-outer/s-middle/level-inner order.
-        let mut position_list: Vec<(u32, u32, u32)> = Vec::new();
-
+        // Enumerate the timepoints (XML range/pattern) to visit, in order.
+        let mut timepoints: Vec<u32> = Vec::new();
         let mut tp = self.first_timepoint;
         let last = self.last_timepoint.max(self.first_timepoint);
         while tp <= last {
-            let path_to_timepoint = format!("t{tp:05}");
-            let setups = hdf5_members(file, &path_to_timepoint).unwrap_or_default();
-            for setup in &setups {
-                let path_to_setup = format!("{path_to_timepoint}/{setup}");
-                let resolutions = hdf5_members(file, &path_to_setup).unwrap_or_default();
-                // setupResolutionCounts recorded only at the first timepoint.
-                if !resolutions.is_empty() && tp == self.first_timepoint {
-                    if let Some(setup_id) = parse_setup_id(setup) {
-                        if !all_setup_res_counts.iter().any(|(s, _)| *s == setup_id) {
-                            all_setup_res_counts.push((setup_id, resolutions.len()));
-                        }
-                    }
-                }
-                for resolution in &resolutions {
-                    if let (Some(setup_id), Ok(level)) =
-                        (parse_setup_id(setup), resolution.parse::<u32>())
-                    {
-                        position_list.push((tp, setup_id, level));
-                    }
-                }
+            timepoints.push(tp);
+            let next = tp.saturating_add(self.timepoint_increment);
+            if next == tp {
+                break;
             }
-            tp = tp.saturating_add(self.timepoint_increment);
+            tp = next;
         }
 
-        if position_list.is_empty() {
-            return Err(BioFormatsError::Format("No series found in file...".into()));
-        }
-
-        if self.size_c == 0 {
-            self.size_c = 1;
-        }
-        let first_channel_index: Option<u32> = self.channel_indexes.first().copied();
-
-        // Build core series. Only first-timepoint coordinates create series;
-        // for multi-channel datasets only the setup matching the first channel
-        // creates a series (others collapse into sizeC).
+        // Build the flattened series list: setup × timepoint × level. Only
+        // coordinates that actually carry a `cells` dataset become series.
         let mut series: Vec<SeriesInfo> = Vec::new();
-        let mut kept_setup_res_counts: Vec<(u32, usize)> = Vec::new();
-
-        for &(coord_tp, setup_id, level) in &position_list {
-            let cells_path = format!("t{coord_tp:05}/s{setup_id:02}/{level}/cells");
-            if !dataset_exists(file, &cells_path) {
-                continue;
-            }
-            if coord_tp != self.first_timepoint {
-                continue;
-            }
-
-            let setup = self.setup_attribute_list.iter().find(|s| s.id == setup_id);
-            let setup_channel = setup.and_then(|s| s.attribute("channel"));
-
-            // Don't create a new series for each channel.
-            let creates_series = self.size_c == 1
-                || match (setup_channel, first_channel_index) {
-                    (Some(ch), Some(first)) => ch.trim().parse::<u32>().ok() == Some(first),
-                    _ => false,
+        for setup in &self.setup_attribute_list {
+            for &tp in &timepoints {
+                let setup_group = format!("t{tp:05}/s{:02}", setup.id);
+                let mut levels: Vec<u32> = match file
+                    .group(&setup_group)
+                    .ok()
+                    .and_then(|g| hdf5_group_members(&g).ok())
+                {
+                    Some(members) => members.iter().filter_map(|n| n.parse::<u32>().ok()).collect(),
+                    None => continue, // missing view — skip
                 };
+                levels.sort_unstable();
 
-            if !creates_series {
-                continue;
+                for &level in &levels {
+                    let cells_path = format!("{setup_group}/{level}/cells");
+                    if !dataset_exists(file, &cells_path) {
+                        continue;
+                    }
+
+                    // Shape: HDF5 cells dataset is [z, y, x].
+                    let ds = file
+                        .dataset(&cells_path)
+                        .map_err(|e| BioFormatsError::Format(format!("dataset {cells_path}: {e}")))?;
+                    let shape = ds.shape().map_err(|e| {
+                        BioFormatsError::Format(format!("BDV: cannot read shape {cells_path}: {e}"))
+                    })?;
+                    if shape.len() != 3 || shape.iter().any(|&d| d == 0) {
+                        return Err(BioFormatsError::Format(format!(
+                            "BDV: unsupported cells shape {shape:?} for {cells_path}"
+                        )));
+                    }
+                    let size_z = u32::try_from(shape[0])
+                        .map_err(|_| BioFormatsError::Format("BDV Z overflows".into()))?;
+                    let size_y = u32::try_from(shape[1])
+                        .map_err(|_| BioFormatsError::Format("BDV Y overflows".into()))?;
+                    let size_x = u32::try_from(shape[2])
+                        .map_err(|_| BioFormatsError::Format("BDV X overflows".into()))?;
+
+                    let dtype_size = ds.dtype().map(|dt| dt.size()).map_err(|e| {
+                        BioFormatsError::Format(format!("BDV: dtype {cells_path}: {e}"))
+                    })?;
+                    let (pixel_type, bytes_per_sample) = pixel_type_for_size(dtype_size)?;
+
+                    let voxel_size = setup.voxel_size;
+                    let meta_map = self.build_series_metadata(Some(setup), setup.id, tp, level);
+
+                    let meta = ImageMetadata {
+                        size_x,
+                        size_y,
+                        size_z,
+                        size_c: 1,
+                        size_t: 1,
+                        pixel_type,
+                        bits_per_pixel: (bytes_per_sample * 8) as u8,
+                        image_count: size_z,
+                        dimension_order: DimensionOrder::XYZTC,
+                        is_rgb: false,
+                        is_interleaved: false,
+                        is_indexed: true,
+                        is_little_endian: true,
+                        resolution_count: 1,
+                        thumbnail: false,
+                        series_metadata: meta_map,
+                        lookup_table: None,
+                        modulo_z: None,
+                        modulo_c: None,
+                        modulo_t: None,
+                    };
+
+                    series.push(SeriesInfo {
+                        setup: setup.id,
+                        timepoint: tp,
+                        level,
+                        meta,
+                        voxel_size,
+                    });
+                }
             }
-
-            let resolutions_in_this_setup = all_setup_res_counts
-                .iter()
-                .find(|(s, _)| *s == setup_id)
-                .map(|(_, c)| *c)
-                .unwrap_or(1);
-
-            // Track this setup's resolution count (in series order) once.
-            if !kept_setup_res_counts.iter().any(|(s, _)| *s == setup_id) {
-                kept_setup_res_counts.push((setup_id, resolutions_in_this_setup));
-            }
-            let series_setup_index = kept_setup_res_counts
-                .iter()
-                .position(|(s, _)| *s == setup_id)
-                .unwrap_or(0);
-
-            // Shape: HDF5 cells dataset is [z, y, x].
-            let ds = file
-                .dataset(&cells_path)
-                .map_err(|e| BioFormatsError::Format(format!("dataset {cells_path}: {e}")))?;
-            let shape = ds.shape().map_err(|e| {
-                BioFormatsError::Format(format!("BDV: cannot read shape {cells_path}: {e}"))
-            })?;
-            if shape.len() != 3 || shape.iter().any(|&d| d == 0) {
-                return Err(BioFormatsError::Format(format!(
-                    "BDV: unsupported cells shape {shape:?} for {cells_path}"
-                )));
-            }
-            let size_z = u32::try_from(shape[0])
-                .map_err(|_| BioFormatsError::Format("BDV Z overflows".into()))?;
-            let size_y = u32::try_from(shape[1])
-                .map_err(|_| BioFormatsError::Format("BDV Y overflows".into()))?;
-            let size_x = u32::try_from(shape[2])
-                .map_err(|_| BioFormatsError::Format("BDV X overflows".into()))?;
-
-            let dtype_size = ds
-                .dtype()
-                .map(|dt| dt.size())
-                .map_err(|e| BioFormatsError::Format(format!("BDV: dtype {cells_path}: {e}")))?;
-            let (pixel_type, bytes_per_sample) = pixel_type_for_size(dtype_size)?;
-
-            let voxel_size = setup.and_then(|s| s.voxel_size);
-            let meta_map = self.build_series_metadata(setup, setup_id, level);
-
-            let size_c = self.size_c;
-            let image_count = size_c
-                .saturating_mul(num_timepoints)
-                .saturating_mul(size_z);
-
-            let meta = ImageMetadata {
-                size_x,
-                size_y,
-                size_z,
-                size_c,
-                size_t: num_timepoints,
-                pixel_type,
-                bits_per_pixel: (bytes_per_sample * 8) as u8,
-                image_count,
-                dimension_order: DimensionOrder::XYZTC,
-                is_rgb: false,
-                is_interleaved: false,
-                is_indexed: true,
-                is_little_endian: true,
-                resolution_count: 1,
-                series_metadata: meta_map,
-                lookup_table: None,
-                modulo_z: None,
-                modulo_c: None,
-                modulo_t: None,
-            };
-
-            series.push(SeriesInfo {
-                series_setup_index,
-                level,
-                meta,
-                voxel_size,
-            });
         }
 
         if series.is_empty() {
@@ -924,7 +827,6 @@ impl BdvReader {
         }
 
         self.series = series;
-        self.setup_resolution_counts = kept_setup_res_counts;
         Ok(())
     }
 
@@ -935,6 +837,7 @@ impl BdvReader {
         &self,
         setup: Option<&SetupXml>,
         setup_id: u32,
+        timepoint: u32,
         level: u32,
     ) -> HashMap<String, MetadataValue> {
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
@@ -947,8 +850,8 @@ impl BdvReader {
         }
         meta_map.insert("bdv_setup".into(), MetadataValue::Int(setup_id as i64));
         meta_map.insert(
-            "bdv_first_timepoint".into(),
-            MetadataValue::Int(self.first_timepoint as i64),
+            "bdv_timepoint".into(),
+            MetadataValue::Int(timepoint as i64),
         );
         meta_map.insert("bdv_level".into(), MetadataValue::Int(level as i64));
         if let Some(setup) = setup {
@@ -982,20 +885,6 @@ impl BdvReader {
         meta_map
     }
 
-    /// numTimepoints, mirroring Java `parseStructure`'s computation.
-    fn compute_num_timepoints(&self) -> u32 {
-        if self.timepoint_use_pattern && self.last_timepoint > 0 {
-            let mut n = self.last_timepoint - self.first_timepoint + 1;
-            if self.timepoint_increment > 0 {
-                n /= self.timepoint_increment;
-            }
-            n.max(1)
-        } else {
-            let last = self.last_timepoint.max(self.first_timepoint);
-            (last - self.first_timepoint + 1).max(1)
-        }
-    }
-
     /// Fallback when there is no companion XML: enumerate the HDF5 root for
     /// `tNNNNN` timepoint groups and (via the first timepoint) `sNN` setups.
     /// Not present in Java (which requires the XML) but keeps the reader usable
@@ -1014,7 +903,12 @@ impl BdvReader {
             .collect();
         timepoints.sort_unstable();
         if timepoints.is_empty() {
-            return Err(BioFormatsError::Format("No timepoint groups found".into()));
+            // No timepoint groups → there are no `sNN` setup groups to enumerate
+            // either, so report the same "no setups" condition the XML-less path
+            // and the empty-`<ViewSetup>` path use.
+            return Err(BioFormatsError::Format(
+                "BDV: no ViewSetups / setup groups found".into(),
+            ));
         }
         self.first_timepoint = timepoints[0];
         self.last_timepoint = *timepoints.last().unwrap();
@@ -1117,10 +1011,6 @@ impl BdvReader {
     }
 }
 
-/// Parse a setup group name `sNN` to its numeric id.
-fn parse_setup_id(name: &str) -> Option<u32> {
-    name.strip_prefix('s').and_then(|n| n.parse::<u32>().ok())
-}
 
 /// Whether a dataset exists at `path` in `file`.
 fn dataset_exists(file: &hdf5_pure_rust::File, path: &str) -> bool {

@@ -1686,8 +1686,9 @@ fn parse_explicit_pattern_part(part: &str) -> Result<Vec<String>> {
 /// `begin.len() == end.len()` (NOT max width), zero-padding pads to
 /// `end.len()`, alphabetic values are upper/lower-cased per the case of the
 /// first character of `begin`, and the element count is
-/// `(end - begin) / step + 1` (so a descending range with positive step yields
-/// no elements rather than counting down).
+/// `(end - begin) / step + 1`. Java yields no elements for a descending range
+/// (`begin > end`) with a positive step; as a deliberate non-upstream extension
+/// this counts DOWN instead (e.g. `<2-0>` → 2,1,0).
 fn expand_range_block(b: &str, e: &str, s: &str) -> Result<Vec<String>> {
     // Stage 1: numeric (base 10).
     let parsed = match (
@@ -1723,13 +1724,21 @@ fn expand_range_block(b: &str, e: &str, s: &str) -> Result<Vec<String>> {
 
     // count = end.subtract(begin).divide(step).intValue() + 1
     let count = (end - begin) / step + 1;
-    if count <= 0 {
+    // Java's formula yields a non-positive count for a descending range
+    // (begin > end) with a positive step — i.e. an empty expansion. As a
+    // deliberate non-upstream extension we instead count DOWN in that case so
+    // `<2-0>` expands to 2,1,0 (covered by the descending-range reader test).
+    let (count, effective_step) = if count > 0 {
+        (count, step)
+    } else if step > 0 && begin > end {
+        ((begin - end) / step + 1, -step)
+    } else {
         return Ok(Vec::new());
-    }
+    };
     let mut out = Vec::with_capacity(count as usize);
     let lower_first = b.chars().next().is_some_and(|c| c.is_lowercase());
     for i in 0..count {
-        let v = begin + step * i;
+        let v = begin + effective_step * i;
         let mut value = if numeric {
             v.to_string()
         } else {
@@ -3191,9 +3200,12 @@ mod tests {
     }
 
     #[test]
-    fn descending_numeric_range_yields_no_elements() {
-        // Java count = (end-begin)/step+1 = (3-5)/1+1 = -1 -> negative -> empty.
-        assert!(parse_explicit_pattern_part("5-3").unwrap().is_empty());
+    fn descending_numeric_range_counts_down() {
+        // Java's count = (end-begin)/step+1 = (3-5)/1+1 = -1 would yield an empty
+        // expansion. As a deliberate non-upstream extension (see the
+        // `filepattern_reader_expands_descending_ranges` reader test) a descending
+        // range with a positive step instead counts down.
+        assert_eq!(parse_explicit_pattern_part("5-3").unwrap(), ["5", "4", "3"]);
     }
 
     #[test]

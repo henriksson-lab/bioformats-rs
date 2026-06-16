@@ -123,6 +123,7 @@ fn parse_kodak_bip(path: &Path) -> Result<(ImageMetadata, u64)> {
         is_indexed: false,
         is_little_endian: false, // Kodak .bip is big-endian
         resolution_count: 1,
+        thumbnail: false,
         series_metadata: HashMap::new(),
         lookup_table: None,
         modulo_z: None,
@@ -223,6 +224,353 @@ impl FormatReader for KodakBipReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+// ── FujiReader ────────────────────────────────────────────────────────────────
+
+/// Fuji LAS 3000 gel reader, ported from the Java `FujiReader`.
+///
+/// A dataset is a companion pair: a `.inf` ASCII text header describing the
+/// image, and a `.img` file holding a single raw (uncompressed) plane. The
+/// header is split on `\r?\n` lines; the fields Java reads by index are:
+///   line 1  — image name
+///   line 3  — physical width (µm)
+///   line 4  — physical height (µm)
+///   line 5  — bit depth
+///   line 6  — sizeX
+///   line 7  — sizeY
+///   line 10 — acquisition timestamp (`ddd MMM dd HH:mm:ss yyyy`)
+///   line 13 — instrument/microscope model
+pub struct FujiReader {
+    /// Absolute path to the `.inf` header (the `currentId` Java settles on).
+    inf_file: Option<PathBuf>,
+    /// Absolute path to the companion `.img` pixels file.
+    pixels_file: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    image_name: Option<String>,
+    acquisition_date: Option<String>,
+    instrument: Option<String>,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+}
+
+impl FujiReader {
+    pub fn new() -> Self {
+        FujiReader {
+            inf_file: None,
+            pixels_file: None,
+            meta: None,
+            image_name: None,
+            acquisition_date: None,
+            instrument: None,
+            physical_size_x: None,
+            physical_size_y: None,
+        }
+    }
+}
+
+impl Default for FujiReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Side-channel header values that feed OME metadata (kept off `ImageMetadata`).
+struct FujiHeader {
+    pixels_file: PathBuf,
+    image_name: Option<String>,
+    acquisition_date: Option<String>,
+    instrument: Option<String>,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+}
+
+/// Replace the extension of `path` (in a confined manner) with `ext`, returning
+/// the sibling path. Mirrors Java's `baseName + "." + ext` companion lookups.
+fn fuji_sibling(path: &Path, ext: &str) -> Option<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path.file_stem()?.to_str()?;
+    crate::common::path::confined_join(parent, &format!("{stem}.{ext}"))
+}
+
+/// Map a sample byte count to an unsigned, non-floating-point pixel type,
+/// mirroring Java's `FormatTools.pixelTypeFromBytes(bytes, false, false)`.
+fn fuji_pixel_type_from_bytes(bytes: usize) -> Result<PixelType> {
+    match bytes {
+        1 => Ok(PixelType::Uint8),
+        2 => Ok(PixelType::Uint16),
+        4 => Ok(PixelType::Uint32),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "Fuji LAS: unsupported pixel size of {bytes} byte(s)"
+        ))),
+    }
+}
+
+/// Convert a Fuji `ddd MMM dd HH:mm:ss yyyy` timestamp (e.g.
+/// "Wed Jul 25 14:00:00 2007") to ISO-8601, mirroring Java's
+/// `DateTools.formatDate(timestamp, DATE_FORMAT)`. Returns `None` if it cannot
+/// be parsed (Java's formatDate likewise yields null).
+fn fuji_format_date(line: &str) -> Option<String> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    // Expect: <weekday> <month> <day> <HH:mm:ss> <year>
+    if tokens.len() != 5 {
+        return None;
+    }
+    let month = match tokens[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: u32 = tokens[2].parse().ok()?;
+    let year: i32 = tokens[4].parse().ok()?;
+    let time = tokens[3];
+    let time_parts: Vec<&str> = time.split(':').collect();
+    if time_parts.len() != 3 || time_parts.iter().any(|p| p.parse::<u32>().is_err()) {
+        return None;
+    }
+    Some(format!("{year:04}-{month:02}-{day:02}T{time}"))
+}
+
+/// Port of Java `FujiReader.initFile`: parse the `.inf` header, locate the
+/// `.img` pixels file, and build the core metadata plus OME-side fields.
+fn parse_fuji(inf_file: &Path) -> Result<(ImageMetadata, FujiHeader)> {
+    let pixels_file = fuji_sibling(inf_file, "img").ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Fuji LAS: could not locate companion .img file".into())
+    })?;
+
+    let text = std::fs::read_to_string(inf_file).map_err(BioFormatsError::Io)?;
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+
+    // Java indexes lines[5..13] directly; guard the highest index it touches.
+    if lines.len() <= 13 {
+        return Err(BioFormatsError::Format(
+            "Fuji LAS: .inf header has too few lines".into(),
+        ));
+    }
+
+    let bits: u32 = lines[5]
+        .trim()
+        .parse()
+        .map_err(|_| BioFormatsError::Format("Fuji LAS: invalid bit depth in .inf header".into()))?;
+    let pixel_type = fuji_pixel_type_from_bytes((bits / 8) as usize)?;
+
+    let size_x: u32 = lines[6]
+        .trim()
+        .parse()
+        .map_err(|_| BioFormatsError::Format("Fuji LAS: invalid sizeX in .inf header".into()))?;
+    let size_y: u32 = lines[7]
+        .trim()
+        .parse()
+        .map_err(|_| BioFormatsError::Format("Fuji LAS: invalid sizeY in .inf header".into()))?;
+
+    let mut series_metadata = HashMap::new();
+    // addGlobalMetaList("Line", line): bare key first, then "Line #2", "Line #3"...
+    for (i, line) in lines.iter().enumerate() {
+        let key = if i == 0 {
+            "Line".to_string()
+        } else {
+            format!("Line #{}", i + 1)
+        };
+        series_metadata.insert(key, MetadataValue::String((*line).to_string()));
+    }
+
+    let meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z: 1,
+        size_c: 1,
+        size_t: 1,
+        pixel_type,
+        bits_per_pixel: bits as u8,
+        image_count: 1,
+        dimension_order: DimensionOrder::XYCZT,
+        is_rgb: false,
+        is_interleaved: false,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        thumbnail: false,
+        series_metadata,
+        lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
+    };
+
+    let image_name = Some(lines[1].to_string());
+    let acquisition_date = fuji_format_date(lines[10].trim());
+    let physical_size_x = lines[3].trim().parse::<f64>().ok();
+    let physical_size_y = lines[4].trim().parse::<f64>().ok();
+    let instrument = Some(lines[13].to_string());
+
+    let header = FujiHeader {
+        pixels_file,
+        image_name,
+        acquisition_date,
+        instrument,
+        physical_size_x,
+        physical_size_y,
+    };
+    Ok((meta, header))
+}
+
+impl FormatReader for FujiReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // Java accepts both .img and .inf, but only when the companion exists
+        // (isThisType(name, open=true)). .img is shared with other readers, so
+        // the companion-existence check is what disambiguates.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("inf") => fuji_sibling(path, "img").is_some_and(|p| p.exists()),
+            Some("img") => fuji_sibling(path, "inf").is_some_and(|p| p.exists()),
+            _ => false,
+        }
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // Mirrors Java isThisType(RandomAccessInputStream) returning false.
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        // Java initFile redirects to the .inf companion when given the .img.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        let inf_file = if ext.as_deref() == Some("inf") {
+            path.to_path_buf()
+        } else {
+            fuji_sibling(path, "inf").ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(
+                    "Fuji LAS: could not locate companion .inf header".into(),
+                )
+            })?
+        };
+
+        let (meta, header) = parse_fuji(&inf_file)?;
+        self.inf_file = Some(inf_file);
+        self.pixels_file = Some(header.pixels_file);
+        self.image_name = header.image_name;
+        self.acquisition_date = header.acquisition_date;
+        self.instrument = header.instrument;
+        self.physical_size_x = header.physical_size_x;
+        self.physical_size_y = header.physical_size_y;
+        self.meta = Some(meta);
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inf_file = None;
+        self.pixels_file = None;
+        self.meta = None;
+        self.image_name = None;
+        self.acquisition_date = None;
+        self.instrument = None;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        1
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let bps = meta.pixel_type.bytes_per_sample();
+        let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
+        let path = self
+            .pixels_file
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
+        let mut buf = vec![0u8; plane_bytes];
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        Ok(buf)
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let full = self.open_bytes(plane_index)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("Fuji LAS", &full, meta, 1, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(img) = ome.images.first_mut() {
+            img.name = self.image_name.clone();
+            img.acquisition_date = self.acquisition_date.clone();
+            img.physical_size_x = self.physical_size_x;
+            img.physical_size_y = self.physical_size_y;
+            // MetadataLevel != MINIMUM: record the microscope model.
+            if let Some(instrument) = &self.instrument {
+                ome.instruments
+                    .push(crate::common::ome_metadata::OmeInstrument {
+                        id: Some("Instrument:0".to_string()),
+                        microscope_model: Some(instrument.clone()),
+                        ..Default::default()
+                    });
+                img.instrument_ref = Some(0);
+            }
+        }
+        Some(ome)
     }
 }
 
@@ -360,6 +708,7 @@ fn new_pict_meta(
         is_indexed,
         is_little_endian: false,
         resolution_count: 1,
+        thumbnail: false,
         series_metadata,
         lookup_table,
         modulo_z: None,
@@ -1230,5 +1579,114 @@ mod tests {
         );
 
         std::fs::remove_file(path).ok();
+    }
+
+    fn fuji_tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bioformats_fuji_{}_{}",
+            name,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Build a minimal but Java-shaped 14-line `.inf` header. Index meanings:
+    /// 1=name, 3=physW, 4=physH, 5=bits, 6=sizeX, 7=sizeY, 10=date, 13=model.
+    fn fuji_inf(name: &str, phys_w: &str, phys_h: &str, bits: u32, x: u32, y: u32) -> String {
+        let mut lines = vec![String::new(); 14];
+        lines[1] = name.to_string();
+        lines[3] = phys_w.to_string();
+        lines[4] = phys_h.to_string();
+        lines[5] = bits.to_string();
+        lines[6] = x.to_string();
+        lines[7] = y.to_string();
+        lines[10] = "Wed Jul 25 14:00:00 2007".to_string();
+        lines[13] = "LAS-3000".to_string();
+        // Use CRLF to exercise the \r? line splitting.
+        lines.join("\r\n")
+    }
+
+    #[test]
+    fn fuji_set_id_parses_header_and_reads_plane() {
+        let dir = fuji_tmp_dir("roundtrip");
+        let inf = dir.join("gel.inf");
+        let img = dir.join("gel.img");
+
+        // 16-bit, 3x2 = 6 samples => 12 bytes of little-endian pixel data.
+        std::fs::write(&inf, fuji_inf("my gel", "10.5", "12.25", 16, 3, 2)).unwrap();
+        let pixels: Vec<u8> = (0u8..12).collect();
+        std::fs::write(&img, &pixels).unwrap();
+
+        let mut reader = FujiReader::new();
+        // Detection must be companion-driven: .img + .inf both present.
+        assert!(reader.is_this_type_by_name(&img));
+        assert!(reader.is_this_type_by_name(&inf));
+        assert!(!reader.is_this_type_by_bytes(&[0u8; 16]));
+
+        // set_id given the .img redirects to the .inf header.
+        reader.set_id(&img).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y), (3, 2));
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 1);
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert_eq!(meta.bits_per_pixel, 16);
+        assert!(meta.is_little_endian);
+        // addGlobalMetaList("Line", ...) numbering: bare key then "Line #N".
+        // MetadataValue has no PartialEq, so compare via its Display form.
+        assert_eq!(
+            meta.series_metadata.get("Line").map(|v| v.to_string()),
+            Some(String::new())
+        );
+        assert_eq!(
+            meta.series_metadata.get("Line #2").map(|v| v.to_string()),
+            Some("my gel".to_string())
+        );
+
+        // Whole plane reads back verbatim.
+        assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+        // Region crop: x=1,y=0,w=2,h=1 => samples 1,2 => bytes [2,3,4,5].
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 2, 1).unwrap(),
+            vec![2, 3, 4, 5]
+        );
+        assert!(matches!(
+            reader.open_bytes(1),
+            Err(BioFormatsError::PlaneOutOfRange(1))
+        ));
+
+        // OME metadata side-channel fields.
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        assert_eq!(image.name.as_deref(), Some("my gel"));
+        assert_eq!(
+            image.acquisition_date.as_deref(),
+            Some("2007-07-25T14:00:00")
+        );
+        assert_eq!(image.physical_size_x, Some(10.5));
+        assert_eq!(image.physical_size_y, Some(12.25));
+        assert_eq!(image.instrument_ref, Some(0));
+        assert_eq!(
+            ome.instruments[0].microscope_model.as_deref(),
+            Some("LAS-3000")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fuji_detection_requires_companion() {
+        let dir = fuji_tmp_dir("nocompanion");
+        let img = dir.join("lonely.img");
+        std::fs::write(&img, [0u8; 8]).unwrap();
+
+        // No .inf companion => not a Fuji dataset (the .img extension is shared).
+        let reader = FujiReader::new();
+        assert!(!reader.is_this_type_by_name(&img));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -162,6 +162,7 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
         is_indexed,
         is_little_endian: little,
         resolution_count: 1,
+        thumbnail: false,
         series_metadata,
         lookup_table,
         modulo_z: None,

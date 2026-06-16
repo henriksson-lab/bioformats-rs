@@ -981,6 +981,8 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         is_indexed,
         is_little_endian: true,
         resolution_count: n_resolutions as u32,
+        // Level 0 is the full-resolution primary (Java ms0.thumbnail = false).
+        thumbnail: false,
         series_metadata: meta_map,
         lookup_table,
         modulo_z: None,
@@ -1013,6 +1015,10 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         )?;
         lvl.image_count = checked_image_count(lvl.size_z, lvl.size_c, lvl.size_t, "resolution")?;
         lvl.resolution_count = n_resolutions as u32;
+        // Java ImarisHDFReader.initFile line 301: every sub-resolution level
+        // (i >= 1) is flagged as a thumbnail, whether it later collapses into
+        // the pyramid or splits off as its own series.
+        lvl.thumbnail = true;
         resolutions.push(lvl);
     }
 

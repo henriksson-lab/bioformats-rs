@@ -481,6 +481,7 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
         is_indexed: false,
         is_little_endian,
         resolution_count: 1,
+        thumbnail: false,
         series_metadata: meta_map,
         lookup_table: None,
         modulo_z: None,

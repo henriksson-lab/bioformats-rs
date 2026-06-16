@@ -1372,6 +1372,7 @@ impl SdtReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: meta_map,
             lookup_table: None,
             modulo_z: None,
@@ -1394,7 +1395,7 @@ impl FormatReader for SdtReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("sdt") | Some("spc"))
+        matches!(ext.as_deref(), Some("sdt"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -1815,6 +1816,7 @@ impl FormatReader for SdtReader {
                 is_indexed: false,
                 is_little_endian: true,
                 resolution_count: 1,
+                thumbnail: false,
                 series_metadata: meta_map,
                 lookup_table: None,
                 modulo_z: None,
@@ -2984,6 +2986,7 @@ impl FormatReader for LiFlimReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: Some(ModuloAnnotation {

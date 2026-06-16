@@ -45,6 +45,15 @@ pub trait FormatReader: Send + Sync {
         0
     }
 
+    /// Whether the current series is a low-resolution thumbnail/preview rather
+    /// than full-resolution image data. Mirrors Java
+    /// `IFormatReader.isThumbnailSeries()`. The default reads
+    /// [`ImageMetadata::thumbnail`]; readers that flag thumbnail series (e.g.
+    /// Imaris collapsed sub-resolutions) populate that field.
+    fn is_thumbnail_series(&self) -> bool {
+        self.metadata().thumbnail
+    }
+
     /// Return the colour lookup table that applies to `plane_index`'s channel,
     /// if the image is indexed.
     ///
@@ -140,5 +149,65 @@ mod tests {
     fn default_ome_metadata_returns_none_for_uninitialized_metadata() {
         let reader = UninitializedReader;
         assert!(reader.ome_metadata().is_none());
+    }
+
+    /// Minimal reader that returns a caller-supplied `ImageMetadata`, used to
+    /// exercise the default trait accessors that read from it.
+    struct MetaReader(ImageMetadata);
+
+    impl FormatReader for MetaReader {
+        fn is_this_type_by_name(&self, _path: &Path) -> bool {
+            false
+        }
+        fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+            false
+        }
+        fn set_id(&mut self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn series_count(&self) -> usize {
+            1
+        }
+        fn set_series(&mut self, _series: usize) -> Result<()> {
+            Ok(())
+        }
+        fn series(&self) -> usize {
+            0
+        }
+        fn metadata(&self) -> &ImageMetadata {
+            &self.0
+        }
+        fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+            Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        }
+        fn open_bytes_region(
+            &mut self,
+            plane_index: u32,
+            _x: u32,
+            _y: u32,
+            _w: u32,
+            _h: u32,
+        ) -> Result<Vec<u8>> {
+            Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        }
+        fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+            Err(BioFormatsError::PlaneOutOfRange(plane_index))
+        }
+    }
+
+    #[test]
+    fn is_thumbnail_series_reflects_metadata_flag() {
+        // Default ImageMetadata is a full-resolution (non-thumbnail) series.
+        let full = MetaReader(ImageMetadata::default());
+        assert!(!full.0.thumbnail);
+        assert!(!full.is_thumbnail_series());
+
+        let mut meta = ImageMetadata::default();
+        meta.thumbnail = true;
+        let thumb = MetaReader(meta);
+        assert!(thumb.is_thumbnail_series());
     }
 }

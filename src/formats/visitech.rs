@@ -440,6 +440,7 @@ impl FormatReader for VisitechReader {
                 is_indexed: false,
                 is_little_endian: true,
                 resolution_count: 1,
+                thumbnail: false,
                 series_metadata: sm,
                 lookup_table: None,
                 modulo_z: None,

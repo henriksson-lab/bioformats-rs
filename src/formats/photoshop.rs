@@ -1327,6 +1327,7 @@ fn finish_psd(
         is_indexed,
         is_little_endian: false, // PSD is big-endian
         resolution_count: 1,
+        thumbnail: false,
         series_metadata,
         lookup_table,
         modulo_z: None,

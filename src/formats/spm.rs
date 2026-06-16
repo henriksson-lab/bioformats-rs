@@ -1990,6 +1990,7 @@ impl FormatReader for PicoQuantReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: None,
@@ -2232,6 +2233,7 @@ fn parse_strict_spm_raw(
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
@@ -2510,6 +2512,7 @@ impl FormatReader for RhkReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: None,
@@ -2809,6 +2812,7 @@ impl QuesantReader {
                 is_indexed: false,
                 is_little_endian: true,
                 resolution_count: 1,
+                thumbnail: false,
                 series_metadata,
                 lookup_table: None,
                 modulo_z: None,
@@ -3348,6 +3352,7 @@ impl FormatReader for WatopReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: None,
@@ -3564,6 +3569,7 @@ impl FormatReader for VgSamReader {
             is_indexed: false,
             is_little_endian: false,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: None,
@@ -3776,6 +3782,7 @@ impl FormatReader for UbmReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: None,
@@ -4009,6 +4016,7 @@ impl FormatReader for SeikoReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata,
             lookup_table: None,
             modulo_z: None,
@@ -4105,5 +4113,448 @@ impl FormatReader for SeikoReader {
         } else {
             Ok(())
         }
+    }
+}
+
+// ===========================================================================
+// Binary reader — PicoQuant Bin (.bin FLIM histogram cube)
+// ===========================================================================
+
+/// PicoQuant `.bin` FLIM reader.
+///
+/// Faithful port of Java Bio-Formats `PQBinReader`. The format holds a FLIM
+/// data cube `(x, y, t)` where each pixel's decay (all `timeBins` values) is
+/// stored contiguously. The 20-byte little-endian header is:
+///   `sizeX:i32`, `sizeY:i32`, `pixResol:f32` (µm), `sizeT:i32`, then a
+///   trailing `timeResol:f32` (ns) is read from the stream during init (the
+///   `isThisType` check stops after `sizeT`). Pixels are `UINT32`.
+///
+/// Each output plane corresponds to a single time bin (an `(x, y)` slice).
+pub struct PqBinReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    /// Number of time bins in the lifetime histogram (mirrors Java `timeBins`).
+    time_bins: u32,
+    /// Default number of bins kept in the load buffer (mirrors Java `blockLength`).
+    block_length: u32,
+}
+
+impl PqBinReader {
+    /// 20-byte little-endian header (mirrors Java `HEADER_SIZE`).
+    const HEADER_SIZE: usize = 20;
+
+    pub fn new() -> Self {
+        PqBinReader {
+            path: None,
+            meta: None,
+            time_bins: 0,
+            block_length: 0,
+        }
+    }
+
+    /// Mirrors Java `isThisType(RandomAccessInputStream)`.
+    ///
+    /// Reads the little-endian header and accepts the file only when
+    /// `sizeX * sizeY * sizeT * 4 + HEADER_SIZE == fileLength`. This is strict
+    /// enough to reject arbitrary `.bin` files (`suffixSufficient = false`).
+    fn is_this_type(header: &[u8], file_length: u64) -> bool {
+        const BPP: i64 = 4; // FormatTools.getBytesPerPixel(UINT32)
+        // Header: sizeX:i32, sizeY:i32, resolution:f32 (skipped), sizeT:i32.
+        if header.len() < 16 {
+            return false;
+        }
+        let size_x = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let size_y = i32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        // header[8..12] is the time-axis resolution float (readFloat, value unused here)
+        let size_t = i32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+
+        // Java multiplies as 32-bit ints; replicate the wrapping product so a
+        // forged header cannot match via 64-bit promotion.
+        let product = (size_x as i32)
+            .wrapping_mul(size_y as i32)
+            .wrapping_mul(size_t as i32)
+            .wrapping_mul(BPP as i32);
+        (product as i64 + Self::HEADER_SIZE as i64) == file_length as i64
+    }
+
+    /// Mirrors Java `initFile(String)`: parses the header and builds metadata.
+    fn init_file(&mut self, path: &Path) -> Result<()> {
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if data.len() < Self::HEADER_SIZE {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant Bin file is shorter than the 20-byte header".into(),
+            ));
+        }
+
+        // Header (little-endian).
+        let size_x = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let size_y = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let pix_resol = f32::from_le_bytes([data[8], data[9], data[10], data[11]]); // µm
+        let size_t = i32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let time_resol = f32::from_le_bytes([data[16], data[17], data[18], data[19]]); // ns
+
+        if size_x <= 0 || size_y <= 0 || size_t <= 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant Bin header contains invalid dimensions".into(),
+            ));
+        }
+        let size_x = size_x as u32;
+        let size_y = size_y as u32;
+        let size_t = size_t as u32;
+
+        // Verify the declared cube actually fits the file (Java relies on the
+        // isThisType length check; we re-validate so open_bytes is bounded).
+        let expected = (Self::HEADER_SIZE as u64)
+            .checked_add(size_x as u64 * size_y as u64 * size_t as u64 * 4)
+            .ok_or_else(|| BioFormatsError::Format("PicoQuant Bin size overflows".into()))?;
+        if (data.len() as u64) < expected {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "PicoQuant Bin pixel payload is shorter than declared cube {size_x}x{size_y}x{size_t}"
+            )));
+        }
+
+        self.time_bins = size_t;
+
+        // moduloT: lifetime sub-dimension along T, step converted to ps.
+        let step = (time_resol as f64) * 1000.0; // Convert to ps
+        let modulo_t = crate::common::metadata::ModuloAnnotation {
+            parent_dimension: "T".to_string(),
+            modulo_type: "lifetime".to_string(),
+            start: 0.0,
+            step,
+            end: step * (size_t as f64 - 1.0),
+            unit: "ps".to_string(),
+            labels: Vec::new(),
+        };
+
+        // blockLength selection (mirrors Java exactly).
+        let size_threshold: u64 = 128 * 128 * 1024; // arbitrary buffer size limit
+        let mut block_length: u32 = 2048; // default No of bins in buffer
+        while (block_length as u64) * (size_x as u64) * (size_y as u64) > size_threshold {
+            block_length /= 2;
+        }
+        if block_length > self.time_bins {
+            block_length = self.time_bins;
+        }
+        self.block_length = block_length;
+
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert(
+            "Physical Size X (in um)".to_string(),
+            MetadataValue::Float(pix_resol as f64),
+        );
+        series_metadata.insert(
+            "Physical Size Y (in um)".to_string(),
+            MetadataValue::Float(pix_resol as f64),
+        );
+        series_metadata.insert(
+            "Time Resolution (in ns)".to_string(),
+            MetadataValue::Float(time_resol as f64),
+        );
+
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z: 1,
+            size_c: 1,
+            size_t,
+            pixel_type: PixelType::Uint32,
+            bits_per_pixel: 32,
+            image_count: size_t,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            thumbnail: false,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: Some(modulo_t),
+        });
+        Ok(())
+    }
+
+    /// Reorder one time bin's `(x, y)` plane out of the contiguous-decay cube.
+    ///
+    /// Mirrors the data layout used by Java `openBytes`: for pixel `(col, row)`
+    /// the decay of `timeBins` UINT32 values is stored contiguously, so plane
+    /// `time_bin` at `(col, row)` sits at file byte offset
+    /// `HEADER + ((row*sizeX + col)*timeBins + time_bin) * bpp`.
+    fn plane_for_time_bin(&self, time_bin: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        const BPP: usize = 4;
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        let time_bins = self.time_bins as usize;
+
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        // Read the whole row of decays for each image row, then pick the bin.
+        let row_decay_bytes = BPP * time_bins * size_x;
+        let mut row_buf = vec![0u8; row_decay_bytes];
+        let mut out = vec![0u8; size_x * size_y * BPP];
+
+        f.seek(SeekFrom::Start(Self::HEADER_SIZE as u64))
+            .map_err(BioFormatsError::Io)?;
+        for row in 0..size_y {
+            f.read_exact(&mut row_buf).map_err(BioFormatsError::Io)?;
+            for col in 0..size_x {
+                let output = (row * size_x + col) * BPP;
+                let input = (col * time_bins + time_bin as usize) * BPP;
+                out[output..output + BPP].copy_from_slice(&row_buf[input..input + BPP]);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Default for PqBinReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for PqBinReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // Java sets suffixSufficient = false, so name alone never suffices;
+        // we still gate on the `.bin` extension for the name-based pre-filter.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("bin"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // The Java magic check needs the total file length, which the
+        // header-only API cannot supply. Returning false here means detection
+        // falls through to set_id, which performs the strict length check.
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if !Self::is_this_type(&data, data.len() as u64) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "PicoQuant Bin header does not match sizeX*sizeY*sizeT*4 + 20 == file length".into(),
+            ));
+        }
+        self.init_file(path)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        // init preLoading (mirrors Java close(fileOnly=false)).
+        self.path = None;
+        self.meta = None;
+        self.time_bins = 0;
+        self.block_length = 0;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        usize::from(self.meta.is_some())
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        if s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        // Plane index == time bin (mirrors Java `int timeBin = no;`).
+        self.plane_for_time_bin(plane_index)
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let full = self.open_bytes(plane_index)?;
+        crop_full_plane("PicoQuant Bin", &full, &meta, 1, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn resolution_count(&self) -> usize {
+        1
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level != 0 {
+            Err(BioFormatsError::Format(format!(
+                "resolution {} out of range",
+                level
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod pqbin_tests {
+    use super::*;
+
+    /// Build a synthetic PicoQuant Bin cube to the Java magic/layout.
+    ///
+    /// Layout: header (sizeX:i32, sizeY:i32, pixResol:f32, sizeT:i32,
+    /// timeResol:f32), then for each (row, col) a contiguous decay of
+    /// `size_t` UINT32 values. Pixel value encodes (col, row, t) so plane
+    /// reordering can be verified deterministically.
+    fn synth_pqbin(size_x: u32, size_y: u32, size_t: u32, time_resol: f32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(size_x as i32).to_le_bytes());
+        data.extend_from_slice(&(size_y as i32).to_le_bytes());
+        data.extend_from_slice(&(0.25f32).to_le_bytes()); // pixResol µm
+        data.extend_from_slice(&(size_t as i32).to_le_bytes());
+        data.extend_from_slice(&time_resol.to_le_bytes()); // timeResol ns
+        for row in 0..size_y {
+            for col in 0..size_x {
+                for t in 0..size_t {
+                    let v: u32 = (col << 20) | (row << 10) | t;
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        data
+    }
+
+    fn write_temp(name: &str, data: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_pqbin_{}_{}.bin",
+            std::process::id(),
+            name
+        ));
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    #[test]
+    fn is_this_type_strict_length_check() {
+        let good = synth_pqbin(3, 2, 4, 0.05);
+        assert!(PqBinReader::is_this_type(&good, good.len() as u64));
+
+        // Truncated cube must be rejected.
+        let mut bad = good.clone();
+        bad.truncate(bad.len() - 4);
+        assert!(!PqBinReader::is_this_type(&bad, bad.len() as u64));
+
+        // Arbitrary .bin garbage of the same length must be rejected (the
+        // header dimensions won't satisfy the size equation).
+        let garbage = vec![0xABu8; good.len()];
+        assert!(!PqBinReader::is_this_type(&garbage, garbage.len() as u64));
+    }
+
+    #[test]
+    fn set_id_and_metadata() {
+        let data = synth_pqbin(5, 3, 7, 0.04);
+        let path = write_temp("meta", &data);
+
+        let mut reader = PqBinReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 5);
+        assert_eq!(meta.size_y, 3);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 7);
+        assert_eq!(meta.image_count, 7);
+        assert_eq!(meta.pixel_type, PixelType::Uint32);
+        assert!(meta.is_little_endian);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
+
+        let modulo = meta.modulo_t.as_ref().expect("moduloT present");
+        assert_eq!(modulo.parent_dimension, "T");
+        assert_eq!(modulo.unit, "ps");
+        // step = timeResol(ns) * 1000 = 0.04 * 1000 = 40 ps
+        assert!((modulo.step - 40.0).abs() < 1e-4);
+        assert!((modulo.end - 40.0 * 6.0).abs() < 1e-3);
+
+        reader.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_bytes_reorders_decay_cube() {
+        let (sx, sy, st) = (5u32, 3u32, 7u32);
+        let data = synth_pqbin(sx, sy, st, 0.04);
+        let path = write_temp("planes", &data);
+
+        let mut reader = PqBinReader::new();
+        reader.set_id(&path).unwrap();
+
+        for t in 0..st {
+            let plane = reader.open_bytes(t).unwrap();
+            assert_eq!(plane.len() as u32, sx * sy * 4);
+            for row in 0..sy {
+                for col in 0..sx {
+                    let off = ((row * sx + col) * 4) as usize;
+                    let got = u32::from_le_bytes([
+                        plane[off],
+                        plane[off + 1],
+                        plane[off + 2],
+                        plane[off + 3],
+                    ]);
+                    let expected = (col << 20) | (row << 10) | t;
+                    assert_eq!(got, expected, "plane {t} pixel ({col},{row})");
+                }
+            }
+        }
+
+        // Region crop of plane 2 returns the requested sub-rectangle.
+        let region = reader.open_bytes_region(2, 1, 1, 2, 2).unwrap();
+        assert_eq!(region.len(), 2 * 2 * 4);
+        let first = u32::from_le_bytes([region[0], region[1], region[2], region[3]]);
+        assert_eq!(first, (1u32 << 20) | (1u32 << 10) | 2u32);
+
+        // Out-of-range plane rejected.
+        assert!(reader.open_bytes(st).is_err());
+
+        reader.close().unwrap();
+        std::fs::remove_file(&path).ok();
     }
 }

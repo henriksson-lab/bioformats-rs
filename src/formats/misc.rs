@@ -425,13 +425,13 @@ impl FormatReader for QuickTimeReader {
             QuickTimeCodec::Jpeg => decode_quicktime_jpeg_sample(sample, meta, sample_index as u32),
             QuickTimeCodec::Png => decode_quicktime_png_sample(sample, meta, sample_index as u32),
             QuickTimeCodec::Rpza => {
-                // Java QTReader inverts the RPZA-decoded plane in place
-                // (`t[i] = 255 - t[i]`, QTReader.java lines 204-210) before
-                // returning, a quirk specific to QTReader (the shared
-                // RPZACodec does not invert).
-                let mut out = quicktime_decompress_rpza(sample, meta, sample_index as u32)?;
-                quicktime_invert_pixels(&mut out);
-                Ok(out)
+                // Java QTReader's RPZA branch (QTReader.java lines 204-210) does
+                // `t[i] = (byte)(255 - t[i])` on the decoded plane `t`, but then
+                // `return buf;` — it returns the (untouched) caller buffer, never
+                // copying the inverted `t` into it. So the inversion is dead code
+                // with no observable effect on the output, and the un-inverted
+                // RPZA pixels are what callers actually receive. Do NOT invert.
+                quicktime_decompress_rpza(sample, meta, sample_index as u32)
             }
             QuickTimeCodec::AnimationRle { depth } => {
                 let mut previous = None;
@@ -2676,6 +2676,7 @@ fn parse_quicktime_track(
                 is_indexed: false,
                 is_little_endian: false,
                 resolution_count: 1,
+                thumbnail: false,
                 series_metadata: HashMap::new(),
                 lookup_table: None,
                 modulo_z: None,
@@ -2700,6 +2701,7 @@ fn parse_quicktime_track(
                 is_indexed: false,
                 is_little_endian: false,
                 resolution_count: 1,
+                thumbnail: false,
                 series_metadata: HashMap::new(),
                 lookup_table: None,
                 modulo_z: None,
@@ -2724,6 +2726,7 @@ fn parse_quicktime_track(
                 is_indexed: false,
                 is_little_endian: false,
                 resolution_count: 1,
+                thumbnail: false,
                 series_metadata: HashMap::new(),
                 lookup_table: None,
                 modulo_z: None,
@@ -2992,6 +2995,7 @@ fn parse_quicktime_track(
         is_indexed: false,
         is_little_endian: false,
         resolution_count: 1,
+        thumbnail: false,
         series_metadata: metadata,
         lookup_table: None,
         modulo_z: None,
@@ -4789,6 +4793,7 @@ impl MincReader {
             // Pixel bytes have been normalised to little-endian above.
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
@@ -5015,6 +5020,7 @@ impl FormatReader for MincReader {
             // Java sets littleEndian = isMINC2.
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
@@ -6270,6 +6276,7 @@ impl FormatReader for Jpeg2000Reader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
@@ -6562,6 +6569,7 @@ impl FormatReader for SmCameraReader {
             is_indexed: false,
             is_little_endian: false,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
@@ -6747,6 +6755,7 @@ impl FormatReader for TextReader {
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
+            thumbnail: false,
             series_metadata: HashMap::new(),
             lookup_table: None,
             modulo_z: None,
