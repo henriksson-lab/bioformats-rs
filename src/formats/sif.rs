@@ -279,16 +279,16 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
     })
 }
 
-pub struct AndorSifReader {
+pub struct SifReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
     timestamps: Vec<f64>,
 }
 
-impl AndorSifReader {
+impl SifReader {
     pub fn new() -> Self {
-        AndorSifReader {
+        SifReader {
             path: None,
             meta: None,
             data_offset: 0,
@@ -297,13 +297,13 @@ impl AndorSifReader {
     }
 }
 
-impl Default for AndorSifReader {
+impl Default for SifReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for AndorSifReader {
+impl FormatReader for SifReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
@@ -500,7 +500,7 @@ mod tests {
         data.extend_from_slice(&[0u8; FOOTER_SIZE as usize]);
         std::fs::write(&path, data).unwrap();
 
-        let mut reader = AndorSifReader::new();
+        let mut reader = SifReader::new();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn sif_detection_matches_java_magic_at_start() {
-        let reader = AndorSifReader::new();
+        let reader = SifReader::new();
         assert!(reader.is_this_type_by_bytes(b"Andor Technology"));
         assert!(!reader.is_this_type_by_bytes(b"prefix Andor Technology"));
     }

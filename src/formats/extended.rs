@@ -623,15 +623,15 @@ impl FormatReader for DngReader {
 // 2. Akoya/PerkinElmer Phenocycler QPTIFF
 // ---------------------------------------------------------------------------
 /// Akoya/PerkinElmer Phenocycler QPTIFF — TIFF-based (`.qptiff`).
-pub struct QptiffReader {
+pub struct VectraReader {
     inner: crate::tiff::TiffReader,
     meta: Option<ImageMetadata>,
     current_resolution: usize,
 }
 
-impl QptiffReader {
+impl VectraReader {
     pub fn new() -> Self {
-        QptiffReader {
+        VectraReader {
             inner: crate::tiff::TiffReader::new(),
             meta: None,
             current_resolution: 0,
@@ -660,7 +660,7 @@ impl QptiffReader {
     }
 }
 
-impl Default for QptiffReader {
+impl Default for VectraReader {
     fn default() -> Self {
         Self::new()
     }
@@ -1136,7 +1136,7 @@ fn qptiff_enrich_metadata(
     }
 }
 
-impl FormatReader for QptiffReader {
+impl FormatReader for VectraReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -10092,7 +10092,7 @@ impl<'a> ByteCursor<'a> {
     }
 }
 
-pub struct LeicaLofReader {
+pub struct LofReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     ome: Option<OmeImage>,
@@ -10107,9 +10107,9 @@ pub struct LeicaLofReader {
     current_series: usize,
 }
 
-impl LeicaLofReader {
+impl LofReader {
     pub fn new() -> Self {
-        LeicaLofReader {
+        LofReader {
             path: None,
             meta: None,
             ome: None,
@@ -10171,13 +10171,13 @@ impl LeicaLofReader {
     }
 }
 
-impl Default for LeicaLofReader {
+impl Default for LofReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for LeicaLofReader {
+impl FormatReader for LofReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -10187,7 +10187,7 @@ impl FormatReader for LeicaLofReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        LeicaLofReader::check_magic(header)
+        LofReader::check_magic(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -12111,15 +12111,15 @@ impl FormatWriter for ApngWriter {
 ///
 /// DF3 format: 6-byte header (3x uint16 BE: x, y, z dimensions) followed
 /// by raw uint8 voxel data.
-pub struct PovRayReader {
+pub struct PovrayReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     pixel_data: Option<Vec<u8>>,
 }
 
-impl PovRayReader {
+impl PovrayReader {
     pub fn new() -> Self {
-        PovRayReader {
+        PovrayReader {
             path: None,
             meta: None,
             pixel_data: None,
@@ -12127,13 +12127,13 @@ impl PovRayReader {
     }
 }
 
-impl Default for PovRayReader {
+impl Default for PovrayReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for PovRayReader {
+impl FormatReader for PovrayReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()

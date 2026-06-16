@@ -22,12 +22,12 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
     vec![
         // Dedicated readers first (most precise magic bytes)
         Box::new(crate::formats::zip::ZipReader::new()),
-        Box::new(crate::formats::imaris::ImarisReader::new()),
-        // HDF5-based formats (extension-only, must come after ImarisReader magic check)
+        Box::new(crate::formats::imaris_hdf::ImarisHdfReader::new()),
+        // HDF5-based formats (extension-only, must come after ImarisHdfReader magic check)
         Box::new(crate::formats::cellh5::CellH5Reader::new()), // .ch5
         Box::new(crate::formats::bdv::BdvReader::new()),       // .h5
-        Box::new(crate::formats::viff::ViffReader::new()),
-        Box::new(crate::formats::mias::Al3dReader::new()),
+        Box::new(crate::formats::khoros::KhorosReader::new()),
+        Box::new(crate::formats::mias::AliconaReader::new()),
         Box::new(crate::formats::perkinelmer::OpenlabRawReader::new()),
         Box::new(crate::formats::incell::InCellReader::new()),
         Box::new(crate::tiff::TiffReader::new()),
@@ -38,7 +38,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::png::PngReader::new()),
         Box::new(crate::formats::jpeg::JpegReader::new()),
         Box::new(crate::formats::bmp::BmpReader::new()),
-        Box::new(crate::formats::czi::CziReader::new()),
+        Box::new(crate::formats::zeiss_czi::ZeissCziReader::new()),
         Box::new(crate::formats::nd2::Nd2Reader::new()),
         Box::new(crate::formats::lif::LifReader::new()),
         // DeltaVision must precede MRC: both readers' byte signatures accept a
@@ -66,7 +66,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         // Additional scientific formats
         Box::new(crate::formats::biorad::BioRadReader::new()),
         Box::new(crate::formats::spe::SpeReader::new()),
-        Box::new(crate::formats::andor::AndorSifReader::new()),
+        Box::new(crate::formats::sif::SifReader::new()),
         Box::new(crate::formats::amira::AmiraReader::new()),
         Box::new(crate::formats::amira::SpiderReader::new()),
         // Fuji LAS gel (.img + .inf companion); detected via the .inf sibling,
@@ -79,46 +79,46 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::flim2::SpcReader::new()),
         Box::new(crate::formats::flim::LiFlimReader::new()),
         Box::new(crate::formats::clinical::Ecat7Reader::new()),
-        Box::new(crate::formats::clinical::FdfReader::new()),
-        Box::new(crate::formats::hamamatsu::DcimgReader::new()),
+        Box::new(crate::formats::clinical::VarianFdfReader::new()),
+        Box::new(crate::formats::dcimg::DcimgReader::new()),
         Box::new(crate::formats::norpix::NorpixReader::new()),
         Box::new(crate::formats::norpix::IplabReader::new()),
-        Box::new(crate::formats::ome::OmeXmlReader::new()),
-        Box::new(crate::formats::olympus::OifReader::new()),
+        Box::new(crate::formats::ome_xml::OmeXmlReader::new()),
+        Box::new(crate::formats::olympus::Fv1000Reader::new()),
         // Magic-byte detected formats
         Box::new(crate::formats::pcx::PcxReader::new()),
-        Box::new(crate::formats::photoshop::PsdReader::new()),
+        Box::new(crate::formats::psd::PsdReader::new()),
         Box::new(crate::formats::aim::AimReader::new()),
         // Molecular Imaging STP (.stp) — distinctive "UK SOFT" magic string.
         Box::new(crate::formats::misc4::MolecularImagingReader::new()),
         // Prairie/Leica XML+TIFF series (magic-byte detection via XML content)
         Box::new(crate::formats::prairie::PrairieReader::new()),
-        Box::new(crate::formats::prairie::LeicaTcsReader::new()),
+        Box::new(crate::formats::prairie::TcsReader::new()),
         // EPS/PostScript
         Box::new(crate::formats::eps::EpsReader::new()),
         // Extension-only TIFF-based formats (no distinct magic bytes)
-        Box::new(crate::formats::lsm::LsmReader::new()),
+        Box::new(crate::formats::zeiss_lsm::ZeissLsmReader::new()),
         Box::new(crate::formats::metamorph::MetamorphReader::new()),
         Box::new(crate::formats::micromanager::MicromanagerReader::new()),
         // OpenSlide-based whole-slide formats (MRXS, VMS, BIF, etc.)
         #[cfg(feature = "openslide")]
         Box::new(crate::formats::openslide_reader::OpenSlideReader::new()),
         // Whole-slide TIFF wrappers (extension-only)
-        Box::new(crate::formats::svs::WholeSlideTiffReader::new()),
+        Box::new(crate::formats::svs::SvsReader::new()),
         // Extension-only Inveon (hdr+img pair, extension-only detection)
         Box::new(crate::formats::clinical::InveonReader::new()),
         // SimFCS FLIM (extension-only). Non-upstream extension: Bio-Formats has
         // no SimFCS reader; kept as a documented extra (reads 256x256 .r64/.ref).
         Box::new(crate::formats::simfcs::SimfcsReader::new()),
         // AFM formats (extension-only)
-        Box::new(crate::formats::afm::TopoMetrixReader::new()),
+        Box::new(crate::formats::afm::TopometrixReader::new()),
         Box::new(crate::formats::afm::UnisokuReader::new()),
         // LIM / TillVision (extension-only)
         Box::new(crate::formats::lim::LimReader::new()),
         Box::new(crate::formats::lim::TillVisionReader::new()),
         // AIM/ISQ extension-only fallback
         // DM2 (extension-only, Gatan)
-        Box::new(crate::formats::gatan::Dm2Reader::new()),
+        Box::new(crate::formats::gatan::GatanDm2Reader::new()),
         // Extension-only (no magic bytes)
         Box::new(crate::formats::raster::tga_reader()),
         // New format readers (extension-only)
@@ -132,13 +132,13 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         // only (Well<xxxx> directory + mode/z naming); generic TiffReader still
         // wins auto-detection of plain .tif via the magic pass.
         Box::new(crate::formats::mias::MiasReader::new()),
-        Box::new(crate::formats::sem::FeiPhilipsReader::new()),
+        Box::new(crate::formats::sem::FeiReader::new()),
         // FEI SER (magic-byte detected: 0x97 0x01)
         Box::new(crate::formats::mias::FeiSerReader::new()),
         // AVI video (RIFF magic)
         Box::new(crate::formats::avi::AviReader::new()),
         // Leica LEI confocal (magic ILIS / 0x49494949)
-        Box::new(crate::formats::lei::LeiReader::new()),
+        Box::new(crate::formats::leica::LeicaReader::new()),
         // PerkinElmer FLEX HCS (TIFF-based)
         Box::new(crate::formats::flex::FlexReader::new()),
         // Bruker MRI / ParaVision (filename "fid"/"acqp", 2dseq pixel blocks)
@@ -148,32 +148,32 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         // Extension-only readers
         Box::new(crate::formats::volocity::VolocityReader::new()),
         Box::new(crate::formats::volocity::NikonNisReader::new()),
-        Box::new(crate::formats::legacy::KodakBipReader::new()),
+        Box::new(crate::formats::legacy::KodakReader::new()),
         Box::new(crate::formats::legacy::PictReader::new()),
-        Box::new(crate::formats::xrm::XrmReader::new()),
-        Box::new(crate::formats::zvi::ZviReader::new()),
+        Box::new(crate::formats::zeiss_xrm::ZeissXrmReader::new()),
+        Box::new(crate::formats::zeiss_zvi::ZeissZviReader::new()),
         // TIFF-based whole-slide / variant formats (extension-only)
         Box::new(crate::formats::tiff_wrappers::NdpiReader::new()),
         Box::new(crate::formats::tiff_wrappers::LeicaScnReader::new()),
         Box::new(crate::formats::tiff_wrappers::VentanaReader::new()),
         Box::new(crate::formats::tiff_wrappers::NikonElementsTiffReader::new()),
         Box::new(crate::formats::tiff_wrappers::FeiTiffReader::new()),
-        Box::new(crate::formats::tiff_wrappers::OlympusSisTiffReader::new()),
+        Box::new(crate::formats::tiff_wrappers::SisReader::new()),
         Box::new(crate::formats::tiff_wrappers::ImprovisionTiffReader::new()),
         Box::new(crate::formats::tiff_wrappers::ZeissApotomeTiffReader::new()),
-        Box::new(crate::formats::tiff_wrappers::FluoviewTiffReader::new()),
+        Box::new(crate::formats::tiff_wrappers::FluoviewReader::new()),
         Box::new(crate::formats::tiff_wrappers::MolecularDevicesTiffReader::new()),
         // Misc readers: partial native ports plus explicit unsupported detectors
         Box::new(crate::formats::misc::Jpeg2000Reader::new()), // magic-byte detection
-        Box::new(crate::formats::misc::QuickTimeReader::new()),
+        Box::new(crate::formats::misc::QtReader::new()),
         Box::new(crate::formats::misc::MngReader::new()),
-        Box::new(crate::formats::misc::SlideBookReader::new()),
+        Box::new(crate::formats::misc::SlidebookReader::new()),
         Box::new(crate::formats::misc::MincReader::new()),
-        Box::new(crate::formats::misc::OpenlabLiffReader::new()),
+        Box::new(crate::formats::misc::OpenlabReader::new()),
         Box::new(crate::formats::misc::SmCameraReader::new()),
         // Extended formats — TIFF wrappers
         Box::new(crate::formats::extended::DngReader::new()),
-        Box::new(crate::formats::extended::QptiffReader::new()),
+        Box::new(crate::formats::extended::VectraReader::new()),
         Box::new(crate::formats::extended::GelReader::new()),
         // Extended formats — binary with magic/structure
         Box::new(crate::formats::extended::ImspectorReader::new()), // magic "OMAS_BF_"
@@ -182,8 +182,8 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         // Extended formats — real native readers plus explicit unsupported detectors
         Box::new(crate::formats::extended::MrwReader::new()),
         Box::new(crate::formats::extended::YokogawaReader::new()),
-        Box::new(crate::formats::extended::LeicaLofReader::new()),
-        Box::new(crate::formats::extended::PovRayReader::new()),
+        Box::new(crate::formats::extended::LofReader::new()),
+        Box::new(crate::formats::extended::PovrayReader::new()),
         Box::new(crate::formats::extended::NafReader::new()),
         Box::new(crate::formats::extended::BurleighReader::new()),
         // HCS2 — TIFF-based HCS wrappers
@@ -239,7 +239,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::flim2::SlideBook7Reader::new()),
         Box::new(crate::formats::flim2::NdpisReader::new()),
         Box::new(crate::formats::flim2::IvisionReader::new()),
-        Box::new(crate::formats::flim2::AfiFluorescenceReader::new()),
+        Box::new(crate::formats::flim2::AfiReader::new()),
         Box::new(crate::formats::flim2::ImarisTiffReader::new()),
         Box::new(crate::formats::flim2::XlefReader::new()),
         // Olympus OMP2 tiled mosaic (.omp2info); delegates tile pixels to the
@@ -261,7 +261,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::misc4::PdsReader::new()),
         Box::new(crate::formats::misc4::HisReader::new()),
         Box::new(crate::formats::misc4::HrdgdfReader::new()),
-        Box::new(crate::formats::misc4::FilePatternReaderStub::new()),
+        Box::new(crate::formats::misc4::FilePatternReader::new()),
         Box::new(crate::formats::misc4::KlbReader::new()),
         Box::new(crate::formats::misc4::ObfReader::new()),
         // OME-Zarr / OME-NGFF (directory-based; detected by `.zarr` path or a
@@ -344,13 +344,13 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
     let mut best_error = None;
 
     // `.ims` is shared by two unrelated formats: the HDF5-based Imaris
-    // (`imaris::ImarisReader`) and the older Bitplane Imaris 3 TIFF variant
+    // (`imaris::ImarisHdfReader`) and the older Bitplane Imaris 3 TIFF variant
     // (`flim2::ImarisTiffReader`). The TIFF wrapper accepts `.ims` purely by
     // extension, so for a genuine HDF5 `.ims` file the HDF5 reader must win.
     // Dispatch on the actual header here: if the file carries the HDF5 magic,
     // route straight to the HDF5 Imaris reader before any TIFF-based handling.
     if has_ims_extension(path) && is_hdf5_header(&header) {
-        let mut r = boxed_reader(crate::formats::imaris::ImarisReader::new());
+        let mut r = boxed_reader(crate::formats::imaris_hdf::ImarisHdfReader::new());
         match r.set_id(path) {
             Ok(()) => return Ok(r),
             Err(err) => remember_set_id_error(&mut best_error, err),
@@ -362,7 +362,7 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
     // `.zvi` directly avoids probing unrelated OLE readers that may parse large
     // streams before rejecting the file.
     if has_zvi_extension(path) {
-        let mut r = boxed_reader(crate::formats::zvi::ZviReader::new());
+        let mut r = boxed_reader(crate::formats::zeiss_zvi::ZeissZviReader::new());
         match r.set_id(path) {
             Ok(()) => return Ok(r),
             Err(err) => remember_set_id_error(&mut best_error, err),
@@ -510,36 +510,36 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         .map(|e| e.to_ascii_lowercase());
 
     match ext.as_deref() {
-        Some("lsm") => vec![boxed_reader(crate::formats::lsm::LsmReader::new())],
+        Some("lsm") => vec![boxed_reader(crate::formats::zeiss_lsm::ZeissLsmReader::new())],
         Some("stk") => vec![boxed_reader(
             crate::formats::metamorph::MetamorphReader::new(),
         )],
         Some("svs") => vec![boxed_reader(
-            crate::formats::svs::WholeSlideTiffReader::new(),
+            crate::formats::svs::SvsReader::new(),
         )],
         Some("ndpi") => vec![
             boxed_reader(crate::formats::tiff_wrappers::NdpiReader::new()),
-            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+            boxed_reader(crate::formats::svs::SvsReader::new()),
         ],
         Some("scn") => vec![
             boxed_reader(crate::formats::tiff_wrappers::LeicaScnReader::new()),
-            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+            boxed_reader(crate::formats::svs::SvsReader::new()),
             boxed_reader(crate::formats::flim2::BioRadScnReader::new()),
         ],
         Some("bif") => vec![
             boxed_reader(crate::formats::tiff_wrappers::VentanaReader::new()),
-            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+            boxed_reader(crate::formats::svs::SvsReader::new()),
         ],
         Some("vsi") => vec![
             boxed_reader(crate::formats::flim2::CellSensReader::new()),
-            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+            boxed_reader(crate::formats::svs::SvsReader::new()),
         ],
         Some("afi") => vec![
-            boxed_reader(crate::formats::flim2::AfiFluorescenceReader::new()),
-            boxed_reader(crate::formats::svs::WholeSlideTiffReader::new()),
+            boxed_reader(crate::formats::flim2::AfiReader::new()),
+            boxed_reader(crate::formats::svs::SvsReader::new()),
         ],
         Some("dng") => vec![boxed_reader(crate::formats::extended::DngReader::new())],
-        Some("qptiff") => vec![boxed_reader(crate::formats::extended::QptiffReader::new())],
+        Some("qptiff") => vec![boxed_reader(crate::formats::extended::VectraReader::new())],
         Some("gel") => vec![boxed_reader(crate::formats::extended::GelReader::new())],
         Some("flex") => vec![boxed_reader(crate::formats::flex::FlexReader::new())],
         Some("cr2") | Some("crw") | Some("cr3") => {
@@ -601,7 +601,7 @@ fn generic_tiff_name_wrappers(path: &Path, header: &[u8]) -> Vec<Box<dyn FormatR
     if has_prairie_xml_sibling(path) {
         readers.push(boxed_reader(crate::formats::prairie::PrairieReader::new()));
     }
-    let lei = crate::formats::lei::LeiReader::new();
+    let lei = crate::formats::leica::LeicaReader::new();
     if has_lei_sibling(path) && lei.is_this_type_by_bytes(header) {
         readers.push(boxed_reader(lei));
     }
@@ -728,7 +728,7 @@ fn generic_tiff_wrappers_for_description(
             if description.contains("[Acquisition Parameters]") || description.contains("FluoView")
             {
                 readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::FluoviewTiffReader::new(),
+                    crate::formats::tiff_wrappers::FluoviewReader::new(),
                 ));
             }
             if description.contains("<Zeiss")
@@ -1120,7 +1120,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = crate::formats::prairie::LeicaTcsReader::new();
+        let mut reader = crate::formats::prairie::TcsReader::new();
         reader.set_id(&xml).unwrap();
 
         assert_eq!(reader.metadata().image_count, 2);
@@ -1158,7 +1158,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = crate::formats::prairie::LeicaTcsReader::new();
+        let mut reader = crate::formats::prairie::TcsReader::new();
         reader.set_id(&xml).unwrap();
         let err = reader.open_bytes(1).unwrap_err();
 
@@ -1177,14 +1177,14 @@ mod tests {
                 "Volocity MVD2 native Metakit decoding is unsupported",
             ),
             ("sample.cif", "FlowSight CIF is not TIFF-like"),
-            // NOTE: LOF (Leica) is no longer a stub — LeicaLofReader is a real
+            // NOTE: LOF (Leica) is no longer a stub — LofReader is a real
             // reader now; it rejects fake data with its own header error.
             // NOTE: OIR and ACFF (Volocity clipping) are no longer stubs —
             // OirReader and VolocityClippingReader are now real readers. They
             // still reject fake data (no fabricated metadata), just with
             // reader-specific messages covered by their own unit tests, so they
             // are intentionally excluded from this not-yet-implemented list.
-            // NOTE: XRM/TXRM are no longer stubs — XrmReader is a real CFB-based
+            // NOTE: XRM/TXRM are no longer stubs — ZeissXrmReader is a real CFB-based
             // reader. It rejects fake/short input with a genuine CFB error
             // ("XRM CFB open: Invalid CFB file ..."), not fabricated metadata.
             // That rejection is covered by xrm.rs's own unit tests, so XRM is

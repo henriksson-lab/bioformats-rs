@@ -6515,16 +6515,16 @@ impl FormatReader for IvisionReader {
 /// the filename substring between `_` and `.` (matching Java). The channels are
 /// assembled into a single multi-channel series (the trailing label/macro
 /// resolutions are taken from the first file).
-pub struct AfiFluorescenceReader {
-    readers: Vec<crate::formats::svs::WholeSlideTiffReader>,
+pub struct AfiReader {
+    readers: Vec<crate::formats::svs::SvsReader>,
     channel_names: Vec<Option<String>>,
     metas: Vec<ImageMetadata>,
     current_series: usize,
 }
 
-impl AfiFluorescenceReader {
+impl AfiReader {
     pub fn new() -> Self {
-        AfiFluorescenceReader {
+        AfiReader {
             readers: Vec::new(),
             channel_names: Vec::new(),
             metas: Vec::new(),
@@ -6551,13 +6551,13 @@ impl AfiFluorescenceReader {
     }
 }
 
-impl Default for AfiFluorescenceReader {
+impl Default for AfiReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for AfiFluorescenceReader {
+impl FormatReader for AfiReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -6593,7 +6593,7 @@ impl FormatReader for AfiFluorescenceReader {
             channel_names.push(name);
 
             let full = parent.join(rel);
-            let mut r = crate::formats::svs::WholeSlideTiffReader::new();
+            let mut r = crate::formats::svs::SvsReader::new();
             r.set_id(&full)?;
             readers.push(r);
         }
@@ -7677,7 +7677,7 @@ fn xlef_delegate_for_reference(reference: &Path) -> Box<dyn FormatReader> {
         .map(|e| e.to_ascii_lowercase())
         .as_deref()
     {
-        Some("lof") => Box::new(crate::formats::extended::LeicaLofReader::new()),
+        Some("lof") => Box::new(crate::formats::extended::LofReader::new()),
         Some("jpg") | Some("jpeg") => Box::new(crate::formats::jpeg::JpegReader::new()),
         Some("png") => Box::new(crate::formats::png::PngReader::new()),
         Some("bmp") => Box::new(crate::formats::bmp::BmpReader::new()),

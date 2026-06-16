@@ -1,7 +1,7 @@
 //! bioformats-mias — format readers:
 //!
 //! - CellWorxReader: CellWorX HCS (.htd / .pnl)
-//! - Al3dReader: 3D image format (.al3d) with "AL3D" magic
+//! - AliconaReader: 3D image format (.al3d) with "AL3D" magic
 //! - OxfordInstrumentsReader: Oxford Instruments SEM/AFM (.top)
 //! - FeiSerReader: FEI SER electron-microscopy series (.ser)
 
@@ -877,26 +877,26 @@ impl FormatReader for CellWorxReader {
     }
 }
 
-// ── Al3dReader ────────────────────────────────────────────────────────────────
+// ── AliconaReader ────────────────────────────────────────────────────────────────
 
 const AL3D_MAGIC: &[u8] = b"AL3D";
 const AL3D_DATA_OFFSET: u64 = 512;
 
-pub struct Al3dReader {
+pub struct AliconaReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
 }
 
-impl Al3dReader {
+impl AliconaReader {
     pub fn new() -> Self {
-        Al3dReader {
+        AliconaReader {
             path: None,
             meta: None,
         }
     }
 }
 
-impl Default for Al3dReader {
+impl Default for AliconaReader {
     fn default() -> Self {
         Self::new()
     }
@@ -948,7 +948,7 @@ fn parse_al3d(path: &Path) -> Result<ImageMetadata> {
     Ok(meta)
 }
 
-impl FormatReader for Al3dReader {
+impl FormatReader for AliconaReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()

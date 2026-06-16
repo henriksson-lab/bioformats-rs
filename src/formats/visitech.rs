@@ -549,7 +549,7 @@ impl FormatReader for VisitechReader {
             .series_meta
             .get(self.series)
             .ok_or(BioFormatsError::NotInitialized)?;
-        crate::formats::lei::crop_region(&full, meta, x, y, w, h)
+        crate::formats::leica::crop_region(&full, meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

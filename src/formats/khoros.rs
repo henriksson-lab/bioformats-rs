@@ -207,15 +207,15 @@ fn validate_viff_payload(file_len: u64, data_offset: u64, meta: &ImageMetadata) 
     Ok(())
 }
 
-pub struct ViffReader {
+pub struct KhorosReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
 }
 
-impl ViffReader {
+impl KhorosReader {
     pub fn new() -> Self {
-        ViffReader {
+        KhorosReader {
             path: None,
             meta: None,
             data_offset: 1024,
@@ -223,13 +223,13 @@ impl ViffReader {
     }
 }
 
-impl Default for ViffReader {
+impl Default for KhorosReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ViffReader {
+impl KhorosReader {
     /// Bytes for a single Z plane (sizeX * sizeY * sizeC * bytesPerSample).
     fn plane_bytes(meta: &ImageMetadata) -> usize {
         let bps = meta.pixel_type.bytes_per_sample();
@@ -237,7 +237,7 @@ impl ViffReader {
     }
 }
 
-impl FormatReader for ViffReader {
+impl FormatReader for KhorosReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()

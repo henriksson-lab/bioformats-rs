@@ -4118,13 +4118,13 @@ impl FormatReader for FeiTiffReader {
 ///
 /// Parses ImageDescription for pixel calibration and acquisition metadata
 /// stored by Olympus SIS software.
-pub struct OlympusSisTiffReader {
+pub struct SisReader {
     inner: crate::tiff::TiffReader,
 }
 
-impl OlympusSisTiffReader {
+impl SisReader {
     pub fn new() -> Self {
-        OlympusSisTiffReader {
+        SisReader {
             inner: crate::tiff::TiffReader::new(),
         }
     }
@@ -4187,13 +4187,13 @@ impl OlympusSisTiffReader {
     }
 }
 
-impl Default for OlympusSisTiffReader {
+impl Default for SisReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for OlympusSisTiffReader {
+impl FormatReader for SisReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -5241,13 +5241,13 @@ impl FormatReader for ZeissApotomeTiffReader {
 ///
 /// Enriches metadata from the ImageDescription tag which may contain
 /// Fluoview-specific key=value pairs like `[Acquisition Parameters]`.
-pub struct FluoviewTiffReader {
+pub struct FluoviewReader {
     inner: crate::tiff::TiffReader,
 }
 
-impl FluoviewTiffReader {
+impl FluoviewReader {
     pub fn new() -> Self {
-        FluoviewTiffReader {
+        FluoviewReader {
             inner: crate::tiff::TiffReader::new(),
         }
     }
@@ -5300,13 +5300,13 @@ impl FluoviewTiffReader {
     }
 }
 
-impl Default for FluoviewTiffReader {
+impl Default for FluoviewReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for FluoviewTiffReader {
+impl FormatReader for FluoviewReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()

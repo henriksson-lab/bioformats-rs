@@ -400,15 +400,15 @@ const FEI_DIMENSION_OFFSET: u64 = 514;
 /// Ported from Bio-Formats `FEIReader`: the header stores the physical scan
 /// parameters at fixed offsets, width/height at offset 514, and pixels as an
 /// 8-bit grayscale plane split into four row passes and two column passes.
-pub struct FeiPhilipsReader {
+pub struct FeiReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     header_size: u64,
 }
 
-impl FeiPhilipsReader {
+impl FeiReader {
     pub fn new() -> Self {
-        FeiPhilipsReader {
+        FeiReader {
             path: None,
             meta: None,
             header_size: 0,
@@ -416,7 +416,7 @@ impl FeiPhilipsReader {
     }
 }
 
-impl Default for FeiPhilipsReader {
+impl Default for FeiReader {
     fn default() -> Self {
         Self::new()
     }
@@ -434,7 +434,7 @@ fn read_le_f32_at(data: &[u8], offset: usize) -> Option<f32> {
     Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-impl FormatReader for FeiPhilipsReader {
+impl FormatReader for FeiReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())

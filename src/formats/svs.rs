@@ -11,13 +11,13 @@ use crate::common::error::Result;
 use crate::common::metadata::{ImageMetadata, MetadataValue};
 use crate::common::reader::FormatReader;
 
-pub struct WholeSlideTiffReader {
+pub struct SvsReader {
     inner: crate::tiff::TiffReader,
 }
 
-impl WholeSlideTiffReader {
+impl SvsReader {
     pub fn new() -> Self {
-        WholeSlideTiffReader {
+        SvsReader {
             inner: crate::tiff::TiffReader::new(),
         }
     }
@@ -96,13 +96,13 @@ impl WholeSlideTiffReader {
     }
 }
 
-impl Default for WholeSlideTiffReader {
+impl Default for SvsReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl WholeSlideTiffReader {
+impl SvsReader {
     /// Convert a chunky/interleaved RGB(A) buffer (`c0c1c2 c0c1c2 …`) into the
     /// channel-separated layout (`c0c0… c1c1… c2c2…`) that Java's SVSReader
     /// returns (`isInterleaved() == false`). No-op unless the current series is
@@ -137,7 +137,7 @@ impl WholeSlideTiffReader {
     }
 }
 
-impl FormatReader for WholeSlideTiffReader {
+impl FormatReader for SvsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()

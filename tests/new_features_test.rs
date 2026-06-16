@@ -9,7 +9,7 @@
 //! - MinMaxCalculator wrapper
 //! - FileStitcher with synthetic sequence
 
-use bioformats::formats::ome::OmeXmlWriter;
+use bioformats::formats::ome_xml::OmeXmlWriter;
 use bioformats::{
     BioFormatsError, ChannelSeparator, DimensionOrder, DimensionSwapper, FormatReader,
     FormatWriter, ImageMetadata, ImageReader, ImageWriter, MinMaxCalculator, PixelType,

@@ -874,7 +874,7 @@ impl FormatReader for PrairieReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.metas.get(self.series).unwrap();
-        crate::formats::lei::crop_region(&full, meta, x, y, w, h)
+        crate::formats::leica::crop_region(&full, meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -892,15 +892,15 @@ impl FormatReader for PrairieReader {
 
 // ── Leica TCS Reader ──────────────────────────────────────────────────────────
 
-pub struct LeicaTcsReader {
+pub struct TcsReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     tiff_files: Vec<PathBuf>,
 }
 
-impl LeicaTcsReader {
+impl TcsReader {
     pub fn new() -> Self {
-        LeicaTcsReader {
+        TcsReader {
             path: None,
             meta: None,
             tiff_files: Vec::new(),
@@ -908,7 +908,7 @@ impl LeicaTcsReader {
     }
 }
 
-impl Default for LeicaTcsReader {
+impl Default for TcsReader {
     fn default() -> Self {
         Self::new()
     }
@@ -1131,7 +1131,7 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
     Ok((meta, tiff_files))
 }
 
-impl FormatReader for LeicaTcsReader {
+impl FormatReader for TcsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
@@ -1223,7 +1223,7 @@ impl FormatReader for LeicaTcsReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        crate::formats::lei::crop_region(&full, meta, x, y, w, h)
+        crate::formats::leica::crop_region(&full, meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

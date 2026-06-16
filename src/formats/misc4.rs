@@ -3412,16 +3412,16 @@ impl FormatReader for HrdgdfReader {
 /// Simple `*` and `?` path-component globs plus bounded recursive `**`
 /// directory globs are expanded from the pattern file's directory. A terminal
 /// `**` is limited to files that a registered reader can plausibly open.
-pub struct FilePatternReaderStub {
+pub struct FilePatternReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     layout: Option<StrictRawLayout>,
     stitcher: Option<FileStitcher>,
 }
 
-impl FilePatternReaderStub {
+impl FilePatternReader {
     pub fn new() -> Self {
-        FilePatternReaderStub {
+        FilePatternReader {
             path: None,
             meta: None,
             layout: None,
@@ -3530,13 +3530,13 @@ enum ExpandedFilePattern {
     },
 }
 
-impl Default for FilePatternReaderStub {
+impl Default for FilePatternReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for FilePatternReaderStub {
+impl FormatReader for FilePatternReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()

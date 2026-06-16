@@ -26,7 +26,7 @@ const IMARIS_SURPASS_METADATA_NODE_LIMIT: usize = 1024;
 const IMARIS_SURPASS_DATASET_VALUE_LIMIT: u64 = 32;
 const IMARIS_SURPASS_STATISTICS_TABLE_VALUE_LIMIT: u64 = 4096;
 
-pub struct ImarisReader {
+pub struct ImarisHdfReader {
     path: Option<PathBuf>,
     file: Option<hdf5_pure_rust::File>,
     // One ImageMetadata per Imaris ResolutionLevel_N. Index 0 is full-resolution.
@@ -77,9 +77,9 @@ struct VolumeCache {
     raw: Vec<u8>,
 }
 
-impl ImarisReader {
+impl ImarisHdfReader {
     pub fn new() -> Self {
-        ImarisReader {
+        ImarisHdfReader {
             path: None,
             file: None,
             resolutions: Vec::new(),
@@ -561,7 +561,7 @@ mod tests {
     }
 }
 
-impl Default for ImarisReader {
+impl Default for ImarisHdfReader {
     fn default() -> Self {
         Self::new()
     }
@@ -2694,7 +2694,7 @@ fn hdf5_dtype_size(dtype: &hdf5_pure_rust::Datatype) -> usize {
     dtype.size()
 }
 
-impl FormatReader for ImarisReader {
+impl FormatReader for ImarisHdfReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()

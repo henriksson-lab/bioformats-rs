@@ -502,28 +502,28 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
     Ok(series)
 }
 
-pub struct LeiReader {
+pub struct LeicaReader {
     path: Option<PathBuf>,
     series_list: Vec<LeiSeries>,
     series: usize,
 }
 
-impl LeiReader {
+impl LeicaReader {
     pub fn new() -> Self {
-        LeiReader {
+        LeicaReader {
             path: None,
             series_list: Vec::new(),
             series: 0,
         }
     }
 }
-impl Default for LeiReader {
+impl Default for LeicaReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for LeiReader {
+impl FormatReader for LeicaReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
@@ -753,7 +753,7 @@ mod tests {
             ..meta.clone()
         };
         ImageWriter::save(&tiff, &tiff_meta, &[vec![17]]).unwrap();
-        let mut reader = LeiReader {
+        let mut reader = LeicaReader {
             path: None,
             series_list: vec![LeiSeries {
                 meta,

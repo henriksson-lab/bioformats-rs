@@ -712,7 +712,7 @@ fn direct_stack_writer_cases() -> Vec<(
         (
             "OME-XML",
             "ome",
-            Box::new(bioformats::formats::ome::OmeXmlWriter::new()),
+            Box::new(bioformats::formats::ome_xml::OmeXmlWriter::new()),
         ),
         (
             "AVI",
@@ -1025,7 +1025,7 @@ fn direct_stateful_stack_writers_allow_retry_after_incomplete_close() {
         (
             "OME-XML",
             "ome",
-            Box::new(bioformats::formats::ome::OmeXmlWriter::new()),
+            Box::new(bioformats::formats::ome_xml::OmeXmlWriter::new()),
         ),
         (
             "AVI",
@@ -1378,7 +1378,7 @@ fn direct_tiff_set_ome_metadata_populates_required_channels() {
 
 #[test]
 fn direct_ome_xml_writer_populates_required_channels_from_empty_store() {
-    use bioformats::formats::ome::OmeXmlWriter;
+    use bioformats::formats::ome_xml::OmeXmlWriter;
     use bioformats::OmeMetadata;
 
     let mut meta = ImageMetadata::default();

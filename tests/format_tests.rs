@@ -492,7 +492,7 @@ fn micromanager_rejects_invalid_dimensions_and_unknown_pixel_type() {
 #[test]
 fn andor_sif_rejects_short_declared_payload_before_metadata() {
     let path = tmp("andor_short_payload.sif");
-    let mut uninit = bioformats::formats::andor::AndorSifReader::new();
+    let mut uninit = bioformats::formats::sif::SifReader::new();
     assert_eq!(uninit.series_count(), 0);
     assert!(uninit.set_series(0).is_err());
 
@@ -804,7 +804,7 @@ fn gatan_rejects_weak_dm_magic_and_short_dm2_payload() {
     bytes[20..22].copy_from_slice(&1i16.to_be_bytes());
     bytes[22..24].copy_from_slice(&0i16.to_be_bytes());
     std::fs::write(&dm2, bytes).unwrap();
-    let mut dm2_reader = bioformats::formats::gatan::Dm2Reader::new();
+    let mut dm2_reader = bioformats::formats::gatan::GatanDm2Reader::new();
     assert_eq!(dm2_reader.series_count(), 0);
     assert!(matches!(
         dm2_reader.set_series(0),
@@ -820,7 +820,7 @@ fn gatan_rejects_weak_dm_magic_and_short_dm2_payload() {
     bytes[18..20].copy_from_slice(&1i16.to_be_bytes());
     bytes[20..22].copy_from_slice(&1i16.to_be_bytes());
     std::fs::write(&zero, bytes).unwrap();
-    let mut dm2_reader = bioformats::formats::gatan::Dm2Reader::new();
+    let mut dm2_reader = bioformats::formats::gatan::GatanDm2Reader::new();
     let err = dm2_reader.set_id(&zero).unwrap_err();
     assert!(err.to_string().contains("non-positive"));
     assert_eq!(dm2_reader.series_count(), 0);
@@ -1243,7 +1243,7 @@ fn topometrix_requires_declared_dimensions() {
     let path = tmp("missing_dims.tfr");
     std::fs::write(&path, topometrix_fixture(b"1.0 ", 0, 2, &[])).unwrap();
 
-    let mut reader = bioformats::formats::afm::TopoMetrixReader::new();
+    let mut reader = bioformats::formats::afm::TopometrixReader::new();
     let err = reader.set_id(&path).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("invalid dimensions")),
@@ -1258,7 +1258,7 @@ fn topometrix_rejects_malformed_version_field() {
     let path = tmp("bad_version.tfr");
     std::fs::write(&path, topometrix_fixture(b"abcd", 1, 1, &[])).unwrap();
 
-    let mut reader = bioformats::formats::afm::TopoMetrixReader::new();
+    let mut reader = bioformats::formats::afm::TopometrixReader::new();
     let err = reader.set_id(&path).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("invalid version field")),
@@ -2457,7 +2457,7 @@ fn qptiff_preserves_description_key_value_metadata_and_pixels() {
         7,
     );
 
-    let mut reader = bioformats::formats::extended::QptiffReader::new();
+    let mut reader = bioformats::formats::extended::VectraReader::new();
     reader.set_id(&path).unwrap();
 
     assert_eq!(reader.open_bytes(0).unwrap(), vec![7]);
@@ -2509,7 +2509,7 @@ fn qptiff_flattens_bounded_vendor_json_object_metadata() {
         11,
     );
 
-    let mut reader = bioformats::formats::extended::QptiffReader::new();
+    let mut reader = bioformats::formats::extended::VectraReader::new();
     reader.set_id(&path).unwrap();
 
     assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
@@ -2695,7 +2695,7 @@ fn xml_and_index_readers_reject_missing_companion_images() {
 
     let leica = tmp("no_file_leica.xml");
     std::fs::write(&leica, r#"<LEICA><Image Width="2" Height="2"/></LEICA>"#).unwrap();
-    let mut reader = bioformats::formats::prairie::LeicaTcsReader::new();
+    let mut reader = bioformats::formats::prairie::TcsReader::new();
     let err = reader.set_id(&leica).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("Leica TCS XML does not reference")),
@@ -2731,7 +2731,7 @@ fn xml_and_index_readers_reject_missing_companion_images() {
 
 #[test]
 fn olympus_prairie_leica_readers_require_initialization_for_series() {
-    let mut oif = bioformats::formats::olympus::OifReader::new();
+    let mut oif = bioformats::formats::olympus::Fv1000Reader::new();
     assert_eq!(oif.series_count(), 0);
     assert!(matches!(
         oif.set_series(0),
@@ -2745,14 +2745,14 @@ fn olympus_prairie_leica_readers_require_initialization_for_series() {
         Err(BioFormatsError::NotInitialized)
     ));
 
-    let mut tcs = bioformats::formats::prairie::LeicaTcsReader::new();
+    let mut tcs = bioformats::formats::prairie::TcsReader::new();
     assert_eq!(tcs.series_count(), 0);
     assert!(matches!(
         tcs.set_series(0),
         Err(BioFormatsError::SeriesOutOfRange(0))
     ));
 
-    let mut lei = bioformats::formats::lei::LeiReader::new();
+    let mut lei = bioformats::formats::leica::LeicaReader::new();
     assert_eq!(lei.series_count(), 0);
     assert!(matches!(
         lei.set_series(0),
@@ -2771,7 +2771,7 @@ fn olympus_prairie_leica_readers_require_initialization_for_series() {
 fn olympus_oif_rejects_missing_planes_and_bad_pixel_depth() {
     let empty = tmp("empty_planes.oif");
     std::fs::write(&empty, "[FileInformation]\n").unwrap();
-    let mut reader = bioformats::formats::olympus::OifReader::new();
+    let mut reader = bioformats::formats::olympus::Fv1000Reader::new();
     let err = reader.set_id(&empty).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("does not reference any PTY")),
@@ -2825,7 +2825,7 @@ fn prairie_and_leica_tcs_reject_fake_metadata_without_readable_tiff_dimensions()
 
     let leica = tmp("leica_missing_tiff_dims.xml");
     std::fs::write(&leica, r#"<LEICA><Attachment Name="missing.tif"/></LEICA>"#).unwrap();
-    let mut reader = bioformats::formats::prairie::LeicaTcsReader::new();
+    let mut reader = bioformats::formats::prairie::TcsReader::new();
     let err = reader.set_id(&leica).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::Format(ref message) if message.contains("companion TIFF")),
@@ -3430,7 +3430,7 @@ fn openlab_liff_preserves_non_image_tag_headers_as_original_metadata() {
     let path = tmp("tag_headers.liff");
     std::fs::write(&path, minimal_openlab_liff_with_non_image_tag()).unwrap();
 
-    let mut reader = bioformats::formats::misc::OpenlabLiffReader::new();
+    let mut reader = bioformats::formats::misc::OpenlabReader::new();
     reader.set_id(&path).unwrap();
     let metadata = &reader.metadata().series_metadata;
     assert!(matches!(
@@ -4391,7 +4391,7 @@ fn dcimg_rejects_out_of_bounds_regions() {
     data.extend_from_slice(&[1, 2, 3, 4]);
     std::fs::write(&path, &data).unwrap();
 
-    let mut reader = bioformats::formats::hamamatsu::DcimgReader::new();
+    let mut reader = bioformats::formats::dcimg::DcimgReader::new();
     reader.set_id(&path).unwrap();
     // DCIMG stores rows bottom-to-top; Java DCIMGReader.openBytes flips them
     // (row h-1-i). For the 2x2 plane [[1,2],[3,4]] the flipped plane is
@@ -4417,7 +4417,7 @@ fn dcimg_ome_metadata_preserves_original_header_metadata() {
     data.extend_from_slice(&[1, 2, 3, 4]);
     std::fs::write(&path, &data).unwrap();
 
-    let mut reader = bioformats::formats::hamamatsu::DcimgReader::new();
+    let mut reader = bioformats::formats::dcimg::DcimgReader::new();
     reader.set_id(&path).unwrap();
     let ome = reader.ome_metadata().expect("DCIMG OME metadata");
     let values = ome
@@ -4467,7 +4467,7 @@ fn dcimg_rejects_clamped_dimensions_unknown_depth_and_short_payload() {
     data[48..52].copy_from_slice(&2u32.to_le_bytes());
     std::fs::write(&path, &data).unwrap();
 
-    let mut reader = bioformats::formats::hamamatsu::DcimgReader::new();
+    let mut reader = bioformats::formats::dcimg::DcimgReader::new();
     assert_eq!(reader.series_count(), 0);
     let err = reader.set_id(&path).unwrap_err();
     assert!(err.to_string().contains("frame count"));
@@ -4510,7 +4510,7 @@ fn clinical_raw_readers_reject_out_of_bounds_regions() {
         b"#!/usr/local/fdf/startup\nint matrix[] = {2, 2};\nint bits = 8;\n\x0c".to_vec();
     fdf_bytes.extend_from_slice(&[1, 2, 3, 4]);
     std::fs::write(&fdf, fdf_bytes).unwrap();
-    let mut fdf_reader = bioformats::formats::clinical::FdfReader::new();
+    let mut fdf_reader = bioformats::formats::clinical::VarianFdfReader::new();
     fdf_reader.set_id(&fdf).unwrap();
     assert_eq!(
         fdf_reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
@@ -4548,7 +4548,7 @@ fn clinical_readers_reject_fake_default_metadata() {
 
     let random_fdf = dir.join("random.fdf");
     std::fs::write(&random_fdf, [1]).unwrap();
-    let mut fdf = bioformats::formats::clinical::FdfReader::new();
+    let mut fdf = bioformats::formats::clinical::VarianFdfReader::new();
     let err = fdf.set_id(&random_fdf).unwrap_err();
     assert!(err.to_string().contains("FDF"));
 
@@ -4558,7 +4558,7 @@ fn clinical_readers_reject_fake_default_metadata() {
         b"#!/usr/local/fdf/startup\nint matrix[] = {1, 1};\n\x0c\x01",
     )
     .unwrap();
-    let mut fdf = bioformats::formats::clinical::FdfReader::new();
+    let mut fdf = bioformats::formats::clinical::VarianFdfReader::new();
     let err = fdf.set_id(&missing_bits_fdf).unwrap_err();
     assert!(err.to_string().contains("bits"));
 
@@ -4632,7 +4632,7 @@ fn mias_placeholder_readers_reject_or_require_real_payloads() {
     al3d[12..16].copy_from_slice(&2u32.to_le_bytes());
     al3d[16..20].copy_from_slice(&1u32.to_le_bytes());
     std::fs::write(&short_al3d, al3d).unwrap();
-    let mut reader = bioformats::formats::mias::Al3dReader::new();
+    let mut reader = bioformats::formats::mias::AliconaReader::new();
     let err = reader.set_id(&short_al3d).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("AL3D pixel payload")),
@@ -4647,7 +4647,7 @@ fn mias_placeholder_readers_reject_or_require_real_payloads() {
     al3d[16..20].copy_from_slice(&1u32.to_le_bytes());
     al3d.extend_from_slice(&[1]);
     std::fs::write(&bad_al3d, al3d).unwrap();
-    let mut reader = bioformats::formats::mias::Al3dReader::new();
+    let mut reader = bioformats::formats::mias::AliconaReader::new();
     let err = reader.set_id(&bad_al3d).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("AL3D magic")),
@@ -4662,7 +4662,7 @@ fn mias_placeholder_readers_reject_or_require_real_payloads() {
     al3d[16..20].copy_from_slice(&1u32.to_le_bytes());
     al3d.extend_from_slice(&[1]);
     std::fs::write(&zero_al3d, al3d).unwrap();
-    let mut reader = bioformats::formats::mias::Al3dReader::new();
+    let mut reader = bioformats::formats::mias::AliconaReader::new();
     let err = reader.set_id(&zero_al3d).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("zero image dimensions")),
@@ -4679,7 +4679,7 @@ fn mias_placeholder_readers_reject_or_require_real_payloads() {
     al3d[20..22].copy_from_slice(&99u16.to_le_bytes());
     al3d.extend_from_slice(&[1, 2]);
     std::fs::write(&unsupported_al3d, al3d).unwrap();
-    let mut reader = bioformats::formats::mias::Al3dReader::new();
+    let mut reader = bioformats::formats::mias::AliconaReader::new();
     assert_eq!(reader.series_count(), 0);
     assert!(matches!(
         reader.set_series(0),
@@ -5839,7 +5839,7 @@ fn fei_philips_img_decodes_java_interlaced_pixels() {
     let pixels: Vec<u8> = (0..16).collect();
     write_fei_philips_img(&path, 4, 4, &pixels);
 
-    let mut reader = bioformats::formats::sem::FeiPhilipsReader::new();
+    let mut reader = bioformats::formats::sem::FeiReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!((meta.size_x, meta.size_y), (4, 4));
@@ -6341,7 +6341,7 @@ fn misc4_readers_report_not_initialized_for_preinit_set_series() {
         Box::new(bioformats::formats::misc4::ArfReader::new()),
         Box::new(bioformats::formats::misc4::PdsReader::new()),
         Box::new(bioformats::formats::misc4::HisReader::new()),
-        Box::new(bioformats::formats::misc4::FilePatternReaderStub::new()),
+        Box::new(bioformats::formats::misc4::FilePatternReader::new()),
         // NOTE: I2i/Jdce/Pci/Obf/Apl/Hrdgdf/Klb removed — they are now real
         // readers (see tests/stub_misc4*_test.rs), no longer placeholders.
     ];
@@ -6362,7 +6362,7 @@ fn misc4_remaining_placeholders_read_strict_raw_subsets() {
     // remaining strict-raw stubs are exercised here.
     let cases: Vec<(&str, Box<dyn FormatReader>, [u8; 8])> = vec![(
         "strict.pattern",
-        Box::new(bioformats::formats::misc4::FilePatternReaderStub::new()),
+        Box::new(bioformats::formats::misc4::FilePatternReader::new()),
         *b"BFPATT\0\0",
     )];
 
@@ -6404,7 +6404,7 @@ fn misc4_strict_raw_subsets_reject_malformed_inputs_before_metadata() {
     // remaining strict-raw stubs are exercised here.
     let cases: Vec<(&str, Box<dyn FormatReader>, Vec<u8>, &str)> = vec![(
         "truncated.pattern",
-        Box::new(bioformats::formats::misc4::FilePatternReaderStub::new()),
+        Box::new(bioformats::formats::misc4::FilePatternReader::new()),
         strict_misc4_raw_bytes(b"BFPATT\0\0", 2, 2, 1, 1, &[1, 2, 3]),
         "payload is truncated",
     )];
@@ -6814,7 +6814,7 @@ fn nifti_rejects_invalid_or_non_positive_dimensions() {
 
 #[test]
 fn viff_rejects_non_positive_counts_and_short_payload() {
-    let mut uninit = bioformats::formats::viff::ViffReader::new();
+    let mut uninit = bioformats::formats::khoros::KhorosReader::new();
     assert_eq!(uninit.series_count(), 0);
     assert!(matches!(
         uninit.set_series(0),
@@ -7432,7 +7432,7 @@ fn ome_xml_uses_bindata_big_endian_when_pixels_omits_it() {
 #[test]
 fn ome_xml_name_detection_accepts_ome_xml_suffix() {
     let path = tmp("suffix.ome.xml");
-    let reader = bioformats::formats::ome::OmeXmlReader::new();
+    let reader = bioformats::formats::ome_xml::OmeXmlReader::new();
     assert!(reader.is_this_type_by_name(&path));
 }
 
@@ -7478,7 +7478,7 @@ fn ome_xml_attribute_matching_does_not_confuse_physical_size_with_size() {
     )
     .unwrap();
 
-    let mut reader = bioformats::formats::ome::OmeXmlReader::new();
+    let mut reader = bioformats::formats::ome_xml::OmeXmlReader::new();
     reader.set_id(&path).unwrap();
 
     assert_eq!(reader.metadata().size_x, 512);
@@ -7513,7 +7513,7 @@ fn ome_xml_rejects_fake_dimensions_unknown_metadata_and_short_bindata() {
     for (name, xml, expected) in cases {
         let path = tmp(name);
         std::fs::write(&path, xml).unwrap();
-        let mut reader = bioformats::formats::ome::OmeXmlReader::new();
+        let mut reader = bioformats::formats::ome_xml::OmeXmlReader::new();
         let err = reader.set_id(&path).unwrap_err();
         assert!(
             err.to_string().contains(expected),
@@ -7529,7 +7529,7 @@ fn ome_xml_rejects_missing_explicit_companion_before_metadata() {
     let xml = r#"<OME><Image><Pixels DimensionOrder="XYZCT" Type="uint8" SizeX="1" SizeY="1" SizeZ="1" SizeC="1" SizeT="1"><TiffData IFD="0"><UUID FileName="missing_pixels.tif">urn:uuid:test</UUID></TiffData></Pixels></Image></OME>"#;
     std::fs::write(&path, xml).unwrap();
 
-    let mut reader = bioformats::formats::ome::OmeXmlReader::new();
+    let mut reader = bioformats::formats::ome_xml::OmeXmlReader::new();
     let err = reader.set_id(&path).unwrap_err();
     assert!(
         err.to_string().contains("companion TIFF not found"),
@@ -8133,7 +8133,7 @@ fn imaris_derives_dimensions_from_dataset_shape_not_attributes() {
     }
     file.flush().unwrap();
 
-    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    let mut reader = bioformats::formats::imaris_hdf::ImarisHdfReader::new();
     reader.set_id(&path).unwrap();
     let m = reader.metadata();
     assert_eq!((m.size_x, m.size_y, m.size_z, m.size_c), (4, 3, 1, 1));
@@ -8171,7 +8171,7 @@ fn imaris_reads_java_style_underscore_layout() {
     }
     file.flush().unwrap();
 
-    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    let mut reader = bioformats::formats::imaris_hdf::ImarisHdfReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(
@@ -8291,7 +8291,7 @@ fn imaris_preserves_recording_spacing_and_dataset_metadata() {
     }
     file.flush().unwrap();
 
-    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    let mut reader = bioformats::formats::imaris_hdf::ImarisHdfReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 2);
@@ -8518,7 +8518,7 @@ fn imaris_preserves_surpass_object_graph_metadata_without_reading_large_payloads
     }
     file.flush().unwrap();
 
-    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    let mut reader = bioformats::formats::imaris_hdf::ImarisHdfReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert!(matches!(
@@ -8683,7 +8683,7 @@ fn imaris_preserves_column_oriented_surpass_statistics_table() {
     }
     file.flush().unwrap();
 
-    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    let mut reader = bioformats::formats::imaris_hdf::ImarisHdfReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert!(matches!(
@@ -8762,7 +8762,7 @@ fn imaris_reports_large_surpass_geometry_without_reading_payloads() {
     }
     file.flush().unwrap();
 
-    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    let mut reader = bioformats::formats::imaris_hdf::ImarisHdfReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert!(matches!(
@@ -8815,7 +8815,7 @@ fn imaris_requires_pixel_dataset_and_initialized_series() {
     let path = tmp("weak_ims.ims");
     let _ = std::fs::remove_file(&path);
 
-    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    let mut reader = bioformats::formats::imaris_hdf::ImarisHdfReader::new();
     assert_eq!(reader.series_count(), 0);
     assert_eq!(reader.resolution_count(), 0);
     assert!(matches!(
@@ -8871,7 +8871,7 @@ fn imaris_rejects_out_of_bounds_region() {
     }
     file.flush().unwrap();
 
-    let mut reader = bioformats::formats::imaris::ImarisReader::new();
+    let mut reader = bioformats::formats::imaris_hdf::ImarisHdfReader::new();
     reader.set_id(&path).unwrap();
     let err = reader.open_bytes_region(0, 2, 0, 2, 1).unwrap_err();
     assert!(
@@ -9115,7 +9115,7 @@ fn psd_utf16be_string(text: &str) -> Vec<u8> {
 fn photoshop_rejects_unknown_header_values_and_short_payload() {
     let version = tmp("bad_version.psd");
     std::fs::write(&version, minimal_psd(3, 1, 1, 1, 8)).unwrap();
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     assert_eq!(reader.series_count(), 0);
     assert!(matches!(
         reader.set_series(0),
@@ -9127,7 +9127,7 @@ fn photoshop_rejects_unknown_header_values_and_short_payload() {
 
     let depth = tmp("bad_depth.psd");
     std::fs::write(&depth, minimal_psd(1, 1, 1, 3, 12)).unwrap();
-    let err = bioformats::formats::photoshop::PsdReader::new()
+    let err = bioformats::formats::psd::PsdReader::new()
         .set_id(&depth)
         .unwrap_err();
     assert!(err.to_string().contains("unsupported bit depth 12"));
@@ -9135,7 +9135,7 @@ fn photoshop_rejects_unknown_header_values_and_short_payload() {
 
     let zero = tmp("zero_dim.psd");
     std::fs::write(&zero, minimal_psd(1, 0, 1, 3, 8)).unwrap();
-    let err = bioformats::formats::photoshop::PsdReader::new()
+    let err = bioformats::formats::psd::PsdReader::new()
         .set_id(&zero)
         .unwrap_err();
     assert!(err.to_string().contains("non-positive"));
@@ -9143,7 +9143,7 @@ fn photoshop_rejects_unknown_header_values_and_short_payload() {
 
     let bad_channels = tmp("bad_channels.psd");
     std::fs::write(&bad_channels, minimal_psd(1, 1, 1, 1, 8)).unwrap();
-    let err = bioformats::formats::photoshop::PsdReader::new()
+    let err = bioformats::formats::psd::PsdReader::new()
         .set_id(&bad_channels)
         .unwrap_err();
     assert!(err.to_string().contains("channel count is too small"));
@@ -9153,7 +9153,7 @@ fn photoshop_rejects_unknown_header_values_and_short_payload() {
     let mut data = minimal_psd(1, 2, 2, 3, 8);
     data.pop();
     std::fs::write(&short, data).unwrap();
-    let err = bioformats::formats::photoshop::PsdReader::new()
+    let err = bioformats::formats::psd::PsdReader::new()
         .set_id(&short)
         .unwrap_err();
     assert!(err.to_string().contains("failed to fill whole buffer"));
@@ -9169,7 +9169,7 @@ fn photoshop_preserves_header_and_image_resource_metadata() {
     )
     .unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
     assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3]);
 
@@ -9210,7 +9210,7 @@ fn photoshop_decodes_pixel_aspect_ratio_image_resource() {
     payload.extend_from_slice(&1.25f64.to_bits().to_be_bytes());
     std::fs::write(&path, psd_with_text_resource(1064, &payload)).unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
 
     let metadata = &reader.metadata().series_metadata;
@@ -9246,7 +9246,7 @@ fn photoshop_decodes_resolution_info_image_resource() {
     payload.extend_from_slice(&3u16.to_be_bytes());
     std::fs::write(&path, psd_with_text_resource(1005, &payload)).unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
 
     let metadata = &reader.metadata().series_metadata;
@@ -9300,7 +9300,7 @@ fn photoshop_decodes_display_info_image_resource() {
     payload.push(0);
     std::fs::write(&path, psd_with_text_resource(1007, &payload)).unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
 
     let metadata = &reader.metadata().series_metadata;
@@ -9342,7 +9342,7 @@ fn photoshop_decodes_print_flags_image_resource() {
     )
     .unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
 
     let metadata = &reader.metadata().series_metadata;
@@ -9390,7 +9390,7 @@ fn photoshop_decodes_print_flags_information_image_resource() {
     payload.extend_from_slice(&72u16.to_be_bytes());
     std::fs::write(&path, psd_with_text_resource(10000, &payload)).unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
 
     let metadata = &reader.metadata().series_metadata;
@@ -9427,7 +9427,7 @@ fn photoshop_decodes_print_flags_information_image_resource() {
 fn photoshop_print_flags_information_records_malformed_payloads() {
     let short = tmp("short_print_flags_information_resource.psd");
     std::fs::write(&short, psd_with_text_resource(10000, &[0, 1, 1])).unwrap();
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&short).unwrap();
     assert!(matches!(
         reader
@@ -9447,7 +9447,7 @@ fn photoshop_print_flags_information_records_malformed_payloads() {
     payload.extend_from_slice(&72u16.to_be_bytes());
     payload.extend_from_slice(&[9, 10]);
     std::fs::write(&trailing, psd_with_text_resource(10000, &payload)).unwrap();
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&trailing).unwrap();
     assert!(matches!(
         reader
@@ -9470,7 +9470,7 @@ fn photoshop_decodes_version_info_image_resource() {
     payload.extend_from_slice(&2u32.to_be_bytes());
     std::fs::write(&path, psd_with_text_resource(1057, &payload)).unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
 
     let metadata = &reader.metadata().series_metadata;
@@ -9507,7 +9507,7 @@ fn photoshop_decodes_copyright_flag_image_resource() {
     let path = tmp("copyright_flag_resource.psd");
     std::fs::write(&path, psd_with_text_resource(1034, &[1])).unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
 
     let metadata = &reader.metadata().series_metadata;
@@ -9532,7 +9532,7 @@ fn photoshop_decodes_global_angle_image_resource() {
     let path = tmp("global_angle_resource.psd");
     std::fs::write(&path, psd_with_text_resource(1037, &120i32.to_be_bytes())).unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
 
     let metadata = &reader.metadata().series_metadata;
@@ -9565,7 +9565,7 @@ fn photoshop_decodes_icc_profile_image_resource_metadata() {
     payload[36..40].copy_from_slice(b"acsp");
     std::fs::write(&path, psd_with_text_resource(1039, &payload)).unwrap();
 
-    let mut reader = bioformats::formats::photoshop::PsdReader::new();
+    let mut reader = bioformats::formats::psd::PsdReader::new();
     reader.set_id(&path).unwrap();
 
     let metadata = &reader.metadata().series_metadata;
@@ -11063,7 +11063,7 @@ fn zvi_preserves_tag_stream_ids_names_and_values() {
 fn czi_lsm_xrm_zvi_reject_fake_metadata_before_initialization() {
     use std::io::Write;
 
-    let mut czi = bioformats::formats::czi::CziReader::new();
+    let mut czi = bioformats::formats::zeiss_czi::ZeissCziReader::new();
     assert_eq!(czi.series_count(), 0);
     assert!(matches!(
         czi.set_series(0),
@@ -11085,7 +11085,7 @@ fn czi_lsm_xrm_zvi_reject_fake_metadata_before_initialization() {
     );
     assert_eq!(czi.series_count(), 0);
 
-    let mut lsm = bioformats::formats::lsm::LsmReader::new();
+    let mut lsm = bioformats::formats::zeiss_lsm::ZeissLsmReader::new();
     assert_eq!(lsm.series_count(), 0);
     assert!(matches!(
         lsm.set_series(0),
@@ -11108,7 +11108,7 @@ fn czi_lsm_xrm_zvi_reject_fake_metadata_before_initialization() {
     );
     assert_eq!(lsm.series_count(), 0);
 
-    let mut xrm = bioformats::formats::xrm::XrmReader::new();
+    let mut xrm = bioformats::formats::zeiss_xrm::ZeissXrmReader::new();
     assert_eq!(xrm.series_count(), 0);
     assert!(matches!(
         xrm.set_series(0),
@@ -11143,7 +11143,7 @@ fn czi_lsm_xrm_zvi_reject_fake_metadata_before_initialization() {
     );
     assert_eq!(xrm.series_count(), 0);
 
-    let mut zvi = bioformats::formats::zvi::ZviReader::new();
+    let mut zvi = bioformats::formats::zeiss_zvi::ZeissZviReader::new();
     assert_eq!(zvi.series_count(), 0);
     assert!(matches!(
         zvi.set_series(0),
@@ -11212,7 +11212,7 @@ fn mias_metamorph_prairie_olympus_require_initialization_for_series() {
         Err(BioFormatsError::NotInitialized)
     ));
 
-    let mut olympus = bioformats::formats::olympus::OifReader::new();
+    let mut olympus = bioformats::formats::olympus::Fv1000Reader::new();
     assert_eq!(olympus.series_count(), 0);
     assert!(matches!(
         olympus.set_series(0),
@@ -11333,7 +11333,7 @@ fn olympus_rejects_missing_pty_and_clears_prior_series() {
     )
     .unwrap();
 
-    let mut reader = bioformats::formats::olympus::OifReader::new();
+    let mut reader = bioformats::formats::olympus::Fv1000Reader::new();
     reader.set_id(&good).unwrap();
     assert_eq!(reader.series_count(), 1);
     let err = reader.set_id(&bad).unwrap_err();

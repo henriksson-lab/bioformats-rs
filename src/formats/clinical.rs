@@ -1587,28 +1587,28 @@ fn parse_fdf_header(path: &Path) -> Result<(u32, u32, u32, u32, PixelType, u8, b
     ))
 }
 
-pub struct FdfReader {
+pub struct VarianFdfReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
 }
 
-impl FdfReader {
+impl VarianFdfReader {
     pub fn new() -> Self {
-        FdfReader {
+        VarianFdfReader {
             path: None,
             meta: None,
             data_offset: 0,
         }
     }
 }
-impl Default for FdfReader {
+impl Default for VarianFdfReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for FdfReader {
+impl FormatReader for VarianFdfReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())

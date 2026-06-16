@@ -481,7 +481,7 @@ impl FormatReader for BdvReader {
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        // Intentionally false — avoid conflict with ImarisReader which uses HDF5
+        // Intentionally false — avoid conflict with ImarisHdfReader which uses HDF5
         // magic bytes; rely on extension/XML detection only.
         false
     }

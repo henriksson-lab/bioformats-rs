@@ -17,15 +17,15 @@ use crate::common::region::crop_full_plane;
 
 const IMAGE_DATA: &str = "/ImageData/";
 
-pub struct XrmReader {
+pub struct ZeissXrmReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     image_paths: Vec<String>,
 }
 
-impl XrmReader {
+impl ZeissXrmReader {
     pub fn new() -> Self {
-        XrmReader {
+        ZeissXrmReader {
             path: None,
             meta: None,
             image_paths: Vec::new(),
@@ -33,13 +33,13 @@ impl XrmReader {
     }
 }
 
-impl Default for XrmReader {
+impl Default for ZeissXrmReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for XrmReader {
+impl FormatReader for ZeissXrmReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -454,7 +454,7 @@ mod tests {
             write_stream(&mut comp, "/ImageData/Image1", &[1, 2, 3, 4, 5, 6]);
         }
 
-        let mut reader = XrmReader::new();
+        let mut reader = ZeissXrmReader::new();
         reader.set_id(&path).unwrap();
         let meta = reader.metadata();
         assert_eq!(meta.size_x, 3);
@@ -492,7 +492,7 @@ mod tests {
             write_stream(&mut comp, "/ImageData/Image1", &[0u8; 8]);
         }
 
-        let mut reader = XrmReader::new();
+        let mut reader = ZeissXrmReader::new();
         reader.set_id(&txrm).unwrap();
         let md = &reader.metadata().series_metadata;
         assert_eq!(
@@ -546,7 +546,7 @@ mod tests {
             write_i32_stream(&mut comp, "/ImageInfo/CameraBinning", 2);
             write_stream(&mut comp, "/ImageData/Image1", &[0u8; 8]);
         }
-        let mut reader = XrmReader::new();
+        let mut reader = ZeissXrmReader::new();
         reader.set_id(&txm).unwrap();
         let md = &reader.metadata().series_metadata;
         assert_eq!(
@@ -572,7 +572,7 @@ mod tests {
             write_stream(&mut comp, "/ImageData/Image1", &[0; 8]);
         }
 
-        let err = XrmReader::new().set_id(&path).unwrap_err();
+        let err = ZeissXrmReader::new().set_id(&path).unwrap_err();
         assert!(
             matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("ImageHeight")),
             "{err:?}"
@@ -591,7 +591,7 @@ mod tests {
             write_stream(&mut comp, "/ImageData/Image1", &[0; 4]);
         }
 
-        let err = XrmReader::new().set_id(&path).unwrap_err();
+        let err = ZeissXrmReader::new().set_id(&path).unwrap_err();
         assert!(
             matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("non-positive")),
             "{err:?}"

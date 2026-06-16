@@ -315,7 +315,7 @@ fn read_lsm_info_from_file(path: &Path) -> Result<(LsmInfo, bool)> {
 
 // ── Reader ────────────────────────────────────────────────────────────────────
 
-pub struct LsmReader {
+pub struct ZeissLsmReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     /// Inner TIFF reader handles pixel I/O; we select the correct series.
@@ -330,9 +330,9 @@ pub struct LsmReader {
     image_name: Option<String>,
 }
 
-impl LsmReader {
+impl ZeissLsmReader {
     pub fn new() -> Self {
-        LsmReader {
+        ZeissLsmReader {
             path: None,
             meta: None,
             inner: TiffReader::new(),
@@ -379,13 +379,13 @@ impl LsmReader {
     }
 }
 
-impl Default for LsmReader {
+impl Default for ZeissLsmReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for LsmReader {
+impl FormatReader for ZeissLsmReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())

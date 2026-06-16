@@ -1,6 +1,6 @@
 //! Legacy and obscure format readers.
 //!
-//! - KodakBipReader: Kodak thermal camera (.bip)
+//! - KodakReader: Kodak thermal camera (.bip)
 //! - PictReader: Apple PICT format (.pict, .pct), bounded bitmap/pixmap support
 
 use std::collections::HashMap;
@@ -26,22 +26,22 @@ fn region_crop(full: &[u8], meta: &ImageMetadata, x: u32, y: u32, w: u32, h: u32
     out
 }
 
-// ── KodakBipReader ────────────────────────────────────────────────────────────
+// ── KodakReader ────────────────────────────────────────────────────────────
 
 /// Kodak Molecular Imaging `.bip` reader, ported from the Java `KodakReader`.
 ///
 /// The format is big-endian with 32-bit float pixels. Dimensions and the pixel
 /// offset are located by scanning for the `GBiH` (dimensions) and `BSfD`
 /// (pixels) tag markers; `DTag` is the file magic.
-pub struct KodakBipReader {
+pub struct KodakReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     pixel_offset: u64,
 }
 
-impl KodakBipReader {
+impl KodakReader {
     pub fn new() -> Self {
-        KodakBipReader {
+        KodakReader {
             path: None,
             meta: None,
             pixel_offset: 0,
@@ -49,7 +49,7 @@ impl KodakBipReader {
     }
 }
 
-impl Default for KodakBipReader {
+impl Default for KodakReader {
     fn default() -> Self {
         Self::new()
     }
@@ -133,7 +133,7 @@ fn parse_kodak_bip(path: &Path) -> Result<(ImageMetadata, u64)> {
     Ok((meta, pixel_offset))
 }
 
-impl FormatReader for KodakBipReader {
+impl FormatReader for KodakReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()

@@ -2055,15 +2055,15 @@ fn parse_dm2_extra_tags(s: &mut Be<'_>, meta: &mut HashMap<String, MetadataValue
     }
 }
 
-pub struct Dm2Reader {
+pub struct GatanDm2Reader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
 }
 
-impl Dm2Reader {
+impl GatanDm2Reader {
     pub fn new() -> Self {
-        Dm2Reader {
+        GatanDm2Reader {
             path: None,
             meta: None,
             data_offset: DM2_HEADER_SIZE,
@@ -2071,13 +2071,13 @@ impl Dm2Reader {
     }
 }
 
-impl Default for Dm2Reader {
+impl Default for GatanDm2Reader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for Dm2Reader {
+impl FormatReader for GatanDm2Reader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())

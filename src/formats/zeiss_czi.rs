@@ -1525,7 +1525,7 @@ fn decompress_zstd_1(data: &[u8]) -> Result<Vec<u8>> {
 
 // ---- reader ----------------------------------------------------------------
 
-pub struct CziReader {
+pub struct ZeissCziReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     entries: Vec<DirEntry>,
@@ -1548,9 +1548,9 @@ pub struct CziReader {
     current_resolution: usize,
 }
 
-impl CziReader {
+impl ZeissCziReader {
     pub fn new() -> Self {
-        CziReader {
+        ZeissCziReader {
             path: None,
             meta: None,
             entries: Vec::new(),
@@ -1799,13 +1799,13 @@ impl CziReader {
     }
 }
 
-impl Default for CziReader {
+impl Default for ZeissCziReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for CziReader {
+impl FormatReader for ZeissCziReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
@@ -2484,7 +2484,7 @@ mod tests {
     fn czi_bgr24_keeps_logical_channels_separate_from_packed_samples() {
         let planes = vec![vec![1, 2, 3, 4, 5, 6], vec![7, 8, 9, 10, 11, 12]];
         let path = write_synthetic_bgr_czi("bgr24_logical_c", 3, &planes);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
@@ -2508,7 +2508,7 @@ mod tests {
             vec![7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12, 0],
         ];
         let path = write_synthetic_bgr_czi("bgr48_logical_c", 4, &planes);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
@@ -2541,7 +2541,7 @@ mod tests {
             (directory_entry_dims(0, 0, 0, 2, 1, 2, 1, 0), vec![7, 8]),
         ];
         let path = write_synthetic_czi_entries("mosaic_tiles", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
@@ -2559,7 +2559,7 @@ mod tests {
     fn czi_rejects_short_decoded_tile_instead_of_padding() {
         let entries = vec![(directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0), vec![1])];
         let path = write_synthetic_czi_entries("short_tile", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         let err = reader.open_bytes(0).unwrap_err();
@@ -2576,7 +2576,7 @@ mod tests {
     fn czi_rejects_long_decoded_tile_instead_of_truncating() {
         let entries = vec![(directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0), vec![1, 2, 3])];
         let path = write_synthetic_czi_entries("long_tile", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         let err = reader.open_bytes(0).unwrap_err();
@@ -2594,7 +2594,7 @@ mod tests {
         let entry = parse_dir_entry(&directory_entry_dims(0, 0, 0, 1, 0, 1, 1, 0));
         let mut out = vec![0u8; 1];
 
-        let err = CziReader::assemble_entry(&mut out, 1, 1, &[7], &entry, 1, 0, 0).unwrap_err();
+        let err = ZeissCziReader::assemble_entry(&mut out, 1, 1, &[7], &entry, 1, 0, 0).unwrap_err();
         assert!(
             err.to_string()
                 .contains("tile X bounds exceed output plane"),
@@ -2612,7 +2612,7 @@ mod tests {
             (directory_entry_zc_dims(0, 0, 1, 1, 1, 1), vec![13]),
         ];
         let path = write_synthetic_czi_entries("xyczt_order", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
@@ -2637,7 +2637,7 @@ mod tests {
             (directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 1), vec![9, 10]),
         ];
         let path = write_synthetic_czi_entries("pyramid_levels", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -2661,7 +2661,7 @@ mod tests {
             (directory_entry_scene(0, 0, 1, 2, 1), vec![3, 4]),
         ];
         let path = write_synthetic_czi_entries("scene_series", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.series_count(), 2);
@@ -2698,7 +2698,7 @@ mod tests {
             (directory_entry_extra(0, 2, 1, 2, 1, "M", 3), vec![7, 8]),
         ];
         let path = write_synthetic_czi_entries("mosaic_M_prestitch", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         // Mosaics are stitched, not exposed as separate series.
@@ -2720,7 +2720,7 @@ mod tests {
             (directory_entry_extra(0, 12, 20, 2, 1, "M", 1), vec![3, 4]),
         ];
         let path = write_synthetic_czi_entries("mosaic_M_origin", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.series_count(), 1);
@@ -2741,7 +2741,7 @@ mod tests {
             (directory_entry_extra(0, 0, 0, 2, 1, "B", 1), vec![3, 4]),
         ];
         let path = write_synthetic_czi_entries("acq_series", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.series_count(), 2);
@@ -2760,7 +2760,7 @@ mod tests {
             (directory_entry_extra(0, 0, 0, 2, 1, "V", 1), vec![3, 4]),
         ];
         let path = write_synthetic_czi_entries("angle_series", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.series_count(), 2);
@@ -2789,7 +2789,7 @@ mod tests {
             (directory_entry_scene_z(0, 1, 1, 2, 1), vec![3, 4]),
         ];
         let path = write_synthetic_czi_entries("fused_collapse", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         // Series collapsed to one; the single series matches both subblocks.
@@ -2838,7 +2838,7 @@ mod tests {
             (directory_entry_rotation(1, 1, 2, 1), vec![22, 23]),
         ];
         let path = write_synthetic_czi_entries("rotation_modulo_z", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
@@ -2874,7 +2874,7 @@ mod tests {
             (directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 1), vec![9, 10]),
         ];
         let path = write_synthetic_czi_entries("r_size_one_pyramid", entries);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
@@ -2948,7 +2948,7 @@ mod tests {
             (directory_entry(0, 0, 0, 4, 1), vec![3, 4, 5, 6]),
         ];
         let path = write_synthetic_czi_with_xml("palm_split", entries, palm_xml);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         // PALM forces sizeC = 1 and exposes two series (one per distinct size).
@@ -2976,7 +2976,7 @@ mod tests {
             (directory_entry(0, 0, 1, 2, 1), vec![3, 4]),
         ];
         let path = write_synthetic_czi_with_xml("palm_same_size", entries, palm_xml);
-        let mut reader = CziReader::new();
+        let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.series_count(), 1);

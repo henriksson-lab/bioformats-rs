@@ -20,7 +20,7 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
-pub struct ZviReader {
+pub struct ZeissZviReader {
     path: Option<PathBuf>,
     comp: Option<cfb::CompoundFile<File>>,
     meta: Option<ImageMetadata>,
@@ -356,9 +356,9 @@ fn parse_zvi_tag_stream(data: &[u8], image_num: usize) -> HashMap<String, Metada
     map
 }
 
-impl ZviReader {
+impl ZeissZviReader {
     pub fn new() -> Self {
-        ZviReader {
+        ZeissZviReader {
             path: None,
             comp: None,
             meta: None,
@@ -372,7 +372,7 @@ impl ZviReader {
     }
 }
 
-impl Default for ZviReader {
+impl Default for ZeissZviReader {
     fn default() -> Self {
         Self::new()
     }
@@ -976,7 +976,7 @@ fn decode_plane_data(data: &[u8], plane: &ZviPlane) -> Result<Vec<u8>> {
     Ok(payload.to_vec())
 }
 
-impl FormatReader for ZviReader {
+impl FormatReader for ZeissZviReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -1362,7 +1362,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut reader = ZviReader::new();
+        let mut reader = ZeissZviReader::new();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.series_count(), 2);
@@ -1396,7 +1396,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut reader = ZviReader::new();
+        let mut reader = ZeissZviReader::new();
         reader.set_id(&path).unwrap();
         assert_eq!(reader.series_count(), 1);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![99]);
@@ -1422,7 +1422,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut reader = ZviReader::new();
+        let mut reader = ZeissZviReader::new();
         reader.set_id(&path).unwrap();
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0]);
 

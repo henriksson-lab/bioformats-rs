@@ -5,7 +5,7 @@
 //! small synthetic fixtures built to match the on-disk layout that each Java
 //! reader parses.
 
-use bioformats::formats::extended::{BurleighReader, ImspectorReader, LeicaLofReader, NafReader};
+use bioformats::formats::extended::{BurleighReader, ImspectorReader, LofReader, NafReader};
 use bioformats::{FormatReader, MetadataValue};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -243,7 +243,7 @@ fn lof_detects_magic() {
     let pixels = vec![10u8, 20, 30, 40];
     let bytes = build_lof(4, 1, 1, &pixels);
 
-    let reader = LeicaLofReader::new();
+    let reader = LofReader::new();
     assert!(reader.is_this_type_by_bytes(&bytes));
     // A LIF-style file (different type name) is rejected.
     let mut wrong = bytes.clone();
@@ -261,7 +261,7 @@ fn lof_reads_single_image() {
     let path = temp_path("single.lof");
     std::fs::write(&path, &bytes).unwrap();
 
-    let mut reader = LeicaLofReader::new();
+    let mut reader = LofReader::new();
     reader.set_id(&path).unwrap();
     assert_eq!(reader.series_count(), 1);
     let meta = reader.metadata();
@@ -298,7 +298,7 @@ fn lof_projects_channel_names_lut_and_wavelength_metadata() {
     let path = temp_path("channel_metadata.lof");
     std::fs::write(&path, &bytes).unwrap();
 
-    let mut reader = LeicaLofReader::new();
+    let mut reader = LofReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_c, 2);
@@ -349,7 +349,7 @@ fn lof_records_bgr_channel_order_from_channel_offsets() {
     let path = temp_path("bgr_channel_order.lof");
     std::fs::write(&path, &bytes).unwrap();
 
-    let mut reader = LeicaLofReader::new();
+    let mut reader = LofReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert!(meta.is_rgb);
@@ -391,7 +391,7 @@ fn lof_projects_structured_instrument_detector_roi_and_stage_metadata() {
     let path = temp_path("structured_metadata.lof");
     std::fs::write(&path, &bytes).unwrap();
 
-    let mut reader = LeicaLofReader::new();
+    let mut reader = LofReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert!(matches!(
@@ -442,7 +442,7 @@ fn lof_projects_structured_instrument_detector_roi_and_stage_metadata() {
 fn lof_rejects_non_lof() {
     let path = temp_path("garbage.lof");
     std::fs::write(&path, b"not a leica lof file at all").unwrap();
-    let mut reader = LeicaLofReader::new();
+    let mut reader = LofReader::new();
     assert!(reader.set_id(&path).is_err());
     assert_eq!(reader.series_count(), 0);
     let _ = std::fs::remove_file(path);

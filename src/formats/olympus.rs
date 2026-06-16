@@ -325,7 +325,7 @@ struct OifChannel {
     excitation: Option<f64>,
 }
 
-pub struct OifReader {
+pub struct Fv1000Reader {
     source: FileSource,
     /// Companion directory for OIF (path prefix); empty for OIB.
     path_prefix: String,
@@ -341,9 +341,9 @@ pub struct OifReader {
     channels: Vec<OifChannel>,
 }
 
-impl OifReader {
+impl Fv1000Reader {
     pub fn new() -> Self {
-        OifReader {
+        Fv1000Reader {
             source: FileSource::Disk,
             path_prefix: String::new(),
             meta: None,
@@ -945,7 +945,7 @@ impl OifReader {
     }
 }
 
-impl Default for OifReader {
+impl Default for Fv1000Reader {
     fn default() -> Self {
         Self::new()
     }
@@ -1109,7 +1109,7 @@ fn rand_suffix(bytes: &[u8]) -> u64 {
     pid ^ (len << 16) ^ h
 }
 
-impl FormatReader for OifReader {
+impl FormatReader for Fv1000Reader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
@@ -1189,7 +1189,7 @@ impl FormatReader for OifReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        crate::formats::lei::crop_region(&full, meta, x, y, w, h)
+        crate::formats::leica::crop_region(&full, meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -2153,7 +2153,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = OifReader::new();
+        let mut reader = Fv1000Reader::new();
         let err = reader.set_id(&root).unwrap_err();
         assert!(
             err.to_string().contains("companion TIFF")

@@ -21,7 +21,7 @@ use crate::common::region::crop_full_plane;
 
 // ── TopoMetrix Reader ─────────────────────────────────────────────────────────
 
-pub struct TopoMetrixReader {
+pub struct TopometrixReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
@@ -36,9 +36,9 @@ pub struct TopoMetrixReader {
     physical_size_y: Option<f64>,
 }
 
-impl TopoMetrixReader {
+impl TopometrixReader {
     pub fn new() -> Self {
-        TopoMetrixReader {
+        TopometrixReader {
             path: None,
             meta: None,
             data_offset: 0,
@@ -50,7 +50,7 @@ impl TopoMetrixReader {
     }
 }
 
-impl Default for TopoMetrixReader {
+impl Default for TopometrixReader {
     fn default() -> Self {
         Self::new()
     }
@@ -440,7 +440,7 @@ fn kv_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     Some(val)
 }
 
-impl FormatReader for TopoMetrixReader {
+impl FormatReader for TopometrixReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -960,7 +960,7 @@ mod tests {
         let bytes = build_fixture(2, 2, 1206, &pixels);
         let path = write_temp("ok", &bytes);
 
-        let mut reader = TopoMetrixReader::new();
+        let mut reader = TopometrixReader::new();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
@@ -1013,7 +1013,7 @@ mod tests {
         bytes[410..412].copy_from_slice(&4i16.to_le_bytes());
         let path = write_temp("trunc", &bytes);
 
-        let mut reader = TopoMetrixReader::new();
+        let mut reader = TopometrixReader::new();
         let err = reader.set_id(&path).unwrap_err();
         assert!(matches!(err, BioFormatsError::UnsupportedFormat(_)));
 
@@ -1023,7 +1023,7 @@ mod tests {
     #[test]
     fn topometrix_rejects_short_file() {
         let path = write_temp("short", &[0u8; 8]);
-        let mut reader = TopoMetrixReader::new();
+        let mut reader = TopometrixReader::new();
         assert!(reader.set_id(&path).is_err());
         std::fs::remove_file(&path).ok();
     }
@@ -1044,7 +1044,7 @@ mod tests {
 
     #[test]
     fn is_this_type_by_bytes_matches_magic() {
-        let reader = TopoMetrixReader::new();
+        let reader = TopometrixReader::new();
         assert!(reader.is_this_type_by_bytes(b"#R1.0 stuff"));
         assert!(!reader.is_this_type_by_bytes(b"#X1.0 "));
         assert!(!reader.is_this_type_by_bytes(b"#R")); // too short (<6)

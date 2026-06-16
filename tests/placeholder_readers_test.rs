@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bioformats::common::error::BioFormatsError;
-use bioformats::formats::misc4::FilePatternReaderStub;
+use bioformats::formats::misc4::FilePatternReader;
 use bioformats::FormatReader;
 use bioformats::MetadataValue;
 
@@ -43,7 +43,7 @@ fn filepattern_reader_delegates_to_stitcher_for_pattern_files() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, f0.file_name().unwrap().to_str().unwrap()).unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 2);
@@ -70,7 +70,7 @@ fn filepattern_reader_expands_explicit_zct_grid() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "fp_z<0-1>_c<0-1>_t<0-1>.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 2);
@@ -92,7 +92,7 @@ fn filepattern_reader_expands_comma_lists_and_steps() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "fp_t<00,02-04:2>.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 1);
@@ -115,7 +115,7 @@ fn filepattern_reader_groups_string_channel_labels_and_time() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_<DAPI,FITC>_t<0-1>.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 1);
@@ -203,7 +203,7 @@ fn filepattern_reader_preserves_explicit_pattern_metadata_slice() {
     let pattern_text = "img_ch<DAPI,FITC>_t[0-1]&sizeX=2&sizeY=1.fake";
     std::fs::write(&pattern, pattern_text).unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_c, 2);
@@ -362,7 +362,7 @@ fn filepattern_reader_names_size_aware_numeric_channel_axis() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_z<0-1>_<0-1>&sizeX=2&sizeY=1&sizeZ=2.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 4);
@@ -404,7 +404,7 @@ fn filepattern_reader_expands_alphabetic_channel_ranges() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_c<A-C>.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_c, 3);
@@ -430,7 +430,7 @@ fn filepattern_reader_expands_descending_ranges() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_t<2-0>.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_t, 3);
@@ -454,7 +454,7 @@ fn filepattern_reader_reports_missing_expanded_files() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "fp_z<0-1>.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     let err = reader.set_id(&pattern).unwrap_err();
     assert!(matches!(err, BioFormatsError::Format(message) if message.contains("missing files")));
 
@@ -472,7 +472,7 @@ fn filepattern_reader_expands_simple_star_glob() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_t*.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 1);
@@ -497,7 +497,7 @@ fn filepattern_reader_expands_question_glob_and_keeps_axis_metadata() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_c?_t?.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 1);
@@ -525,7 +525,7 @@ fn filepattern_reader_expands_bracket_numeric_ranges_with_metadata() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "fp_[0-9].fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     let err = reader.set_id(&pattern).unwrap_err();
     assert!(matches!(err, BioFormatsError::Format(message) if message.contains("missing files")));
 
@@ -555,7 +555,7 @@ fn filepattern_reader_expands_brace_channel_alternation() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_{DAPI,FITC}.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_c, 2);
@@ -595,7 +595,7 @@ fn filepattern_reader_expands_nested_brace_and_class_channel_alternation() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_{DAPI,FITC[0-1]}.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_c, 3);
@@ -628,7 +628,7 @@ fn filepattern_reader_expands_deeper_nested_brace_and_class_alternation() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_{DAPI,{FITC,TRITC}[0-1]}.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_c, 5);
@@ -668,7 +668,7 @@ fn filepattern_reader_matches_overlapping_explicit_channel_labels() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_{A,AB}.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_c, 2);
@@ -704,7 +704,7 @@ fn filepattern_reader_expands_shell_bracket_glob_classes() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_c[AB]_t?.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.image_count, 4);
@@ -745,7 +745,7 @@ fn filepattern_reader_expands_negated_shell_bracket_glob_classes() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "img_c[!C]_t?.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.image_count, 4);
@@ -792,7 +792,7 @@ fn filepattern_reader_uses_directory_blocks_as_axes() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "well_<DAPI,FITC>/img_t<0-1>&sizeX=2&sizeY=1.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 1);
@@ -843,7 +843,7 @@ fn filepattern_reader_expands_recursive_directory_globs() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "plate/**/img_t?&sizeX=2&sizeY=1.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 1);
@@ -868,7 +868,7 @@ fn filepattern_reader_recursive_glob_matches_zero_or_more_directories() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "plate/**/img_t?&sizeX=2&sizeY=1.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_c, 2);
@@ -892,7 +892,7 @@ fn filepattern_reader_collapses_adjacent_recursive_globs() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "plate/**/**/img_t?&sizeX=2&sizeY=1.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.image_count, 4);
@@ -921,7 +921,7 @@ fn filepattern_reader_terminal_recursive_glob_ignores_unreadable_sidecars() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "plate/**").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.image_count, 2);
@@ -948,7 +948,7 @@ fn filepattern_reader_terminal_recursive_glob_reports_unsupported_sidecar_only_t
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "plate/**").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     let err = reader.set_id(&pattern).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("recursive ** glob matched no supported reader files"))
@@ -972,7 +972,7 @@ fn filepattern_reader_expands_directory_globs() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "well_?/img_t?&sizeX=2&sizeY=1.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 1);
@@ -997,7 +997,7 @@ fn filepattern_reader_expands_directory_globs_mixed_with_pattern_blocks() {
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "well_?/img_t<0-1>&sizeX=2&sizeY=1.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 1);
@@ -1056,7 +1056,7 @@ fn filepattern_reader_supports_confined_parent_traversal_after_directory_glob() 
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "well_?/../img_t<0-1>&sizeX=2&sizeY=1.fake").unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_z, 1);
@@ -1081,7 +1081,7 @@ fn filepattern_reader_rejects_escaping_parent_traversal_after_directory_glob() {
     let outside_name = outside.file_name().unwrap().to_string_lossy();
     std::fs::write(&pattern, format!("well_?/../../{outside_name}")).unwrap();
 
-    let mut reader = FilePatternReaderStub::new();
+    let mut reader = FilePatternReader::new();
     let err = reader.set_id(&pattern).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("escapes the pattern root"))

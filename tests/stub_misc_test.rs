@@ -6,7 +6,7 @@
 //! layouts the Rust ports parse, which are translated directly from the Java
 //! reference readers.
 
-use bioformats::formats::misc::{MngReader, OpenlabLiffReader, SlideBookReader};
+use bioformats::formats::misc::{MngReader, OpenlabReader, SlidebookReader};
 use bioformats::{FormatReader, MetadataValue, OmeAnnotation, PixelType};
 use std::io::Write;
 
@@ -343,7 +343,7 @@ fn openlab_v2_detects_and_reads_uint16_plane() {
     let data = build_openlab_v2();
     let path = write_temp("plane.liff", &data);
 
-    let mut reader = OpenlabLiffReader::new();
+    let mut reader = OpenlabReader::new();
     assert!(reader.is_this_type_by_bytes(&data));
     assert!(reader.is_this_type_by_name(std::path::Path::new("x.liff")));
 
@@ -380,7 +380,7 @@ fn openlab_v2_delegates_embedded_pict_bitmap_payload() {
     let data = build_openlab_v2_pict(8, 2, &pict, "PICT bitmap");
     let path = write_temp("pict_bitmap.liff", &data);
 
-    let mut reader = OpenlabLiffReader::new();
+    let mut reader = OpenlabReader::new();
     reader.set_id(&path).unwrap();
 
     let meta = reader.metadata();
@@ -406,7 +406,7 @@ fn openlab_v2_reports_pict_decoder_boundary() {
     let data = build_openlab_v2_pict(2, 1, &pict, "PICT vector");
     let path = write_temp("pict_vector.liff", &data);
 
-    let mut reader = OpenlabLiffReader::new();
+    let mut reader = OpenlabReader::new();
     reader.set_id(&path).unwrap();
     let err = reader.open_bytes(0).unwrap_err();
     assert!(
@@ -428,7 +428,7 @@ fn openlab_v2_infers_zct_and_ome_names_from_plane_names() {
     ]);
     let path = write_temp("Plate42.liff", &data);
 
-    let mut reader = OpenlabLiffReader::new();
+    let mut reader = OpenlabReader::new();
     reader.set_id(&path).unwrap();
 
     let meta = reader.metadata();
@@ -483,7 +483,7 @@ fn openlab_v2_ome_annotations_include_native_series_metadata() {
     let data = build_openlab_v2_with_calibration("Plate7 FieldA Z1 C1 T1", 0.5, 0.75);
     let path = write_temp("Plate7.liff", &data);
 
-    let mut reader = OpenlabLiffReader::new();
+    let mut reader = OpenlabReader::new();
     reader.set_id(&path).unwrap();
 
     let meta = reader.metadata();
@@ -698,7 +698,7 @@ fn openlab_v2_keeps_stack_when_name_tokens_are_incomplete() {
     let data = build_openlab_v2_named_planes(&["field Z1 C1", "field Z2 C1"]);
     let path = write_temp("field.liff", &data);
 
-    let mut reader = OpenlabLiffReader::new();
+    let mut reader = OpenlabReader::new();
     reader.set_id(&path).unwrap();
 
     let meta = reader.metadata();
@@ -714,7 +714,7 @@ fn openlab_v2_keeps_stack_when_name_tokens_are_incomplete() {
 
 #[test]
 fn openlab_rejects_bad_magic() {
-    let reader = OpenlabLiffReader::new();
+    let reader = OpenlabReader::new();
     assert!(!reader.is_this_type_by_bytes(b"\x00\x00\x00\x00impr12"));
 }
 
@@ -722,7 +722,7 @@ fn openlab_rejects_bad_magic() {
 
 #[test]
 fn slidebook_detection_by_magic_shorts() {
-    let reader = SlideBookReader::new();
+    let reader = SlidebookReader::new();
     let mut header = vec![0u8; 16];
     header[4..6].copy_from_slice(b"II"); // little-endian
     header[6..8].copy_from_slice(&0x006cu16.to_le_bytes()); // magic1 = SLD_MAGIC_BYTES_1_0
@@ -743,7 +743,7 @@ fn slidebook_reports_honest_error_when_no_pixel_blocks() {
     data[8..10].copy_from_slice(&0x0100u16.to_le_bytes());
     let path = write_temp("empty.sld", &data);
 
-    let mut reader = SlideBookReader::new();
+    let mut reader = SlidebookReader::new();
     let result = reader.set_id(&path);
     assert!(
         result.is_err(),

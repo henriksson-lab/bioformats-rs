@@ -291,15 +291,15 @@ macro_rules! placeholder_reader {
 /// QuickTime/MOV container parsing is complex (nested atom structure with
 /// multiple codec variants). Returns `UnsupportedFormat` with a descriptive
 /// message instead of a generic "not yet implemented".
-pub struct QuickTimeReader {
+pub struct QtReader {
     path: Option<PathBuf>,
     series: Vec<QuickTimeParsed>,
     current_series: usize,
 }
 
-impl QuickTimeReader {
+impl QtReader {
     pub fn new() -> Self {
-        QuickTimeReader {
+        QtReader {
             path: None,
             series: Vec::new(),
             current_series: 0,
@@ -307,13 +307,13 @@ impl QuickTimeReader {
     }
 }
 
-impl Default for QuickTimeReader {
+impl Default for QtReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for QuickTimeReader {
+impl FormatReader for QtReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -3032,7 +3032,7 @@ fn parse_quicktime_track(
 /// As in Java, grayscale (single-channel) planes are written with each pixel
 /// inverted (`255 - p`) and rows padded to a multiple of 4 bytes; RGB planes
 /// are written verbatim with no padding. Note that the bundled
-/// [`QuickTimeReader`] maps the `"raw "` codec to interleaved RGB, so RGB
+/// [`QtReader`] maps the `"raw "` codec to interleaved RGB, so RGB
 /// output round-trips through it directly, whereas Java-style inverted
 /// grayscale would be re-read as 3-channel RGB.
 pub struct QtWriter {
@@ -3817,15 +3817,15 @@ struct SlideBookSeries {
     plane_bytes: usize,
 }
 
-pub struct SlideBookReader {
+pub struct SlidebookReader {
     path: Option<PathBuf>,
     series: Vec<SlideBookSeries>,
     current: usize,
 }
 
-impl SlideBookReader {
+impl SlidebookReader {
     pub fn new() -> Self {
-        SlideBookReader {
+        SlidebookReader {
             path: None,
             series: Vec::new(),
             current: 0,
@@ -4228,13 +4228,13 @@ impl SlideBookReader {
     }
 }
 
-impl Default for SlideBookReader {
+impl Default for SlidebookReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for SlideBookReader {
+impl FormatReader for SlidebookReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -5195,7 +5195,7 @@ struct OpenlabUserVars {
     z_pos: Option<String>,
 }
 
-pub struct OpenlabLiffReader {
+pub struct OpenlabReader {
     path: Option<PathBuf>,
     version: i32,
     planes: Vec<OpenlabPlane>,
@@ -5207,9 +5207,9 @@ pub struct OpenlabLiffReader {
     current: usize,
 }
 
-impl OpenlabLiffReader {
+impl OpenlabReader {
     pub fn new() -> Self {
-        OpenlabLiffReader {
+        OpenlabReader {
             path: None,
             version: 0,
             planes: Vec::new(),
@@ -5362,7 +5362,7 @@ impl OpenlabLiffReader {
         Ok(())
     }
 
-    fn parse(path: &Path) -> Result<OpenlabLiffReader> {
+    fn parse(path: &Path) -> Result<OpenlabReader> {
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let mut c = Cursor::new(&data, false); // big-endian
 
@@ -5856,7 +5856,7 @@ impl OpenlabLiffReader {
             metas.push(meta);
         }
 
-        Ok(OpenlabLiffReader {
+        Ok(OpenlabReader {
             path: Some(path.to_path_buf()),
             version,
             planes,
@@ -5952,13 +5952,13 @@ impl OpenlabLiffReader {
     }
 }
 
-impl Default for OpenlabLiffReader {
+impl Default for OpenlabReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FormatReader for OpenlabLiffReader {
+impl FormatReader for OpenlabReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -6830,7 +6830,7 @@ mod openlab_user_var_tests {
     use super::*;
 
     /// Encode a single `CStringVariable` entry in the big-endian layout
-    /// `OpenlabLiffReader::read_variable` expects.
+    /// `OpenlabReader::read_variable` expects.
     fn encode_string_var(class: &str, value: &str, name: &str, base_class_version: u8) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(class.as_bytes());
@@ -6867,7 +6867,7 @@ mod openlab_user_var_tests {
         let bytes = encode_string_var("CStringVariable", "123.5", "X-Y Stage: X Position", 1);
         let mut c = Cursor::new(&bytes, false);
         let mut vars = OpenlabUserVars::default();
-        OpenlabLiffReader::read_variable(&mut c, &mut vars).unwrap();
+        OpenlabReader::read_variable(&mut c, &mut vars).unwrap();
         assert_eq!(vars.x_pos.as_deref(), Some("123.5"));
         // The raw variable plus the synthesized "position #1" key are both emitted.
         assert!(vars
@@ -6883,7 +6883,7 @@ mod openlab_user_var_tests {
         let bytes = encode_float_var(2.0, "Gain", 1);
         let mut c = Cursor::new(&bytes, false);
         let mut vars = OpenlabUserVars::default();
-        OpenlabLiffReader::read_variable(&mut c, &mut vars).unwrap();
+        OpenlabReader::read_variable(&mut c, &mut vars).unwrap();
         assert_eq!(vars.gain.as_deref(), Some("2"));
         assert!(vars.metas.iter().any(|(n, _)| n == "Gain"));
 
@@ -6891,7 +6891,7 @@ mod openlab_user_var_tests {
         let bytes = encode_string_var("CStringVariable", "7", "ZPosition", 2);
         let mut c = Cursor::new(&bytes, false);
         let mut vars = OpenlabUserVars::default();
-        OpenlabLiffReader::read_variable(&mut c, &mut vars).unwrap();
+        OpenlabReader::read_variable(&mut c, &mut vars).unwrap();
         assert_eq!(vars.z_pos.as_deref(), Some("7"));
         assert!(vars
             .metas
@@ -6908,7 +6908,7 @@ mod openlab_user_var_tests {
         b.push(2); // invalid derivedClassVersion
         let mut c = Cursor::new(&b, false);
         let mut vars = OpenlabUserVars::default();
-        assert!(OpenlabLiffReader::read_variable(&mut c, &mut vars).is_err());
+        assert!(OpenlabReader::read_variable(&mut c, &mut vars).is_err());
     }
 }
 
@@ -6937,7 +6937,7 @@ mod qt_writer_tests {
     }
 
     /// Write a small uncompressed RGB `.mov` with `QtWriter`, then re-open it
-    /// with `QuickTimeReader` and assert dimensions + pixels round-trip.
+    /// with `QtReader` and assert dimensions + pixels round-trip.
     #[test]
     fn round_trip_uncompressed_rgb() {
         let (w, h, n) = (6u32, 4u32, 3u32);
@@ -6966,7 +6966,7 @@ mod qt_writer_tests {
         }
         writer.close().unwrap();
 
-        let mut reader = QuickTimeReader::new();
+        let mut reader = QtReader::new();
         reader.set_id(&path).unwrap();
         let rm = reader.metadata();
         assert_eq!(rm.size_x, w);
