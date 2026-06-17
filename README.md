@@ -5,7 +5,7 @@ A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-form
 
 **This package has limited real data testing, not all features are yet included**
 
-* 2026-06-15: Some more stragglers found. Definitely need a final audit, but using a different LLM
+* 2026-06-17: Some more stragglers found. Definitely need a final audit, but using a different LLM
 * 2026-06-14: Translation theoretically as complete as it can get. Testing on more data is however needed; if the code does not work on some file you have, please provide if possible
 * 2026-05-27: Further progress but incomplete. See status of translation below. However, more test data is needed for audit
 * 2026-05-26: 60-70% there. see list of libraries below. translation of mdbtools underway to support key file formats
