@@ -2305,6 +2305,432 @@ impl FormatReader for PhotoshopTiffReader {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 9. Nikon NEF — TIFF-based camera RAW (Nikon maker-note compression 34713)
+// ---------------------------------------------------------------------------
+/// Nikon NEF reader (`.nef`).
+///
+/// Faithful port of `NikonReader.java` (extends `BaseTiffReader`). NEF files are
+/// TIFF-based camera RAW images. The reader delegates IFD parsing and metadata
+/// to [`crate::tiff::TiffReader`], then mirrors Java's `initStandardMetadata`,
+/// `initFile`, and `openBytes`:
+///
+///  * detection: extension `.nef`, or a TIFF whose first IFD carries the
+///    `TIFF_EPS_STANDARD` tag (37398) or a `Make` tag containing "Nikon";
+///  * pixel decode: each strip is read raw, decompressed with the **existing**
+///    Nikon codec (`crate::tiff::nikon::decompress_nikon`, fed by options from
+///    `crate::tiff::nikon::extract_compression_options`) when the strip uses
+///    Nikon compression 34713, then assembled with the per-pixel Bayer color
+///    map, optional white-balance scaling, and `cfa::interpolate` into an
+///    interleaved RGB plane (matching `ImageTools.interpolate`).
+///
+/// The Nikon decompression codec and maker-note option parser are reused
+/// verbatim from `src/tiff/nikon.rs`; no codec is reimplemented here.
+pub struct NikonReader {
+    inner: crate::tiff::TiffReader,
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    /// Maker-note compression options (tag 150), if the file is compressed.
+    compression_options: Option<crate::tiff::nikon::NikonCompressionOptions>,
+    /// White-balance RGB coefficients (maker-note tag 12), if present.
+    white_balance: Option<[f64; 3]>,
+    /// Cached decoded interleaved-RGB plane (`lastPlane` in Java).
+    last_plane: Option<Vec<u8>>,
+}
+
+impl NikonReader {
+    /// Tag that gives a good indication of whether this is an NEF file.
+    const TIFF_EPS_STANDARD: u16 = 37398;
+    /// CFA color map tag carried in the data IFD.
+    const COLOR_MAP: u16 = 33422;
+    /// TIFF `Make` tag.
+    const MAKE: u16 = 271;
+    /// Maker-note tag holding RGB white-balance coefficients.
+    const WHITE_BALANCE_RGB_COEFFS: u16 = 12;
+    /// Default Bayer color map (index = (row%2)*2 + (col%2) -> 0=R, 1=G, 2=B).
+    const DEFAULT_COLOR_MAP: [i32; 4] = [1, 0, 2, 1];
+
+    pub fn new() -> Self {
+        NikonReader {
+            inner: crate::tiff::TiffReader::new(),
+            path: None,
+            meta: None,
+            compression_options: None,
+            white_balance: None,
+            last_plane: None,
+        }
+    }
+
+    /// Port of `isThisType(RandomAccessInputStream)`: parse the first IFD and
+    /// check for the EPS-standard tag or a `Make` value containing "Nikon".
+    fn is_this_type_stream(header: &[u8]) -> bool {
+        let cursor = std::io::Cursor::new(header);
+        let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let ifd = match parser.read_ifd(parser.first_ifd_offset) {
+            Ok((ifd, _)) => ifd,
+            Err(_) => return false,
+        };
+        if ifd.get(Self::TIFF_EPS_STANDARD).is_some() {
+            return true;
+        }
+        matches!(ifd.get_str(Self::MAKE), Some(make) if make.contains("Nikon"))
+    }
+
+    /// Extract the maker-note white-balance coefficients (tag 12), if present.
+    ///
+    /// Mirrors the `WHITE_BALANCE_RGB_COEFFS` branch of Java's
+    /// `initStandardMetadata`; reuses the same EXIF/maker-note traversal as the
+    /// compression-option extractor.
+    fn read_white_balance(path: &Path) -> Result<Option<[f64; 3]>> {
+        use crate::tiff::ifd::IfdValue;
+        let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let mut parser = match crate::tiff::parser::TiffParser::new(std::io::BufReader::new(file)) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let little = parser.little_endian;
+        let main_ifds = parser.read_ifds()?;
+        for ifd in &main_ifds {
+            let Some(exif_offset) = ifd.get_u64(crate::tiff::nikon::EXIF_IFD_TAG) else {
+                continue;
+            };
+            if exif_offset == 0 {
+                continue;
+            }
+            let (exif_ifd, _) = parser.read_ifd(exif_offset)?;
+            let maker = match exif_ifd.get(crate::tiff::nikon::EXIF_MAKER_NOTE_TAG) {
+                Some(IfdValue::Byte(b)) | Some(IfdValue::Undefined(b)) => b.clone(),
+                _ => continue,
+            };
+            let Some(note) = Self::parse_maker_note_ifd(&maker, little)? else {
+                continue;
+            };
+            if note.is_rational(Self::WHITE_BALANCE_RGB_COEFFS) {
+                let coeffs = note
+                    .get(Self::WHITE_BALANCE_RGB_COEFFS)
+                    .map(|v| v.as_vec_f64())
+                    .unwrap_or_default();
+                if coeffs.len() >= 3 {
+                    return Ok(Some([coeffs[0], coeffs[1], coeffs[2]]));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Parse the nested Nikon maker-note IFD from raw EXIF MakerNote bytes,
+    /// skipping the 10-byte `Nikon...` prefix. Mirrors the (private) helper of
+    /// the same name in `src/tiff/nikon.rs`; kept here as a thin public-API
+    /// wrapper so this reader needs no changes to that module.
+    fn parse_maker_note_ifd(
+        data: &[u8],
+        little_endian: bool,
+    ) -> Result<Option<crate::tiff::ifd::Ifd>> {
+        let nested = if data.len() >= 10 && data.starts_with(b"Nikon") {
+            &data[10..]
+        } else {
+            data
+        };
+        let mut parser = match crate::tiff::parser::TiffParser::new(std::io::Cursor::new(nested)) {
+            Ok(parser) => parser,
+            Err(_) => return Ok(None),
+        };
+        if parser.little_endian != little_endian {
+            return Ok(None);
+        }
+        parser
+            .read_ifd(parser.first_ifd_offset)
+            .map(|(ifd, _)| Some(ifd))
+    }
+
+    /// Port of `adjustForWhiteBalance`: scale a sample by the per-channel
+    /// white-balance coefficient when three coefficients are available.
+    fn adjust_for_white_balance(&self, val: i16, index: usize) -> i16 {
+        match self.white_balance {
+            Some(wb) => (val as f64 * wb[index]) as i16,
+            None => val,
+        }
+    }
+
+    /// Port of `openBytes`: decode plane `no` into an interleaved RGB plane.
+    fn decode_plane(&mut self, no: usize) -> Result<Vec<u8>> {
+        use crate::tiff::ifd::tag;
+
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        let little = meta.is_little_endian;
+
+        let ifd = self
+            .inner
+            .ifd(no)
+            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(no as u32))?;
+        let bps = ifd.bits_per_sample();
+        let mut data_size = *bps.first().unwrap_or(&16) as u16;
+        let byte_counts = ifd.get_vec_u64(tag::STRIP_BYTE_COUNTS);
+        let offsets = ifd.get_vec_u64(tag::STRIP_OFFSETS);
+        let compression = ifd.compression();
+        let ifd_colors = ifd.get_vec_u16(Self::COLOR_MAP);
+
+        let total_bytes: u64 = byte_counts.iter().copied().sum();
+        let plane_size = size_x
+            .saturating_mul(size_y)
+            .saturating_mul(meta.pixel_type.bytes_per_sample())
+            .saturating_mul(meta.size_c.max(1) as usize);
+
+        // If the data is already uncompressed full-size (or multi-sample),
+        // Java defers to BaseTiffReader.openBytes (plain strip decode).
+        if total_bytes as usize == plane_size || bps.len() > 1 {
+            return self.inner.open_bytes(no as u32);
+        }
+
+        let maybe_compressed = compression == crate::tiff::ifd::Compression::Nikon;
+        let compressed = self.compression_options.is_some() && maybe_compressed;
+
+        if !maybe_compressed && data_size == 14 {
+            data_size = 16;
+        }
+
+        // Read and (optionally) decompress every strip into one buffer.
+        let mut file = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
+        let mut src: Vec<u8> = Vec::new();
+        for (i, &count) in byte_counts.iter().enumerate() {
+            let mut t = vec![0u8; count as usize];
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offsets[i]))
+                .map_err(BioFormatsError::Io)?;
+            std::io::Read::read_exact(&mut file, &mut t).map_err(BioFormatsError::Io)?;
+            if compressed {
+                let options = self.compression_options.as_ref().unwrap();
+                t = crate::tiff::nikon::decompress_nikon(
+                    &t,
+                    size_x as u32,
+                    size_y as u32,
+                    data_size,
+                    options,
+                )?;
+            }
+            src.extend_from_slice(&t);
+        }
+
+        // Build the effective color map (default unless the IFD overrides it).
+        let mut color_map = Self::DEFAULT_COLOR_MAP;
+        if ifd_colors.len() >= color_map.len() {
+            let colors_valid = ifd_colors[..color_map.len()].iter().all(|&c| c <= 2);
+            if colors_valid {
+                for q in 0..color_map.len() {
+                    color_map[q] = ifd_colors[q] as i32;
+                }
+            }
+        }
+
+        let interleave_rows = offsets.len() == 1 && !maybe_compressed && color_map[0] != 0;
+
+        // Planar [R | G | B] short buffer assembled from the CFA samples.
+        let mut pix = vec![0i16; size_x * size_y * 3];
+        let mut bb = cfa::BitReader::new(&src);
+        for row in 0..size_y {
+            let real_row = if interleave_rows {
+                if row < size_y / 2 {
+                    row * 2
+                } else {
+                    (row - size_y / 2) * 2 + 1
+                }
+            } else {
+                row
+            };
+            for col in 0..size_x {
+                let val = (bb.read_bits(data_size as u32) & 0xffff) as u16 as i16;
+                let map_index = (real_row % 2) * 2 + (col % 2);
+
+                let red_offset = real_row * size_x + col;
+                let green_offset = (size_y + real_row) * size_x + col;
+                let blue_offset = (2 * size_y + real_row) * size_x + col;
+
+                match color_map[map_index] {
+                    0 => pix[red_offset] = self.adjust_for_white_balance(val, 0),
+                    1 => pix[green_offset] = self.adjust_for_white_balance(val, 1),
+                    2 => pix[blue_offset] = self.adjust_for_white_balance(val, 2),
+                    _ => {}
+                }
+
+                if maybe_compressed && !compressed {
+                    let mut to_skip = 0usize;
+                    if col % 10 == 9 {
+                        to_skip = 1;
+                    }
+                    if col == size_x - 1 {
+                        to_skip = 10;
+                    }
+                    bb.skip_bits(to_skip * 8);
+                }
+            }
+        }
+
+        let mut out = vec![0u8; size_x * size_y * 3 * 2];
+        cfa::interpolate(&pix, &mut out, &color_map, size_x, size_y, little);
+        Ok(out)
+    }
+}
+
+impl Default for NikonReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for NikonReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // extension is sufficient as long as it is NEF (Java NEF_SUFFIX).
+        matches!(
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("nef")
+        )
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::is_this_type_stream(header)
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        self.inner.set_id(path)?;
+
+        let first = self
+            .inner
+            .ifd(0)
+            .ok_or_else(|| BioFormatsError::UnsupportedFormat("Nikon NEF: no IFD".into()))?;
+        let bits = first.bits_per_sample();
+        let bits_per_sample = bits.first().copied().unwrap_or(16);
+
+        // initStandardMetadata: reset dimensions from the first data IFD.
+        let samples = first.samples_per_pixel();
+        let photo = first.get_u16(crate::tiff::ifd::tag::PHOTOMETRIC_INTERPRETATION);
+        // PhotoInterp.CFA_ARRAY == 32803 (not in our Photometric enum).
+        let is_cfa = photo == Some(32803);
+        let is_rgb = samples > 1 || photo == Some(2) || is_cfa;
+        let size_x = first.image_width().unwrap_or(0);
+        let size_y = first.image_length().unwrap_or(0);
+        let samples = if is_cfa { 3 } else { samples };
+
+        let mut meta = self.inner.metadata().clone();
+        meta.size_x = size_x;
+        meta.size_y = size_y;
+        meta.size_z = 1;
+        meta.size_c = if is_rgb { samples as u32 } else { 1 };
+        meta.is_rgb = is_rgb;
+        meta.is_indexed = false;
+        // initFile: imageCount = 1, sizeT = 1; interleaved when single-sample.
+        meta.size_t = 1;
+        meta.image_count = 1;
+        if first.samples_per_pixel() == 1 {
+            meta.is_interleaved = true;
+        }
+        meta.series_metadata
+            .insert("format".into(), MetadataValue::String("Nikon NEF".into()));
+
+        // Extract the Nikon maker-note compression options (tag 150) using the
+        // existing crate codec helper. Build a parser over the file for it.
+        let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let mut parser = crate::tiff::parser::TiffParser::new(std::io::BufReader::new(file))?;
+        let main_ifds = parser.read_ifds()?;
+        self.compression_options =
+            crate::tiff::nikon::extract_compression_options(&mut parser, &main_ifds, bits_per_sample)?;
+        self.white_balance = Self::read_white_balance(path)?;
+
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.last_plane = None;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.compression_options = None;
+        self.white_balance = None;
+        self.last_plane = None;
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        if self.meta.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        if s != 0 {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
+        Ok(())
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if p != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(p));
+        }
+        if self.last_plane.is_none() {
+            let plane = self.decode_plane(p as usize)?;
+            self.last_plane = Some(plane);
+        }
+        Ok(self.last_plane.clone().unwrap())
+    }
+
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let full = self.open_bytes(p)?;
+        let meta = self.metadata().clone();
+        crop_full_plane("Nikon NEF", &full, &meta, 3, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        let meta = self.metadata().clone();
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(p, tx, ty, tw, th)
+    }
+
+    fn resolution_count(&self) -> usize {
+        1
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level != 0 {
+            return Err(BioFormatsError::Format(format!(
+                "resolution {level} out of range"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2653,5 +3079,126 @@ mod tests {
             let expected_plane_val = s[present * plane + idx];
             assert_eq!(px(&buf, idx, present), expected_plane_val);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Nikon NEF reader tests
+    // -----------------------------------------------------------------------
+
+    fn push_u16_le(data: &mut Vec<u8>, value: u16) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    fn push_u32_le(data: &mut Vec<u8>, value: u32) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    fn push_ifd_entry(data: &mut Vec<u8>, tag: u16, type_code: u16, count: u32, value: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, type_code);
+        push_u32_le(data, count);
+        push_u32_le(data, value);
+    }
+
+    /// Build a minimal single-IFD classic TIFF describing an 8-bit RGB strip,
+    /// optionally tagging it as a Nikon NEF via `Make` or the EPS-standard tag.
+    /// `pixels` is the raw RGB strip (interleaved, 3 bytes/pixel).
+    fn synthetic_nef(width: u32, height: u32, pixels: &[u8], make_nikon: bool, eps: bool) -> Vec<u8> {
+        use crate::tiff::ifd::tag;
+        // Layout: header(8) | IFD | "Nikon\0" make string | strip data.
+        let mut entries: Vec<(u16, u16, u32, u32)> = Vec::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+
+        let make_str: &[u8] = b"Nikon\0"; // 6 bytes
+        // 8 fixed entries + optional Make + optional EPS-standard.
+        let entry_count: u16 = 8 + make_nikon as u16 + eps as u16;
+        let ifd_offset = 8u32;
+        let ifd_bytes = 2 + entry_count as u32 * 12 + 4;
+        let make_offset = ifd_offset + ifd_bytes;
+        // The Make string only occupies file space when present.
+        let make_bytes = if make_nikon { make_str.len() as u32 } else { 0 };
+        let strip_offset = make_offset + make_bytes;
+
+        entries.push((tag::IMAGE_WIDTH, 4, 1, width));
+        entries.push((tag::IMAGE_LENGTH, 4, 1, height));
+        entries.push((tag::BITS_PER_SAMPLE, 3, 1, 8));
+        entries.push((tag::COMPRESSION, 3, 1, 1)); // uncompressed
+        entries.push((tag::PHOTOMETRIC_INTERPRETATION, 3, 1, 2)); // RGB
+        entries.push((tag::STRIP_OFFSETS, 4, 1, strip_offset));
+        entries.push((tag::SAMPLES_PER_PIXEL, 3, 1, 3));
+        entries.push((tag::STRIP_BYTE_COUNTS, 4, 1, pixels.len() as u32));
+        if make_nikon {
+            entries.push((NikonReader::MAKE, 2, make_str.len() as u32, make_offset));
+        }
+        if eps {
+            entries.push((NikonReader::TIFF_EPS_STANDARD, 3, 1, 1));
+        }
+        entries.sort_by_key(|e| e.0); // TIFF requires ascending tag order
+        let entry_count = entries.len() as u16;
+
+        push_u32_le(&mut data, ifd_offset);
+        push_u16_le(&mut data, entry_count);
+        for (t, ty, c, v) in &entries {
+            push_ifd_entry(&mut data, *t, *ty, *c, *v);
+        }
+        push_u32_le(&mut data, 0); // next IFD = 0
+        if make_nikon {
+            data.extend_from_slice(make_str);
+        }
+        data.extend_from_slice(pixels);
+        data
+    }
+
+    #[test]
+    fn nikon_detects_by_extension_and_eps_and_make_tag() {
+        let reader = NikonReader::new();
+        assert!(reader.is_this_type_by_name(Path::new("photo.NEF")));
+        assert!(reader.is_this_type_by_name(Path::new("photo.nef")));
+        assert!(!reader.is_this_type_by_name(Path::new("photo.tif")));
+
+        let eps_tiff = synthetic_nef(2, 1, &[1, 2, 3, 4, 5, 6], false, true);
+        assert!(reader.is_this_type_by_bytes(&eps_tiff));
+
+        let make_tiff = synthetic_nef(2, 1, &[1, 2, 3, 4, 5, 6], true, false);
+        assert!(reader.is_this_type_by_bytes(&make_tiff));
+
+        // Plain TIFF with neither marker is rejected.
+        let plain = synthetic_nef(2, 1, &[1, 2, 3, 4, 5, 6], false, false);
+        assert!(!reader.is_this_type_by_bytes(&plain));
+    }
+
+    #[test]
+    fn nikon_parses_metadata_and_reads_uncompressed_rgb_plane() {
+        let root = temp_dir("nikon_rgb");
+        let w = 2u32;
+        let h = 2u32;
+        // 2x2 interleaved RGB, distinct values per channel/pixel.
+        let pixels: Vec<u8> = (0..(w * h * 3) as u8).collect();
+        let nef = synthetic_nef(w, h, &pixels, true, false);
+        let path = root.join("frame.nef");
+        fs::write(&path, &nef).unwrap();
+
+        let mut reader = NikonReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y), (w, h));
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 1);
+        assert!(meta.is_rgb);
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(reader.series_count(), 1);
+        match meta.series_metadata.get("format") {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "Nikon NEF"),
+            other => panic!("unexpected format metadata: {other:?}"),
+        }
+
+        // total strip bytes == plane size, so Java/our path defers to the plain
+        // TIFF strip decode: the RGB plane should round-trip unchanged.
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane, pixels);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

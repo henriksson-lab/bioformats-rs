@@ -23,6 +23,9 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         // Dedicated readers first (most precise magic bytes)
         Box::new(crate::formats::zip::ZipReader::new()),
         Box::new(crate::formats::imaris_hdf::ImarisHdfReader::new()),
+        // Classic native Bitplane Imaris .ims (magic int 5021964) — distinct from
+        // the HDF5 and TIFF Imaris variants; disambiguated by its own magic.
+        Box::new(crate::formats::flim2::ImarisReader::new()),
         // HDF5-based formats (extension-only, must come after ImarisHdfReader magic check)
         Box::new(crate::formats::cellh5::CellH5Reader::new()), // .ch5
         Box::new(crate::formats::bdv::BdvReader::new()),       // .h5
@@ -545,6 +548,14 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         Some("cr2") | Some("crw") | Some("cr3") => {
             vec![boxed_reader(crate::formats::camera2::CanonRawReader::new())]
         }
+        // Nikon NEF camera RAW (TIFF-based; is_this_type_by_bytes requires the
+        // EPS-standard tag or a Nikon Make, so it won't grab arbitrary TIFFs).
+        Some("nef") => vec![boxed_reader(crate::formats::camera2::NikonReader::new())],
+        // Image-Pro Sequence (TIFF-based with IMAGE_PRO custom tags). Raw Norpix
+        // StreamPix `.seq` is not TIFF and is handled by NorpixReader instead.
+        Some("seq") | Some("ips") => {
+            vec![boxed_reader(crate::formats::norpix::SeqReader::new())]
+        }
         Some("ipw") => vec![boxed_reader(crate::formats::camera2::IpwReader::new())],
         Some("ims") => vec![boxed_reader(crate::formats::flim2::ImarisTiffReader::new())],
         Some("xlef") => vec![boxed_reader(crate::formats::flim2::XlefReader::new())],
@@ -569,6 +580,11 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
                     readers.push(boxed_reader(
                         crate::formats::tiff_wrappers::NikonTiffReader::new(),
                     ));
+                }
+                // Faas-format pyramid TIFFs are identified by a SOFTWARE tag
+                // containing "Faas" (mirrors Java PyramidTiffReader.isThisType).
+                if software.contains("Faas") {
+                    readers.push(boxed_reader(crate::formats::svs::PyramidTiffReader::new()));
                 }
             }
 
@@ -720,6 +736,14 @@ fn generic_tiff_wrappers_for_description(
     description: &str,
 ) -> Vec<Box<dyn FormatReader>> {
     let mut readers = Vec::new();
+
+    // Metamorph TIFF carries a `<MetaData>...</MetaData>` ImageDescription
+    // comment (mirrors Java MetamorphTiffReader.isThisType); applies to .tif/.tiff.
+    if description.trim_start().starts_with("<MetaData>") {
+        readers.push(boxed_reader(
+            crate::formats::tiff_wrappers::MetamorphTiffReader::new(),
+        ));
+    }
 
     match ext {
         "tif" => {

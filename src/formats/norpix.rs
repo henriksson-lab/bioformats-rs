@@ -1,4 +1,4 @@
-//! Norpix StreamPix SEQ and IPLab format readers.
+//! Norpix StreamPix SEQ, Image-Pro Sequence (SEQ), and IPLab format readers.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -739,5 +739,507 @@ impl FormatReader for IplabReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+// ─── Image-Pro Sequence (SEQ) ─────────────────────────────────────────────────
+//
+// SEQReader (Java `loci.formats.in.SEQReader`) reads Image-Pro Sequence files
+// (`.seq`/`.ips`). Unlike Norpix StreamPix `.seq` (a raw frame stream, handled by
+// `NorpixReader` above), Image-Pro SEQ files are *TIFF* containers that carry a
+// set of private "Image-Pro" tags. Pixel and standard TIFF metadata work is
+// delegated to `crate::tiff::TiffReader`; the custom tags drive the Z/T counts,
+// frame rate and dimension order, mirroring `BaseTiffReader` + SEQReader.
+
+/// An array of shorts (length 12) with identical values in all of Bio-Formats'
+/// samples; assumed to be some sort of format identifier.
+const IMAGE_PRO_TAG_1: u16 = 50288;
+
+/// Frame rate.
+const IMAGE_PRO_TAG_2: u16 = 40105;
+
+const IMAGE_PRO_TAG_3: u16 = 40100;
+
+/// Image-Pro Sequence reader (`.seq`/`.ips`), TIFF-based.
+pub struct SeqReader {
+    inner: crate::tiff::TiffReader,
+}
+
+impl SeqReader {
+    /// Constructs a new Image-Pro SEQ reader.
+    pub fn new() -> Self {
+        SeqReader {
+            inner: crate::tiff::TiffReader::new(),
+        }
+    }
+
+    /// Mirror Java `SEQReader.isThisType(RandomAccessInputStream)`: parse the
+    /// first IFD and require IMAGE_PRO_TAG_1 (stored as a `short[]`) or
+    /// IMAGE_PRO_TAG_3 (stored as an `int[]`, i.e. TIFF SHORT). Operates on
+    /// whatever header bytes are available; if the tags lie beyond the supplied
+    /// window the parse fails gracefully and detection returns `false`. This
+    /// keeps the TIFF-based Image-Pro reader from colliding with the raw
+    /// `NorpixReader` (not a TIFF) or with generic TIFFs (which lack these tags).
+    fn is_this_type_from_bytes(header: &[u8]) -> bool {
+        let cursor = std::io::Cursor::new(header);
+        let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let offset = parser.first_ifd_offset;
+        let ifd = match parser.read_ifd(offset) {
+            Ok((ifd, _)) => ifd,
+            Err(_) => return false,
+        };
+        let tag1_short = matches!(
+            ifd.get(IMAGE_PRO_TAG_1),
+            Some(crate::tiff::ifd::IfdValue::Short(_))
+        );
+        // TIFF SHORT values surface as `int[]` in Java; `IfdValue::Short` here.
+        let tag3_int = matches!(
+            ifd.get(IMAGE_PRO_TAG_3),
+            Some(crate::tiff::ifd::IfdValue::Short(_))
+        );
+        tag1_short || tag3_int
+    }
+
+    /// Compute the OME dimension order string from the dominant axis, mirroring
+    /// the tail of Java `SEQReader.initStandardMetadata` (lines 291-316).
+    fn compute_dimension_order(size_z: u32, size_c: u32, size_t: u32) -> DimensionOrder {
+        let mut order = String::from("XY");
+        let dims = [size_z, size_c, size_t];
+        let axes = ['Z', 'C', 'T'];
+
+        let mut max_ndx = 0usize;
+        let mut max = 0u32;
+        for (i, &d) in dims.iter().enumerate() {
+            if d > max {
+                max = d;
+                max_ndx = i;
+            }
+        }
+
+        order.push(axes[max_ndx]);
+
+        if max_ndx != 1 {
+            if size_c > 1 {
+                order.push('C');
+                order.push(if max_ndx == 0 { axes[2] } else { axes[0] });
+            } else {
+                order.push(if max_ndx == 0 { axes[2] } else { axes[0] });
+                order.push('C');
+            }
+        } else if size_z > size_t {
+            order.push_str("ZT");
+        } else {
+            order.push_str("TZ");
+        }
+
+        match order.as_str() {
+            "XYCTZ" => DimensionOrder::XYCTZ,
+            "XYCZT" => DimensionOrder::XYCZT,
+            "XYTCZ" => DimensionOrder::XYTCZ,
+            "XYTZC" => DimensionOrder::XYTZC,
+            "XYZCT" => DimensionOrder::XYZCT,
+            "XYZTC" => DimensionOrder::XYZTC,
+            _ => DimensionOrder::XYZTC,
+        }
+    }
+
+    /// Mirror Java `SEQReader.initStandardMetadata`: after the standard TIFF
+    /// metadata is built, derive Z/T from the Image-Pro tags and the first IFD's
+    /// comment, then recompute the dimension order and plane count.
+    fn init_standard_metadata(&mut self) {
+        // super.initStandardMetadata() already ran inside TiffReader::set_id.
+        let ifd_count = self.inner.ifd_count();
+
+        // Read the per-IFD values we need before mutating the series metadata.
+        let mut size_z: u32 = 0;
+        let mut frame_rate: Option<i64> = None;
+        let mut seq_id: Option<String> = None;
+        for i in 0..ifd_count {
+            let Some(ifd) = self.inner.ifd(i) else {
+                continue;
+            };
+            if i == 0 {
+                if let Some(crate::tiff::ifd::IfdValue::Short(vals)) = ifd.get(IMAGE_PRO_TAG_1) {
+                    let mut id = String::new();
+                    for v in vals {
+                        id.push_str(&v.to_string());
+                    }
+                    seq_id = Some(id);
+                }
+            }
+            // IMAGE_PRO_TAG_2 is read from the *first* IFD in Java
+            // (ifds.get(0)) on every loop iteration; one image plane per IFD.
+            if let Some(rate) = self
+                .inner
+                .ifd(0)
+                .and_then(|f| f.get(IMAGE_PRO_TAG_2))
+                .and_then(|v| v.as_u32())
+            {
+                size_z += 1;
+                frame_rate = Some(rate as i64);
+            }
+        }
+
+        let mut size_t: u32 = 0;
+
+        if size_z == 0 {
+            size_z = 1;
+        }
+        if size_t == 0 {
+            size_t = 1;
+        }
+        if size_z == 1 && size_t == 1 {
+            size_z = ifd_count as u32;
+        }
+
+        // Parse the description (first IFD comment) for channels/slices/frames.
+        let comment = self
+            .inner
+            .ifd(0)
+            .and_then(|ifd| ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION))
+            .map(str::to_owned);
+
+        // Pull the current series metadata to read sizeC and write results back.
+        let series = self.inner.series_list_mut();
+        let Some(s0) = series.first_mut() else {
+            return;
+        };
+        let m = &mut s0.metadata;
+        let mut size_c = m.size_c;
+        let is_rgb = m.is_rgb;
+
+        if let Some(id) = seq_id {
+            m.series_metadata
+                .insert("Image-Pro SEQ ID".into(), MetadataValue::String(id));
+        }
+        if let Some(rate) = frame_rate {
+            m.series_metadata
+                .insert("Frame Rate".into(), MetadataValue::Int(rate));
+        }
+        m.series_metadata
+            .insert("Number of images".into(), MetadataValue::Int(size_z as i64));
+        m.series_metadata
+            .insert("frames".into(), MetadataValue::Int(size_z as i64));
+        m.series_metadata
+            .insert("channels".into(), MetadataValue::Int(size_c as i64));
+        m.series_metadata
+            .insert("slices".into(), MetadataValue::Int(size_t as i64));
+
+        if let Some(descr) = comment {
+            m.series_metadata.remove("Comment");
+            for token in descr.split('\n') {
+                let token = token.trim();
+                let eq = token
+                    .find('=')
+                    .or_else(|| token.find(':'));
+                if let Some(eq) = eq {
+                    let label = &token[..eq];
+                    let data = &token[eq + 1..];
+                    m.series_metadata
+                        .insert(label.to_string(), MetadataValue::String(data.to_string()));
+                    if label == "channels" {
+                        if let Ok(v) = data.trim().parse::<u32>() {
+                            size_c = v;
+                        }
+                    } else if label == "frames" {
+                        if let Ok(v) = data.trim().parse::<u32>() {
+                            size_t = v;
+                        }
+                    } else if label == "slices" {
+                        if let Ok(v) = data.trim().parse::<u32>() {
+                            size_z = v;
+                        }
+                    }
+                }
+            }
+        }
+
+        if is_rgb && size_c != 3 {
+            size_c *= 3;
+        }
+
+        let dimension_order = Self::compute_dimension_order(size_z, size_c, size_t);
+
+        m.size_z = size_z;
+        m.size_c = size_c;
+        m.size_t = size_t;
+        m.dimension_order = dimension_order;
+        // imageCount mirrors getImageCount() = sizeZ * effectiveSizeC * sizeT;
+        // for RGB data the samples share one plane, so use the IFD count when it
+        // matches, otherwise recompute from the planar dimensions.
+        let effective_c = if is_rgb { 1 } else { size_c };
+        m.image_count = size_z
+            .saturating_mul(effective_c)
+            .saturating_mul(size_t);
+    }
+}
+
+impl Default for SeqReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for SeqReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // Java: checkSuffix(name, "ips") => true; otherwise suffixSufficient is
+        // false, so a plain ".seq" name alone is not sufficient (it is shared
+        // with Norpix). The byte check disambiguates ".seq".
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("ips") || e.eq_ignore_ascii_case("seq"))
+            .unwrap_or(false)
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::is_this_type_from_bytes(header)
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.close()?;
+        self.inner.set_id(path)?;
+        self.init_standard_metadata();
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        self.inner.set_series(s)
+    }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(plane_index)
+    }
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(plane_index, x, y, w, h)
+    }
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(plane_index)
+    }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+}
+
+#[cfg(test)]
+mod seq_tests {
+    use super::*;
+
+    /// Build a minimal little-endian classic TIFF carrying the given extra IFD
+    /// entries (tag, type, count, inline-value-or-offset bytes are computed by the
+    /// caller via the `entries` list of (tag, field_type, count, value_u32)). For
+    /// our purposes every custom tag value fits inline (<= 4 bytes) or is laid out
+    /// after the IFD. To keep things simple we only emit tags whose data is laid
+    /// out after the IFD, with the offset pointing at appended payload.
+    ///
+    /// Layout:
+    ///   [0..8)   header: "II", 42, first-IFD-offset = 8
+    ///   [8..)    IFD: entry count, entries (12 bytes each), next-IFD = 0
+    ///   then     out-of-line payloads (strip pixels + tag arrays)
+    fn build_tiff(extra: &[(u16, u16, u32, Vec<u8>)]) -> Vec<u8> {
+        // Minimal 2x2 8-bit grayscale, single strip.
+        let width = 2u32;
+        let height = 2u32;
+        let pixels: Vec<u8> = vec![0, 1, 2, 3];
+
+        // Base structural tags (tag, type, count, inline-or-offset value).
+        // type: 3 = SHORT, 4 = LONG.
+        // We will place pixels and any out-of-line arrays after the IFD.
+        let mut entries: Vec<(u16, u16, u32, Vec<u8>)> = Vec::new();
+
+        // Placeholder for StripOffsets — filled once layout is known.
+        entries.push((256, 4, 1, width.to_le_bytes().to_vec())); // ImageWidth
+        entries.push((257, 4, 1, height.to_le_bytes().to_vec())); // ImageLength
+        entries.push((258, 3, 1, vec![8, 0, 0, 0])); // BitsPerSample = 8
+        entries.push((259, 3, 1, vec![1, 0, 0, 0])); // Compression = none
+        entries.push((262, 3, 1, vec![1, 0, 0, 0])); // Photometric = BlackIsZero
+        entries.push((273, 4, 1, vec![0, 0, 0, 0])); // StripOffsets (fixup later)
+        entries.push((277, 3, 1, vec![1, 0, 0, 0])); // SamplesPerPixel = 1
+        entries.push((278, 4, 1, height.to_le_bytes().to_vec())); // RowsPerStrip
+        entries.push((279, 4, 1, (pixels.len() as u32).to_le_bytes().to_vec())); // StripByteCounts
+
+        for e in extra {
+            entries.push(e.clone());
+        }
+        // Sort by tag id (TIFF requires ascending tag order).
+        entries.sort_by_key(|e| e.0);
+
+        let n = entries.len();
+        let ifd_start = 8usize;
+        let ifd_len = 2 + n * 12 + 4; // count + entries + next-ifd ptr
+        let mut out_of_line_start = ifd_start + ifd_len;
+
+        // Compute out-of-line offsets: each entry whose payload > 4 bytes is
+        // appended; the 4-byte value field then stores its offset.
+        let mut payloads: Vec<u8> = Vec::new();
+        let mut entry_values: Vec<[u8; 4]> = Vec::with_capacity(n);
+        // First, reserve space for the pixel strip right after the IFD so we know
+        // its offset; StripOffsets is fixed up afterwards.
+        let strip_offset = out_of_line_start as u32;
+        payloads.extend_from_slice(&pixels);
+        out_of_line_start += pixels.len();
+
+        for e in &entries {
+            let (_tag, _ty, _count, value) = e;
+            if value.len() <= 4 {
+                let mut v = [0u8; 4];
+                v[..value.len()].copy_from_slice(value);
+                entry_values.push(v);
+            } else {
+                let off = out_of_line_start as u32;
+                payloads.extend_from_slice(value);
+                out_of_line_start += value.len();
+                entry_values.push(off.to_le_bytes());
+            }
+        }
+
+        // Fix up StripOffsets (tag 273) inline value to the strip offset.
+        for (i, e) in entries.iter().enumerate() {
+            if e.0 == 273 {
+                entry_values[i] = strip_offset.to_le_bytes();
+            }
+        }
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&(ifd_start as u32).to_le_bytes());
+
+        tiff.extend_from_slice(&(n as u16).to_le_bytes());
+        for (i, e) in entries.iter().enumerate() {
+            tiff.extend_from_slice(&e.0.to_le_bytes()); // tag
+            tiff.extend_from_slice(&e.1.to_le_bytes()); // type
+            tiff.extend_from_slice(&e.2.to_le_bytes()); // count
+            tiff.extend_from_slice(&entry_values[i]); // value/offset
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+
+        tiff.extend_from_slice(&payloads);
+        tiff
+    }
+
+    fn image_pro_tags() -> Vec<(u16, u16, u32, Vec<u8>)> {
+        // IMAGE_PRO_TAG_1 (50288): SHORT[12] identical values.
+        let mut tag1 = Vec::new();
+        for _ in 0..12 {
+            tag1.extend_from_slice(&7u16.to_le_bytes());
+        }
+        // IMAGE_PRO_TAG_2 (40105): SHORT frame rate = 30 (inline).
+        // IMAGE_PRO_TAG_3 (40100): SHORT (int[]) marker = 1 (inline).
+        vec![
+            (IMAGE_PRO_TAG_1, 3, 12, tag1),
+            (IMAGE_PRO_TAG_2, 3, 1, 30u16.to_le_bytes().to_vec()),
+            (IMAGE_PRO_TAG_3, 3, 1, 1u16.to_le_bytes().to_vec()),
+        ]
+    }
+
+    #[test]
+    fn detects_image_pro_tiff_via_tag1_and_tag3() {
+        let tiff = build_tiff(&image_pro_tags());
+        assert!(
+            SeqReader::is_this_type_from_bytes(&tiff),
+            "Image-Pro TIFF (tag1 short[] + tag3 int[]) should be detected"
+        );
+    }
+
+    #[test]
+    fn rejects_plain_tiff() {
+        let tiff = build_tiff(&[]);
+        assert!(
+            !SeqReader::is_this_type_from_bytes(&tiff),
+            "generic TIFF without Image-Pro tags must not be claimed"
+        );
+    }
+
+    #[test]
+    fn rejects_norpix_streampix_seq() {
+        // A raw Norpix StreamPix header is not a TIFF at all.
+        let mut hdr = vec![0u8; 1024];
+        hdr[..10].copy_from_slice(b"Norpix seq");
+        assert!(
+            !SeqReader::is_this_type_from_bytes(&hdr),
+            "raw Norpix StreamPix .seq must not be claimed by the TIFF-based reader"
+        );
+        // And NorpixReader must still claim it.
+        let norpix = NorpixReader::new();
+        assert!(norpix.is_this_type_by_bytes(&hdr));
+    }
+
+    #[test]
+    fn parses_dimensions_from_image_pro_tags() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("imagepro_seq_test.seq");
+        let tiff = build_tiff(&image_pro_tags());
+        std::fs::write(&path, &tiff).unwrap();
+
+        let mut reader = SeqReader::new();
+        reader.set_id(&path).unwrap();
+        let m = reader.metadata();
+        assert_eq!(m.size_x, 2);
+        assert_eq!(m.size_y, 2);
+        // One IFD with IMAGE_PRO_TAG_2 present => sizeZ counted to 1, then the
+        // (sizeZ==1 && sizeT==1) rule sets sizeZ = ifds.size() = 1.
+        assert_eq!(m.size_z, 1, "single-plane Image-Pro SEQ => sizeZ = 1");
+        assert_eq!(m.size_t, 1);
+        // Frame Rate and SEQ ID recorded as global metadata.
+        assert!(matches!(
+            m.series_metadata.get("Frame Rate"),
+            Some(MetadataValue::Int(30))
+        ));
+        assert!(matches!(
+            m.series_metadata.get("Image-Pro SEQ ID"),
+            Some(MetadataValue::String(_))
+        ));
+
+        // Pixel readback round-trips through the inner TIFF reader.
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane, vec![0, 1, 2, 3]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn dimension_order_picks_dominant_axis() {
+        // Z dominant, C=1 => "XY" + "Z" + "TC" = XYZTC.
+        assert_eq!(
+            SeqReader::compute_dimension_order(5, 1, 2),
+            DimensionOrder::XYZTC
+        );
+        // C dominant => "XY" + "C" + (Z>T? "ZT":"TZ").
+        assert_eq!(
+            SeqReader::compute_dimension_order(3, 9, 2),
+            DimensionOrder::XYCZT
+        );
+        // T dominant, C>1 => "XY" + "T" + "C" + "Z" = XYTCZ.
+        assert_eq!(
+            SeqReader::compute_dimension_order(2, 3, 9),
+            DimensionOrder::XYTCZ
+        );
     }
 }

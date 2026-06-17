@@ -7148,6 +7148,354 @@ impl FormatReader for ImarisTiffReader {
 }
 
 // ---------------------------------------------------------------------------
+// 7b. Imaris (classic native RAW) — Bitplane Imaris
+// ---------------------------------------------------------------------------
+/// Read `n` raw bytes and decode them as a string, mirroring Java
+/// `RandomAccessInputStream.readString(int)`. Imaris pads fixed-width string
+/// fields with NULs; we trim the trailing NULs so the logical value matches the
+/// Java reader's interned strings.
+fn imaris_read_string<R: Read>(r: &mut R, n: usize) -> Result<String> {
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+    Ok(crate::common::io::read_cstring(&buf))
+}
+
+/// Skip `n` bytes, mirroring Java `RandomAccessInputStream.skipBytes(int)`.
+fn imaris_skip_bytes<R: Read>(r: &mut R, n: usize) -> Result<()> {
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+    Ok(())
+}
+
+/// Bitplane Imaris classic RAW format reader (`.ims`).
+///
+/// Faithful port of the Java `ImarisReader` (loci.formats.in.ImarisReader).
+/// This is the *original* native binary Imaris format, identified by the magic
+/// integer `5021964` (big-endian) at the start of the file. It is distinct from
+/// the HDF5-based Imaris (`ImarisHdfReader`) and the Imaris 3 TIFF variant
+/// (`ImarisTiffReader`), both of which also use the `.ims` extension; the magic
+/// number disambiguates them.
+///
+/// The header carries width/height/depth/channel-count, an image name, a
+/// comment/description, physical pixel sizes, and per-channel comment/gain/
+/// offset/pinhole records. Pixel data is raw `UINT8`, big-endian (trivially so
+/// for 8-bit), stored channel-major then Z, and each plane is written Y-flipped
+/// (Java reads rows bottom-to-top in `openBytes`).
+pub struct ImarisReader {
+    path: Option<PathBuf>,
+    meta: ImageMetadata,
+    /// Offsets (in bytes from the start of the file) to each image plane,
+    /// indexed by plane number `no` in `XYZCT` order (mirrors Java `offsets`).
+    offsets: Vec<u64>,
+    /// Image name (Java `imageName`).
+    image_name: String,
+    /// Image comment/description (Java `description`).
+    description: String,
+    /// Physical pixel sizes in micrometres (Java `dx`, `dy`, `dz`).
+    physical_size_x: f32,
+    physical_size_y: f32,
+    physical_size_z: f32,
+    /// Per-channel pinhole sizes (µm), Java `pinholes`.
+    pinholes: Vec<f32>,
+    /// Per-channel detector gains, Java `gains`.
+    gains: Vec<f32>,
+}
+
+impl ImarisReader {
+    /// Magic number present in all classic Imaris files (Java
+    /// `IMARIS_MAGIC_BYTES`). Read big-endian.
+    const IMARIS_MAGIC_BYTES: i32 = 5021964;
+    /// Endianness of the format (Java `IS_LITTLE = false`).
+    const IS_LITTLE: bool = false;
+
+    pub fn new() -> Self {
+        ImarisReader {
+            path: None,
+            meta: ImageMetadata::default(),
+            offsets: Vec::new(),
+            image_name: String::new(),
+            description: String::new(),
+            physical_size_x: 0.0,
+            physical_size_y: 0.0,
+            physical_size_z: 0.0,
+            pinholes: Vec::new(),
+            gains: Vec::new(),
+        }
+    }
+
+    /// Port of Java `ImarisReader.initFile`.
+    ///
+    /// Parses the fixed-layout classic-Imaris header, computes per-plane file
+    /// offsets, and populates core + global metadata.
+    fn init_file(&mut self, path: &Path) -> Result<()> {
+        let mut f = BufReader::new(File::open(path).map_err(BioFormatsError::Io)?);
+
+        use crate::common::endian::{read_f32, read_i16, read_i32};
+        const LE: bool = ImarisReader::IS_LITTLE;
+
+        // Verify magic (big-endian int).
+        let magic = read_i32(&mut f, LE)?;
+        if magic != Self::IMARIS_MAGIC_BYTES {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Imaris magic number not found.".into(),
+            ));
+        }
+
+        // Header.
+        let version = read_i32(&mut f, LE)?;
+        imaris_skip_bytes(&mut f, 4)?;
+
+        let image_name = imaris_read_string(&mut f, 128)?;
+
+        let size_x = read_i16(&mut f, LE)? as u32;
+        let size_y = read_i16(&mut f, LE)? as u32;
+        let size_z = read_i16(&mut f, LE)? as u32;
+
+        imaris_skip_bytes(&mut f, 2)?;
+
+        let size_c = read_i32(&mut f, LE)? as u32;
+        imaris_skip_bytes(&mut f, 2)?;
+
+        let date = imaris_read_string(&mut f, 32)?;
+
+        let dx = read_f32(&mut f, LE)?;
+        let dy = read_f32(&mut f, LE)?;
+        let dz = read_f32(&mut f, LE)?;
+        let _mag = read_i16(&mut f, LE)?;
+
+        let description = imaris_read_string(&mut f, 128)?;
+        let is_survey = read_i32(&mut f, LE)?;
+
+        // Calculating image offsets.
+        let image_count = size_z.saturating_mul(size_c);
+        let mut offsets = vec![0u64; image_count as usize];
+
+        let mut gains = vec![0f32; size_c as usize];
+        let mut detector_offsets = vec![0f32; size_c as usize];
+        let mut pinholes = vec![0f32; size_c as usize];
+
+        // Per-channel comment/gain/offset/pinhole records (164 bytes each).
+        // Java guards this with MetadataLevel != MINIMUM; we always parse so the
+        // file pointer position matches Java's non-minimal path (offsets below
+        // assume these records were consumed).
+        for i in 0..size_c as usize {
+            let comment = imaris_read_string(&mut f, 128)?;
+            self.meta
+                .series_metadata
+                .insert(format!("Channel #{i} Comment"), MetadataValue::String(comment));
+            gains[i] = read_f32(&mut f, LE)?;
+            detector_offsets[i] = read_f32(&mut f, LE)?;
+            pinholes[i] = read_f32(&mut f, LE)?;
+            imaris_skip_bytes(&mut f, 24)?;
+        }
+
+        // Per-plane offsets (Java offset block).
+        let mut offset = 336u64 + 164u64 * size_c as u64;
+        for i in 0..size_c as u64 {
+            for j in 0..size_z as u64 {
+                offsets[(i * size_z as u64 + j) as usize] =
+                    offset + j * size_x as u64 * size_y as u64;
+            }
+            offset += size_x as u64 * size_y as u64 * size_z as u64;
+        }
+
+        // Global metadata.
+        self.meta
+            .series_metadata
+            .insert("Version".into(), MetadataValue::Int(version as i64));
+        self.meta.series_metadata.insert(
+            "Image name".into(),
+            MetadataValue::String(image_name.clone()),
+        );
+        self.meta.series_metadata.insert(
+            "Image comment".into(),
+            MetadataValue::String(description.clone()),
+        );
+        self.meta.series_metadata.insert(
+            "Survey performed".into(),
+            MetadataValue::Bool(is_survey == 0),
+        );
+        self.meta
+            .series_metadata
+            .insert("Original date".into(), MetadataValue::String(date));
+
+        // Populating metadata (core).
+        let size_t = if size_c * size_z == 0 {
+            1
+        } else {
+            image_count / (size_c * size_z)
+        };
+        self.meta.size_x = size_x;
+        self.meta.size_y = size_y;
+        self.meta.size_z = size_z;
+        self.meta.size_c = size_c;
+        self.meta.size_t = size_t;
+        self.meta.image_count = image_count;
+        self.meta.dimension_order = crate::common::metadata::DimensionOrder::XYZCT;
+        self.meta.is_rgb = false;
+        self.meta.is_interleaved = false;
+        self.meta.is_little_endian = Self::IS_LITTLE;
+        self.meta.is_indexed = false;
+        self.meta.pixel_type = PixelType::Uint8;
+        self.meta.bits_per_pixel = 8;
+
+        self.offsets = offsets;
+        self.image_name = image_name;
+        self.description = description;
+        self.physical_size_x = dx;
+        self.physical_size_y = dy;
+        self.physical_size_z = dz;
+        self.pinholes = pinholes;
+        self.gains = gains;
+
+        Ok(())
+    }
+
+    /// Port of Java `ImarisReader.openBytes`.
+    ///
+    /// Reads one raw UINT8 plane, flipping it vertically (Java reads file rows
+    /// bottom-to-top into the output buffer top-to-bottom).
+    fn open_bytes_impl(&self, no: u32) -> Result<Vec<u8>> {
+        let size_x = self.meta.size_x as usize;
+        let size_y = self.meta.size_y as usize;
+        let no = no as usize;
+        if no >= self.offsets.len() {
+            return Err(BioFormatsError::PlaneOutOfRange(no as u32));
+        }
+
+        let mut f = BufReader::new(File::open(self.path.as_ref().ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("Imaris reader not initialised".into())
+        })?)
+        .map_err(BioFormatsError::Io)?);
+
+        // Java: x=0, y=0, w=sizeX, h=sizeY for a full-plane read.
+        // in.seek(offsets[no] + sizeX * (sizeY - y - h)); with y=0,h=sizeY -> 0.
+        let base = self.offsets[no];
+        let mut buf = vec![0u8; size_x * size_y];
+        // Read rows bottom-to-top: row index counts down, output row counts down
+        // too, but the source is read sequentially from `base`, which flips Y.
+        for row in (0..size_y).rev() {
+            let src = read_bytes_at(&mut f, base + ((size_y - 1 - row) * size_x) as u64, size_x)?;
+            buf[row * size_x..(row + 1) * size_x].copy_from_slice(&src);
+        }
+        Ok(buf)
+    }
+}
+
+impl Default for ImarisReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for ImarisReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("ims"))
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Java isThisType: validStream(4) then readInt() == magic (big-endian).
+        if header.len() < 4 {
+            return false;
+        }
+        let magic = i32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        magic == Self::IMARIS_MAGIC_BYTES
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = Some(path.to_path_buf());
+        self.init_file(path)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.offsets = Vec::new();
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        1
+    }
+
+    fn set_series(&mut self, series: usize) -> Result<()> {
+        if series == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(series))
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        &self.meta
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.open_bytes_impl(plane_index)
+    }
+
+    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let full = self.open_bytes_impl(plane_index)?;
+        crop_full_plane("Imaris", &full, &self.meta, 1, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let tw = self.meta.size_x.min(256);
+        let th = self.meta.size_y.min(256);
+        let tx = (self.meta.size_x - tw) / 2;
+        let ty = (self.meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
+        if self.path.is_none() {
+            return None;
+        }
+        let mut image = OmeImage {
+            name: Some(self.image_name.clone()),
+            description: Some(self.description.clone()),
+            time_increment: Some(1.0),
+            ..OmeImage::default()
+        };
+        // FormatTools.getPhysicalSize* returns null for non-positive values.
+        if self.physical_size_x > 0.0 {
+            image.physical_size_x = Some(self.physical_size_x as f64);
+        }
+        if self.physical_size_y > 0.0 {
+            image.physical_size_y = Some(self.physical_size_y as f64);
+        }
+        if self.physical_size_z > 0.0 {
+            image.physical_size_z = Some(self.physical_size_z as f64);
+        }
+        for i in 0..self.meta.size_c as usize {
+            let mut ch = OmeChannel {
+                samples_per_pixel: 1,
+                ..OmeChannel::default()
+            };
+            if self.pinholes.get(i).copied().unwrap_or(0.0) > 0.0 {
+                ch.pinhole_size = Some(self.pinholes[i] as f64);
+            }
+            if self.gains.get(i).copied().unwrap_or(0.0) > 0.0 {
+                ch.detector_settings_gain = Some(self.gains[i] as f64);
+            }
+            image.channels.push(ch);
+        }
+        Some(OmeMetadata {
+            images: vec![image],
+            ..OmeMetadata::default()
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 8. Leica XLEF — image delegate
 // ---------------------------------------------------------------------------
 /// Leica XLEF format reader (`.xlef`).
@@ -18281,5 +18629,160 @@ EndClass: 0
 
         let _ = std::fs::remove_file(&spc_path);
         let _ = std::fs::remove_file(&set_path);
+    }
+
+    /// Build a synthetic classic (native RAW) Imaris file and exercise
+    /// detection, header metadata, and the Y-flipped plane reads.
+    #[test]
+    fn imaris_classic_raw_roundtrip() {
+        let size_x: usize = 3;
+        let size_y: usize = 2;
+        let size_z: usize = 2;
+        let size_c: usize = 2;
+
+        // All header integers/floats are big-endian (IS_LITTLE = false).
+        let mut buf: Vec<u8> = Vec::new();
+        let push_str = |buf: &mut Vec<u8>, s: &str, n: usize| {
+            let mut field = vec![0u8; n];
+            let bytes = s.as_bytes();
+            field[..bytes.len().min(n)].copy_from_slice(&bytes[..bytes.len().min(n)]);
+            buf.extend_from_slice(&field);
+        };
+
+        buf.extend_from_slice(&5021964i32.to_be_bytes()); // magic
+        buf.extend_from_slice(&7i32.to_be_bytes()); // version
+        buf.extend_from_slice(&[0u8; 4]); // skip 4
+        push_str(&mut buf, "MyImage", 128); // imageName
+
+        buf.extend_from_slice(&(size_x as i16).to_be_bytes());
+        buf.extend_from_slice(&(size_y as i16).to_be_bytes());
+        buf.extend_from_slice(&(size_z as i16).to_be_bytes());
+        buf.extend_from_slice(&[0u8; 2]); // skip 2
+        buf.extend_from_slice(&(size_c as i32).to_be_bytes());
+        buf.extend_from_slice(&[0u8; 2]); // skip 2
+
+        push_str(&mut buf, "2026-01-01", 32); // date
+
+        buf.extend_from_slice(&0.5f32.to_be_bytes()); // dx
+        buf.extend_from_slice(&0.25f32.to_be_bytes()); // dy
+        buf.extend_from_slice(&1.5f32.to_be_bytes()); // dz
+        buf.extend_from_slice(&63i16.to_be_bytes()); // mag
+
+        push_str(&mut buf, "a comment", 128); // description
+        buf.extend_from_slice(&0i32.to_be_bytes()); // isSurvey (0 => survey performed = true)
+
+        // Per-channel records (164 bytes each).
+        for c in 0..size_c {
+            push_str(&mut buf, &format!("Channel {c}"), 128);
+            buf.extend_from_slice(&((c as f32) + 1.0).to_be_bytes()); // gain
+            buf.extend_from_slice(&0.0f32.to_be_bytes()); // detector offset
+            buf.extend_from_slice(&(((c as f32) + 1.0) * 10.0).to_be_bytes()); // pinhole
+            buf.extend_from_slice(&[0u8; 24]); // skip 24
+        }
+
+        // The fields Java reads occupy 332 + 164*sizeC bytes, but Java seeks pixel
+        // data using the constant `offset = 336 + 164*sizeC` (a 4-byte gap that is
+        // part of the on-disk format). Pad so the synthetic file matches that.
+        assert_eq!(buf.len(), 332 + 164 * size_c);
+        buf.extend_from_slice(&[0u8; 4]);
+        assert_eq!(buf.len(), 336 + 164 * size_c);
+
+        // Pixel data: channel-major, then Z, each plane size_x*size_y bytes.
+        // Encode the byte value as (plane_index * 100 + row * 10 + col) so we can
+        // verify both plane indexing and the Y-flip.
+        for plane in 0..(size_c * size_z) {
+            for row in 0..size_y {
+                for col in 0..size_x {
+                    buf.push((plane * 100 + row * 10 + col) as u8);
+                }
+            }
+        }
+
+        // Write to a temp file.
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("imaris_classic_{nanos}.ims"));
+        File::create(&path).unwrap().write_all(&buf).unwrap();
+
+        let mut reader = ImarisReader::new();
+
+        // Detection: magic must be recognised; foreign bytes rejected.
+        assert!(reader.is_this_type_by_bytes(&buf[..16]));
+        assert!(!reader.is_this_type_by_bytes(&[0, 0, 0, 0]));
+        assert!(reader.is_this_type_by_name(&path));
+
+        reader.set_id(&path).unwrap();
+
+        let m = reader.metadata();
+        assert_eq!(m.size_x, size_x as u32);
+        assert_eq!(m.size_y, size_y as u32);
+        assert_eq!(m.size_z, size_z as u32);
+        assert_eq!(m.size_c, size_c as u32);
+        assert_eq!(m.size_t, 1);
+        assert_eq!(m.image_count, (size_c * size_z) as u32);
+        assert_eq!(m.pixel_type, PixelType::Uint8);
+        assert!(!m.is_little_endian);
+        assert_eq!(
+            m.dimension_order,
+            crate::common::metadata::DimensionOrder::XYZCT
+        );
+
+        // Global metadata captured.
+        assert_eq!(
+            m.series_metadata.get("Image name").map(|v| v.to_string()),
+            Some("MyImage".to_string())
+        );
+        assert_eq!(
+            m.series_metadata.get("Version").map(|v| v.to_string()),
+            Some("7".to_string())
+        );
+        assert_eq!(
+            m.series_metadata
+                .get("Channel #0 Comment")
+                .map(|v| v.to_string()),
+            Some("Channel 0".to_string())
+        );
+        assert_eq!(
+            m.series_metadata
+                .get("Channel #1 Comment")
+                .map(|v| v.to_string()),
+            Some("Channel 1".to_string())
+        );
+
+        // OME metadata: physical sizes, channel pinholes/gains.
+        let ome = reader.ome_metadata().expect("ome metadata");
+        let img = &ome.images[0];
+        assert_eq!(img.name.as_deref(), Some("MyImage"));
+        assert_eq!(img.description.as_deref(), Some("a comment"));
+        assert_eq!(img.physical_size_x, Some(0.5));
+        assert_eq!(img.physical_size_z, Some(1.5));
+        assert_eq!(img.channels.len(), size_c);
+        assert_eq!(img.channels[0].pinhole_size, Some(10.0));
+        assert_eq!(img.channels[1].pinhole_size, Some(20.0));
+        assert_eq!(img.channels[0].detector_settings_gain, Some(1.0));
+
+        // Plane reads with Y-flip. The file stores file-row k at output row
+        // (size_y - 1 - k), so the encoded value `plane*100 + filerow*10 + col`
+        // lands at output row `size_y - 1 - filerow`.
+        for plane in 0..(size_c * size_z) {
+            let data = reader.open_bytes(plane as u32).unwrap();
+            assert_eq!(data.len(), size_x * size_y);
+            for out_row in 0..size_y {
+                for col in 0..size_x {
+                    let file_row = size_y - 1 - out_row;
+                    let expected = (plane * 100 + file_row * 10 + col) as u8;
+                    assert_eq!(
+                        data[out_row * size_x + col],
+                        expected,
+                        "plane {plane} out_row {out_row} col {col}"
+                    );
+                }
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -4725,6 +4725,728 @@ impl FormatReader for NikonTiffReader {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. Metamorph TIFF — enriched reader
+// ---------------------------------------------------------------------------
+/// Faithful port of Java `loci.formats.in.MetamorphTiffReader`
+/// (`extends BaseTiffReader`). Pixels come from the crate's TIFF engine; the
+/// per-plane acquisition metadata is scraped from each IFD's ImageDescription
+/// comment, which Metamorph (version 7.5+) stores as a `<MetaData>...</MetaData>`
+/// XML document of `<prop>` and `<custom-prop>` entries (one `<PlaneInfo>`
+/// section per plane).
+///
+/// Distinct from the `.stk`/UIC-tagged `MetamorphReader` (`metamorph.rs`): this
+/// reader handles the XML-comment TIFF variant and the HCS/plate flavour.
+///
+/// Detection mirrors Java `isThisType`: parse the first IFD's comment, trim it,
+/// and require it to start with `<MetaData>` and end with `</MetaData>`.
+///
+/// Scope note: Java's multi-file HCS discovery (`findTIFFs`, integer-named
+/// `NEW_SUBFILE_TYPE == 2` master file globbing across siblings) needs
+/// filesystem pattern matching across the dataset. This port implements the
+/// single-file path faithfully (the common case — `files = {id}`, `wellCount =
+/// 1`), including the full `<MetaData>` comment parse, the per-IFD stage-position
+/// field-row inference, the axis-size computation, and the OME projection
+/// (per-plane Z/C/T, deltaT, exposure, stage X/Y; per-channel name + emission
+/// wavelength; physical sizes; imaging-environment temperature). The well/field
+/// stage-label helpers are ported verbatim for parity but only exercise the
+/// single-well branch.
+pub struct MetamorphTiffReader {
+    inner: crate::tiff::TiffReader,
+
+    // -- Fields -- (mirror Java MetamorphTiffReader fields)
+    well_count: usize,
+    field_row_count: usize,
+    field_column_count: usize,
+    dual_camera: bool,
+    /// OME projection computed once at `set_id` from the parsed handler.
+    ome_cache: Option<crate::common::ome_metadata::OmeMetadata>,
+}
+
+/// Faithful port of `loci.formats.in.MetamorphHandler`: the SAX handler that
+/// accumulates per-plane metadata from a Metamorph `<MetaData>` XML comment.
+/// Java drives this with one `parseXML` call per IFD comment, all sharing the
+/// same handler instance so the vectors accumulate across planes.
+#[derive(Default)]
+struct MetamorphHandler {
+    timestamps: Vec<String>,
+    image_name: Option<String>,
+    date: Option<String>,
+    wavelengths: Vec<i32>,
+    z_positions: Vec<f64>,
+    pixel_size_x: f64,
+    pixel_size_y: f64,
+    temperature: f64,
+    lens_na: f64,
+    lens_ri: f64,
+    binning: Option<String>,
+    read_out_rate: f64,
+    zoom: f64,
+    position_x: Option<f64>,
+    position_y: Option<f64>,
+    exposures: Vec<Option<f64>>,
+    channel_name: Option<String>,
+    channel_names: Vec<String>,
+    stage_label: Option<String>,
+    gain: Option<f64>,
+    dual_camera: bool,
+}
+
+impl MetamorphHandler {
+    /// Mirror Java `MetamorphHandler.startElement`: each `<prop id=.. value=..>`
+    /// element contributes a key/value pair (the special `Description` element is
+    /// itself a packed multi-line block which is split apart here), routed
+    /// through `check_key`.
+    fn start_element(&mut self, attrs: &std::collections::HashMap<String, String>) {
+        let id = attrs.get("id").map(String::as_str);
+        let value = attrs.get("value").map(String::as_str);
+        // Java: delim defaults to " #13; #10;" and falls back to the entity form.
+        let mut delim = " #13; #10;";
+        if let Some(v) = value {
+            if !v.contains(delim) {
+                delim = "&#13;&#10;";
+            }
+        }
+        let (Some(id), Some(value)) = (id, value) else {
+            return;
+        };
+
+        if id == "Description" {
+            let mut k: Option<String> = None;
+            let mut freeform = true;
+
+            if value.contains(delim) {
+                for line in value.split(delim) {
+                    if line.starts_with("Exposure: ") {
+                        freeform = false;
+                    }
+                    if freeform {
+                        // Java accumulates a "User Description" free-form block;
+                        // mirrored as an accumulation but only the key/value tail
+                        // feeds typed fields.
+                        continue;
+                    }
+                    if let Some(colon) = line.find(':') {
+                        let key = line[..colon].trim().to_string();
+                        let v = line[colon + 1..].trim().to_string();
+                        self.check_key(&key, &v);
+                        k = Some(key);
+                    } else {
+                        // prevent non-key/value lines from being lost (Java puts
+                        // k -> k); no typed effect.
+                        let _ = &k;
+                    }
+                }
+            } else {
+                // Java's single-line colon scan.
+                let mut value = value.to_string();
+                while let Some(colon) = value.find(':') {
+                    let key = value[..colon].to_string();
+                    // lastIndexOf(" ", indexOf(":", colon+1))
+                    let next_colon = value[colon + 1..].find(':').map(|p| colon + 1 + p);
+                    let search_end = next_colon.unwrap_or(value.len());
+                    let space = value[..search_end].rfind(' ').unwrap_or(value.len());
+                    let v = value[colon + 1..space.max(colon + 1)].trim().to_string();
+                    self.check_key(&key, &v);
+                    value = value[space.min(value.len())..].trim().to_string();
+                }
+            }
+        } else {
+            self.check_key(id, value);
+        }
+    }
+
+    /// Mirror Java `MetamorphHandler.checkKey`: dispatch a single key/value pair
+    /// onto the typed accumulator fields.
+    fn check_key(&mut self, key: &str, value: &str) {
+        let double_value = metamorph_parse_double(value);
+        if let Some(dv) = double_value {
+            match key {
+                "Temperature" => self.temperature = dv,
+                "spatial-calibration-x" => self.pixel_size_x = dv,
+                "spatial-calibration-y" => self.pixel_size_y = dv,
+                "z-position" => self.z_positions.push(dv),
+                "_MagNA_" => self.lens_na = dv,
+                "_MagRI_" => self.lens_ri = dv,
+                "Readout Frequency" => self.read_out_rate = dv,
+                "zoom-percent" => self.zoom = dv,
+                "stage-position-x" => self.position_x = Some(dv),
+                "stage-position-y" => self.position_y = Some(dv),
+                _ => {}
+            }
+        }
+
+        if key == "wavelength" {
+            // usually an integer wavelength in nm; sometimes a descriptive
+            // string with no usable nm value, in which case Java logs & skips.
+            if let Ok(w) = value.parse::<i32>() {
+                self.wavelengths.push(w);
+            }
+        } else if key == "acquisition-time-local" {
+            self.date = Some(value.to_string());
+            self.timestamps.push(value.to_string());
+        } else if key == "image-name" {
+            self.image_name = Some(value.to_string());
+        } else if key == "Binning" {
+            self.binning = Some(value.to_string());
+        } else if key == "Speed" {
+            let v = match value.find(' ') {
+                Some(space) if space > 0 => &value[..space],
+                _ => value,
+            };
+            if let Some(rate) = metamorph_parse_double(v.trim()) {
+                self.read_out_rate = rate;
+            }
+        } else if key == "Exposure" {
+            // exposure times are stored in milliseconds; convert to seconds.
+            let v = match value.find(' ') {
+                Some(space) => &value[..space],
+                None => value,
+            };
+            let exposure = metamorph_parse_double(v).map(|e| e / 1000.0);
+            self.exposures.push(exposure);
+        } else if key == "_IllumSetting_" {
+            if self.channel_name.is_none() {
+                self.channel_name = Some(value.to_string());
+            }
+            self.channel_names.push(value.to_string());
+        } else if key == "stage-label" {
+            self.stage_label = Some(value.to_string());
+        } else if key.ends_with("Gain") && self.gain.is_none() {
+            let cleaned: String = value.chars().filter(|c| *c != 'x' && *c != 'X').collect();
+            if let Some(v) = metamorph_parse_double(&cleaned) {
+                self.gain = Some(v);
+            }
+        } else if key.starts_with("Dual Camera") {
+            // Determine if Metamorph has already split a dual-camera image: it
+            // appends the wavelength number to the Description when splitting.
+            // Example: "Dual Camera Time Difference: 7 msec 561".
+            match value.rfind(' ') {
+                None => self.dual_camera = true,
+                Some(space) => {
+                    // intentional strict parse (Java uses Double.parseDouble so a
+                    // non-number throws, meaning "not split").
+                    match value[space..].trim().parse::<f64>() {
+                        Ok(_) => self.dual_camera = false,
+                        Err(_) => self.dual_camera = true,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mirror Java `MetamorphHandler.parseDouble`: strip '+' (scientific notation
+/// may be stored as `-1e+006`) then parse, returning `None` on failure.
+fn metamorph_parse_double(v: &str) -> Option<f64> {
+    v.replace('+', "").trim().parse::<f64>().ok()
+}
+
+impl MetamorphTiffReader {
+    pub fn new() -> Self {
+        MetamorphTiffReader {
+            inner: crate::tiff::TiffReader::new(),
+            well_count: 1,
+            field_row_count: 1,
+            field_column_count: 1,
+            dual_camera: false,
+            ome_cache: None,
+        }
+    }
+
+    /// Mirror Java `MetamorphTiffReader.isThisType(RandomAccessInputStream)`:
+    /// parse the first IFD, read its comment (ImageDescription), trim it, and
+    /// require it to start with `<MetaData>` and end with `</MetaData>`.
+    fn is_this_type_from_bytes(header: &[u8]) -> bool {
+        let cursor = std::io::Cursor::new(header);
+        let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let offset = parser.first_ifd_offset;
+        let ifd = match parser.read_ifd(offset) {
+            Ok((ifd, _)) => ifd,
+            Err(_) => return false,
+        };
+        let comment = match ifd
+            .get(crate::tiff::ifd::tag::IMAGE_DESCRIPTION)
+            .and_then(|v| v.as_str())
+        {
+            Some(c) => c,
+            None => return false,
+        };
+        let comment = comment.trim();
+        comment.starts_with("<MetaData>") && comment.ends_with("</MetaData>")
+    }
+
+    /// Mirror Java `MetamorphTiffReader.initFile`: parse the `<MetaData>` XML
+    /// comment of every IFD into the shared handler, infer field rows from
+    /// distinct stage positions, compute the Z/C/T axis sizes, and store the
+    /// typed acquisition results for the OME projection.
+    ///
+    /// Single-file path only (`files = {id}`); see the struct doc comment.
+    fn init_file(&mut self) -> MetamorphHandler {
+        // Java: files = {id}; wellCount = fieldRowCount = fieldColumnCount = 1;
+        // m.sizeC = 0 in the single-file branch.
+        self.well_count = 1;
+        self.field_row_count = 1;
+        self.field_column_count = 1;
+
+        let mut handler = MetamorphHandler::default();
+
+        // parse XML comment — Java iterates over every IFD's comment.
+        let mut x_positions: Vec<Option<f64>> = Vec::new();
+        let mut y_positions: Vec<Option<f64>> = Vec::new();
+
+        let comments: Vec<Option<String>> = {
+            let series = self.inner.series_list();
+            series
+                .iter()
+                .map(|s| {
+                    s.metadata
+                        .series_metadata
+                        .get("ImageDescription")
+                        .and_then(|v| {
+                            if let crate::common::metadata::MetadataValue::String(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .collect()
+        };
+        // Java keys off ifds (one comment per plane); the inner reader exposes one
+        // ImageDescription per series entry. For single-IFD/single-series files
+        // this is the first (and only) comment, re-parsed once.
+        let ifd_comments: Vec<String> = if comments.iter().any(|c| c.is_some()) {
+            comments.into_iter().flatten().collect()
+        } else {
+            Vec::new()
+        };
+
+        for xml in &ifd_comments {
+            let tags = xml_scan_tags(xml);
+            for tag in &tags {
+                // Metamorph stores each datum as a start tag carrying id/value
+                // attributes (<prop id=".." value=".."> / <custom-prop ..>).
+                if tag.attrs.contains_key("id") {
+                    handler.start_element(&tag.attrs);
+                }
+            }
+
+            let x = handler.position_x;
+            let y = handler.position_y;
+
+            if x_positions.is_empty() {
+                x_positions.push(x);
+                y_positions.push(y);
+            } else if let (Some(x), Some(y)) = (x, y) {
+                let previous_x = *x_positions.last().unwrap();
+                let previous_y = *y_positions.last().unwrap();
+                if let (Some(x2), Some(y2)) = (previous_x, previous_y) {
+                    if (x - x2).abs() > 0.21 || (y - y2).abs() > 0.21 {
+                        x_positions.push(Some(x));
+                        y_positions.push(Some(y));
+                    }
+                } else {
+                    x_positions.push(Some(x));
+                    y_positions.push(Some(y));
+                }
+            }
+        }
+
+        if x_positions.len() > 1 {
+            self.field_row_count = x_positions.len();
+        }
+
+        self.dual_camera = handler.dual_camera;
+
+        // calculate axis sizes (Java initFile, single-file branch m.sizeC == 0).
+        let mut unique_c: Vec<i32> = Vec::new();
+        for &c in &handler.wavelengths {
+            if !unique_c.contains(&c) {
+                unique_c.push(c);
+            }
+        }
+        let mut effective_c = unique_c.len();
+        if effective_c == 0 {
+            effective_c = 1;
+        }
+
+        let (samples, base_size_x): (u32, u32) = {
+            let series = self.inner.series_list();
+            let m = series.first().map(|s| &s.metadata);
+            let samples = m
+                .map(|m| if m.is_rgb { m.size_c.max(1) } else { 1 })
+                .unwrap_or(1);
+            let sx = m.map(|m| m.size_x).unwrap_or(0);
+            (samples, sx)
+        };
+
+        // Java: m.sizeC starts at 0 (single-file), then `if getSizeC()==0 sizeC=1`.
+        let mut size_c: u32 = 1;
+        size_c *= effective_c as u32 * samples;
+
+        let mut unique_z: Vec<f64> = Vec::new();
+        for &z in &handler.z_positions {
+            if !unique_z.iter().any(|u| *u == z) {
+                unique_z.push(z);
+            }
+        }
+
+        let mut size_z: u32 = 1;
+        if unique_z.len() > 1 {
+            size_z *= unique_z.len() as u32;
+        }
+
+        let mut physical_size_z: Option<f64> = None;
+        if size_z > 1 {
+            let z_range =
+                handler.z_positions[handler.z_positions.len() - 1] - handler.z_positions[0];
+            physical_size_z = Some(z_range.abs() / (size_z as f64 - 1.0));
+        }
+
+        let total_planes = self.inner.ifd_count().max(1) as u32;
+        let effective_c_planes = size_c / samples.max(1);
+
+        // if channel name and Z are unique per plane, prefer unique channels.
+        if effective_c_planes * size_z > total_planes
+            && ((!unique_c.is_empty()
+                && effective_c_planes * (size_z / unique_c.len() as u32) == total_planes)
+                || effective_c_planes == total_planes)
+        {
+            if size_z >= unique_c.len() as u32 {
+                if !unique_c.is_empty() {
+                    size_z /= unique_c.len() as u32;
+                }
+            } else {
+                size_z = 1;
+            }
+        }
+
+        let denom = (self.well_count
+            * self.field_row_count
+            * self.field_column_count) as u32
+            * size_z.max(1)
+            * effective_c_planes.max(1);
+        let mut size_t = if denom > 0 { total_planes / denom } else { 1 };
+        if size_t == 0 {
+            size_t = 1;
+        }
+
+        let series_count = self.well_count * self.field_row_count * self.field_column_count;
+
+        if (series_count > 1 && size_z > total_planes / series_count as u32)
+            || total_planes > size_z * size_t * effective_c_planes.max(1)
+        {
+            size_z = 1;
+            let d = (series_count as u32) * effective_c_planes.max(1);
+            size_t = if d > 0 { total_planes / d } else { 1 };
+        }
+
+        let mut image_count = size_z * size_t * effective_c_planes.max(1);
+
+        let mut final_size_x = base_size_x;
+        if self.dual_camera {
+            final_size_x /= 2;
+            size_c *= 2;
+            image_count *= 2;
+        }
+
+        // Write computed axis sizes back onto the inner series metadata.
+        {
+            let series = self.inner.series_list_mut();
+            if let Some(s) = series.first_mut() {
+                s.metadata.size_x = final_size_x;
+                s.metadata.size_c = size_c.max(1);
+                s.metadata.size_z = size_z.max(1);
+                s.metadata.size_t = size_t.max(1);
+                s.metadata.image_count = image_count.max(1);
+                metamorph_store_physical_z(&mut s.metadata, physical_size_z);
+            }
+        }
+
+        handler
+    }
+
+    /// Mirror Java `MetamorphTiffReader.getField`: parse the leading scan index
+    /// from a stage label of the form `"<n>: Scan <Row><Col>"`.
+    #[allow(dead_code)]
+    fn get_field(stage_label: &str) -> i32 {
+        if !stage_label.contains("Scan") {
+            return 0;
+        }
+        match stage_label.find(':') {
+            Some(colon) => stage_label[..colon].trim().parse::<i32>().map(|n| n - 1).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// Mirror Java `MetamorphTiffReader.getWellRow`.
+    #[allow(dead_code)]
+    fn get_well_row(stage_label: &str) -> i32 {
+        let Some(scan_index) = stage_label.find("Scan") else {
+            return 0;
+        };
+        let after = &stage_label[scan_index..];
+        match after.find(' ') {
+            Some(sp) => {
+                let pos = scan_index + sp + 1;
+                stage_label[pos..]
+                    .chars()
+                    .next()
+                    .map(|c| (c as i32) - ('A' as i32))
+                    .unwrap_or(0)
+            }
+            None => 0,
+        }
+    }
+
+    /// Mirror Java `MetamorphTiffReader.getWellColumn`.
+    #[allow(dead_code)]
+    fn get_well_column(stage_label: &str) -> i32 {
+        let Some(scan_index) = stage_label.find("Scan") else {
+            return 0;
+        };
+        let after = &stage_label[scan_index..];
+        match after.find(' ') {
+            Some(sp) => {
+                let pos = scan_index + sp + 2;
+                stage_label
+                    .get(pos..)
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .map(|n| n - 1)
+                    .unwrap_or(0)
+            }
+            None => 0,
+        }
+    }
+
+    /// Mirror Java `MetamorphTiffReader.initFile`'s `MetadataStore` population:
+    /// project the typed handler fields onto an OME object graph — image name,
+    /// acquisition date, physical sizes, imaging-environment temperature,
+    /// per-plane Z/C/T + deltaT + exposure + stage X/Y, and per-channel
+    /// name + emission wavelength. Single-series (single-file) path.
+    fn build_ome(&self, handler: &MetamorphHandler) -> crate::common::ome_metadata::OmeMetadata {
+        use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata, OmePlane};
+
+        let meta = self.inner.metadata();
+        let effective_size_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) } as usize;
+        let size_t = meta.size_t.max(1) as usize;
+
+        let mut image = OmeImage {
+            name: handler.image_name.clone(),
+            description: Some(String::new()),
+            ..Default::default()
+        };
+
+        if let Some(date) = &handler.date {
+            // Java formats the Metamorph "yyyyMMdd HH:mm:ss" date to ISO-8601;
+            // store the raw value (downstream OME serialisation is lenient).
+            image.acquisition_date = Some(date.clone());
+        }
+
+        // Per-plane Z/C/T, deltaT, exposure, stage X/Y.
+        // start time = first timestamp (Java DateTools.getTime); deltas computed
+        // against it in seconds.
+        let start_date = handler
+            .timestamps
+            .first()
+            .and_then(|t| metamorph_parse_timestamp(t));
+
+        let mut img_idx = 0usize;
+        for c in 0..effective_size_c {
+            for t in 0..size_t {
+                let mut plane = OmePlane {
+                    the_z: 0,
+                    the_c: c as u32,
+                    the_t: t as u32,
+                    ..Default::default()
+                };
+                if let (Some(stamp), Some(start)) = (handler.timestamps.get(t), start_date) {
+                    if let Some(ms) = metamorph_parse_timestamp(stamp) {
+                        plane.delta_t = Some((ms - start) as f64 / 1000.0);
+                    }
+                }
+                let mut exposure_index = img_idx;
+                if self.dual_camera && effective_size_c > 0 {
+                    exposure_index /= effective_size_c;
+                }
+                if handler.exposures.len() == 1 {
+                    exposure_index = 0;
+                }
+                if let Some(Some(exp)) = handler.exposures.get(exposure_index) {
+                    plane.exposure_time = Some(*exp);
+                }
+                // Single series: stage X/Y from the first parsed position.
+                if let Some(x) = handler.position_x {
+                    plane.position_x = Some(x);
+                }
+                if let Some(y) = handler.position_y {
+                    plane.position_y = Some(y);
+                }
+                image.planes.push(plane);
+                img_idx += 1;
+            }
+        }
+
+        if handler.temperature != 0.0 {
+            image.imaging_environment_temperature = Some(handler.temperature);
+        }
+
+        if handler.pixel_size_x > 0.0 {
+            image.physical_size_x = Some(handler.pixel_size_x);
+        }
+        if handler.pixel_size_y > 0.0 {
+            image.physical_size_y = Some(handler.pixel_size_y);
+        }
+        if let Some(z) = metamorph_load_physical_z(meta) {
+            if z > 0.0 {
+                image.physical_size_z = Some(z);
+            }
+        }
+
+        // Per-channel name + emission wavelength.
+        for c in 0..effective_size_c {
+            let mut channel = OmeChannel {
+                samples_per_pixel: 1,
+                ..Default::default()
+            };
+            if handler.channel_names.len() > c {
+                channel.name = Some(handler.channel_names[c].clone());
+            } else if let Some(name) = &handler.channel_name {
+                channel.name = Some(name.clone());
+            }
+            if let Some(&w) = handler.wavelengths.get(c) {
+                channel.emission_wavelength = Some(w as f64);
+            }
+            image.channels.push(channel);
+        }
+
+        OmeMetadata {
+            images: vec![image],
+            ..Default::default()
+        }
+    }
+}
+
+/// Parse a Metamorph `"yyyyMMdd HH:mm:ss"` timestamp into epoch milliseconds,
+/// mirroring Java `DateTools.getTime(.., DATE_FORMAT, ".")`. Returns `None` on
+/// malformed input (Java returns a sentinel which propagates as a skipped delta).
+fn metamorph_parse_timestamp(stamp: &str) -> Option<i64> {
+    // Format: "20100101 12:30:45" possibly with a ".fraction" suffix.
+    let stamp = stamp.trim();
+    let (date_part, time_part) = stamp.split_once(' ')?;
+    if date_part.len() < 8 {
+        return None;
+    }
+    let year: i64 = date_part[0..4].parse().ok()?;
+    let month: i64 = date_part[4..6].parse().ok()?;
+    let day: i64 = date_part[6..8].parse().ok()?;
+    let time_main = time_part.split('.').next().unwrap_or(time_part);
+    let mut hms = time_main.split(':');
+    let hour: i64 = hms.next()?.parse().ok()?;
+    let minute: i64 = hms.next()?.parse().ok()?;
+    let second: i64 = hms.next().unwrap_or("0").parse().ok()?;
+
+    // Days since civil epoch (1970-01-01), proleptic Gregorian (Howard Hinnant).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(((days * 24 + hour) * 60 + minute) * 60 * 1000 + second * 1000)
+}
+
+/// Stash the computed physical Z size on the series metadata so the OME
+/// projection can recover it (the inner `ImageMetadata` has no direct field).
+fn metamorph_store_physical_z(meta: &mut ImageMetadata, z: Option<f64>) {
+    if let Some(z) = z {
+        meta.series_metadata.insert(
+            "metamorph.physical_size_z".to_string(),
+            crate::common::metadata::MetadataValue::Float(z),
+        );
+    }
+}
+
+fn metamorph_load_physical_z(meta: &ImageMetadata) -> Option<f64> {
+    match meta.series_metadata.get("metamorph.physical_size_z") {
+        Some(crate::common::metadata::MetadataValue::Float(z)) => Some(*z),
+        _ => None,
+    }
+}
+
+impl Default for MetamorphTiffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for MetamorphTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::is_this_type_from_bytes(header)
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.inner.set_id(path)?;
+        let handler = self.init_file();
+        self.ome_cache = Some(self.build_ome(&handler));
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.well_count = 1;
+        self.field_row_count = 1;
+        self.field_column_count = 1;
+        self.dual_camera = false;
+        self.ome_cache = None;
+        self.inner.close()
+    }
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        self.inner.set_series(s)
+    }
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(p)
+    }
+    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(p, x, y, w, h)
+    }
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(p)
+    }
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        self.ome_cache.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 7. Improvision/Volocity annotated TIFF — enriched reader
 // ---------------------------------------------------------------------------
 /// Improvision/Volocity annotated TIFF (`.tif`).
@@ -8876,6 +9598,150 @@ mod nikon_tiff_tests {
         assert_eq!(image.channels[0].pinhole_size, Some(30.0));
         assert_eq!(image.channels[0].excitation_wavelength, Some(488.0));
         assert_eq!(image.channels[0].emission_wavelength, Some(520.0));
+
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod metamorph_tiff_tests {
+    use super::*;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bioformats_metamorph_tiff_{name}_{}_{}.tiff",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    fn tiff_entry(tag: u16, typ: u16, count: u32, value: u32) -> [u8; 12] {
+        let mut entry = [0u8; 12];
+        entry[0..2].copy_from_slice(&tag.to_le_bytes());
+        entry[2..4].copy_from_slice(&typ.to_le_bytes());
+        entry[4..8].copy_from_slice(&count.to_le_bytes());
+        entry[8..12].copy_from_slice(&value.to_le_bytes());
+        entry
+    }
+
+    /// Single-IFD synthetic TIFF carrying an out-of-line ImageDescription.
+    fn write_minimal_tiff_with_description(path: &Path, description: &str) {
+        let mut desc = description.as_bytes().to_vec();
+        desc.push(0);
+
+        let ifd_entry_count = 11u32;
+        let ifd_start = 8u32;
+        let desc_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let pixel_start = desc_start + desc.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),                          // ImageWidth
+            tiff_entry(257, 4, 1, 1),                          // ImageLength
+            tiff_entry(258, 3, 1, 8),                          // BitsPerSample
+            tiff_entry(259, 3, 1, 1),                          // Compression
+            tiff_entry(262, 3, 1, 1),                          // Photometric
+            tiff_entry(270, 2, desc.len() as u32, desc_start), // ImageDescription
+            tiff_entry(273, 4, 1, pixel_start),                // StripOffsets
+            tiff_entry(277, 3, 1, 1),                          // SamplesPerPixel
+            tiff_entry(278, 4, 1, 1),                          // RowsPerStrip
+            tiff_entry(279, 4, 1, 1),                          // StripByteCounts
+            tiff_entry(284, 3, 1, 1),                          // PlanarConfiguration
+        ];
+
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&desc);
+        bytes.push(7);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A small Metamorph `<MetaData>` comment exercising the `<prop>` /
+    /// `<custom-prop>` id/value parsing path (`MetamorphHandler.startElement`).
+    const METADATA_COMMENT: &str = concat!(
+        "<MetaData>",
+        "<prop id=\"image-name\" type=\"string\" value=\"MyImage\"/>",
+        "<prop id=\"acquisition-time-local\" type=\"time\" value=\"20100101 12:30:45\"/>",
+        "<prop id=\"spatial-calibration-x\" type=\"float\" value=\"0.32\"/>",
+        "<prop id=\"spatial-calibration-y\" type=\"float\" value=\"0.32\"/>",
+        "<prop id=\"stage-position-x\" type=\"float\" value=\"100.5\"/>",
+        "<prop id=\"stage-position-y\" type=\"float\" value=\"200.25\"/>",
+        "<prop id=\"stage-label\" type=\"string\" value=\"Position1\"/>",
+        "<custom-prop id=\"Temperature\" type=\"float\" value=\"37.0\"/>",
+        "<custom-prop id=\"Exposure\" type=\"string\" value=\"50 ms\"/>",
+        "<custom-prop id=\"wavelength\" type=\"int\" value=\"525\"/>",
+        "<custom-prop id=\"_IllumSetting_\" type=\"string\" value=\"GFP\"/>",
+        "</MetaData>",
+    );
+
+    #[test]
+    fn metamorph_tiff_detects_metadata_comment() {
+        let path = temp_path("detect");
+        write_minimal_tiff_with_description(&path, METADATA_COMMENT);
+
+        let header = std::fs::read(&path).unwrap();
+        let reader = MetamorphTiffReader::new();
+        assert!(reader.is_this_type_by_bytes(&header));
+
+        // A plain (non-Metamorph) comment must be rejected.
+        let path2 = temp_path("reject");
+        write_minimal_tiff_with_description(&path2, "just a normal description");
+        let header2 = std::fs::read(&path2).unwrap();
+        assert!(!reader.is_this_type_by_bytes(&header2));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&path2).ok();
+    }
+
+    #[test]
+    fn metamorph_tiff_scrapes_plane_and_channel_metadata() {
+        let path = temp_path("metadata");
+        write_minimal_tiff_with_description(&path, METADATA_COMMENT);
+
+        let mut reader = MetamorphTiffReader::new();
+        reader.set_id(&path).unwrap();
+
+        let ome = reader.ome_metadata().expect("ome metadata");
+        let image = &ome.images[0];
+
+        // image-name / acquisition-time-local.
+        assert_eq!(image.name.as_deref(), Some("MyImage"));
+        assert_eq!(image.acquisition_date.as_deref(), Some("20100101 12:30:45"));
+
+        // spatial-calibration-{x,y} -> physical sizes.
+        assert_eq!(image.physical_size_x, Some(0.32));
+        assert_eq!(image.physical_size_y, Some(0.32));
+
+        // Temperature -> imaging environment.
+        assert_eq!(image.imaging_environment_temperature, Some(37.0));
+
+        // Per-plane stage X/Y + exposure (50 ms -> 0.05 s).
+        assert!(!image.planes.is_empty());
+        let plane = &image.planes[0];
+        assert_eq!(plane.position_x, Some(100.5));
+        assert_eq!(plane.position_y, Some(200.25));
+        assert_eq!(plane.exposure_time, Some(0.05));
+        // First plane deltaT against the start timestamp is 0.
+        assert_eq!(plane.delta_t, Some(0.0));
+
+        // Channel name (_IllumSetting_) + emission wavelength.
+        assert!(!image.channels.is_empty());
+        assert_eq!(image.channels[0].name.as_deref(), Some("GFP"));
+        assert_eq!(image.channels[0].emission_wavelength, Some(525.0));
 
         std::fs::remove_file(&path).ok();
     }
