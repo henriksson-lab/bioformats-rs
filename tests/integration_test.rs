@@ -589,8 +589,8 @@ fn test_tiff_cmyk_preserves_four_channels_and_inverts() {
     std::fs::write(&path, bytes).expect("fixture write failed");
     let mut reader = ImageReader::open(&path).expect("open failed");
     assert_eq!(reader.metadata().size_c, 4);
-    assert!(!reader.metadata().is_rgb);
-    assert!(reader.metadata().is_interleaved);
+    assert!(reader.metadata().is_rgb);
+    assert!(!reader.metadata().is_interleaved);
     assert_eq!(
         reader.open_bytes(0).expect("open_bytes failed"),
         vec![255, 245, 235, 225]
@@ -949,7 +949,150 @@ fn test_tiff_tiled_planar_subbyte_uses_packed_rows() {
 }
 
 #[test]
-fn test_tiff_missing_strip_byte_counts_returns_format_error() {
+fn test_tiff_compression_zero_is_uncompressed() {
+    let path = write_tiff_with_data(
+        "bioformats_compression_zero.tif",
+        &[
+            TiffEntry::Short(256, 2),
+            TiffEntry::Short(257, 2),
+            TiffEntry::Short(258, 8),
+            TiffEntry::Short(259, 0),
+            TiffEntry::Short(262, 1),
+            TiffEntry::Long(273, 256),
+            TiffEntry::Short(277, 1),
+            TiffEntry::Short(278, 2),
+            TiffEntry::Long(279, 4),
+            TiffEntry::Short(284, 1),
+        ],
+        256,
+        &[9, 8, 7, 6],
+    );
+
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![9, 8, 7, 6]
+    );
+}
+
+#[test]
+fn test_tiff_tiled_ifd_falls_back_to_strip_offsets_and_byte_counts() {
+    let path = write_tiff_with_data(
+        "bioformats_tiled_fallback_strip_tags.tif",
+        &[
+            TiffEntry::Short(256, 2),
+            TiffEntry::Short(257, 2),
+            TiffEntry::Short(258, 8),
+            TiffEntry::Short(259, 1),
+            TiffEntry::Short(262, 1),
+            TiffEntry::Long(273, 256),
+            TiffEntry::Short(277, 1),
+            TiffEntry::Short(284, 1),
+            TiffEntry::Short(322, 2),
+            TiffEntry::Short(323, 2),
+            TiffEntry::Long(279, 4),
+        ],
+        256,
+        &[1, 2, 3, 4],
+    );
+
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn test_tiff_zero_byte_count_strip_zero_fills() {
+    let path = write_tiff_with_data(
+        "bioformats_zero_byte_count_strip.tif",
+        &[
+            TiffEntry::Short(256, 2),
+            TiffEntry::Short(257, 2),
+            TiffEntry::Short(258, 8),
+            TiffEntry::Short(259, 1),
+            TiffEntry::Short(262, 1),
+            TiffEntry::Long(273, 256),
+            TiffEntry::Short(277, 1),
+            TiffEntry::Short(278, 2),
+            TiffEntry::Long(279, 0),
+            TiffEntry::Short(284, 1),
+        ],
+        256,
+        &[],
+    );
+
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn test_tiff_tiled_packed_12_bit_unpacks_samples() {
+    let packed = pack_12_msb(&[0x0abc, 0x0123, 0x0001, 0x0fff]);
+    let path = write_tiff_with_data(
+        "bioformats_tiled_packed_12bit.tif",
+        &[
+            TiffEntry::Short(256, 2),
+            TiffEntry::Short(257, 2),
+            TiffEntry::Short(258, 12),
+            TiffEntry::Short(259, 1),
+            TiffEntry::Short(262, 1),
+            TiffEntry::Short(277, 1),
+            TiffEntry::Short(284, 1),
+            TiffEntry::Short(322, 2),
+            TiffEntry::Short(323, 2),
+            TiffEntry::Long(324, 256),
+            TiffEntry::Long(325, packed.len() as u32),
+        ],
+        256,
+        &packed,
+    );
+
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![0xbc, 0x0a, 0x23, 0x01, 0x01, 0x00, 0xff, 0x0f]
+    );
+}
+
+#[test]
+fn test_tiff_planar_tiled_packed_12_bit_unpacks_samples() {
+    let c0 = pack_12_msb(&[0x0001, 0x0002]);
+    let c1 = pack_12_msb(&[0x0abc, 0x0123]);
+    let mut data = c0.clone();
+    data.extend_from_slice(&c1);
+    let path = write_tiff_with_data(
+        "bioformats_planar_tiled_packed_12bit.tif",
+        &[
+            TiffEntry::Short(256, 2),
+            TiffEntry::Short(257, 1),
+            TiffEntry::LongArray(258, &[12, 12]),
+            TiffEntry::Short(259, 1),
+            TiffEntry::Short(262, 2),
+            TiffEntry::Short(277, 2),
+            TiffEntry::Short(284, 2),
+            TiffEntry::Short(322, 2),
+            TiffEntry::Short(323, 1),
+            TiffEntry::LongArray(324, &[256, 256 + 3]),
+            TiffEntry::LongArray(325, &[3, 3]),
+        ],
+        256,
+        &data,
+    );
+
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![1, 0, 2, 0, 0xbc, 0x0a, 0x23, 0x01]
+    );
+}
+
+#[test]
+fn test_tiff_missing_strip_byte_counts_are_synthesized() {
     let path = write_malformed_tiff(
         "bioformats_missing_strip_byte_counts.tif",
         &[
@@ -965,7 +1108,11 @@ fn test_tiff_missing_strip_byte_counts_returns_format_error() {
         ],
     );
 
-    assert_tiff_open_error_contains(&path, "StripByteCounts");
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![0, 0, 0, 0]
+    );
 }
 
 #[test]
@@ -1052,7 +1199,7 @@ fn test_tiff_missing_tile_width_returns_format_error() {
 }
 
 #[test]
-fn test_tiff_missing_tile_byte_counts_returns_format_error() {
+fn test_tiff_missing_tile_byte_counts_are_synthesized() {
     let path = write_malformed_tiff(
         "bioformats_missing_tile_byte_counts.tif",
         &[
@@ -1069,7 +1216,11 @@ fn test_tiff_missing_tile_byte_counts_returns_format_error() {
         ],
     );
 
-    assert_tiff_open_error_contains(&path, "TileByteCounts");
+    let mut reader = ImageReader::open(&path).expect("open failed");
+    assert_eq!(
+        reader.open_bytes(0).expect("open_bytes failed"),
+        vec![0, 0, 0, 0]
+    );
 }
 
 #[test]
@@ -1145,6 +1296,81 @@ fn write_malformed_tiff(name: &str, entries: &[TiffEntry<'_>]) -> std::path::Pat
 
     std::fs::write(&path, bytes).expect("fixture write failed");
     path
+}
+
+fn write_tiff_with_data(
+    name: &str,
+    entries: &[TiffEntry<'_>],
+    data_offset: usize,
+    data: &[u8],
+) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(name);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42u16.to_le_bytes());
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+
+    let mut array_data = Vec::new();
+    let mut array_offset = 8 + 2 + entries.len() as u32 * 12 + 4;
+    for entry in entries {
+        match *entry {
+            TiffEntry::Short(tag, value) => {
+                bytes.extend_from_slice(&tag.to_le_bytes());
+                bytes.extend_from_slice(&3u16.to_le_bytes());
+                bytes.extend_from_slice(&1u32.to_le_bytes());
+                bytes.extend_from_slice(&value.to_le_bytes());
+                bytes.extend_from_slice(&0u16.to_le_bytes());
+            }
+            TiffEntry::Long(tag, value) => {
+                bytes.extend_from_slice(&tag.to_le_bytes());
+                bytes.extend_from_slice(&4u16.to_le_bytes());
+                bytes.extend_from_slice(&1u32.to_le_bytes());
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            TiffEntry::LongArray(tag, values) => {
+                bytes.extend_from_slice(&tag.to_le_bytes());
+                bytes.extend_from_slice(&4u16.to_le_bytes());
+                bytes.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(&array_offset.to_le_bytes());
+                for value in values {
+                    array_data.extend_from_slice(&value.to_le_bytes());
+                }
+                array_offset += values.len() as u32 * 4;
+            }
+        }
+    }
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&array_data);
+    assert!(
+        bytes.len() <= data_offset,
+        "fixture IFD is larger than requested data offset"
+    );
+    bytes.resize(data_offset, 0);
+    bytes.extend_from_slice(data);
+
+    std::fs::write(&path, bytes).expect("fixture write failed");
+    path
+}
+
+fn pack_12_msb(samples: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut bits = 0u32;
+    let mut used = 0usize;
+    for &sample in samples {
+        bits = (bits << 12) | u32::from(sample & 0x0fff);
+        used += 12;
+        while used >= 8 {
+            let shift = used - 8;
+            out.push(((bits >> shift) & 0xff) as u8);
+            bits &= (1u32 << shift).saturating_sub(1);
+            used = shift;
+        }
+    }
+    if used != 0 {
+        out.push((bits << (8 - used)) as u8);
+    }
+    out
 }
 
 fn assert_tiff_open_error_contains(path: &std::path::Path, needle: &str) {

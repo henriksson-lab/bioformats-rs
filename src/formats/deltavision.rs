@@ -759,7 +759,8 @@ impl DeltavisionReader {
         for raw_line in lines {
             let line = raw_line;
             let colon = line.find(':');
-            if let Some(colon) = colon.filter(|&c| c < line.len() - 1 && !line.starts_with("Created"))
+            if let Some(colon) =
+                colon.filter(|&c| c < line.len() - 1 && !line.starts_with("Created"))
             {
                 let key = line[..colon].trim().to_string();
                 let mut value = line[colon + 1..].trim().to_string();
@@ -939,13 +940,9 @@ impl DeltavisionReader {
                 let metadata_series = self.stage_metadata_series_index(0);
                 for (c, slot) in nd_filters.iter_mut().enumerate() {
                     if slot.is_none() {
-                        let raw_idx = self.file_plane_index_for_series(
-                            0,
-                            c as u32,
-                            0,
-                            metadata_series,
-                            meta,
-                        ) as usize;
+                        let raw_idx =
+                            self.file_plane_index_for_series(0, c as u32, 0, metadata_series, meta)
+                                as usize;
                         if let Some(h) = self.extended_headers.get(raw_idx) {
                             *slot = Some(h.nd_filter as f64);
                         }
@@ -2014,7 +2011,10 @@ mod tests {
         );
 
         let ome = reader.ome_metadata().unwrap();
-        assert_eq!(ome.images[0].acquisition_date.as_deref(), Some("2007-07-25T14:00:00"));
+        assert_eq!(
+            ome.images[0].acquisition_date.as_deref(),
+            Some("2007-07-25T14:00:00")
+        );
         assert_eq!(ome.images[0].physical_size_x, Some(0.1));
         assert_eq!(ome.images[0].physical_size_z, Some(0.2));
         assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("FITC"));

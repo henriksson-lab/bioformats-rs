@@ -347,7 +347,9 @@ fn pe_parse_csv(m: &mut PeMeta, content: &str) {
             j += 1;
             key = None;
             value = None;
-        } else if (t_num > 7 && t_num < 12) || (t_num > 12 && t_num < 18) || (t_num > 18 && t_num < 22)
+        } else if (t_num > 7 && t_num < 12)
+            || (t_num > 12 && t_num < 18)
+            || (t_num > 18 && t_num < 22)
         {
             j += 1;
             key = None;
@@ -1764,7 +1766,11 @@ mod perkinelmer_metadata_tests {
         pe_parse_key_value(&mut m, "Start Time:", "09:30:00 (01/02/2020)");
         pe_parse_key_value(&mut m, "Finish Time:", "09:31:00 (01/02/2020)");
         pe_parse_key_value(&mut m, "Z slice space", "1.25");
-        pe_parse_key_value(&mut m, "Experiment details:", "3 Wavelengths 4 Frames 2 Slices");
+        pe_parse_key_value(
+            &mut m,
+            "Experiment details:",
+            "3 Wavelengths 4 Frames 2 Slices",
+        );
 
         assert_eq!(m.pixel_size_x, 0.25);
         assert_eq!(m.pixel_size_y, 0.30);
@@ -1774,7 +1780,10 @@ mod perkinelmer_metadata_tests {
         assert_eq!(m.start_time.as_deref(), Some("09:30:00 (01/02/2020)"));
         assert_eq!(m.finish_time.as_deref(), Some("09:31:00 (01/02/2020)"));
         assert_eq!(m.slice_space.as_deref(), Some("1.25"));
-        assert_eq!(m.details.as_deref(), Some("3 Wavelengths 4 Frames 2 Slices"));
+        assert_eq!(
+            m.details.as_deref(),
+            Some("3 Wavelengths 4 Frames 2 Slices")
+        );
         // Every key is also kept as global metadata (Java addGlobalMeta).
         assert!(matches!(
             m.metadata.get("Origin Z"),

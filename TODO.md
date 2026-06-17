@@ -96,9 +96,12 @@ where such code exists; no-Java-reference extensions are called out separately.
 
 1. PicoQuant `.ptu` / `.pqres`
    - PicoHarp T2/T3 records are recognized for metadata but remain
-     pixel-reconstruction blocked until a local Bio-Formats Java branch, oracle
-     fixture, or PicoHarp marker-raster bit-packing reference is available; the
-     Rust reader explicitly rejects HydraHarp-compatible inference.
+     pixel-reconstruction blocked until a local oracle fixture or PicoHarp
+     marker-raster bit-packing reference is available; `tests/java_parity_test.rs`
+     has a `BIOFORMATS_RS_PICOQUANT_FIXTURE` placeholder gate so local/release
+     runs can attach PTU/PQRes coverage without requiring redistributable
+     fixtures in CI. The Rust reader explicitly rejects HydraHarp-compatible
+     inference.
    - TTTR record layouts beyond HydraHarp, HydraHarp 2, TimeHarp 260N/260P,
      MultiHarp, and metadata-only PicoHarp identification still need
      translation and Java-oracle parity tests; current metadata records the
@@ -124,7 +127,10 @@ where such code exists; no-Java-reference extensions are called out separately.
 2. QuickTime `.mov` / `.qt`
    - External-codec families are recognized with explicit Java-delegation
      diagnostics but not decoded: H.264/AVC, HEVC, ProRes, MJ2K, DV, and
-     related platform-decoder codecs.
+     related platform-decoder codecs. The parity harness reserves an absent
+     `mov/external_codec_avc1.mov` slot and has a
+     `BIOFORMATS_RS_QT_EXTERNAL_CODEC_FIXTURE` gate for local Java-oracle
+     metadata coverage of non-redistributable/platform-codec samples.
    - Edit-list handling supports complete normal-speed, sample-aligned
      multi-segment presentation-to-source sample reordering in `open_bytes`,
      including sample-aligned clipped normal-speed media segments, internal and
@@ -488,7 +494,10 @@ where such code exists; no-Java-reference extensions are called out separately.
     multi-channel light-path, ROI object graphs beyond
     rectangle/point/ellipse/line scalar coordinates, and acquisition metadata
     beyond scalar acquisition-date projection is still partial across several
-    formats.
+    formats. Java parity now checks object-graph summary counts for instruments,
+    objectives, detectors, light sources, filters, dichroics, planes,
+    ROIs/shapes, plates, wells, and well samples; full semantic equality for
+    every object field remains future work.
 
 ## Non-Upstream / No-Java-Reference Extensions
 

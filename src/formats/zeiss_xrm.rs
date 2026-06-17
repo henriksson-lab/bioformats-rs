@@ -496,7 +496,8 @@ mod tests {
         reader.set_id(&txrm).unwrap();
         let md = &reader.metadata().series_metadata;
         assert_eq!(
-            md.get("Image Details: Acquisition mode").map(|v| v.to_string()),
+            md.get("Image Details: Acquisition mode")
+                .map(|v| v.to_string()),
             Some("Tomography".to_string())
         );
         assert_eq!(
@@ -516,11 +517,13 @@ mod tests {
             Some("1.2.3".to_string())
         );
         assert_eq!(
-            md.get("Projection Info: Objective name").map(|v| v.to_string()),
+            md.get("Projection Info: Objective name")
+                .map(|v| v.to_string()),
             Some("20X".to_string())
         );
         assert_eq!(
-            md.get("Projection Info: Frames per image").map(|v| v.to_string()),
+            md.get("Projection Info: Frames per image")
+                .map(|v| v.to_string()),
             Some("4".to_string())
         );
         assert_eq!(
@@ -529,7 +532,8 @@ mod tests {
             Some("3".to_string())
         );
         assert_eq!(
-            md.get("Projection Info: Camera binning").map(|v| v.to_string()),
+            md.get("Projection Info: Camera binning")
+                .map(|v| v.to_string()),
             Some("2".to_string())
         );
         // TXRM must NOT carry the TXM-only "Output data type" key.

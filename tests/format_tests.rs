@@ -425,6 +425,23 @@ fn eps_reader_accepts_bioformats_binary_image_subset() {
 }
 
 #[test]
+fn eps_reader_uses_imagedata_custom_operator_like_java() {
+    let path = tmp("custom_operator.eps");
+    std::fs::write(
+        &path,
+        b"%!PS-Adobe-3.0 EPSF-3.0\n%ImageData: 2 1 8 1 0 1 1 \"drawpixels\"\n2 1 8 drawpixels\n0a14\n",
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::eps::EpsReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 1);
+    assert_eq!(reader.metadata().size_c, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 20]);
+}
+
+#[test]
 fn eps_reader_rejects_invalid_raster_dimensions_instead_of_clamping() {
     let image_data = tmp("eps_bad_imagedata.eps");
     std::fs::write(
@@ -765,8 +782,8 @@ fn aim_rejects_missing_magic_zero_dimensions_and_short_payload() {
     bytes.extend_from_slice(&[1, 2]);
     std::fs::write(&short, bytes).unwrap();
     let mut reader = bioformats::formats::aim::AimReader::new();
-    let err = reader.set_id(&short).unwrap_err();
-    assert!(err.to_string().contains("shorter than declared"));
+    reader.set_id(&short).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 8]);
     let _ = std::fs::remove_file(&short);
 
     let short_isq = tmp("short.isq");
@@ -780,6 +797,26 @@ fn aim_rejects_missing_magic_zero_dimensions_and_short_payload() {
     let err = reader.set_id(&short_isq).unwrap_err();
     assert!(err.to_string().contains("shorter than declared"));
     let _ = std::fs::remove_file(&short_isq);
+}
+
+#[test]
+fn aim_missing_aim_plane_returns_zero_buffer_like_java() {
+    let path = tmp("aim_missing_plane.aim");
+    let mut bytes = vec![0u8; 160];
+    bytes[..12].copy_from_slice(b"AIMDATA_V020");
+    bytes[56..60].copy_from_slice(&2i32.to_le_bytes());
+    bytes[60..64].copy_from_slice(&2i32.to_le_bytes());
+    bytes[64..68].copy_from_slice(&1i32.to_le_bytes());
+    bytes.push(0);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = bioformats::formats::aim::AimReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 8]);
+    assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![0; 4]);
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -889,6 +926,76 @@ fn iplab_preserves_header_and_common_original_metadata_tags() {
         metadata.get("iplab.tag.note.size"),
         Some(MetadataValue::Int(576))
     ));
+}
+
+#[test]
+fn iplab_reads_java_core_header_and_channel_plane_layout() {
+    let path = tmp("java_core_header.ipl");
+    let mut data = vec![0u8; 44];
+    data[..4].copy_from_slice(b"iiii");
+    write_i32_le(&mut data, 4, 4);
+    write_i32_le(&mut data, 8, 0x100e);
+    write_i32_le(&mut data, 16, 28);
+    write_i32_le(&mut data, 20, 2);
+    write_i32_le(&mut data, 24, 1);
+    write_i32_le(&mut data, 28, 2);
+    write_i32_le(&mut data, 32, 1);
+    write_i32_le(&mut data, 36, 2);
+    write_i32_le(&mut data, 40, 0);
+    data.extend_from_slice(&[1, 2, 3, 4]);
+    data.extend_from_slice(&[5, 6, 7, 8]);
+    std::fs::write(&path, data).unwrap();
+
+    let reader_probe = bioformats::formats::norpix::IplabReader::new();
+    let header = std::fs::read(&path).unwrap();
+    assert!(reader_probe.is_this_type_by_bytes(&header));
+
+    let mut reader = bioformats::formats::norpix::IplabReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_z, 1);
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_t, 2);
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(meta.pixel_type, PixelType::Uint8);
+    assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+    assert!(meta.is_rgb);
+    assert!(meta.is_little_endian);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn iplab_reads_java_big_endian_float_header() {
+    let path = tmp("java_big_endian_float.ipl");
+    let mut data = vec![0u8; 44];
+    data[..4].copy_from_slice(b"mmmm");
+    write_i32_be(&mut data, 4, 4);
+    write_i32_be(&mut data, 8, 0x100e);
+    write_i32_be(&mut data, 16, 28);
+    write_i32_be(&mut data, 20, 1);
+    write_i32_be(&mut data, 24, 1);
+    write_i32_be(&mut data, 28, 1);
+    write_i32_be(&mut data, 32, 1);
+    write_i32_be(&mut data, 36, 1);
+    write_i32_be(&mut data, 40, 4);
+    data.extend_from_slice(&1.25f32.to_be_bytes());
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::norpix::IplabReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.pixel_type, PixelType::Float32);
+    assert_eq!(meta.bits_per_pixel, 32);
+    assert_eq!(meta.dimension_order, DimensionOrder::XYZTC);
+    assert!(!meta.is_little_endian);
+    assert_eq!(reader.open_bytes(0).unwrap(), 1.25f32.to_be_bytes());
+
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -2448,6 +2555,49 @@ fn build_gel_tiff(w: u16, h: u16, pixels_le: &[u8], extra: &[(u16, u16, u32)]) -
     out
 }
 
+fn build_two_ifd_gel_tiff(first_pixel_le: [u8; 2], second_pixel_le: [u8; 2]) -> Vec<u8> {
+    fn write_ifd(out: &mut Vec<u8>, pixel_offset: u32, next_ifd: u32) {
+        let mut entries: Vec<(u16, u16, u32, u32)> = vec![
+            (256, 3, 1, 1),            // ImageWidth
+            (257, 3, 1, 1),            // ImageLength
+            (258, 3, 1, 16),           // BitsPerSample
+            (259, 3, 1, 1),            // Compression = none
+            (262, 3, 1, 1),            // PhotometricInterpretation = BlackIsZero
+            (277, 3, 1, 1),            // SamplesPerPixel
+            (278, 3, 1, 1),            // RowsPerStrip
+            (33445, 3, 1, 128),        // MD_FILETAG = LINEAR
+            (273, 4, 1, pixel_offset), // StripOffsets
+            (279, 4, 1, 2),            // StripByteCounts
+        ];
+        entries.sort_by_key(|e| e.0);
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, ty, count, value) in entries {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&ty.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&next_ifd.to_le_bytes());
+    }
+
+    let entry_count = 10u32;
+    let ifd_size = 2 + 12 * entry_count + 4;
+    let ifd0 = 8u32;
+    let ifd1 = ifd0 + ifd_size;
+    let pixel0 = ifd1 + ifd_size;
+    let pixel1 = pixel0 + 2;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"II");
+    out.extend_from_slice(&42u16.to_le_bytes());
+    out.extend_from_slice(&ifd0.to_le_bytes());
+    write_ifd(&mut out, pixel0, ifd1);
+    write_ifd(&mut out, pixel1, 0);
+    out.extend_from_slice(&first_pixel_le);
+    out.extend_from_slice(&second_pixel_le);
+    out
+}
+
 #[test]
 fn qptiff_preserves_description_key_value_metadata_and_pixels() {
     let path = tmp("metadata_slice.qptiff");
@@ -2674,6 +2824,25 @@ fn gel_square_root_squares_and_scales_to_float() {
         .collect();
     // value*value*scale: 1*1*2=2, 4*2=8, 9*2=18, 16*2=32
     assert_eq!(floats, vec![2.0, 8.0, 18.0, 32.0]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn gel_multi_ifd_uses_java_paired_ifd_plane_mapping() {
+    let path = tmp("gel_two_ifds_java_pairing.gel");
+    std::fs::write(&path, build_two_ifd_gel_tiff([0x11, 0], [0x22, 0])).unwrap();
+
+    let mut reader = bioformats::formats::extended::GelReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 1);
+    assert_eq!(meta.size_t, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0x11, 0]);
+    assert!(matches!(
+        reader.open_bytes(1),
+        Err(BioFormatsError::PlaneOutOfRange(1))
+    ));
+
     let _ = std::fs::remove_file(&path);
 }
 
@@ -3163,10 +3332,7 @@ fn cellomics_dib_records_safe_header_and_filename_metadata() {
     //       FormatTools.getWellName(row, col), field), image);
     // For well A03 (row 0, col 2) getWellName -> "A03" and field 0 -> "00",
     // so the faithful name is "Well A03, Field #00" (not the plate+well string).
-    assert_eq!(
-        ome.images[0].name.as_deref(),
-        Some("Well A03, Field #00")
-    );
+    assert_eq!(ome.images[0].name.as_deref(), Some("Well A03, Field #00"));
     assert!(ome.annotations.iter().any(|annotation| {
         matches!(
             annotation,
@@ -3614,6 +3780,28 @@ fn sm_camera_rejects_bad_magic_and_truncated_payload() {
         "{err:?}"
     );
     let _ = std::fs::remove_file(short);
+}
+
+#[test]
+fn viff_zero_image_count_defaults_to_one_like_java() {
+    let path = tmp("zero_image_count.viff");
+    let mut bytes = vec![0u8; 1024];
+    bytes[..2].copy_from_slice(&[0xab, 0x01]);
+    write_i32_be(&mut bytes, 520, 2);
+    write_i32_be(&mut bytes, 524, 1);
+    write_i32_be(&mut bytes, 556, 0);
+    write_i32_be(&mut bytes, 560, 1);
+    write_i32_be(&mut bytes, 564, 1);
+    bytes.extend_from_slice(&[7, 8]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = bioformats::formats::khoros::KhorosReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.metadata().size_z, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![7, 8]);
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -4379,7 +4567,8 @@ fn simfcs_requires_whole_frames_and_crops_real_pixels() {
 
 #[test]
 fn dcimg_rejects_out_of_bounds_regions() {
-    let path = tmp("region_bounds.dcimg");
+    let dir = isolated_tmp_dir("dcimg_region_bounds");
+    let path = dir.join("region_bounds.dcimg");
     let mut data = vec![0u8; 64];
     data[0..5].copy_from_slice(b"DCIMG");
     data[16..20].copy_from_slice(&64u32.to_le_bytes());
@@ -4400,12 +4589,13 @@ fn dcimg_rejects_out_of_bounds_regions() {
     assert!(reader.open_bytes_region(0, 1, 0, 2, 1).is_err());
     assert!(reader.open_bytes_region(0, 0, 0, 0, 1).is_err());
 
-    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn dcimg_ome_metadata_preserves_original_header_metadata() {
-    let path = tmp("original_metadata.dcimg");
+    let dir = isolated_tmp_dir("dcimg_original_metadata");
+    let path = dir.join("original_metadata.dcimg");
     let mut data = vec![0u8; 64];
     data[0..5].copy_from_slice(b"DCIMG");
     data[16..20].copy_from_slice(&64u32.to_le_bytes());
@@ -4451,12 +4641,13 @@ fn dcimg_ome_metadata_preserves_original_header_metadata() {
         .iter()
         .any(|(key, value)| key == "bit_depth" && value == "8"));
 
-    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn dcimg_rejects_clamped_dimensions_unknown_depth_and_short_payload() {
-    let path = tmp("bad.dcimg");
+    let dir = isolated_tmp_dir("dcimg_bad");
+    let path = dir.join("bad.dcimg");
     let mut data = vec![0u8; 64];
     data[0..5].copy_from_slice(b"DCIMG");
     data[16..20].copy_from_slice(&64u32.to_le_bytes());
@@ -4484,7 +4675,7 @@ fn dcimg_rejects_clamped_dimensions_unknown_depth_and_short_payload() {
     let err = reader.set_id(&path).unwrap_err();
     assert!(err.to_string().contains("shorter than declared"));
 
-    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -4865,19 +5056,19 @@ fn zip_preserves_companion_file_relative_paths() {
 }
 
 #[test]
-fn zip_primary_entry_requires_base_name_boundary() {
+fn zip_primary_entry_uses_java_starts_with_match() {
     use std::io::Write;
 
-    let dir = isolated_tmp_dir("zip_primary_boundary");
+    let dir = isolated_tmp_dir("zip_primary_starts_with");
     let mut meta = ImageMetadata::default();
     meta.size_x = 1;
     meta.size_y = 1;
     meta.pixel_type = PixelType::Uint8;
     meta.image_count = 1;
 
-    let wrong_tiff = dir.join("wrong.tif");
-    ImageWriter::save(&wrong_tiff, &meta, &[vec![99]]).unwrap();
-    let wrong_bytes = std::fs::read(&wrong_tiff).unwrap();
+    let java_first_tiff = dir.join("java_first.tif");
+    ImageWriter::save(&java_first_tiff, &meta, &[vec![99]]).unwrap();
+    let java_first_bytes = std::fs::read(&java_first_tiff).unwrap();
 
     let right_tiff = dir.join("right.tif");
     ImageWriter::save(&right_tiff, &meta, &[vec![7]]).unwrap();
@@ -4888,13 +5079,13 @@ fn zip_primary_entry_requires_base_name_boundary() {
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default();
     zip.start_file("sample2.tif", options).unwrap();
-    zip.write_all(&wrong_bytes).unwrap();
+    zip.write_all(&java_first_bytes).unwrap();
     zip.start_file("sample.tif", options).unwrap();
     zip.write_all(&right_bytes).unwrap();
     zip.finish().unwrap();
 
     let mut reader = ImageReader::open(&zip_path).unwrap();
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![7]);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![99]);
 }
 
 #[test]
@@ -7434,6 +7625,8 @@ fn ome_xml_name_detection_accepts_ome_xml_suffix() {
     let path = tmp("suffix.ome.xml");
     let reader = bioformats::formats::ome_xml::OmeXmlReader::new();
     assert!(reader.is_this_type_by_name(&path));
+    assert!(reader.is_this_type_by_name(Path::new("sample.ome")));
+    assert!(!reader.is_this_type_by_name(Path::new("companion.ome")));
 }
 
 #[test]
@@ -7450,6 +7643,44 @@ fn ome_xml_slices_multichannel_bindata_with_samples_per_pixel() {
     assert_eq!(reader.metadata().image_count, 2);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3]);
     assert_eq!(reader.open_bytes(1).unwrap(), vec![4, 5, 6]);
+}
+
+#[test]
+fn ome_xml_without_bindata_returns_blank_plane_like_java() {
+    let path = tmp("metadata_only_without_bindata.ome");
+    std::fs::write(
+        &path,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0">
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8"
+            SizeX="2" SizeY="2" SizeZ="1" SizeC="1" SizeT="1">
+      <Channel ID="Channel:0:0" SamplesPerPixel="1"/>
+    </Pixels>
+  </Image>
+</OME>"#,
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::ome_xml::OmeXmlReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 0, 0, 0]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn ome_xml_unknown_bindata_compression_falls_through_to_raw_like_java() {
+    let path = tmp("unknown_compression_raw.ome");
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="2" SizeY="1" SizeZ="1" SizeC="1" SizeT="1"><BinData Length="2" Compression="not-a-codec">Bwg=</BinData></Pixels></Image></OME>"#;
+    std::fs::write(&path, xml).unwrap();
+
+    let mut reader = bioformats::formats::ome_xml::OmeXmlReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![7, 8]);
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -7654,12 +7885,8 @@ fn dicom_series_requires_successful_initialization() {
 #[test]
 fn dicom_rejects_missing_required_pixel_attributes() {
     // Note: missing SamplesPerPixel (0028,0002) is NOT rejected — it defaults to
-    // 1 per the DICOM standard (old ACR-NEMA / implicit-VR files omit it). Only
-    // genuinely-required-and-invalid attributes (bits) are rejected here.
-    for (name, omit_samples, omit_bits) in [
-        ("bits_allocated", false, true),
-        ("bits_stored_too_large", false, false),
-    ] {
+    // 1 per the DICOM standard (old ACR-NEMA / implicit-VR files omit it).
+    for (name, omit_samples, omit_bits) in [("bits_allocated", false, true)] {
         let path = tmp(&format!("dicom_missing_required_{name}.dcm"));
         let mut bytes = Vec::new();
         if !omit_samples {
@@ -7670,18 +7897,7 @@ fn dicom_rejects_missing_required_pixel_attributes() {
         if !omit_bits {
             dicom_elem_explicit(&mut bytes, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
         }
-        let bits_stored = if name == "bits_stored_too_large" {
-            16u16
-        } else {
-            8u16
-        };
-        dicom_elem_explicit(
-            &mut bytes,
-            0x0028,
-            0x0101,
-            b"US",
-            &bits_stored.to_le_bytes(),
-        );
+        dicom_elem_explicit(&mut bytes, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
         dicom_elem_explicit(&mut bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
         dicom_elem_explicit(&mut bytes, 0x7FE0, 0x0010, b"OB", &[1]);
         std::fs::write(&path, bytes).unwrap();
@@ -7692,11 +7908,29 @@ fn dicom_rejects_missing_required_pixel_attributes() {
         };
         assert!(
             err.to_string().contains("SamplesPerPixel")
-                || err.to_string().contains("BitsAllocated")
-                || err.to_string().contains("BitsStored"),
+                || err.to_string().contains("BitsAllocated"),
             "{name}: unexpected DICOM error: {err}"
         );
     }
+}
+
+#[test]
+fn dicom_bits_stored_larger_than_allocated_does_not_block_java_pixel_type() {
+    let path = tmp("dicom_bits_stored_too_large_java_fallback.dcm");
+    let mut bytes = Vec::new();
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0010, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0011, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0101, b"US", &16u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x7FE0, 0x0010, b"OB", &[1]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1]);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -7722,8 +7956,8 @@ fn dicom_skips_undefined_length_explicit_sequence_before_image_tags() {
 }
 
 #[test]
-fn dicom_rejects_invalid_or_zero_number_of_frames() {
-    for (name, value) in [("invalid", b"abc".as_slice()), ("zero", b"0".as_slice())] {
+fn dicom_rejects_invalid_number_of_frames() {
+    for (name, value) in [("invalid", b"abc".as_slice())] {
         let path = tmp(&format!("dicom_bad_number_of_frames_{name}.dcm"));
         let mut bytes = Vec::new();
 
@@ -7746,6 +7980,28 @@ fn dicom_rejects_invalid_or_zero_number_of_frames() {
             "{name}: unexpected error: {err}"
         );
     }
+}
+
+#[test]
+fn dicom_zero_number_of_frames_defaults_to_one_like_java() {
+    let path = tmp("dicom_zero_number_of_frames_java_default.dcm");
+    let mut bytes = Vec::new();
+
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0008, b"IS", b"0");
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0010, b"US", &2u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0011, b"US", &2u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x7FE0, 0x0010, b"OB", &[1, 2, 3, 4]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_z, 1);
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -7923,19 +8179,19 @@ fn bdv_preserves_companion_xml_original_metadata() {
     let mut reader = bioformats::formats::bdv::BdvReader::new();
     reader.set_id(&path).unwrap();
 
-    // Java parity: each (setup × timepoint × level) becomes its own series.
-    // The XML declares 2 setups and timepoints 2..=4 (3 timepoints), but the
-    // HDF5 fixture only contains pixels for setup 0 at t00002 level 0, so only
-    // one series is actually readable. Each series is single-channel,
-    // single-timepoint, with dims taken from the cells dataset shape.
+    // Java parity: timepoints stay on the T axis, not as separate series. The
+    // XML declares 2 setups and timepoints 2..=4 (3 timepoints), but the HDF5
+    // fixture only contains pixels for setup 0 at t00002 level 0, so only one
+    // setup/resolution series is actually discoverable. Dims come from the cells
+    // dataset shape, while sizeT comes from the XML timepoint range.
     assert_eq!(reader.series_count(), 1);
     let metadata = &reader.metadata().series_metadata;
     assert_eq!(reader.metadata().size_x, 3);
     assert_eq!(reader.metadata().size_y, 2);
     assert_eq!(reader.metadata().size_z, 1);
     assert_eq!(reader.metadata().size_c, 1);
-    assert_eq!(reader.metadata().size_t, 1);
-    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.metadata().size_t, 3);
+    assert_eq!(reader.metadata().image_count, 3);
     assert!(matches!(
         metadata.get("bdv_setup"),
         Some(MetadataValue::Int(0))
@@ -8055,6 +8311,59 @@ fn bdv_derives_dimensions_from_cells_dataset_shape() {
 }
 
 #[test]
+fn bdv_resolution_count_matches_discovered_levels() {
+    let path = tmp("resolution_count_bdv.h5");
+    let xml_path = path.with_extension("xml");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&xml_path);
+
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut t0 = file.create_group("t00000").unwrap();
+        let mut s0 = t0.create_group("s00").unwrap();
+        let mut level0 = s0.create_group("0").unwrap();
+        level0
+            .new_dataset_builder("cells")
+            .shape(&[1, 2, 2])
+            .write::<u16>(&[1u16, 2, 3, 4])
+            .unwrap();
+        let mut level1 = s0.create_group("1").unwrap();
+        level1
+            .new_dataset_builder("cells")
+            .shape(&[1, 1, 1])
+            .write::<u16>(&[9u16])
+            .unwrap();
+    }
+    {
+        let mut setup0 = file.create_group("s00").unwrap();
+        setup0
+            .new_dataset_builder("resolutions")
+            .shape(&[2, 3])
+            .write::<f64>(&[1.0f64, 1.0, 1.0, 2.0, 2.0, 1.0])
+            .unwrap();
+    }
+    file.flush().unwrap();
+
+    std::fs::write(
+        &xml_path,
+        r#"<SpimData><SequenceDescription><ViewSetups><ViewSetup><id>0</id><size>2 2 1</size></ViewSetup></ViewSetups></SequenceDescription></SpimData>"#,
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::bdv::BdvReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.series_count(), 2);
+    assert_eq!(reader.resolution_count(), 2);
+    assert_eq!(reader.metadata().resolution_count, 2);
+    reader.set_series(1).unwrap();
+    assert_eq!(reader.resolution_count(), 2);
+    assert_eq!(reader.metadata().resolution_count, 2);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&xml_path);
+}
+
+#[test]
 fn bdv_requires_real_dimensions_and_initialized_series() {
     let path = tmp("weak_bdv.h5");
     let xml_path = path.with_extension("xml");
@@ -8138,6 +8447,40 @@ fn imaris_derives_dimensions_from_dataset_shape_not_attributes() {
     let m = reader.metadata();
     assert_eq!((m.size_x, m.size_y, m.size_z, m.size_c), (4, 3, 1, 1));
     assert_eq!(reader.open_bytes(0).unwrap().len(), 12);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn imaris_signed_integer_datasets_report_unsigned_pixel_type_like_java() {
+    let path = tmp("signed_int_ims.ims");
+    let _ = std::fs::remove_file(&path);
+
+    let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+    {
+        let mut info = file.create_group("DataSetInfo").unwrap();
+        let mut image = info.create_group("Image").unwrap();
+        image.add_fixed_ascii_attr("X", "2", 1).unwrap();
+        image.add_fixed_ascii_attr("Y", "1", 1).unwrap();
+        image.add_fixed_ascii_attr("Z", "1", 1).unwrap();
+    }
+    {
+        let mut dataset = file.create_group("DataSet").unwrap();
+        let mut res = dataset.create_group("ResolutionLevel 0").unwrap();
+        let mut time = res.create_group("TimePoint 0").unwrap();
+        let mut channel = time.create_group("Channel 0").unwrap();
+        channel
+            .new_dataset_builder("Data")
+            .shape(&[1, 1, 2])
+            .write::<i32>(&[-1i32, 7])
+            .unwrap();
+    }
+    file.flush().unwrap();
+
+    let mut reader = bioformats::formats::imaris_hdf::ImarisHdfReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.metadata().pixel_type, PixelType::Uint32);
+    assert_eq!(reader.metadata().bits_per_pixel, 32);
+
     let _ = std::fs::remove_file(&path);
 }
 
@@ -8926,6 +9269,7 @@ fn cellh5_preserves_hdf5_attributes_and_dataset_metadata() {
     assert_eq!(reader.metadata().size_x, 3);
     assert_eq!(reader.metadata().size_y, 2);
     assert_eq!(reader.metadata().size_t, 2);
+    assert!(reader.metadata().is_indexed);
     assert!(
         matches!(
             metadata.get("cellh5_attr:/@experiment_name"),
@@ -8994,7 +9338,7 @@ fn cellh5_rejects_unsupported_dataset_dtype_and_clears_failed_reopen() {
 }
 
 #[test]
-fn spe_rejects_zero_dimensions_and_short_payload() {
+fn spe_rejects_zero_dimensions_and_zero_fills_short_payload_like_java() {
     let zero = tmp("zero.spe");
     let mut bytes = vec![0u8; 4100];
     bytes[108..110].copy_from_slice(&3i16.to_le_bytes());
@@ -9015,8 +9359,9 @@ fn spe_rejects_zero_dimensions_and_short_payload() {
     bytes.extend_from_slice(&[1, 2]);
     std::fs::write(&short, bytes).unwrap();
     let mut reader = bioformats::formats::spe::SpeReader::new();
-    let err = reader.set_id(&short).unwrap_err();
-    assert!(err.to_string().contains("shorter than declared"));
+    reader.set_id(&short).unwrap();
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 2 * 2 * 2]);
     let _ = std::fs::remove_file(&short);
 }
 
@@ -9158,6 +9503,23 @@ fn photoshop_rejects_unknown_header_values_and_short_payload() {
         .unwrap_err();
     assert!(err.to_string().contains("failed to fill whole buffer"));
     let _ = std::fs::remove_file(short);
+}
+
+#[test]
+fn photoshop_palette_color_without_lut_is_still_indexed_like_java() {
+    let path = tmp("palette_without_lut.psd");
+    let mut data = minimal_psd(1, 1, 1, 1, 8);
+    data[24..26].copy_from_slice(&2u16.to_be_bytes());
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::psd::PsdReader::new();
+    reader.set_id(&path).unwrap();
+    assert!(reader.metadata().is_indexed);
+    assert!(reader.metadata().lookup_table.is_none());
+    assert_eq!(reader.metadata().size_c, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0]);
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -9672,7 +10034,7 @@ fn dicom_rejects_mismatched_pixel_data_length() {
 }
 
 #[test]
-fn dicom_palette_color_pixels_are_expanded_to_rgb() {
+fn dicom_palette_color_exposes_indices_and_lut() {
     let path = tmp("palette_color.dcm");
     let mut bytes = Vec::new();
     let descriptor = [2u16, 0, 8]
@@ -9698,10 +10060,128 @@ fn dicom_palette_color_pixels_are_expanded_to_rgb() {
     std::fs::write(&path, bytes).unwrap();
     let mut reader = ImageReader::open(&path).unwrap();
 
+    assert_eq!(reader.metadata().size_c, 1);
+    assert!(!reader.metadata().is_rgb);
+    assert!(reader.metadata().is_indexed);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1]);
+    let lut = reader
+        .metadata()
+        .lookup_table
+        .as_ref()
+        .expect("palette LUT");
+    assert_eq!(lut.red, vec![10, 20]);
+    assert_eq!(lut.green, vec![30, 40]);
+    assert_eq!(lut.blue, vec![50, 60]);
+}
+
+#[test]
+fn dicom_palette_color_without_lut_is_still_indexed_like_java() {
+    let path = tmp("palette_color_no_lut.dcm");
+    let mut bytes = Vec::new();
+
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0004, b"CS", b"PALETTE COLOR ");
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0010, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0011, b"US", &2u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x7FE0, 0x0010, b"OB", &[0, 1]);
+
+    std::fs::write(&path, bytes).unwrap();
+    let mut reader = ImageReader::open(&path).unwrap();
+
+    assert_eq!(reader.metadata().size_c, 1);
+    assert!(!reader.metadata().is_rgb);
+    assert!(reader.metadata().is_indexed);
+    assert!(reader.metadata().lookup_table.is_none());
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1]);
+}
+
+#[test]
+fn dicom_twenty_four_bit_allocated_rgb_uses_java_channel_stride() {
+    let path = tmp("rgb_bits_allocated_24.dcm");
+    let mut bytes = Vec::new();
+
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0002, b"US", &3u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0004, b"CS", b"RGB ");
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0006, b"US", &0u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0010, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0011, b"US", &2u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0100, b"US", &24u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x7FE0, 0x0010, b"OB", &[1, 2, 3, 4, 5, 6]);
+
+    std::fs::write(&path, bytes).unwrap();
+    let mut reader = ImageReader::open(&path).unwrap();
+
+    assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+    assert_eq!(reader.metadata().bits_per_pixel, 8);
     assert_eq!(reader.metadata().size_c, 3);
     assert!(reader.metadata().is_rgb);
-    assert!(!reader.metadata().is_indexed);
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 30, 50, 20, 40, 60]);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn dicom_wsi_total_matrix_stitches_native_tiles() {
+    let path = tmp("wsi_tiles.dcm");
+    let mut bytes = Vec::new();
+
+    dicom_elem_explicit(
+        &mut bytes,
+        0x0008,
+        0x0016,
+        b"UI",
+        b"1.2.840.10008.5.1.4.1.1.77.1.6\0",
+    );
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0008, b"IS", b"2");
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0010, b"US", &2u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0011, b"US", &2u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0048, 0x0006, b"UL", &4u32.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x0048, 0x0007, b"UL", &2u32.to_le_bytes());
+    dicom_elem_explicit(&mut bytes, 0x7FE0, 0x0010, b"OB", &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+    std::fs::write(&path, bytes).unwrap();
+    let mut reader = ImageReader::open(&path).unwrap();
+
+    assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 2));
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 5, 6, 3, 4, 7, 8]);
+}
+
+#[test]
+fn dicomdir_opens_first_referenced_file() {
+    let dir = tmp("dicomdir_case");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("STUDY")).unwrap();
+    let image = dir.join("STUDY").join("IMG0001");
+    let dicomdir = dir.join("DICOMDIR");
+
+    let mut image_bytes = Vec::new();
+    dicom_elem_explicit(&mut image_bytes, 0x0028, 0x0002, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut image_bytes, 0x0028, 0x0010, b"US", &1u16.to_le_bytes());
+    dicom_elem_explicit(&mut image_bytes, 0x0028, 0x0011, b"US", &2u16.to_le_bytes());
+    dicom_elem_explicit(&mut image_bytes, 0x0028, 0x0100, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut image_bytes, 0x0028, 0x0101, b"US", &8u16.to_le_bytes());
+    dicom_elem_explicit(&mut image_bytes, 0x0028, 0x0103, b"US", &0u16.to_le_bytes());
+    dicom_elem_explicit(&mut image_bytes, 0x7FE0, 0x0010, b"OB", &[9, 10]);
+    std::fs::write(&image, image_bytes).unwrap();
+
+    let mut dir_bytes = vec![0u8; 128];
+    dir_bytes.extend_from_slice(b"DICM");
+    dicom_elem_explicit(&mut dir_bytes, 0x0004, 0x1500, b"CS", b"STUDY\\IMG0001 ");
+    std::fs::write(&dicomdir, dir_bytes).unwrap();
+
+    let mut reader = bioformats::formats::dicom::DicomReader::new();
+    reader.set_id(&dicomdir).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 10]);
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -9756,7 +10236,7 @@ fn dicom_twelve_bit_stored_pixels_are_masked() {
         .collect::<Vec<_>>();
 
     assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
-    assert_eq!(reader.metadata().bits_per_pixel, 12);
+    assert_eq!(reader.metadata().bits_per_pixel, 16);
     assert_eq!(values, vec![0x0000, 0x0abc, 0x0123]);
 }
 
@@ -11348,6 +11828,13 @@ fn olympus_rejects_missing_pty_and_clears_prior_series() {
 
 // ---- raster formats --------------------------------------------------------
 
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&0u32.to_be_bytes());
+}
+
 #[test]
 fn simple_raster_readers_do_not_report_series_before_set_id() {
     let mut avi = bioformats::formats::avi::AviReader::new();
@@ -11391,6 +11878,82 @@ fn simple_raster_readers_do_not_report_series_before_set_id() {
         gif.set_series(0),
         Err(BioFormatsError::SeriesOutOfRange(0))
     ));
+}
+
+#[test]
+fn jpeg_reader_accepts_java_jpe_suffix() {
+    let reader = bioformats::formats::jpeg::JpegReader::new();
+    assert!(reader.is_this_type_by_name(Path::new("sample.jpe")));
+}
+
+#[test]
+fn pcx_magic_detection_matches_java_without_version_filter() {
+    let reader = bioformats::formats::pcx::PcxReader::new();
+    assert!(reader.is_this_type_by_bytes(&[0x0a, 99]));
+}
+
+#[test]
+fn png_gray_alpha_reports_rgb_interleaved_like_java_apng_reader() {
+    use image::ImageEncoder;
+
+    let path = tmp("gray_alpha.png");
+    let pixels = [10u8, 200, 20, 100];
+    let mut encoded = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut encoded)
+        .write_image(&pixels, 2, 1, image::ColorType::La8.into())
+        .unwrap();
+    std::fs::write(&path, encoded).unwrap();
+
+    let mut reader = bioformats::formats::png::PngReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 2);
+    assert!(meta.is_rgb);
+    assert!(meta.is_interleaved);
+    assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn indexed_png_keeps_indices_and_lookup_table_like_java_apng_reader() {
+    use std::io::Write;
+
+    let path = tmp("indexed_palette.png");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&2u32.to_be_bytes());
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.push(8);
+    ihdr.push(3);
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(0);
+    png_chunk(&mut bytes, b"IHDR", &ihdr);
+    png_chunk(&mut bytes, b"PLTE", &[255, 0, 0, 0, 255, 0]);
+
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&[0, 1, 0]).unwrap();
+    let idat = encoder.finish().unwrap();
+    png_chunk(&mut bytes, b"IDAT", &idat);
+    png_chunk(&mut bytes, b"IEND", &[]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = bioformats::formats::png::PngReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(meta.is_indexed);
+    assert!(!meta.is_rgb);
+    assert!(!meta.is_interleaved);
+    assert_eq!(meta.bits_per_pixel, 8);
+    let lut = meta.lookup_table.as_ref().unwrap();
+    assert_eq!(lut.red[0], 255);
+    assert_eq!(lut.green[1], 255);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0]);
+
+    let _ = std::fs::remove_file(path);
 }
 
 fn riff_avi(chunks: &[u8]) -> Vec<u8> {
@@ -11693,8 +12256,14 @@ fn animated_png_round_trip_two_frames() {
     };
 
     // Frame 0: blue; frame 1: white.
-    let blue: Vec<u8> = std::iter::repeat([0u8, 0, 255, 255]).take(4).flatten().collect();
-    let white: Vec<u8> = std::iter::repeat([255u8, 255, 255, 255]).take(4).flatten().collect();
+    let blue: Vec<u8> = std::iter::repeat([0u8, 0, 255, 255])
+        .take(4)
+        .flatten()
+        .collect();
+    let white: Vec<u8> = std::iter::repeat([255u8, 255, 255, 255])
+        .take(4)
+        .flatten()
+        .collect();
 
     ImageWriter::save(&path, &meta, &[blue.clone(), white.clone()]).expect("apng write failed");
 
@@ -12890,7 +13459,9 @@ fn paletted_tga_keeps_indices_with_lookup_table() {
     // raw palette indices for the two pixels
     assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1]);
     // color map reconstructs RGB (red, green)
-    let lut = meta.lookup_table.expect("indexed image exposes a lookup table");
+    let lut = meta
+        .lookup_table
+        .expect("indexed image exposes a lookup table");
     assert_eq!(lut.red, vec![255, 0]);
     assert_eq!(lut.green, vec![0, 255]);
     assert_eq!(lut.blue, vec![0, 0]);

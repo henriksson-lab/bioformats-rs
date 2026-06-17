@@ -518,9 +518,18 @@ impl FormatReader for MrcReader {
         series_metadata.insert("Grid size (X)".into(), MetadataValue::Int(hdr.mx as i64));
         series_metadata.insert("Grid size (Y)".into(), MetadataValue::Int(hdr.my as i64));
         series_metadata.insert("Grid size (Z)".into(), MetadataValue::Int(hdr.mz as i64));
-        series_metadata.insert("Cell size (X)".into(), MetadataValue::Float(hdr.xlen as f64));
-        series_metadata.insert("Cell size (Y)".into(), MetadataValue::Float(hdr.ylen as f64));
-        series_metadata.insert("Cell size (Z)".into(), MetadataValue::Float(hdr.zlen as f64));
+        series_metadata.insert(
+            "Cell size (X)".into(),
+            MetadataValue::Float(hdr.xlen as f64),
+        );
+        series_metadata.insert(
+            "Cell size (Y)".into(),
+            MetadataValue::Float(hdr.ylen as f64),
+        );
+        series_metadata.insert(
+            "Cell size (Z)".into(),
+            MetadataValue::Float(hdr.zlen as f64),
+        );
         series_metadata.insert("Alpha angle".into(), MetadataValue::Float(hdr.alpha as f64));
         series_metadata.insert("Beta angle".into(), MetadataValue::Float(hdr.beta as f64));
         series_metadata.insert("Gamma angle".into(), MetadataValue::Float(hdr.gamma as f64));

@@ -362,10 +362,9 @@ fn parse_fuji(inf_file: &Path) -> Result<(ImageMetadata, FujiHeader)> {
         ));
     }
 
-    let bits: u32 = lines[5]
-        .trim()
-        .parse()
-        .map_err(|_| BioFormatsError::Format("Fuji LAS: invalid bit depth in .inf header".into()))?;
+    let bits: u32 = lines[5].trim().parse().map_err(|_| {
+        BioFormatsError::Format("Fuji LAS: invalid bit depth in .inf header".into())
+    })?;
     let pixel_type = fuji_pixel_type_from_bytes((bits / 8) as usize)?;
 
     let size_x: u32 = lines[6]
@@ -1582,11 +1581,8 @@ mod tests {
     }
 
     fn fuji_tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "bioformats_fuji_{}_{}",
-            name,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("bioformats_fuji_{}_{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -71,7 +71,7 @@ pub fn decompress(
             }
         }
         Compression::Zstd => decompress_zstd(data)?,
-        Compression::Jpeg2000 => decompress_jpeg2000(data)?,
+        Compression::Jpeg2000 => decompress_jpeg2000_with_endianness(data, little_endian)?,
         Compression::JpegXR => decompress_jpegxr(data)?,
         Compression::Ccitt => {
             if bits_per_pixel != 1 {
@@ -341,17 +341,15 @@ fn undo_tiff_horizontal_differencing(
     // integer of `bytes_per_sample` bytes (respecting endianness); the previous
     // same-channel sample (one pixel, i.e. `samples_per_pixel` samples, to the
     // left) is added with wrapping overflow and repacked in place.
-    let bytes_per_sample = match bits_per_sample {
-        8 => 1usize,
-        16 => 2usize,
-        32 => 4usize,
-        64 => 8usize,
-        other => {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "TIFF horizontal predictor for {other}-bit samples not supported"
-            )));
-        }
-    };
+    let bytes_per_sample = ((bits_per_sample as usize) + 7) / 8;
+    if bytes_per_sample == 0 {
+        return Ok(());
+    }
+    if bytes_per_sample > 8 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "TIFF horizontal predictor for {bits_per_sample}-bit samples not supported"
+        )));
+    }
 
     // Stride, in samples, between a sample and its left neighbour of the same
     // channel. This is the per-channel horizontal differencing stride.
@@ -525,6 +523,33 @@ mod tests {
         let expected: Vec<u8> = [0x0100u16, 0x0102, 0x0105]
             .into_iter()
             .flat_map(u16::to_be_bytes)
+            .collect();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn tiff_horizontal_predictor_accepts_ceil_byte_sample_widths() {
+        let differenced = [1u8, 0, 2, 0, 3, 0];
+
+        let out = decompress(
+            &differenced,
+            Compression::None,
+            differenced.len(),
+            2,
+            1,
+            12,
+            3,
+            1,
+            true,
+            None,
+            None,
+            JpegColor::Default,
+        )
+        .expect("12-bit predictor decode failed");
+
+        let expected: Vec<u8> = [1u16, 3, 6]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
             .collect();
         assert_eq!(out, expected);
     }

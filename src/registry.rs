@@ -33,6 +33,10 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::mias::AliconaReader::new()),
         Box::new(crate::formats::perkinelmer::OpenlabRawReader::new()),
         Box::new(crate::formats::incell::InCellReader::new()),
+        // DICOM can legally use arbitrary 128-byte preambles, including bytes
+        // that look like another container. It must get the DICM/preambleless
+        // byte probe before broad TIFF magic claims DICOM-TIFF files.
+        Box::new(crate::formats::dicom::DicomReader::new()),
         Box::new(crate::tiff::TiffReader::new()),
         // ApngReader must precede PngReader: both match the PNG byte signature,
         // but ApngReader only claims animated PNGs (those with an acTL chunk),
@@ -55,7 +59,6 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::nrrd::NrrdReader::new()),
         Box::new(crate::formats::metaimage::MetaImageReader::new()),
         Box::new(crate::formats::ics::IcsReader::new()),
-        Box::new(crate::formats::dicom::DicomReader::new()),
         Box::new(crate::formats::nifti::NiftiReader::new()),
         Box::new(crate::formats::gatan::GatanReader::new()),
         // Generic raster wrappers (via image crate)
@@ -174,6 +177,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::misc::MincReader::new()),
         Box::new(crate::formats::misc::OpenlabReader::new()),
         Box::new(crate::formats::misc::SmCameraReader::new()),
+        Box::new(crate::formats::misc::TextReader::new()),
         // Extended formats — TIFF wrappers
         Box::new(crate::formats::extended::DngReader::new()),
         Box::new(crate::formats::extended::VectraReader::new()),
@@ -513,13 +517,13 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         .map(|e| e.to_ascii_lowercase());
 
     match ext.as_deref() {
-        Some("lsm") => vec![boxed_reader(crate::formats::zeiss_lsm::ZeissLsmReader::new())],
+        Some("lsm") => vec![boxed_reader(
+            crate::formats::zeiss_lsm::ZeissLsmReader::new(),
+        )],
         Some("stk") => vec![boxed_reader(
             crate::formats::metamorph::MetamorphReader::new(),
         )],
-        Some("svs") => vec![boxed_reader(
-            crate::formats::svs::SvsReader::new(),
-        )],
+        Some("svs") => vec![boxed_reader(crate::formats::svs::SvsReader::new())],
         Some("ndpi") => vec![
             boxed_reader(crate::formats::tiff_wrappers::NdpiReader::new()),
             boxed_reader(crate::formats::svs::SvsReader::new()),
@@ -884,6 +888,51 @@ mod tests {
         dir
     }
 
+    fn write_dicom(path: &PathBuf, width: u32, height: u32) {
+        let meta = ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        };
+        let pixels = vec![7; (width * height) as usize];
+        ImageWriter::save(path, &meta, &[pixels]).unwrap();
+    }
+
+    fn install_minimal_tiff_preamble(bytes: &mut [u8]) {
+        assert!(bytes.len() >= 132);
+        bytes[..128].fill(0);
+        bytes[0..2].copy_from_slice(b"II");
+        bytes[2..4].copy_from_slice(&42u16.to_le_bytes());
+        bytes[4..8].copy_from_slice(&8u32.to_le_bytes());
+        bytes[8..10].copy_from_slice(&9u16.to_le_bytes());
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),   // ImageWidth
+            tiff_entry(257, 4, 1, 1),   // ImageLength
+            tiff_entry(258, 3, 1, 8),   // BitsPerSample
+            tiff_entry(259, 3, 1, 1),   // Compression
+            tiff_entry(262, 3, 1, 1),   // PhotometricInterpretation
+            tiff_entry(273, 4, 1, 122), // StripOffsets
+            tiff_entry(277, 3, 1, 1),   // SamplesPerPixel
+            tiff_entry(278, 4, 1, 1),   // RowsPerStrip
+            tiff_entry(279, 4, 1, 1),   // StripByteCounts
+        ];
+        let mut offset = 10;
+        for entry in entries {
+            bytes[offset..offset + 12].copy_from_slice(&entry);
+            offset += 12;
+        }
+        bytes[offset..offset + 4].copy_from_slice(&0u32.to_le_bytes());
+        bytes[122] = 99;
+        bytes[128..132].copy_from_slice(b"DICM");
+    }
+
     #[test]
     fn open_returns_set_id_error_for_matching_corrupt_file() {
         let path = temp_path("corrupt.png");
@@ -986,6 +1035,76 @@ mod tests {
                 .any(|key| key.starts_with("fluoview.")),
             "plain TIFF should not be claimed by Fluoview wrapper"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dicom_with_tiff_preamble_dispatches_before_generic_tiff() {
+        let path = temp_path("dicom_tiff_preamble.dcm");
+        write_dicom(&path, 2, 1);
+        let mut bytes = std::fs::read(&path).unwrap();
+        install_minimal_tiff_preamble(&mut bytes);
+        std::fs::write(&path, bytes).unwrap();
+
+        let reader = ImageReader::open(&path).expect("DICOM-TIFF dispatch failed");
+
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert!(
+            reader
+                .metadata()
+                .series_metadata
+                .contains_key("TransferSyntaxUID"),
+            "TIFF preamble claimed file before DICOM"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn preambleless_dicom_dataset_dispatches_by_bytes() {
+        let path = temp_path("preambleless.dcm");
+        write_dicom(&path, 2, 1);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[132..]).unwrap();
+
+        let reader = ImageReader::open(&path).expect("preambleless DICOM dispatch failed");
+
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert!(
+            reader
+                .metadata()
+                .series_metadata
+                .contains_key("TransferSyntaxUID"),
+            "preambleless dataset was not parsed as DICOM"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dicom_name_detection_includes_jpeg2000_transfer_extensions() {
+        let reader = crate::formats::dicom::DicomReader::new();
+
+        assert!(reader.is_this_type_by_name(&PathBuf::from("ct.j2ki")));
+        assert!(reader.is_this_type_by_name(&PathBuf::from("mr.j2kr")));
+    }
+
+    #[test]
+    fn csv_dispatches_to_text_reader() {
+        let path = temp_path("numeric_grid.csv");
+        std::fs::write(&path, "1,2\n3,4\n").unwrap();
+
+        let mut reader = ImageReader::open(&path).expect("CSV TextReader dispatch failed");
+        let bytes = reader.open_bytes(0).unwrap();
+        let first = f32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let last = f32::from_be_bytes(bytes[12..16].try_into().unwrap());
+
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Float32);
+        assert!(!reader.metadata().is_little_endian);
+        assert_eq!(first, 1.0);
+        assert_eq!(last, 4.0);
         let _ = std::fs::remove_file(path);
     }
 

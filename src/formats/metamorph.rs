@@ -321,8 +321,10 @@ fn read_stage_positions(data: &[u8], off: usize, le: bool, mm_planes: u32) -> (V
     let mut ys = Vec::new();
     let mut o = off;
     for _ in 0..mm_planes {
-        let (Some(x), Some(y)) = (read_rational_at(data, o, le), read_rational_at(data, o + 8, le))
-        else {
+        let (Some(x), Some(y)) = (
+            read_rational_at(data, o, le),
+            read_rational_at(data, o + 8, le),
+        ) else {
             break;
         };
         xs.push(x);
@@ -391,14 +393,24 @@ fn read_len_prefixed_string(data: &[u8], off: usize, le: bool) -> Option<String>
 fn read_uic1_datetime(data: &[u8], off: usize, le: bool) -> Option<String> {
     let date_raw = rd_i32_at(data, off, le)?;
     let time_raw = rd_i32_at(data, off + 4, le)?;
-    Some(format!("{} {}", decode_date(date_raw), decode_time(time_raw)))
+    Some(format!(
+        "{} {}",
+        decode_date(date_raw),
+        decode_time(time_raw)
+    ))
 }
 
 /// Parse the UIC4 binary id-list table (Java `parseUIC4Tags`), extracting the
 /// stage positions (id 28), absolute Z (id 40) and stage labels (id 37). The
 /// table is a sequence of 16-bit ids terminated by id 0; each known id is
 /// followed by `mmPlanes` records, unknown ids by a single 4-byte value.
-fn parse_uic4_data_fields(data: &[u8], off: usize, le: bool, mm_planes: u32, out: &mut MetamorphData) {
+fn parse_uic4_data_fields(
+    data: &[u8],
+    off: usize,
+    le: bool,
+    mm_planes: u32,
+    out: &mut MetamorphData,
+) {
     let rd_i16 = |o: usize| -> Option<i16> {
         if o + 2 > data.len() {
             return None;
@@ -534,9 +546,10 @@ fn parse_uic1_data_fields(
             }
             46 => {
                 if val_off + 8 <= data.len() {
-                    if let (Some(xb), Some(yb)) =
-                        (rd_i32_at(data, val_off, le), rd_i32_at(data, val_off + 4, le))
-                    {
+                    if let (Some(xb), Some(yb)) = (
+                        rd_i32_at(data, val_off, le),
+                        rd_i32_at(data, val_off + 4, le),
+                    ) {
                         out.binning = Some(format!("{xb}x{yb}"));
                     }
                 }
@@ -564,14 +577,17 @@ fn read_metamorph_data(path: &Path, ifd: &Ifd, mm_planes: u32) -> MetamorphData 
             else {
                 break;
             };
-            let z = if den != 0 { num as f64 / den as f64 } else { num as f64 };
+            let z = if den != 0 {
+                num as f64 / den as f64
+            } else {
+                num as f64
+            };
             out.z_distances.push(z);
             // creation date (4B) + time (4B) -> ms timestamp.
             if let (Some(d_raw), Some(t_raw)) =
                 (rd_i32_at(&data, o + 8, le), rd_i32_at(&data, o + 12, le))
             {
-                out.internal_stamps
-                    .push(julian_ms_timestamp(d_raw, t_raw));
+                out.internal_stamps.push(julian_ms_timestamp(d_raw, t_raw));
             }
             o += 24;
         }
@@ -583,7 +599,11 @@ fn read_metamorph_data(path: &Path, ifd: &Ifd, mm_planes: u32) -> MetamorphData 
     // UIC3: emission wavelengths (Java `emWavelength`/`wave`).
     if let Some(IfdValue::Rational(waves)) = ifd.get(UIC3_TAG) {
         for (n, d) in waves {
-            let v = if *d != 0 { *n as f64 / *d as f64 } else { *n as f64 };
+            let v = if *d != 0 {
+                *n as f64 / *d as f64
+            } else {
+                *n as f64
+            };
             out.em_wavelength.push(v);
         }
     }
@@ -630,7 +650,10 @@ fn emit_metamorph_data_metadata(
         out.insert("Name".into(), MetadataValue::String(name.clone()));
     }
     if let Some(date) = &mm.image_creation_date {
-        out.insert("imageCreationDate".into(), MetadataValue::String(date.clone()));
+        out.insert(
+            "imageCreationDate".into(),
+            MetadataValue::String(date.clone()),
+        );
     }
     if let Some(binning) = &mm.binning {
         out.insert("binning".into(), MetadataValue::String(binning.clone()));
@@ -665,7 +688,10 @@ fn emit_metamorph_data_metadata(
                 let d = mm.z_distances[pi];
                 distance += if d != 0.0 { d } else { mm.z_distances[0] };
             }
-            out.insert(format!("plane.{p}.position_z"), MetadataValue::Float(distance));
+            out.insert(
+                format!("plane.{p}.position_z"),
+                MetadataValue::Float(distance),
+            );
         }
     } else if !mm.absolute_z.is_empty() {
         for (i, z) in mm.absolute_z.iter().enumerate() {
@@ -2376,8 +2402,14 @@ mod tests {
         assert_eq!(metadata_f64(&out, "plane.0.position_z"), Some(0.0));
         assert_eq!(metadata_f64(&out, "plane.1.position_z"), Some(0.5));
         // Emission wavelengths surfaced per channel (>= 1).
-        assert_eq!(metadata_f64(&out, "channel.0.emission_wavelength"), Some(488.0));
-        assert_eq!(metadata_f64(&out, "channel.1.emission_wavelength"), Some(561.0));
+        assert_eq!(
+            metadata_f64(&out, "channel.0.emission_wavelength"),
+            Some(488.0)
+        );
+        assert_eq!(
+            metadata_f64(&out, "channel.1.emission_wavelength"),
+            Some(561.0)
+        );
         // Binning surfaced both as Java key and per-channel detector settings.
         assert_eq!(metadata_str(&out, "binning"), Some("2x2"));
         assert_eq!(metadata_str(&out, "Name"), Some("img"));

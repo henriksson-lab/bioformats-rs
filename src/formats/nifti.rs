@@ -18,14 +18,10 @@ use crate::common::region::crop_full_plane;
 
 // ── NIfTI datatype codes ─────────────────────────────────────────────────────
 //
-// Mirrors NiftiReader.populatePixelType. Datatypes 128 (RGB24) and 2304
-// (RGBA32) are colour types: they set the pixel type to UINT8 and fix the
-// channel count (3 / 4 respectively). The returned `Option<u32>`, when set,
-// overrides sizeC for these colour types.
-//
-// Note: the Java switch has fall-through bugs (missing `break` after cases 128
-// and 2304); this uses the clearly intended mapping
-// (128 → UINT8 RGB sizeC=3, 2304 → UINT8 RGBA sizeC=4).
+// Mirrors NiftiReader.populatePixelType. Datatype 128 (RGB24) falls through to
+// case 256 in Java, so Bio-Formats reports INT8 with sizeC=3. Datatype 2304
+// also falls through to the Java default and throws, but Rust keeps RGBA32 as an
+// allowed extension because extra supported cases are acceptable here.
 fn nifti_pixel_type(datatype: i16) -> Result<(PixelType, Option<u32>)> {
     Ok(match datatype {
         1 | 2 => (PixelType::Uint8, None),
@@ -33,7 +29,7 @@ fn nifti_pixel_type(datatype: i16) -> Result<(PixelType, Option<u32>)> {
         8 => (PixelType::Int32, None),
         16 => (PixelType::Float32, None),
         64 => (PixelType::Float64, None),
-        128 => (PixelType::Uint8, Some(3)),
+        128 => (PixelType::Int8, Some(3)),
         256 => (PixelType::Int8, None),
         512 => (PixelType::Uint16, None),
         768 => (PixelType::Uint32, None),
@@ -304,7 +300,10 @@ fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
     // Spatial/time units from the xyzt_units byte (addGlobalMeta "XYZT units"
     // etc.). The voxel sizes above are expressed in this spatial unit; the
     // time increment in this time unit.
-    meta_map.insert("xyzt_units".into(), MetadataValue::Int(hdr.xyzt_units as i64));
+    meta_map.insert(
+        "xyzt_units".into(),
+        MetadataValue::Int(hdr.xyzt_units as i64),
+    );
     meta_map.insert(
         "spatial_unit".into(),
         MetadataValue::String(spatial_unit_symbol(hdr.xyzt_units).into()),
@@ -315,10 +314,7 @@ fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
     );
 
     // addGlobalMeta("Number of dimensions", nDimensions).
-    meta_map.insert(
-        "nDimensions".into(),
-        MetadataValue::Int(hdr.ndim as i64),
-    );
+    meta_map.insert("nDimensions".into(), MetadataValue::Int(hdr.ndim as i64));
 
     Ok(ImageMetadata {
         size_x,
@@ -645,7 +641,7 @@ mod tests {
         buf[84..88].copy_from_slice(&2.5f32.to_le_bytes()); // voxelHeight
         buf[88..92].copy_from_slice(&3.5f32.to_le_bytes()); // sliceThickness
         buf[92..96].copy_from_slice(&4.5f32.to_le_bytes()); // deltaT
-        // xyzt_units byte at offset 123
+                                                            // xyzt_units byte at offset 123
         buf[123] = xyzt_units;
         // descrip at offset 148
         let desc = b"a synthetic nifti";
@@ -701,5 +697,21 @@ mod tests {
         // microsecond time code (24)
         assert_eq!(time_unit_symbol(UNITS_USEC), "µs");
         assert_eq!(spatial_unit_symbol(UNITS_METER), "m");
+    }
+
+    #[test]
+    fn rgb24_datatype_reports_int8_like_java_fallthrough() {
+        let mut buf = synthetic_header(0);
+        // datatype = 128 (RGB24), bitpix = 24.
+        buf[70..72].copy_from_slice(&128i16.to_le_bytes());
+        buf[72..74].copy_from_slice(&24i16.to_le_bytes());
+
+        let hdr = parse_header(&buf).unwrap();
+        let meta = build_metadata(&hdr).unwrap();
+
+        assert_eq!(meta.pixel_type, PixelType::Int8);
+        assert_eq!(meta.size_c, 3);
+        assert!(meta.is_rgb);
+        assert!(meta.is_interleaved);
     }
 }

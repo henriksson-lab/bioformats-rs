@@ -70,7 +70,7 @@ impl FormatReader for JpegReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "jpe"))
             .unwrap_or(false)
     }
 

@@ -278,7 +278,8 @@ impl DcimgReader {
         if self.version == DCIMG_VERSION_0 {
             if self.four_pixel_correction_in_footer {
                 // TODO (Java): Why do we need the +1?
-                return (self.four_pixel_offset_in_frame / self.bytes_per_row.max(1) as u64) as usize
+                return (self.four_pixel_offset_in_frame / self.bytes_per_row.max(1) as u64)
+                    as usize
                     + 1;
             } else {
                 return size_y.saturating_sub(1);

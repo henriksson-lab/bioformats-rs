@@ -207,10 +207,10 @@ impl FormatReader for PcxReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        if header.len() < 2 {
+        if header.is_empty() {
             return false;
         }
-        header[0] == 0x0A && matches!(header[1], 0 | 2 | 3 | 5)
+        header[0] == 0x0A
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {

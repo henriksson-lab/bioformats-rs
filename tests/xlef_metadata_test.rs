@@ -1,5 +1,7 @@
 use bioformats::common::metadata::MetadataValue;
+use bioformats::common::pixel_type::PixelType;
 use bioformats::formats::flim2::XlefReader;
+use bioformats::formats::leica_lms::{image_metadata_from_xlif, XlifDocument};
 use bioformats::{FormatReader, OmeAnnotation, OmeShape};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +62,31 @@ fn write_one_pixel_bmp(path: &std::path::Path, red: u8, green: u8, blue: u8) {
     data.extend_from_slice(&0u32.to_le_bytes());
     data.extend_from_slice(&[blue, green, red, 0]);
     std::fs::write(path, data).unwrap();
+}
+
+#[test]
+fn xlef_lms_four_byte_x_stride_maps_to_float_like_java() {
+    let lms = temp_path("float32_image.xlif");
+    std::fs::write(
+        &lms,
+        r#"<XLIF><Element Name="Float scan"><Data><Image Name="Float Image">
+<ImageDescription>
+<Channels><ChannelDescription BytesInc="0"/></Channels>
+<Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="2" BytesInc="4"/>
+<DimensionDescription DimID="2" NumberOfElements="2" BytesInc="8"/>
+</Dimensions>
+</ImageDescription>
+</Image></Data></Element></XLIF>"#,
+    )
+    .unwrap();
+
+    let xlif = XlifDocument::new(&lms).unwrap();
+    let meta = image_metadata_from_xlif(&xlif).unwrap();
+    assert_eq!(meta.pixel_type, PixelType::Float32);
+    assert_eq!(meta.bits_per_pixel, 32);
+
+    let _ = std::fs::remove_file(lms);
 }
 
 #[test]

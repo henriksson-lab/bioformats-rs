@@ -168,7 +168,9 @@ impl FormatWriter for V3DrawWriter {
             .max(1)
             .checked_mul(effective_c)
             .and_then(|v| v.checked_mul(meta.size_t.max(1)))
-            .ok_or_else(|| BioFormatsError::Format("V3Draw writer: plane count overflows".into()))?;
+            .ok_or_else(|| {
+                BioFormatsError::Format("V3Draw writer: plane count overflows".into())
+            })?;
         self.path = Some(path.to_path_buf());
         self.planes = (0..count as usize).map(|_| None).collect();
         Ok(())
@@ -198,10 +200,8 @@ impl FormatWriter for V3DrawWriter {
         // Reorder the incoming plane (input dimension order) to the writer's
         // XYZCT output order, exactly as the Java does with getZCTCoords +
         // getIndex.
-        let (z, c, t) =
-            get_zct_coords(meta.dimension_order, size_z, size_c, size_t, plane_index);
-        let real_index =
-            get_index(OUTPUT_ORDER, size_z, size_c, size_t, z, c, t) as usize;
+        let (z, c, t) = get_zct_coords(meta.dimension_order, size_z, size_c, size_t, plane_index);
+        let real_index = get_index(OUTPUT_ORDER, size_z, size_c, size_t, z, c, t) as usize;
 
         match self.planes.get_mut(real_index) {
             Some(slot) => *slot = Some(data.to_vec()),
@@ -232,15 +232,9 @@ impl FormatWriter for V3DrawWriter {
         let bigendian = !meta.is_little_endian;
 
         // Vaa3D xyzct dimensions: layer = Z*T aggregate, color = C*rgbChannels.
-        let sz: [u32; 4] = [
-            size_x,
-            size_y,
-            size_z * size_t,
-            size_c * rgb_channels,
-        ];
+        let sz: [u32; 4] = [size_x, size_y, size_z * size_t, size_c * rgb_channels];
 
-        let plane_size =
-            size_x as u64 * size_y as u64 * bytes_per_pixel * rgb_channels as u64;
+        let plane_size = size_x as u64 * size_y as u64 * bytes_per_pixel * rgb_channels as u64;
 
         let mut f = File::create(&path).map_err(BioFormatsError::Io)?;
 
@@ -275,8 +269,10 @@ impl FormatWriter for V3DrawWriter {
                     "V3Draw writer: missing plane at output index {real_index}"
                 ))
             })?;
-            f.seek(SeekFrom::Start(plane_size * real_index as u64 + PIXEL_OFFSET))
-                .map_err(BioFormatsError::Io)?;
+            f.seek(SeekFrom::Start(
+                plane_size * real_index as u64 + PIXEL_OFFSET,
+            ))
+            .map_err(BioFormatsError::Io)?;
             f.write_all(buf).map_err(BioFormatsError::Io)?;
         }
 

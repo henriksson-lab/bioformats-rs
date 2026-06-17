@@ -618,11 +618,7 @@ fn parse_image_metadata_lv(data: &[u8]) -> Option<ImageMetadataLv> {
     // strip_string equivalent: drop trailing NUL units. Java's
     // DataTools.stripString trims the string at the first embedded null.
     fn strip_string(units: &[u16]) -> String {
-        let trimmed: Vec<u16> = units
-            .iter()
-            .copied()
-            .take_while(|&u| u != 0)
-            .collect();
+        let trimmed: Vec<u16> = units.iter().copied().take_while(|&u| u != 0).collect();
         String::from_utf16_lossy(&trimmed)
     }
     fn read_i32(d: &[u8], p: usize) -> Option<i32> {
@@ -1011,7 +1007,10 @@ fn nd2_xml_item_list_f64(xml: &str, tag: &str) -> Vec<f64> {
                     .map(|e| body[item_content..item_content + e].trim().to_string())
             }
         });
-        if let Some(v) = value.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()) {
+        if let Some(v) = value
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+        {
             items.push(v);
         }
         cursor = item_pos + item_gt + 1;
@@ -2625,10 +2624,7 @@ impl FormatReader for Nd2Reader {
         // with "ImageMetadat" is walked. We scan chunks in their natural order and
         // stop at the first that yields a processed LV experiment.
         let mut image_metadata_lv = ImageMetadataLv::default();
-        for mc in chunks
-            .iter()
-            .filter(|c| c.name.starts_with("ImageMetadat"))
-        {
+        for mc in chunks.iter().filter(|c| c.name.starts_with("ImageMetadat")) {
             if image_metadata_lv.processed {
                 break;
             }
@@ -3169,68 +3165,68 @@ impl FormatReader for Nd2Reader {
             );
         } else if !image_metadata_lv.processed {
             if let Some(position_count) = loop_series_count.filter(|&count| count > 1) {
-            let position_count = position_count as usize;
-            if image_count as usize == position_count {
-                // Java exposes simple XY-position loops as separate series. The
-                // general ImageDataSeq mapping is index/dimension-order based;
-                // only split the unambiguous one-frame-per-position case here.
-                series_count = position_count;
-                series_image_count = 1;
-                series_size_z = 1;
-                series_size_t = 1;
-                series_image_chunks = image_chunks.iter().map(|&chunk| vec![chunk]).collect();
-                series_plane_offsets = (0..position_count).collect();
-                series_source_planes = (0..position_count).map(|plane| vec![plane]).collect();
-                series_handling = "split_xy_positions_one_plane_each";
-            } else if image_count as usize % position_count == 0 {
-                let planes_per_position = image_count as usize / position_count;
-                let expected_planes_per_position = size_z as usize * size_t as usize;
-                if expected_planes_per_position == planes_per_position {
-                    let (layout, source_planes, layout_source) = nd2_choose_xy_position_layout(
-                        position_count,
-                        planes_per_position,
-                        size_z,
-                        &plane_position_z,
-                        &loop_descriptors,
-                    );
+                let position_count = position_count as usize;
+                if image_count as usize == position_count {
+                    // Java exposes simple XY-position loops as separate series. The
+                    // general ImageDataSeq mapping is index/dimension-order based;
+                    // only split the unambiguous one-frame-per-position case here.
                     series_count = position_count;
-                    series_image_count = planes_per_position as u32;
-                    series_source_planes = source_planes;
-                    series_image_chunks = (0..position_count)
-                        .map(|series| {
-                            series_source_planes[series]
-                                .iter()
-                                .map(|&plane| image_chunks[plane])
-                                .collect::<Vec<_>>()
-                        })
-                        .collect();
-                    series_plane_offsets = series_source_planes
-                        .iter()
-                        .map(|planes| planes.first().copied().unwrap_or(0))
-                        .collect();
-                    series_metadata.insert(
-                        "nd2_loop_series_candidate_layouts".into(),
-                        MetadataValue::String("interleaved,contiguous".into()),
-                    );
-                    series_metadata.insert(
-                        "nd2_loop_series_assumed_layout".into(),
-                        MetadataValue::String(layout.into()),
-                    );
-                    series_metadata.insert(
-                        "nd2_loop_series_layout_source".into(),
-                        MetadataValue::String(layout_source.into()),
-                    );
-                    series_handling = if layout == "contiguous" {
-                        "split_xy_positions_contiguous_full_series"
+                    series_image_count = 1;
+                    series_size_z = 1;
+                    series_size_t = 1;
+                    series_image_chunks = image_chunks.iter().map(|&chunk| vec![chunk]).collect();
+                    series_plane_offsets = (0..position_count).collect();
+                    series_source_planes = (0..position_count).map(|plane| vec![plane]).collect();
+                    series_handling = "split_xy_positions_one_plane_each";
+                } else if image_count as usize % position_count == 0 {
+                    let planes_per_position = image_count as usize / position_count;
+                    let expected_planes_per_position = size_z as usize * size_t as usize;
+                    if expected_planes_per_position == planes_per_position {
+                        let (layout, source_planes, layout_source) = nd2_choose_xy_position_layout(
+                            position_count,
+                            planes_per_position,
+                            size_z,
+                            &plane_position_z,
+                            &loop_descriptors,
+                        );
+                        series_count = position_count;
+                        series_image_count = planes_per_position as u32;
+                        series_source_planes = source_planes;
+                        series_image_chunks = (0..position_count)
+                            .map(|series| {
+                                series_source_planes[series]
+                                    .iter()
+                                    .map(|&plane| image_chunks[plane])
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+                        series_plane_offsets = series_source_planes
+                            .iter()
+                            .map(|planes| planes.first().copied().unwrap_or(0))
+                            .collect();
+                        series_metadata.insert(
+                            "nd2_loop_series_candidate_layouts".into(),
+                            MetadataValue::String("interleaved,contiguous".into()),
+                        );
+                        series_metadata.insert(
+                            "nd2_loop_series_assumed_layout".into(),
+                            MetadataValue::String(layout.into()),
+                        );
+                        series_metadata.insert(
+                            "nd2_loop_series_layout_source".into(),
+                            MetadataValue::String(layout_source.into()),
+                        );
+                        series_handling = if layout == "contiguous" {
+                            "split_xy_positions_contiguous_full_series"
+                        } else {
+                            "split_xy_positions_interleaved_full_series"
+                        };
                     } else {
-                        "split_xy_positions_interleaved_full_series"
-                    };
-                } else {
+                        series_handling = "unsupported_multi_position_layout_kept_flat";
+                    }
+                } else if image_count > 0 {
                     series_handling = "unsupported_multi_position_layout_kept_flat";
                 }
-            } else if image_count > 0 {
-                series_handling = "unsupported_multi_position_layout_kept_flat";
-            }
             }
         }
 
@@ -3326,10 +3322,7 @@ impl FormatReader for Nd2Reader {
             );
         }
         if let Some(ri) = self.refractive_index {
-            series_metadata.insert(
-                "nd2_refractive_index".into(),
-                MetadataValue::Float(ri),
-            );
+            series_metadata.insert("nd2_refractive_index".into(), MetadataValue::Float(ri));
         }
         if let Some(na) = self.lens_na {
             series_metadata.insert("nd2_objective_na".into(), MetadataValue::Float(na));
@@ -3648,13 +3641,14 @@ impl FormatReader for Nd2Reader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::ome_metadata::{OmeInstrument, OmeObjective, OmeMetadata, OmePlane};
+        use crate::common::ome_metadata::{OmeInstrument, OmeMetadata, OmeObjective, OmePlane};
         let meta = self.meta.get(self.current_series)?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
 
         // Objective (lensNA / objectiveMag / objectiveModel) → OME Objective,
         // mirroring ND2Reader.populateMetadataStore:2569-2585.
-        if self.lens_na.is_some() || self.objective_mag.is_some() || self.objective_model.is_some() {
+        if self.lens_na.is_some() || self.objective_mag.is_some() || self.objective_model.is_some()
+        {
             let instrument = OmeInstrument {
                 objectives: vec![OmeObjective {
                     calibrated_magnification: self.objective_mag,

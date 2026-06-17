@@ -482,7 +482,8 @@ theAuxSerializedDataTablesSize: 0
         Some(MetadataValue::String(value)) if value == "GFP"
     ));
     assert!(matches!(
-        meta.series_metadata.get("slidebook7.channel.0.exposure_time"),
+        meta.series_metadata
+            .get("slidebook7.channel.0.exposure_time"),
         Some(MetadataValue::Int(75))
     ));
     assert!(matches!(

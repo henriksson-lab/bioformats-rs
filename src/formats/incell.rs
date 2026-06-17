@@ -438,10 +438,12 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         m.refractive = attr_f64(e, "refractive_index");
                         if let Some(objective) = attr_val(e, "objective_name") {
                             let tokens: Vec<&str> = objective.split('_').collect();
-                            m.objective_manufacturer =
-                                tokens.first().map(|s| s.to_string());
+                            m.objective_manufacturer = tokens.first().map(|s| s.to_string());
                             m.objective_correction = Some(
-                                tokens.get(2).map(|s| s.to_string()).unwrap_or_else(|| "Other".to_string()),
+                                tokens
+                                    .get(2)
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| "Other".to_string()),
                             );
                         }
                     }
@@ -784,7 +786,10 @@ impl InCellReader {
             "totalChannels".to_string(),
             MetadataValue::Int(m.total_channels as i64),
         ));
-        common_meta.push(("variableZ".to_string(), MetadataValue::String(m.variable_z.to_string())));
+        common_meta.push((
+            "variableZ".to_string(),
+            MetadataValue::String(m.variable_z.to_string()),
+        ));
         if let Some(v) = m.refractive {
             common_meta.push(("refractiveIndex".to_string(), MetadataValue::Float(v)));
         }
@@ -798,16 +803,25 @@ impl InCellReader {
             common_meta.push(("binning".to_string(), MetadataValue::String(s.clone())));
         }
         if let Some(s) = &m.detector_model {
-            common_meta.push(("detectorModel".to_string(), MetadataValue::String(s.clone())));
+            common_meta.push((
+                "detectorModel".to_string(),
+                MetadataValue::String(s.clone()),
+            ));
         }
         if let Some(s) = &m.creation_date {
             common_meta.push(("creationDate".to_string(), MetadataValue::String(s.clone())));
         }
         for (i, f) in m.ex_filters.iter().enumerate() {
-            common_meta.push((format!("excitationFilter {i}"), MetadataValue::String(f.clone())));
+            common_meta.push((
+                format!("excitationFilter {i}"),
+                MetadataValue::String(f.clone()),
+            ));
         }
         for (i, f) in m.em_filters.iter().enumerate() {
-            common_meta.push((format!("emissionFilter {i}"), MetadataValue::String(f.clone())));
+            common_meta.push((
+                format!("emissionFilter {i}"),
+                MetadataValue::String(f.clone()),
+            ));
         }
 
         // Build per-series metadata and the flat plane lookup.
@@ -1139,8 +1153,7 @@ impl FormatReader for InCellReader {
         let has_objective = h.nominal_magnification.is_some() || h.lens_na.is_some();
         // Java always creates a Detector and sets DetectorSettings (gain/binning)
         // per channel; surface a detector when any detector data is present.
-        let has_detector =
-            h.detector_model.is_some() || h.gain.is_some() || h.bin.is_some();
+        let has_detector = h.detector_model.is_some() || h.gain.is_some() || h.bin.is_some();
         let has_instrument = has_objective || has_detector;
         let instruments = if has_instrument {
             let objectives = if has_objective {

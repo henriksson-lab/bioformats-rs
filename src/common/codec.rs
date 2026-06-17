@@ -233,6 +233,13 @@ fn decode_image_memory(data: &[u8], format: image::ImageFormat) -> Result<Vec<u8
 
 /// Decompress JPEG 2000 data (JP2 or J2K codestream).
 pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
+    decompress_jpeg2000_with_endianness(data, true)
+}
+
+/// Decompress JPEG 2000 data, emitting multi-byte samples in the requested byte
+/// order. TIFF callers pass the IFD endianness; standalone callers keep the
+/// historical little-endian output through [`decompress_jpeg2000`].
+pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> Result<Vec<u8>> {
     use jpeg2k::Image as J2kImage;
     let image = J2kImage::from_bytes(data)
         .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e}")))?;
@@ -290,9 +297,13 @@ pub fn decompress_jpeg2000(data: &[u8]) -> Result<Vec<u8>> {
         for x in 0..width {
             for c in 0..n_components {
                 let val = components[c].data()[y * width + x];
-                // Take the low `bps` bytes of the little-endian i32 encoding.
-                let bytes = val.to_le_bytes();
-                out.extend_from_slice(&bytes[..bps]);
+                if little_endian {
+                    let bytes = val.to_le_bytes();
+                    out.extend_from_slice(&bytes[..bps]);
+                } else {
+                    let bytes = val.to_be_bytes();
+                    out.extend_from_slice(&bytes[4 - bps..]);
+                }
             }
         }
     }
@@ -440,7 +451,7 @@ pub fn compress_jpeg2000(
         params.cp_disto_alloc = 1;
         params.irreversible = 0;
         params.cod_format = 1; // JP2
-        // Number of resolution levels must satisfy 2^(numres-1) <= min(w, h).
+                               // Number of resolution levels must satisfy 2^(numres-1) <= min(w, h).
         let min_dim = w.min(h) as i32;
         let mut numres = params.numresolution;
         while numres > 1 && (1i32 << (numres - 1)) > min_dim {
@@ -518,20 +529,10 @@ pub fn decompress_jpegxr(data: &[u8]) -> Result<Vec<u8>> {
         .get_pixel_format()
         .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR format: {e}")))?;
 
-    // Determine bytes per pixel from the pixel format
-    let bpp: usize = match format {
-        jpegxr::PixelFormat::PixelFormat8bppGray => 1,
-        jpegxr::PixelFormat::PixelFormat16bppGray => 2,
-        jpegxr::PixelFormat::PixelFormat32bppGrayFloat => 4,
-        jpegxr::PixelFormat::PixelFormat24bppRGB => 3,
-        jpegxr::PixelFormat::PixelFormat24bppBGR => 3,
-        jpegxr::PixelFormat::PixelFormat32bppBGRA => 4,
-        jpegxr::PixelFormat::PixelFormat32bppRGBA => 4,
-        jpegxr::PixelFormat::PixelFormat48bppRGB => 6,
-        jpegxr::PixelFormat::PixelFormat64bppRGBA => 8,
-        _ => 3, // fallback: assume 3 bytes per pixel
-    };
-    let row_bytes = width as usize * bpp;
+    let layout = jpegxr_layout(format)?;
+    let row_bytes = layout
+        .row_bytes(width as usize)
+        .ok_or_else(|| BioFormatsError::Codec("JPEG-XR decoded row is too large".into()))?;
     let stride = (row_bytes + 3) & !3; // 4-byte aligned
     let mut buf = vec![0u8; stride * height as usize];
     decoder
@@ -544,10 +545,116 @@ pub fn decompress_jpegxr(data: &[u8]) -> Result<Vec<u8>> {
         for y in 0..height as usize {
             out.extend_from_slice(&buf[y * stride..y * stride + row_bytes]);
         }
+        normalize_jpegxr_output(&mut out, layout);
         Ok(out)
     } else {
+        normalize_jpegxr_output(&mut buf, layout);
         Ok(buf)
     }
+}
+
+#[cfg(feature = "jpegxr")]
+fn jpegxr_layout(format: jpegxr::PixelFormat) -> Result<JpegxrPixelLayout> {
+    use jpegxr::PixelFormat::*;
+
+    let layout = match format {
+        PixelFormatBlackWhite => JpegxrPixelLayout::Other { bits_per_pixel: 1 },
+        PixelFormat8bppGray => JpegxrPixelLayout::Other { bits_per_pixel: 8 },
+        PixelFormat16bppRGB555
+        | PixelFormat16bppRGB565
+        | PixelFormat16bppGray
+        | PixelFormat16bppGrayFixedPoint
+        | PixelFormat16bppGrayHalf
+        | PixelFormat16bppYCC422
+        | PixelFormat16bpp48bppYCC444FixedPoint => JpegxrPixelLayout::Other { bits_per_pixel: 16 },
+        PixelFormat24bppBGR => JpegxrPixelLayout::Bgr8,
+        PixelFormat24bppRGB | PixelFormat24bpp3Channels | PixelFormat24bppYCC444 => {
+            JpegxrPixelLayout::Other { bits_per_pixel: 24 }
+        }
+        PixelFormat32bppBGR => JpegxrPixelLayout::Bgrx8,
+        PixelFormat32bppBGRA | PixelFormat32bppPBGRA => JpegxrPixelLayout::Bgra8,
+        PixelFormat32bppGrayFloat
+        | PixelFormat32bppRGB
+        | PixelFormat32bppRGBA
+        | PixelFormat32bppPRGBA
+        | PixelFormat32bppRGB101010
+        | PixelFormat32bpp
+        | PixelFormat32bppRGBE
+        | PixelFormat32bppGrayFixedPoint
+        | PixelFormat32bpp4Channels
+        | PixelFormat32bpp3ChannelsAlpha
+        | PixelFormat32bppYCC422
+        | PixelFormat32bppYCC444Alpha
+        | PixelFormat32bppCMYKDIRECT => JpegxrPixelLayout::Other { bits_per_pixel: 32 },
+        PixelFormat40bpp5Channels
+        | PixelFormat40bppCMYKAlpha
+        | PixelFormat40bpp4ChannelsAlpha
+        | PixelFormat40bppYCC444Alpha
+        | PixelFormat40bppCMYKDIRECTAlpha => JpegxrPixelLayout::Other { bits_per_pixel: 40 },
+        PixelFormat48bppRGBFixedPoint
+        | PixelFormat48bppRGB
+        | PixelFormat48bppRGBHalf
+        | PixelFormat48bpp6Channels
+        | PixelFormat48bpp3Channels
+        | PixelFormat48bpp5ChannelsAlpha
+        | PixelFormat48bppYCC444
+        | PixelFormat48bppYCC422Alpha => JpegxrPixelLayout::Other { bits_per_pixel: 48 },
+        PixelFormat56bpp7Channels | PixelFormat56bpp6ChannelsAlpha => {
+            JpegxrPixelLayout::Other { bits_per_pixel: 56 }
+        }
+        PixelFormat64bppRGBA
+        | PixelFormat64bppPRGBA
+        | PixelFormat64bppRGBAFixedPoint
+        | PixelFormat64bppRGBFixedPoint
+        | PixelFormat64bppRGBAHalf
+        | PixelFormat64bppRGBHalf
+        | PixelFormat64bppCMYK
+        | PixelFormat64bpp8Channels
+        | PixelFormat64bpp4Channels
+        | PixelFormat64bpp7ChannelsAlpha
+        | PixelFormat64bpp3ChannelsAlpha
+        | PixelFormat64bppYCC444Alpha
+        | PixelFormat64bppYCC444AlphaFixedPoint
+        | PixelFormat64bppCMYKDIRECT => JpegxrPixelLayout::Other { bits_per_pixel: 64 },
+        PixelFormat72bpp8ChannelsAlpha => JpegxrPixelLayout::Other { bits_per_pixel: 72 },
+        PixelFormat80bpp5Channels
+        | PixelFormat80bppCMYKAlpha
+        | PixelFormat80bpp4ChannelsAlpha
+        | PixelFormat80bppCMYKDIRECTAlpha => JpegxrPixelLayout::Other { bits_per_pixel: 80 },
+        PixelFormat96bppRGBFixedPoint
+        | PixelFormat96bppRGBFloat
+        | PixelFormat96bpp6Channels
+        | PixelFormat96bpp5ChannelsAlpha => JpegxrPixelLayout::Other { bits_per_pixel: 96 },
+        PixelFormat112bpp7Channels | PixelFormat112bpp6ChannelsAlpha => JpegxrPixelLayout::Other {
+            bits_per_pixel: 112,
+        },
+        PixelFormat128bppRGBAFloat
+        | PixelFormat128bppPRGBAFloat
+        | PixelFormat128bppRGBFloat
+        | PixelFormat128bppRGBAFixedPoint
+        | PixelFormat128bppRGBFixedPoint
+        | PixelFormat128bpp8Channels
+        | PixelFormat128bpp7ChannelsAlpha => JpegxrPixelLayout::Other {
+            bits_per_pixel: 128,
+        },
+        PixelFormat144bpp8ChannelsAlpha => JpegxrPixelLayout::Other {
+            bits_per_pixel: 144,
+        },
+        PixelFormat12bppYCC420 => JpegxrPixelLayout::Other { bits_per_pixel: 12 },
+        PixelFormat20bppYCC422 | PixelFormat20bppYCC420Alpha => {
+            JpegxrPixelLayout::Other { bits_per_pixel: 20 }
+        }
+        PixelFormat24bppYCC422Alpha => JpegxrPixelLayout::Other { bits_per_pixel: 24 },
+        PixelFormat30bppYCC444 | PixelFormat30bppYCC422Alpha => {
+            JpegxrPixelLayout::Other { bits_per_pixel: 30 }
+        }
+        PixelFormatDontCare => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "JPEG-XR pixel format {format:?} does not declare a usable byte depth"
+            )));
+        }
+    };
+    Ok(layout)
 }
 
 /// Placeholder for JPEG-XR when the feature is not enabled.
@@ -556,6 +663,58 @@ pub fn decompress_jpegxr(_data: &[u8]) -> Result<Vec<u8>> {
     Err(BioFormatsError::UnsupportedFormat(
         "JPEG-XR support requires the 'jpegxr' feature: cargo build --features jpegxr".into(),
     ))
+}
+
+#[cfg(any(feature = "jpegxr", test))]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JpegxrPixelLayout {
+    Bgr8,
+    Bgrx8,
+    Bgra8,
+    Other { bits_per_pixel: usize },
+}
+
+#[cfg(any(feature = "jpegxr", test))]
+#[allow(dead_code)]
+impl JpegxrPixelLayout {
+    fn bits_per_pixel(self) -> usize {
+        match self {
+            JpegxrPixelLayout::Bgr8 => 24,
+            JpegxrPixelLayout::Bgrx8 => 32,
+            JpegxrPixelLayout::Bgra8 => 32,
+            JpegxrPixelLayout::Other { bits_per_pixel } => bits_per_pixel,
+        }
+    }
+
+    fn row_bytes(self, width: usize) -> Option<usize> {
+        width
+            .checked_mul(self.bits_per_pixel())?
+            .checked_add(7)
+            .map(|bits| bits / 8)
+    }
+}
+
+#[cfg(any(feature = "jpegxr", test))]
+fn normalize_jpegxr_output(buf: &mut [u8], layout: JpegxrPixelLayout) {
+    match layout {
+        JpegxrPixelLayout::Bgr8 => {
+            for px in buf.chunks_exact_mut(3) {
+                px.swap(0, 2);
+            }
+        }
+        JpegxrPixelLayout::Bgrx8 => {
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        JpegxrPixelLayout::Bgra8 => {
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        JpegxrPixelLayout::Other { .. } => {}
+    }
 }
 
 // ---- CCITT fax compression ----
@@ -2899,14 +3058,12 @@ mod tests {
 
         let mut pos = 0usize;
         let mut decoded = Vec::new();
-        let (out_a, consumed_a) =
-            decompress_lzo_with_consumed(&data[pos..]).expect("first block");
+        let (out_a, consumed_a) = decompress_lzo_with_consumed(&data[pos..]).expect("first block");
         decoded.extend_from_slice(&out_a);
         assert_eq!(consumed_a, block_a.len());
         pos += consumed_a + trailer.len(); // mirror Java's skipBytes(4)
 
-        let (out_b, consumed_b) =
-            decompress_lzo_with_consumed(&data[pos..]).expect("second block");
+        let (out_b, consumed_b) = decompress_lzo_with_consumed(&data[pos..]).expect("second block");
         decoded.extend_from_slice(&out_b);
         assert_eq!(consumed_b, block_b.len());
 
@@ -3286,6 +3443,55 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read JP2 back");
         let decoded = decompress_jpeg2000(&bytes).expect("decode JP2");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(decoded, pixels, "lossless 16-bit grayscale JP2 must round-trip");
+        assert_eq!(
+            decoded, pixels,
+            "lossless 16-bit grayscale JP2 must round-trip"
+        );
+    }
+
+    #[cfg(feature = "jpeg2000-write")]
+    #[test]
+    fn jpeg2000_decode_can_emit_big_endian_samples() {
+        let w = 4u32;
+        let h = 3u32;
+        let values: Vec<u16> = (0..(w * h)).map(|i| 0x0100u16 + i as u16).collect();
+        let pixels: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let path = std::env::temp_dir().join(format!("bf_jp2_be16_{}.jp2", std::process::id()));
+        compress_jpeg2000(&pixels, w, h, 1, 16, false, &path).expect("encode gray16 JP2");
+        let bytes = std::fs::read(&path).expect("read JP2 back");
+        let decoded = decompress_jpeg2000_with_endianness(&bytes, false).expect("decode JP2 as BE");
+        let _ = std::fs::remove_file(&path);
+        let expected: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn jpegxr_bgr_and_bgra_are_normalized_to_rgb_order() {
+        let mut bgr = vec![1, 2, 3, 4, 5, 6];
+        normalize_jpegxr_output(&mut bgr, JpegxrPixelLayout::Bgr8);
+        assert_eq!(bgr, vec![3, 2, 1, 6, 5, 4]);
+
+        let mut bgrx = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        normalize_jpegxr_output(&mut bgrx, JpegxrPixelLayout::Bgrx8);
+        assert_eq!(bgrx, vec![3, 2, 1, 4, 7, 6, 5, 8]);
+
+        let mut bgra = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        normalize_jpegxr_output(&mut bgra, JpegxrPixelLayout::Bgra8);
+        assert_eq!(bgra, vec![3, 2, 1, 4, 7, 6, 5, 8]);
+    }
+
+    #[test]
+    fn jpegxr_row_size_uses_declared_bit_depth() {
+        assert_eq!(
+            JpegxrPixelLayout::Other {
+                bits_per_pixel: 128
+            }
+            .row_bytes(2),
+            Some(32)
+        );
+        assert_eq!(
+            JpegxrPixelLayout::Other { bits_per_pixel: 12 }.row_bytes(3),
+            Some(5)
+        );
     }
 }

@@ -169,8 +169,24 @@ impl DirEntry {
 #[derive(Debug, Clone)]
 struct CziResolution {
     r: i32,
+    scale_x: i32,
+    scale_y: i32,
     width: u32,
     height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CziResolutionKey {
+    r: i32,
+    scale_x: i32,
+    scale_y: i32,
+}
+
+impl CziResolutionKey {
+    fn sort_key(self) -> (i32, i32, i32, i32) {
+        let scale = self.scale_x.max(self.scale_y).max(1);
+        (scale, self.r, self.scale_x.max(1), self.scale_y.max(1))
+    }
 }
 
 /// One series corresponds to one combination of the CZI "extra" dimensions that
@@ -342,6 +358,9 @@ struct CziParsed {
     /// True when "R" acts as the rotation axis (folded into Z) rather than the
     /// pyramid-resolution selector.
     rotation_axis: bool,
+    /// Bio-Formats-style maxResolution; positive when reduced-resolution
+    /// pyramid data is present.
+    max_resolution: i32,
     /// True when PALM data was detected and split into two series by stored size.
     palm: bool,
 }
@@ -492,9 +511,10 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
     // to distinguish genuine rotation files from the pyramid repurposing of "R".
     let (mut min_rot, mut max_rot) = (i32::MAX, i32::MIN);
     let mut max_r_size = 0i32;
-    // Max X tile size observed at each R level, used to tell a downscaled pyramid
-    // (sizes differ across R) from a rotation axis (sizes equal across R).
-    let mut r_level_xsize: HashMap<i32, i32> = HashMap::new();
+    // Max stored X/Y tile size observed at each R level, used to tell a
+    // downscaled pyramid (stored sizes differ across R) from a rotation axis
+    // (stored sizes equal across R).
+    let mut r_level_stored_size: HashMap<i32, (i32, i32)> = HashMap::new();
     let (mut min_i, mut max_i) = (i32::MAX, i32::MIN);
     let (mut min_h, mut max_h) = (i32::MAX, i32::MIN);
 
@@ -555,10 +575,14 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
             min_rot = min_rot.min(start);
             max_rot = max_rot.max(start + size);
             max_r_size = max_r_size.max(size);
-            // Track the X tile size seen at each R level to detect downscaling.
-            let x_size = e.dim_size("X").max(0);
-            let cur = r_level_xsize.entry(start).or_insert(x_size);
-            *cur = (*cur).max(x_size);
+            // Track the stored X/Y tile size seen at each R level to detect
+            // downscaling. Java's pyramid signal is reduced stored X/Y, not only
+            // the presence of a distinct R start.
+            let x_size = e.dim_stored_size("X").max(0);
+            let y_size = e.dim_stored_size("Y").max(0);
+            let cur = r_level_stored_size.entry(start).or_insert((x_size, y_size));
+            cur.0 = cur.0.max(x_size);
+            cur.1 = cur.1.max(y_size);
         }
         if let Some(&(start, _)) = e.dims.get("S") {
             min_s = min_s.min(start);
@@ -612,15 +636,15 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
     //     no downscaling, so they are not a pyramid).
     // When R levels have differing X sizes, "R" is a downscaled pyramid and stays
     // the resolution selector.
-    let distinct_r_levels = r_level_xsize.len();
-    let all_r_same_xsize = {
-        let mut sizes = r_level_xsize.values().copied();
+    let distinct_r_levels = r_level_stored_size.len();
+    let all_r_same_stored_size = {
+        let mut sizes = r_level_stored_size.values().copied();
         match sizes.next() {
             Some(first) => sizes.all(|s| s == first),
             None => true,
         }
     };
-    let rotation_axis = max_r_size > 1 || (distinct_r_levels > 1 && all_r_same_xsize);
+    let rotation_axis = max_r_size > 1 || (distinct_r_levels > 1 && all_r_same_stored_size);
     if rotation_axis && max_rot != i32::MIN && min_rot != i32::MAX {
         c.rotations = (max_rot - min_rot).max(1);
         c.rotation_axis = true;
@@ -709,8 +733,15 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
     // The "R" dimension supplies discrete resolution levels in this crate's model,
     // UNLESS it is acting as a rotation axis (R.size > 1). In the rotation case the
     // R start indexes rotation (folded into Z), so there is a single resolution.
-    let max_resolution = if !c.rotation_axis && max_r != i32::MIN {
-        (max_r - 1).max(0)
+    let max_resolution = if !c.rotation_axis {
+        let mut keys: Vec<CziResolutionKey> = Vec::new();
+        for e in &entries {
+            let key = resolution_key(e, false);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        (keys.len() as i32 - 1).max(0)
     } else {
         0
     };
@@ -897,6 +928,8 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
             palm_size: None,
             resolutions: vec![CziResolution {
                 r: 0,
+                scale_x: 1,
+                scale_y: 1,
                 width: 0,
                 height: 0,
             }],
@@ -936,6 +969,8 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
                     palm_size: Some((sx, sy)),
                     resolutions: vec![CziResolution {
                         r: 0,
+                        scale_x: 1,
+                        scale_y: 1,
                         width: sx,
                         height: sy,
                     }],
@@ -967,6 +1002,7 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
         illuminations: c.illuminations,
         phases: c.phases,
         rotation_axis: c.rotation_axis,
+        max_resolution,
         palm,
     })
 }
@@ -1227,6 +1263,29 @@ impl DimCounts {
 /// Build the sorted resolution list for one series selection. Each "R" level
 /// becomes a resolution; the X/Y extent is the stitched bounding box of all
 /// subblocks matching the selection at that level (mosaic prestitching).
+fn resolution_scale(logical: i32, stored: i32) -> i32 {
+    if logical > 0 && stored > 0 && logical > stored {
+        (logical + stored - 1) / stored
+    } else {
+        1
+    }
+}
+
+fn resolution_key(e: &DirEntry, rotation_axis: bool) -> CziResolutionKey {
+    if rotation_axis {
+        return CziResolutionKey {
+            r: 0,
+            scale_x: 1,
+            scale_y: 1,
+        };
+    }
+    CziResolutionKey {
+        r: e.dim_start("R"),
+        scale_x: resolution_scale(e.dim_size("X"), e.dim_stored_size("X")),
+        scale_y: resolution_scale(e.dim_size("Y"), e.dim_stored_size("Y")),
+    }
+}
+
 fn compute_resolutions(
     entries: &[DirEntry],
     scene: Option<i32>,
@@ -1236,26 +1295,24 @@ fn compute_resolutions(
     _prestitched: bool,
     rotation_axis: bool,
 ) -> Vec<CziResolution> {
-    // R-level -> (min_col, min_row, max_x_end, max_y_end)
+    // Resolution key -> (min_col, min_row, max_x_end, max_y_end)
     //
     // The stitched extent is the bounding box of all subblocks in the selection;
     // this collapses to a single tile's size when there is only one tile, and to
     // the full mosaic span when there are several (ZeissCZIReader prestitching /
     // the calculateDimensions(s, true) min/max row-col logic at 1034-1076).
-    let mut buckets: HashMap<i32, (i64, i64, i64, i64)> = HashMap::new();
+    let mut buckets: HashMap<CziResolutionKey, (i64, i64, i64, i64)> = HashMap::new();
     for e in entries {
         if !entry_in_series(e, scene, acquisition, angle, mosaic) {
             continue;
         }
-        // When "R" is a rotation axis, its start indexes rotation (not resolution),
-        // so collapse every subblock into the single resolution bucket (R = 0).
-        let r = if rotation_axis { 0 } else { e.dim_start("R") };
-        let col = e.dim_start("X").max(0) as i64;
-        let row = e.dim_start("Y").max(0) as i64;
-        let x_size = e.dim_size("X").max(0) as i64;
-        let y_size = e.dim_size("Y").max(0) as i64;
+        let key = resolution_key(e, rotation_axis);
+        let col = (e.dim_start("X").max(0) / key.scale_x.max(1)) as i64;
+        let row = (e.dim_start("Y").max(0) / key.scale_y.max(1)) as i64;
+        let x_size = e.dim_stored_size("X").max(0) as i64;
+        let y_size = e.dim_stored_size("Y").max(0) as i64;
         let entry = buckets
-            .entry(r)
+            .entry(key)
             .or_insert((i64::MAX, i64::MAX, i64::MIN, i64::MIN));
         entry.0 = entry.0.min(col);
         entry.1 = entry.1.min(row);
@@ -1265,16 +1322,27 @@ fn compute_resolutions(
 
     let mut resolutions: Vec<CziResolution> = buckets
         .into_iter()
-        .map(|(r, (min_c, min_r, max_x, max_y))| CziResolution {
-            r,
+        .map(|(key, (min_c, min_r, max_x, max_y))| CziResolution {
+            r: key.r,
+            scale_x: key.scale_x.max(1),
+            scale_y: key.scale_y.max(1),
             width: (max_x - min_c).max(0) as u32,
             height: (max_y - min_r).max(0) as u32,
         })
         .collect();
-    resolutions.sort_by_key(|res| res.r);
+    resolutions.sort_by_key(|res| {
+        CziResolutionKey {
+            r: res.r,
+            scale_x: res.scale_x,
+            scale_y: res.scale_y,
+        }
+        .sort_key()
+    });
     if resolutions.is_empty() {
         resolutions.push(CziResolution {
             r: 0,
+            scale_x: 1,
+            scale_y: 1,
             width: 0,
             height: 0,
         });
@@ -1327,7 +1395,11 @@ fn decompress_subblock(
         }
         4 => {
             // JPEG-XR
-            crate::common::codec::decompress_jpegxr(data)
+            match crate::common::codec::decompress_jpegxr(data) {
+                Ok(decoded) => Ok(decoded),
+                Err(_) if data.len() == max_bytes => Ok(data.to_vec()),
+                Err(_) => Ok(vec![0; max_bytes]),
+            }
         }
         5 => {
             // Zstd
@@ -1504,12 +1576,6 @@ fn decompress_zstd_1(data: &[u8]) -> Result<Vec<u8>> {
     if !high_low_unpacking {
         return Ok(decoded);
     }
-    if decoded.len() % 2 != 0 {
-        return Err(BioFormatsError::InvalidData(
-            "CZI ZSTD_1 high/low decoded byte count is odd".into(),
-        ));
-    }
-
     let second_half = decoded.len() / 2;
     let mut out = vec![0; decoded.len()];
     for i in 0..decoded.len() {
@@ -1544,6 +1610,8 @@ pub struct ZeissCziReader {
     phases: u32,
     /// True when "R" is the rotation axis folded into Z (vs. pyramid resolution).
     rotation_axis: bool,
+    /// Bio-Formats-style maxResolution from dimension parsing.
+    max_resolution: i32,
     current_series: usize,
     current_resolution: usize,
 }
@@ -1563,6 +1631,7 @@ impl ZeissCziReader {
             illuminations: 1,
             phases: 1,
             rotation_axis: false,
+            max_resolution: 0,
             current_series: 0,
             current_resolution: 0,
         }
@@ -1589,7 +1658,13 @@ impl ZeissCziReader {
     fn matching_entries(&self, plane_index: u32) -> Option<Vec<DirEntry>> {
         let (z, c, t) = self.plane_zct(plane_index)?;
         let series = self.series.get(self.current_series)?;
-        let r = self.current_resolutions().get(self.current_resolution)?.r;
+        let res = self.current_resolutions().get(self.current_resolution)?;
+        let r = res.r;
+        let want_resolution_key = CziResolutionKey {
+            r: res.r,
+            scale_x: res.scale_x.max(1),
+            scale_y: res.scale_y.max(1),
+        };
 
         // Invert the modulo folding (ZeissCZIReader:2216-2223). The requested
         // expanded z/c/t decompose into the per-subblock coordinate plus the
@@ -1626,12 +1701,16 @@ impl ZeissCziReader {
         } else {
             r
         };
-        let match_r = |e: &DirEntry| -> bool {
-            if !e.has_dim("R") {
-                // Subblocks without an explicit R default to level/rotation 0.
-                want_r == 0
+        let match_resolution = |e: &DirEntry| -> bool {
+            if self.rotation_axis {
+                if !e.has_dim("R") {
+                    // Subblocks without an explicit R default to rotation 0.
+                    want_r == 0
+                } else {
+                    e.dim_start("R") == want_r
+                }
             } else {
-                e.dim_start("R") == want_r
+                resolution_key(e, false) == want_resolution_key
             }
         };
         // Illumination ("I") and phase ("H") sub-index selectors. Subblocks lacking
@@ -1649,7 +1728,7 @@ impl ZeissCziReader {
             .iter()
             .filter(|e| {
                 entry_in_series(e, series.scene, series.acquisition, series.angle, series.mosaic)
-                    && match_r(e)
+                    && match_resolution(e)
                     && (self.illuminations <= 1 || match_sub(e, "I", illum))
                     && (self.phases <= 1 || match_sub(e, "H", phase))
                     && e.matches_plane(z, c_with_offset, t)
@@ -1733,7 +1812,12 @@ impl ZeissCziReader {
         let tile_w = entry.dim_stored_size("X").max(0) as usize;
         let tile_h = entry.dim_stored_size("Y").max(0) as usize;
         let max_bytes = tile_w * tile_h * pixel_bytes;
-        decompress_subblock(&compressed, entry.compression, tile_w, tile_h, max_bytes)
+        match decompress_subblock(&compressed, entry.compression, tile_w, tile_h, max_bytes) {
+            Ok(decoded) => Ok(decoded),
+            Err(err) if entry.compression == 4 && compressed.len() == max_bytes => Ok(compressed),
+            Err(_err) if entry.compression == 4 => Ok(vec![0; max_bytes]),
+            Err(err) => Err(err),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1744,11 +1828,13 @@ impl ZeissCziReader {
         tile: &[u8],
         entry: &DirEntry,
         pixel_bytes: usize,
+        scale_x: i32,
+        scale_y: i32,
         off_x: i32,
         off_y: i32,
     ) -> Result<()> {
-        let tile_x = (entry.dim_start("X").max(0) - off_x).max(0) as u32;
-        let tile_y = (entry.dim_start("Y").max(0) - off_y).max(0) as u32;
+        let tile_x = ((entry.dim_start("X").max(0) / scale_x.max(1)) - off_x).max(0) as u32;
+        let tile_y = ((entry.dim_start("Y").max(0) / scale_y.max(1)) - off_y).max(0) as u32;
         let tile_w = entry.dim_stored_size("X").max(0) as u32;
         let tile_h = entry.dim_stored_size("Y").max(0) as u32;
         if tile_w > 0 && tile_x >= out_width {
@@ -1879,6 +1965,7 @@ impl FormatReader for ZeissCziReader {
         self.illuminations = parsed.illuminations.max(1) as u32;
         self.phases = parsed.phases.max(1) as u32;
         self.rotation_axis = parsed.rotation_axis;
+        self.max_resolution = parsed.max_resolution;
         self.current_series = 0;
         self.current_resolution = 0;
         self.meta_xml = parsed.meta_xml;
@@ -1899,6 +1986,7 @@ impl FormatReader for ZeissCziReader {
         self.illuminations = 1;
         self.phases = 1;
         self.rotation_axis = false;
+        self.max_resolution = 0;
         self.current_series = 0;
         self.current_resolution = 0;
         Ok(())
@@ -1937,22 +2025,33 @@ impl FormatReader for ZeissCziReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
-        let entries = self
-            .matching_entries(plane_index)
-            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let entries = self.matching_entries(plane_index).unwrap_or_default();
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let bps = meta.pixel_type.bytes_per_sample();
         let expected = meta.size_x as usize * meta.size_y as usize * self.packed_spp as usize * bps;
         let pixel_bytes = self.packed_spp as usize * bps;
-        let mut out = vec![0; expected];
+        let mut out = vec![czi_initial_plane_fill(meta, self.max_resolution); expected];
+        if entries.is_empty() {
+            return Ok(out);
+        }
+        let res = self
+            .current_resolutions()
+            .get(self.current_resolution)
+            .cloned();
+        let (scale_x, scale_y) = res
+            .map(|r| (r.scale_x.max(1), r.scale_y.max(1)))
+            .unwrap_or((1, 1));
 
         // Prestitching: normalize tile placement so the minimum tile col/row maps
         // to the stitched-image origin (ZeissCZIReader.openBytes:435-439). A tile
         // whose stored size already equals the full image is placed at (0,0).
         let (min_col, min_row) = if self.prestitched {
             entries.iter().fold((i32::MAX, i32::MAX), |(mc, mr), e| {
-                (mc.min(e.dim_start("X")), mr.min(e.dim_start("Y")))
+                (
+                    mc.min(e.dim_start("X") / scale_x),
+                    mr.min(e.dim_start("Y") / scale_y),
+                )
             })
         } else {
             (0, 0)
@@ -1966,13 +2065,16 @@ impl FormatReader for ZeissCziReader {
                 .checked_mul(tile_h)
                 .and_then(|n| n.checked_mul(pixel_bytes))
                 .ok_or_else(|| BioFormatsError::Format("CZI tile byte count overflows".into()))?;
-            let tile = Self::read_subblock(path, &entry, pixel_bytes)?;
+            let mut tile = Self::read_subblock(path, &entry, pixel_bytes)?;
             if tile.len() != tile_expected {
                 return Err(BioFormatsError::Format(format!(
                     "CZI decoded tile byte count {} does not match expected {}",
                     tile.len(),
                     tile_expected
                 )));
+            }
+            if czi_should_swap_bgr_to_rgb(meta, self.packed_spp as usize, entry.compression) {
+                swap_bgr_to_rgb(&mut tile, bps, self.packed_spp as usize);
             }
             // Place the tile at its normalized position. When a tile's stored size
             // already spans the whole stitched image, it sits at the origin.
@@ -1990,12 +2092,11 @@ impl FormatReader for ZeissCziReader {
                 &tile,
                 &entry,
                 pixel_bytes,
+                scale_x,
+                scale_y,
                 off_x,
                 off_y,
             )?;
-        }
-        if meta.is_rgb && self.packed_spp >= 3 {
-            swap_bgr_to_rgb(&mut out, bps, self.packed_spp as usize);
         }
         Ok(out)
     }
@@ -2083,6 +2184,22 @@ fn swap_bgr_to_rgb(buf: &mut [u8], bytes_per_sample: usize, samples_per_pixel: u
     }
 }
 
+fn czi_initial_plane_fill(meta: &ImageMetadata, max_resolution: i32) -> u8 {
+    if meta.is_rgb && max_resolution > 0 {
+        0xff
+    } else {
+        0
+    }
+}
+
+fn czi_should_swap_bgr_to_rgb(
+    meta: &ImageMetadata,
+    samples_per_pixel: usize,
+    compression: i32,
+) -> bool {
+    meta.is_rgb && samples_per_pixel >= 3 && compression != 4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2134,10 +2251,15 @@ mod tests {
     }
 
     fn dimension_entry(name: &str, start: i32, size: i32) -> [u8; 20] {
+        dimension_entry_stored(name, start, size, 0)
+    }
+
+    fn dimension_entry_stored(name: &str, start: i32, size: i32, stored_size: i32) -> [u8; 20] {
         let mut dim = [0; 20];
         dim[..name.len()].copy_from_slice(name.as_bytes());
         put_i32(&mut dim, 4, start);
         put_i32(&mut dim, 8, size);
+        put_i32(&mut dim, 16, stored_size);
         dim
     }
 
@@ -2253,6 +2375,33 @@ mod tests {
         entry[72..92].copy_from_slice(&dimension_entry("Z", z, 1));
         entry[92..112].copy_from_slice(&dimension_entry("C", c, 1));
         entry[112..132].copy_from_slice(&dimension_entry("R", 0, 1));
+        entry
+    }
+
+    fn directory_entry_stored_xy(
+        pixel_type: i32,
+        compression: i32,
+        x_start: i32,
+        y_start: i32,
+        x_size: i32,
+        y_size: i32,
+        x_stored: i32,
+        y_stored: i32,
+        r: i32,
+    ) -> Vec<u8> {
+        let mut entry = vec![0; 256];
+        put_i32(&mut entry, 2, pixel_type);
+        put_i32(&mut entry, 18, compression);
+        put_i32(&mut entry, 28, 4);
+        entry[32..52].copy_from_slice(&dimension_entry_stored("X", x_start, x_size, x_stored));
+        entry[52..72].copy_from_slice(&dimension_entry_stored("Y", y_start, y_size, y_stored));
+        entry[72..92].copy_from_slice(&dimension_entry("C", 0, 1));
+        entry[92..112].copy_from_slice(&dimension_entry("R", r, 1));
+        entry
+    }
+
+    fn with_compression(mut entry: Vec<u8>, compression: i32) -> Vec<u8> {
+        put_i32(&mut entry, 18, compression);
         entry
     }
 
@@ -2468,6 +2617,14 @@ mod tests {
     }
 
     #[test]
+    fn czi_zstd_1_high_low_odd_length_matches_java_unpacking() {
+        let payload = crate::common::codec::zstd_encode_all(b"\x11\x22\x33", 0).unwrap();
+        let mut wrapped = vec![3, 1, 1];
+        wrapped.extend_from_slice(&payload);
+        assert_eq!(decompress_zstd_1(&wrapped).unwrap(), vec![0x11, 0x22, 0x22]);
+    }
+
+    #[test]
     fn czi_directory_rejects_truncated_declared_entry() {
         let mut entry = directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0);
         entry.truncate(40);
@@ -2594,7 +2751,8 @@ mod tests {
         let entry = parse_dir_entry(&directory_entry_dims(0, 0, 0, 1, 0, 1, 1, 0));
         let mut out = vec![0u8; 1];
 
-        let err = ZeissCziReader::assemble_entry(&mut out, 1, 1, &[7], &entry, 1, 0, 0).unwrap_err();
+        let err = ZeissCziReader::assemble_entry(&mut out, 1, 1, &[7], &entry, 1, 1, 1, 0, 0)
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("tile X bounds exceed output plane"),
@@ -2650,6 +2808,141 @@ mod tests {
         assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 10]);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_detects_pyramid_from_reduced_stored_xy_without_r_start() {
+        let entries = vec![
+            (
+                directory_entry_stored_xy(0, 0, 0, 0, 4, 2, 4, 2, 0),
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            (
+                directory_entry_stored_xy(0, 0, 0, 0, 4, 2, 2, 1, 0),
+                vec![9, 10],
+            ),
+        ];
+        let path = write_synthetic_czi_entries("stored_xy_pyramid", entries);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 2));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        reader.set_resolution(1).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 10]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_sparse_logical_plane_returns_fill_buffer() {
+        let entries = vec![(directory_entry_dims(0, 0, 1, 0, 0, 2, 1, 0), vec![7, 8])];
+        let path = write_synthetic_czi_entries("sparse_logical_plane", entries);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 0]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![7, 8]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_jpegxr_fallback_uses_raw_data_when_length_matches() {
+        let entry = with_compression(directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0), 4);
+        let path = write_synthetic_czi_entries("jpegxr_raw_fallback", vec![(entry, vec![5, 6])]);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![5, 6]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_jpegxr_fallback_zero_fills_recoverable_block() {
+        let entry = with_compression(directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0), 4);
+        let path = write_synthetic_czi_entries("jpegxr_zero_fallback", vec![(entry, vec![5])]);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 0]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_rgb_pyramid_missing_tiles_are_white_filled() {
+        let entries = vec![
+            (directory_entry_dims(3, 0, 0, 0, 0, 6, 1, 0), vec![0; 18]),
+            (
+                directory_entry_dims(3, 0, 0, 0, 0, 2, 1, 1),
+                vec![1, 2, 3, 4, 5, 6],
+            ),
+            (
+                directory_entry_dims(3, 0, 0, 4, 0, 2, 1, 1),
+                vec![7, 8, 9, 10, 11, 12],
+            ),
+        ];
+        let path = write_synthetic_czi_entries("rgb_pyramid_sparse_white", entries);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.resolution_count(), 2);
+        reader.set_resolution(1).unwrap();
+        assert!(reader.metadata().is_rgb);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (6, 1));
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            vec![3, 2, 1, 6, 5, 4, 255, 255, 255, 255, 255, 255, 9, 8, 7, 12, 11, 10]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_rgb_non_pyramid_missing_tiles_are_black_filled() {
+        let entries = vec![
+            (
+                directory_entry_dims(3, 0, 0, 0, 0, 2, 1, 0),
+                vec![1, 2, 3, 4, 5, 6],
+            ),
+            (
+                directory_entry_dims(3, 0, 0, 4, 0, 2, 1, 0),
+                vec![7, 8, 9, 10, 11, 12],
+            ),
+        ];
+        let path = write_synthetic_czi_entries("rgb_sparse_black", entries);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.resolution_count(), 1);
+        assert!(reader.metadata().is_rgb);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (6, 1));
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            vec![3, 2, 1, 6, 5, 4, 0, 0, 0, 0, 0, 0, 9, 8, 7, 12, 11, 10]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_jpegxr_rgb_skips_bgr_swap() {
+        let mut meta = ImageMetadata {
+            is_rgb: true,
+            ..Default::default()
+        };
+
+        assert!(czi_should_swap_bgr_to_rgb(&meta, 3, 0));
+        assert!(!czi_should_swap_bgr_to_rgb(&meta, 3, 4));
+
+        meta.is_rgb = false;
+        assert!(!czi_should_swap_bgr_to_rgb(&meta, 3, 0));
     }
 
     #[test]

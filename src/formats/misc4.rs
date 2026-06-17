@@ -2231,10 +2231,7 @@ impl FormatReader for PciReader {
         // increment between the first two acquired planes.
         for i in 0..image_count {
             if let Some(t) = timestamps.get(&i) {
-                series_metadata.insert(
-                    format!("DeltaT {i}"),
-                    MetadataValue::Float(*t),
-                );
+                series_metadata.insert(format!("DeltaT {i}"), MetadataValue::Float(*t));
             }
         }
         if let (Some(first), Some(second)) = (timestamps.get(&1), timestamps.get(&2)) {
@@ -5217,8 +5214,8 @@ impl ObfReadState {
         let no = no as usize;
         for yy in y..y + h {
             for xx in x..x + w {
-                let source = lifetime_count * bps * ((yy as usize) * width + xx as usize)
-                    + no * bps;
+                let source =
+                    lifetime_count * bps * ((yy as usize) * width + xx as usize) + no * bps;
                 let dest = ((yy - y) as usize) * (w as usize) * bps + ((xx - x) as usize) * bps;
                 if source + bps <= whole.len() {
                     region[dest..dest + bps].copy_from_slice(&whole[source..source + bps]);
@@ -5445,8 +5442,7 @@ impl ObfReader {
                 let first_is_flim = !labels.is_empty() && obf_is_flim_label(&labels[0]);
                 if (label.ends_with('X') && size_x == 0) || (dimension == 1 && first_is_flim) {
                     size_x = sizes[dimension].max(0) as u32;
-                } else if (label.ends_with('Y') && size_y == 0)
-                    || (dimension == 2 && first_is_flim)
+                } else if (label.ends_with('Y') && size_y == 0) || (dimension == 2 && first_is_flim)
                 {
                     size_y = sizes[dimension].max(0) as u32;
                 } else if obf_is_flim_label(&label) {
@@ -5977,10 +5973,7 @@ mod pci_tests {
     #[test]
     fn cobol_date_converts_to_iso8601() {
         // COBOL epoch itself (date == 0 ms) is 1582-10-15T00:00:00.
-        assert_eq!(
-            PciReader::convert_cobol_date(0),
-            "1582-10-15T00:00:00"
-        );
+        assert_eq!(PciReader::convert_cobol_date(0), "1582-10-15T00:00:00");
         // The Unix epoch in COBOL milliseconds round-trips to 1970-01-01.
         let unix_epoch_in_cobol_ms = 12_219_292_800_000;
         assert_eq!(
@@ -6208,8 +6201,7 @@ impl FormatReader for MolecularImagingReader {
         // MetadataStore; capture them as named global metadata.
         if let Some(raw) = &date {
             if let Some(iso) = Self::format_date(raw) {
-                series_metadata
-                    .insert("Acquisition Date".to_string(), MetadataValue::String(iso));
+                series_metadata.insert("Acquisition Date".to_string(), MetadataValue::String(iso));
             }
         }
         if pixel_size_x > 0.0 {
@@ -6294,13 +6286,18 @@ impl FormatReader for MolecularImagingReader {
         // Java: in.seek(pixelOffset + no * getPlaneSize()).
         let offset = self
             .pixel_offset
-            .checked_add((plane_index as u64).checked_mul(n_bytes as u64).ok_or_else(
-                || BioFormatsError::Format("Molecular Imaging plane offset overflows".into()),
-            )?)
+            .checked_add(
+                (plane_index as u64)
+                    .checked_mul(n_bytes as u64)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("Molecular Imaging plane offset overflows".into())
+                    })?,
+            )
             .ok_or_else(|| {
                 BioFormatsError::Format("Molecular Imaging plane offset overflows".into())
             })?;
-        f.seek(SeekFrom::Start(offset)).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)

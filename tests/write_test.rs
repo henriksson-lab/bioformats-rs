@@ -209,7 +209,10 @@ fn tiff_round_trip_rgb8() {
 
     let data: Vec<u8> = (0u8..48).collect(); // 4×4×3
     let readback = round_trip("rgb8.tif", &meta, &data);
-    assert_eq!(readback, data);
+    let expected: Vec<u8> = (0..3)
+        .flat_map(|channel| data.chunks_exact(3).map(move |pixel| pixel[channel]))
+        .collect();
+    assert_eq!(readback, expected);
 }
 
 #[test]

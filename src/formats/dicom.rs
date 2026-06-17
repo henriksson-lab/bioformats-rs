@@ -86,6 +86,15 @@ struct DicomAttrs {
     content_date: Option<String>,
     /// (0008,0033) Content Time (DicomReader.time).
     content_time: Option<String>,
+    /// (0040,0551) Specimen ID, usually nested in Specimen Description Sequence.
+    specimen: Option<String>,
+    /// (0008,0030) Study Time, used by Java's WSI grouping fallback.
+    study_time: Option<String>,
+    /// Whole-slide image marker from Total Pixel Matrix dimensions.
+    wsi: bool,
+    total_pixel_matrix_columns: u32,
+    total_pixel_matrix_rows: u32,
+    tile_positions: Vec<(u32, u32)>,
     /// (0028,0030) Pixel Spacing column value, in mm (DicomReader.pixelSizeX).
     pixel_size_x: Option<f64>,
     /// (0028,0030) Pixel Spacing row value, in mm (DicomReader.pixelSizeY).
@@ -123,9 +132,6 @@ struct PaletteLut {
 
 #[derive(Clone)]
 struct LutChannel {
-    entries: usize,
-    first_mapped: i32,
-    bits_per_entry: u16,
     data: Vec<u16>,
 }
 
@@ -201,6 +207,7 @@ fn dicom_tag_info(group: u16, element: u16) -> Option<(&'static str, &'static st
         (0x0008, 0x0021) => ("SeriesDate", "DA"),
         (0x0008, 0x0022) => ("AcquisitionDate", "DA"),
         (0x0008, 0x0023) => ("ContentDate", "DA"),
+        (0x0008, 0x002A) => ("AcquisitionDateTime", "DT"),
         (0x0008, 0x0030) => ("StudyTime", "TM"),
         (0x0008, 0x0031) => ("SeriesTime", "TM"),
         (0x0008, 0x0032) => ("AcquisitionTime", "TM"),
@@ -244,9 +251,19 @@ fn dicom_tag_info(group: u16, element: u16) -> Option<(&'static str, &'static st
         (0x0028, 0x1201) => ("RedPaletteColorLookupTableData", "OW"),
         (0x0028, 0x1202) => ("GreenPaletteColorLookupTableData", "OW"),
         (0x0028, 0x1203) => ("BluePaletteColorLookupTableData", "OW"),
+        (0x0040, 0x0554) => ("SpecimenUID", "UI"),
         (0x0048, 0x0105) => ("OpticalPathSequence", "SQ"),
         (0x0048, 0x0106) => ("OpticalPathIdentifier", "SH"),
         (0x0048, 0x0107) => ("OpticalPathDescription", "ST"),
+        (0x0040, 0x0551) => ("SpecimenID", "LO"),
+        (0x0040, 0x0560) => ("SpecimenDescriptionSequence", "SQ"),
+        (0x0048, 0x0006) => ("TotalPixelMatrixColumns", "UL"),
+        (0x0048, 0x0007) => ("TotalPixelMatrixRows", "UL"),
+        (0x0048, 0x021A) => ("PlanePositionSlideSequence", "SQ"),
+        (0x0048, 0x021E) => ("ColumnPositionInTotalImagePixelMatrix", "SL"),
+        (0x0048, 0x021F) => ("RowPositionInTotalImagePixelMatrix", "SL"),
+        (0x0004, 0x1220) => ("DirectoryRecordSequence", "SQ"),
+        (0x0004, 0x1500) => ("ReferencedFileID", "CS"),
         _ => return None,
     })
 }
@@ -404,11 +421,7 @@ fn dicom_content_timestamp(date: Option<&str>, time: Option<&str>) -> Option<Str
     if time_digits.len() < 6 {
         return None;
     }
-    let (h, mi, s) = (
-        &time_digits[0..2],
-        &time_digits[2..4],
-        &time_digits[4..6],
-    );
+    let (h, mi, s) = (&time_digits[0..2], &time_digits[2..4], &time_digits[4..6]);
     Some(format!("{y}-{mo}-{d}T{h}:{mi}:{s}"))
 }
 
@@ -448,11 +461,123 @@ fn find_nested_string(
         }
         if (group, element) == target {
             let v = &blob[start..end];
-            return Some(decode_dicom_metadata_value(&vr, group, element, v, little_endian)
-                .unwrap_or_else(|| ascii_trim(v)));
+            return Some(
+                decode_dicom_metadata_value(&vr, group, element, v, little_endian)
+                    .unwrap_or_else(|| ascii_trim(v)),
+            );
         }
         cur.set_position(end as u64);
     }
+}
+
+fn find_nested_i32(
+    blob: &[u8],
+    explicit_vr: bool,
+    little_endian: bool,
+    target: (u16, u16),
+) -> Option<i32> {
+    let mut cur = std::io::Cursor::new(blob);
+    loop {
+        let (group, element) = read_tag(&mut cur, little_endian).ok()?;
+        if (group, element) == (0xFFFE, 0xE000)
+            || (group, element) == (0xFFFE, 0xE00D)
+            || (group, element) == (0xFFFE, 0xE0DD)
+        {
+            let _len = read_u32(&mut cur, little_endian).ok()?;
+            continue;
+        }
+        let (vr, length) =
+            read_element_length_after_tag(&mut cur, explicit_vr, little_endian).ok()?;
+        if length == 0xFFFF_FFFF {
+            return None;
+        }
+        let start = cur.position() as usize;
+        let end = start.checked_add(length as usize)?;
+        if end > blob.len() {
+            return None;
+        }
+        if (group, element) == target {
+            let v = &blob[start..end];
+            return match &vr {
+                b"US" => Some(read_u16_value(v, little_endian) as i32),
+                b"SS" => Some(read_i16_value(v, little_endian) as i32),
+                b"UL" => {
+                    if v.len() >= 4 {
+                        Some(if little_endian {
+                            u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as i32
+                        } else {
+                            u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as i32
+                        })
+                    } else {
+                        None
+                    }
+                }
+                b"SL" | b"??" => {
+                    if v.len() >= 4 {
+                        Some(if little_endian {
+                            i32::from_le_bytes([v[0], v[1], v[2], v[3]])
+                        } else {
+                            i32::from_be_bytes([v[0], v[1], v[2], v[3]])
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => ascii_trim(v).trim().parse::<i32>().ok(),
+            };
+        }
+        cur.set_position(end as u64);
+    }
+}
+
+fn parse_per_frame_tile_positions(
+    blob: &[u8],
+    explicit_vr: bool,
+    little_endian: bool,
+) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut cur = std::io::Cursor::new(blob);
+    loop {
+        let Ok((group, element)) = read_tag(&mut cur, little_endian) else {
+            break;
+        };
+        if (group, element) != (0xFFFE, 0xE000) {
+            let Ok((_vr, length)) =
+                read_element_length_after_tag(&mut cur, explicit_vr, little_endian)
+            else {
+                break;
+            };
+            if length == 0xFFFF_FFFF {
+                break;
+            }
+            let next = cur.position().saturating_add(length);
+            cur.set_position(next);
+            continue;
+        }
+        let Ok(length) = read_u32(&mut cur, little_endian) else {
+            break;
+        };
+        if length == 0xFFFF_FFFF {
+            break;
+        }
+        let start = cur.position() as usize;
+        let Some(end) = start.checked_add(length as usize) else {
+            break;
+        };
+        if end > blob.len() {
+            break;
+        }
+        let item = &blob[start..end];
+        let col = find_nested_i32(item, explicit_vr, little_endian, (0x0048, 0x021E));
+        let row = find_nested_i32(item, explicit_vr, little_endian, (0x0048, 0x021F));
+        if let (Some(col), Some(row)) = (col, row) {
+            if col > 0 && row > 0 {
+                out.push((col as u32, row as u32));
+            }
+        }
+        cur.set_position(end as u64);
+    }
+    out
 }
 
 fn read_tag(r: &mut impl Read, little_endian: bool) -> std::io::Result<(u16, u16)> {
@@ -875,7 +1000,7 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
 
         // Decode key imaging tags
         let read_u16 = |v: &[u8]| -> u16 { read_u16_value(v, attrs.little_endian) };
-        let _read_u32_val = |v: &[u8]| -> u32 {
+        let read_u32_val = |v: &[u8]| -> u32 {
             if v.len() >= 4 {
                 if attrs.little_endian {
                     u32::from_le_bytes([v[0], v[1], v[2], v[3]])
@@ -901,12 +1026,9 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
                         ))
                     })?
                 };
-                if frames == 0 {
-                    return Err(BioFormatsError::InvalidData(
-                        "DICOM: NumberOfFrames must be positive".into(),
-                    ));
-                }
-                attrs.number_of_frames = frames;
+                // Java DicomReader only updates imagesPerFile for values > 1;
+                // zero falls through to the later default of one frame.
+                attrs.number_of_frames = frames.max(1);
             }
             (0x0028, 0x0004) => attrs.photometric_interpretation = ascii_trim(&value),
             (0x0028, 0x0010) => attrs.rows = read_u16(&value),
@@ -965,6 +1087,20 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
             }
             (0x0008, 0x0023) => attrs.content_date = Some(ascii_trim(&value)), // Content Date
             (0x0008, 0x0033) => attrs.content_time = Some(ascii_trim(&value)), // Content Time
+            (0x0008, 0x002A) => {
+                let stamp = ascii_trim(&value);
+                if stamp.len() >= 8 && attrs.extra.get("AcquisitionDate").is_none() {
+                    attrs
+                        .extra
+                        .insert("AcquisitionDate".into(), stamp[0..8].to_string());
+                }
+                if stamp.len() > 8 && attrs.extra.get("AcquisitionTime").is_none() {
+                    attrs
+                        .extra
+                        .insert("AcquisitionTime".into(), stamp[8..].to_string());
+                }
+            }
+            (0x0008, 0x0030) => attrs.study_time = Some(ascii_trim(&value)), // Study Time
             (0x0028, 0x0030) => {
                 // Pixel Spacing (DS): "rowSpacing\colSpacing".
                 let (x, y) = parse_pixel_spacing(&ascii_trim(&value));
@@ -995,6 +1131,32 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
                     attrs.channel_names.push(desc);
                 }
             }
+            (0x0040, 0x0551) => attrs.specimen = Some(ascii_trim(&value)), // Specimen ID
+            (0x0040, 0x0560) => {
+                if let Some(specimen) = find_nested_string(
+                    &value,
+                    attrs.explicit_vr,
+                    attrs.little_endian,
+                    (0x0040, 0x0551),
+                ) {
+                    attrs.specimen = Some(specimen);
+                }
+            }
+            (0x0048, 0x0006) | (0x0048, 0x0007) => {
+                let v = read_u32_val(&value);
+                if (group, element) == (0x0048, 0x0006) {
+                    attrs.total_pixel_matrix_columns = v;
+                } else {
+                    attrs.total_pixel_matrix_rows = v;
+                }
+                if v > 0 {
+                    attrs.wsi = true;
+                }
+            }
+            (0x5200, 0x9230) => {
+                attrs.tile_positions =
+                    parse_per_frame_tile_positions(&value, attrs.explicit_vr, attrs.little_endian);
+            }
             _ => {}
         }
         let _ = (pos, value_start);
@@ -1013,14 +1175,9 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
         attrs.planar_configuration = 0;
     }
     let make_channel = |index: usize| -> Option<LutChannel> {
-        let (entries, first_mapped, bits_per_entry) = palette_descriptors[index]?;
+        let (_entries, _first_mapped, _bits_per_entry) = palette_descriptors[index]?;
         let data = palette_data[index].clone()?;
-        Some(LutChannel {
-            entries,
-            first_mapped,
-            bits_per_entry,
-            data,
-        })
+        Some(LutChannel { data })
     };
     attrs.palette = PaletteLut {
         red: make_channel(0),
@@ -1051,9 +1208,12 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
 struct DicomGroupKey {
     date: Option<String>,
     time: Option<String>,
+    study_time: Option<String>,
     instance: Option<i64>,
     series: i32,
     instance_uid: Option<String>,
+    specimen: Option<String>,
+    is_wsi: bool,
     rows: u16,
     columns: u16,
 }
@@ -1066,6 +1226,10 @@ fn group_key_from_attrs(a: &DicomAttrs) -> DicomGroupKey {
     let get = |tag: &str| a.extra.get(tag).map(|v| first_value(v));
     let date = get("AcquisitionDate").filter(|s| !s.is_empty());
     let time = get("AcquisitionTime").filter(|s| !s.is_empty());
+    let study_time = a
+        .study_time
+        .clone()
+        .or_else(|| get("StudyTime").filter(|s| !s.is_empty()));
     let instance = get("InstanceNumber")
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse::<f64>().ok())
@@ -1075,12 +1239,20 @@ fn group_key_from_attrs(a: &DicomAttrs) -> DicomGroupKey {
         .map(|f| f as i32)
         .unwrap_or(0);
     let instance_uid = get("SOPInstanceUID").filter(|s| !s.is_empty());
+    let specimen = a
+        .specimen
+        .clone()
+        .or_else(|| get("SpecimenID").filter(|s| !s.is_empty()));
+    let is_wsi = a.wsi || get("SOPClassUID").as_deref() == Some("1.2.840.10008.5.1.4.1.1.77.1.6");
     DicomGroupKey {
         date,
         time,
+        study_time,
         instance,
         series,
         instance_uid,
+        specimen,
+        is_wsi,
         rows: a.rows,
         columns: a.columns,
     }
@@ -1151,6 +1323,9 @@ fn grouped_series(original: &DicomGroupKey, candidate: &DicomGroupKey) -> Option
     if !instance_uid_prefix_matches(&original.instance_uid, &candidate.instance_uid) {
         return None;
     }
+    if candidate.specimen != original.specimen {
+        return None;
+    }
 
     let mut file_series = candidate.series;
     // Differing dimensions → separate (resolution) series.
@@ -1161,8 +1336,12 @@ fn grouped_series(original: &DicomGroupKey, candidate: &DicomGroupKey) -> Option
     let stamp = timestamp_microseconds(candidate.time.as_deref());
     let timestamp = timestamp_microseconds(original.time.as_deref());
     let time_difference = (stamp - timestamp).abs();
+    let same_wsi_study_time = original.is_wsi
+        && original.study_time.is_some()
+        && candidate.study_time.is_some()
+        && original.study_time == candidate.study_time;
 
-    if candidate.date == original.date && time_difference < 150_000_000 {
+    if candidate.date == original.date && (time_difference < 150_000_000 || same_wsi_study_time) {
         Some(file_series)
     } else {
         None
@@ -1292,6 +1471,51 @@ fn read_dicom_probe_header(path: &Path) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+fn dicomdir_first_referenced_file(path: &Path) -> Option<PathBuf> {
+    let mut f = File::open(path).ok()?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data).ok()?;
+    let tag = [0x04, 0x00, 0x00, 0x15];
+    let pos = data.windows(4).position(|w| w == tag)?;
+    let value_start;
+    let length;
+    let vr = data.get(pos + 4..pos + 6)?;
+    if vr.iter().all(|b| b.is_ascii_uppercase()) {
+        if data.len() < pos + 8 {
+            return None;
+        }
+        if vr_has_long_length(&[vr[0], vr[1]]) {
+            if data.len() < pos + 12 {
+                return None;
+            }
+            length =
+                u32::from_le_bytes([data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11]])
+                    as usize;
+            value_start = pos + 12;
+        } else {
+            length = u16::from_le_bytes([data[pos + 6], data[pos + 7]]) as usize;
+            value_start = pos + 8;
+        }
+    } else {
+        if data.len() < pos + 8 {
+            return None;
+        }
+        length = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+            as usize;
+        value_start = pos + 8;
+    }
+    let value = data.get(value_start..value_start.checked_add(length)?)?;
+    let rel = ascii_trim(value);
+    if rel.is_empty() {
+        return None;
+    }
+    let mut out = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    for part in rel.split('\\').filter(|s| !s.is_empty()) {
+        out.push(part);
+    }
+    Some(out)
+}
+
 fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
     if a.rows == 0 || a.columns == 0 {
         return Err(BioFormatsError::Format(
@@ -1306,28 +1530,24 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
             "DICOM: missing BitsAllocated".into(),
         ));
     }
-    if a.bits_stored > a.bits_allocated {
-        return Err(BioFormatsError::Format(format!(
-            "DICOM: BitsStored {} exceeds BitsAllocated {}",
-            a.bits_stored, a.bits_allocated
-        )));
-    }
-    let has_palette =
+    let photometric = a.photometric_interpretation.trim();
+    let is_palette_color = photometric == "PALETTE COLOR";
+    let has_palette_lut =
         a.palette.red.is_some() && a.palette.green.is_some() && a.palette.blue.is_some();
-    let palette_bits = a
-        .palette
-        .red
-        .as_ref()
-        .map(|lut| lut.bits_per_entry)
-        .unwrap_or(0);
-    let pixel_type = if has_palette {
-        if palette_bits <= 8 {
-            PixelType::Uint8
-        } else {
-            PixelType::Uint16
+    let bits_allocated = java_effective_bits_allocated(a.bits_allocated);
+    let pixel_type = if is_palette_color {
+        match bits_allocated {
+            0..=8 => PixelType::Uint8,
+            9..=16 => PixelType::Uint16,
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "DICOM: unsupported palette BitsAllocated {}",
+                    a.bits_allocated
+                )));
+            }
         }
     } else {
-        match (a.bits_allocated, a.pixel_representation) {
+        match (bits_allocated, a.pixel_representation) {
             (1, _) => PixelType::Uint8,
             // FormatTools.pixelTypeFromBytes(1, signed, false): INT8 when signed,
             // UINT8 otherwise (DicomReader.java:909).
@@ -1340,36 +1560,36 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
             _ => {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "DICOM: unsupported BitsAllocated {} / PixelRepresentation {}",
-                    a.bits_allocated, a.pixel_representation
+                    bits_allocated, a.pixel_representation
                 )));
             }
         }
     };
-    let source_bits = if a.bits_stored == 0 {
-        a.bits_allocated
-    } else {
-        a.bits_stored
-    };
-    let bits_per_pixel = if has_palette {
-        palette_bits.clamp(8, 16) as u8
-    } else {
-        source_bits.clamp(1, 32) as u8
-    };
+    let bits_per_pixel = bits_allocated.clamp(1, 32) as u8;
 
-    let photometric = a.photometric_interpretation.trim();
-    let is_rgb = matches!(photometric, "RGB" | "YBR_FULL" | "YBR_FULL_422")
-        || has_palette
-        || (photometric.is_empty() && samples_per_pixel == 3);
-    let image_count = a.number_of_frames;
-    let size_c = if has_palette {
-        3
+    let is_rgb = !is_palette_color && samples_per_pixel > 1;
+    let tiled_wsi = a.total_pixel_matrix_columns > 0
+        && a.total_pixel_matrix_rows > 0
+        && (a.total_pixel_matrix_columns != u32::from(a.columns)
+            || a.total_pixel_matrix_rows != u32::from(a.rows));
+    let image_count = if tiled_wsi { 1 } else { a.number_of_frames };
+    let size_c = if is_palette_color {
+        1
     } else {
         samples_per_pixel as u32
     };
 
     let mut meta = ImageMetadata {
-        size_x: a.columns as u32,
-        size_y: a.rows as u32,
+        size_x: if tiled_wsi {
+            a.total_pixel_matrix_columns
+        } else {
+            a.columns as u32
+        },
+        size_y: if tiled_wsi {
+            a.total_pixel_matrix_rows
+        } else {
+            a.rows as u32
+        },
         size_z: image_count,
         size_c,
         size_t: 1,
@@ -1379,7 +1599,7 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,
         is_interleaved: true,
-        is_indexed: false,
+        is_indexed: is_palette_color,
         is_little_endian: a.little_endian,
         resolution_count: 1,
         thumbnail: false,
@@ -1388,7 +1608,11 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
             .iter()
             .map(|(k, v)| (k.clone(), MetadataValue::String(v.clone())))
             .collect(),
-        lookup_table: palette_lookup_table(&a.palette),
+        lookup_table: if has_palette_lut {
+            palette_lookup_table(&a.palette)
+        } else {
+            None
+        },
         modulo_z: None,
         modulo_c: None,
         modulo_t: None,
@@ -1412,30 +1636,95 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
             MetadataValue::String(a.planar_configuration.to_string()),
         );
     }
+    if tiled_wsi {
+        meta.series_metadata.insert(
+            "dicom.tile_width".into(),
+            MetadataValue::Int(i64::from(a.columns)),
+        );
+        meta.series_metadata.insert(
+            "dicom.tile_height".into(),
+            MetadataValue::Int(i64::from(a.rows)),
+        );
+    }
 
     Ok(meta)
 }
 
-fn source_pixel_bytes(meta: &ImageMetadata, samples: u16, bits_allocated: u16) -> Result<usize> {
-    let pixels = (meta.size_x as usize)
-        .checked_mul(meta.size_y as usize)
+fn looks_like_dicom_header(header: &[u8]) -> bool {
+    if header.len() >= 132 && &header[128..132] == b"DICM" {
+        return true;
+    }
+    looks_like_preambleless_dicom(header)
+}
+
+fn looks_like_preambleless_dicom(header: &[u8]) -> bool {
+    if header.len() < 8 {
+        return false;
+    }
+
+    let group = u16::from_le_bytes([header[0], header[1]]);
+    let element = u16::from_le_bytes([header[2], header[3]]);
+    if !is_common_dicom_group(group) || element == 0xffff {
+        return false;
+    }
+
+    let vr = [header[4], header[5]];
+    if is_valid_vr(&vr) {
+        if vr_has_long_length(&vr) {
+            return header.len() >= 12 && header[6] == 0 && header[7] == 0;
+        }
+        return true;
+    }
+
+    // Implicit VR Little Endian raw datasets commonly start at group 0008 or
+    // later with a 32-bit value length instead of a VR code.
+    group != 0x0002 && header[4..8] != [0xff, 0xff, 0xff, 0xff]
+}
+
+fn is_common_dicom_group(group: u16) -> bool {
+    matches!(
+        group,
+        0x0002 | 0x0008 | 0x0010 | 0x0018 | 0x0020 | 0x0028 | 0x0032 | 0x0040 | 0x0054 | 0x7fe0
+    )
+}
+
+fn source_pixel_bytes_for_dims(
+    width: u32,
+    height: u32,
+    samples: u16,
+    bits_allocated: u16,
+) -> Result<usize> {
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
         .and_then(|v| v.checked_mul(samples as usize))
         .ok_or_else(|| BioFormatsError::Format("DICOM: image dimensions overflow".into()))?;
+    let bits_allocated = java_effective_bits_allocated(bits_allocated);
     let bits = pixels
         .checked_mul(bits_allocated.max(1) as usize)
         .ok_or_else(|| BioFormatsError::Format("DICOM: pixel byte count overflow".into()))?;
     Ok(bits.div_ceil(8))
 }
 
+fn java_effective_bits_allocated(bits_allocated: u16) -> u16 {
+    // DicomReader.java divides 24-bit and 48-bit RGB-style values by 3 before
+    // deriving bytes per pixel and CoreMetadata.bitsPerPixel.
+    match bits_allocated {
+        24 | 48 => bits_allocated / 3,
+        _ => bits_allocated,
+    }
+}
+
 fn validate_pixel_data_length(
-    meta: &ImageMetadata,
+    width: u32,
+    height: u32,
     pixel_data_length: u64,
+    image_count: u32,
     samples: u16,
     bits_allocated: u16,
 ) -> Result<()> {
-    let plane_bytes = source_pixel_bytes(meta, samples, bits_allocated)?;
+    let plane_bytes = source_pixel_bytes_for_dims(width, height, samples, bits_allocated)?;
     let expected = (plane_bytes as u64)
-        .checked_mul(meta.image_count as u64)
+        .checked_mul(image_count as u64)
         .ok_or_else(|| BioFormatsError::Format("DICOM: pixel byte count overflow".into()))?;
     let allowed_padding = u64::from(expected % 2 == 1);
     if pixel_data_length < expected {
@@ -1458,27 +1747,6 @@ fn palette_lookup_table(palette: &PaletteLut) -> Option<LookupTable> {
         green: palette.green.as_ref()?.data.clone(),
         blue: palette.blue.as_ref()?.data.clone(),
     })
-}
-
-fn lut_value(lut: &LutChannel, index: u16) -> u16 {
-    let offset = i32::from(index) - lut.first_mapped;
-    if offset <= 0 {
-        return lut.data.first().copied().unwrap_or(0);
-    }
-    let offset = (offset as usize).min(lut.entries.saturating_sub(1));
-    lut.data
-        .get(offset)
-        .copied()
-        .or_else(|| lut.data.last().copied())
-        .unwrap_or(0)
-}
-
-fn lut_output_value(value: u16, bits_per_entry: u16) -> u16 {
-    if bits_per_entry <= 8 {
-        value & 0x00ff
-    } else {
-        value
-    }
 }
 
 fn unpack_bit_samples(src: &[u8], samples: usize, bits: u16) -> Vec<u16> {
@@ -1506,6 +1774,7 @@ fn normalize_native_pixels(
     pixel_representation: u16,
     palette: &PaletteLut,
 ) -> Vec<u8> {
+    let bits_allocated = java_effective_bits_allocated(bits_allocated);
     let sample_count = meta.size_x as usize * meta.size_y as usize * samples as usize;
     let stored_bits = bits_stored.max(1).min(bits_allocated.max(1));
     let mask = if stored_bits >= 16 {
@@ -1559,28 +1828,6 @@ fn normalize_native_pixels(
             })
             .collect()
     };
-
-    if let (Some(red), Some(green), Some(blue)) = (&palette.red, &palette.green, &palette.blue) {
-        let bytes_per_sample = meta.pixel_type.bytes_per_sample();
-        let mut out = Vec::with_capacity(values.len() * 3 * bytes_per_sample);
-        for index in values {
-            for (lut, value) in [
-                (red, lut_value(red, index)),
-                (green, lut_value(green, index)),
-                (blue, lut_value(blue, index)),
-            ] {
-                let value = lut_output_value(value, lut.bits_per_entry);
-                if bytes_per_sample == 1 {
-                    out.push(value as u8);
-                } else if meta.is_little_endian {
-                    out.extend_from_slice(&value.to_le_bytes());
-                } else {
-                    out.extend_from_slice(&value.to_be_bytes());
-                }
-            }
-        }
-        return out;
-    }
 
     if meta.pixel_type.bytes_per_sample() == 1 {
         values.into_iter().map(|v| v as u8).collect()
@@ -1848,6 +2095,10 @@ pub struct DicomReader {
     photometric_interpretation: String,
     planar_configuration: u16,
     source_samples_per_pixel: u16,
+    source_tile_width: u32,
+    source_tile_height: u32,
+    source_frame_count: u32,
+    tile_positions: Vec<(u32, u32)>,
     bits_allocated: u16,
     bits_stored: u16,
     pixel_representation: u16,
@@ -1891,6 +2142,10 @@ impl DicomReader {
             photometric_interpretation: String::new(),
             planar_configuration: 0,
             source_samples_per_pixel: 1,
+            source_tile_width: 0,
+            source_tile_height: 0,
+            source_frame_count: 1,
+            tile_positions: Vec::new(),
             bits_allocated: 8,
             bits_stored: 8,
             pixel_representation: 0,
@@ -1932,8 +2187,10 @@ impl DicomReader {
 
         if !attrs.encapsulated {
             validate_pixel_data_length(
-                &meta,
+                attrs.columns as u32,
+                attrs.rows as u32,
                 attrs.pixel_data_length,
+                attrs.number_of_frames,
                 attrs.samples_per_pixel,
                 attrs.bits_allocated,
             )?;
@@ -1957,6 +2214,10 @@ impl DicomReader {
         self.photometric_interpretation = attrs.photometric_interpretation;
         self.planar_configuration = attrs.planar_configuration;
         self.source_samples_per_pixel = attrs.samples_per_pixel;
+        self.source_tile_width = attrs.columns as u32;
+        self.source_tile_height = attrs.rows as u32;
+        self.source_frame_count = attrs.number_of_frames;
+        self.tile_positions = attrs.tile_positions;
         self.bits_allocated = attrs.bits_allocated;
         self.bits_stored = attrs.bits_stored;
         self.pixel_representation = attrs.pixel_representation;
@@ -1987,8 +2248,10 @@ impl DicomReader {
         let meta = build_metadata(&attrs)?;
         if !attrs.encapsulated {
             validate_pixel_data_length(
-                &meta,
+                attrs.columns as u32,
+                attrs.rows as u32,
                 attrs.pixel_data_length,
+                attrs.number_of_frames,
                 attrs.samples_per_pixel,
                 attrs.bits_allocated,
             )?;
@@ -2004,6 +2267,10 @@ impl DicomReader {
         sub.photometric_interpretation = attrs.photometric_interpretation;
         sub.planar_configuration = attrs.planar_configuration;
         sub.source_samples_per_pixel = attrs.samples_per_pixel;
+        sub.source_tile_width = attrs.columns as u32;
+        sub.source_tile_height = attrs.rows as u32;
+        sub.source_frame_count = attrs.number_of_frames;
+        sub.tile_positions = attrs.tile_positions;
         sub.bits_allocated = attrs.bits_allocated;
         sub.bits_stored = attrs.bits_stored;
         sub.pixel_representation = attrs.pixel_representation;
@@ -2038,6 +2305,106 @@ impl DicomReader {
         let local = plane_index % planes_per_file;
         Ok((files[file_idx].clone(), local))
     }
+
+    fn is_tiled_wsi(&self) -> bool {
+        let Some(meta) = self.meta.as_ref() else {
+            return false;
+        };
+        self.source_frame_count > 1
+            && self.source_tile_width > 0
+            && self.source_tile_height > 0
+            && (self.source_tile_width != meta.size_x || self.source_tile_height != meta.size_y)
+    }
+
+    fn tile_position(&self, frame: u32, meta: &ImageMetadata) -> (u32, u32) {
+        if let Some(&(col, row)) = self.tile_positions.get(frame as usize) {
+            return (col.saturating_sub(1), row.saturating_sub(1));
+        }
+        let tiles_per_row = meta.size_x.div_ceil(self.source_tile_width.max(1)).max(1);
+        (
+            (frame % tiles_per_row) * self.source_tile_width,
+            (frame / tiles_per_row) * self.source_tile_height,
+        )
+    }
+
+    fn read_native_frame_as_tile(
+        &self,
+        path: &Path,
+        frame_index: u32,
+        tile_meta: &ImageMetadata,
+    ) -> Result<Vec<u8>> {
+        if self.encapsulated {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "DICOM: tiled WSI stitching for encapsulated transfer syntax is unsupported".into(),
+            ));
+        }
+        let source_plane_bytes = source_pixel_bytes_for_dims(
+            self.source_tile_width,
+            self.source_tile_height,
+            self.source_samples_per_pixel,
+            self.bits_allocated,
+        )?;
+        let plane_offset = self.pixel_data_offset + frame_index as u64 * source_plane_bytes as u64;
+        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(plane_offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut source = vec![0u8; source_plane_bytes];
+        f.read_exact(&mut source).map_err(BioFormatsError::Io)?;
+        let mut tile = normalize_native_pixels(
+            &source,
+            tile_meta,
+            self.source_samples_per_pixel,
+            self.bits_allocated,
+            self.bits_stored,
+            self.pixel_representation,
+            &self.palette,
+        );
+        if self.planar_configuration == 1 && tile_meta.size_c > 1 {
+            tile = planar_to_interleaved(&tile, tile_meta);
+        }
+        if self.photometric_interpretation.trim() == "MONOCHROME1" {
+            invert_monochrome1(
+                &mut tile,
+                tile_meta,
+                self.max_pixel_range,
+                self.center_pixel_value,
+            );
+        }
+        Ok(tile)
+    }
+
+    fn stitch_tiled_wsi(&self) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let sample_bytes = meta.pixel_type.bytes_per_sample();
+        let channels = meta.size_c as usize;
+        let mut tile_meta = meta.clone();
+        tile_meta.size_x = self.source_tile_width;
+        tile_meta.size_y = self.source_tile_height;
+        tile_meta.size_z = 1;
+        tile_meta.image_count = 1;
+
+        let mut out = vec![0u8; expected_output_bytes(meta)?];
+        for frame in 0..self.source_frame_count {
+            let tile = self.read_native_frame_as_tile(path, frame, &tile_meta)?;
+            let (dst_x, dst_y) = self.tile_position(frame, meta);
+            if dst_x >= meta.size_x || dst_y >= meta.size_y {
+                continue;
+            }
+            let copy_w = self.source_tile_width.min(meta.size_x - dst_x) as usize;
+            let copy_h = self.source_tile_height.min(meta.size_y - dst_y) as usize;
+            let row_bytes = copy_w * channels * sample_bytes;
+            let src_stride = self.source_tile_width as usize * channels * sample_bytes;
+            let dst_stride = meta.size_x as usize * channels * sample_bytes;
+            for row in 0..copy_h {
+                let src = row * src_stride;
+                let dst =
+                    (dst_y as usize + row) * dst_stride + dst_x as usize * channels * sample_bytes;
+                out[dst..dst + row_bytes].copy_from_slice(&tile[src..src + row_bytes]);
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl Default for DicomReader {
@@ -2052,15 +2419,44 @@ impl FormatReader for DicomReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("dcm") | Some("dicom") | Some("dic"))
+        matches!(
+            ext.as_deref(),
+            Some("dcm")
+                | Some("dicom")
+                | Some("dic")
+                | Some("j2ki")
+                | Some("j2kr")
+                | Some("jp2")
+                | Some("raw")
+                | Some("ima")
+        )
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 132 && &header[128..132] == b"DICM"
+        looks_like_dicom_header(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("DICOMDIR"))
+        {
+            let referenced = dicomdir_first_referenced_file(path).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat("DICOMDIR: no referenced image file".into())
+            })?;
+            if referenced
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("DICOMDIR"))
+            {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "DICOMDIR: self-referential entry".into(),
+                ));
+            }
+            return self.set_id(&referenced);
+        }
         // Parse the selected file first to derive its grouping key.
         let attrs = parse_dicom(path)?;
         let key = group_key_from_attrs(&attrs);
@@ -2109,6 +2505,7 @@ impl FormatReader for DicomReader {
         self.position_y.clear();
         self.position_z.clear();
         self.channel_names.clear();
+        self.tile_positions.clear();
         self.series_files.clear();
         self.current_series = 0;
         Ok(())
@@ -2161,6 +2558,10 @@ impl FormatReader for DicomReader {
 
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+
+        if self.is_tiled_wsi() {
+            return self.stitch_tiled_wsi();
+        }
 
         if self.encapsulated {
             let syntax = classify_transfer_syntax(&self.transfer_syntax);
@@ -2278,8 +2679,12 @@ impl FormatReader for DicomReader {
             }
         }
 
-        let source_plane_bytes =
-            source_pixel_bytes(meta, self.source_samples_per_pixel, self.bits_allocated)?;
+        let source_plane_bytes = source_pixel_bytes_for_dims(
+            self.source_tile_width.max(meta.size_x),
+            self.source_tile_height.max(meta.size_y),
+            self.source_samples_per_pixel,
+            self.bits_allocated,
+        )?;
         let plane_offset = self.pixel_data_offset + plane_index as u64 * source_plane_bytes as u64;
 
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
@@ -2822,7 +3227,10 @@ mod tests {
         let got = find_nested_string(&blob, false, true, (0x0048, 0x0107));
         assert_eq!(got.as_deref(), Some("DAPI"));
         // Absent tag → None.
-        assert_eq!(find_nested_string(&blob, false, true, (0x0048, 0x0106)), None);
+        assert_eq!(
+            find_nested_string(&blob, false, true, (0x0048, 0x0106)),
+            None
+        );
     }
 
     #[test]
@@ -2855,7 +3263,10 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let attrs = parse_dicom(&path).unwrap();
-        assert_eq!(attrs.image_type.as_deref(), Some("DERIVED\\SECONDARY\\VOLUME"));
+        assert_eq!(
+            attrs.image_type.as_deref(),
+            Some("DERIVED\\SECONDARY\\VOLUME")
+        );
         assert_eq!(attrs.content_date.as_deref(), Some("20240115"));
         assert_eq!(attrs.content_time.as_deref(), Some("131415"));
         assert_eq!(attrs.pixel_size_x, Some(0.25));
@@ -2867,6 +3278,71 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn dicom_grouping_rejects_specimen_mismatch() {
+        let original = DicomGroupKey {
+            date: Some("20240115".into()),
+            time: Some("120000".into()),
+            instance: Some(1),
+            series: 7,
+            instance_uid: Some("1.2.3.4.5.1".into()),
+            specimen: Some("block-A".into()),
+            rows: 2,
+            columns: 2,
+            ..Default::default()
+        };
+        let candidate = DicomGroupKey {
+            time: Some("120030".into()),
+            instance: Some(2),
+            instance_uid: Some("1.2.3.4.5.2".into()),
+            specimen: Some("block-B".into()),
+            ..original.clone()
+        };
+
+        assert_eq!(grouped_series(&original, &candidate), None);
+    }
+
+    #[test]
+    fn dicom_wsi_grouping_allows_matching_study_time_beyond_acquisition_window() {
+        let original = DicomGroupKey {
+            date: Some("20240115".into()),
+            time: Some("120000".into()),
+            study_time: Some("090000".into()),
+            instance: Some(1),
+            series: 7,
+            instance_uid: Some("1.2.3.4.5.1".into()),
+            specimen: Some("block-A".into()),
+            is_wsi: true,
+            rows: 2,
+            columns: 2,
+        };
+        let candidate = DicomGroupKey {
+            time: Some("130000".into()),
+            study_time: Some("090000".into()),
+            instance: Some(2),
+            instance_uid: Some("1.2.3.4.5.2".into()),
+            ..original.clone()
+        };
+
+        assert_eq!(grouped_series(&original, &candidate), Some(7));
+    }
+
+    #[test]
+    fn dicom_name_detection_includes_java_and_fallback_suffixes() {
+        let reader = DicomReader::new();
+
+        for name in [
+            "scan.dcm",
+            "scan.j2ki",
+            "scan.j2kr",
+            "scan.jp2",
+            "scan.raw",
+            "scan.ima",
+        ] {
+            assert!(reader.is_this_type_by_name(Path::new(name)), "{name}");
+        }
     }
 
     #[test]

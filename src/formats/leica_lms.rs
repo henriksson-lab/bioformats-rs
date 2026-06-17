@@ -352,10 +352,7 @@ impl XlifDocument {
     pub fn new(filepath: &Path) -> Option<XlifDocument> {
         let xml = std::fs::read_to_string(filepath).ok()?;
         let doc = parse_dom(&xml)?;
-        let dir = filepath
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
+        let dir = filepath.parent().map(Path::to_path_buf).unwrap_or_default();
         let mut xlif = XlifDocument {
             doc,
             dir,
@@ -443,7 +440,11 @@ impl XlifDocument {
                 .collect();
         }
         for attrs in references {
-            let file = attrs.get("File").cloned().unwrap_or_default().to_lowercase();
+            let file = attrs
+                .get("File")
+                .cloned()
+                .unwrap_or_default()
+                .to_lowercase();
             let path = parse_file_path(&self.dir, &file);
             // Java uses fileExists(path) (which can return null), storing the
             // corrected path. We fall back to the parsed path when missing so a
@@ -571,10 +572,7 @@ impl XlefDocument {
 
     /// Mirror of XlefDocument.getImageCount.
     pub fn get_image_count(&self) -> usize {
-        self.get_xlifs()
-            .iter()
-            .map(|x| x.image_paths.len())
-            .sum()
+        self.get_xlifs().iter().map(|x| x.image_paths.len()).sum()
     }
 
     /// Mirror of LMSCollectionXmlDocument.getChildrenFiles.
@@ -945,9 +943,21 @@ pub struct Roi {
 /// A geometry produced by `ROI.storeROI` (the OME shape branch chosen by `type`).
 #[derive(Debug, Clone)]
 pub enum StoredShape {
-    Polygon { points: Vec<(f64, f64)> },
-    Rectangle { x: f64, y: f64, width: f64, height: f64 },
-    Line { x1: f64, y1: f64, x2: f64, y2: f64 },
+    Polygon {
+        points: Vec<(f64, f64)>,
+    },
+    Rectangle {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
+    Line {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
 }
 
 impl Roi {
@@ -991,7 +1001,10 @@ impl Roi {
         let (roi_x, roi_y) = if alternate_center {
             (self.trans_x - 2.0 * corner_x, self.trans_y - 2.0 * corner_y)
         } else {
-            (center_x as f64 + self.trans_x, center_y as f64 + self.trans_y)
+            (
+                center_x as f64 + self.trans_x,
+                center_y as f64 + self.trans_y,
+            )
         };
 
         match self.roi_type {
@@ -1140,8 +1153,14 @@ impl ImageBuffer {
             .sort_by(|a, b| a.bytes_inc.cmp(&b.bytes_inc));
 
         // Move X and Y to the start in bytesInc order.
-        let x_index = self.dimensions.iter().position(|d| d.key == Some(DimensionKey::X));
-        let y_index = self.dimensions.iter().position(|d| d.key == Some(DimensionKey::Y));
+        let x_index = self
+            .dimensions
+            .iter()
+            .position(|d| d.key == Some(DimensionKey::X));
+        let y_index = self
+            .dimensions
+            .iter()
+            .position(|d| d.key == Some(DimensionKey::Y));
         if let (Some(_), Some(_)) = (x_index, y_index) {
             // Remove highest index first to keep the other index valid.
             let (xi, yi) = (x_index.unwrap(), y_index.unwrap());
@@ -1164,7 +1183,11 @@ impl ImageBuffer {
         }
 
         // Move dimension S to the end.
-        if let Some(s_index) = self.dimensions.iter().position(|d| d.key == Some(DimensionKey::S)) {
+        if let Some(s_index) = self
+            .dimensions
+            .iter()
+            .position(|d| d.key == Some(DimensionKey::S))
+        {
             let dim_s = self.dimensions.remove(s_index);
             self.dimensions.push(dim_s);
         }
@@ -1244,7 +1267,10 @@ impl ImageBuffer {
             self.channels.len() as i32
         };
         let channel_bytes_inc = self.get_channel_dimension_bytes_inc();
-        self.add_dimension(Dimension::create_channel_dimension(size_c, channel_bytes_inc));
+        self.add_dimension(Dimension::create_channel_dimension(
+            size_c,
+            channel_bytes_inc,
+        ));
     }
 
     /// Mirror of MetadataTempBuffer.getChannelDimensionBytesInc.
@@ -1387,7 +1413,8 @@ impl LmsMetadataExtractor {
             let unit = channel_element.get_attribute("Unit");
             let lut_name = channel_element.get_attribute("LUTName");
             let bytes_inc = Self::parse_long(&channel_element.get_attribute("BytesInc"));
-            let channel = Channel::new(channel_tag, resolution, min, max, unit, lut_name, bytes_inc);
+            let channel =
+                Channel::new(channel_tag, resolution, min, max, unit, lut_name, bytes_inc);
             self.buffer.channels.push(channel);
         }
 
@@ -1803,9 +1830,7 @@ impl LmsMetadataExtractor {
                     if let Ok(key) = data.parse::<i32>() {
                         self.buffer.detector_indexes.insert(key, object.clone());
                     }
-                    self.buffer
-                        .active_detector
-                        .push(variant.trim() == "Active");
+                    self.buffer.active_detector.push(variant.trim() == "Active");
                 }
             } else if attribute == "Objective" {
                 // Tokenise the objective string: "<mag>x<NA> <immersion> <correction>".
@@ -1974,7 +1999,9 @@ impl LmsMetadataExtractor {
             // gpName = aotf.getParentNode().getParentNode().getNodeName().
             let is_master =
                 gp_name.ends_with("Sequential_Master") || gp_name.ends_with("Attachment");
-            self.buffer.laser_frap.push(gp_name.ends_with("FRAP_Master"));
+            self.buffer
+                .laser_frap
+                .push(gp_name.ends_with("FRAP_Master"));
             for laser_line in &laser_lines {
                 if is_master {
                     continue;
@@ -2083,7 +2110,8 @@ impl LmsMetadataExtractor {
                     roi.scale_y = scale_y / physical_size_y;
                 }
             }
-            if let Some(rotation) = Self::data_parse_double(&roi_node.get_attribute("transRotation"))
+            if let Some(rotation) =
+                Self::data_parse_double(&roi_node.get_attribute("transRotation"))
             {
                 roi.rotation = rotation;
             }
@@ -2189,27 +2217,23 @@ impl LmsMetadataExtractor {
                     roi.rotation = rotation;
                 }
                 if let Some(scaling) = get_nodes(transform, "Scaling").first() {
-                    if let Some(scale_x) =
-                        Self::data_parse_double(&scaling.get_attribute("XScale"))
+                    if let Some(scale_x) = Self::data_parse_double(&scaling.get_attribute("XScale"))
                     {
                         roi.scale_x = scale_x;
                     }
-                    if let Some(scale_y) =
-                        Self::data_parse_double(&scaling.get_attribute("YScale"))
+                    if let Some(scale_y) = Self::data_parse_double(&scaling.get_attribute("YScale"))
                     {
                         roi.scale_y = scale_y;
                     }
                 }
                 if let Some(translation) = get_nodes(transform, "Translation").first() {
-                    if let Some(trans_x) =
-                        Self::data_parse_double(&translation.get_attribute("X"))
+                    if let Some(trans_x) = Self::data_parse_double(&translation.get_attribute("X"))
                     {
                         if physical_size_x != 0.0 {
                             roi.trans_x = trans_x / physical_size_x;
                         }
                     }
-                    if let Some(trans_y) =
-                        Self::data_parse_double(&translation.get_attribute("Y"))
+                    if let Some(trans_y) = Self::data_parse_double(&translation.get_attribute("Y"))
                     {
                         if physical_size_y != 0.0 {
                             roi.trans_y = trans_y / physical_size_y;
@@ -2353,12 +2377,12 @@ impl Default for LmsMetadataExtractor {
     }
 }
 
-/// Mirror of FormatTools.pixelTypeFromBytes(bytes, signed=false, allowLong=true).
+/// Mirror of FormatTools.pixelTypeFromBytes(bytes, signed=false, fp=true).
 fn pixel_type_from_bytes(bytes: i32) -> Result<PixelType> {
     match bytes {
         1 => Ok(PixelType::Uint8),
         2 => Ok(PixelType::Uint16),
-        4 => Ok(PixelType::Uint32),
+        4 => Ok(PixelType::Float32),
         8 => Ok(PixelType::Float64),
         _ => Err(BioFormatsError::UnsupportedFormat(format!(
             "Leica LMS: unsupported X bytesInc {bytes}"
@@ -2386,8 +2410,7 @@ pub fn image_metadata_from_xlif(xlif: &XlifDocument) -> Result<ImageMetadata> {
         ))
     })?;
 
-    let is_tif_or_jpeg =
-        matches!(xlif.image_format, ImageFormat::Tif | ImageFormat::Jpeg);
+    let is_tif_or_jpeg = matches!(xlif.image_format, ImageFormat::Tif | ImageFormat::Jpeg);
 
     let mut extractor = LmsMetadataExtractor::new();
     extractor.image_format = xlif.image_format;
@@ -2416,10 +2439,8 @@ pub fn image_metadata_from_xlif(xlif: &XlifDocument) -> Result<ImageMetadata> {
 
     // Image name and per-channel / physical-size metadata.
     if let Some(name) = xlif.get_image_name() {
-        meta.series_metadata.insert(
-            "xlef.lms.image.name".into(),
-            MetadataValue::String(name),
-        );
+        meta.series_metadata
+            .insert("xlef.lms.image.name".into(), MetadataValue::String(name));
     }
     if let Some(px) = extractor.buffer.physical_size_x {
         if px.is_finite() && px != 0.0 {
@@ -2458,8 +2479,10 @@ pub fn image_metadata_from_xlif(xlif: &XlifDocument) -> Result<ImageMetadata> {
             );
         }
         if let Some(color) = extractor.buffer.channel_colors.get(index) {
-            meta.series_metadata
-                .insert(format!("{prefix}.ome_color"), MetadataValue::Int(*color as i64));
+            meta.series_metadata.insert(
+                format!("{prefix}.ome_color"),
+                MetadataValue::Int(*color as i64),
+            );
         }
     }
 
@@ -2467,7 +2490,12 @@ pub fn image_metadata_from_xlif(xlif: &XlifDocument) -> Result<ImageMetadata> {
     emit_lms_channel_lasers(&extractor, &mut meta);
     emit_lms_channel_detectors(&extractor, &mut meta);
     emit_lms_planes(&extractor, &mut meta);
-    emit_lms_roi_metadata(&mut extractor, core.size_x as i32, core.size_y as i32, &mut meta);
+    emit_lms_roi_metadata(
+        &mut extractor,
+        core.size_x as i32,
+        core.size_y as i32,
+        &mut meta,
+    );
 
     Ok(meta)
 }
@@ -2481,8 +2509,10 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
     let put_str = |meta: &mut ImageMetadata, key: &str, value: Option<&str>| {
         if let Some(value) = value {
             if !value.trim().is_empty() {
-                meta.series_metadata
-                    .insert(key.to_string(), MetadataValue::String(value.trim().to_string()));
+                meta.series_metadata.insert(
+                    key.to_string(),
+                    MetadataValue::String(value.trim().to_string()),
+                );
             }
         }
     };
@@ -2623,7 +2653,11 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
             "xlef.lms.filter.0.name",
             buffer.filter_models.first().map(|s| s.as_str()),
         );
-        put_f64(meta, "xlef.lms.filter.0.cut_in", buffer.cut_ins.first().copied());
+        put_f64(
+            meta,
+            "xlef.lms.filter.0.cut_in",
+            buffer.cut_ins.first().copied(),
+        );
         put_f64(
             meta,
             "xlef.lms.filter.0.cut_out",
@@ -2634,11 +2668,7 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
     // Per-channel names + excitation wavelengths (initDetectorModels / scanner).
     for (index, name) in buffer.channel_names.iter().enumerate() {
         if let Some(name) = name {
-            put_str(
-                meta,
-                &format!("xlef.lms.channel.{index}.name"),
-                Some(name),
-            );
+            put_str(meta, &format!("xlef.lms.channel.{index}.name"), Some(name));
         }
     }
     for (index, ex) in buffer.ex_waves.iter().enumerate() {
@@ -2907,10 +2937,7 @@ fn emit_lms_channel_detectors(extractor: &LmsMetadataExtractor, meta: &mut Image
                 // store.setDetectorSettingsID(Detector:series:(nextDetector-first)).
                 meta.series_metadata.insert(
                     format!("{prefix}.detector_ref"),
-                    MetadataValue::String(format!(
-                        "Detector:0:{}",
-                        next_detector - first_detector
-                    )),
+                    MetadataValue::String(format!("Detector:0:{}", next_detector - first_detector)),
                 );
                 next_detector += 1;
 
@@ -2959,11 +2986,7 @@ fn emit_lms_channel_detectors(extractor: &LmsMetadataExtractor, meta: &mut Image
 
         // Channel colour (only when not RGB) — already projected via ome_color in
         // the channel loop, so no separate key is needed here.
-        let channel_color = buffer
-            .channel_colors
-            .get(c as usize)
-            .copied()
-            .unwrap_or(-1);
+        let channel_color = buffer.channel_colors.get(c as usize).copied().unwrap_or(-1);
 
         // Emission-filter light path (this setLightPathEmissionFilterRef IS live
         // in Java, unlike the one in initLasers). Record the referenced filter id
@@ -3028,22 +3051,16 @@ fn emit_lms_planes(extractor: &LmsMetadataExtractor, meta: &mut ImageMetadata) {
         }
 
         if let Some(x) = x_pos {
-            meta.series_metadata.insert(
-                format!("{prefix}.position_x"),
-                MetadataValue::Float(x),
-            );
+            meta.series_metadata
+                .insert(format!("{prefix}.position_x"), MetadataValue::Float(x));
         }
         if let Some(y) = y_pos {
-            meta.series_metadata.insert(
-                format!("{prefix}.position_y"),
-                MetadataValue::Float(y),
-            );
+            meta.series_metadata
+                .insert(format!("{prefix}.position_y"), MetadataValue::Float(y));
         }
         if let Some(z) = buffer.pos_z {
-            meta.series_metadata.insert(
-                format!("{prefix}.position_z"),
-                MetadataValue::Float(z),
-            );
+            meta.series_metadata
+                .insert(format!("{prefix}.position_z"), MetadataValue::Float(z));
         }
 
         // deltaT from timestamps.
@@ -3056,20 +3073,16 @@ fn emit_lms_planes(extractor: &LmsMetadataExtractor, meta: &mut ImageMetadata) {
                     timestamp = t0;
                 }
             }
-            meta.series_metadata.insert(
-                format!("{prefix}.delta_t"),
-                MetadataValue::Float(timestamp),
-            );
+            meta.series_metadata
+                .insert(format!("{prefix}.delta_t"), MetadataValue::Float(timestamp));
         }
 
         // Exposure time via getZCTCoords()[1].
         if !buffer.exp_times.is_empty() {
             let c = lms_get_zct_coords(extractor, image)[1];
             if let Some(Some(exp)) = buffer.exp_times.get(c as usize).copied() {
-                meta.series_metadata.insert(
-                    format!("{prefix}.exposure_time"),
-                    MetadataValue::Float(exp),
-                );
+                meta.series_metadata
+                    .insert(format!("{prefix}.exposure_time"), MetadataValue::Float(exp));
             }
         }
     }
@@ -3098,7 +3111,12 @@ fn emit_lms_roi_metadata(
         }
         let shape = roi.store_roi(size_x, size_y, alternate_center);
         match shape {
-            Some(StoredShape::Rectangle { x, y, width, height }) => {
+            Some(StoredShape::Rectangle {
+                x,
+                y,
+                width,
+                height,
+            }) => {
                 meta.series_metadata.insert(
                     format!("{prefix}.shape"),
                     MetadataValue::String("Rectangle".into()),
@@ -3136,10 +3154,8 @@ fn emit_lms_roi_metadata(
                     .map(|(px, py)| format!("{px},{py}"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                meta.series_metadata.insert(
-                    format!("{prefix}.points"),
-                    MetadataValue::String(encoded),
-                );
+                meta.series_metadata
+                    .insert(format!("{prefix}.points"), MetadataValue::String(encoded));
             }
             None => {}
         }

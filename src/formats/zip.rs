@@ -56,17 +56,7 @@ impl ZipReader {
     }
 
     fn primary_name_matches_base(name: &str, base: &str) -> bool {
-        if base.is_empty() {
-            return false;
-        }
-        let Some(rest) = name.strip_prefix(base) else {
-            return false;
-        };
-        rest.is_empty()
-            || matches!(
-                rest.as_bytes().first(),
-                Some(b'.' | b'_' | b'-' | b'/' | b'\\')
-            )
+        !base.is_empty() && name.starts_with(base)
     }
 }
 
@@ -95,10 +85,9 @@ impl FormatReader for ZipReader {
         let mut archive = zip::ZipArchive::new(file)
             .map_err(|e| BioFormatsError::Format(format!("ZIP open error: {e}")))?;
 
-        // Per the Java ZipReader, the preferred ("primary") entry is based on
-        // the archive's base name (file name minus the ".zip" suffix). Require
-        // an exact match or a delimiter boundary so `sample2.tif` is not picked
-        // ahead of `sample.tif` for `sample.zip`.
+        // Per the Java ZipReader, the preferred ("primary") entry is the first
+        // entry whose name starts with the archive's base name (file name minus
+        // the ".zip" suffix).
         let inner_base = path
             .file_name()
             .and_then(|n| n.to_str())

@@ -77,7 +77,7 @@ impl Compression {
 impl From<u16> for Compression {
     fn from(v: u16) -> Self {
         match v {
-            1 => Compression::None,
+            0 | 1 => Compression::None,
             2 => Compression::Ccitt,
             3 => Compression::Group3Fax,
             4 => Compression::Group4Fax,
@@ -363,7 +363,7 @@ impl Ifd {
     }
 
     pub fn is_tiled(&self) -> bool {
-        self.entries.contains_key(&tag::TILE_OFFSETS)
+        self.entries.contains_key(&tag::TILE_WIDTH) || self.entries.contains_key(&tag::TILE_OFFSETS)
     }
 
     pub fn tile_width(&self) -> Option<u32> {

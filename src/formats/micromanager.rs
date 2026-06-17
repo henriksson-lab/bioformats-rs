@@ -177,6 +177,24 @@ struct Position {
 }
 
 impl Position {
+    fn samples_per_pixel(&self) -> usize {
+        if self.meta.is_rgb {
+            self.meta.size_c.max(1) as usize
+        } else {
+            1
+        }
+    }
+
+    fn plane_byte_count(&self, w: u32, h: u32) -> Result<usize> {
+        (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(self.samples_per_pixel()))
+            .and_then(|px| px.checked_mul(self.meta.pixel_type.bytes_per_sample()))
+            .ok_or_else(|| {
+                BioFormatsError::Format("MicroManager plane byte count overflows".into())
+            })
+    }
+
     /// Convert a 1D raster plane index to (z, c, t) for the given dimension order.
     fn zct_coords(order: DimensionOrder, z: u32, c: u32, t: u32, no: u32) -> (u32, u32, u32) {
         let z = z.max(1);
@@ -615,7 +633,8 @@ fn parse_frame_keys(json: &str, dir: &Path, data: &mut FrameData, digits: usize)
             if real.exists() {
                 data.file_name_map.insert(Index { z, c, t }, real);
             } else {
-                data.file_name_map.insert(Index { z, c, t }, dir.join(fname));
+                data.file_name_map
+                    .insert(Index { z, c, t }, dir.join(fname));
             }
         }
 
@@ -859,12 +878,18 @@ impl FormatReader for MicromanagerReader {
         if plane_index >= pos.meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let file = pos.file_for_plane(plane_index).ok_or_else(|| {
-            BioFormatsError::Format(format!(
-                "MicroManager: no TIFF file for plane {}",
-                plane_index
-            ))
-        })?;
+        let Some(file) = pos.file_for_plane(plane_index) else {
+            return Ok(vec![
+                0;
+                pos.plane_byte_count(pos.meta.size_x, pos.meta.size_y)?
+            ]);
+        };
+        if !file.exists() {
+            return Ok(vec![
+                0;
+                pos.plane_byte_count(pos.meta.size_x, pos.meta.size_y)?
+            ]);
+        }
         let mut r = TiffReader::new();
         r.set_id(&file)?;
         let inner_count = r.metadata().image_count.max(1);
@@ -887,12 +912,12 @@ impl FormatReader for MicromanagerReader {
         if plane_index >= pos.meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let file = pos.file_for_plane(plane_index).ok_or_else(|| {
-            BioFormatsError::Format(format!(
-                "MicroManager: no TIFF file for plane {}",
-                plane_index
-            ))
-        })?;
+        let Some(file) = pos.file_for_plane(plane_index) else {
+            return Ok(vec![0; pos.plane_byte_count(w, h)?]);
+        };
+        if !file.exists() {
+            return Ok(vec![0; pos.plane_byte_count(w, h)?]);
+        }
         let mut r = TiffReader::new();
         r.set_id(&file)?;
         let inner_count = r.metadata().image_count.max(1);
@@ -921,8 +946,8 @@ mod tests {
     /// camera/detector keys, plus the real TIFF files the FrameKeys reference
     /// (copied from the test fixture so `file_for_plane(..).exists()` holds).
     fn write_dataset() -> PathBuf {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/test_8x8_gray8.tif");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_8x8_gray8.tif");
         let dir = std::env::temp_dir().join(format!(
             "mm_meta_test_{}_{}",
             std::process::id(),
@@ -1055,6 +1080,45 @@ mod tests {
         assert_eq!(det.model.as_deref(), Some("ZylaModel"));
         assert_eq!(det.manufacturer.as_deref(), Some("Andor"));
         assert_eq!(det.detector_type.as_deref(), Some("EMCCD"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_mapped_tiff_returns_zero_filled_buffer_like_java() {
+        let dir = std::env::temp_dir().join(format!(
+            "mm_missing_tiff_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = r#"{
+  "Summary": {
+    "Width": 4,
+    "Height": 3,
+    "Channels": 1,
+    "Slices": 1,
+    "Frames": 1,
+    "PixelType": "GRAY8"
+  },
+  "FrameKey-0-0-0": {
+    "FileName": "missing.tif"
+  }
+}"#;
+        let meta_path = dir.join("metadata.txt");
+        std::fs::write(&meta_path, json).unwrap();
+
+        let mut reader = MicromanagerReader::new();
+        reader.set_id(&meta_path).unwrap();
+
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(plane, vec![0; 12]);
+
+        let region = reader.open_bytes_region(0, 1, 1, 2, 1).unwrap();
+        assert_eq!(region, vec![0; 2]);
 
         let _ = std::fs::remove_dir_all(dir);
     }

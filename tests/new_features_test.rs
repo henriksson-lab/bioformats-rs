@@ -834,8 +834,9 @@ fn file_stitcher_maps_mixed_time_channel_filenames() {
     let smeta = stitcher.metadata();
     assert_eq!((smeta.size_z, smeta.size_c, smeta.size_t), (1, 2, 2));
     assert_eq!(smeta.image_count, 4);
+    assert_eq!(smeta.dimension_order, bioformats::DimensionOrder::XYCZT);
 
-    let expected = [10, 30, 15, 35];
+    let expected = [10, 15, 30, 35];
     for (plane_index, value) in expected.into_iter().enumerate() {
         let plane = stitcher
             .open_bytes(plane_index as u32)

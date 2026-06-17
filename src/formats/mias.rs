@@ -301,7 +301,10 @@ impl CellWorxReader {
         // Z Map File), following the head of Java populateMetadata. The plate
         // log is "<plate>scan.log" (plate_base already ends with '_').
         let plate_log = PathBuf::from(format!("{}scan.log", plate));
-        let htd_path = self.htd_path.clone().unwrap_or_else(|| PathBuf::from(&plate));
+        let htd_path = self
+            .htd_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&plate));
         let plate_info = parse_plate_log(&plate_log, &htd_path);
         self.serial_number = plate_info.serial_number.clone();
         self.z_map_file = plate_info.z_map_file.clone();

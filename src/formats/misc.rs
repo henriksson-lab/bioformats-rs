@@ -1437,6 +1437,85 @@ fn parse_quicktime_stsc(stsc: Atom<'_>) -> Result<Vec<QuickTimeStscEntry>> {
     Ok(entries)
 }
 
+fn quicktime_sample_offsets_from_chunks(
+    chunk_offsets: &[u64],
+    sample_sizes: &[u32],
+    stsc_entries: Option<&[QuickTimeStscEntry]>,
+    chunk_offset_table_type: &str,
+) -> Result<Vec<u64>> {
+    let Some(stsc_entries) = stsc_entries else {
+        if chunk_offsets.len() != sample_sizes.len() {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "QuickTime blind parser requires one {chunk_offset_table_type} chunk offset per sample"
+            )));
+        }
+        return Ok(chunk_offsets.to_vec());
+    };
+
+    if stsc_entries.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsc table contains no entries".into(),
+        ));
+    }
+    if stsc_entries[0].first_chunk != 1 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsc first entry must start at chunk 1".into(),
+        ));
+    }
+    if stsc_entries
+        .iter()
+        .any(|entry| entry.first_chunk == 0 || entry.samples_per_chunk == 0)
+    {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsc contains an invalid chunk or sample count".into(),
+        ));
+    }
+    if stsc_entries
+        .windows(2)
+        .any(|window| window[1].first_chunk <= window[0].first_chunk)
+    {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsc entries are not strictly increasing".into(),
+        ));
+    }
+
+    let mut sample_offsets = Vec::with_capacity(sample_sizes.len());
+    let mut sample_index = 0usize;
+    let mut stsc_index = 0usize;
+    for (chunk_index, &chunk_offset) in chunk_offsets.iter().enumerate() {
+        let chunk_number = (chunk_index + 1) as u32;
+        while stsc_index + 1 < stsc_entries.len()
+            && stsc_entries[stsc_index + 1].first_chunk <= chunk_number
+        {
+            stsc_index += 1;
+        }
+        let samples_per_chunk = stsc_entries[stsc_index].samples_per_chunk as usize;
+        let mut offset = chunk_offset;
+        for _ in 0..samples_per_chunk {
+            if sample_index >= sample_sizes.len() {
+                return Ok(sample_offsets);
+            }
+            sample_offsets.push(offset);
+            offset = offset
+                .checked_add(sample_sizes[sample_index] as u64)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("QuickTime sample offset overflows".into())
+                })?;
+            sample_index += 1;
+        }
+    }
+
+    if sample_offsets.len() != sample_sizes.len() {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime stsc maps {} samples from {} chunks, but stsz declares {} samples",
+            sample_offsets.len(),
+            chunk_offsets.len(),
+            sample_sizes.len()
+        )));
+    }
+    Ok(sample_offsets)
+}
+
 fn parse_quicktime_elst(elst: Atom<'_>) -> Result<Vec<QuickTimeEditEntry>> {
     if elst.data.len() < 8 {
         return Err(BioFormatsError::UnsupportedFormat(
@@ -2586,14 +2665,12 @@ fn parse_quicktime_track(
     } else {
         4usize
     };
-    if chunk_count != sample_sizes.len()
-        || chunk_offsets_atom.data.len() < 8 + chunk_count * offset_entry_size
-    {
+    if chunk_offsets_atom.data.len() < 8 + chunk_count * offset_entry_size {
         return Err(BioFormatsError::UnsupportedFormat(format!(
-            "QuickTime blind parser requires one {chunk_offset_table_type} chunk offset per sample"
+            "QuickTime {chunk_offset_table_type} table is truncated"
         )));
     }
-    let sample_offsets: Vec<u64> = (0..chunk_count)
+    let chunk_offsets: Vec<u64> = (0..chunk_count)
         .map(|i| {
             let base = 8 + i * offset_entry_size;
             if chunk_offset_table_type == "co64" {
@@ -2606,6 +2683,15 @@ fn parse_quicktime_track(
             }
         })
         .collect();
+    let stsc_entries = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stsc"])?
+        .map(parse_quicktime_stsc)
+        .transpose()?;
+    let sample_offsets = quicktime_sample_offsets_from_chunks(
+        &chunk_offsets,
+        &sample_sizes,
+        stsc_entries.as_deref(),
+        chunk_offset_table_type,
+    )?;
     for (offset, size) in sample_offsets.iter().zip(&sample_sizes) {
         let end = offset
             .checked_add(*size as u64)
@@ -2762,7 +2848,7 @@ fn parse_quicktime_track(
         sample_sizes.len() as u64,
     );
     quicktime_insert_u32_list_metadata(&mut metadata, "quicktime.sample_sizes", &sample_sizes);
-    quicktime_insert_u64_list_metadata(&mut metadata, "quicktime.chunk_offsets", &sample_offsets);
+    quicktime_insert_u64_list_metadata(&mut metadata, "quicktime.chunk_offsets", &chunk_offsets);
     quicktime_insert_u64_list_metadata(&mut metadata, "quicktime.sample_offsets", &sample_offsets);
     metadata.insert(
         "quicktime.chunk_offset_table_type".into(),
@@ -2785,9 +2871,6 @@ fn parse_quicktime_track(
         .transpose()?;
     let stts_entries = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stts"])?
         .map(|atom| parse_quicktime_stts(atom, sample_sizes.len()))
-        .transpose()?;
-    let stsc_entries = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"stsc"])?
-        .map(parse_quicktime_stsc)
         .transpose()?;
     let ctts_entries = descendant(trak, &[*b"mdia", *b"minf", *b"stbl", *b"ctts"])?
         .map(|atom| parse_quicktime_ctts(atom, sample_sizes.len()))
@@ -6655,10 +6738,14 @@ impl FormatReader for SmCameraReader {
 // ---------------------------------------------------------------------------
 // 10. Plain text image — CSV/TSV parsing like TextImageReader
 // ---------------------------------------------------------------------------
-/// Plain text image reader (`.txt`).
+/// Plain text image reader (`.txt`, `.csv`).
 ///
-/// Parses tab/comma/space-separated numeric values from a text file,
-/// treating each row as a line of pixels and each value as a Float32 sample.
+/// Parses Bio-Formats TextReader-style coordinate tables.
+///
+/// A header row containing `x` and `y` coordinate columns identifies the table;
+/// every other column is exposed as one Float32 channel. Missing sparse pixels
+/// are initialized to NaN. Plain numeric grids are retained as a compatibility
+/// fallback.
 pub struct TextReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -6687,7 +6774,7 @@ impl FormatReader for TextReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("txt"))
+        matches!(ext.as_deref(), Some("txt") | Some("csv"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -6696,67 +6783,26 @@ impl FormatReader for TextReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
-        let mut rows: Vec<Vec<f32>> = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut cells: Vec<f32> = Vec::new();
-            for cell in line
-                .split(|c: char| c == ',' || c == '\t' || c == ' ')
-                .filter(|s| !s.is_empty())
-            {
-                let value = cell.trim().parse::<f64>().map_err(|_| {
-                    BioFormatsError::UnsupportedFormat(format!(
-                        "TextReader: non-numeric cell {cell:?}"
-                    ))
-                })?;
-                cells.push(value as f32);
-            }
-            if !cells.is_empty() {
-                rows.push(cells);
-            }
-        }
-        if rows.is_empty() {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "TextReader: file contains no numeric data".to_string(),
-            ));
-        }
-        let height = rows.len() as u32;
-        let width = rows[0].len();
-        if rows.iter().any(|row| row.len() != width) {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "TextReader: rows have inconsistent column counts".to_string(),
-            ));
-        }
-        let width = width as u32;
-        // Build Float32 pixel buffer (row-major).
-        let mut pixel_data = Vec::with_capacity((width * height * 4) as usize);
-        for row in &rows {
-            for &val in row {
-                pixel_data.extend_from_slice(&val.to_le_bytes());
-            }
-        }
+        let (width, height, channels, pixel_data, metadata) = parse_text_pixels(&text)?;
         self.path = Some(path.to_path_buf());
         self.pixel_data = pixel_data;
         self.meta = Some(ImageMetadata {
             size_x: width,
             size_y: height,
             size_z: 1,
-            size_c: 1,
+            size_c: channels,
             size_t: 1,
             pixel_type: PixelType::Float32,
             bits_per_pixel: 32,
-            image_count: 1,
+            image_count: channels,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: true,
+            is_little_endian: false,
             resolution_count: 1,
             thumbnail: false,
-            series_metadata: HashMap::new(),
+            series_metadata: metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
@@ -6799,7 +6845,22 @@ impl FormatReader for TextReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        Ok(self.pixel_data.clone())
+        let plane_size = (meta.size_x as usize)
+            .checked_mul(meta.size_y as usize)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| BioFormatsError::Format("TextReader: plane size overflows".into()))?;
+        let start = plane_size
+            .checked_mul(plane_index as usize)
+            .ok_or_else(|| BioFormatsError::Format("TextReader: plane offset overflows".into()))?;
+        let end = start
+            .checked_add(plane_size)
+            .ok_or_else(|| BioFormatsError::Format("TextReader: plane end overflows".into()))?;
+        self.pixel_data
+            .get(start..end)
+            .map(|plane| plane.to_vec())
+            .ok_or_else(|| {
+                BioFormatsError::InvalidData("TextReader: plane buffer truncated".into())
+            })
     }
 
     fn open_bytes_region(
@@ -6822,6 +6883,305 @@ impl FormatReader for TextReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+fn parse_text_pixels(
+    text: &str,
+) -> Result<(u32, u32, u32, Vec<u8>, HashMap<String, MetadataValue>)> {
+    let lines: Vec<Vec<String>> = text
+        .lines()
+        .filter_map(|line| {
+            let tokens: Vec<String> = split_text_row(line)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            if tokens.is_empty() {
+                None
+            } else {
+                Some(tokens)
+            }
+        })
+        .collect();
+
+    if let Some(parsed) = parse_text_coordinate_table(&lines)? {
+        return Ok(parsed);
+    }
+    parse_text_dense_grid(&lines)
+}
+
+fn split_text_row(line: &str) -> Vec<&str> {
+    line.trim()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn parse_text_coordinate_table(
+    lines: &[Vec<String>],
+) -> Result<Option<(u32, u32, u32, Vec<u8>, HashMap<String, MetadataValue>)>> {
+    let Some((header_index, data_index, x_index, y_index)) = find_text_table_header(lines) else {
+        return Ok(None);
+    };
+    let header = &lines[header_index];
+    let row_len = header.len();
+    let channel_columns: Vec<usize> = (0..row_len)
+        .filter(|&i| i != x_index && i != y_index)
+        .collect();
+    let channels = u32::try_from(channel_columns.len())
+        .map_err(|_| BioFormatsError::Format("TextReader: channel count overflows".into()))?;
+
+    let mut parsed_rows: Vec<Vec<f64>> = Vec::new();
+    let mut width = 0u32;
+    let mut height = 0u32;
+    for tokens in &lines[data_index..] {
+        if tokens.len() != row_len {
+            continue;
+        }
+        let Some(row) = parse_text_numeric_row(tokens) else {
+            continue;
+        };
+        let x = row[x_index] as i32;
+        let y = row[y_index] as i32;
+        if x < 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TextReader: invalid X coordinate {x}"
+            )));
+        }
+        if y < 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TextReader: invalid Y coordinate {y}"
+            )));
+        }
+        width = width.max(x as u32 + 1);
+        height = height.max(y as u32 + 1);
+        parsed_rows.push(row);
+    }
+    if parsed_rows.is_empty() || width == 0 || height == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TextReader: file contains no tabular numeric data".into(),
+        ));
+    }
+
+    let plane_values = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| BioFormatsError::Format("TextReader: plane size overflows".into()))?;
+    let total_values = plane_values
+        .checked_mul(channels as usize)
+        .ok_or_else(|| BioFormatsError::Format("TextReader: image size overflows".into()))?;
+    let mut values = vec![f32::NAN; total_values];
+    for row in parsed_rows {
+        let x = row[x_index] as usize;
+        let y = row[y_index] as usize;
+        let pixel = y * width as usize + x;
+        for (c, &column) in channel_columns.iter().enumerate() {
+            values[c * plane_values + pixel] = row[column] as f32;
+        }
+    }
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "TextReader table header rows".into(),
+        MetadataValue::Int(header_index as i64 + 1),
+    );
+    metadata.insert(
+        "TextReader x column".into(),
+        MetadataValue::String(header[x_index].clone()),
+    );
+    metadata.insert(
+        "TextReader y column".into(),
+        MetadataValue::String(header[y_index].clone()),
+    );
+    for (c, &column) in channel_columns.iter().enumerate() {
+        metadata.insert(
+            format!("TextReader channel {c}"),
+            MetadataValue::String(header[column].clone()),
+        );
+    }
+
+    Ok(Some((
+        width,
+        height,
+        channels,
+        floats_to_big_endian_bytes(&values)?,
+        metadata,
+    )))
+}
+
+fn find_text_table_header(lines: &[Vec<String>]) -> Option<(usize, usize, usize, usize)> {
+    for data_index in 1..lines.len() {
+        let header_index = data_index - 1;
+        let header = &lines[header_index];
+        let data = &lines[data_index];
+        if data.len() < 3 || header.len() != data.len() || parse_text_numeric_row(data).is_none() {
+            continue;
+        }
+        let x_index = header.iter().position(|token| token == "x");
+        let y_index = header.iter().position(|token| token == "y");
+        if let (Some(x), Some(y)) = (x_index, y_index) {
+            return Some((header_index, data_index, x, y));
+        }
+    }
+    None
+}
+
+fn parse_text_numeric_row(tokens: &[String]) -> Option<Vec<f64>> {
+    tokens
+        .iter()
+        .map(|token| parse_java_double(token))
+        .collect()
+}
+
+fn parse_java_double(token: &str) -> Option<f64> {
+    let mut token = token.trim();
+    if matches!(token.as_bytes().last(), Some(b'f' | b'F' | b'd' | b'D')) {
+        token = &token[..token.len() - 1];
+    }
+    match token {
+        "Infinity" | "+Infinity" => Some(f64::INFINITY),
+        "-Infinity" => Some(f64::NEG_INFINITY),
+        "NaN" | "+NaN" | "-NaN" => Some(f64::NAN),
+        _ => token
+            .parse::<f64>()
+            .ok()
+            .or_else(|| parse_java_hex_double(token)),
+    }
+}
+
+fn parse_java_hex_double(token: &str) -> Option<f64> {
+    let (negative, body) = token
+        .strip_prefix('-')
+        .map(|s| (true, s))
+        .or_else(|| token.strip_prefix('+').map(|s| (false, s)))
+        .unwrap_or((false, token));
+    let body = body
+        .strip_prefix("0x")
+        .or_else(|| body.strip_prefix("0X"))?;
+    let (mantissa, exponent) = body.split_once(['p', 'P'])?;
+    let exponent = exponent.parse::<i32>().ok()?;
+    let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && frac.is_empty() {
+        return None;
+    }
+    let mut value = 0.0f64;
+    let mut seen_digit = false;
+    for ch in whole.chars() {
+        value = value * 16.0 + ch.to_digit(16)? as f64;
+        seen_digit = true;
+    }
+    let mut scale = 1.0 / 16.0;
+    for ch in frac.chars() {
+        value += ch.to_digit(16)? as f64 * scale;
+        scale /= 16.0;
+        seen_digit = true;
+    }
+    if !seen_digit {
+        return None;
+    }
+    value *= 2.0f64.powi(exponent);
+    Some(if negative { -value } else { value })
+}
+
+fn parse_text_dense_grid(
+    lines: &[Vec<String>],
+) -> Result<(u32, u32, u32, Vec<u8>, HashMap<String, MetadataValue>)> {
+    let mut rows: Vec<Vec<f32>> = Vec::new();
+    for tokens in lines {
+        let mut row = Vec::with_capacity(tokens.len());
+        for cell in tokens {
+            let value = parse_java_double(cell).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!("TextReader: non-numeric cell {cell:?}"))
+            })?;
+            row.push(value as f32);
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    if rows.is_empty() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TextReader: file contains no numeric data".to_string(),
+        ));
+    }
+    let width = rows[0].len();
+    if rows.iter().any(|row| row.len() != width) {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TextReader: rows have inconsistent column counts".to_string(),
+        ));
+    }
+    let width = u32::try_from(width)
+        .map_err(|_| BioFormatsError::Format("TextReader: width overflows".into()))?;
+    let height = u32::try_from(rows.len())
+        .map_err(|_| BioFormatsError::Format("TextReader: height overflows".into()))?;
+    let values: Vec<f32> = rows.iter().flatten().copied().collect();
+    Ok((
+        width,
+        height,
+        1,
+        floats_to_big_endian_bytes(&values)?,
+        HashMap::new(),
+    ))
+}
+
+fn floats_to_big_endian_bytes(values: &[f32]) -> Result<Vec<u8>> {
+    let mut pixel_data = Vec::with_capacity(
+        values
+            .len()
+            .checked_mul(4)
+            .ok_or_else(|| BioFormatsError::Format("TextReader: byte count overflows".into()))?,
+    );
+    for &value in values {
+        pixel_data.extend_from_slice(&value.to_be_bytes());
+    }
+    Ok(pixel_data)
+}
+
+#[cfg(test)]
+mod text_reader_tests {
+    use super::*;
+
+    fn f32_be_at(bytes: &[u8], index: usize) -> f32 {
+        let start = index * 4;
+        f32::from_be_bytes(bytes[start..start + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn text_reader_coordinate_table_uses_columns_as_sparse_channels() {
+        let text = "ignored preamble\nx,y,ch1,ch2\n0,0,1,10\n2,1,2,20\n";
+        let (width, height, channels, bytes, metadata) = parse_text_pixels(text).unwrap();
+
+        assert_eq!((width, height, channels), (3, 2, 2));
+        assert!(!bytes.is_empty());
+        assert_eq!(f32_be_at(&bytes, 0), 1.0);
+        assert!(f32_be_at(&bytes, 1).is_nan());
+        assert_eq!(f32_be_at(&bytes, 5), 2.0);
+        assert_eq!(f32_be_at(&bytes, 6), 10.0);
+        assert!(f32_be_at(&bytes, 7).is_nan());
+        assert_eq!(f32_be_at(&bytes, 11), 20.0);
+        assert!(matches!(
+            metadata.get("TextReader channel 1"),
+            Some(MetadataValue::String(value)) if value == "ch2"
+        ));
+    }
+
+    #[test]
+    fn text_reader_dense_fallback_uses_big_endian_float_bytes() {
+        let (width, height, channels, bytes, _) = parse_text_pixels("1,2\n3,4\n").unwrap();
+
+        assert_eq!((width, height, channels), (2, 2, 1));
+        assert_eq!(&bytes[0..4], &1.0f32.to_be_bytes());
+        assert_eq!(&bytes[12..16], &4.0f32.to_be_bytes());
+    }
+
+    #[test]
+    fn text_reader_accepts_java_double_tokens() {
+        let (width, height, channels, bytes, _) =
+            parse_text_pixels("x,y,value\n0,0,Infinity\n1,0,0x1.8p1\n").unwrap();
+
+        assert_eq!((width, height, channels), (2, 1, 1));
+        assert!(f32_be_at(&bytes, 0).is_infinite());
+        assert_eq!(f32_be_at(&bytes, 1), 3.0);
+        assert_eq!(parse_java_double("-0x1p2D"), Some(-4.0));
     }
 }
 
@@ -6953,10 +7313,8 @@ mod qt_writer_tests {
             })
             .collect();
 
-        let path = std::env::temp_dir().join(format!(
-            "bioformats_qtwriter_rt_{}.mov",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("bioformats_qtwriter_rt_{}.mov", std::process::id()));
 
         let mut writer = QtWriter::new();
         writer.set_metadata(&meta).unwrap();

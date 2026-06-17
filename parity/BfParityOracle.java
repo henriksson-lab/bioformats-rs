@@ -12,7 +12,8 @@
 ///   - one NON-ZERO-ORIGIN region (centered 256² crop) of plane 0, to catch
 ///     tiling/stride/offset bugs the (0,0) crop misses.
 /// and the OME metadata (per image: name, physical sizes, time increment,
-/// per-channel name / samplesPerPixel / emission / excitation).
+/// per-channel name / samplesPerPixel / emission / excitation, plus graph
+/// summary counts for instruments, planes, ROIs, and plates).
 ///
 /// The JSON is hand-built (no JSON lib) so it only needs bioformats_package.jar.
 ///
@@ -200,7 +201,78 @@ public class BfParityOracle {
             }
             sb.append("]}");
         }
-        sb.append("]}");
+        sb.append("],\"summary\":");
+        sb.append(omeSummaryJson(ome));
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private static String omeSummaryJson(IMetadata ome) {
+        int instrumentCount = intValRaw(() -> ome.getInstrumentCount());
+        int objectiveCount = 0;
+        int detectorCount = 0;
+        int lightSourceCount = 0;
+        int filterCount = 0;
+        int dichroicCount = 0;
+        for (int i = 0; i < instrumentCount; i++) {
+            final int ii = i;
+            objectiveCount += intValRaw(() -> ome.getObjectiveCount(ii));
+            detectorCount += intValRaw(() -> ome.getDetectorCount(ii));
+            lightSourceCount += intValRaw(() -> ome.getLightSourceCount(ii));
+            filterCount += intValRaw(() -> ome.getFilterCount(ii));
+            dichroicCount += intValRaw(() -> ome.getDichroicCount(ii));
+        }
+
+        int imageCount = intValRaw(() -> ome.getImageCount());
+        int planeCount = 0;
+        for (int i = 0; i < imageCount; i++) {
+            final int ii = i;
+            planeCount += intValRaw(() -> ome.getPlaneCount(ii));
+        }
+
+        int roiCount = intValRaw(() -> ome.getROICount());
+        int roiShapeCount = 0;
+        for (int r = 0; r < roiCount; r++) {
+            final int rr = r;
+            roiShapeCount += intValRaw(() -> ome.getShapeCount(rr));
+        }
+
+        int plateCount = intValRaw(() -> ome.getPlateCount());
+        int wellCount = 0;
+        int wellSampleCount = 0;
+        for (int p = 0; p < plateCount; p++) {
+            final int pp = p;
+            int wc = intValRaw(() -> ome.getWellCount(pp));
+            wellCount += wc;
+            for (int w = 0; w < wc; w++) {
+                final int ww = w;
+                wellSampleCount += intValRaw(() -> ome.getWellSampleCount(pp, ww));
+            }
+        }
+
+        int mapAnnotationCount = intValRaw(() -> ome.getMapAnnotationCount());
+        int commentAnnotationCount = intValRaw(() -> ome.getCommentAnnotationCount());
+        int tagAnnotationCount = intValRaw(() -> ome.getTagAnnotationCount());
+        int xmlAnnotationCount = intValRaw(() -> ome.getXMLAnnotationCount());
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"instrumentCount\":").append(instrumentCount);
+        sb.append(",\"objectiveCount\":").append(objectiveCount);
+        sb.append(",\"detectorCount\":").append(detectorCount);
+        sb.append(",\"lightSourceCount\":").append(lightSourceCount);
+        sb.append(",\"filterCount\":").append(filterCount);
+        sb.append(",\"dichroicCount\":").append(dichroicCount);
+        sb.append(",\"planeCount\":").append(planeCount);
+        sb.append(",\"roiCount\":").append(roiCount);
+        sb.append(",\"roiShapeCount\":").append(roiShapeCount);
+        sb.append(",\"plateCount\":").append(plateCount);
+        sb.append(",\"wellCount\":").append(wellCount);
+        sb.append(",\"wellSampleCount\":").append(wellSampleCount);
+        sb.append(",\"mapAnnotationCount\":").append(mapAnnotationCount);
+        sb.append(",\"commentAnnotationCount\":").append(commentAnnotationCount);
+        sb.append(",\"tagAnnotationCount\":").append(tagAnnotationCount);
+        sb.append(",\"xmlAnnotationCount\":").append(xmlAnnotationCount);
+        sb.append("}");
         return sb.toString();
     }
 
@@ -222,6 +294,10 @@ public class BfParityOracle {
     private static String intVal(IntSup s) {
         try { Integer v = s.get(); return v == null ? "null" : String.valueOf(v); }
         catch (Throwable t) { return "null"; }
+    }
+    private static int intValRaw(IntSup s) {
+        try { Integer v = s.get(); return v == null ? 0 : v.intValue(); }
+        catch (Throwable t) { return 0; }
     }
 
     private static String jstr(String s) {

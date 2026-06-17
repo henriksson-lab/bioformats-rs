@@ -321,12 +321,13 @@ fn flowsight_channel_count(ifd0: &Ifd) -> usize {
 }
 
 fn split_flowsight_pipe_list(value: &str) -> Vec<String> {
-    value
-        .split('|')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
+    // Java FlowSightReader uses String.split("\\|"), which preserves empty
+    // interior tokens but discards trailing empty tokens.
+    let mut parts: Vec<String> = value.split('|').map(str::to_owned).collect();
+    while parts.len() > 1 && parts.last().is_some_and(|s| s.is_empty()) {
+        parts.pop();
+    }
+    parts
 }
 
 fn count_flowsight_channels_in_use(xml: &str) -> Option<usize> {
@@ -2641,9 +2642,7 @@ impl Sb7ImageRecord70 {
             if let Sb7Node::Scalar(text) = value {
                 let text = text.trim();
                 match name {
-                    "mName" => {
-                        record.lens.name = Some(slidebook7_restore_special_characters(text))
-                    }
+                    "mName" => record.lens.name = Some(slidebook7_restore_special_characters(text)),
                     "mNA" => record.lens.na = text.parse::<f64>().ok(),
                     "mMicronPerPixel" => record.lens.micron_per_pixel = text.parse::<f64>().ok(),
                     "mActualMagnification" => {
@@ -2685,7 +2684,9 @@ impl Sb7ImageRecord70 {
                 match name {
                     "mLow" => record.main_view.low = slidebook7_decode_number_array(value, true),
                     "mHigh" => record.main_view.high = slidebook7_decode_number_array(value, true),
-                    "mGamma" => record.main_view.gamma = slidebook7_decode_number_array(value, true),
+                    "mGamma" => {
+                        record.main_view.gamma = slidebook7_decode_number_array(value, true)
+                    }
                     _ => {}
                 }
             }
@@ -2730,18 +2731,19 @@ impl Sb7ChannelDef70 {
     // assigned through the generic walk).
     fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
         let mut record = Sb7ChannelDef70::default();
-        let after_def = slidebook7_class_decode(node, start_index, "CChannelDef70", |name, value| {
-            if let Sb7Node::Scalar(text) = value {
-                let text = text.trim();
-                match name {
-                    "mName" => record.name = Some(slidebook7_restore_special_characters(text)),
-                    "mCameraName" => {
-                        record.camera_name = Some(slidebook7_restore_special_characters(text))
+        let after_def =
+            slidebook7_class_decode(node, start_index, "CChannelDef70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mName" => record.name = Some(slidebook7_restore_special_characters(text)),
+                        "mCameraName" => {
+                            record.camera_name = Some(slidebook7_restore_special_characters(text))
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-        });
+            });
         let after_fluor = slidebook7_class_decode(node, after_def, "CFluorDef70", |name, value| {
             if let Sb7Node::Scalar(text) = value {
                 let text = text.trim();
@@ -2749,7 +2751,9 @@ impl Sb7ChannelDef70 {
                     "mName" => {
                         record.fluor.name = Some(slidebook7_restore_special_characters(text))
                     }
-                    "mExcitationLambda" => record.fluor.excitation_lambda = text.parse::<f64>().ok(),
+                    "mExcitationLambda" => {
+                        record.fluor.excitation_lambda = text.parse::<f64>().ok()
+                    }
                     "mLambda" => record.fluor.lambda = text.parse::<f64>().ok(),
                     _ => {}
                 }
@@ -2977,8 +2981,11 @@ struct Sb7DataTableHeader70 {
 impl Sb7DataTableHeader70 {
     fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
         let mut record = Sb7DataTableHeader70::default();
-        let next =
-            slidebook7_class_decode(node, start_index, "CDataTableHeaderRecord70", |name, value| {
+        let next = slidebook7_class_decode(
+            node,
+            start_index,
+            "CDataTableHeaderRecord70",
+            |name, value| {
                 if let Sb7Node::Scalar(text) = value {
                     let text = text.trim();
                     match name {
@@ -2991,7 +2998,8 @@ impl Sb7DataTableHeader70 {
                         _ => {}
                     }
                 }
-            });
+            },
+        );
         (record, next)
     }
 }
@@ -3076,14 +3084,18 @@ impl Sb7FrapRegionAnnotation70 {
     // chained base `CAnnotation70`, then `theNumRegions` cube annotations.
     fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
         let mut record = Sb7FrapRegionAnnotation70::default();
-        let after_frap =
-            slidebook7_class_decode(node, start_index, "CFRAPRegionAnnotation70", |name, value| {
+        let after_frap = slidebook7_class_decode(
+            node,
+            start_index,
+            "CFRAPRegionAnnotation70",
+            |name, value| {
                 if let Sb7Node::Scalar(text) = value {
                     if name == "mXML" {
                         record.xml = Some(slidebook7_restore_special_characters(text.trim()));
                     }
                 }
-            });
+            },
+        );
         let (ann, after_ann) = Sb7Annotation70::decode(node, after_frap);
         record.ann = ann;
         let (num_regions, after_count) =
@@ -3184,11 +3196,8 @@ fn slidebook7_load_annotations(node: &Sb7Node) -> (Sb7DataTableHeader70, Vec<Sb7
         last_index = tp_next;
         let mut anno = Sb7Annotations::default();
 
-        let (cube_size, next) = slidebook7_get_integer_value(
-            node,
-            last_index as usize,
-            "theCubeAnnotation70ListSize",
-        );
+        let (cube_size, next) =
+            slidebook7_get_integer_value(node, last_index as usize, "theCubeAnnotation70ListSize");
         if next < 0 {
             break;
         }
@@ -3260,24 +3269,25 @@ struct Sb7RemapChannelLut70 {
 impl Sb7RemapChannelLut70 {
     fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
         let mut record = Sb7RemapChannelLut70::default();
-        let next = slidebook7_class_decode(node, start_index, "CRemapChannelLUT70", |name, value| {
-            if let Sb7Node::Scalar(text) = value {
-                let text = text.trim();
-                match name {
-                    "mRemapType" => record.remap_type = text.parse::<i64>().ok(),
-                    "mLowDesired" => record.low_desired = text.parse::<f64>().ok(),
-                    "mHighDesired" => record.high_desired = text.parse::<f64>().ok(),
-                    "mLowGiven" => record.low_given = text.parse::<i64>().ok(),
-                    "mHighGiven" => record.high_given = text.parse::<i64>().ok(),
-                    "mBuiltTable" => record.built_table = Some(text == "true"),
-                    "mEquationString" => {
-                        record.equation_string =
-                            Some(slidebook7_restore_special_characters(text))
+        let next =
+            slidebook7_class_decode(node, start_index, "CRemapChannelLUT70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mRemapType" => record.remap_type = text.parse::<i64>().ok(),
+                        "mLowDesired" => record.low_desired = text.parse::<f64>().ok(),
+                        "mHighDesired" => record.high_desired = text.parse::<f64>().ok(),
+                        "mLowGiven" => record.low_given = text.parse::<i64>().ok(),
+                        "mHighGiven" => record.high_given = text.parse::<i64>().ok(),
+                        "mBuiltTable" => record.built_table = Some(text == "true"),
+                        "mEquationString" => {
+                            record.equation_string =
+                                Some(slidebook7_restore_special_characters(text))
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-        });
+            });
         (record, next)
     }
 }
@@ -3293,18 +3303,19 @@ struct Sb7AlignManipRecord70 {
 impl Sb7AlignManipRecord70 {
     fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
         let mut record = Sb7AlignManipRecord70::default();
-        let next = slidebook7_class_decode(node, start_index, "CAlignManipRecord70", |name, value| {
-            if let Sb7Node::Scalar(text) = value {
-                let text = text.trim();
-                match name {
-                    "mManipID" => record.manip_id = text.parse::<i64>().ok(),
-                    "mXOffset" => record.x_offset = text.parse::<f64>().ok(),
-                    "mYOffset" => record.y_offset = text.parse::<f64>().ok(),
-                    "mZOffset" => record.z_offset = text.parse::<f64>().ok(),
-                    _ => {}
+        let next =
+            slidebook7_class_decode(node, start_index, "CAlignManipRecord70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mManipID" => record.manip_id = text.parse::<i64>().ok(),
+                        "mXOffset" => record.x_offset = text.parse::<f64>().ok(),
+                        "mYOffset" => record.y_offset = text.parse::<f64>().ok(),
+                        "mZOffset" => record.z_offset = text.parse::<f64>().ok(),
+                        _ => {}
+                    }
                 }
-            }
-        });
+            });
         (record, next)
     }
 }
@@ -3321,19 +3332,20 @@ struct Sb7RatioManipRecord70 {
 impl Sb7RatioManipRecord70 {
     fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
         let mut record = Sb7RatioManipRecord70::default();
-        let next = slidebook7_class_decode(node, start_index, "CRatioManipRecord70", |name, value| {
-            if let Sb7Node::Scalar(text) = value {
-                let text = text.trim();
-                match name {
-                    "mManipID" => record.manip_id = text.parse::<i64>().ok(),
-                    "mKd" => record.kd = text.parse::<f64>().ok(),
-                    "mRmin" => record.rmin = text.parse::<f64>().ok(),
-                    "mRmax" => record.rmax = text.parse::<f64>().ok(),
-                    "mBeta" => record.beta = text.parse::<f64>().ok(),
-                    _ => {}
+        let next =
+            slidebook7_class_decode(node, start_index, "CRatioManipRecord70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mManipID" => record.manip_id = text.parse::<i64>().ok(),
+                        "mKd" => record.kd = text.parse::<f64>().ok(),
+                        "mRmin" => record.rmin = text.parse::<f64>().ok(),
+                        "mRmax" => record.rmax = text.parse::<f64>().ok(),
+                        "mBeta" => record.beta = text.parse::<f64>().ok(),
+                        _ => {}
+                    }
                 }
-            }
-        });
+            });
         (record, next)
     }
 }
@@ -3349,18 +3361,19 @@ struct Sb7FretManipRecord70 {
 impl Sb7FretManipRecord70 {
     fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
         let mut record = Sb7FretManipRecord70::default();
-        let next = slidebook7_class_decode(node, start_index, "CFRETManipRecord70", |name, value| {
-            if let Sb7Node::Scalar(text) = value {
-                let text = text.trim();
-                match name {
-                    "mManipID" => record.manip_id = text.parse::<i64>().ok(),
-                    "mFRETParadigm" => record.fret_paradigm = text.parse::<i64>().ok(),
-                    "mFdDd" => record.fd_dd = text.parse::<f64>().ok(),
-                    "mFaAa" => record.fa_aa = text.parse::<f64>().ok(),
-                    _ => {}
+        let next =
+            slidebook7_class_decode(node, start_index, "CFRETManipRecord70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mManipID" => record.manip_id = text.parse::<i64>().ok(),
+                        "mFRETParadigm" => record.fret_paradigm = text.parse::<i64>().ok(),
+                        "mFdDd" => record.fd_dd = text.parse::<f64>().ok(),
+                        "mFaAa" => record.fa_aa = text.parse::<f64>().ok(),
+                        _ => {}
+                    }
                 }
-            }
-        });
+            });
         (record, next)
     }
 }
@@ -3375,17 +3388,18 @@ struct Sb7RemapManipRecord70 {
 impl Sb7RemapManipRecord70 {
     fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
         let mut record = Sb7RemapManipRecord70::default();
-        let next = slidebook7_class_decode(node, start_index, "CRemapManipRecord70", |name, value| {
-            if let Sb7Node::Scalar(text) = value {
-                let text = text.trim();
-                match name {
-                    "mManipID" => record.manip_id = text.parse::<i64>().ok(),
-                    "mRemapType" => record.remap_type = text.parse::<i64>().ok(),
-                    "mNumCalibPoints" => record.num_calib_points = text.parse::<i64>().ok(),
-                    _ => {}
+        let next =
+            slidebook7_class_decode(node, start_index, "CRemapManipRecord70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mManipID" => record.manip_id = text.parse::<i64>().ok(),
+                        "mRemapType" => record.remap_type = text.parse::<i64>().ok(),
+                        "mNumCalibPoints" => record.num_calib_points = text.parse::<i64>().ok(),
+                        _ => {}
+                    }
                 }
-            }
-        });
+            });
         (record, next)
     }
 }
@@ -3412,19 +3426,20 @@ struct Sb7HistogramRecord70 {
 impl Sb7HistogramRecord70 {
     fn decode(node: &Sb7Node, start_index: usize) -> (Self, usize) {
         let mut record = Sb7HistogramRecord70::default();
-        let next = slidebook7_class_decode(node, start_index, "CHistogramRecord70", |name, value| {
-            if let Sb7Node::Scalar(text) = value {
-                let text = text.trim();
-                match name {
-                    "mMin" => record.min = text.parse::<i64>().ok(),
-                    "mMax" => record.max = text.parse::<i64>().ok(),
-                    "mMean" => record.mean = text.parse::<f64>().ok(),
-                    "mNumBins" => record.num_bins = text.parse::<i64>().ok(),
-                    "mChannelIndex" => record.channel_index = text.parse::<i64>().ok(),
-                    _ => {}
+        let next =
+            slidebook7_class_decode(node, start_index, "CHistogramRecord70", |name, value| {
+                if let Sb7Node::Scalar(text) = value {
+                    let text = text.trim();
+                    match name {
+                        "mMin" => record.min = text.parse::<i64>().ok(),
+                        "mMax" => record.max = text.parse::<i64>().ok(),
+                        "mMean" => record.mean = text.parse::<f64>().ok(),
+                        "mNumBins" => record.num_bins = text.parse::<i64>().ok(),
+                        "mChannelIndex" => record.channel_index = text.parse::<i64>().ok(),
+                        _ => {}
+                    }
                 }
-            }
-        });
+            });
         (record, next)
     }
 }
@@ -4448,7 +4463,10 @@ impl SlideBook7Reader {
             put_string("slidebook7.image_record.info", &typed.info);
             put_string("slidebook7.image_record.unique_id", &typed.unique_id);
             put_string("slidebook7.image_record.lens.name", &typed.lens.name);
-            put_string("slidebook7.image_record.lens.camera_name", &typed.lens.camera_name);
+            put_string(
+                "slidebook7.image_record.lens.camera_name",
+                &typed.lens.camera_name,
+            );
             put_string("slidebook7.image_record.optovar.name", &typed.optovar.name);
             let mut put_float = |key: &str, value: Option<f64>| {
                 if let Some(value) = value.filter(|v| v.is_finite()) {
@@ -4458,7 +4476,10 @@ impl SlideBook7Reader {
                     );
                 }
             };
-            put_float("slidebook7.image_record.lens.numerical_aperture", typed.lens.na);
+            put_float(
+                "slidebook7.image_record.lens.numerical_aperture",
+                typed.lens.na,
+            );
             put_float(
                 "slidebook7.image_record.lens.micron_per_pixel",
                 typed.lens.micron_per_pixel,
@@ -4480,7 +4501,10 @@ impl SlideBook7Reader {
                 }
             };
             put_int("slidebook7.image_record.num_masks", typed.num_masks);
-            put_int("slidebook7.image_record.main_view.view_id", typed.main_view.view_id);
+            put_int(
+                "slidebook7.image_record.main_view.view_id",
+                typed.main_view.view_id,
+            );
             put_int(
                 "slidebook7.image_record.main_view.red_channel",
                 typed.main_view.red_channel,
@@ -4501,9 +4525,18 @@ impl SlideBook7Reader {
             }
             for (key, values) in [
                 ("slidebook7.image_record.thumbnail", &typed.thumbnail),
-                ("slidebook7.image_record.main_view.low", &typed.main_view.low),
-                ("slidebook7.image_record.main_view.high", &typed.main_view.high),
-                ("slidebook7.image_record.main_view.gamma", &typed.main_view.gamma),
+                (
+                    "slidebook7.image_record.main_view.low",
+                    &typed.main_view.low,
+                ),
+                (
+                    "slidebook7.image_record.main_view.high",
+                    &typed.main_view.high,
+                ),
+                (
+                    "slidebook7.image_record.main_view.gamma",
+                    &typed.main_view.gamma,
+                ),
             ] {
                 if let Some(values) = values {
                     meta.series_metadata.insert(
@@ -4547,7 +4580,10 @@ impl SlideBook7Reader {
                         ("slidebook7.histogram.0.min", histogram.min),
                         ("slidebook7.histogram.0.max", histogram.max),
                         ("slidebook7.histogram.0.num_bins", histogram.num_bins),
-                        ("slidebook7.histogram.0.channel_index", histogram.channel_index),
+                        (
+                            "slidebook7.histogram.0.channel_index",
+                            histogram.channel_index,
+                        ),
                     ] {
                         if let Some(value) = value {
                             meta.series_metadata.insert(
@@ -4599,8 +4635,10 @@ impl SlideBook7Reader {
                     ("slidebook7.remap_lut.0.high_desired", lut.high_desired),
                 ] {
                     if let Some(value) = value.filter(|v| v.is_finite()) {
-                        meta.series_metadata
-                            .insert(key.into(), crate::common::metadata::MetadataValue::Float(value));
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Float(value),
+                        );
                     }
                 }
                 for (key, value) in [
@@ -4608,8 +4646,10 @@ impl SlideBook7Reader {
                     ("slidebook7.remap_lut.0.high_given", lut.high_given),
                 ] {
                     if let Some(value) = value {
-                        meta.series_metadata
-                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Int(value),
+                        );
                     }
                 }
                 if let Some(built) = lut.built_table {
@@ -4620,12 +4660,12 @@ impl SlideBook7Reader {
                 }
             }
             if let Some(align) = extras.align_manips.first() {
-                for (key, value) in [
-                    ("slidebook7.align_manip.0.manip_id", align.manip_id),
-                ] {
+                for (key, value) in [("slidebook7.align_manip.0.manip_id", align.manip_id)] {
                     if let Some(value) = value {
-                        meta.series_metadata
-                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Int(value),
+                        );
                     }
                 }
                 for (key, value) in [
@@ -4634,8 +4674,10 @@ impl SlideBook7Reader {
                     ("slidebook7.align_manip.0.z_offset", align.z_offset),
                 ] {
                     if let Some(value) = value.filter(|v| v.is_finite()) {
-                        meta.series_metadata
-                            .insert(key.into(), crate::common::metadata::MetadataValue::Float(value));
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Float(value),
+                        );
                     }
                 }
             }
@@ -4653,8 +4695,10 @@ impl SlideBook7Reader {
                     ("slidebook7.ratio_manip.0.beta", ratio.beta),
                 ] {
                     if let Some(value) = value.filter(|v| v.is_finite()) {
-                        meta.series_metadata
-                            .insert(key.into(), crate::common::metadata::MetadataValue::Float(value));
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Float(value),
+                        );
                     }
                 }
             }
@@ -4664,8 +4708,10 @@ impl SlideBook7Reader {
                     ("slidebook7.fret_manip.0.fret_paradigm", fret.fret_paradigm),
                 ] {
                     if let Some(value) = value {
-                        meta.series_metadata
-                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Int(value),
+                        );
                     }
                 }
                 for (key, value) in [
@@ -4673,8 +4719,10 @@ impl SlideBook7Reader {
                     ("slidebook7.fret_manip.0.fa_aa", fret.fa_aa),
                 ] {
                     if let Some(value) = value.filter(|v| v.is_finite()) {
-                        meta.series_metadata
-                            .insert(key.into(), crate::common::metadata::MetadataValue::Float(value));
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Float(value),
+                        );
                     }
                 }
             }
@@ -4682,21 +4730,26 @@ impl SlideBook7Reader {
                 for (key, value) in [
                     ("slidebook7.remap_manip.0.manip_id", remap.manip_id),
                     ("slidebook7.remap_manip.0.remap_type", remap.remap_type),
-                    ("slidebook7.remap_manip.0.num_calib_points", remap.num_calib_points),
+                    (
+                        "slidebook7.remap_manip.0.num_calib_points",
+                        remap.num_calib_points,
+                    ),
                 ] {
                     if let Some(value) = value {
-                        meta.series_metadata
-                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Int(value),
+                        );
                     }
                 }
             }
             for (index, channel) in channel_records.iter().enumerate() {
                 let prefix = format!("slidebook7.channel.{index}");
-                if let Some(name) = channel
+                if let Some(name) = channel.channel_def.name.as_ref().or(channel
                     .channel_def
+                    .fluor
                     .name
-                    .as_ref()
-                    .or(channel.channel_def.fluor.name.as_ref())
+                    .as_ref())
                 {
                     meta.series_metadata.insert(
                         format!("{prefix}.name"),
@@ -4748,7 +4801,8 @@ impl SlideBook7Reader {
         // MaskRecord.yaml carries the typed CMaskRecord70 list plus per-timepoint
         // position tables (Java CImageGroup.LoadMaks).
         if let Ok(mask_text) = std::fs::read_to_string(group.join("MaskRecord.yaml")) {
-            let (masks, position_tables) = slidebook7_load_masks(&slidebook7_yaml_compose(&mask_text));
+            let (masks, position_tables) =
+                slidebook7_load_masks(&slidebook7_yaml_compose(&mask_text));
             meta.series_metadata.insert(
                 "slidebook7.mask.count".into(),
                 crate::common::metadata::MetadataValue::Int(masks.len() as i64),
@@ -4797,16 +4851,27 @@ impl SlideBook7Reader {
                 crate::common::metadata::MetadataValue::Int(timepoints.len() as i64),
             );
             for (key, value) in [
-                ("slidebook7.annotation.data_table.channel_index", header.channel_index),
+                (
+                    "slidebook7.annotation.data_table.channel_index",
+                    header.channel_index,
+                ),
                 ("slidebook7.annotation.data_table.rows", header.rows),
                 ("slidebook7.annotation.data_table.columns", header.columns),
                 ("slidebook7.annotation.data_table.planes", header.planes),
-                ("slidebook7.annotation.data_table.value_type", header.value_type),
-                ("slidebook7.annotation.data_table.table_type", header.table_type),
+                (
+                    "slidebook7.annotation.data_table.value_type",
+                    header.value_type,
+                ),
+                (
+                    "slidebook7.annotation.data_table.table_type",
+                    header.table_type,
+                ),
             ] {
                 if let Some(value) = value {
-                    meta.series_metadata
-                        .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                    meta.series_metadata.insert(
+                        key.into(),
+                        crate::common::metadata::MetadataValue::Int(value),
+                    );
                 }
             }
             let cube_total: usize = timepoints.iter().map(|tp| tp.cube.len()).sum();
@@ -4819,8 +4884,10 @@ impl SlideBook7Reader {
                 ("slidebook7.annotation.frap_region_count", frap_total),
                 ("slidebook7.annotation.unknown_count", unknown_total),
             ] {
-                meta.series_metadata
-                    .insert(key.into(), crate::common::metadata::MetadataValue::Int(value as i64));
+                meta.series_metadata.insert(
+                    key.into(),
+                    crate::common::metadata::MetadataValue::Int(value as i64),
+                );
             }
             // Bounded sample of the first base/cube/FRAP/unknown annotation.
             if let Some(base) = timepoints.iter().find_map(|tp| tp.base.first()) {
@@ -4832,15 +4899,20 @@ impl SlideBook7Reader {
                 }
                 for (key, value) in [
                     ("slidebook7.annotation.0.graphic_type", base.graphic_type),
-                    ("slidebook7.annotation.0.dependency_type", base.dependency_type),
+                    (
+                        "slidebook7.annotation.0.dependency_type",
+                        base.dependency_type,
+                    ),
                     ("slidebook7.annotation.0.group_id", base.group_id),
                     ("slidebook7.annotation.0.plane_id", base.plane_id),
                     ("slidebook7.annotation.0.sequence_id", base.sequence_id),
                     ("slidebook7.annotation.0.object_id", base.object_id),
                 ] {
                     if let Some(value) = value {
-                        meta.series_metadata
-                            .insert(key.into(), crate::common::metadata::MetadataValue::Int(value));
+                        meta.series_metadata.insert(
+                            key.into(),
+                            crate::common::metadata::MetadataValue::Int(value),
+                        );
                     }
                 }
             }
@@ -4988,9 +5060,18 @@ impl SlideBook7Reader {
                 }
             }
             for (key, table) in [
-                ("slidebook7.aux.double.0.value_count", aux.double_tables.first()),
-                ("slidebook7.aux.sint32.0.value_count", aux.sint32_tables.first()),
-                ("slidebook7.aux.sint64.0.value_count", aux.sint64_tables.first()),
+                (
+                    "slidebook7.aux.double.0.value_count",
+                    aux.double_tables.first(),
+                ),
+                (
+                    "slidebook7.aux.sint32.0.value_count",
+                    aux.sint32_tables.first(),
+                ),
+                (
+                    "slidebook7.aux.sint64.0.value_count",
+                    aux.sint64_tables.first(),
+                ),
             ] {
                 if let Some(table) = table {
                     meta.series_metadata.insert(
@@ -6019,11 +6100,7 @@ impl IvisionAcquisitionMetadata {
     ///   * `Exposure` → per-plane ExposureTime,
     ///   * `Objective_Mag`/`Objective_NA` → Objective + settings refractive index,
     ///   * `Gain`/`Bin_X`/`Bin_Y` → DetectorSettings gain + binning.
-    fn apply(
-        &self,
-        meta: &mut ImageMetadata,
-        ome: &mut crate::common::ome_metadata::OmeMetadata,
-    ) {
+    fn apply(&self, meta: &mut ImageMetadata, ome: &mut crate::common::ome_metadata::OmeMetadata) {
         use crate::common::ome_metadata::{
             create_lsid, OmeChannel, OmeDetector, OmeImage, OmeInstrument, OmeObjective, OmePlane,
         };
@@ -7280,9 +7357,10 @@ impl ImarisReader {
         // assume these records were consumed).
         for i in 0..size_c as usize {
             let comment = imaris_read_string(&mut f, 128)?;
-            self.meta
-                .series_metadata
-                .insert(format!("Channel #{i} Comment"), MetadataValue::String(comment));
+            self.meta.series_metadata.insert(
+                format!("Channel #{i} Comment"),
+                MetadataValue::String(comment),
+            );
             gains[i] = read_f32(&mut f, LE)?;
             detector_offsets[i] = read_f32(&mut f, LE)?;
             pinholes[i] = read_f32(&mut f, LE)?;
@@ -7363,10 +7441,12 @@ impl ImarisReader {
             return Err(BioFormatsError::PlaneOutOfRange(no as u32));
         }
 
-        let mut f = BufReader::new(File::open(self.path.as_ref().ok_or_else(|| {
-            BioFormatsError::UnsupportedFormat("Imaris reader not initialised".into())
-        })?)
-        .map_err(BioFormatsError::Io)?);
+        let mut f = BufReader::new(
+            File::open(self.path.as_ref().ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat("Imaris reader not initialised".into())
+            })?)
+            .map_err(BioFormatsError::Io)?,
+        );
 
         // Java: x=0, y=0, w=sizeX, h=sizeY for a full-plane read.
         // in.seek(offsets[no] + sizeX * (sizeY - y - h)); with y=0,h=sizeY -> 0.
@@ -7441,7 +7521,14 @@ impl FormatReader for ImarisReader {
         self.open_bytes_impl(plane_index)
     }
 
-    fn open_bytes_region(&mut self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
         let full = self.open_bytes_impl(plane_index)?;
         crop_full_plane("Imaris", &full, &self.meta, 1, x, y, w, h)
     }
@@ -7588,8 +7675,7 @@ impl XlefReader {
             // An xlif may reference one image (TIF/LOF) or several frames; apply
             // the same image-level LMS metadata to each referenced image path.
             for image_path in &xlif.image_paths {
-                let key = std::fs::canonicalize(image_path)
-                    .unwrap_or_else(|_| image_path.clone());
+                let key = std::fs::canonicalize(image_path).unwrap_or_else(|_| image_path.clone());
                 self.xlif_lms_by_image.insert(key, meta.clone());
             }
         }
@@ -8057,6 +8143,7 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
     // the unsupported-layout diagnostics can describe exactly what was declared.
     let mut channel_bytes_inc_count = 0i64;
     let mut dimension_bytes_inc_count = 0i64;
+    let mut x_dimension_bytes_inc: Option<i64> = None;
     let mut memory_count = 0i64;
     let mut storage_count = 0i64;
     // ROI alias capture index (Java LeicaMicrosystemsMetadata ROIs/ROI extractor).
@@ -8131,9 +8218,14 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
                 format!("xlef.lms.dimension.{dim_id}.elements"),
                 crate::common::metadata::MetadataValue::Int(elements as i64),
             );
-            if let Some(bytes_inc) = attrs.get("BytesInc").and_then(|v| v.trim().parse::<i64>().ok())
+            if let Some(bytes_inc) = attrs
+                .get("BytesInc")
+                .and_then(|v| v.trim().parse::<i64>().ok())
             {
                 dimension_bytes_inc_count += 1;
+                if dim_id == 1 {
+                    x_dimension_bytes_inc = Some(bytes_inc);
+                }
                 meta.series_metadata.insert(
                     format!("xlef.lms.dimension.{dim_id}.bytes_inc"),
                     crate::common::metadata::MetadataValue::Int(bytes_inc),
@@ -8331,6 +8423,22 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
     if !size_c_from_dimension && channel_count_from_descriptions > 0 {
         meta.size_c = channel_count_from_descriptions;
     }
+    if let Some(bytes_inc) = x_dimension_bytes_inc.filter(|v| *v > 0) {
+        // Java LMSMetadataExtractor.setCoreDimensionSizes first treats an X
+        // stride divisible by 3 as RGB and divides the stride, then
+        // setPixelType uses FormatTools.pixelTypeFromBytes(bytes, false, true).
+        let sample_bytes = if bytes_inc % 3 == 0 {
+            meta.is_rgb = true;
+            meta.is_interleaved = true;
+            bytes_inc / 3
+        } else {
+            bytes_inc
+        };
+        if let Some(pixel_type) = xlef_lms_pixel_type_from_sample_bytes(sample_bytes) {
+            meta.pixel_type = pixel_type;
+            meta.bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
+        }
+    }
     if meta.size_x == 0 || meta.size_y == 0 {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "Leica XLEF LMS metadata leaf {} does not declare bounded X/Y dimensions",
@@ -8343,6 +8451,16 @@ fn xlef_lms_metadata_for_reference(reference: &Path) -> Result<ImageMetadata> {
         .saturating_mul(meta.size_t)
         .max(1);
     Ok(meta)
+}
+
+fn xlef_lms_pixel_type_from_sample_bytes(bytes: i64) -> Option<PixelType> {
+    match bytes {
+        1 => Some(PixelType::Uint8),
+        2 => Some(PixelType::Uint16),
+        4 => Some(PixelType::Float32),
+        8 => Some(PixelType::Float64),
+        _ => None,
+    }
 }
 
 const XLEF_LMS_GRAPH_CAPTURE_LIMIT: usize = 16;
@@ -8715,16 +8833,17 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
             // initDetectorModels per-channel assignment loops).
             channel.light_source_settings_id =
                 xlef_lms_metadata_string(meta, &format!("{prefix}.light_source_settings_id"));
-            channel.light_source_settings_attenuation =
-                xlef_lms_metadata_float(meta, &format!("{prefix}.light_source_settings_attenuation"));
+            channel.light_source_settings_attenuation = xlef_lms_metadata_float(
+                meta,
+                &format!("{prefix}.light_source_settings_attenuation"),
+            );
             channel.detector_ref =
                 xlef_lms_metadata_string(meta, &format!("{prefix}.detector_ref"));
             channel.detector_settings_gain =
                 xlef_lms_metadata_float(meta, &format!("{prefix}.detector_settings_gain"));
             channel.detector_settings_offset =
                 xlef_lms_metadata_float(meta, &format!("{prefix}.detector_settings_offset"));
-            channel.pinhole_size =
-                xlef_lms_metadata_float(meta, &format!("{prefix}.pinhole_size"));
+            channel.pinhole_size = xlef_lms_metadata_float(meta, &format!("{prefix}.pinhole_size"));
         }
 
         // Per-channel emission-filter light paths (Java initDetectorModels'
@@ -8801,7 +8920,10 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
         instrument
             .objectives
             .push(crate::common::ome_metadata::OmeObjective {
-                id: Some(crate::common::ome_metadata::create_lsid("Objective", &[0, 0])),
+                id: Some(crate::common::ome_metadata::create_lsid(
+                    "Objective",
+                    &[0, 0],
+                )),
                 model: objective_model,
                 manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.objective.0.manufacturer"),
                 nominal_magnification: xlef_lms_metadata_float(
@@ -8907,7 +9029,10 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
         instrument
             .dichroics
             .push(crate::common::ome_metadata::OmeDichroic {
-                id: Some(crate::common::ome_metadata::create_lsid("Dichroic", &[0, 0])),
+                id: Some(crate::common::ome_metadata::create_lsid(
+                    "Dichroic",
+                    &[0, 0],
+                )),
                 model: xlef_lms_metadata_string(meta, "xlef.lms.dichroic.0.name"),
                 manufacturer: xlef_lms_metadata_string(meta, "xlef.lms.dichroic.0.manufacturer"),
             });
@@ -9022,12 +9147,7 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
                     _ => None,
                 }
             } else if is_ellipse {
-                match (
-                    center_x.or(x),
-                    center_y.or(y),
-                    radius_x,
-                    radius_y,
-                ) {
+                match (center_x.or(x), center_y.or(y), radius_x, radius_y) {
                     (Some(x), Some(y), Some(radius_x), Some(radius_y)) => {
                         Some(crate::common::ome_metadata::OmeShape::Ellipse {
                             x,
@@ -11925,7 +12045,7 @@ fn cellsens_tag_name(tag: i32) -> Option<&'static str> {
         2059 => Some("Staining"),                                 // SLIDE_STAINING
         2060 => Some("Slide Info"),                               // SLIDE_INFO
         2061 => Some("Slide Name"),                               // SLIDE_NAME
-        100002 => Some("Exposure time (microseconds)"),          // EXPOSURE_TIME
+        100002 => Some("Exposure time (microseconds)"),           // EXPOSURE_TIME
         100003 => Some("Camera gain"),                            // CAMERA_GAIN
         100004 => Some("Camera offset"),                          // CAMERA_OFFSET
         100005 => Some("Gamma"),                                  // CAMERA_GAMMA
@@ -12065,58 +12185,58 @@ fn cellsens_tag_name(tag: i32) -> Option<&'static str> {
         120637 => Some("Slide No."),
         34 => Some("Product Name"),
         35 => Some("Product Version"),
-        120116 => Some("Device Name"),                            // DEVICE_NAME
-        100049 => Some("Camera Actual Bit Depth"),                // BIT_DEPTH
+        120116 => Some("Device Name"),             // DEVICE_NAME
+        100049 => Some("Camera Actual Bit Depth"), // BIT_DEPTH
         120001 => Some("Device Position"),
         120050 => Some("TV Adapter Magnification"),
-        120079 => Some("Objective Refractive Index"),             // REFRACTIVE_INDEX
+        120079 => Some("Objective Refractive Index"), // REFRACTIVE_INDEX
         120117 => Some("Device Type"),
-        120129 => Some("Device Unit ID"),                         // DEVICE_ID
-        120130 => Some("Device Subtype"),                         // DEVICE_SUBTYPE
+        120129 => Some("Device Unit ID"), // DEVICE_ID
+        120130 => Some("Device Subtype"), // DEVICE_SUBTYPE
         120132 => Some("Device Model"),
-        120133 => Some("Device Manufacturer"),                    // DEVICE_MANUFACTURER
+        120133 => Some("Device Manufacturer"), // DEVICE_MANUFACTURER
         121102 => Some("Stage Insert Position"),
         121131 => Some("Laser/Lamp Intensity"),
         268435456 => Some("Units"),
-        268435458 => Some("Value"),                               // VALUE
+        268435458 => Some("Value"), // VALUE
         175208 => Some("Snapshot Count"),
         175209 => Some("Scanning Time (seconds)"),
         120210 => Some("Device Configuration Position"),
         120211 => Some("Device Configuration Index"),
         124000 => Some("Aperture Max Mode"),
-        100048 => Some("Camera Maximum Frame Size"),              // FRAME_SIZE
-        100055 => Some("Camera HDRI Enabled"),                    // HDRI_ON
-        100056 => Some("Camera Images per HDRI image"),           // HDRI_FRAMES
-        100057 => Some("Camera HDRI Exposure Ratio"),             // HDRI_EXPOSURE_RANGE
-        100058 => Some("Camera HDRI Mapping Mode"),               // HDRI_MAP_MODE
-        100059 => Some("Camera Custom Grayscale Value"),          // CUSTOM_GRAYSCALE
-        100060 => Some("Camera Saturation"),                      // SATURATION
-        100061 => Some("Camera White Balance Preset ID"),         // WB_PRESET_ID
-        100062 => Some("Camera White Balance Preset Name"),       // WB_PRESET_NAME
-        100063 => Some("Camera White Balance Mode"),              // WB_MODE
-        100064 => Some("Camera CCD Sensitivity"),                 // CCD_SENSITIVITY
-        100065 => Some("Camera Enhanced Dynamic Range"),          // ENHANCED_DYNAMIC_RANGE
-        100066 => Some("Camera Pixel Clock (MHz)"),               // PIXEL_CLOCK
-        100067 => Some("Camera Colorspace"),                      // COLORSPACE
-        100068 => Some("Camera Cooling Enabled"),                 // COOLING_ON
-        100069 => Some("Camera Cooling Fan Speed"),               // FAN_SPEED
-        100070 => Some("Camera Cooling Temperature Target"),      // TEMPERATURE_TARGET
-        100071 => Some("Camera Gain Unit"),                       // GAIN_UNIT
-        100072 => Some("Camera EM Gain"),                         // EM_GAIN
-        100073 => Some("Camera Photon Imaging Mode"),             // PHOTON_IMAGING_MODE
-        100074 => Some("Camera Frame Transfer Enabled"),          // FRAME_TRANSFER
-        100075 => Some("Camera iXon Shift Speed"),                // ANDOR_SHIFT_SPEED
-        100076 => Some("Camera Vertical Clock Amplitude"),        // VCLOCK_AMPLITUDE
-        100077 => Some("Camera Spurious Noise Removal Enabled"),  // SPURIOUS_NOISE_REMOVAL
-        100078 => Some("Camera Signal Output"),                   // SIGNAL_OUTPUT
-        100079 => Some("Camera Baseline Offset Clamp"),           // BASELINE_OFFSET_CLAMP
-        100080 => Some("Camera DP80 Frame Centering"),            // DP80_FRAME_CENTERING
-        100081 => Some("Camera Hot Pixel Correction Enabled"),    // HOT_PIXEL_CORRECTION
-        100082 => Some("Camera Noise Reduction"),                 // NOISE_REDUCTION
-        100083 => Some("Camera WiDER"),                           // WIDER
-        100084 => Some("Camera Photobleaching Enabled"),          // PHOTOBLEACHING
-        100085 => Some("Camera Preamp Gain"),                     // PREAMP_GAIN_VALUE
-        100086 => Some("Camera WiDER Enabled"),                   // WIDER_ENABLED
+        100048 => Some("Camera Maximum Frame Size"), // FRAME_SIZE
+        100055 => Some("Camera HDRI Enabled"),       // HDRI_ON
+        100056 => Some("Camera Images per HDRI image"), // HDRI_FRAMES
+        100057 => Some("Camera HDRI Exposure Ratio"), // HDRI_EXPOSURE_RANGE
+        100058 => Some("Camera HDRI Mapping Mode"),  // HDRI_MAP_MODE
+        100059 => Some("Camera Custom Grayscale Value"), // CUSTOM_GRAYSCALE
+        100060 => Some("Camera Saturation"),         // SATURATION
+        100061 => Some("Camera White Balance Preset ID"), // WB_PRESET_ID
+        100062 => Some("Camera White Balance Preset Name"), // WB_PRESET_NAME
+        100063 => Some("Camera White Balance Mode"), // WB_MODE
+        100064 => Some("Camera CCD Sensitivity"),    // CCD_SENSITIVITY
+        100065 => Some("Camera Enhanced Dynamic Range"), // ENHANCED_DYNAMIC_RANGE
+        100066 => Some("Camera Pixel Clock (MHz)"),  // PIXEL_CLOCK
+        100067 => Some("Camera Colorspace"),         // COLORSPACE
+        100068 => Some("Camera Cooling Enabled"),    // COOLING_ON
+        100069 => Some("Camera Cooling Fan Speed"),  // FAN_SPEED
+        100070 => Some("Camera Cooling Temperature Target"), // TEMPERATURE_TARGET
+        100071 => Some("Camera Gain Unit"),          // GAIN_UNIT
+        100072 => Some("Camera EM Gain"),            // EM_GAIN
+        100073 => Some("Camera Photon Imaging Mode"), // PHOTON_IMAGING_MODE
+        100074 => Some("Camera Frame Transfer Enabled"), // FRAME_TRANSFER
+        100075 => Some("Camera iXon Shift Speed"),   // ANDOR_SHIFT_SPEED
+        100076 => Some("Camera Vertical Clock Amplitude"), // VCLOCK_AMPLITUDE
+        100077 => Some("Camera Spurious Noise Removal Enabled"), // SPURIOUS_NOISE_REMOVAL
+        100078 => Some("Camera Signal Output"),      // SIGNAL_OUTPUT
+        100079 => Some("Camera Baseline Offset Clamp"), // BASELINE_OFFSET_CLAMP
+        100080 => Some("Camera DP80 Frame Centering"), // DP80_FRAME_CENTERING
+        100081 => Some("Camera Hot Pixel Correction Enabled"), // HOT_PIXEL_CORRECTION
+        100082 => Some("Camera Noise Reduction"),    // NOISE_REDUCTION
+        100083 => Some("Camera WiDER"),              // WIDER
+        100084 => Some("Camera Photobleaching Enabled"), // PHOTOBLEACHING
+        100085 => Some("Camera Preamp Gain"),        // PREAMP_GAIN_VALUE
+        100086 => Some("Camera WiDER Enabled"),      // WIDER_ENABLED
         _ => None,
     }
 }
@@ -14209,10 +14329,12 @@ impl SpcReader {
             }
         }
 
-        let set_name = set_name
-            .ok_or_else(|| BioFormatsError::Format("Failed to find a matching .set file!".into()))?;
-        let spc_name = spc_name
-            .ok_or_else(|| BioFormatsError::Format("Failed to find a matching .spc file!".into()))?;
+        let set_name = set_name.ok_or_else(|| {
+            BioFormatsError::Format("Failed to find a matching .set file!".into())
+        })?;
+        let spc_name = spc_name.ok_or_else(|| {
+            BioFormatsError::Format("Failed to find a matching .spc file!".into())
+        })?;
 
         self.frame_clock_list = Vec::new();
         self.end_of_frame_list = Vec::new();
@@ -14269,7 +14391,9 @@ impl SpcReader {
             tb *= 1.000e12;
             time_base = tb;
         } else {
-            return Err(BioFormatsError::Format("Failed to parse setup file!".into()));
+            return Err(BioFormatsError::Format(
+                "Failed to parse setup file!".into(),
+            ));
         }
 
         // ---- Now read .spc file ----
@@ -14346,8 +14470,8 @@ impl SpcReader {
         let mut max_frame_length: i32 = 0;
         let mut t = 0;
         while t < self.n_frames {
-            let frame_length = self.end_of_frame_list[(t + 1) as usize]
-                - self.frame_clock_list[t as usize];
+            let frame_length =
+                self.end_of_frame_list[(t + 1) as usize] - self.frame_clock_list[t as usize];
             if frame_length > max_frame_length {
                 max_frame_length = frame_length;
             }
@@ -14400,11 +14524,11 @@ impl SpcReader {
             let adc_lm = (adc_l as u8) & 0xF0;
 
             match adc_lm {
-                0xA0 => {} // gap
-                0x20 => {} // Got GAP but not invalid
+                0xA0 => {}               // gap
+                0x20 => {}               // Got GAP but not invalid
                 0x40 => self.photon(bb), // photon + ovfl
                 0x00 => self.photon(bb), // photon
-                0x80 => {} // invalid photon
+                0x80 => {}               // invalid photon
                 0x90 => self.invalid_and_mark(bb),
                 // Invalid, Mark and MTOV all set. Not well documented.
                 0xd0 => self.invalid_and_mark(bb),
@@ -14499,8 +14623,7 @@ impl SpcReader {
 
     /// Accumulate one photon into the per-timebin histogram. (Java: `photon(int)`.)
     fn photon(&mut self, block_ptr: i32) {
-        let current_channel =
-            ((self.raw_buf[(block_ptr - 2) as usize] as u8 & 0xF0) >> 4) as i32;
+        let current_channel = ((self.raw_buf[(block_ptr - 2) as usize] as u8 & 0xF0) >> 4) as i32;
 
         if current_channel == self.channel || self.n_channels == 1 {
             if self.current_pixel < self.n_pixels
@@ -14749,14 +14872,16 @@ impl FormatReader for SpcReader {
 
         // if the pre-stored data doesn't match that requested then read it.
         if self.stored_t != t || self.stored_channel != self.channel {
-            let frame_clock_pos = *self
-                .frame_clock_list
-                .get(t as usize)
-                .ok_or_else(|| BioFormatsError::Format("SPC: frame clock index out of range".into()))?;
-            let end_of_frame_pos = *self
-                .end_of_frame_list
-                .get((t + 1) as usize)
-                .ok_or_else(|| BioFormatsError::Format("SPC: end-of-frame index out of range".into()))?;
+            let frame_clock_pos = *self.frame_clock_list.get(t as usize).ok_or_else(|| {
+                BioFormatsError::Format("SPC: frame clock index out of range".into())
+            })?;
+            let end_of_frame_pos =
+                *self
+                    .end_of_frame_list
+                    .get((t + 1) as usize)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("SPC: end-of-frame index out of range".into())
+                    })?;
 
             let frame_length = end_of_frame_pos - frame_clock_pos;
 
@@ -14769,7 +14894,10 @@ impl FormatReader for SpcReader {
 
             self.reopen_file()?;
             let no_of_bytes = {
-                let f = self.spc_in.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+                let f = self
+                    .spc_in
+                    .as_mut()
+                    .ok_or(BioFormatsError::NotInitialized)?;
                 spc_seek(f, frame_clock_pos as u64)?;
                 if self.raw_buf.len() < frame_length.max(0) as usize {
                     self.raw_buf = vec![0u8; frame_length.max(0) as usize];
@@ -14797,12 +14925,16 @@ impl FormatReader for SpcReader {
         let i_line_size = self.n_pixels * self.bpp;
         let o_line_size = (w as i32) * self.bpp;
 
-        let tstore = self.tstore.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tstore = self
+            .tstore
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
         let mut buf = vec![0u8; (h as usize) * (o_line_size as usize)];
 
         if !self.line_mode {
             // image Mode
-            let mut input = (self.bin_size * timebin) + (y as i32 * i_line_size) + (x as i32 * self.bpp);
+            let mut input =
+                (self.bin_size * timebin) + (y as i32 * i_line_size) + (x as i32 * self.bpp);
             let mut output = 0i32;
             for _line in 0..h as i32 {
                 let src = input as usize;
@@ -15268,14 +15400,20 @@ theXmlAuxData: <aux/>
 ";
         let aux = slidebook7_load_aux_data(&slidebook7_yaml_compose(yaml));
         assert_eq!(aux.float_tables.len(), 1);
-        assert_eq!(aux.float_tables[0].xml_descriptor.as_deref(), Some("float-desc"));
+        assert_eq!(
+            aux.float_tables[0].xml_descriptor.as_deref(),
+            Some("float-desc")
+        );
         assert_eq!(aux.float_tables[0].value_count, 3);
         assert_eq!(aux.double_tables.len(), 1);
         assert_eq!(aux.double_tables[0].value_count, 2);
         assert_eq!(aux.sint32_tables.len(), 0);
         assert_eq!(aux.sint64_tables.len(), 0);
         assert_eq!(aux.xml_tables.len(), 1);
-        assert_eq!(aux.xml_tables[0].xml_descriptor.as_deref(), Some("xml-desc"));
+        assert_eq!(
+            aux.xml_tables[0].xml_descriptor.as_deref(),
+            Some("xml-desc")
+        );
         assert_eq!(aux.xml_tables[0].xml_data.as_deref(), Some("<aux/>"));
     }
 
@@ -15917,15 +16055,14 @@ EndClass: 0
         bytes.extend_from_slice(&1985u32.to_be_bytes());
         bytes.extend_from_slice(&im3_container(
             "Root",
-            vec![
-                im3_container("DataSet", vec![dataset]),
-                spectral_library,
-            ],
+            vec![im3_container("DataSet", vec![dataset]), spectral_library],
         ));
         std::fs::write(&path, bytes).unwrap();
 
         let mut reader = Im3Reader::new();
-        reader.set_id(&path).expect("native IM3 spectral-library fixture");
+        reader
+            .set_id(&path)
+            .expect("native IM3 spectral-library fixture");
         let metadata = &reader.metadata().series_metadata;
         assert!(matches!(
             metadata.get("im3.spectral_library.spectrum_count"),
@@ -16590,9 +16727,7 @@ EndClass: 0
             .expect("OME instrument");
         let objective = instrument.objectives.first().expect("OME objective");
         assert!(matches!(objective.lens_na, Some(v) if (v - 1.3).abs() < 1e-9));
-        assert!(
-            matches!(objective.nominal_magnification, Some(v) if (v - 40.0).abs() < 1e-9)
-        );
+        assert!(matches!(objective.nominal_magnification, Some(v) if (v - 40.0).abs() < 1e-9));
 
         // DetectorSettings: gain + binning on the first channel.
         let channel = image.channels.first().expect("OME channel");
@@ -17327,6 +17462,42 @@ EndClass: 0
     }
 
     #[test]
+    fn xlef_lms_metadata_leaf_uses_x_bytes_inc_for_java_pixel_type() {
+        let xlef = temp_flim2_path("lms_float32.xlef");
+        let lms = xlef.with_extension("lms");
+        std::fs::write(
+            &lms,
+            r#"<XLIF><Element Name="Float scan"><Data><Image Name="scan">
+<ImageDescription>
+<Channels><ChannelDescription BytesInc="0"/></Channels>
+<Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="2" BytesInc="4"/>
+<DimensionDescription DimID="2" NumberOfElements="2" BytesInc="8"/>
+</Dimensions>
+</ImageDescription>
+</Image></Data></Element></XLIF>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &xlef,
+            format!(
+                r#"<XLEF><Image File="{}"/></XLEF>"#,
+                lms.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let mut reader = XlefReader::new();
+        reader.set_id(&xlef).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.pixel_type, PixelType::Float32);
+        assert_eq!(meta.bits_per_pixel, 32);
+
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_file(lms);
+    }
+
+    #[test]
     fn xlef_opens_supported_leaves_and_lms_metadata_series() {
         let xlef = temp_flim2_path("mixed.xlef");
         let tiff = xlef.with_file_name("supported.tif");
@@ -17493,6 +17664,18 @@ EndClass: 0
             err,
             BioFormatsError::InvalidData(message) if message.contains("ended before filling")
         ));
+    }
+
+    #[test]
+    fn flowsight_channel_name_split_preserves_java_interior_empty_tokens() {
+        assert_eq!(
+            split_flowsight_pipe_list("BF||SSC"),
+            vec!["BF".to_string(), "".to_string(), "SSC".to_string()]
+        );
+        assert_eq!(
+            split_flowsight_pipe_list("BF|SSC|"),
+            vec!["BF".to_string(), "SSC".to_string()]
+        );
     }
 
     #[test]
@@ -17722,7 +17905,10 @@ EndClass: 0
             get("cellsens.ets.0.stack_type").as_deref(),
             Some("Overview image")
         );
-        assert_eq!(get("cellsens.ets.0.frame_origin_x").as_deref(), Some("12.5"));
+        assert_eq!(
+            get("cellsens.ets.0.frame_origin_x").as_deref(),
+            Some("12.5")
+        );
         assert_eq!(get("cellsens.ets.0.frame_origin_y").as_deref(), Some("34"));
     }
 
@@ -18589,10 +18775,7 @@ EndClass: 0
 
         let mut set = build_set_file();
         // Corrupt "SPC-830" -> "SPC-999" inside the header region.
-        if let Some(pos) = set
-            .windows(7)
-            .position(|w| w == b"SPC-830")
-        {
+        if let Some(pos) = set.windows(7).position(|w| w == b"SPC-830") {
             set[pos..pos + 7].copy_from_slice(b"SPC-999");
         }
         File::create(&set_path).unwrap().write_all(&set).unwrap();

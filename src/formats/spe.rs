@@ -192,13 +192,7 @@ impl FormatReader for SpeReader {
             )));
         }
         let (pixel_type, bpp) = spe_pixel_type(datatype);
-        validate_spe_payload(
-            f.metadata().map_err(BioFormatsError::Io)?.len(),
-            xdim,
-            ydim,
-            numframes,
-            pixel_type,
-        )?;
+        validate_spe_layout(xdim, ydim, numframes, pixel_type)?;
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         if exposure > 0 {
@@ -291,6 +285,13 @@ impl FormatReader for SpeReader {
         let offset = HEADER_SIZE + plane_index as u64 * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if offset
+            .checked_add(plane_bytes as u64)
+            .is_none_or(|end| end > file_len)
+        {
+            return Ok(vec![0u8; plane_bytes]);
+        }
         f.seek(SeekFrom::Start(offset))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
@@ -354,28 +355,17 @@ fn positive_i32_dim(value: i32, label: &str) -> Result<u32> {
     Ok(value as u32)
 }
 
-fn validate_spe_payload(
-    file_len: u64,
-    size_x: u32,
-    size_y: u32,
-    frames: u32,
-    pixel_type: PixelType,
-) -> Result<()> {
+fn validate_spe_layout(size_x: u32, size_y: u32, frames: u32, pixel_type: PixelType) -> Result<()> {
     let plane_bytes = (size_x as u64)
         .checked_mul(size_y as u64)
         .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample() as u64))
         .ok_or_else(|| BioFormatsError::Format("SPE plane size overflows".into()))?;
-    let required_len = HEADER_SIZE
+    HEADER_SIZE
         .checked_add(
             plane_bytes
                 .checked_mul(frames as u64)
                 .ok_or_else(|| BioFormatsError::Format("SPE payload size overflows".into()))?,
         )
         .ok_or_else(|| BioFormatsError::Format("SPE payload size overflows".into()))?;
-    if file_len < required_len {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "SPE pixel payload is shorter than declared ({file_len} < {required_len})"
-        )));
-    }
     Ok(())
 }

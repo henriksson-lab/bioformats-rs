@@ -585,12 +585,8 @@ fn build_metadata(mut p: FakeParams) -> Result<Vec<ImageMetadata>> {
         }
         // imageCount = screens? * plates * rows * cols * fields * acqs
         let screen_count = p.screens.max(1);
-        let image_count = screen_count
-            * p.plates
-            * p.plate_rows
-            * p.plate_cols
-            * p.fields
-            * p.plate_acqs;
+        let image_count =
+            screen_count * p.plates * p.plate_rows * p.plate_cols * p.fields * p.plate_acqs;
         if image_count > 0 {
             p.series_count = image_count as u32;
         }
@@ -617,10 +613,7 @@ fn build_metadata(mut p: FakeParams) -> Result<Vec<ImageMetadata>> {
         } else {
             name.clone()
         };
-        sm.insert(
-            "Image name".to_string(),
-            MetadataValue::String(image_name),
-        );
+        sm.insert("Image name".to_string(), MetadataValue::String(image_name));
 
         let ms = ImageMetadata {
             size_x: p.size_x,

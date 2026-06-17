@@ -304,6 +304,7 @@ fn parse_bindata_blocks(pixels_xml: &str) -> Result<(Vec<Vec<u8>>, Option<String
 /// - `J2K` → JPEG 2000 via `codec::decompress_jpeg2000`
 /// - `JPEG` → JPEG via `codec::decompress_jpeg`
 /// - `bzip2` → bzip2 via `codec::decompress_bzip2`
+/// - unknown values → raw bytes (Java falls through without decompression)
 fn decompress_bindata(data: Vec<u8>, compression: &str) -> Result<Vec<u8>> {
     if data.is_empty() {
         return Ok(data);
@@ -314,9 +315,7 @@ fn decompress_bindata(data: Vec<u8>, compression: &str) -> Result<Vec<u8>> {
         "J2K" => crate::common::codec::decompress_jpeg2000(&data),
         "JPEG" => crate::common::codec::decompress_jpeg(&data),
         "bzip2" => crate::common::codec::decompress_bzip2(&data),
-        other => Err(BioFormatsError::UnsupportedFormat(format!(
-            "OME-XML BinData unknown compression: {other}"
-        ))),
+        _ => Ok(data),
     }
 }
 
@@ -871,7 +870,7 @@ impl FormatReader for OmeXmlReader {
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.to_ascii_lowercase());
-        matches!(name.as_deref(), Some(n) if n.ends_with(".ome") || n.ends_with(".ome.xml"))
+        matches!(name.as_deref(), Some(n) if !n.ends_with("companion.ome") && (n.ends_with(".ome") || n.ends_with(".ome.xml")))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -956,6 +955,9 @@ impl FormatReader for OmeXmlReader {
             if offset + plane_bytes <= src.len() {
                 return Ok(src[offset..offset + plane_bytes].to_vec());
             }
+        }
+        if series.planes.is_empty() {
+            return Ok(vec![0u8; plane_bytes]);
         }
         Err(BioFormatsError::PlaneOutOfRange(plane_index))
     }

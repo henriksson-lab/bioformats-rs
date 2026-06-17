@@ -17,6 +17,9 @@ fn r_u32_le(b: &[u8], off: usize) -> u32 {
 fn r_i32_le(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
+fn r_i32_be(b: &[u8], off: usize) -> i32 {
+    i32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
 
 fn positive_i32_dim(value: i32, label: &str) -> Result<u32> {
     if value <= 0 {
@@ -474,6 +477,8 @@ impl FormatReader for NorpixReader {
 pub struct IplabReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    data_offset: u64,
+    plane_samples: usize,
 }
 
 impl IplabReader {
@@ -481,6 +486,8 @@ impl IplabReader {
         IplabReader {
             path: None,
             meta: None,
+            data_offset: 96,
+            plane_samples: 1,
         }
     }
 }
@@ -584,47 +591,192 @@ impl FormatReader for IplabReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 8 && &header[..8] == b"ipl bina"
+        if header.len() >= 8 && &header[..8] == b"ipl bina" {
+            return true;
+        }
+        if header.len() < 12 {
+            return false;
+        }
+        let little = &header[..4] == b"iiii";
+        let big = &header[..4] == b"mmmm";
+        if !little && !big {
+            return false;
+        }
+        let size = if little {
+            r_i32_le(header, 4)
+        } else {
+            r_i32_be(header, 4)
+        };
+        let version = if little {
+            r_i32_le(header, 8)
+        } else {
+            r_i32_be(header, 8)
+        };
+        size == 4 && version >= 0x100e
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let mut hdr = vec![0u8; 96];
-        f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
+        let n = f.read(&mut hdr).map_err(BioFormatsError::Io)?;
+        if n < 12 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "IPLab header is truncated".into(),
+            ));
+        }
 
-        let width = positive_i32_dim(r_i32_le(&hdr, 12), "width")?;
-        let height = positive_i32_dim(r_i32_le(&hdr, 16), "height")?;
-        let depth = positive_i32_dim(r_i32_le(&hdr, 20), "depth")?;
-        let n_channels = positive_i32_dim(r_i32_le(&hdr, 24), "channel count")?;
-        let n_frames = positive_i32_dim(r_i32_le(&hdr, 28), "frame count")?;
-        let data_type = r_i32_le(&hdr, 32);
-
-        let (pixel_type, bpp, spp): (PixelType, u8, u32) = match data_type {
-            0 => (PixelType::Uint8, 8, 1), // int8 → report as uint8
-            1 => (PixelType::Uint16, 16, 1),
-            2 => (PixelType::Int16, 16, 1),
-            3 => (PixelType::Float32, 32, 1),
-            4 => (PixelType::Uint8, 8, 1),
-            5 => (PixelType::Uint8, 8, 3), // RGB
-            _ => {
-                return Err(BioFormatsError::UnsupportedFormat(format!(
-                    "IPLab unsupported data type {data_type}"
-                )))
-            }
+        let is_java_iplab = (&hdr[..4] == b"iiii" || &hdr[..4] == b"mmmm") && {
+            let little = &hdr[..4] == b"iiii";
+            let block_size = if little {
+                r_i32_le(&hdr, 4)
+            } else {
+                r_i32_be(&hdr, 4)
+            };
+            let version = if little {
+                r_i32_le(&hdr, 8)
+            } else {
+                r_i32_be(&hdr, 8)
+            };
+            block_size == 4 && version >= 0x100e
         };
-        let is_rgb = spp == 3;
-        let image_count = depth * n_channels * n_frames;
+
+        let (
+            width,
+            height,
+            depth,
+            n_channels,
+            n_frames,
+            data_type,
+            pixel_type,
+            bpp,
+            spp,
+            is_little_endian,
+            data_offset,
+            tag_offset,
+            dimension_order,
+            image_count,
+            plane_samples,
+            is_rgb,
+        ) = if is_java_iplab {
+            let little = &hdr[..4] == b"iiii";
+            let read_i32 = |off: usize| {
+                if little {
+                    r_i32_le(&hdr, off)
+                } else {
+                    r_i32_be(&hdr, off)
+                }
+            };
+            let width = positive_i32_dim(read_i32(20), "width")?;
+            let height = positive_i32_dim(read_i32(24), "height")?;
+            let n_channels = positive_i32_dim(read_i32(28), "channel count")?;
+            let depth = positive_i32_dim(read_i32(32), "depth")?;
+            let n_frames = positive_i32_dim(read_i32(36), "frame count")?;
+            let data_type = read_i32(40);
+            let (pixel_type, bpp, spp): (PixelType, u8, u32) = match data_type {
+                0 => (PixelType::Uint8, 8, 1),
+                1 => (PixelType::Int16, 16, 1),
+                2 => (PixelType::Uint16, 16, 1),
+                3 => (PixelType::Int32, 32, 1),
+                4 => (PixelType::Float32, 32, 1),
+                5 => (PixelType::Uint32, 32, 1),
+                6 => (PixelType::Uint16, 16, 1),
+                10 => (PixelType::Float64, 64, 1),
+                _ => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "IPLab unsupported data type {data_type}"
+                    )))
+                }
+            };
+            let image_count = depth
+                .checked_mul(n_frames)
+                .ok_or_else(|| BioFormatsError::Format("IPLab image count overflows".into()))?;
+            (
+                width,
+                height,
+                depth,
+                n_channels,
+                n_frames,
+                data_type,
+                pixel_type,
+                bpp,
+                spp,
+                little,
+                44u64,
+                None,
+                if n_channels > 1 {
+                    DimensionOrder::XYCZT
+                } else {
+                    DimensionOrder::XYZTC
+                },
+                image_count,
+                (n_channels * spp) as usize,
+                n_channels > 1,
+            )
+        } else {
+            if n < 40 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "IPLab binary header is truncated".into(),
+                ));
+            }
+            let width = positive_i32_dim(r_i32_le(&hdr, 12), "width")?;
+            let height = positive_i32_dim(r_i32_le(&hdr, 16), "height")?;
+            let depth = positive_i32_dim(r_i32_le(&hdr, 20), "depth")?;
+            let n_channels = positive_i32_dim(r_i32_le(&hdr, 24), "channel count")?;
+            let n_frames = positive_i32_dim(r_i32_le(&hdr, 28), "frame count")?;
+            let data_type = r_i32_le(&hdr, 32);
+
+            let (pixel_type, bpp, spp): (PixelType, u8, u32) = match data_type {
+                0 => (PixelType::Uint8, 8, 1), // int8 → report as uint8
+                1 => (PixelType::Uint16, 16, 1),
+                2 => (PixelType::Int16, 16, 1),
+                3 => (PixelType::Float32, 32, 1),
+                4 => (PixelType::Uint8, 8, 1),
+                5 => (PixelType::Uint8, 8, 3), // RGB
+                _ => {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "IPLab unsupported data type {data_type}"
+                    )))
+                }
+            };
+            let image_count = depth
+                .checked_mul(n_channels)
+                .and_then(|v| v.checked_mul(n_frames))
+                .ok_or_else(|| BioFormatsError::Format("IPLab image count overflows".into()))?;
+            (
+                width,
+                height,
+                depth,
+                n_channels,
+                n_frames,
+                data_type,
+                pixel_type,
+                bpp,
+                spp,
+                true,
+                96u64,
+                None,
+                if n_channels * spp > 1 {
+                    DimensionOrder::XYCZT
+                } else {
+                    DimensionOrder::XYZTC
+                },
+                image_count,
+                spp as usize,
+                spp == 3,
+            )
+        };
+
         let plane_bytes = (width as u64)
             .checked_mul(height as u64)
-            .and_then(|v| v.checked_mul(spp as u64))
+            .and_then(|v| v.checked_mul(plane_samples as u64))
             .and_then(|v| v.checked_mul(bpp as u64 / 8))
             .ok_or_else(|| BioFormatsError::Format("IPLab plane byte count overflows".into()))?;
         let pixel_bytes = plane_bytes
             .checked_mul(image_count as u64)
             .ok_or_else(|| BioFormatsError::Format("IPLab pixel byte count overflows".into()))?;
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
-        let required_len = 96u64
+        let required_len = data_offset
             .checked_add(pixel_bytes)
             .ok_or_else(|| BioFormatsError::Format("IPLab payload offset overflows".into()))?;
         if file_len < required_len {
@@ -635,19 +787,32 @@ impl FormatReader for IplabReader {
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert("format".into(), MetadataValue::String("IPLab".into()));
-        meta_map.insert(
-            "iplab.version".into(),
-            MetadataValue::Int(r_i32_le(&hdr, 8) as i64),
-        );
+        if is_java_iplab {
+            let version = if is_little_endian {
+                r_i32_le(&hdr, 8)
+            } else {
+                r_i32_be(&hdr, 8)
+            };
+            meta_map.insert("iplab.version".into(), MetadataValue::Int(version as i64));
+        } else {
+            meta_map.insert(
+                "iplab.version".into(),
+                MetadataValue::Int(r_i32_le(&hdr, 8) as i64),
+            );
+            meta_map.insert(
+                "iplab.color_mode".into(),
+                MetadataValue::Int(r_i32_le(&hdr, 36) as i64),
+            );
+        }
         meta_map.insert(
             "iplab.data_type".into(),
             MetadataValue::Int(data_type as i64),
         );
-        meta_map.insert(
-            "iplab.color_mode".into(),
-            MetadataValue::Int(r_i32_le(&hdr, 36) as i64),
-        );
-        meta_map.extend(read_iplab_tags(path, 96 + pixel_bytes).unwrap_or_default());
+        let post_pixel_tags = tag_offset.unwrap_or(data_offset + pixel_bytes);
+        meta_map.extend(read_iplab_tags(path, post_pixel_tags).unwrap_or_default());
+
+        self.data_offset = data_offset;
+        self.plane_samples = plane_samples;
 
         self.meta = Some(ImageMetadata {
             size_x: width,
@@ -658,11 +823,11 @@ impl FormatReader for IplabReader {
             pixel_type,
             bits_per_pixel: bpp,
             image_count,
-            dimension_order: DimensionOrder::XYZCT,
+            dimension_order,
             is_rgb,
             is_interleaved: is_rgb,
             is_indexed: false,
-            is_little_endian: true,
+            is_little_endian,
             resolution_count: 1,
             thumbnail: false,
             series_metadata: meta_map,
@@ -678,6 +843,8 @@ impl FormatReader for IplabReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.data_offset = 96;
+        self.plane_samples = 1;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -708,9 +875,9 @@ impl FormatReader for IplabReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let bps = meta.pixel_type.bytes_per_sample();
-        let spp = if meta.is_rgb { 3usize } else { 1usize };
+        let spp = self.plane_samples;
         let plane_bytes = (meta.size_x * meta.size_y) as usize * spp * bps;
-        let offset = 96u64 + plane_index as u64 * plane_bytes as u64;
+        let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(offset))
@@ -730,7 +897,7 @@ impl FormatReader for IplabReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let spp = if meta.is_rgb { 3usize } else { 1usize };
+        let spp = self.plane_samples;
         crop_full_plane("IPLab", &full, meta, spp, x, y, w, h)
     }
 
@@ -932,9 +1099,7 @@ impl SeqReader {
             m.series_metadata.remove("Comment");
             for token in descr.split('\n') {
                 let token = token.trim();
-                let eq = token
-                    .find('=')
-                    .or_else(|| token.find(':'));
+                let eq = token.find('=').or_else(|| token.find(':'));
                 if let Some(eq) = eq {
                     let label = &token[..eq];
                     let data = &token[eq + 1..];
@@ -971,9 +1136,7 @@ impl SeqReader {
         // for RGB data the samples share one plane, so use the IFD count when it
         // matches, otherwise recompute from the planar dimensions.
         let effective_c = if is_rgb { 1 } else { size_c };
-        m.image_count = size_z
-            .saturating_mul(effective_c)
-            .saturating_mul(size_t);
+        m.image_count = size_z.saturating_mul(effective_c).saturating_mul(size_t);
     }
 }
 

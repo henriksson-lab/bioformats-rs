@@ -266,11 +266,35 @@ fn adjust_for_white_balance(val: i16, index: usize, wb: &Option<[f64; 3]>) -> i1
 const PHOTO_CFA_ARRAY: u16 = 32803;
 
 impl DngReader {
+    const CANON_TAG: u16 = 34665;
+    const TIFF_EPS_STANDARD: u16 = 37398;
+
     pub fn new() -> Self {
         DngReader {
             inner: crate::tiff::TiffReader::new(),
             cfa: None,
         }
+    }
+
+    fn is_canon_dng_tiff(header: &[u8]) -> bool {
+        let cursor = std::io::Cursor::new(header);
+        let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+            Ok(parser) => parser,
+            Err(_) => return false,
+        };
+        let ifd = match parser.read_ifd(parser.first_ifd_offset) {
+            Ok((ifd, _)) => ifd,
+            Err(_) => return false,
+        };
+        let has_eps_tag =
+            ifd.get(Self::TIFF_EPS_STANDARD).is_some() || ifd.get(Self::CANON_TAG).is_some();
+        let make = ifd.get_str(271);
+        let model = ifd.get_str(272);
+        let software = ifd.get_str(crate::tiff::ifd::tag::SOFTWARE);
+        matches!(make, Some(make) if make.contains("Canon"))
+            && has_eps_tag
+            && !matches!(model, Some(model) if model.ends_with("S1 IS"))
+            && software.is_none_or(|software| software.contains("Canon"))
     }
 
     /// Port of the Bayer-CFA branch of `DNGReader.openBytes`. Concatenates the
@@ -368,7 +392,71 @@ impl DngReader {
 
 #[cfg(test)]
 mod dng_wb_tests {
-    use super::adjust_for_white_balance;
+    use super::{adjust_for_white_balance, DngReader};
+    use crate::common::reader::FormatReader;
+
+    fn canon_tiff_header(make: &str, model: Option<&str>, software: Option<&str>) -> Vec<u8> {
+        struct Entry {
+            tag: u16,
+            ty: u16,
+            count: u32,
+            inline: Option<u32>,
+            data: Vec<u8>,
+        }
+
+        let mut entries = vec![Entry {
+            tag: DngReader::TIFF_EPS_STANDARD,
+            ty: 3,
+            count: 1,
+            inline: Some(1),
+            data: Vec::new(),
+        }];
+        for (tag, text) in [
+            (271u16, Some(make)),
+            (272u16, model),
+            (crate::tiff::ifd::tag::SOFTWARE, software),
+        ] {
+            if let Some(text) = text {
+                let mut data = text.as_bytes().to_vec();
+                data.push(0);
+                entries.push(Entry {
+                    tag,
+                    ty: 2,
+                    count: data.len() as u32,
+                    inline: None,
+                    data,
+                });
+            }
+        }
+        entries.sort_by_key(|entry| entry.tag);
+
+        let ifd_start = 8u32;
+        let ifd_size = 2 + entries.len() as u32 * 12 + 4;
+        let mut data_offset = ifd_start + ifd_size;
+        for entry in &mut entries {
+            if entry.inline.is_none() {
+                entry.inline = Some(data_offset);
+                data_offset += entry.data.len() as u32;
+            }
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in &entries {
+            bytes.extend_from_slice(&entry.tag.to_le_bytes());
+            bytes.extend_from_slice(&entry.ty.to_le_bytes());
+            bytes.extend_from_slice(&entry.count.to_le_bytes());
+            bytes.extend_from_slice(&entry.inline.unwrap().to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        for entry in &entries {
+            bytes.extend_from_slice(&entry.data);
+        }
+        bytes
+    }
 
     #[test]
     fn no_white_balance_is_identity() {
@@ -399,6 +487,19 @@ mod dng_wb_tests {
         let wb = Some([2.0f64, 2.0, 2.0]);
         assert_eq!(adjust_for_white_balance(50, 3, &wb), 50);
     }
+
+    #[test]
+    fn dng_stream_detection_matches_java_canon_tiff_predicate() {
+        let reader = DngReader::new();
+        let good = canon_tiff_header("Canon", Some("EOS 5D"), Some("Canon Digital"));
+        assert!(reader.is_this_type_by_bytes(&good));
+
+        let s1 = canon_tiff_header("Canon", Some("PowerShot S1 IS"), Some("Canon Digital"));
+        assert!(!reader.is_this_type_by_bytes(&s1));
+
+        let non_canon_software = canon_tiff_header("Canon", Some("EOS 5D"), Some("Other"));
+        assert!(!reader.is_this_type_by_bytes(&non_canon_software));
+    }
 }
 
 impl Default for DngReader {
@@ -416,8 +517,8 @@ impl FormatReader for DngReader {
         matches!(ext.as_deref(), Some("dng"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::is_canon_dng_tiff(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1245,6 +1346,10 @@ pub struct GelReader {
     square_root: bool,
     /// MD_SCALE_PIXEL rational as f64 (defaults to 1.0).
     scale: f64,
+    /// Java GelReader merges paired IFDs when more than one IFD exists. Logical
+    /// plane `n` reads physical IFD `n * 2` in that layout.
+    plane_ifds: Vec<u32>,
+    plane_scales: Vec<f64>,
 }
 
 impl GelReader {
@@ -1254,8 +1359,26 @@ impl GelReader {
             meta: None,
             square_root: false,
             scale: 1.0,
+            plane_ifds: Vec::new(),
+            plane_scales: Vec::new(),
         }
     }
+}
+
+fn gel_scale_from_ifd(ifd: &crate::tiff::ifd::Ifd) -> f64 {
+    ifd.get(MD_SCALE_PIXEL)
+        .and_then(|v| match v {
+            crate::tiff::ifd::IfdValue::Rational(r) if !r.is_empty() => {
+                let (num, den) = r[0];
+                if den == 0 {
+                    Some(1.0)
+                } else {
+                    Some(num as f64 / den as f64)
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or(1.0)
 }
 
 impl Default for GelReader {
@@ -1298,20 +1421,7 @@ impl FormatReader for GelReader {
             .and_then(|v| v.as_u64())
             .unwrap_or(128);
         self.square_root = fmt == GEL_SQUARE_ROOT;
-        self.scale = first
-            .get(MD_SCALE_PIXEL)
-            .and_then(|v| match v {
-                crate::tiff::ifd::IfdValue::Rational(r) if !r.is_empty() => {
-                    let (num, den) = r[0];
-                    if den == 0 {
-                        Some(1.0)
-                    } else {
-                        Some(num as f64 / den as f64)
-                    }
-                }
-                _ => None,
-            })
-            .unwrap_or(1.0);
+        self.scale = gel_scale_from_ifd(first);
 
         // imageCount == number of IFDs; reported as the T dimension (Java
         // GelReader.initMetadata sets sizeT = imageCount, sizeZ/sizeC = 1).
@@ -1319,7 +1429,24 @@ impl FormatReader for GelReader {
         while self.inner.ifd(ifds as usize).is_some() {
             ifds += 1;
         }
-        let ifds = ifds.max(1);
+        self.plane_ifds.clear();
+        self.plane_scales.clear();
+        if ifds > 1 {
+            for logical in 0..(ifds / 2) {
+                let physical = logical * 2;
+                self.plane_ifds.push(physical);
+                let scale = self
+                    .inner
+                    .ifd(physical as usize)
+                    .map(gel_scale_from_ifd)
+                    .unwrap_or(1.0);
+                self.plane_scales.push(scale);
+            }
+        } else {
+            self.plane_ifds.push(0);
+            self.plane_scales.push(self.scale);
+        }
+        let ifds = self.plane_ifds.len().max(1) as u32;
         let base = self.inner.metadata();
         let mut meta = base.clone();
         meta.size_z = 1;
@@ -1339,6 +1466,8 @@ impl FormatReader for GelReader {
         self.meta = None;
         self.square_root = false;
         self.scale = 1.0;
+        self.plane_ifds.clear();
+        self.plane_scales.clear();
         self.inner.close()
     }
 
@@ -1370,26 +1499,36 @@ impl FormatReader for GelReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let little_endian = meta.is_little_endian;
+        let physical_plane = self
+            .plane_ifds
+            .get(plane_index as usize)
+            .copied()
+            .unwrap_or(plane_index);
 
         if !self.square_root {
             // LINEAR: plain TIFF pixels.
-            return self.inner.open_bytes(plane_index);
+            return self.inner.open_bytes(physical_plane);
         }
 
         // SQUARE_ROOT: the TIFF holds unsigned-short samples that must be
         // squared and multiplied by the scale, then emitted as 32-bit floats.
         // We read the raw shorts directly (the TIFF reports a 16-bit type for
         // these IFDs) rather than letting any float interpretation occur.
-        let raw = self.inner.open_bytes(plane_index)?;
+        let raw = self.inner.open_bytes(physical_plane)?;
         let n = raw.len() / 2;
         let mut out = vec![0u8; n * 4];
+        let scale = self
+            .plane_scales
+            .get(plane_index as usize)
+            .copied()
+            .unwrap_or(self.scale);
         for i in 0..n {
             let value = if little_endian {
                 u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]])
             } else {
                 u16::from_be_bytes([raw[i * 2], raw[i * 2 + 1]])
             } as u64;
-            let pixel = (value * value) as f64 * self.scale;
+            let pixel = (value * value) as f64 * scale;
             let bits = (pixel as f32).to_bits();
             let bytes = if little_endian {
                 bits.to_le_bytes()
@@ -1925,8 +2064,12 @@ fn parse_imspector_native_stack(
     let name = imspector_read_fixed_string(bytes, name_offset, name_len, "stack name")?;
     imspector_skip_len_bytes(bytes, &mut offset, name_len, "stack name")?;
     let description_offset = offset;
-    let description =
-        imspector_read_fixed_string(bytes, description_offset, description_len, "stack description")?;
+    let description = imspector_read_fixed_string(
+        bytes,
+        description_offset,
+        description_len,
+        "stack description",
+    )?;
     imspector_skip_len_bytes(bytes, &mut offset, description_len, "stack description")?;
 
     let payload_offset = offset;
@@ -2347,10 +2490,8 @@ fn parse_imspector_native_stack(
                 length *= 1_000_000.0;
             }
             if length > 0.0 && dim_size > 0 {
-                meta.series_metadata.insert(
-                    key.into(),
-                    MetadataValue::Float(length / dim_size as f64),
-                );
+                meta.series_metadata
+                    .insert(key.into(), MetadataValue::Float(length / dim_size as f64));
             }
         }
     }
@@ -3663,8 +3804,7 @@ mod imspector_tests {
         // second stack starts at header_len + len(first block).
         let block_len = native_v1_stack_block(2, 2, 2, 1, 1, 0, &[1, 2, 3, 4, 5, 6, 7, 8]).len();
         let next_offset = (header_len + block_len) as i64;
-        let stack0 =
-            native_v1_stack_block(2, 2, 2, 1, 1, next_offset, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let stack0 = native_v1_stack_block(2, 2, 2, 1, 1, next_offset, &[1, 2, 3, 4, 5, 6, 7, 8]);
         let stack1 = native_v1_stack_block(3, 3, 1, 1, 1, 0, &stack1_pixels);
 
         let mut bytes = imspector_header(1);
@@ -5331,10 +5471,9 @@ impl FormatReader for HamamatsuVmsReader {
                 }
             }
             if kind == "full resolution" {
-                let magnification = match meta.series_metadata.get("VMS source_lens_magnification") {
-                    Some(MetadataValue::Float(value))
-                        if value.is_finite() && *value > 0.0 =>
-                    {
+                let magnification = match meta.series_metadata.get("VMS source_lens_magnification")
+                {
+                    Some(MetadataValue::Float(value)) if value.is_finite() && *value > 0.0 => {
                         Some(*value)
                     }
                     _ => None,
@@ -5800,7 +5939,10 @@ mod hamamatsu_vms_tests {
         // Series 0: full resolution name, physical sizes, and objective magnification.
         let ome0 = reader.ome_metadata().unwrap();
         let image0 = &ome0.images[0];
-        assert_eq!(image0.name.as_deref(), Some(format!("{base_name} full resolution").as_str()));
+        assert_eq!(
+            image0.name.as_deref(),
+            Some(format!("{base_name} full resolution").as_str())
+        );
         assert!((image0.physical_size_x.unwrap() - 1.0).abs() < 0.0001);
         assert!((image0.physical_size_y.unwrap() - 1.0).abs() < 0.0001);
         assert_eq!(image0.instrument_ref, Some(0));
@@ -5819,7 +5961,10 @@ mod hamamatsu_vms_tests {
         reader.set_series(1).unwrap();
         let ome1 = reader.ome_metadata().unwrap();
         let image1 = &ome1.images[0];
-        assert_eq!(image1.name.as_deref(), Some(format!("{base_name} macro").as_str()));
+        assert_eq!(
+            image1.name.as_deref(),
+            Some(format!("{base_name} macro").as_str())
+        );
         assert!((image1.physical_size_x.unwrap() - 4.0).abs() < 0.0001);
         assert!((image1.physical_size_y.unwrap() - 2.0).abs() < 0.0001);
         assert!(image1.instrument_ref.is_none());
@@ -5829,7 +5974,10 @@ mod hamamatsu_vms_tests {
         reader.set_series(2).unwrap();
         let ome2 = reader.ome_metadata().unwrap();
         let image2 = &ome2.images[0];
-        assert_eq!(image2.name.as_deref(), Some(format!("{base_name} map").as_str()));
+        assert_eq!(
+            image2.name.as_deref(),
+            Some(format!("{base_name} map").as_str())
+        );
         assert!(image2.physical_size_x.is_none());
         assert!(ome2.instruments.is_empty());
 
@@ -8080,9 +8228,7 @@ fn cellomics_finalize_plate_metadata(
     let plate_name = filename_metadata
         .plate
         .clone()
-        .or_else(|| {
-            cellomics_metadata_string(&metas[0].series_metadata, "cellomics.plate")
-        })
+        .or_else(|| cellomics_metadata_string(&metas[0].series_metadata, "cellomics.plate"))
         .unwrap_or_default();
 
     for (series_index, meta) in metas.iter_mut().enumerate() {
@@ -8114,7 +8260,11 @@ fn cellomics_finalize_plate_metadata(
         let col = cellomics_metadata_i64(&meta.series_metadata, "cellomics.well_column")
             .map(|v| v.max(0) as u32)
             .unwrap_or(0);
-        let (image_row, image_col) = if series_count == 1 { (0, 0) } else { (row, col) };
+        let (image_row, image_col) = if series_count == 1 {
+            (0, 0)
+        } else {
+            (row, col)
+        };
 
         if image_row < real_rows && image_col < real_cols {
             let well_index = image_row * real_cols + image_col;
@@ -11403,7 +11553,9 @@ impl ApngReader {
         while offset < total {
             let length = self.read_be_i32(offset)? as i64;
             if length < 0 {
-                return Err(BioFormatsError::Format("APNG: negative chunk length".into()));
+                return Err(BioFormatsError::Format(
+                    "APNG: negative chunk length".into(),
+                ));
             }
             let length = length as u32;
             let type_bytes = self
@@ -11925,7 +12077,12 @@ impl ApngWriter {
                     for col in 0..width * size_c {
                         let offset = (i * size_c * width + col) * bytes_per_pixel;
                         let pixel = bytes_to_int(stream, offset, bytes_per_pixel, true);
-                        unpack_bytes_be(pixel, &mut row_buf, col * bytes_per_pixel, bytes_per_pixel);
+                        unpack_bytes_be(
+                            pixel,
+                            &mut row_buf,
+                            col * bytes_per_pixel,
+                            bytes_per_pixel,
+                        );
                     }
                 } else {
                     row_buf.copy_from_slice(&stream[i * row_len..i * row_len + row_len]);
@@ -13103,7 +13260,7 @@ mod mrw_tests {
 #[cfg(test)]
 mod lof_lut_tests {
     use super::{
-        lof_channel_priority, lof_inverse_rgb, lof_insert_channel_lut_metadata, lof_pack_rgba,
+        lof_channel_priority, lof_insert_channel_lut_metadata, lof_inverse_rgb, lof_pack_rgba,
         lof_translate_lut, lof_translate_metadata, LofNode,
     };
     use crate::common::metadata::MetadataValue;

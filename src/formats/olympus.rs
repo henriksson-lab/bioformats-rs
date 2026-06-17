@@ -1343,10 +1343,7 @@ impl Region {
         let rh = ry + rh;
         let tw = tx + tw;
         let th = ty + th;
-        (rw < rx || rw > tx)
-            && (rh < ry || rh > ty)
-            && (tw < tx || tw > rx)
-            && (th < ty || th > ry)
+        (rw < rx || rw > tx) && (rh < ry || rh > ty) && (tw < tx || tw > rx) && (th < ty || th > ry)
     }
 
     /// Java `Region.intersection`.
@@ -1382,14 +1379,7 @@ impl TileHelper {
         }
     }
 
-    fn open_bytes_region(
-        &mut self,
-        no: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-    ) -> Result<Vec<u8>> {
+    fn open_bytes_region(&mut self, no: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         match self {
             TileHelper::Oir(r) => r.open_bytes_region(no, x, y, w, h),
             TileHelper::CellSens(r) => r.open_bytes_region(no, x, y, w, h),
@@ -1573,9 +1563,9 @@ impl OlympusTileReader {
         }
 
         for tile in &all_tiles {
-            let tile_file_rel = self
-                .get_child_value(tile, "matl:image")
-                .ok_or_else(|| BioFormatsError::Format("Olympus .omp2info: tile without image".into()))?;
+            let tile_file_rel = self.get_child_value(tile, "matl:image").ok_or_else(|| {
+                BioFormatsError::Format("Olympus .omp2info: tile without image".into())
+            })?;
             let tile_file = parent_dir.join(&tile_file_rel);
             let tile_file = tile_file.to_string_lossy().to_string();
 
@@ -1615,9 +1605,12 @@ impl OlympusTileReader {
                 let mut diff_x = stage_overlap * cols * 4;
                 let mut diff_y = stage_overlap * rows * 4;
 
-                if let (Some(sw), Some(sh), Some(px), Some(py)) =
-                    (stitched_width, stitched_height, physical_size_x, physical_size_y)
-                {
+                if let (Some(sw), Some(sh), Some(px), Some(py)) = (
+                    stitched_width,
+                    stitched_height,
+                    physical_size_x,
+                    physical_size_y,
+                ) {
                     let actual_width = (sw / px) as i64;
                     let actual_height = (sh / py) as i64;
                     diff_x = width_with_overlaps - actual_width;
@@ -1936,14 +1929,7 @@ impl FormatReader for OlympusTileReader {
     }
 
     /// Java `openBytes(int no, byte[] buf, int x, int y, int w, int h)`.
-    fn open_bytes_region(
-        &mut self,
-        no: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-    ) -> Result<Vec<u8>> {
+    fn open_bytes_region(&mut self, no: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let pixel = {
             let rgb = if meta.is_rgb { meta.size_c.max(1) } else { 1 } as usize;
@@ -2286,10 +2272,7 @@ mod tests {
         for row in 0..4 {
             for col in 0..8 {
                 let expected = if col < 4 { 10 } else { 20 };
-                assert_eq!(
-                    buf[row * 8 + col], expected,
-                    "pixel ({col},{row}) mismatch"
-                );
+                assert_eq!(buf[row * 8 + col], expected, "pixel ({col},{row}) mismatch");
             }
         }
 

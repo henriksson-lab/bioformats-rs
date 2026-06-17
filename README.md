@@ -157,7 +157,7 @@ translations, so they are not rated here — see
 | APNG | `.apng` | ✅ | Animated PNG read + write: each frame is a timepoint (sizeT == numFrames), per-frame fcTL composited onto the default image |
 | MNG | `.mng` | ✅ | Java-style MNG/JNG container parse with embedded PNG/JPEG frames |
 | AVI (video) | `.avi` | ✅ | Uncompressed/16-bit/Y8 + MSRLE, MS Video 1, Cinepak, JPEG/MJPEG |
-| QuickTime MOV/QT | `.mov` `.qt` | 🟡 | Uncompressed raw/gray/RGB plus JPEG/MJPEG and PNG layouts including gray, gray+alpha, RGB, and RGBA where decoder-supported; RPZA; Cinepak with prior-frame delta replay; 24-bit, 16-bit RGB555, and 32-bit ARGB Animation RLE including supported delta/partial-frame replay; sample/chunk table metadata, sample timing, codec-family diagnostics, simple edit-list timestamps, compatible multi-video-track series, OME plane DeltaT, and OME original-metadata annotations |
+| QuickTime MOV/QT | `.mov` `.qt` | 🟡 | Uncompressed raw/gray/RGB plus JPEG/MJPEG and PNG layouts including gray, gray+alpha, RGB, and RGBA where decoder-supported; RPZA; Cinepak with prior-frame delta replay; 24-bit, 16-bit RGB555, and 32-bit ARGB Animation RLE including supported delta/partial-frame replay; sample/chunk table metadata, sample timing, codec-family diagnostics, simple edit-list timestamps, compatible multi-video-track series, OME plane DeltaT, OME original-metadata annotations, and opt-in Java parity slots for external-codec fixtures |
 | Fake (test format) | `.fake` | ✅ | Synthetic gradient generator |
 
 ### Microscopy acquisition containers
@@ -339,7 +339,7 @@ format (so the name collides), that is noted.
 | Photon Dynamics | `.hdr` `.img` `.pds` | Header + companion IMG / raw pixel sidecar |
 | Norpix StreamPix | `.seq` | Raw/JPEG frames, timestamps, bounded compressed-frame diagnostics, OME original-metadata. (Bio-Formats' `SEQReader` is the unrelated *Image-Pro Sequence* `.seq`/`.ips`.) |
 | Bruker MicroCT | `.ctf` | Header + TIFF delegate. (Bio-Formats' `MicroCTReader` reads `.vff` only — that one *is* translated, separately, as `MicroCtVffReader`.) |
-| PicoQuant | `.ptu` `.pqres` | PTU/PQRes tag headers + bounded T2/T3 marker-raster reconstruction (HydraHarp/TimeHarp 260/MultiHarp) + exact histogram payloads; PicoHarp reconstruction fixture-blocked. (Bio-Formats only has `PQBinReader` for the unrelated `.bin` format.) |
+| PicoQuant | `.ptu` `.pqres` | PTU/PQRes tag headers + bounded T2/T3 marker-raster reconstruction (HydraHarp/TimeHarp 260/MultiHarp) + exact histogram payloads; PicoHarp reconstruction is fixture-gated by `BIOFORMATS_RS_PICOQUANT_FIXTURE`. (Bio-Formats only has `PQBinReader` for the unrelated `.bin` format.) |
 
 ## API overview
 
@@ -535,27 +535,44 @@ around the whole harness process, so Java RSS includes JVM overhead.
 
 ## Java parity & known divergences
 
-Readers and writers are checked against the reference Java Bio-Formats
-(`bioformats_package.jar`) by a parity harness (`tests/java_parity_test.rs` for
-reads, `tests/java_writer_parity_test.rs` for writes; oracle in
-`parity/BfParityOracle.java`). For each file it compares **core metadata**, **OME
-metadata** (image name, physical sizes, channels/wavelengths) and **pixels**
-(CRC of the top-left crop of every plane, the whole plane for small images, and a
-centered off-origin region). Pixel results are classified **bitwise** /
-**tolerant** (≤5 levels, JPEG IDCT rounding) / **⚠ Java-bug** / **✗**. Run with
-`BIOFORMATS_RS_JAVA_PARITY=1` (skipped otherwise, so a plain `cargo test` needs
-no JVM).
+Readers are checked against the reference Java Bio-Formats
+(`bioformats_package.jar`) by `tests/java_parity_test.rs` with
+`parity/BfParityOracle.java`. The reader harness is opt-in:
+`BIOFORMATS_RS_JAVA_PARITY=1 cargo test --test java_parity_test -- --nocapture`
+(skipped otherwise, so a plain `cargo test` needs no JVM).
 
-Core metadata reaches full parity; the remaining divergences are documented and
-intentional:
+Default reader parity runs fail on **core metadata** and **OME metadata**. Core
+coverage includes dimensions, pixel type, bit depth, image count, dimension
+order, RGB/interleaved/indexed/little-endian flags, `rgbChannelCount`, and
+`resolutionCount`. OME coverage includes image name, physical sizes X/Y/Z, time
+increment, channel count, channel name, `samplesPerPixel`, and
+emission/excitation wavelengths. The oracle also compares OME object-graph
+summary counts: instruments, objectives, detectors, light sources, filters,
+dichroics, plane metadata entries, ROIs/shapes, plates, wells, well samples, and
+structured annotation counts for annotation types represented by Rust.
 
-- **OME image name — IMAGIC (`.hed`/`.img`).** The OME *image name* convention is
-  the file basename, which we populate for every reader to match Java. IMAGIC is
-  the one exception: Java's `IMAGICReader` takes the name from a header field
-  rather than the filename, and in real files that field often contains numeric
-  header junk (e.g. `"!--0.507 41.5 10.9 …"`). We deliberately leave the name
-  unset (`None`) rather than replicate the junk — matching Java here would be
-  *less* useful, not more. This is the only OME-metadata divergence in the suite.
+Pixel parity is evidence by default and becomes a gate with
+`BIOFORMATS_RS_JAVA_PARITY_STRICT=1`. Pixel sampling compares top-left 256x256
+crops for up to 64 planes per series (per-file caps may reduce this for very
+slow fixtures), whole planes only when Java reports the plane is small enough
+(<= 4 MiB), and one centered off-origin crop from plane 0. Very large Rust plane
+reads are skipped above the harness memory budget. Pixel results are classified
+**bitwise** / **tolerant** (<=5 levels, JPEG IDCT rounding) / **Java-bug** /
+**mismatch**.
+
+Release/CI strict pixel coverage can run the explicit ignored gate:
+`BIOFORMATS_RS_JAVA_PARITY=1 BIOFORMATS_RS_JAVA_PARITY_STRICT=1 cargo test --test java_parity_test java_parity_strict_pixel_gate -- --ignored --nocapture`.
+Optional fixture hooks are `BIOFORMATS_RS_QT_EXTERNAL_CODEC_FIXTURE` for a local
+QuickTime H.264/HEVC/ProRes/DV-style sample and `BIOFORMATS_RS_PICOQUANT_FIXTURE`
+for local PTU/PQRes coverage; both skip when unset.
+
+Writer parity is separate: `tests/java_writer_parity_test.rs` synthesizes small
+Rust outputs, asks Java to read them, and fails on unannotated metadata or pixel
+divergence. It runs by default when the Java jar/toolchain are present, and can
+be disabled with `BIOFORMATS_RS_JAVA_PARITY=0`.
+
+Core and OME metadata are expected to reach full parity. The remaining
+documented divergences are pixel-only:
 
 - **JPEG-compressed pixels** (whole-slide SVS/SCN/NDPI, VSI overview, baseline
   JPEG). These match Java to within ±1–3 levels per sample but not bitwise: the

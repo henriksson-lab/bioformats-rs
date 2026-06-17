@@ -101,8 +101,28 @@ impl BioRadReader {
 
 /// Mirrors Java `NOTE_NAMES`; index = note type, length 23 (indices 0..=22).
 const NOTE_NAMES: [&str; 23] = [
-    "0", "LIVE", "FILE1", "NUMBER", "USER", "LINE", "COLLECT", "FILE2", "SCALEBAR", "MERGE",
-    "THRUVIEW", "ARROW", "12", "13", "14", "15", "16", "17", "18", "19", "VARIABLE", "STRUCTURE",
+    "0",
+    "LIVE",
+    "FILE1",
+    "NUMBER",
+    "USER",
+    "LINE",
+    "COLLECT",
+    "FILE2",
+    "SCALEBAR",
+    "MERGE",
+    "THRUVIEW",
+    "ARROW",
+    "12",
+    "13",
+    "14",
+    "15",
+    "16",
+    "17",
+    "18",
+    "19",
+    "VARIABLE",
+    "STRUCTURE",
     "4D SERIES",
 ];
 
@@ -911,13 +931,14 @@ impl FormatReader for BioRadReader {
         // Java: m.indexed = lut != null. Surface channel 0's table as the
         // ImageMetadata LookupTable (the readable channel-0 LUT).
         let is_indexed = lut.is_some();
-        let lookup_table = lut.as_ref().and_then(|l| l.first()).map(|ramp| {
-            crate::common::metadata::LookupTable {
-                red: ramp[0].iter().map(|&b| b as u16).collect(),
-                green: ramp[1].iter().map(|&b| b as u16).collect(),
-                blue: ramp[2].iter().map(|&b| b as u16).collect(),
-            }
-        });
+        let lookup_table =
+            lut.as_ref()
+                .and_then(|l| l.first())
+                .map(|ramp| crate::common::metadata::LookupTable {
+                    red: ramp[0].iter().map(|&b| b as u16).collect(),
+                    green: ramp[1].iter().map(|&b| b as u16).collect(),
+                    blue: ramp[2].iter().map(|&b| b as u16).collect(),
+                });
 
         self.meta = Some(ImageMetadata {
             size_x: nx,
@@ -1048,9 +1069,7 @@ impl FormatReader for BioRadReader {
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         use crate::common::metadata::MetadataValue;
-        use crate::common::ome_metadata::{
-            OmeDetector, OmeInstrument, OmeMetadata, OmeObjective,
-        };
+        use crate::common::ome_metadata::{OmeDetector, OmeInstrument, OmeMetadata, OmeObjective};
         let meta = self.meta.as_ref()?;
         let sm = &meta.series_metadata;
         let get_f = |key: &str| match sm.get(key) {
@@ -1207,10 +1226,7 @@ mod tests {
         assert_eq!(r.detectors.gain.first().copied().flatten(), Some(850.0));
         assert_eq!(r.detectors.offset.get(1).copied().flatten(), Some(12.5));
         // Free-form keys are preserved in global metadata.
-        assert_eq!(
-            global_get(&r, "INFO_OBJECTIVE_MAGNIFICATION"),
-            Some("60")
-        );
+        assert_eq!(global_get(&r, "INFO_OBJECTIVE_MAGNIFICATION"), Some("60"));
     }
 
     #[test]

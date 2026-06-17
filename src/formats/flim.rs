@@ -1022,7 +1022,10 @@ fn insert_sdt_meas_fcs_info_metadata(
         format!("{p}endTime"),
         MetadataValue::Float(f.end_time as f64),
     );
-    meta_map.insert(format!("{p}overruns"), MetadataValue::Int(f.overruns as i64));
+    meta_map.insert(
+        format!("{p}overruns"),
+        MetadataValue::Int(f.overruns as i64),
+    );
     meta_map.insert(format!("{p}fcsType"), MetadataValue::Int(f.fcs_type as i64));
     meta_map.insert(
         format!("{p}crossChan"),

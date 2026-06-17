@@ -42,19 +42,16 @@ use crate::common::reader::FormatReader;
 
 use hdf5_pure_rust::{HyperslabDim, Selection};
 
-/// One core series: a single resolution level of one setup at one timepoint.
-///
-/// Resolutions *and timepoints* are flattened (the default pure-Rust
-/// `ImageReader` configuration): every existing `(setup × timepoint × level)`
-/// coordinate that has a `cells` dataset is exposed as its own single-plane-set
-/// series with `sizeT = 1`. `setup` is the `sNN` group id and `timepoint` is
-/// the `tNNNNN` group number; `level` is the resolution level.
+/// One core series: a single resolution level of one logical setup across all
+/// timepoints. Resolutions are flattened, but timepoints stay in `sizeT`.
 #[derive(Clone)]
 struct SeriesInfo {
-    /// The owning setup's `sNN` id.
+    /// The first-channel/base `sNN` setup id for this logical series.
     setup: u32,
-    /// The timepoint (`tNNNNN`) this series belongs to.
-    timepoint: u32,
+    /// Setup id for each channel index in this logical series.
+    channel_setups: Vec<u32>,
+    /// Timepoints exposed through this series' T axis.
+    timepoints: Vec<u32>,
     /// Resolution level (the `{level}` group number).
     level: u32,
     /// Core metadata for this series.
@@ -102,7 +99,7 @@ pub struct BdvReader {
     timepoint_increment: u32,
     timepoint_use_pattern: bool,
 
-    /// Flattened series list (one per (setup, timepoint, level)).
+    /// Flattened series list (one per logical setup/resolution level).
     series: Vec<SeriesInfo>,
     current_series: usize,
 }
@@ -125,17 +122,31 @@ impl BdvReader {
         }
     }
 
-    /// The `cells` dataset path for the current series. Each series corresponds
-    /// to a single concrete `(timepoint, setup, level)` coordinate, so the path
-    /// is fixed regardless of the plane index within the series.
-    fn image_data_path(&self, _no: u32) -> Result<String> {
+    /// The `cells` dataset path for a plane in the current series.
+    fn image_data_path(&self, no: u32) -> Result<String> {
         let si = self
             .series
             .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?;
+        let (_z, c, t) = get_zct_coords(
+            si.meta.dimension_order,
+            si.meta.size_z,
+            si.meta.size_c,
+            si.meta.size_t,
+            no,
+        );
+        let timepoint =
+            si.timepoints.get(t as usize).copied().ok_or_else(|| {
+                BioFormatsError::Format("BDV timepoint index out of range".into())
+            })?;
+        let setup = si
+            .channel_setups
+            .get(c as usize)
+            .copied()
+            .unwrap_or(si.setup);
         Ok(format!(
             "t{:05}/s{:02}/{}/cells",
-            si.timepoint, si.setup, si.level
+            timepoint, setup, si.level
         ))
     }
 }
@@ -342,6 +353,27 @@ fn parse_integer_string(pattern: &str, first: &mut u32, last: &mut u32, incremen
                 *increment = i;
             }
         }
+    }
+}
+
+/// Java BDVReader computes patterned timepoint count as integer division of
+/// `(last - first + 1) / increment`, even though the path iteration still walks
+/// `first, first + increment, ... <= last`.
+fn java_timepoint_count(first: u32, last: u32, increment: u32, use_pattern: bool) -> u32 {
+    let last = if !use_pattern && last == 0 {
+        first
+    } else {
+        last
+    };
+    if use_pattern && last > 0 {
+        let span = last.saturating_sub(first).saturating_add(1);
+        if increment > 0 {
+            (span / increment).max(1)
+        } else {
+            span.max(1)
+        }
+    } else {
+        last.saturating_sub(first).saturating_add(1).max(1)
     }
 }
 
@@ -560,22 +592,20 @@ impl FormatReader for BdvReader {
     }
 
     fn resolution_count(&self) -> usize {
-        // Resolutions are flattened (Java default ImageReader behaviour): each
-        // level is its own series, so every series is single-resolution.
-        if self.series.is_empty() {
-            0
-        } else {
-            1
-        }
+        self.series
+            .get(self.current_series)
+            .map(|s| s.meta.resolution_count as usize)
+            .unwrap_or(0)
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         if self.series.is_empty() {
             return Err(BioFormatsError::NotInitialized);
         }
-        if level != 0 {
+        if level >= self.resolution_count().max(1) {
             return Err(BioFormatsError::Format(format!(
-                "resolution {level} out of range (max 0)"
+                "resolution {level} out of range (max {})",
+                self.resolution_count().saturating_sub(1)
             )));
         }
         Ok(())
@@ -590,8 +620,13 @@ impl FormatReader for BdvReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let (z, _c, _t) =
-            get_zct_coords(meta.dimension_order, meta.size_z, meta.size_c, meta.size_t, plane_index);
+        let (z, _c, _t) = get_zct_coords(
+            meta.dimension_order,
+            meta.size_z,
+            meta.size_c,
+            meta.size_t,
+            plane_index,
+        );
         let (sx, sy) = (meta.size_x, meta.size_y);
         self.read_block(plane_index, z, 0, 0, sx, sy)
     }
@@ -623,8 +658,13 @@ impl FormatReader for BdvReader {
                 "BDV region is outside image bounds".into(),
             ));
         }
-        let (z, _c, _t) =
-            get_zct_coords(meta.dimension_order, meta.size_z, meta.size_c, meta.size_t, plane_index);
+        let (z, _c, _t) = get_zct_coords(
+            meta.dimension_order,
+            meta.size_z,
+            meta.size_c,
+            meta.size_t,
+            plane_index,
+        );
         self.read_block(plane_index, z, x, y, w, h)
     }
 
@@ -648,9 +688,14 @@ impl FormatReader for BdvReader {
         let mut ome = OmeMetadata::default();
         for si in &self.series {
             let setup = self.setup_attribute_list.iter().find(|s| s.id == si.setup);
+            let first_timepoint = si
+                .timepoints
+                .first()
+                .copied()
+                .unwrap_or(self.first_timepoint);
             let name = match setup {
-                Some(s) => format!("P_t{:05}, W_s{:02}_{}", si.timepoint, s.id, si.level),
-                None => format!("P_t{:05}, W_s{:02}_{}", si.timepoint, si.setup, si.level),
+                Some(s) => format!("P_t{first_timepoint:05}, W_s{:02}_{}", s.id, si.level),
+                None => format!("P_t{first_timepoint:05}, W_s{:02}_{}", si.setup, si.level),
             };
             let (psx, psy, psz) = match si.voxel_size {
                 Some((x, y, z)) => (Some(x), Some(y), Some(z)),
@@ -711,13 +756,9 @@ impl BdvReader {
     }
 
     /// Walk the HDF5 group tree (`tNNNNN/sNN/{level}/cells`) and build one core
-    /// series per existing `(timepoint × setup × resolution-level)` coordinate.
-    ///
-    /// Resolutions *and* timepoints are flattened in the pure-Rust reader's
-    /// default configuration: each series is a single (`sizeT = 1`) volume whose
-    /// dimensions come from its own `cells` dataset shape `[z, y, x]`, not from
-    /// the companion XML's `<size>`. Setups come from the companion XML
-    /// `<ViewSetup>` blocks when present, else from the HDF5 `sNN` groups.
+    /// series per logical setup/resolution level. Timepoints stay in `sizeT`;
+    /// channel ViewSetups with the same non-channel position collapse into
+    /// `sizeC`, matching Java BDVReader.
     fn parse_structure(&mut self) -> Result<()> {
         // If no XML setups were parsed, fall back to enumerating root groups.
         if self.setup_attribute_list.is_empty() {
@@ -727,98 +768,151 @@ impl BdvReader {
         let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         // Enumerate the timepoints (XML range/pattern) to visit, in order.
+        // Bio-Formats' pattern branch computes the count with integer division
+        // of `(last - first + 1) / increment`, rather than including every
+        // stepped endpoint. Preserve that behavior for metadata/plane parity.
         let mut timepoints: Vec<u32> = Vec::new();
-        let mut tp = self.first_timepoint;
         let last = self.last_timepoint.max(self.first_timepoint);
-        while tp <= last {
-            timepoints.push(tp);
-            let next = tp.saturating_add(self.timepoint_increment);
-            if next == tp {
-                break;
+        let increment = self.timepoint_increment.max(1);
+        if self.timepoint_use_pattern && last > 0 {
+            let count = java_timepoint_count(
+                self.first_timepoint,
+                self.last_timepoint,
+                self.timepoint_increment,
+                self.timepoint_use_pattern,
+            );
+            for i in 0..count {
+                timepoints.push(
+                    self.first_timepoint
+                        .saturating_add(i.saturating_mul(increment)),
+                );
             }
-            tp = next;
+        } else {
+            let mut tp = self.first_timepoint;
+            while tp <= last {
+                timepoints.push(tp);
+                let next = tp.saturating_add(increment);
+                if next == tp {
+                    break;
+                }
+                tp = next;
+            }
         }
 
-        // Build the flattened series list: setup × timepoint × level. Only
-        // coordinates that actually carry a `cells` dataset become series.
+        let size_c = self.size_c.max(1);
+
+        // Build the flattened series list: logical setup × level. Only first
+        // timepoint coordinates that actually carry a `cells` dataset become
+        // series; other timepoints are resolved at plane-read time through T.
         let mut series: Vec<SeriesInfo> = Vec::new();
+        let first_channel = self.channel_indexes.first().copied();
+        let mut logical_setup_index = 0usize;
         for setup in &self.setup_attribute_list {
-            for &tp in &timepoints {
-                let setup_group = format!("t{tp:05}/s{:02}", setup.id);
-                let mut levels: Vec<u32> = match file
-                    .group(&setup_group)
-                    .ok()
-                    .and_then(|g| hdf5_group_members(&g).ok())
-                {
-                    Some(members) => members.iter().filter_map(|n| n.parse::<u32>().ok()).collect(),
-                    None => continue, // missing view — skip
-                };
-                levels.sort_unstable();
+            let participates_as_base = if size_c == 1 {
+                true
+            } else {
+                setup
+                    .attribute("channel")
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    == first_channel
+            };
+            if !participates_as_base {
+                continue;
+            }
 
-                for &level in &levels {
-                    let cells_path = format!("{setup_group}/{level}/cells");
-                    if !dataset_exists(file, &cells_path) {
-                        continue;
-                    }
+            let channel_setups =
+                self.channel_setups_for_logical_index(logical_setup_index, setup.id);
+            logical_setup_index += 1;
 
-                    // Shape: HDF5 cells dataset is [z, y, x].
-                    let ds = file
-                        .dataset(&cells_path)
-                        .map_err(|e| BioFormatsError::Format(format!("dataset {cells_path}: {e}")))?;
-                    let shape = ds.shape().map_err(|e| {
-                        BioFormatsError::Format(format!("BDV: cannot read shape {cells_path}: {e}"))
-                    })?;
-                    if shape.len() != 3 || shape.iter().any(|&d| d == 0) {
-                        return Err(BioFormatsError::Format(format!(
-                            "BDV: unsupported cells shape {shape:?} for {cells_path}"
-                        )));
-                    }
-                    let size_z = u32::try_from(shape[0])
-                        .map_err(|_| BioFormatsError::Format("BDV Z overflows".into()))?;
-                    let size_y = u32::try_from(shape[1])
-                        .map_err(|_| BioFormatsError::Format("BDV Y overflows".into()))?;
-                    let size_x = u32::try_from(shape[2])
-                        .map_err(|_| BioFormatsError::Format("BDV X overflows".into()))?;
+            let setup_group = format!("t{:05}/s{:02}", timepoints[0], setup.id);
+            let mut levels: Vec<u32> = match file
+                .group(&setup_group)
+                .ok()
+                .and_then(|g| hdf5_group_members(&g).ok())
+            {
+                Some(members) => members
+                    .iter()
+                    .filter_map(|n| n.parse::<u32>().ok())
+                    .collect(),
+                None => continue, // missing view — skip
+            };
+            levels.sort_unstable();
 
-                    let dtype_size = ds.dtype().map(|dt| dt.size()).map_err(|e| {
-                        BioFormatsError::Format(format!("BDV: dtype {cells_path}: {e}"))
-                    })?;
-                    let (pixel_type, bytes_per_sample) = pixel_type_for_size(dtype_size)?;
-
-                    let voxel_size = setup.voxel_size;
-                    let meta_map = self.build_series_metadata(Some(setup), setup.id, tp, level);
-
-                    let meta = ImageMetadata {
-                        size_x,
-                        size_y,
-                        size_z,
-                        size_c: 1,
-                        size_t: 1,
-                        pixel_type,
-                        bits_per_pixel: (bytes_per_sample * 8) as u8,
-                        image_count: size_z,
-                        dimension_order: DimensionOrder::XYZTC,
-                        is_rgb: false,
-                        is_interleaved: false,
-                        is_indexed: true,
-                        is_little_endian: true,
-                        resolution_count: 1,
-                        thumbnail: false,
-                        series_metadata: meta_map,
-                        lookup_table: None,
-                        modulo_z: None,
-                        modulo_c: None,
-                        modulo_t: None,
-                    };
-
-                    series.push(SeriesInfo {
-                        setup: setup.id,
-                        timepoint: tp,
-                        level,
-                        meta,
-                        voxel_size,
-                    });
+            for &level in &levels {
+                let cells_path = format!("{setup_group}/{level}/cells");
+                if !dataset_exists(file, &cells_path) {
+                    continue;
                 }
+
+                // Shape: HDF5 cells dataset is [z, y, x].
+                let ds = file
+                    .dataset(&cells_path)
+                    .map_err(|e| BioFormatsError::Format(format!("dataset {cells_path}: {e}")))?;
+                let shape = ds.shape().map_err(|e| {
+                    BioFormatsError::Format(format!("BDV: cannot read shape {cells_path}: {e}"))
+                })?;
+                if shape.len() != 3 || shape.iter().any(|&d| d == 0) {
+                    return Err(BioFormatsError::Format(format!(
+                        "BDV: unsupported cells shape {shape:?} for {cells_path}"
+                    )));
+                }
+                let size_z = u32::try_from(shape[0])
+                    .map_err(|_| BioFormatsError::Format("BDV Z overflows".into()))?;
+                let size_y = u32::try_from(shape[1])
+                    .map_err(|_| BioFormatsError::Format("BDV Y overflows".into()))?;
+                let size_x = u32::try_from(shape[2])
+                    .map_err(|_| BioFormatsError::Format("BDV X overflows".into()))?;
+
+                let dtype_size = ds.dtype().map(|dt| dt.size()).map_err(|e| {
+                    BioFormatsError::Format(format!("BDV: dtype {cells_path}: {e}"))
+                })?;
+                let (pixel_type, bytes_per_sample) = pixel_type_for_size(dtype_size)?;
+
+                let voxel_size = setup.voxel_size;
+                let meta_map =
+                    self.build_series_metadata(Some(setup), setup.id, timepoints[0], level);
+                let size_t = java_timepoint_count(
+                    self.first_timepoint,
+                    self.last_timepoint,
+                    self.timepoint_increment,
+                    self.timepoint_use_pattern,
+                );
+                let image_count = size_z
+                    .checked_mul(size_c)
+                    .and_then(|v| v.checked_mul(size_t))
+                    .ok_or_else(|| BioFormatsError::Format("BDV image count overflows".into()))?;
+
+                let meta = ImageMetadata {
+                    size_x,
+                    size_y,
+                    size_z,
+                    size_c,
+                    size_t,
+                    pixel_type,
+                    bits_per_pixel: (bytes_per_sample * 8) as u8,
+                    image_count,
+                    dimension_order: DimensionOrder::XYZTC,
+                    is_rgb: false,
+                    is_interleaved: false,
+                    is_indexed: true,
+                    is_little_endian: true,
+                    resolution_count: levels.len().max(1) as u32,
+                    thumbnail: false,
+                    series_metadata: meta_map,
+                    lookup_table: None,
+                    modulo_z: None,
+                    modulo_c: None,
+                    modulo_t: None,
+                };
+
+                series.push(SeriesInfo {
+                    setup: setup.id,
+                    channel_setups: channel_setups.clone(),
+                    timepoints: timepoints.clone(),
+                    level,
+                    meta,
+                    voxel_size,
+                });
             }
         }
 
@@ -828,6 +922,29 @@ impl BdvReader {
 
         self.series = series;
         Ok(())
+    }
+
+    fn channel_setups_for_logical_index(&self, logical_index: usize, base_setup: u32) -> Vec<u32> {
+        if self.size_c <= 1 || self.channel_indexes.is_empty() {
+            return vec![base_setup];
+        }
+
+        self.channel_indexes
+            .iter()
+            .map(|channel| {
+                self.setup_attribute_list
+                    .iter()
+                    .filter(|setup| {
+                        setup
+                            .attribute("channel")
+                            .and_then(|v| v.trim().parse::<u32>().ok())
+                            == Some(*channel)
+                    })
+                    .nth(logical_index)
+                    .map(|setup| setup.id)
+                    .unwrap_or(base_setup)
+            })
+            .collect()
     }
 
     /// Build the per-series original-metadata map (format tag, paths, setup
@@ -849,10 +966,7 @@ impl BdvReader {
             meta_map.insert("bdv_xml_path".into(), MetadataValue::String(p.into()));
         }
         meta_map.insert("bdv_setup".into(), MetadataValue::Int(setup_id as i64));
-        meta_map.insert(
-            "bdv_timepoint".into(),
-            MetadataValue::Int(timepoint as i64),
-        );
+        meta_map.insert("bdv_timepoint".into(), MetadataValue::Int(timepoint as i64));
         meta_map.insert("bdv_level".into(), MetadataValue::Int(level as i64));
         if let Some(setup) = setup {
             if let Some(name) = setup.name.as_ref().filter(|s| !s.is_empty()) {
@@ -1011,7 +1125,6 @@ impl BdvReader {
     }
 }
 
-
 /// Whether a dataset exists at `path` in `file`.
 fn dataset_exists(file: &hdf5_pure_rust::File, path: &str) -> bool {
     file.dataset(path).is_ok()
@@ -1074,6 +1187,25 @@ mod tests {
     }
 
     #[test]
+    fn bdv_pattern_size_t_matches_java_integer_division() {
+        let first = 0;
+        let last = 10;
+        let increment = 3;
+        let mapped_timepoints = {
+            let mut out = Vec::new();
+            let mut tp = first;
+            while tp <= last {
+                out.push(tp);
+                tp += increment;
+            }
+            out
+        };
+
+        assert_eq!(mapped_timepoints, vec![0, 3, 6, 9]);
+        assert_eq!(java_timepoint_count(first, last, increment, true), 3);
+    }
+
+    #[test]
     fn bdv_timepoint_range_first_last() {
         let xml = r#"<SpimData><Timepoints type="range">
           <first>3</first><last>7</last>
@@ -1093,5 +1225,80 @@ mod tests {
         assert_eq!(r.size_c, 2);
         assert_eq!(r.channel_indexes, vec![0, 1]);
         assert_eq!(r.setup_attribute_list.len(), 2);
+    }
+
+    fn bdv_test_meta() -> ImageMetadata {
+        ImageMetadata {
+            size_x: 4,
+            size_y: 3,
+            size_z: 2,
+            size_c: 2,
+            size_t: 2,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 8,
+            dimension_order: DimensionOrder::XYZTC,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: true,
+            is_little_endian: true,
+            resolution_count: 1,
+            thumbnail: false,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        }
+    }
+
+    #[test]
+    fn bdv_plane_index_maps_xyz_tc_to_timepoint_and_channel_setup() {
+        let mut r = BdvReader::new();
+        r.series.push(SeriesInfo {
+            setup: 10,
+            channel_setups: vec![10, 11],
+            timepoints: vec![3, 5],
+            level: 2,
+            meta: bdv_test_meta(),
+            voxel_size: None,
+        });
+
+        assert_eq!(r.image_data_path(0).unwrap(), "t00003/s10/2/cells");
+        assert_eq!(r.image_data_path(1).unwrap(), "t00003/s10/2/cells");
+        assert_eq!(r.image_data_path(2).unwrap(), "t00005/s10/2/cells");
+        assert_eq!(r.image_data_path(4).unwrap(), "t00003/s11/2/cells");
+        assert_eq!(r.image_data_path(6).unwrap(), "t00005/s11/2/cells");
+    }
+
+    #[test]
+    fn bdv_channel_setup_lookup_uses_same_logical_setup_ordinal() {
+        let xml = r#"<SpimData>
+          <ViewSetup><id>0</id><attributes><channel>0</channel><angle>0</angle></attributes></ViewSetup>
+          <ViewSetup><id>1</id><attributes><channel>1</channel><angle>0</angle></attributes></ViewSetup>
+          <ViewSetup><id>2</id><attributes><channel>0</channel><angle>1</angle></attributes></ViewSetup>
+          <ViewSetup><id>3</id><attributes><channel>1</channel><angle>1</angle></attributes></ViewSetup>
+        </SpimData>"#;
+        let mut r = BdvReader::new();
+        r.parse_xml(Some(xml));
+
+        assert_eq!(r.channel_setups_for_logical_index(0, 0), vec![0, 1]);
+        assert_eq!(r.channel_setups_for_logical_index(1, 2), vec![2, 3]);
+    }
+
+    #[test]
+    fn bdv_fixture_keeps_timepoints_in_size_t_not_series() {
+        let path = Path::new("testdata/bdv/HisYFP-SPIM.xml");
+        if !path.exists() {
+            return;
+        }
+
+        let mut r = BdvReader::new();
+        r.set_id(path).unwrap();
+
+        assert_eq!(r.series_count(), 34);
+        assert_eq!(r.metadata().size_t, 1);
+        assert_eq!(r.metadata().size_c, 1);
+        assert_eq!(r.metadata().image_count, r.metadata().size_z);
     }
 }

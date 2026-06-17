@@ -121,7 +121,6 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     let (processing_log, pixel_offset) = read_cstring(&mut f)?;
 
     let mut meta = aim_metadata(w, h, d);
-    validate_payload_len(file_len, pixel_offset, &meta)?;
     // Store the processing log lines as global metadata (key  value pairs).
     for line in processing_log.split('\n') {
         let line = line.trim();
@@ -267,9 +266,13 @@ impl FormatReader for AimReader {
         let file_offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        let mut buf = vec![0u8; plane_bytes];
+        if file_offset >= file_len {
+            return Ok(buf);
+        }
         f.seek(SeekFrom::Start(file_offset))
             .map_err(BioFormatsError::Io)?;
-        let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }

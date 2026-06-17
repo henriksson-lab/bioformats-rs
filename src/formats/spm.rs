@@ -4159,7 +4159,7 @@ impl PqBinReader {
     /// enough to reject arbitrary `.bin` files (`suffixSufficient = false`).
     fn is_this_type(header: &[u8], file_length: u64) -> bool {
         const BPP: i64 = 4; // FormatTools.getBytesPerPixel(UINT32)
-        // Header: sizeX:i32, sizeY:i32, resolution:f32 (skipped), sizeT:i32.
+                            // Header: sizeX:i32, sizeY:i32, resolution:f32 (skipped), sizeT:i32.
         if header.len() < 16 {
             return false;
         }
@@ -4341,7 +4341,8 @@ impl FormatReader for PqBinReader {
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if !Self::is_this_type(&data, data.len() as u64) {
             return Err(BioFormatsError::UnsupportedFormat(
-                "PicoQuant Bin header does not match sizeX*sizeY*sizeT*4 + 20 == file length".into(),
+                "PicoQuant Bin header does not match sizeX*sizeY*sizeT*4 + 20 == file length"
+                    .into(),
             ));
         }
         self.init_file(path)

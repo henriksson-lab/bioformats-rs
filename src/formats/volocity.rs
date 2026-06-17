@@ -1745,10 +1745,7 @@ fn volocity_native_stream_clue(bytes: &[u8]) -> Option<VolocityNativeStreamClue>
 /// `data_dir` is `None` during the lightweight `isThisType` probe (no library
 /// directory is known yet); in that case external rows fall back to their
 /// inline data, matching the pre-existing inline-only behavior.
-fn volocity_get_stream(
-    row: &VolocitySampleRow,
-    data_dir: Option<&Path>,
-) -> Option<Vec<u8>> {
+fn volocity_get_stream(row: &VolocitySampleRow, data_dir: Option<&Path>) -> Option<Vec<u8>> {
     // Java: fileLink = o == null ? "0" : o.toString().trim(); the integer 0
     // stringifies to "0", so external_data == Some(0) also reads inline.
     let external = row.external_data.filter(|value| *value != 0);
@@ -1810,8 +1807,7 @@ fn volocity_stack_candidates(
             //   OR sampleExternalData (col 14) != 0
             //   OR sampleData (col 13) length > 21.
             let inline_len = row.inline_data.as_ref().map_or(0, Vec::len);
-            let qualifies =
-                channel_child.is_some() || has_external_data || inline_len > 21;
+            let qualifies = channel_child.is_some() || has_external_data || inline_len > 21;
             if !qualifies {
                 return None;
             }
@@ -1824,9 +1820,7 @@ fn volocity_stack_candidates(
             // real `.dat` like Java; when no data_dir is known (the isThisType
             // probe) external rows fall back to inline bytes.
             let row_stream = volocity_get_stream(row, data_dir);
-            let native_stream_clue = row_stream
-                .as_deref()
-                .and_then(volocity_native_stream_clue);
+            let native_stream_clue = row_stream.as_deref().and_then(volocity_native_stream_clue);
             // Java line 301-316: the x*y*z sanity check is a REJECTION filter that
             // only fires when getStream(i) actually yields readable bytes. If a
             // stream is readable but its x*y*z is out of the sane range, the stack
@@ -1857,9 +1851,11 @@ fn volocity_stack_candidates(
                     let (aisf_id, pixels_dat) = if stream_len > 22 {
                         (volocity_channel_aisf_id(child_stream.as_deref()), None)
                     } else {
-                        let first_child =
-                            volocity_children(samples, child.id).next().map(|c| c.id);
-                        (None, first_child.and_then(|id| volocity_get_file(samples, id)))
+                        let first_child = volocity_children(samples, child.id).next().map(|c| c.id);
+                        (
+                            None,
+                            first_child.and_then(|id| volocity_get_file(samples, id)),
+                        )
                     };
                     VolocityChannelLink {
                         sample_id: child.id,
@@ -2376,8 +2372,9 @@ fn volocity_build_stacks(
             for channel in &candidate.channel_links {
                 channel_names.push(channel.name.clone());
                 if let Some(aisf_id) = channel.aisf_id {
-                    pixels_files
-                        .push(VolocityPixels::File(volocity_companion_path(data_dir, aisf_id, "aisf")));
+                    pixels_files.push(VolocityPixels::File(volocity_companion_path(
+                        data_dir, aisf_id, "aisf",
+                    )));
                 } else if let Some(dat) = &channel.pixels_dat {
                     pixels_files.push(VolocityPixels::File(data_dir.join(dat)));
                 } else {
@@ -2390,10 +2387,7 @@ fn volocity_build_stacks(
             // getFile(parent, dir); if that file is null or does not exist, fall
             // back to the stack sample's own inline data mapped as the embedded
             // stream.
-            let dat_path = candidate
-                .pixels_dat
-                .as_ref()
-                .map(|dat| data_dir.join(dat));
+            let dat_path = candidate.pixels_dat.as_ref().map(|dat| data_dir.join(dat));
             match dat_path {
                 Some(path) if path.exists() => pixels_files.push(VolocityPixels::File(path)),
                 _ => match &candidate.inline_data {
@@ -2459,7 +2453,12 @@ fn volocity_build_stacks(
     volocity_split_channels(&mut stacks);
 
     // Drop stacks whose base pixels file does not exist (Java line 484-488).
-    stacks.retain(|stack| stack.pixels_files.first().is_some_and(VolocityPixels::exists));
+    stacks.retain(|stack| {
+        stack
+            .pixels_files
+            .first()
+            .is_some_and(VolocityPixels::exists)
+    });
 
     // Per-series CoreMetadata (Java lines 544-691).
     let mut result = Vec::with_capacity(stacks.len());
@@ -2476,7 +2475,11 @@ fn volocity_build_stacks(
 fn volocity_split_channels(stacks: &mut Vec<VolocityStack>) {
     let mut i = 0;
     while i < stacks.len() {
-        if !stacks[i].pixels_files.first().is_some_and(VolocityPixels::exists) {
+        if !stacks[i]
+            .pixels_files
+            .first()
+            .is_some_and(VolocityPixels::exists)
+        {
             stacks.remove(i);
             continue;
         }
@@ -2497,7 +2500,9 @@ fn volocity_split_channels(stacks: &mut Vec<VolocityStack>) {
                 continue;
             }
             let length = match pix {
-                VolocityPixels::File(path) => std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0),
+                VolocityPixels::File(path) => {
+                    std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0)
+                }
                 VolocityPixels::Embedded(bytes) => bytes.len() as u64,
             };
             if length > base_length {
@@ -2610,7 +2615,9 @@ fn volocity_init_core_aisf(stack: &mut VolocityStack, bytes: &[u8], file_len: i6
     stack.image_count = stack.size_z * stack.size_c * stack.size_t;
 
     if stack.size_x == 0 || stack.size_y == 0 || stack.size_z == 0 {
-        return Err(BioFormatsError::Format("Volocity: empty .aisf dimensions".into()));
+        return Err(BioFormatsError::Format(
+            "Volocity: empty .aisf dimensions".into(),
+        ));
     }
 
     let planes_per_file = (stack.size_z * stack.size_t).max(1) as i64;
@@ -3397,8 +3404,14 @@ mod tests {
         // valid inline stream that getStream falls back to, exercising the file-
         // link resolution this test targets. external_data=Some(42) still drives
         // getFile()/pixels_dat below.
-        let mut stack =
-            volocity_test_sample(2, 1, 1, 2, Some(volocity_test_inline_stream(4, 5, 2)), Some(42));
+        let mut stack = volocity_test_sample(
+            2,
+            1,
+            1,
+            2,
+            Some(volocity_test_inline_stream(4, 5, 2)),
+            Some(42),
+        );
         stack.file_link = Some(7);
         let samples = vec![volocity_test_sample(1, 0, 1, 1, None, None), stack];
         let files = vec![VolocityFileRow {

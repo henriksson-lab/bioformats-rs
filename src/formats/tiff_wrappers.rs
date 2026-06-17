@@ -3191,8 +3191,7 @@ impl Nd2Handler {
                 if let Ok(v) = value.parse::<u32>() {
                     self.core_size_c = v;
                     if !self.core_dimension_order.contains('C') {
-                        self.core_dimension_order =
-                            format!("{0}C{0}", self.core_dimension_order);
+                        self.core_dimension_order = format!("{0}C{0}", self.core_dimension_order);
                     }
                 }
             }
@@ -3358,7 +3357,8 @@ fn nd2handler_parse_xml(xml: &str, tags: &[XmlTag], n_images: i32) -> Nd2Handler
                 }
             }
         } else if name == "HorizontalLine" || name == "VerticalLine" || name == "Text" {
-            let mut roi: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut roi: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             roi.insert("ROIType".to_string(), name.to_string());
             for (k, v) in &tag.attrs {
                 roi.insert(k.clone(), v.clone());
@@ -3433,14 +3433,21 @@ fn nd2handler_apply_to_ome(
             instrument
                 .objectives
                 .push(crate::common::ome_metadata::OmeObjective {
-                    id: Some(crate::common::ome_metadata::create_lsid("Objective", &[0, 0])),
+                    id: Some(crate::common::ome_metadata::create_lsid(
+                        "Objective",
+                        &[0, 0],
+                    )),
                     model: handler.objective_model.clone(),
                     calibrated_magnification: handler.mag,
                     lens_na: handler.na,
-                    immersion: Some(
-                        handler.immersion.clone().unwrap_or_else(|| "Other".into()),
+                    immersion: Some(handler.immersion.clone().unwrap_or_else(|| "Other".into())),
+                    correction: Some(
+                        handler
+                            .correction
+                            .clone()
+                            .filter(|c| !c.is_empty())
+                            .unwrap_or_else(|| "Other".into()),
                     ),
-                    correction: Some(handler.correction.clone().filter(|c| !c.is_empty()).unwrap_or_else(|| "Other".into())),
                     ..Default::default()
                 });
         }
@@ -3448,7 +3455,10 @@ fn nd2handler_apply_to_ome(
             instrument
                 .detectors
                 .push(crate::common::ome_metadata::OmeDetector {
-                    id: Some(crate::common::ome_metadata::create_lsid("Detector", &[0, 0])),
+                    id: Some(crate::common::ome_metadata::create_lsid(
+                        "Detector",
+                        &[0, 0],
+                    )),
                     model: handler.camera_model.clone(),
                     detector_type: Some("Other".into()),
                     ..Default::default()
@@ -3464,10 +3474,12 @@ fn nd2handler_apply_to_ome(
     let effective_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) } as usize;
     let image = &mut ome.images[0];
     while image.channels.len() < effective_c {
-        image.channels.push(crate::common::ome_metadata::OmeChannel {
-            samples_per_pixel: 1,
-            ..Default::default()
-        });
+        image
+            .channels
+            .push(crate::common::ome_metadata::OmeChannel {
+                samples_per_pixel: 1,
+                ..Default::default()
+            });
     }
     for (c, channel) in image.channels.iter_mut().enumerate() {
         if let Some(p) = handler.pinhole_size {
@@ -3618,13 +3630,21 @@ fn nikon_insert_nd2handler_diagnostics(
         );
     }
     for (i, v) in handler.speed.iter().enumerate() {
-        put_f(metadata, &format!("nikon.nd2.channel.{i}.readout_speed"), *v);
+        put_f(
+            metadata,
+            &format!("nikon.nd2.channel.{i}.readout_speed"),
+            *v,
+        );
     }
     for (i, v) in handler.gain.iter().enumerate() {
         put_f(metadata, &format!("nikon.nd2.channel.{i}.gain"), *v);
     }
     for (i, v) in handler.exposure_time.iter().enumerate() {
-        put_f(metadata, &format!("nikon.nd2.channel.{i}.exposure_time"), *v);
+        put_f(
+            metadata,
+            &format!("nikon.nd2.channel.{i}.exposure_time"),
+            *v,
+        );
     }
     for (i, v) in handler.ex_wave.iter().enumerate() {
         put_f(
@@ -3915,7 +3935,7 @@ impl FormatReader for NikonElementsTiffReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tiff"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -4063,7 +4083,7 @@ impl FormatReader for FeiTiffReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tiff"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -4199,7 +4219,7 @@ impl FormatReader for SisReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -4370,10 +4390,8 @@ impl NikonTiffReader {
         };
         let Some(comment) = comment else { return };
 
-        let mut vendor: std::collections::HashMap<
-            String,
-            crate::common::metadata::MetadataValue,
-        > = std::collections::HashMap::new();
+        let mut vendor: std::collections::HashMap<String, crate::common::metadata::MetadataValue> =
+            std::collections::HashMap::new();
 
         // Java removes the raw "Comment" entry before re-parsing it.
         let lines: Vec<&str> = comment.split('\n').collect();
@@ -4426,8 +4444,7 @@ impl NikonTiffReader {
                         .collect(),
                 );
             } else if key == "document scale" {
-                dimension_sizes =
-                    Some(value.split(' ').map(|s| s.to_string()).collect());
+                dimension_sizes = Some(value.split(' ').map(|s| s.to_string()).collect());
             } else if key.starts_with("history Acquisition") && key.contains("Filter") {
                 self.filter_models.push(value.clone());
             } else if key.starts_with("history Acquisition") && key.contains("Dichroic") {
@@ -4480,17 +4497,11 @@ impl NikonTiffReader {
 
             // Java: addGlobalMeta(key, value) for every parsed line.
             if !key.is_empty() {
-                vendor.insert(
-                    key,
-                    crate::common::metadata::MetadataValue::String(value),
-                );
+                vendor.insert(key, crate::common::metadata::MetadataValue::String(value));
             }
         }
 
-        self.parse_dimension_sizes(
-            dimension_labels.as_deref(),
-            dimension_sizes.as_deref(),
-        );
+        self.parse_dimension_sizes(dimension_labels.as_deref(), dimension_sizes.as_deref());
 
         let series = self.inner.series_list_mut();
         if let Some(s) = series.first_mut() {
@@ -4530,8 +4541,8 @@ impl NikonTiffReader {
     /// lasers, detectors, per-channel pinhole/ex/em, filters, dichroics).
     fn build_ome(&self) -> crate::common::ome_metadata::OmeMetadata {
         use crate::common::ome_metadata::{
-            create_lsid, OmeChannel, OmeDetector, OmeDichroic, OmeFilter, OmeImage,
-            OmeInstrument, OmeLightSource, OmeMetadata, OmeObjective,
+            create_lsid, OmeChannel, OmeDetector, OmeDichroic, OmeFilter, OmeImage, OmeInstrument,
+            OmeLightSource, OmeMetadata, OmeObjective,
         };
 
         let meta = self.inner.metadata();
@@ -5124,9 +5135,7 @@ impl MetamorphTiffReader {
             }
         }
 
-        let denom = (self.well_count
-            * self.field_row_count
-            * self.field_column_count) as u32
+        let denom = (self.well_count * self.field_row_count * self.field_column_count) as u32
             * size_z.max(1)
             * effective_c_planes.max(1);
         let mut size_t = if denom > 0 { total_planes / denom } else { 1 };
@@ -5177,7 +5186,11 @@ impl MetamorphTiffReader {
             return 0;
         }
         match stage_label.find(':') {
-            Some(colon) => stage_label[..colon].trim().parse::<i32>().map(|n| n - 1).unwrap_or(0),
+            Some(colon) => stage_label[..colon]
+                .trim()
+                .parse::<i32>()
+                .map(|n| n - 1)
+                .unwrap_or(0),
             None => 0,
         }
     }
@@ -5547,9 +5560,11 @@ impl ImprovisionTiffReader {
         }
 
         // Determine size_c the way Java does (TotalChannels multiplier, etc.).
-        let size_c = self.inner.series_list().first().map_or(1, |s| {
-            s.metadata.size_c.max(1) as usize
-        });
+        let size_c = self
+            .inner
+            .series_list()
+            .first()
+            .map_or(1, |s| s.metadata.size_c.max(1) as usize);
 
         // Second pass: timestamps + channel names (mirrors Java lines 245-284).
         self.c_names = vec![None; size_c];
@@ -5617,10 +5632,7 @@ impl ImprovisionTiffReader {
         for i in 0..effective_c as usize {
             let name = self.c_names.get(i).and_then(|n| n.clone());
             // Java color index: getIndex(0, i, 0) into channelColors.
-            let color = self
-                .channel_colors
-                .get(i)
-                .and_then(|c| *c);
+            let color = self.channel_colors.get(i).and_then(|c| *c);
             channels.push(OmeChannel {
                 name,
                 color,
@@ -5713,7 +5725,7 @@ impl FormatReader for ImprovisionTiffReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -5908,7 +5920,7 @@ impl FormatReader for ZeissApotomeTiffReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -6034,7 +6046,7 @@ impl FormatReader for FluoviewReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -6906,7 +6918,9 @@ fn insert_simplepci_ini_typed_metadata(
         let mut index = 1usize;
         loop {
             let filter_key = format!("c_Filter{index}");
-            let has_filter = entries.iter().any(|(k, _)| k.eq_ignore_ascii_case(&filter_key));
+            let has_filter = entries
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(&filter_key));
             if !has_filter {
                 break;
             }
@@ -7704,6 +7718,22 @@ mod nikon_elements_tiff_tests {
         bytes.push(7);
 
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn java_tiff_wrapper_suffixes_accept_tif_and_tiff() {
+        assert!(NikonElementsTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(NikonElementsTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+        assert!(FeiTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(FeiTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+        assert!(SisReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(SisReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+        assert!(ImprovisionTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(ImprovisionTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+        assert!(ZeissApotomeTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(ZeissApotomeTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+        assert!(FluoviewReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(FluoviewReader::new().is_this_type_by_name(Path::new("sample.tiff")));
     }
 
     #[test]
@@ -9073,8 +9103,7 @@ Bit Depth=16-bit\n",
         for well in ["A01", "A02"] {
             for field in 1..=2 {
                 for channel in 1..=2 {
-                    let p =
-                        PathBuf::from(format!("{base}{well}_s{field}_w{channel}.TIF"));
+                    let p = PathBuf::from(format!("{base}{well}_s{field}_w{channel}.TIF"));
                     write_minimal_tiff_with_description(&p, "MetaXpress site");
                 }
             }
@@ -9474,17 +9503,17 @@ mod nikon_tiff_tests {
         bytes.extend_from_slice(&ifd_start.to_le_bytes());
 
         let entries = [
-            tiff_entry(256, 4, 1, 1),                      // ImageWidth
-            tiff_entry(257, 4, 1, 1),                      // ImageLength
-            tiff_entry(258, 3, 1, 8),                      // BitsPerSample
-            tiff_entry(259, 3, 1, 1),                      // Compression
-            tiff_entry(262, 3, 1, 1),                      // Photometric
+            tiff_entry(256, 4, 1, 1),                          // ImageWidth
+            tiff_entry(257, 4, 1, 1),                          // ImageLength
+            tiff_entry(258, 3, 1, 8),                          // BitsPerSample
+            tiff_entry(259, 3, 1, 1),                          // Compression
+            tiff_entry(262, 3, 1, 1),                          // Photometric
             tiff_entry(270, 2, desc.len() as u32, desc_start), // ImageDescription
-            tiff_entry(273, 4, 1, pixel_start),            // StripOffsets
-            tiff_entry(277, 3, 1, 1),                      // SamplesPerPixel
-            tiff_entry(278, 4, 1, 1),                      // RowsPerStrip
-            tiff_entry(279, 4, 1, 1),                      // StripByteCounts
-            tiff_entry(284, 3, 1, 1),                      // PlanarConfiguration
+            tiff_entry(273, 4, 1, pixel_start),                // StripOffsets
+            tiff_entry(277, 3, 1, 1),                          // SamplesPerPixel
+            tiff_entry(278, 4, 1, 1),                          // RowsPerStrip
+            tiff_entry(279, 4, 1, 1),                          // StripByteCounts
+            tiff_entry(284, 3, 1, 1),                          // PlanarConfiguration
             tiff_entry(305, 2, soft.len() as u32, soft_start), // Software
         ];
 

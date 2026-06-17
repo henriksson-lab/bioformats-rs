@@ -1624,10 +1624,10 @@ impl FormatReader for GatanReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::OmeMetadata;
         use crate::common::ome_metadata::{
             create_lsid, OmeChannel, OmeDetector, OmeInstrument, OmeObjective, OmePlane,
         };
-        use crate::common::ome_metadata::OmeMetadata;
         let meta = self.meta.as_ref()?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
 
@@ -1698,11 +1698,7 @@ impl FormatReader for GatanReader {
         } else {
             (self.pos_x, self.pos_y, self.pos_z)
         };
-        if px.is_some()
-            || py.is_some()
-            || pz.is_some()
-            || self.sample_time.is_some()
-        {
+        if px.is_some() || py.is_some() || pz.is_some() || self.sample_time.is_some() {
             let c_size = meta.size_c.max(1);
             let z_size = meta.size_z.max(1);
             img.planes = (0..meta.image_count)

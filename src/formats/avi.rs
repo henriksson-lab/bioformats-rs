@@ -355,7 +355,9 @@ fn parse_strf(buf: &[u8], payload: usize, data_end: usize, parsed: &mut AviParse
             );
             m.insert(
                 "Bits per pixel".into(),
-                MetadataValue::Int(i16::from_le_bytes([buf[payload + 14], buf[payload + 15]]) as i64),
+                MetadataValue::Int(
+                    i16::from_le_bytes([buf[payload + 14], buf[payload + 15]]) as i64
+                ),
             );
         }
 

@@ -274,13 +274,16 @@ fn stitch_layout(
     let file_axes = pattern
         .and_then(|pattern| infer_file_axes(files, pattern, base_meta))
         .unwrap_or_else(|| FileAxisLayout {
-            file_coords: (0..files.len()).map(|i| (i as u32, 0, 0)).collect(),
-            size_z: files.len() as u32,
+            file_coords: (0..files.len()).map(|i| (0, 0, i as u32)).collect(),
+            size_z: 1,
             size_c: 1,
-            size_t: 1,
+            size_t: files.len() as u32,
             axis_types: pattern.map(AxisGuesser::guess).unwrap_or_default(),
+            adjusted_order: dimension_order_str(base_meta.dimension_order).to_string(),
         });
 
+    meta.dimension_order =
+        dimension_order_from_str(&file_axes.adjusted_order).unwrap_or(base_meta.dimension_order);
     meta.size_z = checked_axis_mul(base_meta.size_z, file_axes.size_z, "Z")?;
     meta.size_c = checked_axis_mul(base_meta.size_c, file_axes.size_c, "C")?;
     meta.size_t = checked_axis_mul(base_meta.size_t, file_axes.size_t, "T")?;
@@ -320,6 +323,7 @@ struct FileAxisLayout {
     size_c: u32,
     size_t: u32,
     axis_types: Vec<AxisType>,
+    adjusted_order: String,
 }
 
 fn infer_file_axes(
@@ -390,6 +394,7 @@ fn infer_file_axes(
         size_c,
         size_t,
         axis_types: guessed,
+        adjusted_order: guess.adjusted_order,
     })
 }
 
@@ -570,6 +575,19 @@ fn dimension_order_str(order: crate::common::metadata::DimensionOrder) -> &'stat
         XYTZC => "XYTZC",
         XYZCT => "XYZCT",
         XYZTC => "XYZTC",
+    }
+}
+
+fn dimension_order_from_str(order: &str) -> Option<crate::common::metadata::DimensionOrder> {
+    use crate::common::metadata::DimensionOrder::*;
+    match order {
+        "XYCTZ" => Some(XYCTZ),
+        "XYCZT" => Some(XYCZT),
+        "XYTCZ" => Some(XYTCZ),
+        "XYTZC" => Some(XYTZC),
+        "XYZCT" => Some(XYZCT),
+        "XYZTC" => Some(XYZTC),
+        _ => None,
     }
 }
 
@@ -1672,7 +1690,11 @@ fn parse_explicit_pattern_part(part: &str) -> Result<Vec<String>> {
     // element for the STOP[:STEP] portion.
     let colon_parts: Vec<&str> = dash_parts[1].split(':').collect();
     let e = colon_parts[0];
-    let s = if colon_parts.len() < 2 { "1" } else { colon_parts[1] };
+    let s = if colon_parts.len() < 2 {
+        "1"
+    } else {
+        colon_parts[1]
+    };
 
     expand_range_block(b, e, s)
 }
@@ -1691,19 +1713,11 @@ fn parse_explicit_pattern_part(part: &str) -> Result<Vec<String>> {
 /// this counts DOWN instead (e.g. `<2-0>` → 2,1,0).
 fn expand_range_block(b: &str, e: &str, s: &str) -> Result<Vec<String>> {
     // Stage 1: numeric (base 10).
-    let parsed = match (
-        b.parse::<i128>(),
-        e.parse::<i128>(),
-        s.parse::<i128>(),
-    ) {
+    let parsed = match (b.parse::<i128>(), e.parse::<i128>(), s.parse::<i128>()) {
         (Ok(begin), Ok(end), Ok(step)) => Some((begin, end, step, true)),
         _ => {
             // Stage 2: alphabetic (base 36).
-            match (
-                from_radix36(b),
-                from_radix36(e),
-                from_radix36(s),
-            ) {
+            match (from_radix36(b), from_radix36(e), from_radix36(s)) {
                 (Some(begin), Some(end), Some(step)) => Some((begin, end, step, false)),
                 _ => None,
             }
@@ -2207,16 +2221,15 @@ pub fn find_series_patterns(base: &str, dir: &str, name_list: &[String]) -> Vec<
         let Some(check_pattern) = find_pattern_in_dir(name, dir, name_list) else {
             continue;
         };
-        let check_files: Vec<String> = match FilePattern::from_explicit_pattern(Path::new(
-            &check_pattern,
-        )) {
-            Ok(fp) => fp
-                .filenames()
-                .iter()
-                .map(|p| absolute_path_string(&p.to_string_lossy()))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let check_files: Vec<String> =
+            match FilePattern::from_explicit_pattern(Path::new(&check_pattern)) {
+                Ok(fp) => fp
+                    .filenames()
+                    .iter()
+                    .map(|p| absolute_path_string(&p.to_string_lossy()))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
 
         let pattern_exists = Path::new(&pattern).exists();
         if !patterns.contains(&pattern)
@@ -2983,16 +2996,16 @@ impl AxisGuesser {
     /// trailing alphanumeric segment against the exact Java prefix sets.
     fn guess_from_separator(sep: &str) -> AxisType {
         let p = Self::trailing_segment(sep);
-        if Z_PREFIXES.contains(&p.as_str()) {
+        if axis_prefix_matches(&p, Z_PREFIXES) {
             return AxisType::Z;
         }
-        if T_PREFIXES.contains(&p.as_str()) {
+        if axis_prefix_matches(&p, T_PREFIXES) {
             return AxisType::Time;
         }
-        if C_PREFIXES.contains(&p.as_str()) {
+        if axis_prefix_matches(&p, C_PREFIXES) {
             return AxisType::Channel;
         }
-        if S_PREFIXES.contains(&p.as_str()) {
+        if axis_prefix_matches(&p, S_PREFIXES) {
             return AxisType::Series;
         }
         AxisType::Unknown
@@ -3024,6 +3037,12 @@ impl AxisGuesser {
         }
         ch[(f + 1) as usize..=(l as usize)].iter().collect()
     }
+}
+
+fn axis_prefix_matches(label: &str, prefixes: &[&str]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| label == *prefix || label.ends_with(prefix))
 }
 
 #[cfg(test)]
@@ -3133,6 +3152,63 @@ mod tests {
     }
 
     #[test]
+    fn stitch_layout_uses_axis_guesser_adjusted_dimension_order() {
+        let fp = pattern(&[("z", 2), ("_", 2)]);
+        let files = fp.filenames();
+        let base_meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 2,
+            size_c: 1,
+            size_t: 1,
+            image_count: 2,
+            dimension_order: crate::common::metadata::DimensionOrder::XYZCT,
+            ..ImageMetadata::default()
+        };
+
+        let (stitched, plane_map) = stitch_layout(&files, &base_meta, Some(&fp)).unwrap();
+
+        assert_eq!(
+            stitched.dimension_order,
+            crate::common::metadata::DimensionOrder::XYTCZ
+        );
+        assert_eq!(
+            (stitched.size_z, stitched.size_c, stitched.size_t),
+            (4, 2, 1)
+        );
+        assert_eq!(stitched.image_count, 8);
+        assert_eq!(plane_map.len(), 8);
+    }
+
+    #[test]
+    fn stitch_layout_no_axis_fallback_uses_time_like_java() {
+        let files = vec![
+            PathBuf::from("a.fake"),
+            PathBuf::from("b.fake"),
+            PathBuf::from("c.fake"),
+        ];
+        let base_meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            image_count: 1,
+            dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
+            ..ImageMetadata::default()
+        };
+
+        let (stitched, plane_map) = stitch_layout(&files, &base_meta, None).unwrap();
+
+        assert_eq!(
+            (stitched.size_z, stitched.size_c, stitched.size_t),
+            (1, 1, 3)
+        );
+        assert_eq!(stitched.image_count, 3);
+        assert_eq!(plane_map, vec![(0, 0), (1, 0), (2, 0)]);
+    }
+
+    #[test]
     fn no_swap_when_order_certain() {
         let fp = pattern(&[("z", 2), ("_", 2)]);
         let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 2, 1, 1, true);
@@ -3141,6 +3217,17 @@ mod tests {
         // Order certain so step 2 skipped; sizeZ=2 (foundZ), sizeT=1 so the
         // unknown block back-fills to T.
         assert_eq!(guess.axis_types[1], AxisType::Time);
+    }
+
+    #[test]
+    fn axis_guesser_matches_java_ends_with_prefix_rule() {
+        let fp = pattern(&[("tilez", 2), ("laserch", 2), ("elapsedtime", 2)]);
+        let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 1, 1, 1, false);
+
+        assert_eq!(
+            guess.axis_types,
+            vec![AxisType::Z, AxisType::Channel, AxisType::Time]
+        );
     }
 
     #[test]
@@ -3297,10 +3384,15 @@ mod tests {
 
     #[test]
     fn find_series_patterns_splits_per_series() {
-        let names: Vec<String> = ["foo_s1_z1.ext", "foo_s1_z2.ext", "foo_s2_z1.ext", "foo_s2_z2.ext"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let names: Vec<String> = [
+            "foo_s1_z1.ext",
+            "foo_s1_z2.ext",
+            "foo_s2_z1.ext",
+            "foo_s2_z2.ext",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         // No files actually exist on disk so the existence/membership filters in
         // findSeriesPatterns drop everything; verify the underlying per-name
         // pattern with S excluded instead (the core splitting logic).
@@ -3394,7 +3486,7 @@ mod tests {
             touch(&dir.join("z0.fake"));
             touch(&dir.join("z1.fake"));
             touch(&dir.join("y0.fake")); // must NOT match z.*
-            // dir-prefixed regex: <dir>/z.*\.fake  (escaped separator + regex).
+                                         // dir-prefixed regex: <dir>/z.*\.fake  (escaped separator + regex).
             let pat = format!(
                 "{}{}z.*\\.fake",
                 dir.to_str().unwrap(),
@@ -3452,10 +3544,7 @@ mod tests {
                 assert_eq!(fp.filenames().len(), 2);
             }
             // The two series cover distinct files.
-            let mut all: Vec<PathBuf> = patterns
-                .iter()
-                .flat_map(|fp| fp.filenames())
-                .collect();
+            let mut all: Vec<PathBuf> = patterns.iter().flat_map(|fp| fp.filenames()).collect();
             all.sort();
             all.dedup();
             assert_eq!(all.len(), 4);

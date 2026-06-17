@@ -197,6 +197,7 @@ impl FormatReader for EpsReader {
         let mut channels = 1u32;
         let mut binary = false;
         let mut data_offset = None;
+        let mut image_operator = "image".to_string();
         let mut metadata = HashMap::new();
         metadata.insert(
             "format".into(),
@@ -259,6 +260,12 @@ impl FormatReader for EpsReader {
                     width = parse_positive_eps_u32(parts[0], "ImageData width")?;
                     height = parse_positive_eps_u32(parts[1], "ImageData height")?;
                     channels = parse_positive_eps_u32(parts[3], "ImageData channel count")?;
+                    for token in parts.iter().skip(4) {
+                        let candidate = token.trim().trim_matches('"');
+                        if candidate.len() > 1 {
+                            image_operator = candidate.to_string();
+                        }
+                    }
                 }
             } else if trimmed.starts_with("%%BeginBinary") {
                 binary = true;
@@ -266,7 +273,8 @@ impl FormatReader for EpsReader {
                 channels = 3;
                 data_offset = Some(next_line_start(&data, end));
                 break;
-            } else if trimmed == "image" || trimmed.ends_with(" image") {
+            } else if trimmed == image_operator || trimmed.ends_with(&format!(" {image_operator}"))
+            {
                 if fields.len() >= 3 {
                     if let (Ok(x), Ok(y), Ok(bits)) = (
                         fields[0].parse::<u32>(),

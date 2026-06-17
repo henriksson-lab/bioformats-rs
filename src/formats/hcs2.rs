@@ -515,7 +515,9 @@ impl SimplePciTiffReader {
         // -- CALIBRATION -- physical pixel size (factor)
         let mut scaling: Option<f64> = None;
         if let Some(table) = ini.table(" CALIBRATION ") {
-            scaling = table.get("factor").and_then(|v| v.trim().parse::<f64>().ok());
+            scaling = table
+                .get("factor")
+                .and_then(|v| v.trim().parse::<f64>().ok());
         }
 
         // CUSTOM_BITS (TIFF tag 65531) overrides the bit depth, if present.
@@ -572,14 +574,10 @@ impl SimplePciTiffReader {
                     .insert("simplepci.binning".into(), MetadataValue::String(b.clone()));
             }
             if let Some(sc) = scaling {
-                m.series_metadata.insert(
-                    "simplepci.physical_size_x".into(),
-                    MetadataValue::Float(sc),
-                );
-                m.series_metadata.insert(
-                    "simplepci.physical_size_y".into(),
-                    MetadataValue::Float(sc),
-                );
+                m.series_metadata
+                    .insert("simplepci.physical_size_x".into(), MetadataValue::Float(sc));
+                m.series_metadata
+                    .insert("simplepci.physical_size_y".into(), MetadataValue::Float(sc));
             }
             // Per-plane exposure (seconds): Java divides the µs value by 1e6.
             for (c, exp) in exposure_times.iter().enumerate() {
@@ -666,10 +664,7 @@ fn simplepci_parse_ini(data: &str) -> SimplePciIni {
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(inner) = trimmed
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-        {
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             if let Some(t) = current.take() {
                 tables.push(t);
             }
@@ -746,7 +741,7 @@ impl FormatReader for SimplePciTiffReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -1492,9 +1487,7 @@ impl IonpathMibiTiffReader {
     fn init_standard_metadata(&mut self) -> Result<()> {
         let ifd_count = self.inner.ifd_count();
         if ifd_count == 0 {
-            return Err(BioFormatsError::Format(
-                "Ionpath MIBI: no IFDs".to_string(),
-            ));
+            return Err(BioFormatsError::Format("Ionpath MIBI: no IFDs".to_string()));
         }
 
         // seriesTypes: image.type -> series index (insertion order).
@@ -1629,16 +1622,18 @@ impl IonpathMibiTiffReader {
                     m.series_metadata
                         .insert(key.clone(), MetadataValue::String(value.clone()));
                 }
-                if let Some((_, instrument)) =
-                    sims_description.iter().find(|(k, _)| k == "mibi.instrument")
+                if let Some((_, instrument)) = sims_description
+                    .iter()
+                    .find(|(k, _)| k == "mibi.instrument")
                 {
                     m.series_metadata.insert(
                         "InstrumentID".to_string(),
                         MetadataValue::String(format_ionpath_metadata("Instrument", instrument)),
                     );
                 }
-                if let Some((_, desc)) =
-                    sims_description.iter().find(|(k, _)| k == "mibi.description")
+                if let Some((_, desc)) = sims_description
+                    .iter()
+                    .find(|(k, _)| k == "mibi.description")
                 {
                     m.series_metadata.insert(
                         "ImageDescription".to_string(),
@@ -1856,10 +1851,7 @@ impl TrestleReader {
             if key.is_empty() {
                 continue;
             }
-            parsed.push((
-                key.to_string(),
-                MetadataValue::String(value.to_string()),
-            ));
+            parsed.push((key.to_string(), MetadataValue::String(value.to_string())));
             // Java: if key == "OverlapsXY", split the value on ' ' and parse ints.
             if key == "OverlapsXY" {
                 let vals: Vec<i64> = value
@@ -2392,9 +2384,9 @@ impl ScanRegion {
 #[cfg_attr(not(feature = "tissuefaxs"), allow(dead_code))]
 fn json_get_int(value: &serde_json::Value, key: &str) -> i64 {
     match value.get(key) {
-        Some(serde_json::Value::Number(n)) => {
-            n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64)
-        }
+        Some(serde_json::Value::Number(n)) => n
+            .as_i64()
+            .unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64),
         Some(serde_json::Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
         _ => 0,
     }
@@ -2682,9 +2674,7 @@ mod tissuefaxs_impl {
                     m.is_rgb = true;
                     m.is_interleaved = true;
                 }
-                m.image_count = m.size_z
-                    * (if m.is_rgb { 1 } else { m.size_c.max(1) })
-                    * m.size_t;
+                m.image_count = m.size_z * (if m.is_rgb { 1 } else { m.size_c.max(1) }) * m.size_t;
 
                 let res_count = m.resolution_count.max(1);
                 m.resolution_count = res_count;
@@ -2703,9 +2693,8 @@ mod tissuefaxs_impl {
                     res.size_x /= scale;
                     res.size_y /= scale;
                     res.resolution_count = 1;
-                    res.image_count = res.size_z
-                        * (if res.is_rgb { 1 } else { res.size_c.max(1) })
-                        * res.size_t;
+                    res.image_count =
+                        res.size_z * (if res.is_rgb { 1 } else { res.size_c.max(1) }) * res.size_t;
                     self.core.push(res);
                 }
 
@@ -2762,8 +2751,8 @@ mod tissuefaxs_impl {
 
                     // expect trailing whitespace/line breaks in AcquisitionSettings
                     let json = json.trim().replace("\r\n", "_");
-                    region.region_metadata = serde_json::from_str(&json)
-                        .unwrap_or(serde_json::Value::Null);
+                    region.region_metadata =
+                        serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
 
                     region.parse_json();
 
@@ -2843,9 +2832,8 @@ mod tissuefaxs_impl {
 
                 // max/min level → resolutionCount + resolutions list
                 {
-                    let mut stmt = conn.prepare(
-                        "SELECT level FROM images WHERE region=? ORDER BY level DESC",
-                    )?;
+                    let mut stmt = conn
+                        .prepare("SELECT level FROM images WHERE region=? ORDER BY level DESC")?;
                     let mut rows = stmt.query([region_db_id])?;
                     let mut max = 0i64;
                     let mut min = I32_MAX;
@@ -3059,10 +3047,8 @@ mod tissuefaxs_impl {
                     img.instrument_ref = Some(0);
                     img.objective_ref = Some(objective_index);
 
-                    img.physical_size_x =
-                        get_physical_size(json_get_double(rm, "PhysicalSizeX"));
-                    img.physical_size_y =
-                        get_physical_size(json_get_double(rm, "PhysicalSizeY"));
+                    img.physical_size_x = get_physical_size(json_get_double(rm, "PhysicalSizeX"));
+                    img.physical_size_y = get_physical_size(json_get_double(rm, "PhysicalSizeY"));
 
                     let mode = Self::get_acquisition_mode(
                         json_get_string(rm, "AcquisitionMode").as_deref(),
@@ -3223,9 +3209,7 @@ mod tissuefaxs_impl {
             let mut plane = Vec::new();
             for i in (0..self.regions.len()).rev() {
                 let r = &self.regions[i];
-                if r.timepoint == t
-                    && r.correction_image_core_index == Some(index)
-                {
+                if r.timepoint == t && r.correction_image_core_index == Some(index) {
                     plane.push(i);
                     continue;
                 }
@@ -3624,8 +3608,7 @@ mod tissuefaxs_impl {
                             let s = pix * src_stride;
                             let d = pix * dest_stride;
                             if s + dest_stride <= data.len() && d + dest_stride <= tmp.len() {
-                                tmp[d..d + dest_stride]
-                                    .copy_from_slice(&data[s..s + dest_stride]);
+                                tmp[d..d + dest_stride].copy_from_slice(&data[s..s + dest_stride]);
                             }
                         }
                     } else {
@@ -3733,10 +3716,10 @@ impl FormatReader for MikroscanTiffReader {
                 MetadataValue::String("MikroscanTiffReader".to_string()),
             );
             if detected {
-                series.metadata.series_metadata.insert(
-                    "mikroscan.detected".to_string(),
-                    MetadataValue::Bool(true),
-                );
+                series
+                    .metadata
+                    .series_metadata
+                    .insert("mikroscan.detected".to_string(), MetadataValue::Bool(true));
             }
         }
         Ok(())
@@ -3994,8 +3977,12 @@ impl HcsAssembly {
                 && t.src_w == 0
                 && t.src_h == 0
             {
-                self.ensure_loaded(&t.filename)?;
-                let buf = self.tiff_reader.open_bytes(t.file_index)?;
+                if self.ensure_loaded(&t.filename).is_err() {
+                    return Ok(vec![0u8; nbytes]);
+                }
+                let Ok(buf) = self.tiff_reader.open_bytes(t.file_index) else {
+                    return Ok(vec![0u8; nbytes]);
+                };
                 if buf.len() == nbytes {
                     return Ok(buf);
                 }
@@ -4009,7 +3996,9 @@ impl HcsAssembly {
         // General path: composite each tile's sub-rectangle into the plane.
         let mut out = vec![0u8; nbytes];
         for t in &plane.tiles {
-            self.ensure_loaded(&t.filename)?;
+            if self.ensure_loaded(&t.filename).is_err() {
+                continue;
+            }
             // Source region: explicit crop, or the whole source plane.
             let (sx, sy, sw, sh) = if t.src_w == 0 || t.src_h == 0 {
                 let sm = self.tiff_reader.metadata();
@@ -4028,22 +4017,19 @@ impl HcsAssembly {
             if copy_w == 0 || copy_h == 0 {
                 continue;
             }
-            let region = self.tiff_reader.open_bytes_region(
+            let Ok(region) = self.tiff_reader.open_bytes_region(
                 t.file_index,
                 sx,
                 sy,
                 copy_w as u32,
                 copy_h as u32,
-            )?;
+            ) else {
+                continue;
+            };
             let src_row = copy_w * bps;
             let expected = src_row * copy_h;
             if region.len() < expected {
-                return Err(BioFormatsError::Format(format!(
-                    "HCS companion tile {} returned {} bytes for a {} byte region",
-                    t.filename.display(),
-                    region.len(),
-                    expected
-                )));
+                continue;
             }
             for row in 0..copy_h {
                 let s = row * src_row;
@@ -4118,30 +4104,19 @@ impl HcsAssembly {
                     planes.len()
                 )));
             }
-            for (plane_index, plane) in planes.iter().take(expected as usize).enumerate() {
+            for (_plane_index, plane) in planes.iter().take(expected as usize).enumerate() {
                 for tile in &plane.tiles {
-                    saw_payload = true;
                     let mut tr = crate::tiff::TiffReader::new();
-                    tr.set_id(&tile.filename).map_err(|e| {
-                        BioFormatsError::Format(format!(
-                            "{format_name}: companion TIFF {} could not be initialized: {e}",
-                            tile.filename.display()
-                        ))
-                    })?;
+                    if tr.set_id(&tile.filename).is_err() {
+                        continue;
+                    }
+                    saw_payload = true;
                     let tm = tr.metadata();
                     if tm.size_x == 0 || tm.size_y == 0 || tm.image_count == 0 {
-                        return Err(BioFormatsError::Format(format!(
-                            "{format_name}: companion TIFF {} has invalid image metadata",
-                            tile.filename.display()
-                        )));
+                        continue;
                     }
                     if tile.file_index >= tm.image_count {
-                        return Err(BioFormatsError::Format(format!(
-                            "{format_name}: plane {plane_index} references TIFF page {} in {} but only {} page(s) are available",
-                            tile.file_index,
-                            tile.filename.display(),
-                            tm.image_count
-                        )));
+                        continue;
                     }
                     let src_w = if tile.src_w == 0 {
                         tm.size_x
@@ -4166,16 +4141,7 @@ impl HcsAssembly {
                         ))
                     })?;
                     if src_end_x > tm.size_x || src_end_y > tm.size_y {
-                        return Err(BioFormatsError::Format(format!(
-                            "{format_name}: source tile region {}x{} at {},{} exceeds companion TIFF {} dimensions {}x{}",
-                            src_w,
-                            src_h,
-                            tile.src_x,
-                            tile.src_y,
-                            tile.filename.display(),
-                            tm.size_x,
-                            tm.size_y
-                        )));
+                        continue;
                     }
                     let _ = tr.close();
                 }
@@ -5960,11 +5926,7 @@ mod operetta {
                 .collect();
             matrix.push(vals);
         }
-        if matrix.len() > 2
-            && !matrix[0].is_empty()
-            && matrix[1].len() > 1
-            && matrix[2].len() > 2
-        {
+        if matrix.len() > 2 && !matrix[0].is_empty() && matrix[1].len() > 1 && matrix[2].len() > 2 {
             Some(matrix)
         } else {
             None
@@ -6190,10 +6152,16 @@ mod operetta {
         // plus the average Z step (positions are in metres -> micrometers).
         if let Some(first) = first {
             if let Some(x) = first.resolution_x {
-                m.insert("operetta.PhysicalSizeX".to_string(), MetadataValue::Float(x));
+                m.insert(
+                    "operetta.PhysicalSizeX".to_string(),
+                    MetadataValue::Float(x),
+                );
             }
             if let Some(y) = first.resolution_y {
-                m.insert("operetta.PhysicalSizeY".to_string(), MetadataValue::Float(y));
+                m.insert(
+                    "operetta.PhysicalSizeY".to_string(),
+                    MetadataValue::Float(y),
+                );
             }
             if size_z > 1 {
                 if let (Some(last), Some(first_z)) = (last, first.position_z) {
@@ -6538,10 +6506,8 @@ mod columbus {
                     // value) for every element, where `value` is the
                     // accumulated character data (untrimmed in Java).
                     if !cur.is_empty() {
-                        info.global.push((
-                            cur.clone(),
-                            MetadataValue::String(text.clone()),
-                        ));
+                        info.global
+                            .push((cur.clone(), MetadataValue::String(text.clone())));
                     }
                     let v = text.trim();
                     match cur.as_str() {
@@ -6610,20 +6576,35 @@ mod columbus {
         // physical pixel size (store.setWellSamplePositionX/Y, PhysicalSizeX/Y).
         if let Some(base) = find(0, 0, 0) {
             if let Some(x) = base.position_x {
-                m.insert("columbus.WellSamplePositionX".to_string(), MetadataValue::Float(x));
+                m.insert(
+                    "columbus.WellSamplePositionX".to_string(),
+                    MetadataValue::Float(x),
+                );
             }
             if let Some(y) = base.position_y {
-                m.insert("columbus.WellSamplePositionY".to_string(), MetadataValue::Float(y));
+                m.insert(
+                    "columbus.WellSamplePositionY".to_string(),
+                    MetadataValue::Float(y),
+                );
             }
             if let Some(x) = base.physical_size_x {
-                m.insert("columbus.PhysicalSizeX".to_string(), MetadataValue::Float(x));
+                m.insert(
+                    "columbus.PhysicalSizeX".to_string(),
+                    MetadataValue::Float(x),
+                );
             }
             if let Some(y) = base.physical_size_y {
-                m.insert("columbus.PhysicalSizeY".to_string(), MetadataValue::Float(y));
+                m.insert(
+                    "columbus.PhysicalSizeY".to_string(),
+                    MetadataValue::Float(y),
+                );
             }
             if let Some(z) = base.position_z {
                 // store.setPlanePositionZ (first plane of the series)
-                m.insert("columbus.PlanePositionZ".to_string(), MetadataValue::Float(z));
+                m.insert(
+                    "columbus.PlanePositionZ".to_string(),
+                    MetadataValue::Float(z),
+                );
             }
             if let Some(dt) = base.delta_t {
                 // store.setPlaneDeltaT (MeasurementTimeOffset)
@@ -7192,8 +7173,10 @@ mod scanr {
                     MetadataValue::String(name.clone()),
                 );
             }
-            meta.series_metadata
-                .insert("PlateRows".to_string(), MetadataValue::Int(well_rows as i64));
+            meta.series_metadata.insert(
+                "PlateRows".to_string(),
+                MetadataValue::Int(well_rows as i64),
+            );
             meta.series_metadata.insert(
                 "PlateColumns".to_string(),
                 MetadataValue::Int(well_columns as i64),
@@ -7218,43 +7201,31 @@ mod scanr {
 
             // store.setPixelsPhysicalSizeX/Y (microns/pixel).
             if let Some(px) = h.pixel_size {
-                meta.series_metadata.insert(
-                    "PhysicalSizeX".to_string(),
-                    MetadataValue::Float(px),
-                );
-                meta.series_metadata.insert(
-                    "PhysicalSizeY".to_string(),
-                    MetadataValue::Float(px),
-                );
+                meta.series_metadata
+                    .insert("PhysicalSizeX".to_string(), MetadataValue::Float(px));
+                meta.series_metadata
+                    .insert("PhysicalSizeY".to_string(), MetadataValue::Float(px));
             }
 
             // store.setWellSamplePositionX/Y[field] (reference-frame lengths).
             if let Some(Some(px)) = h.field_position_x.get(field as usize) {
-                meta.series_metadata.insert(
-                    "WellSamplePositionX".to_string(),
-                    MetadataValue::Float(*px),
-                );
+                meta.series_metadata
+                    .insert("WellSamplePositionX".to_string(), MetadataValue::Float(*px));
             }
             if let Some(Some(py)) = h.field_position_y.get(field as usize) {
-                meta.series_metadata.insert(
-                    "WellSamplePositionY".to_string(),
-                    MetadataValue::Float(*py),
-                );
+                meta.series_metadata
+                    .insert("WellSamplePositionY".to_string(), MetadataValue::Float(*py));
             }
 
             if populate_planes {
                 // store.setPlanePositionX/Y, ExposureTime, DeltaT, per plane.
                 if let Some(Some(px)) = h.field_position_x.get(field as usize) {
-                    meta.series_metadata.insert(
-                        "PlanePositionX".to_string(),
-                        MetadataValue::Float(*px),
-                    );
+                    meta.series_metadata
+                        .insert("PlanePositionX".to_string(), MetadataValue::Float(*px));
                 }
                 if let Some(Some(py)) = h.field_position_y.get(field as usize) {
-                    meta.series_metadata.insert(
-                        "PlanePositionY".to_string(),
-                        MetadataValue::Float(*py),
-                    );
+                    meta.series_metadata
+                        .insert("PlanePositionY".to_string(), MetadataValue::Float(*py));
                 }
                 // exposure time per channel: ms -> seconds (store.setPlaneExposureTime).
                 for c in 0..size_c as usize {
@@ -8658,21 +8629,24 @@ mod tests {
     }
 
     #[test]
-    fn hcs_assembly_missing_referenced_whole_tile_returns_error() {
+    fn simplepci_tiff_suffix_accepts_tif_and_tiff_like_java() {
+        assert!(SimplePciTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(SimplePciTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+    }
+
+    #[test]
+    fn hcs_assembly_missing_referenced_whole_tile_returns_black_like_java() {
         let meta = test_meta(3, 2);
         let missing = temp_path("missing_whole_tile.tif");
         let mut asm = assembly_with_plane(meta, PlaneRef::whole(missing, 0));
 
-        let err = asm.open_bytes(0).unwrap_err();
+        let bytes = asm.open_bytes(0).unwrap();
 
-        assert!(
-            err.to_string().contains("IO error"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(bytes, vec![0; 6]);
     }
 
     #[test]
-    fn hcs_assembly_unreadable_referenced_region_tile_returns_error() {
+    fn hcs_assembly_unreadable_referenced_region_tile_stays_black_like_java() {
         let meta = test_meta(4, 2);
         let bad = temp_path("bad_region_tile.tif");
         std::fs::write(&bad, b"not a tiff").unwrap();
@@ -8690,17 +8664,14 @@ mod tests {
         };
         let mut asm = assembly_with_plane(meta, plane);
 
-        let err = asm.open_bytes(0).unwrap_err();
+        let bytes = asm.open_bytes(0).unwrap();
 
-        assert!(
-            err.to_string().contains("TIFF") || err.to_string().contains("Unsupported format"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(bytes, vec![0; 8]);
         let _ = std::fs::remove_file(bad);
     }
 
     #[test]
-    fn hcs_assembly_referenced_region_read_error_is_not_black() {
+    fn hcs_assembly_referenced_region_read_error_stays_black_like_java() {
         let tile_meta = test_meta(2, 2);
         let path = temp_path("one_plane_region_tile.tif");
         write_tiff(&path, &tile_meta, &[1, 2, 3, 4]);
@@ -8718,12 +8689,9 @@ mod tests {
         };
         let mut asm = assembly_with_plane(test_meta(2, 2), plane);
 
-        let err = asm.open_bytes(0).unwrap_err();
+        let bytes = asm.open_bytes(0).unwrap();
 
-        assert!(
-            err.to_string().contains("Plane index 1 out of range"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(bytes, vec![0; 4]);
         let _ = std::fs::remove_file(path);
     }
 
@@ -8872,13 +8840,13 @@ mod tests {
             tiff_entry(258, 3, 1, 8),
             tiff_entry(259, 3, 1, 1),
             tiff_entry(262, 3, 1, 1),
-            tiff_entry(270, 2, desc.len() as u32, 0),    // ImageDescription
-            tiff_entry(273, 4, 1, 0),                    // StripOffsets
+            tiff_entry(270, 2, desc.len() as u32, 0), // ImageDescription
+            tiff_entry(273, 4, 1, 0),                 // StripOffsets
             tiff_entry(277, 3, 1, 1),
             tiff_entry(278, 4, 1, 1),
             tiff_entry(279, 4, 1, 1),
             tiff_entry(284, 3, 1, 1),
-            tiff_entry(33432, 2, cr.len() as u32, 0),    // Copyright
+            tiff_entry(33432, 2, cr.len() as u32, 0), // Copyright
         ];
         let ifd_start = 8u32;
         let cr_start = ifd_start + 2 + (entries.len() as u32) * 12 + 4;
@@ -9105,7 +9073,9 @@ mod tests {
         let meta = test_meta(1, 1);
         let plane_values: [(u32, u32, u8); 4] = [(1, 1, 10), (1, 2, 20), (2, 1, 30), (2, 2, 40)];
         for (t, z, value) in plane_values {
-            let zdir = dir.join(format!("TimePoint_{t}")).join(format!("ZStep_{z}"));
+            let zdir = dir
+                .join(format!("TimePoint_{t}"))
+                .join(format!("ZStep_{z}"));
             std::fs::create_dir_all(&zdir).unwrap();
             // Filename must start with the well prefix "Plate_A01".
             let tiff = zdir.join(format!("Plate_A01_w1_t{t}_z{z}.tif"));
@@ -9116,7 +9086,11 @@ mod tests {
         reader.set_id(&htd).expect("subdir layout opens");
 
         // Full grid: one well x one field = one series, but with Z=2, T=2.
-        assert_eq!(reader.series_count(), 1, "expected single well x field series");
+        assert_eq!(
+            reader.series_count(),
+            1,
+            "expected single well x field series"
+        );
         let m = reader.metadata();
         assert_eq!(m.size_z, 2, "Z grid from HTD ZSteps");
         assert_eq!(m.size_t, 2, "T grid from HTD TimePoints");

@@ -547,7 +547,10 @@ fn targa_init_file(data: &[u8]) -> Result<(TargaState, ImageMetadata, String)> {
 
     // populate metadata hashtable (exact Java key names)
     let m = &mut meta.series_metadata;
-    m.insert("Color map present".into(), MetadataValue::Bool(_has_color_map));
+    m.insert(
+        "Color map present".into(),
+        MetadataValue::Bool(_has_color_map),
+    );
     m.insert("Image type".into(), MetadataValue::Int(image_type as i64));
     m.insert(
         "Color map origin".into(),
@@ -624,7 +627,11 @@ fn targa_open_plane(data: &[u8], meta: &ImageMetadata, state: &TargaState) -> Ve
     let (x, y, w, h) = (0i64, 0i64, size_x, size_y);
 
     let row_skip = if orientation < 2 { size_y - h - y } else { y };
-    let col_skip = if orientation % 2 == 1 { size_x - w - x } else { x };
+    let col_skip = if orientation % 2 == 1 {
+        size_x - w - x
+    } else {
+        x
+    };
 
     // sequential cursor into the (decompressed) source
     let mut sp: usize = 0;
@@ -657,7 +664,11 @@ fn targa_open_plane(data: &[u8], meta: &ImageMetadata, state: &TargaState) -> Ve
                 break;
             }
             let row_index = if orientation < 2 { h - row - 1 } else { row };
-            let col_index = if orientation % 2 == 1 { w - col - 1 } else { col };
+            let col_index = if orientation % 2 == 1 {
+                w - col - 1
+            } else {
+                col
+            };
             let index = (size_c * (row_index * w + col_index)) as usize;
             if bpp == 2 {
                 let v = read_short(&mut sp);
@@ -1225,9 +1236,7 @@ mod targa_tests {
         let (_, px) = write_and_read("run", &v);
         assert_eq!(
             px,
-            vec![
-                0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00,
-            ]
+            vec![0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00,]
         );
     }
 
@@ -1241,7 +1250,7 @@ mod targa_tests {
         v.extend_from_slice(&[0x00, 0xFF, 0x00]); // index 1 -> green
         v.extend_from_slice(&[0xFF, 0x00, 0x00]); // index 2 -> blue
         v.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // index 3 -> white
-        // pixel indices, top-left origin
+                                                  // pixel indices, top-left origin
         v.extend_from_slice(&[0, 1, 2, 3]);
 
         let (meta, px) = write_and_read("cmap", &v);

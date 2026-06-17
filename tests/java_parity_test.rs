@@ -5,8 +5,8 @@
 //! its output to our Rust `ImageReader`, across three axes:
 //!   1. CORE metadata   — sizeX/Y/Z/C/T, pixelType, bitsPerPixel, imageCount,
 //!                        dimensionOrder, rgb/interleaved/indexed/littleEndian.
-//!   2. OME metadata    — image name, physical sizes, time increment, and
-//!                        per-channel name / samplesPerPixel / emission / excitation.
+//!   2. OME metadata    — image name, physical sizes, time increment, per-channel
+//!                        fields, object graph counts, and annotation counts.
 //!   3. PIXELS          — read identically on both sides and compared three ways:
 //!                        a) CRC32 of a bounded top-left 256² region of up to
 //!                           MAX_PLANES planes (deep Z/C/T coverage);
@@ -23,14 +23,16 @@
 //!
 //! Run:  BIOFORMATS_RS_JAVA_PARITY=1 cargo test --test java_parity_test -- --nocapture
 //!
-//! By default the test FAILS only on CORE-metadata divergence (the baseline
-//! contract). OME and pixel-CRC parity are printed as a scored report. Set
-//! `BIOFORMATS_RS_JAVA_PARITY_STRICT=1` to also fail on OME/pixel divergence.
+//! By default the test FAILS on CORE and OME metadata divergence. Pixel-CRC
+//! parity is printed as a scored report. Set `BIOFORMATS_RS_JAVA_PARITY_STRICT=1`
+//! to also fail on pixel divergence.
 
 use bioformats::common::metadata::DimensionOrder;
+use bioformats::common::ome_metadata::OmeAnnotation;
 use bioformats::common::pixel_type::PixelType;
 use bioformats::ImageReader;
 use serde_json::Value;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -63,6 +65,10 @@ const FILES: &[&str] = &[
     "oif/Source Data Figure S5c-d CTRL.oif",
     "zvi/fig3d_wt_sting_cd31.zvi",
     "avi/cryper2_newborn.avi",
+    // Optional external-codec QuickTime fixture. Most CI/testdata checkouts do
+    // not carry redistribution-sensitive H.264/HEVC/ProRes/DV samples, so this
+    // remains a skipped parity slot unless a local fixture is installed.
+    "mov/external_codec_avc1.mov",
     "psd/sample_rgb.psd",
     "dm3/clem_fig3b.dm3",
     "imagic/12409.stpm.hed",
@@ -290,16 +296,104 @@ fn approx(a: Option<f64>, b: Option<f64>) -> bool {
     }
 }
 
+fn ju64(v: &Value, name: &str) -> u64 {
+    v.get(name).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn cmp_summary_u(name: &str, jv: u64, rv: u64, out: &mut Vec<String>) {
+    if jv != rv {
+        out.push(format!("{name}: java={jv} rust={rv}"));
+    }
+}
+
+fn env_path(var: &str) -> Option<PathBuf> {
+    env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+}
+
+#[test]
+#[ignore = "release gate: run with BIOFORMATS_RS_JAVA_PARITY=1 BIOFORMATS_RS_JAVA_PARITY_STRICT=1"]
+fn java_parity_strict_pixel_gate() {
+    assert_eq!(
+        env::var("BIOFORMATS_RS_JAVA_PARITY").as_deref(),
+        Ok("1"),
+        "set BIOFORMATS_RS_JAVA_PARITY=1 to run the Java parity oracle"
+    );
+    assert_eq!(
+        env::var("BIOFORMATS_RS_JAVA_PARITY_STRICT").as_deref(),
+        Ok("1"),
+        "set BIOFORMATS_RS_JAVA_PARITY_STRICT=1 to fail on pixel divergence"
+    );
+    java_parity();
+}
+
+#[test]
+fn quicktime_external_codec_fixture_gate() {
+    let Some(path) = env_path("BIOFORMATS_RS_QT_EXTERNAL_CODEC_FIXTURE") else {
+        eprintln!(
+            "SKIP QuickTime external-codec fixture: set BIOFORMATS_RS_QT_EXTERNAL_CODEC_FIXTURE"
+        );
+        return;
+    };
+    let err = ImageReader::open(&path).err().unwrap_or_else(|| {
+        panic!(
+            "external-codec QuickTime unexpectedly opened: {}",
+            path.display()
+        )
+    });
+    let msg = err.to_string();
+    assert!(
+        msg.contains("QuickTime codec") && msg.contains("unsupported"),
+        "expected explicit QuickTime external-codec unsupported diagnostic, got: {msg}"
+    );
+
+    if env::var("BIOFORMATS_RS_JAVA_PARITY").as_deref() == Ok("1") {
+        if let Some(cp) = oracle_classpath() {
+            let j = run_oracle(cp, &path, 1, false)
+                .unwrap_or_else(|| panic!("Java oracle produced no output for {}", path.display()));
+            assert_eq!(
+                j.get("ok").and_then(Value::as_bool),
+                Some(true),
+                "Java did not open external-codec fixture: {}",
+                j.get("error").and_then(Value::as_str).unwrap_or("?")
+            );
+        }
+    }
+}
+
+#[test]
+fn picoquant_fixture_gate() {
+    let Some(path) = env_path("BIOFORMATS_RS_PICOQUANT_FIXTURE") else {
+        eprintln!("SKIP PicoQuant fixture: set BIOFORMATS_RS_PICOQUANT_FIXTURE");
+        return;
+    };
+    let mut reader = ImageReader::open(&path)
+        .unwrap_or_else(|e| panic!("PicoQuant fixture did not open: {}: {e}", path.display()));
+    let meta = reader.metadata().clone();
+    assert!(
+        meta.series_metadata
+            .keys()
+            .any(|key| key.starts_with("picoquant")
+                || key.starts_with("ptu")
+                || key.starts_with("pqres")),
+        "PicoQuant fixture opened without PicoQuant/PTU/PQRes provenance metadata"
+    );
+    if meta.image_count > 0 {
+        let _ = reader.open_bytes(0);
+    }
+}
+
 #[test]
 fn java_parity() {
-    if std::env::var("BIOFORMATS_RS_JAVA_PARITY").as_deref() != Ok("1") {
+    if env::var("BIOFORMATS_RS_JAVA_PARITY").as_deref() != Ok("1") {
         eprintln!("SKIP parity: set BIOFORMATS_RS_JAVA_PARITY=1 to run (needs the jar + java).");
         return;
     }
-    let strict = std::env::var("BIOFORMATS_RS_JAVA_PARITY_STRICT").as_deref() == Ok("1");
+    let strict = env::var("BIOFORMATS_RS_JAVA_PARITY_STRICT").as_deref() == Ok("1");
     // Optional comma-separated substring filter, so a worker can verify just its
     // own files quickly: BIOFORMATS_RS_JAVA_PARITY_FILES="lsm/,nd2/"
-    let filter = std::env::var("BIOFORMATS_RS_JAVA_PARITY_FILES").unwrap_or_default();
+    let filter = env::var("BIOFORMATS_RS_JAVA_PARITY_FILES").unwrap_or_default();
     let filters: Vec<&str> = filter
         .split(',')
         .map(str::trim)
@@ -309,7 +403,8 @@ fn java_parity() {
 
     let mut score = Score::default();
     let mut core_failures: Vec<String> = Vec::new();
-    let mut hard_failures: Vec<String> = Vec::new();
+    let mut ome_failures: Vec<String> = Vec::new();
+    let mut strict_failures: Vec<String> = Vec::new();
     // Pixel divergences caught ONLY by the new deeper checks (deep planes,
     // whole-plane CRC, or offset region) where the old first-8/256² sampling
     // would have reported a clean pass.
@@ -350,7 +445,6 @@ fn java_parity() {
             Err(e) => {
                 println!("  RUST open FAILED: {e}");
                 core_failures.push(format!("{rel}: rust open failed: {e}"));
-                hard_failures.push(rel.to_string());
                 continue;
             }
         };
@@ -361,7 +455,6 @@ fn java_parity() {
         if jseries != rseries {
             println!("  seriesCount: java={jseries} rust={rseries}  ✗");
             core_failures.push(format!("{rel}: seriesCount java={jseries} rust={rseries}"));
-            hard_failures.push(rel.to_string());
         } else {
             println!("  seriesCount={rseries} ✓");
         }
@@ -374,7 +467,6 @@ fn java_parity() {
             }
             if reader.set_series(si).is_err() {
                 core_failures.push(format!("{rel} s{si}: rust set_series failed"));
-                hard_failures.push(rel.to_string());
                 continue;
             }
             let m = reader.metadata().clone();
@@ -452,6 +544,31 @@ fn java_parity() {
             if js["rgb"].as_bool() != Some(m.is_rgb) {
                 core_diffs.push(format!("rgb: java={} rust={}", js["rgb"], m.is_rgb));
             }
+            if js["interleaved"].as_bool() != Some(m.is_interleaved) {
+                core_diffs.push(format!(
+                    "interleaved: java={} rust={}",
+                    js["interleaved"], m.is_interleaved
+                ));
+            }
+            if js["indexed"].as_bool() != Some(m.is_indexed) {
+                core_diffs.push(format!(
+                    "indexed: java={} rust={}",
+                    js["indexed"], m.is_indexed
+                ));
+            }
+            let rust_rgb_channel_count = if m.is_rgb { m.size_c.max(1) } else { 1 };
+            cmp_u(
+                "rgbChannelCount",
+                js["rgbChannelCount"].as_u64().unwrap_or(0),
+                rust_rgb_channel_count as u64,
+                &mut core_diffs,
+            );
+            cmp_u(
+                "resolutionCount",
+                js["resolutionCount"].as_u64().unwrap_or(0),
+                reader.resolution_count() as u64,
+                &mut core_diffs,
+            );
 
             if core_diffs.is_empty() {
                 println!(
@@ -469,7 +586,6 @@ fn java_parity() {
                 println!("  s{si} core ✗  {}", core_diffs.join("; "));
                 score.core_bad += 1;
                 core_failures.push(format!("{rel} s{si}: {}", core_diffs.join("; ")));
-                hard_failures.push(rel.to_string());
             }
 
             // ---- pixels: multi-region compare per plane ----
@@ -701,7 +817,7 @@ fn java_parity() {
                     }
                     score.px_bad += 1;
                     if strict {
-                        hard_failures.push(rel.to_string());
+                        strict_failures.push(rel.to_string());
                     }
                 }
             }
@@ -746,6 +862,20 @@ fn java_parity() {
                         ri.physical_size_y
                     ));
                 }
+                if !approx(jf64(&ji["physicalSizeZ"]), ri.physical_size_z) {
+                    ome_diffs.push(format!(
+                        "img{ii} physZ: java={:?} rust={:?}",
+                        jf64(&ji["physicalSizeZ"]),
+                        ri.physical_size_z
+                    ));
+                }
+                if !approx(jf64(&ji["timeIncrement"]), ri.time_increment) {
+                    ome_diffs.push(format!(
+                        "img{ii} timeIncrement: java={:?} rust={:?}",
+                        jf64(&ji["timeIncrement"]),
+                        ri.time_increment
+                    ));
+                }
                 let jch = ji["channels"].as_array().cloned().unwrap_or_default();
                 if jch.len() != ri.channels.len() {
                     ome_diffs.push(format!(
@@ -761,6 +891,13 @@ fn java_parity() {
                             "img{ii} ch{ci} name: java={:?} rust={:?}",
                             jc["name"].as_str(),
                             rc.name
+                        ));
+                    }
+                    if jc["samplesPerPixel"].as_u64() != Some(rc.samples_per_pixel as u64) {
+                        ome_diffs.push(format!(
+                            "img{ii} ch{ci} samplesPerPixel: java={:?} rust={}",
+                            jc["samplesPerPixel"].as_u64(),
+                            rc.samples_per_pixel
                         ));
                     }
                     if !approx(jf64(&jc["emission"]), rc.emission_wavelength) {
@@ -779,6 +916,137 @@ fn java_parity() {
                     }
                 }
             }
+            let summary = jome.get("summary").unwrap_or(&Value::Null);
+            let map_annotation_count = rome
+                .annotations
+                .iter()
+                .filter(|annotation| matches!(annotation, OmeAnnotation::MapAnnotation { .. }))
+                .count() as u64;
+            let comment_annotation_count = rome
+                .annotations
+                .iter()
+                .filter(|annotation| matches!(annotation, OmeAnnotation::CommentAnnotation { .. }))
+                .count() as u64;
+            let tag_annotation_count = rome
+                .annotations
+                .iter()
+                .filter(|annotation| matches!(annotation, OmeAnnotation::TagAnnotation { .. }))
+                .count() as u64;
+            cmp_summary_u(
+                "instrument count",
+                ju64(summary, "instrumentCount"),
+                rome.instruments.len() as u64,
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "objective count",
+                ju64(summary, "objectiveCount"),
+                rome.instruments
+                    .iter()
+                    .map(|instrument| instrument.objectives.len() as u64)
+                    .sum(),
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "detector count",
+                ju64(summary, "detectorCount"),
+                rome.instruments
+                    .iter()
+                    .map(|instrument| instrument.detectors.len() as u64)
+                    .sum(),
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "light source count",
+                ju64(summary, "lightSourceCount"),
+                rome.instruments
+                    .iter()
+                    .map(|instrument| instrument.light_sources.len() as u64)
+                    .sum(),
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "filter count",
+                ju64(summary, "filterCount"),
+                rome.instruments
+                    .iter()
+                    .map(|instrument| instrument.filters.len() as u64)
+                    .sum(),
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "dichroic count",
+                ju64(summary, "dichroicCount"),
+                rome.instruments
+                    .iter()
+                    .map(|instrument| instrument.dichroics.len() as u64)
+                    .sum(),
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "ROI count",
+                ju64(summary, "roiCount"),
+                rome.rois.len() as u64,
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "ROI shape count",
+                ju64(summary, "roiShapeCount"),
+                rome.rois.iter().map(|roi| roi.shapes.len() as u64).sum(),
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "plane metadata count",
+                ju64(summary, "planeCount"),
+                rome.images
+                    .iter()
+                    .map(|image| image.planes.len() as u64)
+                    .sum(),
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "plate count",
+                ju64(summary, "plateCount"),
+                rome.plates.len() as u64,
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "well count",
+                ju64(summary, "wellCount"),
+                rome.plates
+                    .iter()
+                    .map(|plate| plate.wells.len() as u64)
+                    .sum(),
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "well sample count",
+                ju64(summary, "wellSampleCount"),
+                rome.plates
+                    .iter()
+                    .flat_map(|plate| &plate.wells)
+                    .map(|well| well.well_samples.len() as u64)
+                    .sum(),
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "map annotation count",
+                ju64(summary, "mapAnnotationCount"),
+                map_annotation_count,
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "comment annotation count",
+                ju64(summary, "commentAnnotationCount"),
+                comment_annotation_count,
+                &mut ome_diffs,
+            );
+            cmp_summary_u(
+                "tag annotation count",
+                ju64(summary, "tagAnnotationCount"),
+                tag_annotation_count,
+                &mut ome_diffs,
+            );
             if ome_diffs.is_empty() {
                 println!("  OME ✓  {} image(s)", rome.images.len());
                 score.ome_ok += 1;
@@ -794,9 +1062,7 @@ fn java_parity() {
                     }
                 );
                 score.ome_bad += 1;
-                if strict {
-                    hard_failures.push(rel.to_string());
-                }
+                ome_failures.push(format!("{rel}: {}", ome_diffs.join("; ")));
             }
         } else if jome
             .get("images")
@@ -806,9 +1072,9 @@ fn java_parity() {
         {
             println!("  OME ✗  java exposed OME images, rust returned None");
             score.ome_bad += 1;
-            if strict {
-                hard_failures.push(rel.to_string());
-            }
+            ome_failures.push(format!(
+                "{rel}: java exposed OME images, rust returned None"
+            ));
         }
     }
 
@@ -838,16 +1104,26 @@ fn java_parity() {
 
     assert!(checked > 0, "no files were compared — populate ./testdata");
 
-    if strict && !hard_failures.is_empty() {
-        hard_failures.sort();
-        hard_failures.dedup();
-        panic!("STRICT parity divergence in: {}", hard_failures.join(", "));
+    if strict && !strict_failures.is_empty() {
+        strict_failures.sort();
+        strict_failures.dedup();
+        panic!(
+            "STRICT pixel parity divergence in: {}",
+            strict_failures.join(", ")
+        );
     }
     if !core_failures.is_empty() {
         panic!(
             "CORE metadata divergence from Java ({} issue(s)):\n  - {}",
             core_failures.len(),
             core_failures.join("\n  - ")
+        );
+    }
+    if !ome_failures.is_empty() {
+        panic!(
+            "OME metadata divergence from Java ({} issue(s)):\n  - {}",
+            ome_failures.len(),
+            ome_failures.join("\n  - ")
         );
     }
 }

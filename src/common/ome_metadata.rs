@@ -661,7 +661,9 @@ impl OmeMetadata {
                             xml,
                             r#"<LightSourceSettings ID="{}""#,
                             xml_escape(
-                                ch.light_source_settings_id.as_deref().unwrap_or("LightSource:0")
+                                ch.light_source_settings_id
+                                    .as_deref()
+                                    .unwrap_or("LightSource:0")
                             )
                         );
                         if let Some(v) = ch.light_source_settings_attenuation {
@@ -703,11 +705,8 @@ impl OmeMetadata {
                                 let _ = write!(xml, r#"<DichroicRef ID="{}"/>"#, xml_escape(id));
                             }
                             for id in &path.emission_filter_ids {
-                                let _ = write!(
-                                    xml,
-                                    r#"<EmissionFilterRef ID="{}"/>"#,
-                                    xml_escape(id)
-                                );
+                                let _ =
+                                    write!(xml, r#"<EmissionFilterRef ID="{}"/>"#, xml_escape(id));
                             }
                             xml.push_str("</LightPath>");
                         }

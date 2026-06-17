@@ -2064,9 +2064,7 @@ fn photoshop_clean_layer_name(bytes: &[u8]) -> String {
         .collect();
     // Java String.trim() removes any leading/trailing char <= ' ' (0x20),
     // which includes the NUL padding bytes appended to layer names.
-    ascii
-        .trim_matches(|c: char| (c as u32) <= 0x20)
-        .to_string()
+    ascii.trim_matches(|c: char| (c as u32) <= 0x20).to_string()
 }
 
 /// Adobe Photoshop TIFF reader.
@@ -2147,10 +2145,7 @@ impl PhotoshopTiffReader {
                     // to a single series and break. The merged image is not RGB
                     // in this port's metadata, so multi-channel layers abort.
                     let is_rgb = self.inner.metadata().is_rgb;
-                    if layer_size_x == 0
-                        || layer_size_y == 0
-                        || (layer_size_c > 1 && !is_rgb)
-                    {
+                    if layer_size_x == 0 || layer_size_y == 0 || (layer_size_c > 1 && !is_rgb) {
                         series_count = 1;
                         self.layer_names.clear();
                         break;
@@ -2187,8 +2182,7 @@ impl PhotoshopTiffReader {
                     // matches nameLength+pad) and is not the synthetic mask name
                     // "Layer <n>M".
                     let synthetic = format!("Layer {layer}M");
-                    if raw_len == name_length + pad
-                        && !layer_name.eq_ignore_ascii_case(&synthetic)
+                    if raw_len == name_length + pad && !layer_name.eq_ignore_ascii_case(&synthetic)
                     {
                         self.layer_names.push(layer_name);
                         series_count += 1;
@@ -2213,8 +2207,10 @@ impl PhotoshopTiffReader {
         // accepted layer names as a "Layer name" global-metadata list.
         let mut meta = self.inner.metadata().clone();
         for (i, name) in self.layer_names.iter().enumerate() {
-            meta.series_metadata
-                .insert(format!("Layer name #{}", i + 1), MetadataValue::String(name.clone()));
+            meta.series_metadata.insert(
+                format!("Layer name #{}", i + 1),
+                MetadataValue::String(name.clone()),
+            );
         }
         meta.series_metadata.insert(
             "Photoshop layer count".to_string(),
@@ -2279,9 +2275,7 @@ impl FormatReader for PhotoshopTiffReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
-            .unwrap_or_else(|| self.inner.metadata())
+        self.meta.as_ref().unwrap_or_else(|| self.inner.metadata())
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
@@ -2644,8 +2638,11 @@ impl FormatReader for NikonReader {
         let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
         let mut parser = crate::tiff::parser::TiffParser::new(std::io::BufReader::new(file))?;
         let main_ifds = parser.read_ifds()?;
-        self.compression_options =
-            crate::tiff::nikon::extract_compression_options(&mut parser, &main_ifds, bits_per_sample)?;
+        self.compression_options = crate::tiff::nikon::extract_compression_options(
+            &mut parser,
+            &main_ifds,
+            bits_per_sample,
+        )?;
         self.white_balance = Self::read_white_balance(path)?;
 
         self.path = Some(path.to_path_buf());
@@ -3101,7 +3098,13 @@ mod tests {
     /// Build a minimal single-IFD classic TIFF describing an 8-bit RGB strip,
     /// optionally tagging it as a Nikon NEF via `Make` or the EPS-standard tag.
     /// `pixels` is the raw RGB strip (interleaved, 3 bytes/pixel).
-    fn synthetic_nef(width: u32, height: u32, pixels: &[u8], make_nikon: bool, eps: bool) -> Vec<u8> {
+    fn synthetic_nef(
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        make_nikon: bool,
+        eps: bool,
+    ) -> Vec<u8> {
         use crate::tiff::ifd::tag;
         // Layout: header(8) | IFD | "Nikon\0" make string | strip data.
         let mut entries: Vec<(u16, u16, u32, u32)> = Vec::new();
@@ -3110,7 +3113,7 @@ mod tests {
         push_u16_le(&mut data, 42);
 
         let make_str: &[u8] = b"Nikon\0"; // 6 bytes
-        // 8 fixed entries + optional Make + optional EPS-standard.
+                                          // 8 fixed entries + optional Make + optional EPS-standard.
         let entry_count: u16 = 8 + make_nikon as u16 + eps as u16;
         let ifd_offset = 8u32;
         let ifd_bytes = 2 + entry_count as u32 * 12 + 4;
@@ -3195,9 +3198,9 @@ mod tests {
         }
 
         // total strip bytes == plane size, so Java/our path defers to the plain
-        // TIFF strip decode: the RGB plane should round-trip unchanged.
+        // TIFF strip decode. Bio-Formats exposes chunky RGB as channel-planar.
         let plane = reader.open_bytes(0).unwrap();
-        assert_eq!(plane, pixels);
+        assert_eq!(plane, vec![0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]);
 
         fs::remove_dir_all(root).unwrap();
     }

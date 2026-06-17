@@ -1256,7 +1256,7 @@ fn finish_psd(
     //   palette(2)       -> indexed
     // sizeC keeps the full channel count (RGB+alpha=4, CMYK=4, Lab=3, ...).
     let is_rgb = color_mode == 3 || color_mode == 4;
-    let is_indexed = color_mode == 2 && lookup_table.is_some();
+    let is_indexed = color_mode == 2;
     let output_channels = channels as usize;
 
     // Keep the composite data **planar** (channel-separated): channel 0's plane,

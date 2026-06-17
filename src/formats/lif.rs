@@ -1938,7 +1938,9 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
         acquisition_date,
         physical_size_x: physical_size_x.filter(|v| *v > 0.0),
         physical_size_y: physical_size_y.filter(|v| *v > 0.0),
-        physical_size_z: z_step.filter(|v| *v > 0.0).or(physical_size_z.filter(|v| *v > 0.0)),
+        physical_size_z: z_step
+            .filter(|v| *v > 0.0)
+            .or(physical_size_z.filter(|v| *v > 0.0)),
         time_increment: acc.time_increment,
         channels,
         planes,
@@ -2069,7 +2071,10 @@ fn apply_laser_light_source_settings(
     // live `int nextFilter = 0;` (unused once the filter cross-walk is dropped).
     let mut next_channel: usize = 0;
     for &laser_array_index in &valid_intensities {
-        let intensity = laser_intensities.get(laser_array_index).copied().unwrap_or(0.0);
+        let intensity = laser_intensities
+            .get(laser_array_index)
+            .copied()
+            .unwrap_or(0.0);
         let laser = laser_array_index % lasers.len();
         let wavelength = lasers[laser];
         if wavelength != 0.0 {
@@ -2555,12 +2560,20 @@ fn translate_scanner_settings(dom: &Dom, img: usize, acc: &mut LifMetaAcc) {
 
     for &cs in &confocal_settings {
         let attrs = &dom.nodes[cs].attrs;
-        if let Some(v) = attrs.get("Pinhole").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(v) = attrs
+            .get("Pinhole")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             if let Ok(v) = v.parse::<f64>() {
                 acc.pinhole = Some(v * LIF_METER_MULTIPLY);
             }
         }
-        if let Some(v) = attrs.get("Zoom").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(v) = attrs
+            .get("Zoom")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             acc.zoom = v.parse::<f64>().ok();
         }
         if let Some(v) = attrs
@@ -2570,13 +2583,25 @@ fn translate_scanner_settings(dom: &Dom, img: usize, acc: &mut LifMetaAcc) {
         {
             acc.objective_model = Some(v.to_string());
         }
-        if let Some(v) = attrs.get("FlipX").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(v) = attrs
+            .get("FlipX")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             acc.flip_x = v == "1";
         }
-        if let Some(v) = attrs.get("FlipY").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(v) = attrs
+            .get("FlipY")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             acc.flip_y = v == "1";
         }
-        if let Some(v) = attrs.get("SwapXY").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(v) = attrs
+            .get("SwapXY")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             acc.swap_xy = v == "1";
         }
     }
@@ -2753,8 +2778,7 @@ fn translate_laser_lines(dom: &Dom, img: usize, acc: &mut LifMetaAcc) {
             .and_then(|p| dom.nodes[p].parent)
             .map(|gp| dom.nodes[gp].name.as_str())
             .unwrap_or("");
-        let is_master =
-            gp_name.ends_with("Sequential_Master") || gp_name.ends_with("Attachment");
+        let is_master = gp_name.ends_with("Sequential_Master") || gp_name.ends_with("Attachment");
         acc.laser_frap.push(gp_name.ends_with("FRAP_Master"));
         for &ll in &laser_lines {
             if is_master {
@@ -2795,8 +2819,7 @@ fn translate_laser_lines(dom: &Dom, img: usize, acc: &mut LifMetaAcc) {
 
             // IntensityDev → laserIntensity (Java ~1717-1736). Java stores
             // 100 - IntensityDev at realIndex = baseIntensityIndex + index.
-            let real_intensity = 100.0
-                - acc_attr_intensity(&dom.nodes[ll].attrs);
+            let real_intensity = 100.0 - acc_attr_intensity(&dom.nodes[ll].attrs);
             let real_index = base_intensity_index + index;
             if real_index < acc.laser_intensity.len() {
                 acc.laser_intensity[real_index] = real_intensity;
@@ -2856,7 +2879,8 @@ fn translate_timestamps(dom: &Dom, img: usize, image_count: usize, acc: &mut Lif
         }
         for (stamp, &node) in timestamp_nodes.iter().enumerate() {
             if stamp < image_count {
-                acc.timestamps[stamp] = Some(translate_single_timestamp_attrs(&dom.nodes[node].attrs));
+                acc.timestamps[stamp] =
+                    Some(translate_single_timestamp_attrs(&dom.nodes[node].attrs));
             }
         }
     }
@@ -2968,10 +2992,18 @@ fn translate_rois(
         for &node in &annotations {
             let attrs = &dom.nodes[node].attrs;
             let mut roi = LifRoi::default();
-            if let Some(t) = attrs.get("type").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some(t) = attrs
+                .get("type")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 roi.roi_type = t.parse().unwrap_or(0);
             }
-            if let Some(c) = attrs.get("color").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some(c) = attrs
+                .get("color")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 roi.color = c.parse().unwrap_or(0);
             }
             roi.name = attrs.get("name").cloned();
@@ -2991,7 +3023,11 @@ fn translate_rois(
             if let Some(v) = parse_attr_f64(attrs, "transRotation") {
                 roi.rotation = v;
             }
-            if let Some(lw) = attrs.get("linewidth").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some(lw) = attrs
+                .get("linewidth")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 if let Ok(v) = lw.parse::<i32>() {
                     roi.linewidth = v;
                 }
@@ -3046,10 +3082,18 @@ fn translate_rois(
         };
         let attrs = &dom.nodes[roi_node].attrs;
         let mut roi = LifRoi::default();
-        if let Some(t) = attrs.get("RoiType").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(t) = attrs
+            .get("RoiType")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             roi.roi_type = t.parse().unwrap_or(0);
         }
-        if let Some(c) = attrs.get("Color").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(c) = attrs
+            .get("Color")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             roi.color = c.parse().unwrap_or(0);
         }
         // name = roiNode.parent.parent.Name
@@ -3503,13 +3547,12 @@ fn lif_rois_to_ome(rois: &[LifRoi], acc: &LifMetaAcc, size_x: u32, size_y: u32) 
     out
 }
 
-/// Java `FormatTools.pixelTypeFromBytes(nBytes, signed=false, fp=true)`:
-/// LIF channels are unsigned integer.
+/// Java `FormatTools.pixelTypeFromBytes(nBytes, signed=false, fp=true)`.
 fn pixel_type_from_bytes(n_bytes: u64) -> PixelType {
     match n_bytes {
         0 | 1 => PixelType::Uint8,
         2 => PixelType::Uint16,
-        4 => PixelType::Uint32,
+        4 => PixelType::Float32,
         8 => PixelType::Float64,
         _ => PixelType::Uint8,
     }
@@ -3565,6 +3608,11 @@ mod tests {
         // Channel 1: intensity 100 was filtered out (not < 100).
         assert_eq!(channels[1].light_source_settings_attenuation, None);
         assert_eq!(lasers[1], None);
+    }
+
+    #[test]
+    fn lif_four_byte_x_stride_maps_to_float_like_java() {
+        assert_eq!(super::pixel_type_from_bytes(4), PixelType::Float32);
     }
 
     fn synthetic_lif_bytes() -> Vec<u8> {

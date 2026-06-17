@@ -565,7 +565,9 @@ impl FlexReader {
             let (names, _f) = parse_flex_arrays(&xml);
             self.channel_names = names;
             self.physical_size = parse_physical_size(&xml);
-            self.run_flex_handler(&xml, /*well=*/ 0, /*this_field=*/ -1, /*populate_core=*/ true);
+            self.run_flex_handler(
+                &xml, /*well=*/ 0, /*this_field=*/ -1, /*populate_core=*/ true,
+            );
         }
         self.image_count = self
             .inner
@@ -759,7 +761,9 @@ impl FlexReader {
             } else {
                 flex_files[0].field as i64
             };
-            self.run_flex_handler(xml, /*well=*/ 0, this_field, /*populate_core=*/ true);
+            self.run_flex_handler(
+                xml, /*well=*/ 0, this_field, /*populate_core=*/ true,
+            );
         }
 
         // For a single file, the field count comes from the in-file
@@ -982,7 +986,8 @@ impl FlexReader {
                         }
                         "Field" => {
                             parent_qname = qname.clone();
-                            if let Some(no) = attr("No").and_then(|s| s.trim().parse::<u32>().ok()) {
+                            if let Some(no) = attr("No").and_then(|s| s.trim().parse::<u32>().ok())
+                            {
                                 // Mirror Java: bump fieldCount when this No exceeds
                                 // it and the well isn't split across files.
                                 let fc = self.field_count;
@@ -1021,7 +1026,8 @@ impl FlexReader {
                         "Filter" => {
                             if let Some(id) = attr("ID") {
                                 if slider_name.ends_with("Dichro") {
-                                    let lsid = create_lsid("Dichroic", &[0, next_dichroic as usize]);
+                                    let lsid =
+                                        create_lsid("Dichroic", &[0, next_dichroic as usize]);
                                     if self.dichroic_map.get(id) != Some(&lsid) {
                                         self.dichroic_map.insert(id.clone(), lsid);
                                     }
@@ -1099,7 +1105,14 @@ impl FlexReader {
                             next_slider_ref = 0;
                         }
                         _ if parent_qname == "Image" => {
-                            self.handle_image_end(&qname, &value, well, this_field, first_well_planes, next_image);
+                            self.handle_image_end(
+                                &qname,
+                                &value,
+                                well,
+                                this_field,
+                                first_well_planes,
+                                next_image,
+                            );
                         }
                         _ => {}
                     }
@@ -1134,8 +1147,8 @@ impl FlexReader {
                 if n_images == 0 {
                     n_images = 1;
                 }
-                let current_series = ((next_image - 1).max(0) as u32 / n_images)
-                    + well * field_count;
+                let current_series =
+                    ((next_image - 1).max(0) as u32 / n_images) + well * field_count;
                 let series_count =
                     (self.plate_count.max(1) * self.well_count.max(1) * field_count) as usize;
                 if (current_series as usize) < series_count && !value.is_empty() {
@@ -1249,11 +1262,7 @@ impl FlexReader {
     /// light-path filter refs (on `img.light_paths`) for series `i`, mirroring
     /// the channel loop of Java `populateMetadataStore`
     /// (indices keyed by `seriesIndex = i*imageCount`).
-    fn apply_channel_instrument(
-        &self,
-        img: &mut crate::common::ome_metadata::OmeImage,
-        i: usize,
-    ) {
+    fn apply_channel_instrument(&self, img: &mut crate::common::ome_metadata::OmeImage, i: usize) {
         let series_index = i * self.image_count.max(1) as usize;
         let n = img.channels.len();
         let mut light_paths: Vec<crate::common::ome_metadata::OmeLightPath> = Vec::new();
@@ -2083,11 +2092,8 @@ impl FormatReader for FlexReader {
                 // Detector/binning/light-path settings per channel.
                 self.apply_channel_instrument(&mut img, i);
                 // Per-plane positions / times.
-                img.planes = self.build_series_planes(
-                    i,
-                    self.image_count.max(1),
-                    eff_size_c as u32,
-                );
+                img.planes =
+                    self.build_series_planes(i, self.image_count.max(1), eff_size_c as u32);
                 img
             })
             .collect();
@@ -2262,7 +2268,7 @@ mod tests {
             }
         }
         assert_eq!(starts.len(), 3); // a, b, c (self-close still one Start)
-        // Start order: a, b, c. End order: b("hi"), c(""), a("").
+                                     // Start order: a, b, c. End order: b("hi"), c(""), a("").
         assert_eq!(starts[1].0, "b");
         assert_eq!(starts[1].1.get("x").map(|s| s.as_str()), Some("1"));
         assert!(ends.iter().any(|(q, v)| q == "b" && v == "hi"));
@@ -2279,12 +2285,7 @@ mod tests {
             factors: None,
         };
         // two wells, two fields each, well order (0,0) then (0,1).
-        let files = vec![
-            mk(0, 0, 0),
-            mk(0, 0, 1),
-            mk(0, 1, 0),
-            mk(0, 1, 1),
-        ];
+        let files = vec![mk(0, 0, 0), mk(0, 0, 1), mk(0, 1, 0), mk(0, 1, 1)];
         assert_eq!(file_well_indices(&files), vec![0, 0, 1, 1]);
     }
 

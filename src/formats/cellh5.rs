@@ -375,7 +375,8 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
             dimension_order: DimensionOrder::XYZTC,
             is_rgb: false,
             is_interleaved: false,
-            is_indexed: false,
+            // Java CellH5Reader marks both image and segmentation series indexed.
+            is_indexed: true,
             is_little_endian: true,
             resolution_count: 1,
             thumbnail: false,
@@ -602,9 +603,7 @@ impl FormatWriter for CellH5Writer {
                 let mut vol = vec![<$ty>::default(); total_pixels];
                 for (no, slot) in self.planes.iter().enumerate() {
                     let buf = slot.as_ref().ok_or_else(|| {
-                        BioFormatsError::Format(format!(
-                            "CellH5Writer: missing plane {no}"
-                        ))
+                        BioFormatsError::Format(format!("CellH5Writer: missing plane {no}"))
                     })?;
                     let (c, t, z) = cellh5_ctz_coords(
                         meta.dimension_order,
@@ -613,9 +612,8 @@ impl FormatWriter for CellH5Writer {
                         meta.size_t,
                         no as u32,
                     )?;
-                    let base = c as usize * stride_c
-                        + t as usize * stride_t
-                        + z as usize * stride_z;
+                    let base =
+                        c as usize * stride_c + t as usize * stride_t + z as usize * stride_z;
                     let conv = $from_le;
                     for p in 0..plane_pixels {
                         vol[base + p] = conv(buf, p);
@@ -653,21 +651,21 @@ impl FormatWriter for CellH5Writer {
 
         // Walk/create: sample -> 0 -> plate -> <plate> -> experiment -> <well>
         //   -> position -> <site> -> image, then build the dataset there.
-        let mut sample = file.create_group("sample").map_err(|e| {
-            BioFormatsError::Format(format!("CellH5Writer: create /sample: {e}"))
-        })?;
+        let mut sample = file
+            .create_group("sample")
+            .map_err(|e| BioFormatsError::Format(format!("CellH5Writer: create /sample: {e}")))?;
         let mut g0 = sample
             .create_group("0")
             .map_err(|e| BioFormatsError::Format(format!("CellH5Writer: create sample/0: {e}")))?;
         let mut plate_g = g0
             .create_group("plate")
             .map_err(|e| BioFormatsError::Format(format!("CellH5Writer: create plate: {e}")))?;
-        let mut plate_named = plate_g
-            .create_group(&self.plate)
-            .map_err(|e| BioFormatsError::Format(format!("CellH5Writer: create plate name: {e}")))?;
-        let mut experiment = plate_named
-            .create_group("experiment")
-            .map_err(|e| BioFormatsError::Format(format!("CellH5Writer: create experiment: {e}")))?;
+        let mut plate_named = plate_g.create_group(&self.plate).map_err(|e| {
+            BioFormatsError::Format(format!("CellH5Writer: create plate name: {e}"))
+        })?;
+        let mut experiment = plate_named.create_group("experiment").map_err(|e| {
+            BioFormatsError::Format(format!("CellH5Writer: create experiment: {e}"))
+        })?;
         let mut well_g = experiment
             .create_group(&self.well)
             .map_err(|e| BioFormatsError::Format(format!("CellH5Writer: create well: {e}")))?;

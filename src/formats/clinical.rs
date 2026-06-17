@@ -205,22 +205,13 @@ impl FormatReader for Ecat7Reader {
         let scan_start = r_i32_be(&hdr, 62);
         let isotope_name = r_string(&hdr, 66, 8);
         let isotope_halflife = r_f32_be(&hdr, 74);
-        meta_map.insert(
-            "Original path".into(),
-            MetadataValue::String(original_path),
-        );
+        meta_map.insert("Original path".into(), MetadataValue::String(original_path));
         meta_map.insert("Version".into(), MetadataValue::Int(version as i64));
         meta_map.insert("System type".into(), MetadataValue::Int(system_type as i64));
         meta_map.insert("File type".into(), MetadataValue::Int(file_type as i64));
-        meta_map.insert(
-            "Serial number".into(),
-            MetadataValue::String(serial_number),
-        );
+        meta_map.insert("Serial number".into(), MetadataValue::String(serial_number));
         meta_map.insert("Scan start".into(), MetadataValue::Int(scan_start as i64));
-        meta_map.insert(
-            "Isotope Name".into(),
-            MetadataValue::String(isotope_name),
-        );
+        meta_map.insert("Isotope Name".into(), MetadataValue::String(isotope_name));
         meta_map.insert(
             "Isotope half-life".into(),
             MetadataValue::Float(isotope_halflife as f64),
@@ -307,10 +298,7 @@ impl FormatReader for Ecat7Reader {
             "Calibration units label".into(),
             MetadataValue::Int(calibration_label as i64),
         );
-        meta_map.insert(
-            "Compression".into(),
-            MetadataValue::Int(compression as i64),
-        );
+        meta_map.insert("Compression".into(), MetadataValue::Int(compression as i64));
 
         // Patient/study header block (Java Ecat7Reader.initFile continues
         // field-by-field from compression @152):
@@ -362,10 +350,7 @@ impl FormatReader for Ecat7Reader {
             "Physician name".into(),
             MetadataValue::String(physician_name),
         );
-        meta_map.insert(
-            "Operator name".into(),
-            MetadataValue::String(operator_name),
-        );
+        meta_map.insert("Operator name".into(), MetadataValue::String(operator_name));
         meta_map.insert("Description".into(), MetadataValue::String(description));
         meta_map.insert(
             "Acquisition type".into(),
@@ -375,10 +360,7 @@ impl FormatReader for Ecat7Reader {
             "Patient orientation".into(),
             MetadataValue::Int(patient_orientation as i64),
         );
-        meta_map.insert(
-            "Facility name".into(),
-            MetadataValue::String(facility_name),
-        );
+        meta_map.insert("Facility name".into(), MetadataValue::String(facility_name));
 
         // Acquisition/scan-parameter block (Java Ecat7Reader.initFile continues
         // field-by-field from facilityName @332 ending at 352):
@@ -461,10 +443,7 @@ impl FormatReader for Ecat7Reader {
             MetadataValue::Float(well_counter_correction_factor as f64),
         );
         meta_map.insert("Data units".into(), MetadataValue::String(data_units));
-        meta_map.insert(
-            "Septa state".into(),
-            MetadataValue::Int(septa_state as i64),
-        );
+        meta_map.insert("Septa state".into(), MetadataValue::Int(septa_state as i64));
         // fillCTI[6] @500 emitted via addGlobalMetaList("Fill CTI", ...); 6
         // entries flatten to 1-digit keys "Fill CTI #1".."Fill CTI #6".
         for i in 0..6usize {
@@ -599,10 +578,7 @@ impl FormatReader for Ecat7Reader {
             let recon_type = r_i16_be(&hdr, 1260);
             let recon_views = r_i16_be(&hdr, 1262);
 
-            meta_map.insert(
-                "Filter code".into(),
-                MetadataValue::Int(filter_code as i64),
-            );
+            meta_map.insert("Filter code".into(), MetadataValue::Int(filter_code as i64));
             meta_map.insert(
                 "X resolution".into(),
                 MetadataValue::Float(x_resolution as f64),
@@ -719,10 +695,7 @@ impl FormatReader for Ecat7Reader {
                 "Scatter type".into(),
                 MetadataValue::Int(scatter_type as i64),
             );
-            meta_map.insert(
-                "Recon. type".into(),
-                MetadataValue::Int(recon_type as i64),
-            );
+            meta_map.insert("Recon. type".into(), MetadataValue::Int(recon_type as i64));
             meta_map.insert(
                 "Recon. views".into(),
                 MetadataValue::Int(recon_views as i64),
@@ -1142,8 +1115,7 @@ fn inveon_parse_header_line(line: &str) -> Option<(String, String)> {
             value = inveon_transform_ct_projection_interpolation(&value)
         }
         "event_type" => value = inveon_transform_event_type(&value),
-        "projection" | "ct_projection_center_offset"
-        | "ct_projection_horizontal_bed_offset" => {
+        "projection" | "ct_projection_center_offset" | "ct_projection_horizontal_bed_offset" => {
             if let Some(s) = value.find(' ') {
                 let index = &value[..s];
                 let rest = value[s + 1..].to_string();

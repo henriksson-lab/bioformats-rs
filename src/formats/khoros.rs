@@ -60,7 +60,10 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
     let size_x = positive_i32_dim(read_i32(data, 520, little), "width")?;
     let size_y = positive_i32_dim(read_i32(data, 524, little), "height")?;
     // skipBytes(28) -> pos 556
-    let image_count = positive_i32_dim(read_i32(data, 556, little), "image count")?;
+    let image_count = match read_i32(data, 556, little) {
+        0 => 1,
+        value => positive_i32_dim(value, "image count")?,
+    };
     let mut size_c = positive_i32_dim(read_i32(data, 560, little), "channel count")?;
 
     let type_code = read_i32(data, 564, little);

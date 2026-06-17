@@ -641,21 +641,35 @@ fn r_f32_le_w(b: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+fn r_f32_w(b: &[u8], off: usize, little_endian: bool) -> f32 {
+    let bytes = [b[off], b[off + 1], b[off + 2], b[off + 3]];
+    if little_endian {
+        f32::from_le_bytes(bytes)
+    } else {
+        f32::from_be_bytes(bytes)
+    }
+}
+
 // Mirrors the addGlobalMeta(...) block of Java SpiderReader.initFile: reads the
 // named header words (4-byte little-endian floats) plus the trailing date/time/
 // title strings and stores them under Java's exact key names. Header layout in
 // words (word N = byte offset (N-1)*4); some words Java skips are omitted here.
-fn read_spider_metadata(path: &Path) -> Result<HashMap<String, MetadataValue>> {
+fn read_spider_metadata(
+    path: &Path,
+    little_endian: bool,
+) -> Result<HashMap<String, MetadataValue>> {
     let f = File::open(path).map_err(BioFormatsError::Io)?;
     // Read up to 1024 bytes (through the 160-byte title at byte 864), zero-
     // padding short files so payload validation — not this read — reports any
     // truncation. read_to_end may exceed 1024; truncate/pad to a fixed size.
     let mut hdr = Vec::new();
-    f.take(1024).read_to_end(&mut hdr).map_err(BioFormatsError::Io)?;
+    f.take(1024)
+        .read_to_end(&mut hdr)
+        .map_err(BioFormatsError::Io)?;
     hdr.resize(1024, 0);
 
-    let int_w = |off: usize| MetadataValue::Int(r_f32_le_w(&hdr, off) as i32 as i64);
-    let float_w = |off: usize| MetadataValue::Float(r_f32_le_w(&hdr, off) as f64);
+    let int_w = |off: usize| MetadataValue::Int(r_f32_w(&hdr, off, little_endian) as i32 as i64);
+    let float_w = |off: usize| MetadataValue::Float(r_f32_w(&hdr, off, little_endian) as f64);
     let str_at = |off: usize, len: usize| {
         MetadataValue::String(
             String::from_utf8_lossy(&hdr[off..off + len])
@@ -710,20 +724,31 @@ fn read_spider_metadata(path: &Path) -> Result<HashMap<String, MetadataValue>> {
     Ok(m)
 }
 
-fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
+fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64, bool, bool)> {
     let mut f = File::open(path).map_err(BioFormatsError::Io)?;
     let mut hdr = [0u8; 256]; // read first 256 bytes = enough for the key fields
     f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
 
-    let nslice = spider_positive_u32(r_f32_le_w(&hdr, 0), "NSLICE")?;
-    let nrow = spider_positive_u32(r_f32_le_w(&hdr, 4), "NROW")?;
-    let iform = r_f32_le_w(&hdr, 16) as i32;
-    let nsam = spider_positive_u32(r_f32_le_w(&hdr, 44), "NSAM")?;
-    let labbyt = r_f32_le_w(&hdr, 84) as u64;
+    // Java starts little-endian, then switches to big-endian only when NSLICE
+    // read as little-endian is not positive.
+    let little_endian = (r_f32_le_w(&hdr, 0) as i32) > 0;
+    let nslice_raw = r_f32_w(&hdr, 0, little_endian);
+    let nslice = if nslice_raw > 0.0 {
+        spider_positive_u32(nslice_raw, "NSLICE")?
+    } else {
+        1
+    };
+    let nrow = spider_positive_u32(r_f32_w(&hdr, 4, little_endian), "NROW")?;
+    let irec = r_f32_w(&hdr, 8, little_endian) as i32;
+    let iform = r_f32_w(&hdr, 16, little_endian) as i32;
+    let nsam = spider_positive_u32(r_f32_w(&hdr, 44, little_endian), "NSAM")?;
+    let labrec = r_f32_w(&hdr, 48, little_endian) as u64;
+    let labbyt = r_f32_w(&hdr, 84, little_endian) as u64;
+    let maxim = r_f32_w(&hdr, 100, little_endian);
 
     let width = nsam;
     let height = nrow;
-    let nz = match iform {
+    let base_image_count = match iform {
         1 | -1 => 1,                    // single 2D image
         3 | -3 => nslice,               // 3D volume
         11 | -11 | -21 | -22 => nslice, // sequence / known Spider variants
@@ -734,15 +759,31 @@ fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64)> {
         }
     };
 
+    let image_count = if maxim > 0.0 {
+        (maxim * base_image_count as f32) as u32
+    } else {
+        base_image_count
+    };
+
     let header_size = if labbyt > 0 {
         labbyt
     } else {
-        // Estimate: LABREC * NSAM * 4
-        let labrec = r_f32_le_w(&hdr, 48) as u64;
         labrec * nsam as u64 * 4
     };
+    let plane_size = width as u64 * height as u64 * 4;
+    let plane_size_i64 = plane_size as i64;
+    let one_header_per_slice = irec > 0
+        && irec as i64 * nsam as i64 * 4 != plane_size_i64
+        && (irec - 1) as i64 * 4 != plane_size_i64;
 
-    Ok((width, height, nz, header_size))
+    Ok((
+        width,
+        height,
+        image_count,
+        header_size,
+        little_endian,
+        one_header_per_slice,
+    ))
 }
 
 fn spider_positive_u32(value: f32, label: &str) -> Result<u32> {
@@ -754,10 +795,48 @@ fn spider_positive_u32(value: f32, label: &str) -> Result<u32> {
     Ok(value as u32)
 }
 
+fn validate_spider_payload_len(
+    path: &Path,
+    header_size: u64,
+    meta: &ImageMetadata,
+    one_header_per_slice: bool,
+) -> Result<()> {
+    let file_len = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
+    let plane_bytes = checked_plane_bytes("Spider", meta)?;
+    let required_len = if meta.image_count == 0 {
+        header_size
+    } else {
+        let last_plane = meta.image_count as u64 - 1;
+        let mut offset =
+            header_size
+                .checked_add(last_plane.checked_mul(plane_bytes).ok_or_else(|| {
+                    BioFormatsError::Format("Spider: payload size overflows".into())
+                })?)
+                .ok_or_else(|| BioFormatsError::Format("Spider: payload size overflows".into()))?;
+        if one_header_per_slice {
+            offset = offset
+                .checked_add((last_plane + 1).checked_mul(header_size).ok_or_else(|| {
+                    BioFormatsError::Format("Spider: payload size overflows".into())
+                })?)
+                .ok_or_else(|| BioFormatsError::Format("Spider: payload size overflows".into()))?;
+        }
+        offset
+            .checked_add(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("Spider: payload size overflows".into()))?
+    };
+    if file_len < required_len {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Spider: pixel payload is shorter than declared ({file_len} < {required_len})"
+        )));
+    }
+    Ok(())
+}
+
 pub struct SpiderReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
+    one_header_per_slice: bool,
 }
 
 impl SpiderReader {
@@ -766,6 +845,7 @@ impl SpiderReader {
             path: None,
             meta: None,
             data_offset: 0,
+            one_header_per_slice: false,
         }
     }
 }
@@ -790,9 +870,10 @@ impl FormatReader for SpiderReader {
         }
         // Spider header: check NSLICE (word 1) and NSAM (word 12) are non-zero float32s
         // and IFORM (word 5) is a valid type code
-        let iform = r_f32_le_w(header, 16) as i32;
-        let nsam = r_f32_le_w(header, 44);
-        let nrow = r_f32_le_w(header, 4);
+        let little_endian = (r_f32_le_w(header, 0) as i32) > 0;
+        let iform = r_f32_w(header, 16, little_endian) as i32;
+        let nsam = r_f32_w(header, 44, little_endian);
+        let nrow = r_f32_w(header, 4, little_endian);
         matches!(iform, 1 | 3 | -1 | -3 | 11 | -11 | -21 | -22) && nsam > 0.0 && nrow > 0.0
     }
 
@@ -800,12 +881,13 @@ impl FormatReader for SpiderReader {
         self.path = None;
         self.meta = None;
         self.data_offset = 0;
-        let (width, height, nz, data_offset) = parse_spider_header(path)?;
-        let image_count = nz;
+        self.one_header_per_slice = false;
+        let (width, height, image_count, data_offset, little_endian, one_header_per_slice) =
+            parse_spider_header(path)?;
         let meta = ImageMetadata {
             size_x: width,
             size_y: height,
-            size_z: nz,
+            size_z: image_count,
             size_c: 1,
             size_t: 1,
             pixel_type: PixelType::Float32,
@@ -815,11 +897,11 @@ impl FormatReader for SpiderReader {
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: true,
+            is_little_endian: little_endian,
             resolution_count: 1,
             thumbnail: false,
             series_metadata: {
-                let mut m = read_spider_metadata(path)?;
+                let mut m = read_spider_metadata(path, little_endian)?;
                 m.insert("format".into(), MetadataValue::String("Spider EM".into()));
                 m
             },
@@ -828,9 +910,10 @@ impl FormatReader for SpiderReader {
             modulo_c: None,
             modulo_t: None,
         };
-        validate_payload_len("Spider", path, data_offset, &meta)?;
+        validate_spider_payload_len(path, data_offset, &meta, one_header_per_slice)?;
         self.meta = Some(meta);
         self.data_offset = data_offset;
+        self.one_header_per_slice = one_header_per_slice;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -838,6 +921,7 @@ impl FormatReader for SpiderReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.one_header_per_slice = false;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -865,7 +949,10 @@ impl FormatReader for SpiderReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let plane_bytes = checked_plane_bytes("Spider", meta)? as usize;
-        let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
+        let mut offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
+        if self.one_header_per_slice {
+            offset += (plane_index as u64 + 1) * self.data_offset;
+        }
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(offset))
@@ -908,6 +995,11 @@ mod spider_tests {
     fn put_f32(buf: &mut [u8], word: usize, v: f32) {
         let off = word * 4;
         buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_f32_be(buf: &mut [u8], word: usize, v: f32) {
+        let off = word * 4;
+        buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
     }
 
     #[test]
@@ -955,6 +1047,81 @@ mod spider_tests {
         assert_eq!(float_of("FMIN"), -3.25);
         assert_eq!(int_of("NSAM"), 2);
         assert!(matches!(md.get("CTIT"), Some(MetadataValue::String(_))));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn spider_big_endian_header_and_pixels_match_java_detection() {
+        let mut hdr = vec![0u8; 1024];
+        put_f32_be(&mut hdr, 0, 1.0); // NSLICE
+        put_f32_be(&mut hdr, 1, 2.0); // NROW
+        put_f32_be(&mut hdr, 2, 2.0); // IREC: one leading header, no per-slice headers
+        put_f32_be(&mut hdr, 4, 1.0); // IFORM
+        put_f32_be(&mut hdr, 11, 2.0); // NSAM
+        put_f32_be(&mut hdr, 12, 256.0); // LABREC
+        put_f32_be(&mut hdr, 21, 1024.0); // LABBYT
+
+        let path =
+            std::env::temp_dir().join(format!("spider_be_{}_{}.spi", std::process::id(), line!()));
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&hdr).unwrap();
+            for value in [1.0f32, 2.0, 3.0, 4.0] {
+                f.write_all(&value.to_be_bytes()).unwrap();
+            }
+            f.flush().unwrap();
+        }
+
+        let mut r = SpiderReader::new();
+        assert!(r.is_this_type_by_bytes(&hdr[..104]));
+        r.set_id(&path).unwrap();
+        let meta = r.metadata();
+        assert!(!meta.is_little_endian);
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(
+            r.open_bytes(0).unwrap(),
+            [1.0f32, 2.0, 3.0, 4.0]
+                .into_iter()
+                .flat_map(f32::to_be_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn spider_one_header_per_slice_offsets_match_java() {
+        let mut hdr = vec![0u8; 1024];
+        put_f32(&mut hdr, 0, 2.0); // NSLICE
+        put_f32(&mut hdr, 1, 1.0); // NROW
+        put_f32(&mut hdr, 2, 3.0); // IREC, triggers oneHeaderPerSlice
+        put_f32(&mut hdr, 4, 3.0); // IFORM = 3D volume
+        put_f32(&mut hdr, 11, 1.0); // NSAM
+        put_f32(&mut hdr, 12, 256.0); // LABREC
+        put_f32(&mut hdr, 21, 1024.0); // LABBYT
+
+        let path = std::env::temp_dir().join(format!(
+            "spider_slice_headers_{}_{}.spi",
+            std::process::id(),
+            line!()
+        ));
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&hdr).unwrap();
+            f.write_all(&vec![0xaa; 1024]).unwrap(); // slice 0 header
+            f.write_all(&10.0f32.to_le_bytes()).unwrap();
+            f.write_all(&vec![0xbb; 1024]).unwrap(); // slice 1 header
+            f.write_all(&20.0f32.to_le_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+
+        let mut r = SpiderReader::new();
+        r.set_id(&path).unwrap();
+        assert_eq!(r.metadata().image_count, 2);
+        assert_eq!(r.open_bytes(0).unwrap(), 10.0f32.to_le_bytes());
+        assert_eq!(r.open_bytes(1).unwrap(), 20.0f32.to_le_bytes());
 
         std::fs::remove_file(&path).ok();
     }

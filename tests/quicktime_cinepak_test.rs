@@ -289,6 +289,80 @@ fn quicktime_elst(entries: &[(u32, i32, i32)]) -> Vec<u8> {
     atom(b"elst", &payload)
 }
 
+fn quicktime_stsc(entries: &[(u32, u32, u32)]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (first_chunk, samples_per_chunk, sample_description_index) in entries {
+        payload.extend_from_slice(&first_chunk.to_be_bytes());
+        payload.extend_from_slice(&samples_per_chunk.to_be_bytes());
+        payload.extend_from_slice(&sample_description_index.to_be_bytes());
+    }
+    atom(b"stsc", &payload)
+}
+
+fn quicktime_movie_samples_in_one_chunk(
+    codec: &[u8; 4],
+    width: u16,
+    height: u16,
+    depth: u16,
+    samples: &[&[u8]],
+) -> Vec<u8> {
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(b"qt  ");
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(b"qt  ");
+    let ftyp = atom(b"ftyp", &ftyp);
+
+    let mut mdat_payload = Vec::new();
+    for sample in samples {
+        mdat_payload.extend_from_slice(sample);
+    }
+    let mdat = atom(b"mdat", &mdat_payload);
+
+    let mut sample_entry = vec![0u8; 86];
+    sample_entry[..4].copy_from_slice(&86u32.to_be_bytes());
+    sample_entry[4..8].copy_from_slice(codec);
+    sample_entry[14..16].copy_from_slice(&1u16.to_be_bytes());
+    sample_entry[32..34].copy_from_slice(&width.to_be_bytes());
+    sample_entry[34..36].copy_from_slice(&height.to_be_bytes());
+    sample_entry[82..84].copy_from_slice(&depth.to_be_bytes());
+
+    let mut stsd_payload = Vec::new();
+    stsd_payload.extend_from_slice(&0u32.to_be_bytes());
+    stsd_payload.extend_from_slice(&1u32.to_be_bytes());
+    stsd_payload.extend_from_slice(&sample_entry);
+
+    let mut stsz_payload = Vec::new();
+    stsz_payload.extend_from_slice(&0u32.to_be_bytes());
+    stsz_payload.extend_from_slice(&0u32.to_be_bytes());
+    stsz_payload.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+    for sample in samples {
+        stsz_payload.extend_from_slice(&(sample.len() as u32).to_be_bytes());
+    }
+
+    let mut stco_payload = Vec::new();
+    stco_payload.extend_from_slice(&0u32.to_be_bytes());
+    stco_payload.extend_from_slice(&1u32.to_be_bytes());
+    stco_payload.extend_from_slice(&((ftyp.len() + 8) as u32).to_be_bytes());
+
+    let mut stbl_payload = Vec::new();
+    stbl_payload.extend_from_slice(&atom(b"stsd", &stsd_payload));
+    stbl_payload.extend_from_slice(&atom(b"stsz", &stsz_payload));
+    stbl_payload.extend_from_slice(&atom(b"stco", &stco_payload));
+    stbl_payload.extend_from_slice(&quicktime_stsc(&[(1, samples.len() as u32, 1)]));
+
+    let minf = atom(b"minf", &atom(b"stbl", &stbl_payload));
+    let mdia = atom(b"mdia", &minf);
+    let moov = atom(b"moov", &atom(b"trak", &mdia));
+
+    let mut mov = Vec::new();
+    mov.extend_from_slice(&ftyp);
+    mov.extend_from_slice(&mdat);
+    mov.extend_from_slice(&moov);
+    mov
+}
+
 fn quicktime_movie_two_tracks(
     first: (&[u8; 4], u16, u16, u16, &[u8]),
     second: (&[u8; 4], u16, u16, u16, &[u8]),
@@ -428,6 +502,31 @@ fn quicktime_decodes_rgba_png_sample() {
         reader.open_bytes_region(0, 0, 1, 2, 1).unwrap(),
         vec![7, 8, 9, 64, 10, 11, 12, 0]
     );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_stsc_maps_multiple_samples_in_one_chunk() {
+    let path = tmp("stsc_two_samples_one_chunk.mov");
+    let first = [1u8, 2, 3, 4, 5, 6];
+    let second = [11u8, 12, 13, 14, 15, 16];
+    let mov = quicktime_movie_samples_in_one_chunk(b"raw ", 2, 1, 24, &[&first, &second]);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(meta.size_t, 2);
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.chunk_offsets"),
+        Some(MetadataValue::String(offsets)) if !offsets.contains(',')
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("quicktime.sample_offsets"),
+        Some(MetadataValue::String(offsets)) if offsets.contains(',')
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), first);
+    assert_eq!(reader.open_bytes(1).unwrap(), second);
     let _ = std::fs::remove_file(path);
 }
 

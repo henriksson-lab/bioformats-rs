@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::io::read_bytes_at;
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
@@ -52,6 +51,7 @@ struct IfdInfo {
     image_description: Option<String>,
     ycbcr_subsampling: (u16, u16),
     ycbcr_coefficients: (f32, f32, f32),
+    ycbcr_reference_black_white: Option<[f32; 6]>,
     nikon_compression_options: Option<NikonCompressionOptions>,
     /// Hamamatsu NDPI restart-marker offsets (relative to the strip start) for a
     /// single-strip JPEG level. Built from tag 65426 (low 32 bits) + 65432 (high
@@ -371,9 +371,37 @@ impl TiffReader {
         };
 
         let strip_offsets = ifd.get_vec_u64(tag::STRIP_OFFSETS);
-        let strip_byte_counts = ifd.get_vec_u64(tag::STRIP_BYTE_COUNTS);
-        let tile_offsets = ifd.get_vec_u64(tag::TILE_OFFSETS);
-        let tile_byte_counts = ifd.get_vec_u64(tag::TILE_BYTE_COUNTS);
+        let mut strip_byte_counts = ifd.get_vec_u64(tag::STRIP_BYTE_COUNTS);
+        if !is_tiled && strip_byte_counts.is_empty() && !strip_offsets.is_empty() {
+            strip_byte_counts = synthesize_byte_counts(
+                width,
+                height,
+                samples_per_pixel,
+                planar_config,
+                bits_per_sample,
+                strip_offsets.len(),
+            )?;
+        }
+        let mut tile_offsets = ifd.get_vec_u64(tag::TILE_OFFSETS);
+        let mut tile_byte_counts = ifd.get_vec_u64(tag::TILE_BYTE_COUNTS);
+        if is_tiled {
+            if tile_offsets.is_empty() {
+                tile_offsets = strip_offsets.clone();
+            }
+            if tile_byte_counts.is_empty() {
+                tile_byte_counts = strip_byte_counts.clone();
+            }
+            if tile_byte_counts.is_empty() && !tile_offsets.is_empty() {
+                tile_byte_counts = synthesize_byte_counts(
+                    width,
+                    height,
+                    samples_per_pixel,
+                    planar_config,
+                    bits_per_sample,
+                    tile_offsets.len(),
+                )?;
+            }
+        }
         validate_tiff_storage(
             width,
             height,
@@ -451,6 +479,19 @@ impl TiffReader {
             .filter(|v| v.len() >= 3)
             .map(|v| (v[0], v[1], v[2]))
             .unwrap_or((0.299, 0.587, 0.114));
+        let ycbcr_reference_black_white = ifd
+            .get_vec_f64(tag::REFERENCE_BLACK_WHITE)
+            .get(0..6)
+            .map(|v| {
+                [
+                    v[0] as f32,
+                    v[1] as f32,
+                    v[2] as f32,
+                    v[3] as f32,
+                    v[4] as f32,
+                    v[5] as f32,
+                ]
+            });
 
         Ok(IfdInfo {
             width,
@@ -477,6 +518,7 @@ impl TiffReader {
             image_description,
             ycbcr_subsampling,
             ycbcr_coefficients: coefficients,
+            ycbcr_reference_black_white,
             nikon_compression_options: None,
             ndpi_restart_markers,
         })
@@ -502,12 +544,29 @@ impl TiffReader {
             return vec![];
         }
 
-        // Group consecutive IFDs with matching dimensions
+        // Group consecutive full-resolution IFDs with matching dimensions.
+        // Plain Bio-Formats TIFF maps pages onto T (XYCZT), not Z. Reduced
+        // images (NewSubfileType bit 0) are thumbnails/sub-resolutions, so they
+        // must not be folded into a normal full-resolution series.
         let mut groups: Vec<Vec<(usize, &IfdInfo)>> = Vec::new();
         for (idx, info) in &infos {
+            if ifds
+                .get(*idx)
+                .and_then(|ifd| ifd.get_u32(tag::NEW_SUBFILE_TYPE))
+                .is_some_and(|v| v & 1 != 0)
+            {
+                groups.push(vec![(*idx, info)]);
+                continue;
+            }
             if let Some(last) = groups.last_mut() {
                 let prev = last.last().unwrap().1;
-                if prev.width == info.width
+                let prev_idx = last.last().unwrap().0;
+                let prev_reduced = ifds
+                    .get(prev_idx)
+                    .and_then(|ifd| ifd.get_u32(tag::NEW_SUBFILE_TYPE))
+                    .is_some_and(|v| v & 1 != 0);
+                if !prev_reduced
+                    && prev.width == info.width
                     && prev.height == info.height
                     && prev.samples_per_pixel == info.samples_per_pixel
                     && prev.bits_per_sample == info.bits_per_sample
@@ -524,11 +583,15 @@ impl TiffReader {
             .map(|group| {
                 let ifd_indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
                 let info = group[0].1;
+                let reduced = ifds
+                    .get(ifd_indices[0])
+                    .and_then(|ifd| ifd.get_u32(tag::NEW_SUBFILE_TYPE))
+                    .is_some_and(|v| v & 1 != 0);
 
-                let is_rgb = matches!(info.photometric, Photometric::Rgb | Photometric::YCbCr)
-                    && info.samples_per_pixel >= 3;
-                let is_indexed = info.photometric == Photometric::Palette;
-                let size_c = if is_rgb || info.photometric == Photometric::Cmyk {
+                let is_rgb = info.samples_per_pixel > 1 || info.photometric == Photometric::Rgb;
+                let is_indexed =
+                    info.photometric == Photometric::Palette && info.color_map.is_some();
+                let size_c = if is_rgb {
                     info.samples_per_pixel as u32
                 } else {
                     1
@@ -547,19 +610,19 @@ impl TiffReader {
                 let mut meta = ImageMetadata {
                     size_x: info.width,
                     size_y: info.height,
-                    size_z: image_count,
+                    size_z: 1,
                     size_c,
-                    size_t: 1,
+                    size_t: image_count,
                     pixel_type: info.pixel_type,
                     bits_per_pixel: info.bits_per_sample as u8,
                     image_count,
-                    dimension_order: crate::common::metadata::DimensionOrder::XYZTC,
+                    dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
                     is_rgb,
                     is_interleaved: is_interleaved_rgb(info),
                     is_indexed,
                     is_little_endian: little_endian,
                     resolution_count: 1,
-                    thumbnail: false,
+                    thumbnail: reduced,
                     series_metadata: HashMap::new(),
                     lookup_table,
                     modulo_z: None,
@@ -577,8 +640,8 @@ impl TiffReader {
 
                 // ImageJ-style TIFF comment parsing (Java TiffReader.parseCommentImageJ
                 // + populateMetadataStoreImageJ). Java checks both the first and last
-                // IFD's comment; mirror that here. Strictly metadata-only: this does
-                // not alter dimensions, ordering, or pixel decoding.
+                // IFD's comment; mirror that here, including Java's Z/C/T reshape
+                // when the ImageJ axes match the number of IFDs.
                 let comment = info
                     .image_description
                     .as_deref()
@@ -591,6 +654,7 @@ impl TiffReader {
                     });
                 if let Some(comment) = comment {
                     parse_comment_imagej(comment, &mut meta.series_metadata);
+                    apply_imagej_dimensions(comment, &mut meta);
                 }
 
                 TiffSeries {
@@ -626,6 +690,9 @@ impl TiffReader {
 
         let mut series = Vec::new();
         for (image_idx, image) in images.into_iter().enumerate() {
+            if image.tiff_data.iter().any(|td| td.plane_count == Some(0)) {
+                continue;
+            }
             let image_count = image
                 .size_z
                 .saturating_mul(image.effective_c)
@@ -674,11 +741,42 @@ impl TiffReader {
             // photo == RGB`, where `samples` is the OME-XML Channel SamplesPerPixel
             // and `photo` is the first IFD's photometric interpretation. This is
             // broader than the generic TIFF rule (spp >= 3 && photo in {RGB,YCbCr}).
+            let ifd_samples_per_pixel = first_info
+                .as_ref()
+                .map(|info| u32::from(info.samples_per_pixel))
+                .unwrap_or(1)
+                .max(1);
+            let samples_per_pixel = image.samples_per_pixel.max(ifd_samples_per_pixel);
+            let adjusted_samples = samples_per_pixel != image.samples_per_pixel;
+            let mut reconciled_size_c = image.size_c.max(1);
+            if (samples_per_pixel != reconciled_size_c
+                && samples_per_pixel % reconciled_size_c != 0
+                && reconciled_size_c % samples_per_pixel != 0)
+                || reconciled_size_c == 1
+                || adjusted_samples
+            {
+                reconciled_size_c = reconciled_size_c.saturating_mul(samples_per_pixel).max(1);
+            }
+            let (pixel_type, bits_per_pixel) = match &first_info {
+                Some(info)
+                    if info.pixel_type != image.pixel_type
+                        || usize::from(info.bits_per_sample.div_ceil(8))
+                            != image.pixel_type.bytes_per_sample() =>
+                {
+                    (info.pixel_type, info.bits_per_sample as u8)
+                }
+                _ => (image.pixel_type, image.bits_per_pixel),
+            };
+
             let (is_rgb, is_interleaved, is_indexed, lookup_table) = match &first_info {
                 Some(info) => (
-                    image.samples_per_pixel > 1 || info.photometric == Photometric::Rgb,
-                    is_interleaved_rgb(info),
-                    info.photometric == Photometric::Palette,
+                    samples_per_pixel > 1 || info.photometric == Photometric::Rgb,
+                    if samples_per_pixel > 1 {
+                        false
+                    } else {
+                        is_interleaved_rgb(info)
+                    },
+                    info.photometric == Photometric::Palette && info.color_map.is_some(),
                     info.color_map
                         .as_ref()
                         .map(|(r, g, b)| crate::common::metadata::LookupTable {
@@ -688,7 +786,7 @@ impl TiffReader {
                         }),
                 ),
                 None => (
-                    image.samples_per_pixel > 1 || image.effective_c < image.size_c,
+                    samples_per_pixel > 1 || image.effective_c < reconciled_size_c,
                     false,
                     false,
                     None,
@@ -699,10 +797,10 @@ impl TiffReader {
                 size_x: image.size_x,
                 size_y: image.size_y,
                 size_z: image.size_z,
-                size_c: image.size_c,
+                size_c: reconciled_size_c,
                 size_t: image.size_t,
-                pixel_type: image.pixel_type,
-                bits_per_pixel: image.bits_per_pixel,
+                pixel_type,
+                bits_per_pixel,
                 image_count,
                 dimension_order: image.dimension_order,
                 is_rgb,
@@ -746,11 +844,7 @@ impl TiffReader {
             });
         }
 
-        if series.is_empty() {
-            None
-        } else {
-            Some(series)
-        }
+        Some(series)
     }
 
     /// Parse SubIFD chains for pyramid support.
@@ -1206,6 +1300,7 @@ impl TiffReader {
         if info.planar_config == 2 && info.samples_per_pixel > 1 {
             return self.read_planar_stripped_plane(info, x, y, w, h);
         }
+        let planarize_rgb = should_planarize_chunky_rgb(info, self.path.as_deref());
 
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         // JPEG-compressed YCbCr decodes to RGB inside the JPEG codec, so it takes
@@ -1338,7 +1433,15 @@ impl TiffReader {
                                 )
                             })?);
                         }
-                        return Ok(out);
+                        return finish_chunky_decoded_samples(
+                            out,
+                            w,
+                            h,
+                            channels as u32,
+                            1,
+                            planarize_rgb,
+                            "TIFF NDPI cropped band",
+                        );
                     }
                     // The band is a sub-rectangle [band_x0, band_x0+band_width) ×
                     // [band_y0, band_y0+band_height) that fully contains the
@@ -1379,7 +1482,9 @@ impl TiffReader {
         {
             let offset = info.strip_offsets[0];
             let byte_count = info.strip_byte_counts[0] as usize;
-            let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+            let mut compressed =
+                read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                    .unwrap_or_default();
             apply_fill_order(&mut compressed, info.fill_order, info.compression);
             let merged = match info.jpeg_tables.as_deref() {
                 Some(tables) => merge_jpeg_tables(tables, &compressed),
@@ -1445,7 +1550,15 @@ impl TiffReader {
                                 )
                             })?);
                         }
-                        return Ok(out);
+                        return finish_chunky_decoded_samples(
+                            out,
+                            w,
+                            h,
+                            channels as u32,
+                            1,
+                            planarize_rgb,
+                            "TIFF JPEG cropped band",
+                        );
                     }
                     // Crop [y, y_end) rows from the band, exactly like the generic
                     // path crops within a strip (band_y0 plays strip_start_row).
@@ -1520,8 +1633,6 @@ impl TiffReader {
                 byte_count = doubled.min(remaining);
             }
 
-            let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
-            apply_fill_order(&mut compressed, info.fill_order, info.compression);
             let strip_rows = strip_end_row - strip_start_row;
             let expected = if ycbcr {
                 checked_ycbcr_strip_bytes(info.width, strip_rows, info.ycbcr_subsampling)?
@@ -1529,24 +1640,32 @@ impl TiffReader {
                 checked_mul_usize(strip_rows as usize, row_bytes, "TIFF strip byte count")?
             };
 
-            let mut strip_data = decompress(
-                &compressed,
-                info.compression,
-                expected,
-                info.predictor,
-                effective_spp as u16,
-                info.bits_per_sample,
-                info.width,
-                strip_rows,
-                file.parser.little_endian,
-                info.jpeg_tables.as_deref(),
-                info.nikon_compression_options.as_ref(),
-                jpeg_color_for(info),
-            )?;
-            if info.compression != Compression::Nikon {
-                require_decompressed_len("strip", strip_idx, strip_data.len(), expected)?;
-            }
-            strip_data.truncate(expected);
+            let strip_data = if let Some(mut compressed) =
+                read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+            {
+                apply_fill_order(&mut compressed, info.fill_order, info.compression);
+                let mut decoded = decompress(
+                    &compressed,
+                    info.compression,
+                    expected,
+                    info.predictor,
+                    effective_spp as u16,
+                    info.bits_per_sample,
+                    info.width,
+                    strip_rows,
+                    file.parser.little_endian,
+                    info.jpeg_tables.as_deref(),
+                    info.nikon_compression_options.as_ref(),
+                    jpeg_color_for(info),
+                )?;
+                if info.compression != Compression::Nikon {
+                    require_decompressed_len("strip", strip_idx, decoded.len(), expected)?;
+                }
+                decoded.truncate(expected);
+                decoded
+            } else {
+                vec![0; expected]
+            };
 
             // Crop rows within this strip to the requested y range
             let row_start = y.saturating_sub(strip_start_row) as usize;
@@ -1562,6 +1681,7 @@ impl TiffReader {
                     strip_rows,
                     info.ycbcr_subsampling,
                     info.ycbcr_coefficients,
+                    info.ycbcr_reference_black_white,
                 )?;
                 let plane_len = checked_mul_usize(
                     info.width as usize,
@@ -1663,6 +1783,9 @@ impl TiffReader {
                 info.bits_per_sample,
                 file.parser.little_endian,
             );
+            if planarize_rgb {
+                out = planarize_chunky_samples(&out, w, h, effective_spp, 1, "TIFF RGB output")?;
+            }
             return Ok(out);
         }
 
@@ -1693,6 +1816,16 @@ impl TiffReader {
                 info.bits_per_sample,
                 file.parser.little_endian,
             );
+            if planarize_rgb {
+                out = planarize_chunky_samples(
+                    &out,
+                    w,
+                    h,
+                    effective_spp,
+                    bytes_per_sample,
+                    "TIFF RGB output",
+                )?;
+            }
             return Ok(out);
         }
 
@@ -1703,30 +1836,40 @@ impl TiffReader {
             file.parser.little_endian,
         );
 
-        // Crop columns
-        if x == 0 && w == info.width {
-            return Ok(plane_rows);
-        }
-
-        let x_start = checked_row_bytes(x, effective_spp, bytes_per_sample)?;
-        let x_len = checked_row_bytes(w, effective_spp, bytes_per_sample)?;
-        let full_row = row_bytes;
-        let out_len = checked_mul_usize(h as usize, x_len, "TIFF cropped output length")?;
-        let mut out = checked_vec_with_capacity(out_len, "TIFF cropped output")?;
-        for row in 0..h as usize {
-            let row_start = checked_mul_usize(row, full_row, "TIFF plane row offset")?;
-            let row_end = row_start
-                .checked_add(full_row)
-                .ok_or_else(|| BioFormatsError::Format("TIFF plane row range overflows".into()))?;
-            let src = plane_rows.get(row_start..row_end).ok_or_else(|| {
-                BioFormatsError::InvalidData(format!("TIFF decoded plane row {row} is missing"))
-            })?;
-            let x_end = x_start
-                .checked_add(x_len)
-                .ok_or_else(|| BioFormatsError::Format("TIFF crop x range overflows".into()))?;
-            out.extend_from_slice(src.get(x_start..x_end).ok_or_else(|| {
-                BioFormatsError::Format("TIFF crop range is outside decoded row".into())
-            })?);
+        let mut out = if x == 0 && w == info.width {
+            plane_rows
+        } else {
+            let x_start = checked_row_bytes(x, effective_spp, bytes_per_sample)?;
+            let x_len = checked_row_bytes(w, effective_spp, bytes_per_sample)?;
+            let full_row = row_bytes;
+            let out_len = checked_mul_usize(h as usize, x_len, "TIFF cropped output length")?;
+            let mut out = checked_vec_with_capacity(out_len, "TIFF cropped output")?;
+            for row in 0..h as usize {
+                let row_start = checked_mul_usize(row, full_row, "TIFF plane row offset")?;
+                let row_end = row_start.checked_add(full_row).ok_or_else(|| {
+                    BioFormatsError::Format("TIFF plane row range overflows".into())
+                })?;
+                let src = plane_rows.get(row_start..row_end).ok_or_else(|| {
+                    BioFormatsError::InvalidData(format!("TIFF decoded plane row {row} is missing"))
+                })?;
+                let x_end = x_start
+                    .checked_add(x_len)
+                    .ok_or_else(|| BioFormatsError::Format("TIFF crop x range overflows".into()))?;
+                out.extend_from_slice(src.get(x_start..x_end).ok_or_else(|| {
+                    BioFormatsError::Format("TIFF crop range is outside decoded row".into())
+                })?);
+            }
+            out
+        };
+        if planarize_rgb {
+            out = planarize_chunky_samples(
+                &out,
+                w,
+                h,
+                effective_spp,
+                bytes_per_sample,
+                "TIFF RGB output",
+            )?;
         }
         Ok(out)
     }
@@ -1742,14 +1885,16 @@ impl TiffReader {
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
         let subbyte = info.bits_per_sample < 8;
+        let packed_samples = info.bits_per_sample % 8 != 0;
         // For sub-byte planar samples, each channel's row is stored as packed bits
         // (one sample per pixel) padded to a byte boundary, matching Java's per-row
         // skipBits handling in TiffParser.unpackBytes.
-        let channel_row_bytes = if subbyte {
+        let channel_row_bytes = if packed_samples {
             checked_packed_row_bytes(info.width, 1, info.bits_per_sample)?
         } else {
             checked_row_bytes(info.width, 1, bytes_per_sample)?
         };
+        let unpacked_channel_row_bytes = (info.width * bytes_per_sample) as usize;
         let rows_per_strip = if info.rows_per_strip == 0 || info.rows_per_strip >= info.height {
             info.height
         } else {
@@ -1815,32 +1960,38 @@ impl TiffReader {
                         .unwrap_or(doubled);
                     byte_count = doubled.min(remaining);
                 }
-                let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
-                apply_fill_order(&mut compressed, info.fill_order, info.compression);
                 let strip_rows = strip_end_row - strip_start_row;
                 let expected = checked_mul_usize(
                     strip_rows as usize,
                     channel_row_bytes,
                     "TIFF strip byte count",
                 )?;
-                let mut strip_data = decompress(
-                    &compressed,
-                    info.compression,
-                    expected,
-                    info.predictor,
-                    1,
-                    info.bits_per_sample,
-                    info.width,
-                    strip_rows,
-                    file.parser.little_endian,
-                    info.jpeg_tables.as_deref(),
-                    info.nikon_compression_options.as_ref(),
-                    jpeg_color_for(info),
-                )?;
-                if info.compression != Compression::Nikon {
-                    require_decompressed_len("strip", strip_idx, strip_data.len(), expected)?;
-                }
-                strip_data.truncate(expected);
+                let strip_data = if let Some(mut compressed) =
+                    read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                {
+                    apply_fill_order(&mut compressed, info.fill_order, info.compression);
+                    let mut decoded = decompress(
+                        &compressed,
+                        info.compression,
+                        expected,
+                        info.predictor,
+                        1,
+                        info.bits_per_sample,
+                        info.width,
+                        strip_rows,
+                        file.parser.little_endian,
+                        info.jpeg_tables.as_deref(),
+                        info.nikon_compression_options.as_ref(),
+                        jpeg_color_for(info),
+                    )?;
+                    if info.compression != Compression::Nikon {
+                        require_decompressed_len("strip", strip_idx, decoded.len(), expected)?;
+                    }
+                    decoded.truncate(expected);
+                    decoded
+                } else {
+                    vec![0; expected]
+                };
 
                 let row_start = y.saturating_sub(strip_start_row) as usize;
                 let row_end = y_end.saturating_sub(strip_start_row).min(strip_rows) as usize;
@@ -1873,6 +2024,51 @@ impl TiffReader {
                 );
                 let cropped = crop_unpacked_rows(&unpacked, info.width, 1, x, w, h);
                 out.extend_from_slice(&cropped);
+                continue;
+            }
+
+            if packed_samples {
+                let mut unpacked = unpack_packed_samples(
+                    &channel_rows,
+                    info.width,
+                    h,
+                    1,
+                    info.bits_per_sample,
+                    file.parser.little_endian,
+                );
+                apply_photometric(
+                    &mut unpacked,
+                    info.photometric,
+                    info.bits_per_sample,
+                    file.parser.little_endian,
+                );
+                if x == 0 && w == info.width {
+                    out.extend_from_slice(&unpacked);
+                } else {
+                    let x_end = x_start.checked_add(x_len).ok_or_else(|| {
+                        BioFormatsError::Format("TIFF crop x range overflows".into())
+                    })?;
+                    for row in 0..h as usize {
+                        let row_start = checked_mul_usize(
+                            row,
+                            unpacked_channel_row_bytes,
+                            "TIFF channel row offset",
+                        )?;
+                        let row_end = row_start
+                            .checked_add(unpacked_channel_row_bytes)
+                            .ok_or_else(|| {
+                                BioFormatsError::Format("TIFF channel row range overflows".into())
+                            })?;
+                        let src = unpacked.get(row_start..row_end).ok_or_else(|| {
+                            BioFormatsError::InvalidData(format!(
+                                "TIFF decoded channel {channel} row {row} is missing"
+                            ))
+                        })?;
+                        out.extend_from_slice(src.get(x_start..x_end).ok_or_else(|| {
+                            BioFormatsError::Format("TIFF crop range is outside decoded row".into())
+                        })?);
+                    }
+                }
                 continue;
             }
 
@@ -1934,20 +2130,22 @@ impl TiffReader {
             }
             return self.read_tiled_ycbcr_plane(info, x, y, w, h);
         }
+        let planarize_rgb = should_planarize_chunky_rgb(info, self.path.as_deref());
 
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
         let effective_spp = info.samples_per_pixel as u32;
         let subbyte = info.bits_per_sample < 8;
+        let packed_samples = info.bits_per_sample % 8 != 0;
         let packed_tile_row_bytes =
             packed_row_bytes(info.tile_width, effective_spp, info.bits_per_sample);
         let unpacked_tile_row_bytes = (info.tile_width * effective_spp * bytes_per_sample) as usize;
-        let tile_row_bytes = if subbyte {
+        let raw_tile_row_bytes = if packed_samples {
             packed_tile_row_bytes
         } else {
             unpacked_tile_row_bytes
         };
-        let tile_data_bytes = tile_row_bytes * info.tile_height as usize;
+        let raw_tile_data_bytes = raw_tile_row_bytes * info.tile_height as usize;
         let tiles_across = (info.width + info.tile_width - 1) / info.tile_width;
 
         let tx_start = x / info.tile_width;
@@ -1966,24 +2164,30 @@ impl TiffReader {
                 }
                 let offset = info.tile_offsets[tile_idx];
                 let byte_count = info.tile_byte_counts[tile_idx] as usize;
-                let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
-                apply_fill_order(&mut compressed, info.fill_order, info.compression);
-                let mut tile_data = decompress(
-                    &compressed,
-                    info.compression,
-                    tile_data_bytes,
-                    info.predictor,
-                    effective_spp as u16,
-                    info.bits_per_sample,
-                    info.tile_width,
-                    info.tile_height,
-                    file.parser.little_endian,
-                    info.jpeg_tables.as_deref(),
-                    info.nikon_compression_options.as_ref(),
-                    jpeg_color_for(info),
-                )?;
-                require_decompressed_len("tile", tile_idx, tile_data.len(), tile_data_bytes)?;
-                tile_data.truncate(tile_data_bytes);
+                let mut tile_data = if let Some(mut compressed) =
+                    read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                {
+                    apply_fill_order(&mut compressed, info.fill_order, info.compression);
+                    let mut decoded = decompress(
+                        &compressed,
+                        info.compression,
+                        raw_tile_data_bytes,
+                        info.predictor,
+                        effective_spp as u16,
+                        info.bits_per_sample,
+                        info.tile_width,
+                        info.tile_height,
+                        file.parser.little_endian,
+                        info.jpeg_tables.as_deref(),
+                        info.nikon_compression_options.as_ref(),
+                        jpeg_color_for(info),
+                    )?;
+                    require_decompressed_len("tile", tile_idx, decoded.len(), raw_tile_data_bytes)?;
+                    decoded.truncate(raw_tile_data_bytes);
+                    decoded
+                } else {
+                    vec![0; raw_tile_data_bytes]
+                };
                 if subbyte {
                     tile_data = unpack_subbyte_samples(
                         &tile_data,
@@ -1991,6 +2195,15 @@ impl TiffReader {
                         info.tile_height,
                         effective_spp,
                         info.bits_per_sample,
+                    );
+                } else if packed_samples {
+                    tile_data = unpack_packed_samples(
+                        &tile_data,
+                        info.tile_width,
+                        info.tile_height,
+                        effective_spp,
+                        info.bits_per_sample,
+                        file.parser.little_endian,
                     );
                 }
                 apply_photometric(
@@ -2012,11 +2225,7 @@ impl TiffReader {
                 let copy_w = ((info.tile_width - src_x as u32).min(w - dst_x as u32)) as usize;
                 let copy_h = ((info.tile_height - src_y as u32).min(h - dst_y as u32)) as usize;
                 let copy_bytes = copy_w * effective_spp as usize * bytes_per_sample as usize;
-                let src_row_bytes = if subbyte {
-                    unpacked_tile_row_bytes
-                } else {
-                    tile_row_bytes
-                };
+                let src_row_bytes = unpacked_tile_row_bytes;
 
                 for row in 0..copy_h {
                     let src_off = ((src_y + row) * src_row_bytes)
@@ -2032,7 +2241,18 @@ impl TiffReader {
             }
         }
 
-        Ok(out)
+        if planarize_rgb {
+            planarize_chunky_samples(
+                &out,
+                w,
+                h,
+                effective_spp,
+                bytes_per_sample,
+                "TIFF RGB output",
+            )
+        } else {
+            Ok(out)
+        }
     }
 
     /// Read a tiled, subsampled YCbCr plane (chunky, 8-bit, non-JPEG), decoding
@@ -2071,7 +2291,11 @@ impl TiffReader {
                 }
                 let offset = info.tile_offsets[tile_idx];
                 let byte_count = info.tile_byte_counts[tile_idx] as usize;
-                let mut compressed = read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
+                let Some(mut compressed) =
+                    read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                else {
+                    continue;
+                };
                 apply_fill_order(&mut compressed, info.fill_order, info.compression);
                 let mut tile_data = decompress(
                     &compressed,
@@ -2097,6 +2321,7 @@ impl TiffReader {
                     info.tile_height,
                     info.ycbcr_subsampling,
                     info.ycbcr_coefficients,
+                    info.ycbcr_reference_black_white,
                 )?;
                 let tile_plane = (info.tile_width * info.tile_height) as usize;
                 let r_plane = &rgb[0..tile_plane];
@@ -2145,9 +2370,10 @@ impl TiffReader {
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
         let subbyte = info.bits_per_sample < 8;
+        let packed_samples = info.bits_per_sample % 8 != 0;
         // For sub-byte planar samples, each tile stores packed bits (one sample per
         // pixel) with byte-aligned rows; we unpack to one byte per sample below.
-        let tile_data_bytes = if subbyte {
+        let tile_data_bytes = if packed_samples {
             packed_row_bytes(info.tile_width, 1, info.bits_per_sample) * info.tile_height as usize
         } else {
             (info.tile_width * bytes_per_sample) as usize * info.tile_height as usize
@@ -2179,25 +2405,30 @@ impl TiffReader {
                     }
                     let offset = info.tile_offsets[tile_idx];
                     let byte_count = info.tile_byte_counts[tile_idx] as usize;
-                    let mut compressed =
-                        read_bytes_at(&mut file.parser.reader, offset, byte_count)?;
-                    apply_fill_order(&mut compressed, info.fill_order, info.compression);
-                    let mut tile_data = decompress(
-                        &compressed,
-                        info.compression,
-                        tile_data_bytes,
-                        info.predictor,
-                        1,
-                        info.bits_per_sample,
-                        info.tile_width,
-                        info.tile_height,
-                        file.parser.little_endian,
-                        info.jpeg_tables.as_deref(),
-                        info.nikon_compression_options.as_ref(),
-                        jpeg_color_for(info),
-                    )?;
-                    require_decompressed_len("tile", tile_idx, tile_data.len(), tile_data_bytes)?;
-                    tile_data.truncate(tile_data_bytes);
+                    let mut tile_data = if let Some(mut compressed) =
+                        read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                    {
+                        apply_fill_order(&mut compressed, info.fill_order, info.compression);
+                        let mut decoded = decompress(
+                            &compressed,
+                            info.compression,
+                            tile_data_bytes,
+                            info.predictor,
+                            1,
+                            info.bits_per_sample,
+                            info.tile_width,
+                            info.tile_height,
+                            file.parser.little_endian,
+                            info.jpeg_tables.as_deref(),
+                            info.nikon_compression_options.as_ref(),
+                            jpeg_color_for(info),
+                        )?;
+                        require_decompressed_len("tile", tile_idx, decoded.len(), tile_data_bytes)?;
+                        decoded.truncate(tile_data_bytes);
+                        decoded
+                    } else {
+                        vec![0; tile_data_bytes]
+                    };
                     if subbyte {
                         // Unpack the packed bits of this tile to one byte per sample.
                         tile_data = unpack_subbyte_samples(
@@ -2206,6 +2437,15 @@ impl TiffReader {
                             info.tile_height,
                             1,
                             info.bits_per_sample,
+                        );
+                    } else if packed_samples {
+                        tile_data = unpack_packed_samples(
+                            &tile_data,
+                            info.tile_width,
+                            info.tile_height,
+                            1,
+                            info.bits_per_sample,
+                            file.parser.little_endian,
                         );
                     }
                     apply_photometric(
@@ -2293,7 +2533,73 @@ impl TiffReader {
 }
 
 fn is_interleaved_rgb(info: &IfdInfo) -> bool {
-    info.planar_config == 1 && info.photometric != Photometric::YCbCr
+    info.samples_per_pixel <= 1
+}
+
+fn should_planarize_chunky_rgb(info: &IfdInfo, _path: Option<&Path>) -> bool {
+    if info.planar_config != 1 || info.samples_per_pixel <= 1 {
+        return false;
+    }
+    true
+}
+
+fn finish_chunky_decoded_samples(
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    samples_per_pixel: u32,
+    bytes_per_sample: u32,
+    planarize: bool,
+    context: &str,
+) -> Result<Vec<u8>> {
+    if planarize {
+        planarize_chunky_samples(
+            &data,
+            width,
+            height,
+            samples_per_pixel,
+            bytes_per_sample,
+            context,
+        )
+    } else {
+        Ok(data)
+    }
+}
+
+fn planarize_chunky_samples(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    samples_per_pixel: u32,
+    bytes_per_sample: u32,
+    context: &str,
+) -> Result<Vec<u8>> {
+    let pixels = checked_mul_usize(width as usize, height as usize, context)?;
+    let channels = samples_per_pixel as usize;
+    let bps = bytes_per_sample as usize;
+    if channels <= 1 || bps == 0 || pixels == 0 {
+        return Ok(data.to_vec());
+    }
+    let expected = pixels
+        .checked_mul(channels)
+        .and_then(|v| v.checked_mul(bps))
+        .ok_or_else(|| BioFormatsError::Format(format!("{context} length overflows")))?;
+    if data.len() != expected {
+        return Ok(data.to_vec());
+    }
+    let mut out = checked_vec_with_capacity(expected, context)?;
+    out.resize(expected, 0);
+    let plane = pixels
+        .checked_mul(bps)
+        .ok_or_else(|| BioFormatsError::Format(format!("{context} plane length overflows")))?;
+    for pixel in 0..pixels {
+        for channel in 0..channels {
+            let src = (pixel * channels + channel) * bps;
+            let dst = channel * plane + pixel * bps;
+            out[dst..dst + bps].copy_from_slice(&data[src..src + bps]);
+        }
+    }
+    Ok(out)
 }
 
 fn pixel_type_from_bps_format(
@@ -2360,6 +2666,55 @@ fn validate_region(info: &IfdInfo, x: u32, y: u32, w: u32, h: u32) -> Result<()>
     }
 
     Ok(())
+}
+
+fn synthesize_byte_counts(
+    width: u32,
+    height: u32,
+    samples_per_pixel: u16,
+    planar_config: u16,
+    bits_per_sample: u16,
+    block_count: usize,
+) -> Result<Vec<u64>> {
+    if block_count == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes_per_sample = u64::from(bits_per_sample).div_ceil(8).max(1);
+    let samples = if planar_config == 2 {
+        1u64
+    } else {
+        samples_per_pixel as u64
+    };
+    let image_size = (width as u64)
+        .checked_mul(height as u64)
+        .and_then(|v| v.checked_mul(bytes_per_sample))
+        .and_then(|v| v.checked_mul(samples))
+        .ok_or_else(|| BioFormatsError::Format("TIFF synthesized byte counts overflow".into()))?;
+    let count = image_size / block_count as u64;
+    Ok(vec![count; block_count])
+}
+
+fn read_tiff_block_or_zero<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    byte_count: usize,
+) -> Result<Option<Vec<u8>>> {
+    if byte_count == 0 {
+        return Ok(None);
+    }
+    let end = reader.seek(SeekFrom::End(0)).map_err(BioFormatsError::Io)?;
+    if offset >= end {
+        return Ok(None);
+    }
+    let available = end.saturating_sub(offset).min(byte_count as u64) as usize;
+    let mut buf = vec![0; byte_count];
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(BioFormatsError::Io)?;
+    reader
+        .read_exact(&mut buf[..available])
+        .map_err(BioFormatsError::Io)?;
+    Ok(Some(buf))
 }
 
 fn require_decompressed_len(
@@ -3015,7 +3370,10 @@ fn parse_comment_imagej(
         let value = eq.map(|i| &token[i + 1..]);
 
         if let Some(value) = token.strip_prefix("mode=") {
-            out.insert("Color mode".into(), MetadataValue::String(value.to_string()));
+            out.insert(
+                "Color mode".into(),
+                MetadataValue::String(value.to_string()),
+            );
         } else if let Some(value) = token.strip_prefix("unit=") {
             out.insert("Unit".into(), MetadataValue::String(value.to_string()));
         } else if let Some(value) = token.strip_prefix("finterval=") {
@@ -3061,6 +3419,36 @@ fn parse_comment_imagej(
     // initMetadataStore: description = comment with newlines replaced by "; ".
     let description = comment.replace('\n', "; ");
     out.insert("description".into(), MetadataValue::String(description));
+}
+
+fn apply_imagej_dimensions(comment: &str, meta: &mut ImageMetadata) {
+    let value = |key: &str| -> Option<u32> {
+        let prefix = format!("{key}=");
+        comment.split('\n').find_map(|token| {
+            token
+                .strip_prefix(&prefix)
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|&v| v > 0)
+        })
+    };
+
+    let declared_images = value("images").unwrap_or(meta.image_count);
+    if declared_images != meta.image_count {
+        return;
+    }
+
+    let z = value("slices").unwrap_or(1);
+    let logical_c = value("channels").unwrap_or(1);
+    let t = value("frames").unwrap_or(1);
+    if z.saturating_mul(logical_c).saturating_mul(t) != meta.image_count {
+        return;
+    }
+
+    let samples = if meta.is_rgb { meta.size_c.max(1) } else { 1 };
+    meta.size_z = z;
+    meta.size_c = logical_c.saturating_mul(samples);
+    meta.size_t = t;
+    meta.dimension_order = DimensionOrder::XYCZT;
 }
 
 /// True if `path` ends with the OME companion-metadata suffix `companion.ome`
@@ -3584,6 +3972,7 @@ fn decode_ycbcr_chunky(
     height: u32,
     subsampling: (u16, u16),
     coefficients: (f32, f32, f32),
+    reference_black_white: Option<[f32; 6]>,
 ) -> Result<Vec<u8>> {
     let hsub = subsampling.0.max(1) as u32;
     let vsub = subsampling.1.max(1) as u32;
@@ -3614,7 +4003,8 @@ fn decode_ycbcr_chunky(
                         continue;
                     }
                     let y_sample = y_values[(yy * hsub + xx) as usize] as f32;
-                    let (rr, gg, bb) = ycbcr_to_rgb(y_sample, cb, cr, coefficients);
+                    let (rr, gg, bb) =
+                        ycbcr_to_rgb(y_sample, cb, cr, coefficients, reference_black_white);
                     let idx = (y * width + x) as usize;
                     r[idx] = rr;
                     g[idx] = gg;
@@ -3631,10 +4021,19 @@ fn decode_ycbcr_chunky(
     Ok(out)
 }
 
-fn ycbcr_to_rgb(y: f32, cb: f32, cr: f32, coefficients: (f32, f32, f32)) -> (u8, u8, u8) {
+fn ycbcr_to_rgb(
+    y: f32,
+    cb: f32,
+    cr: f32,
+    coefficients: (f32, f32, f32),
+    reference_black_white: Option<[f32; 6]>,
+) -> (u8, u8, u8) {
     let (luma_red, luma_green, luma_blue) = coefficients;
-    let cr = cr - 128.0;
-    let cb = cb - 128.0;
+    let (y, cb, cr) = if let Some(rbw) = reference_black_white {
+        (y - rbw[0], cb - rbw[2], cr - rbw[4])
+    } else {
+        (y, cb - 128.0, cr - 128.0)
+    };
     let red = y + cr * (2.0 - 2.0 * luma_red);
     let blue = y + cb * (2.0 - 2.0 * luma_blue);
     let green = (y - luma_blue * blue - luma_red * red) / luma_green;
@@ -4260,6 +4659,106 @@ mod tests {
         push_u32_le(data, value_offset);
     }
 
+    fn push_ifd_ascii(data: &mut Vec<u8>, tag: u16, count: u32, value_offset: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 2); // ASCII
+        push_u32_le(data, count);
+        push_u32_le(data, value_offset);
+    }
+
+    fn push_ifd_short_array(data: &mut Vec<u8>, tag: u16, count: u32, value_offset: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 3); // SHORT
+        push_u32_le(data, count);
+        push_u32_le(data, value_offset);
+    }
+
+    struct TinyIfdSpec<'a> {
+        width: u32,
+        height: u32,
+        bits_per_sample: u16,
+        samples_per_pixel: u16,
+        photometric: u16,
+        new_subfile_type: Option<u32>,
+        description: Option<&'a str>,
+        color_map: Option<Vec<u16>>,
+        pixels: Vec<u8>,
+    }
+
+    fn synthetic_tiff_chain(specs: &[TinyIfdSpec<'_>]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+
+        for (i, spec) in specs.iter().enumerate() {
+            let entry_count = 10u16
+                + u16::from(spec.new_subfile_type.is_some())
+                + u16::from(spec.description.is_some())
+                + u16::from(spec.color_map.is_some());
+            let ifd_start = data.len() as u32;
+            let after_ifd = ifd_start + 2 + u32::from(entry_count) * 12 + 4;
+            let desc_len = spec.description.map(|s| s.len() as u32 + 1).unwrap_or(0);
+            let desc_offset = after_ifd;
+            let color_map_offset = desc_offset + desc_len;
+            let color_map_len = spec
+                .color_map
+                .as_ref()
+                .map(|v| v.len() as u32 * 2)
+                .unwrap_or(0);
+            let pixel_offset = color_map_offset + color_map_len;
+            let next_ifd = if i + 1 == specs.len() {
+                0
+            } else {
+                pixel_offset + spec.pixels.len() as u32
+            };
+
+            push_u16_le(&mut data, entry_count);
+            if let Some(v) = spec.new_subfile_type {
+                push_ifd_long(&mut data, tag::NEW_SUBFILE_TYPE, v);
+            }
+            push_ifd_long(&mut data, tag::IMAGE_WIDTH, spec.width);
+            push_ifd_long(&mut data, tag::IMAGE_LENGTH, spec.height);
+            push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, spec.bits_per_sample);
+            push_ifd_short(&mut data, tag::COMPRESSION, 1);
+            push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, spec.photometric);
+            push_ifd_long(&mut data, tag::STRIP_OFFSETS, pixel_offset);
+            push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, spec.samples_per_pixel);
+            push_ifd_long(&mut data, tag::ROWS_PER_STRIP, spec.height);
+            push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, spec.pixels.len() as u32);
+            push_ifd_short(&mut data, tag::PLANAR_CONFIGURATION, 1);
+            if let Some(desc) = spec.description {
+                push_ifd_ascii(
+                    &mut data,
+                    tag::IMAGE_DESCRIPTION,
+                    desc.len() as u32 + 1,
+                    desc_offset,
+                );
+            }
+            if let Some(color_map) = &spec.color_map {
+                push_ifd_short_array(
+                    &mut data,
+                    tag::COLOR_MAP,
+                    color_map.len() as u32,
+                    color_map_offset,
+                );
+            }
+            push_u32_le(&mut data, next_ifd);
+            if let Some(desc) = spec.description {
+                data.extend_from_slice(desc.as_bytes());
+                data.push(0);
+            }
+            if let Some(color_map) = &spec.color_map {
+                for &value in color_map {
+                    push_u16_le(&mut data, value);
+                }
+            }
+            data.extend_from_slice(&spec.pixels);
+        }
+
+        data
+    }
+
     /// Build a Canon-style EXIF maker-note blob carrying a rational
     /// `WHITE_BALANCE_RGB_COEFFS` (tag 16385) with the given r/g/b values.
     ///
@@ -4399,6 +4898,494 @@ mod tests {
         let wb = reader.dng_white_balance();
         let _ = fs::remove_file(&path);
         assert!(wb.is_none());
+    }
+
+    fn synthetic_chunky_rgb_tiff() -> Vec<u8> {
+        let entry_count = 10u16;
+        let data_offset = 8 + 2 + entry_count as u32 * 12 + 4;
+        let pixels = [1u8, 10, 100, 2, 20, 110];
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+        push_u16_le(&mut data, entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, 2);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 1);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, tag::COMPRESSION, 1);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 2);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, data_offset);
+        push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 3);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 1);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+        push_ifd_short(&mut data, tag::PLANAR_CONFIGURATION, 1);
+        push_u32_le(&mut data, 0);
+        data.extend_from_slice(&pixels);
+        data
+    }
+
+    fn synthetic_chunky_multisample_gray_tiff(description: Option<&str>) -> Vec<u8> {
+        let entry_count = if description.is_some() { 11u16 } else { 10u16 };
+        let after_ifd = 8 + 2 + entry_count as u32 * 12 + 4;
+        let desc_offset = after_ifd;
+        let desc_len = description.map(|s| s.len() as u32 + 1).unwrap_or(0);
+        let data_offset = desc_offset + desc_len;
+        let pixels = [1u8, 10, 100, 2, 20, 110];
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+        push_u16_le(&mut data, entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, 2);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 1);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, tag::COMPRESSION, 1);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 1);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, data_offset);
+        push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 3);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 1);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+        push_ifd_short(&mut data, tag::PLANAR_CONFIGURATION, 1);
+        if let Some(desc) = description {
+            push_ifd_ascii(
+                &mut data,
+                tag::IMAGE_DESCRIPTION,
+                desc.len() as u32 + 1,
+                desc_offset,
+            );
+        }
+        push_u32_le(&mut data, 0);
+        if let Some(desc) = description {
+            data.extend_from_slice(desc.as_bytes());
+            data.push(0);
+        }
+        data.extend_from_slice(&pixels);
+        data
+    }
+
+    #[test]
+    fn generic_chunky_rgb_tiff_returns_planar_channel_blocks() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-chunky-rgb-planar-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_chunky_rgb_tiff()).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        assert!(reader.metadata().is_rgb);
+        assert!(!reader.metadata().is_interleaved);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 10, 20, 100, 110]);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+            vec![2, 20, 110]
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn generic_multisample_non_rgb_tiff_is_rgb_style_planar() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-multisample-gray-planar-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_chunky_multisample_gray_tiff(None)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_c, 3);
+        assert!(meta.is_rgb);
+        assert!(!meta.is_interleaved);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 10, 20, 100, 110]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plain_multipage_tiff_maps_pages_to_t_axis() {
+        let specs = vec![
+            TinyIfdSpec {
+                width: 1,
+                height: 1,
+                bits_per_sample: 8,
+                samples_per_pixel: 1,
+                photometric: 1,
+                new_subfile_type: None,
+                description: None,
+                color_map: None,
+                pixels: vec![1],
+            },
+            TinyIfdSpec {
+                width: 1,
+                height: 1,
+                bits_per_sample: 8,
+                samples_per_pixel: 1,
+                photometric: 1,
+                new_subfile_type: None,
+                description: None,
+                color_map: None,
+                pixels: vec![2],
+            },
+            TinyIfdSpec {
+                width: 1,
+                height: 1,
+                bits_per_sample: 8,
+                samples_per_pixel: 1,
+                photometric: 1,
+                new_subfile_type: None,
+                description: None,
+                color_map: None,
+                pixels: vec![3],
+            },
+        ];
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-plain-t-axis-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_tiff_chain(&specs)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(meta.image_count, 3);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 3);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+        assert_eq!(reader.open_bytes(2).unwrap(), vec![3]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn imagej_comment_reshapes_axes_when_product_matches_ifd_count() {
+        let comment = "ImageJ=1.53c\nimages=6\nchannels=3\nslices=2\nframes=1";
+        let specs: Vec<_> = (0..6)
+            .map(|i| TinyIfdSpec {
+                width: 1,
+                height: 1,
+                bits_per_sample: 8,
+                samples_per_pixel: 1,
+                photometric: 1,
+                new_subfile_type: None,
+                description: if i == 0 { Some(comment) } else { None },
+                color_map: None,
+                pixels: vec![i as u8],
+            })
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-imagej-reshape-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_tiff_chain(&specs)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.image_count, 6);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reduced_new_subfile_type_ifds_are_thumbnail_series() {
+        let specs = vec![
+            TinyIfdSpec {
+                width: 1,
+                height: 1,
+                bits_per_sample: 8,
+                samples_per_pixel: 1,
+                photometric: 1,
+                new_subfile_type: None,
+                description: None,
+                color_map: None,
+                pixels: vec![7],
+            },
+            TinyIfdSpec {
+                width: 1,
+                height: 1,
+                bits_per_sample: 8,
+                samples_per_pixel: 1,
+                photometric: 1,
+                new_subfile_type: Some(1),
+                description: None,
+                color_map: None,
+                pixels: vec![9],
+            },
+        ];
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-reduced-thumbnail-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_tiff_chain(&specs)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert!(!reader.metadata().thumbnail);
+        reader.set_series(1).unwrap();
+        assert!(reader.metadata().thumbnail);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ome_multisample_non_rgb_tiff_is_rgb_style_planar_metadata() {
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="1" SizeZ="1" SizeC="3" SizeT="1"><Channel ID="Channel:0:0" SamplesPerPixel="3"/><TiffData IFD="0" PlaneCount="1"/></Pixels></Image></OME>"#;
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-ome-multisample-gray-planar-{}.ome.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_chunky_multisample_gray_tiff(Some(xml))).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.image_count, 1);
+        assert!(meta.is_rgb);
+        assert!(!meta.is_interleaved);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 10, 20, 100, 110]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ome_tiff_does_not_multiply_size_c_when_samples_are_multiple_of_channels() {
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="1" SizeY="1" SizeZ="1" SizeC="2" SizeT="1"><Channel ID="Channel:0:0" SamplesPerPixel="4"/><TiffData IFD="0" FirstC="0" PlaneCount="1"/><TiffData IFD="1" FirstC="1" PlaneCount="1"/></Pixels></Image></OME>"#;
+        let specs = vec![
+            TinyIfdSpec {
+                width: 1,
+                height: 1,
+                bits_per_sample: 8,
+                samples_per_pixel: 4,
+                photometric: 1,
+                new_subfile_type: None,
+                description: Some(xml),
+                color_map: None,
+                pixels: vec![1, 2, 3, 4],
+            },
+            TinyIfdSpec {
+                width: 1,
+                height: 1,
+                bits_per_sample: 8,
+                samples_per_pixel: 4,
+                photometric: 1,
+                new_subfile_type: None,
+                description: None,
+                color_map: None,
+                pixels: vec![5, 6, 7, 8],
+            },
+        ];
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-ome-sizec-no-overexpand-{}.ome.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_tiff_chain(&specs)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_c, 2);
+        assert_eq!(meta.image_count, 2);
+        assert!(meta.is_rgb);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ome_tiff_reconciles_size_c_with_ifd_samples_per_pixel() {
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="1" SizeZ="1" SizeC="1" SizeT="1"><Channel ID="Channel:0:0" SamplesPerPixel="1"/><TiffData IFD="0" PlaneCount="1"/></Pixels></Image></OME>"#;
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-ome-reconcile-sizec-{}.ome.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_chunky_multisample_gray_tiff(Some(xml))).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.image_count, 1);
+        assert_eq!(meta.size_c, 3);
+        assert!(meta.is_rgb);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ome_tiff_pixel_type_falls_back_to_ifd_on_xml_mismatch() {
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="1" SizeY="1" SizeZ="1" SizeC="1" SizeT="1"><Channel ID="Channel:0:0" SamplesPerPixel="1"/><TiffData IFD="0" PlaneCount="1"/></Pixels></Image></OME>"#;
+        let specs = vec![TinyIfdSpec {
+            width: 1,
+            height: 1,
+            bits_per_sample: 16,
+            samples_per_pixel: 1,
+            photometric: 1,
+            new_subfile_type: None,
+            description: Some(xml),
+            color_map: None,
+            pixels: vec![0x34, 0x12],
+        }];
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-ome-pixel-type-ifd-{}.ome.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_tiff_chain(&specs)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert_eq!(meta.bits_per_pixel, 16);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x34, 0x12]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ome_tiff_zero_plane_count_does_not_fallback_to_sequential_ifds() {
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="1" SizeY="1" SizeZ="1" SizeC="1" SizeT="1"><Channel ID="Channel:0:0" SamplesPerPixel="1"/><TiffData IFD="0" PlaneCount="0"/></Pixels></Image></OME>"#;
+        let specs = vec![TinyIfdSpec {
+            width: 1,
+            height: 1,
+            bits_per_sample: 8,
+            samples_per_pixel: 1,
+            photometric: 1,
+            new_subfile_type: None,
+            description: Some(xml),
+            color_map: None,
+            pixels: vec![42],
+        }];
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-ome-zero-planecount-{}.ome.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_tiff_chain(&specs)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 0);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn palette_photometric_is_indexed_only_when_color_map_exists() {
+        let no_map = vec![TinyIfdSpec {
+            width: 1,
+            height: 1,
+            bits_per_sample: 8,
+            samples_per_pixel: 1,
+            photometric: 3,
+            new_subfile_type: None,
+            description: None,
+            color_map: None,
+            pixels: vec![0],
+        }];
+        let with_map = vec![TinyIfdSpec {
+            width: 1,
+            height: 1,
+            bits_per_sample: 8,
+            samples_per_pixel: 1,
+            photometric: 3,
+            new_subfile_type: None,
+            description: None,
+            color_map: Some(vec![0, 65535, 0, 65535, 0, 65535]),
+            pixels: vec![1],
+        }];
+        let no_map_path = std::env::temp_dir().join(format!(
+            "bioformats-rs-palette-no-map-{}.tif",
+            std::process::id()
+        ));
+        let with_map_path = std::env::temp_dir().join(format!(
+            "bioformats-rs-palette-with-map-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&no_map_path, synthetic_tiff_chain(&no_map)).unwrap();
+        fs::write(&with_map_path, synthetic_tiff_chain(&with_map)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&no_map_path).unwrap();
+        assert!(!reader.metadata().is_indexed);
+        assert!(reader.metadata().lookup_table.is_none());
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&with_map_path).unwrap();
+        assert!(reader.metadata().is_indexed);
+        assert!(reader.metadata().lookup_table.is_some());
+
+        let _ = fs::remove_file(&no_map_path);
+        let _ = fs::remove_file(&with_map_path);
+    }
+
+    #[test]
+    fn restart_window_cropped_band_finish_planarizes_samples() {
+        let chunky = vec![1u8, 10, 100, 2, 20, 110];
+        assert_eq!(
+            finish_chunky_decoded_samples(chunky.clone(), 2, 1, 3, 1, true, "test").unwrap(),
+            vec![1, 2, 10, 20, 100, 110]
+        );
+        assert_eq!(
+            finish_chunky_decoded_samples(chunky.clone(), 2, 1, 3, 1, false, "test").unwrap(),
+            chunky
+        );
+    }
+
+    fn synthetic_ycbcr_reference_black_white_tiff() -> Vec<u8> {
+        let entry_count = 12u16;
+        let rbw_offset = 8 + 2 + entry_count as u32 * 12 + 4;
+        let data_offset = rbw_offset + 6 * 8;
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+        push_u16_le(&mut data, entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, 1);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 1);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, tag::COMPRESSION, 1);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 6);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, data_offset);
+        push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 3);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 1);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, 3);
+        push_ifd_short(&mut data, tag::PLANAR_CONFIGURATION, 1);
+        push_u16_le(&mut data, tag::YCBCR_SUBSAMPLING);
+        push_u16_le(&mut data, 3);
+        push_u32_le(&mut data, 2);
+        push_u16_le(&mut data, 1);
+        push_u16_le(&mut data, 1);
+        push_ifd_rational(&mut data, tag::REFERENCE_BLACK_WHITE, 6, rbw_offset);
+        push_u32_le(&mut data, 0);
+        for (n, d) in [(16, 1), (235, 1), (128, 1), (240, 1), (128, 1), (240, 1)] {
+            push_u32_le(&mut data, n);
+            push_u32_le(&mut data, d);
+        }
+        data.extend_from_slice(&[235, 128, 128]);
+        data
+    }
+
+    #[test]
+    fn non_jpeg_ycbcr_reference_black_white_subtracts_black_refs_only() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-ycbcr-rbw-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_ycbcr_reference_black_white_tiff()).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![219, 219, 219]);
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

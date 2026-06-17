@@ -145,10 +145,7 @@ mod tests {
         // Mirrors ImarisHDFReader.parseAttributes()'s DELIMITERS loop: for each
         // of {" ", "-", "."} in turn, keep the substring after its first match.
         assert_eq!(strip_imaris_channel_value_delimiters("Gain 7"), "7");
-        assert_eq!(
-            strip_imaris_channel_value_delimiters("Channel-1.5"),
-            "5"
-        );
+        assert_eq!(strip_imaris_channel_value_delimiters("Channel-1.5"), "5");
         assert_eq!(strip_imaris_channel_value_delimiters("488"), "488");
     }
 
@@ -757,37 +754,17 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         let dtype = ds.dtype().map_err(|e| {
             BioFormatsError::Format(format!("Imaris: cannot read dtype for {data_path}: {e}"))
         })?;
-        // Java ImarisHDFReader.java:336-337 maps the sample array type to the
-        // pixel type, including FLOAT and DOUBLE. Distinguish float/double from
-        // the integer types of the same element size by inspecting the dtype
-        // class and element size.
+        // Java ImarisHDFReader.java:333-337 maps byte/short/int sample arrays
+        // to UINT8/UINT16/UINT32; it does not preserve HDF5 signedness here.
+        // Floating-point arrays remain FLOAT/DOUBLE.
         let class = dtype.class();
         let size = dtype.size();
-        let signed = dtype.is_signed().unwrap_or(false);
         match (class, size) {
             (DatatypeClass::FloatingPoint, 4) => (PixelType::Float32, 4usize),
             (DatatypeClass::FloatingPoint, 8) => (PixelType::Float64, 8usize),
-            (DatatypeClass::FixedPoint, 1) => {
-                if signed {
-                    (PixelType::Int8, 1usize)
-                } else {
-                    (PixelType::Uint8, 1usize)
-                }
-            }
-            (DatatypeClass::FixedPoint, 2) => {
-                if signed {
-                    (PixelType::Int16, 2usize)
-                } else {
-                    (PixelType::Uint16, 2usize)
-                }
-            }
-            (DatatypeClass::FixedPoint, 4) => {
-                if signed {
-                    (PixelType::Int32, 4usize)
-                } else {
-                    (PixelType::Uint32, 4usize)
-                }
-            }
+            (DatatypeClass::FixedPoint, 1) => (PixelType::Uint8, 1usize),
+            (DatatypeClass::FixedPoint, 2) => (PixelType::Uint16, 2usize),
+            (DatatypeClass::FixedPoint, 4) => (PixelType::Uint32, 4usize),
             _ => {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "Imaris: unsupported dtype (class {class:?}, size {size}) for {data_path}"

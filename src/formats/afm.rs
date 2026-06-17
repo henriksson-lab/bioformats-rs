@@ -337,7 +337,10 @@ fn parse_topometrix(path: &Path) -> Result<TopoMetrixHeader> {
         let scan_angle = read_le_double(&content, &mut pos)?;
 
         metadata_block.push(("Sample volts".into(), MetadataValue::Float(sample_volts)));
-        metadata_block.push(("Tunnel current".into(), MetadataValue::Float(tunnel_current)));
+        metadata_block.push((
+            "Tunnel current".into(),
+            MetadataValue::Float(tunnel_current),
+        ));
         metadata_block.push(("Scan rate".into(), MetadataValue::Float(time_per_pixel)));
         metadata_block.push(("Scan angle".into(), MetadataValue::Float(scan_angle)));
     } else {
@@ -360,7 +363,10 @@ fn parse_topometrix(path: &Path) -> Result<TopoMetrixHeader> {
         MetadataValue::Float(dac_to_world_zero),
     ));
     metadata_block.push(("Comment".into(), MetadataValue::String(comment.clone())));
-    metadata_block.push(("Acquisition date".into(), MetadataValue::String(date.clone())));
+    metadata_block.push((
+        "Acquisition date".into(),
+        MetadataValue::String(date.clone()),
+    ));
 
     // Physical sizes: xSize/sizeX and ySize/sizeY in micrometres (Java L192-201),
     // filtered through FormatTools.getPhysicalSize (rejects value == 0).
@@ -975,9 +981,10 @@ mod tests {
 
         // Metadata table fields ported from Java's addGlobalMeta calls.
         // MetadataValue has no PartialEq, so match the variant payload directly.
-        assert!(
-            matches!(meta.series_metadata.get("Version"), Some(MetadataValue::Int(1)))
-        );
+        assert!(matches!(
+            meta.series_metadata.get("Version"),
+            Some(MetadataValue::Int(1))
+        ));
         assert!(
             matches!(meta.series_metadata.get("X size (in um)"), Some(MetadataValue::Float(v)) if *v == 10.0)
         );
