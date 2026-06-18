@@ -46,8 +46,10 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
         ));
     }
 
-    // skipBytes(4); order(true); dependency = readInt() [big-endian].
-    let dependency = read_i32(data, 4, false);
+    // Java does `skipBytes(4); order(true); dependency = readInt()`: the
+    // dependency word itself is always read little-endian, and then selects the
+    // byte order for the remaining header fields.
+    let dependency = read_i32(data, 4, true);
 
     // Comment block: readString(512) at pos 8..520.
     let comment = String::from_utf8_lossy(&data[8..520])

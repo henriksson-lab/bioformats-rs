@@ -303,34 +303,42 @@ fn parse_timepoints(xml: &str) -> (u32, u32, u32, bool) {
     let mut last = 0u32;
     let mut increment = 1u32;
 
+    let Some(tp_open) = xml.find("<Timepoints") else {
+        return (first, last, increment, false);
+    };
+    let Some(gt_rel) = xml[tp_open..].find('>') else {
+        return (first, last, increment, false);
+    };
+    let tag = &xml[tp_open..tp_open + gt_rel];
+    let body_start = tp_open + gt_rel + 1;
+    let Some(close_rel) = xml[body_start..].find("</Timepoints>") else {
+        return (first, last, increment, false);
+    };
+    let body = &xml[body_start..body_start + close_rel];
+
     // Determine whether the <Timepoints type="..."> is a pattern.
     let mut use_pattern = false;
-    if let Some(tp_open) = xml.find("<Timepoints") {
-        if let Some(gt) = xml[tp_open..].find('>') {
-            let tag = &xml[tp_open..tp_open + gt];
-            if let Some(tidx) = tag.find("type=") {
-                let rest = &tag[tidx + 5..];
-                let quote = rest.chars().next();
-                if matches!(quote, Some('"') | Some('\'')) {
-                    let q = quote.unwrap();
-                    if let Some(end) = rest[1..].find(q) {
-                        let val = &rest[1..1 + end];
-                        use_pattern = val.eq_ignore_ascii_case("pattern");
-                    }
-                }
+    if let Some(tidx) = tag.find("type=") {
+        let rest = &tag[tidx + 5..];
+        let quote = rest.chars().next();
+        if matches!(quote, Some('"') | Some('\'')) {
+            let q = quote.unwrap();
+            if let Some(end) = rest[1..].find(q) {
+                let val = &rest[1..1 + end];
+                use_pattern = val.eq_ignore_ascii_case("pattern");
             }
         }
     }
 
     if use_pattern {
-        if let Some(pat) = inner_text(xml, "integerpattern") {
+        if let Some(pat) = inner_text(body, "integerpattern") {
             parse_integer_string(pat.trim(), &mut first, &mut last, &mut increment);
         }
     }
-    if let Some(f) = inner_text(xml, "first").and_then(|s| s.trim().parse::<u32>().ok()) {
+    if let Some(f) = inner_text(body, "first").and_then(|s| s.trim().parse::<u32>().ok()) {
         first = f;
     }
-    if let Some(l) = inner_text(xml, "last").and_then(|s| s.trim().parse::<u32>().ok()) {
+    if let Some(l) = inner_text(body, "last").and_then(|s| s.trim().parse::<u32>().ok()) {
         last = l;
     }
 
@@ -896,7 +904,10 @@ impl BdvReader {
                     is_interleaved: false,
                     is_indexed: true,
                     is_little_endian: true,
-                    resolution_count: levels.len().max(1) as u32,
+                    // This reader exposes each BDV mipmap level as its own
+                    // flattened series, matching Java's core view here; each
+                    // visible series therefore has a single active resolution.
+                    resolution_count: 1,
                     thumbnail: false,
                     series_metadata: meta_map,
                     lookup_table: None,
@@ -1215,6 +1226,26 @@ mod tests {
     }
 
     #[test]
+    fn bdv_timepoint_range_ignores_first_last_outside_timepoints() {
+        let xml = r#"<SpimData>
+          <ViewRegistration><first>99</first><last>101</last></ViewRegistration>
+          <Timepoints type="range"><first>3</first><last>7</last></Timepoints>
+        </SpimData>"#;
+        let (first, last, inc, pat) = parse_timepoints(xml);
+        assert_eq!((first, last, inc, pat), (3, 7, 1, false));
+    }
+
+    #[test]
+    fn bdv_timepoint_pattern_ignores_first_last_outside_timepoints() {
+        let xml = r#"<SpimData>
+          <ViewRegistration><first>99</first><last>101</last></ViewRegistration>
+          <Timepoints type="pattern"><integerpattern>0-10:2</integerpattern></Timepoints>
+        </SpimData>"#;
+        let (first, last, inc, pat) = parse_timepoints(xml);
+        assert_eq!((first, last, inc, pat), (0, 10, 2, true));
+    }
+
+    #[test]
     fn bdv_channels_collapse_into_size_c() {
         let xml = r#"<SpimData>
           <ViewSetup><id>0</id><attributes><channel>0</channel></attributes></ViewSetup>
@@ -1299,6 +1330,7 @@ mod tests {
         assert_eq!(r.series_count(), 34);
         assert_eq!(r.metadata().size_t, 1);
         assert_eq!(r.metadata().size_c, 1);
+        assert_eq!(r.metadata().resolution_count, 1);
         assert_eq!(r.metadata().image_count, r.metadata().size_z);
     }
 }

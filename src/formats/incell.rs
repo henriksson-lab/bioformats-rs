@@ -556,6 +556,9 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
     m.channels_per_timepoint = channels_per_timepoint;
     // Java initFile: totalChannels = getSizeC().
     m.total_channels = m.size_c.max(1);
+    if m.total_images == 0 {
+        synthesize_incell_image_files(&mut m, &dir);
+    }
 
     Ok(m)
 }
@@ -583,6 +586,83 @@ fn allocate_image_files(m: &mut InCellMeta, channels_per_timepoint: &[u32]) {
                 .collect()
         })
         .collect();
+}
+
+fn incell_well_row_name(mut row: usize) -> String {
+    let mut chars = Vec::new();
+    loop {
+        chars.push((b'A' + (row % 26) as u8) as char);
+        row /= 26;
+        if row == 0 {
+            break;
+        }
+        row -= 1;
+    }
+    chars.iter().rev().collect()
+}
+
+fn synthesize_incell_image_files(m: &mut InCellMeta, dir: &Path) {
+    if m.image_files.is_empty() {
+        let cpt = m.channels_per_timepoint.clone();
+        allocate_image_files(m, &cpt);
+    }
+
+    let size_z = m.size_z.max(1);
+    let size_c = m.size_c.max(1);
+    let size_t = m.size_t.max(1);
+    for row in 0..m.well_rows.max(1) {
+        for col in 0..m.well_cols.max(1) {
+            if row < m.plate_map.len() && col < m.plate_map[row].len() {
+                // Java's totalImages == 0 fallback assumes the whole declared
+                // plate is populated, then lets missing files remain blank.
+                m.plate_map[row][col] = true;
+            }
+            let well = row * m.well_cols.max(1) + col;
+            for field in 0..m.field_count.max(1) {
+                for t in 0..size_t {
+                    let channels = m
+                        .channels_per_timepoint
+                        .get(t as usize)
+                        .copied()
+                        .unwrap_or(size_c)
+                        .min(size_c);
+                    for c in 0..channels {
+                        let Some(ex) = m.ex_filters.get(c as usize) else {
+                            continue;
+                        };
+                        let Some(em) = m.em_filters.get(c as usize) else {
+                            continue;
+                        };
+                        let filename = format!(
+                            "{} - {}(fld {} wv {} - {}).tif",
+                            incell_well_row_name(row),
+                            col + 1,
+                            field + 1,
+                            ex,
+                            em
+                        );
+                        let path = dir.join(filename);
+                        let plane = ImagePlane {
+                            filename: path.exists().then_some(path),
+                            is_tiff: true,
+                        };
+                        for z in 0..size_z {
+                            let index = (z + c * size_z) as usize;
+                            if let Some(slot) = m
+                                .image_files
+                                .get_mut(well)
+                                .and_then(|w| w.get_mut(field))
+                                .and_then(|f| f.get_mut(t as usize))
+                                .and_then(|tp| tp.get_mut(index))
+                            {
+                                *slot = Some(plane.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn iter_image_planes(m: &InCellMeta) -> impl Iterator<Item = &ImagePlane> {
@@ -975,11 +1055,6 @@ impl FormatReader for InCellReader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let m = parse_incell_xml(path)?;
-        if m.total_images == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "InCell XML/XDCE does not reference any companion TIFF image files".into(),
-            ));
-        }
         validate_incell_companions(&m)?;
         self.build(m)?;
         if self.series.is_empty() {

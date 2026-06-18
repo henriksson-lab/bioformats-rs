@@ -1574,15 +1574,22 @@ impl FormatReader for ImaconReader {
 // ---------------------------------------------------------------------------
 /// Santa Barbara Instrument Group reader (`.fts`).
 ///
-/// SBIG .fts files use the FITS format; this reader delegates to `FitsReader`.
+/// SBIG camera format (`ST-7 Compressed Image` header).
 pub struct SbigReader {
-    inner: crate::formats::fits::FitsReader,
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    compressed: bool,
 }
 
 impl SbigReader {
+    const HEADER_SIZE: u64 = 2048;
+    const MAGIC: &'static str = "ST-7 Compressed Image";
+
     pub fn new() -> Self {
         SbigReader {
-            inner: crate::formats::fits::FitsReader::new(),
+            path: None,
+            meta: None,
+            compressed: false,
         }
     }
 }
@@ -1594,53 +1601,205 @@ impl Default for SbigReader {
 }
 
 impl FormatReader for SbigReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("fts"))
-    }
-
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
         false
     }
 
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        let n = header.len().min(32);
+        std::str::from_utf8(&header[..n])
+            .map(|s| s.contains(Self::MAGIC))
+            .unwrap_or(false)
+    }
+
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path)
+        self.close()?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if file_len < Self::HEADER_SIZE {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "SBIG file is too short".into(),
+            ));
+        }
+        let mut header = vec![0u8; Self::HEADER_SIZE as usize];
+        f.read_exact(&mut header).map_err(BioFormatsError::Io)?;
+        if !self.is_this_type_by_bytes(&header) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "SBIG header magic not found".into(),
+            ));
+        }
+
+        let text = String::from_utf8_lossy(&header);
+        let mut size_x = None;
+        let mut size_y = None;
+        let mut compressed = false;
+        let mut series_metadata = HashMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line == "End" {
+                break;
+            }
+            if line.contains("Compressed") {
+                compressed = true;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = value.trim();
+                series_metadata.insert(key.to_string(), MetadataValue::String(value.to_string()));
+                match key {
+                    "Width" => size_x = value.parse::<u32>().ok(),
+                    "Height" => size_y = value.parse::<u32>().ok(),
+                    _ => {}
+                }
+            }
+        }
+
+        let size_x = size_x
+            .filter(|&v| v > 0)
+            .ok_or_else(|| BioFormatsError::Format("SBIG: missing Width".into()))?;
+        let size_y = size_y
+            .filter(|&v| v > 0)
+            .ok_or_else(|| BioFormatsError::Format("SBIG: missing Height".into()))?;
+        if !compressed {
+            let expected = Self::HEADER_SIZE
+                .checked_add(size_x as u64 * size_y as u64 * 2)
+                .ok_or_else(|| BioFormatsError::Format("SBIG plane size overflow".into()))?;
+            if file_len < expected {
+                return Err(BioFormatsError::Format(
+                    "SBIG file is too short for declared dimensions".into(),
+                ));
+            }
+        }
+
+        self.path = Some(path.to_path_buf());
+        self.compressed = compressed;
+        self.meta = Some(ImageMetadata {
+            size_x,
+            size_y,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            thumbnail: false,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        });
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        self.path = None;
+        self.meta = None;
+        self.compressed = false;
+        Ok(())
     }
 
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        if s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
-        self.inner.series()
+        0
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if p >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(p));
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(Self::HEADER_SIZE))
+            .map_err(BioFormatsError::Io)?;
+        let width_bytes = meta.size_x as usize * 2;
+        let mut buf = vec![0u8; width_bytes * meta.size_y as usize];
+        if self.compressed {
+            for row in 0..meta.size_y as usize {
+                let row_len = read_u16_from(&mut f, true)? as usize;
+                let row_start = row * width_bytes;
+                if row_len == width_bytes {
+                    f.read_exact(&mut buf[row_start..row_start + row_len])
+                        .map_err(BioFormatsError::Io)?;
+                } else {
+                    if width_bytes < 2 {
+                        continue;
+                    }
+                    f.read_exact(&mut buf[row_start..row_start + 2])
+                        .map_err(BioFormatsError::Io)?;
+                    let mut offset = row_start + 2;
+                    while offset - row_start < width_bytes {
+                        let mut check = [0u8; 1];
+                        f.read_exact(&mut check).map_err(BioFormatsError::Io)?;
+                        if check[0] == 0x80 {
+                            f.read_exact(&mut buf[offset..offset + 2])
+                                .map_err(BioFormatsError::Io)?;
+                        } else {
+                            let prev = i16::from_le_bytes([buf[offset - 2], buf[offset - 1]]);
+                            let value = prev.wrapping_add(check[0] as i8 as i16);
+                            buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+                        }
+                        offset += 2;
+                    }
+                }
+            }
+        } else {
+            f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        }
+        Ok(buf)
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let full = self.open_bytes(p)?;
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crop_full_plane("SBIG", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(p, tx, ty, tw, th)
     }
+}
+
+fn read_u16_from(f: &mut std::fs::File, little_endian: bool) -> Result<u16> {
+    let mut b = [0u8; 2];
+    f.read_exact(&mut b).map_err(BioFormatsError::Io)?;
+    Ok(if little_endian {
+        u16::from_le_bytes(b)
+    } else {
+        u16::from_be_bytes(b)
+    })
 }
 
 // ---------------------------------------------------------------------------

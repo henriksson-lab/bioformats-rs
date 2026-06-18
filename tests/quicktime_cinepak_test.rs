@@ -363,6 +363,77 @@ fn quicktime_movie_samples_in_one_chunk(
     mov
 }
 
+fn quicktime_movie_two_sample_descriptions(
+    codec0: &[u8; 4],
+    codec1: &[u8; 4],
+    width: u16,
+    height: u16,
+    depth: u16,
+    samples: &[&[u8]],
+) -> Vec<u8> {
+    assert_eq!(samples.len(), 2);
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(b"qt  ");
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(b"qt  ");
+    let ftyp = atom(b"ftyp", &ftyp);
+
+    let mut mdat_payload = Vec::new();
+    let mut offsets = Vec::new();
+    let mut next_offset = (ftyp.len() + 8) as u32;
+    for sample in samples {
+        offsets.push(next_offset);
+        mdat_payload.extend_from_slice(sample);
+        next_offset += sample.len() as u32;
+    }
+    let mdat = atom(b"mdat", &mdat_payload);
+
+    let mut stsd_payload = Vec::new();
+    stsd_payload.extend_from_slice(&0u32.to_be_bytes());
+    stsd_payload.extend_from_slice(&2u32.to_be_bytes());
+    for codec in [codec0, codec1] {
+        let mut sample_entry = vec![0u8; 86];
+        sample_entry[..4].copy_from_slice(&86u32.to_be_bytes());
+        sample_entry[4..8].copy_from_slice(codec);
+        sample_entry[14..16].copy_from_slice(&1u16.to_be_bytes());
+        sample_entry[32..34].copy_from_slice(&width.to_be_bytes());
+        sample_entry[34..36].copy_from_slice(&height.to_be_bytes());
+        sample_entry[82..84].copy_from_slice(&depth.to_be_bytes());
+        stsd_payload.extend_from_slice(&sample_entry);
+    }
+
+    let mut stsz_payload = Vec::new();
+    stsz_payload.extend_from_slice(&0u32.to_be_bytes());
+    stsz_payload.extend_from_slice(&0u32.to_be_bytes());
+    stsz_payload.extend_from_slice(&2u32.to_be_bytes());
+    for sample in samples {
+        stsz_payload.extend_from_slice(&(sample.len() as u32).to_be_bytes());
+    }
+
+    let mut stco_payload = Vec::new();
+    stco_payload.extend_from_slice(&0u32.to_be_bytes());
+    stco_payload.extend_from_slice(&2u32.to_be_bytes());
+    for offset in offsets {
+        stco_payload.extend_from_slice(&offset.to_be_bytes());
+    }
+
+    let mut stbl_payload = Vec::new();
+    stbl_payload.extend_from_slice(&atom(b"stsd", &stsd_payload));
+    stbl_payload.extend_from_slice(&atom(b"stsz", &stsz_payload));
+    stbl_payload.extend_from_slice(&atom(b"stco", &stco_payload));
+    stbl_payload.extend_from_slice(&quicktime_stsc(&[(1, 1, 1), (2, 1, 2)]));
+
+    let minf = atom(b"minf", &atom(b"stbl", &stbl_payload));
+    let mdia = atom(b"mdia", &minf);
+    let moov = atom(b"moov", &atom(b"trak", &mdia));
+
+    let mut mov = Vec::new();
+    mov.extend_from_slice(&ftyp);
+    mov.extend_from_slice(&mdat);
+    mov.extend_from_slice(&moov);
+    mov
+}
+
 fn quicktime_movie_two_tracks(
     first: (&[u8; 4], u16, u16, u16, &[u8]),
     second: (&[u8; 4], u16, u16, u16, &[u8]),
@@ -406,6 +477,26 @@ fn quicktime_movie_two_tracks(
     mov.extend_from_slice(&mdat);
     mov.extend_from_slice(&moov);
     mov
+}
+
+#[test]
+fn quicktime_dispatches_stsc_sample_description_codecs() {
+    let path = tmp("two_sample_descriptions.mov");
+    let first = [1u8, 2, 3, 4, 5, 6];
+    let second = [7u8, 8, 9, 10, 11, 12];
+    let mov =
+        quicktime_movie_two_sample_descriptions(b"raw ", b"RAW ", 2, 1, 24, &[&first, &second]);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().image_count, 2);
+    assert!(matches!(
+        reader.metadata().series_metadata.get("Second codec"),
+        Some(MetadataValue::String(value)) if value == "RAW "
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), first);
+    assert_eq!(reader.open_bytes(1).unwrap(), second);
+    let _ = std::fs::remove_file(path);
 }
 
 fn be16(v: u16) -> [u8; 2] {

@@ -156,6 +156,44 @@ fn is_tiff_name(name: &str) -> bool {
     has_ext(name, "tif") || has_ext(name, "tiff")
 }
 
+fn is_hex_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| i32::from_str_radix(e, 16).is_ok())
+        .unwrap_or(false)
+}
+
+fn find_pe_htm_for_entry(path: &Path) -> Option<PathBuf> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if matches!(ext.as_deref(), Some("htm") | Some("html")) {
+        return path.exists().then(|| path.to_path_buf());
+    }
+
+    let bin_file = is_tiff_name(path.file_name()?.to_str()?) || is_hex_extension(path);
+    let mut prefix = path.file_stem()?.to_string_lossy().to_string();
+    if prefix.contains('_') && bin_file {
+        prefix.truncate(prefix.rfind('_').unwrap_or(prefix.len()));
+    }
+
+    loop {
+        for name in [format!("{prefix}.htm"), format!("{prefix}.HTM")] {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        match prefix.rfind('_') {
+            Some(i) => prefix.truncate(i),
+            None => break,
+        }
+    }
+    None
+}
+
 /// Result of parsing the metadata companion files.
 struct PeMeta {
     size_x: u32,
@@ -696,21 +734,20 @@ impl FormatReader for PerkinElmerReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        match ext.as_deref() {
-            Some("htm") | Some("html") => true,
-            // A companion file is acceptable if a sibling .htm exists.
-            Some("tim") | Some("csv") | Some("zpo") | Some("cfg") | Some("ano") | Some("rec") => {
-                let dir = path.parent().unwrap_or(Path::new("."));
-                std::fs::read_dir(dir)
-                    .map(|entries| {
-                        entries.flatten().any(|e| {
-                            let n = e.file_name().to_string_lossy().to_string();
-                            has_ext(&n, "htm") || has_ext(&n, "html")
-                        })
-                    })
-                    .unwrap_or(false)
+        if matches!(ext.as_deref(), Some("cfg")) {
+            if let Ok(check) = std::fs::read_to_string(path) {
+                if !check.contains("Ultraview") {
+                    return false;
+                }
             }
-            _ => false,
+        }
+        match ext.as_deref() {
+            Some("htm") | Some("html") => path.exists(),
+            Some("tif") | Some("tiff") => find_pe_htm_for_entry(path).is_some(),
+            Some("tim") | Some("csv") | Some("zpo") | Some("cfg") | Some("ano") | Some("rec") => {
+                find_pe_htm_for_entry(path).is_some()
+            }
+            _ => is_hex_extension(path) && find_pe_htm_for_entry(path).is_some(),
         }
     }
 
@@ -911,6 +948,9 @@ impl FormatReader for PerkinElmerReader {
         let end = offset.checked_add(plane_bytes as u64).ok_or_else(|| {
             BioFormatsError::InvalidData("PerkinElmer plane offset overflows".into())
         })?;
+        if offset >= len {
+            return Ok(buf);
+        }
         if end > len {
             return Err(BioFormatsError::InvalidData(format!(
                 "PerkinElmer raw plane {plane_index} exceeds file length: need bytes {offset}..{end}, file length {len}"
@@ -1021,11 +1061,22 @@ impl FormatReader for PerkinElmerReader {
 // ── OpenlabRawReader ──────────────────────────────────────────────────────────
 
 const OPENLAB_MAGIC: &[u8] = b"LBLB";
+const OPENLAB_JAVA_MAGIC: &[u8] = b"OLRW";
 const OPENLAB_HEADER_SIZE: u64 = 288;
+
+#[derive(Clone)]
+enum OpenlabRawLayout {
+    ExtraLblb,
+    JavaOlrw {
+        offsets: Vec<u64>,
+        bytes_per_pixel: usize,
+    },
+}
 
 pub struct OpenlabRawReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    layout: OpenlabRawLayout,
 }
 
 impl OpenlabRawReader {
@@ -1033,6 +1084,7 @@ impl OpenlabRawReader {
         OpenlabRawReader {
             path: None,
             meta: None,
+            layout: OpenlabRawLayout::ExtraLblb,
         }
     }
 }
@@ -1043,14 +1095,92 @@ impl Default for OpenlabRawReader {
     }
 }
 
-fn parse_openlab(path: &Path) -> Result<ImageMetadata> {
+fn parse_openlab(path: &Path) -> Result<(ImageMetadata, OpenlabRawLayout)> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    if data.len() < 4 {
+        return Err(BioFormatsError::Format("Openlab header too short".into()));
+    }
+
+    if data[..4] == *OPENLAB_JAVA_MAGIC {
+        if data.len() < 46 {
+            return Err(BioFormatsError::Format(
+                "Openlab RAW OLRW header too short".into(),
+            ));
+        }
+        let version = i32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        let image_count = i32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+        let width = i32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+        let height = i32::from_be_bytes([data[24], data[25], data[26], data[27]]);
+        let raw_channels = data[29] as u32;
+        let bytes_per_pixel = data[30] as usize;
+        let name_len = data[45] as usize;
+        let name_start = 46usize;
+        let name_end = name_start
+            .saturating_add(name_len.saturating_sub(1))
+            .min(data.len());
+        let image_name = String::from_utf8_lossy(&data[name_start..name_end])
+            .trim()
+            .to_string();
+
+        if width <= 0 || height <= 0 || image_count <= 0 || bytes_per_pixel == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Openlab RAW OLRW header has invalid dimensions/count/bytes: {width}x{height}, count={image_count}, bytes={bytes_per_pixel}"
+            )));
+        }
+
+        let size_c = if raw_channels <= 1 { 1 } else { 3 };
+        let pixel_type = match bytes_per_pixel {
+            1 | 3 => PixelType::Uint8,
+            2 => PixelType::Uint16,
+            _ => PixelType::Float32,
+        };
+        let mut meta = default_meta(width as u32, height as u32, pixel_type);
+        meta.size_z = image_count as u32;
+        meta.image_count = image_count as u32;
+        meta.size_c = size_c;
+        meta.is_rgb = size_c > 1;
+        meta.dimension_order = if meta.is_rgb {
+            DimensionOrder::XYCZT
+        } else {
+            DimensionOrder::XYZTC
+        };
+        meta.is_little_endian = false;
+        meta.series_metadata
+            .insert("Version".into(), MetadataValue::Int(version as i64));
+        meta.series_metadata.insert(
+            "Bytes per pixel".into(),
+            MetadataValue::Int(bytes_per_pixel as i64),
+        );
+        if !image_name.is_empty() {
+            meta.series_metadata
+                .insert("Image name".into(), MetadataValue::String(image_name));
+        }
+
+        let plane_stride = (width as u64)
+            .checked_mul(height as u64)
+            .and_then(|v| v.checked_mul(bytes_per_pixel as u64))
+            .ok_or_else(|| BioFormatsError::Format("Openlab RAW plane size overflows".into()))?;
+        let mut offsets = Vec::with_capacity(image_count as usize);
+        offsets.push(12);
+        for i in 1..image_count as usize {
+            let prev = offsets[i - 1];
+            offsets.push(prev + OPENLAB_HEADER_SIZE + plane_stride);
+        }
+        return Ok((
+            meta,
+            OpenlabRawLayout::JavaOlrw {
+                offsets,
+                bytes_per_pixel,
+            },
+        ));
+    }
+
     if data.len() < OPENLAB_HEADER_SIZE as usize {
         return Err(BioFormatsError::Format("Openlab header too short".into()));
     }
     if data[..4] != *OPENLAB_MAGIC {
         return Err(BioFormatsError::UnsupportedFormat(
-            "Openlab raw header is missing LBLB magic".into(),
+            "Openlab raw header is missing LBLB/OLRW magic".into(),
         ));
     }
 
@@ -1093,7 +1223,7 @@ fn parse_openlab(path: &Path) -> Result<ImageMetadata> {
         )));
     }
 
-    Ok(meta)
+    Ok((meta, OpenlabRawLayout::ExtraLblb))
 }
 
 impl FormatReader for OpenlabRawReader {
@@ -1106,19 +1236,21 @@ impl FormatReader for OpenlabRawReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 4 && header[0..4] == *OPENLAB_MAGIC
+        header.len() >= 4 && (header[0..4] == *OPENLAB_MAGIC || header[0..4] == *OPENLAB_JAVA_MAGIC)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let meta = parse_openlab(path)?;
+        let (meta, layout) = parse_openlab(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
+        self.layout = layout;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.layout = OpenlabRawLayout::ExtraLblb;
         Ok(())
     }
 
@@ -1149,7 +1281,52 @@ impl FormatReader for OpenlabRawReader {
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
-        open_bytes_impl(&path, OPENLAB_HEADER_SIZE, meta, plane_index)
+        match &self.layout {
+            OpenlabRawLayout::ExtraLblb => {
+                open_bytes_impl(&path, OPENLAB_HEADER_SIZE, meta, plane_index)
+            }
+            OpenlabRawLayout::JavaOlrw {
+                offsets,
+                bytes_per_pixel,
+            } => {
+                if plane_index >= meta.image_count {
+                    return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+                }
+                let plane_bytes = meta.size_x as usize
+                    * meta.size_y as usize
+                    * if meta.is_rgb {
+                        meta.size_c as usize
+                    } else {
+                        meta.pixel_type.bytes_per_sample()
+                    };
+                let offset_index = if meta.is_rgb {
+                    (plane_index / meta.size_c.max(1)) as usize
+                } else {
+                    plane_index as usize
+                };
+                let offset = offsets
+                    .get(offset_index)
+                    .copied()
+                    .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?
+                    + OPENLAB_HEADER_SIZE;
+                let mut buf = vec![0u8; plane_bytes];
+                let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
+                let len = f.metadata().map_err(BioFormatsError::Io)?.len();
+                if offset < len {
+                    f.seek(SeekFrom::Start(offset))
+                        .map_err(BioFormatsError::Io)?;
+                    let available = (len - offset).min(plane_bytes as u64) as usize;
+                    f.read_exact(&mut buf[..available])
+                        .map_err(BioFormatsError::Io)?;
+                }
+                if *bytes_per_pixel == 1 {
+                    for b in &mut buf {
+                        *b = 255u8.saturating_sub(*b);
+                    }
+                }
+                Ok(buf)
+            }
+        }
     }
 
     fn open_bytes_region(
@@ -1825,6 +2002,42 @@ mod perkinelmer_metadata_tests {
             m.metadata.get("Z slice position #3"),
             Some(MetadataValue::String(v)) if v == "3.0"
         ));
+    }
+
+    #[test]
+    fn detection_accepts_pixel_companions_with_matching_htm_like_java() {
+        let dir = unique_dir("perkin_detect_entry");
+        let htm = dir.join("scan.htm");
+        let tif = dir.join("scan_001.tif");
+        let raw = dir.join("scan_001.2");
+        let cfg = dir.join("scan.cfg");
+        std::fs::write(&htm, b"<html></html>").unwrap();
+        std::fs::write(&tif, []).unwrap();
+        std::fs::write(&raw, []).unwrap();
+        std::fs::write(&cfg, b"not this reader").unwrap();
+
+        let reader = PerkinElmerReader::new();
+        assert!(reader.is_this_type_by_name(&tif));
+        assert!(reader.is_this_type_by_name(&raw));
+        assert!(!reader.is_this_type_by_name(&cfg));
+
+        std::fs::write(&cfg, b"Ultraview acquisition").unwrap();
+        assert!(reader.is_this_type_by_name(&cfg));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn detection_trims_underscored_pixel_prefix_to_find_htm() {
+        let dir = unique_dir("perkin_detect_trim");
+        let htm = dir.join("scan.htm");
+        let tif = dir.join("scan_w1_001.tif");
+        std::fs::write(&htm, b"<html></html>").unwrap();
+        std::fs::write(&tif, []).unwrap();
+
+        assert!(PerkinElmerReader::new().is_this_type_by_name(&tif));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

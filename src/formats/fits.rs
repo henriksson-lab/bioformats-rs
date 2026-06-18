@@ -58,7 +58,7 @@ fn read_hdu(f: &mut File) -> Result<Option<FitsHdu>> {
     let mut bitpix: i64 = 8;
     let mut dims: Vec<u32> = Vec::new();
     let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
-    let mut found_end = false;
+    let mut found_image_end = false;
     let mut block = vec![0u8; BLOCK];
 
     loop {
@@ -78,8 +78,13 @@ fn read_hdu(f: &mut File) -> Result<Option<FitsHdu>> {
             let (key, val) = read_keyword(rec);
             match key {
                 "END" => {
-                    found_end = true;
-                    break;
+                    // FitsReader.java keeps scanning if the first header has
+                    // no populated image dimensions; the next END after NAXIS1
+                    // marks the image header whose pixels will be read.
+                    if dims.first().copied().unwrap_or(0) > 0 {
+                        found_image_end = true;
+                        break;
+                    }
                 }
                 "BITPIX" => {
                     if let Some(v) = val.and_then(parse_int_value) {
@@ -128,7 +133,7 @@ fn read_hdu(f: &mut File) -> Result<Option<FitsHdu>> {
             }
         }
 
-        if found_end {
+        if found_image_end {
             break;
         }
     }
@@ -640,6 +645,28 @@ mod tests {
         assert_eq!(reader.series_count(), 1);
         assert_eq!(reader.open_bytes(0).expect("primary plane"), vec![9, 10]);
         assert!(reader.set_series(1).is_err());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fits_empty_primary_reads_first_image_extension_like_java() {
+        let path = temp_fits_path("empty_primary_extension");
+        let mut bytes = header(vec![
+            fits_record("SIMPLE", "                   T"),
+            fits_record("BITPIX", "                   8"),
+            fits_record("NAXIS", "                   0"),
+        ]);
+        bytes.extend_from_slice(&image_extension_hdu(8, &[2, 1], &[], &[11, 12]));
+        std::fs::write(&path, bytes).expect("write synthetic FITS");
+
+        let mut reader = FitsReader::new();
+        reader.set_id(&path).expect("open FITS extension image");
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert_eq!(reader.metadata().size_z, 1);
+        assert_eq!(reader.open_bytes(0).expect("extension plane"), vec![11, 12]);
 
         let _ = std::fs::remove_file(path);
     }

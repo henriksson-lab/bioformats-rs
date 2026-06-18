@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bioformats::common::error::BioFormatsError;
 use bioformats::formats::misc4::FilePatternReader;
+use bioformats::FileStitcher;
 use bioformats::FormatReader;
 use bioformats::MetadataValue;
 
@@ -52,6 +53,34 @@ fn filepattern_reader_delegates_to_stitcher_for_pattern_files() {
     assert_eq!(meta.image_count, 2);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1]);
     assert_eq!(reader.open_bytes(1).unwrap(), vec![0, 1]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn file_stitcher_single_file_preserves_wrapped_reader_series() {
+    let dir = tmp_dir("single_series");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("single&series=3&sizeX=2&sizeY=1.fake");
+    std::fs::write(&file, b"").unwrap();
+
+    let mut reader = FileStitcher::open(&file).expect("single-file stitcher open failed");
+
+    assert_eq!(reader.series_count(), 3);
+    reader.set_series(2).expect("set series failed");
+    assert_eq!(reader.series(), 2);
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.open_bytes(0).expect("open bytes failed"), vec![0, 1]);
+    assert_eq!(
+        reader
+            .metadata()
+            .series_metadata
+            .get("Image name")
+            .unwrap()
+            .to_string(),
+        "single 3"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }

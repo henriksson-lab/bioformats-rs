@@ -1005,7 +1005,7 @@ impl FormatReader for I2iReader {
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
         // Java isThisType: requires at least HEADER_SIZE bytes, a valid pixel
         // type character, a space separator, and a positive pixel count.
-        if header.len() < 20 {
+        if header.len() < I2I_HEADER_SIZE as usize {
             return false;
         }
         let pixel_type = header[0];
@@ -1026,7 +1026,7 @@ impl FormatReader for I2iReader {
         self.meta = None;
 
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        let mut header = [0u8; 64];
+        let mut header = [0u8; I2I_HEADER_SIZE as usize];
         f.read_exact(&mut header).map_err(BioFormatsError::Io)?;
 
         let pixel_type = match header[0] {
@@ -1065,6 +1065,10 @@ impl FormatReader for I2iReader {
         };
 
         // shorts at offset 21: min, max, x, y, then n.
+        let min_pixel_value = read_i16(&header[21..23]);
+        let max_pixel_value = read_i16(&header[23..25]);
+        let x_coordinate = read_i16(&header[25..27]);
+        let y_coordinate = read_i16(&header[27..29]);
         let n = read_i16(&header[29..31]) as i32;
 
         // The stored Z value is the total plane count; divide by n (the
@@ -1086,6 +1090,44 @@ impl FormatReader for I2iReader {
             .checked_mul(size_t)
             .ok_or_else(|| BioFormatsError::Format("I2I image count overflows".to_string()))?;
 
+        let mut series_metadata = HashMap::new();
+        for i in 0..15 {
+            let start = 64 + i * 64;
+            let history_bytes = &header[start..start + 64];
+            let first = history_bytes
+                .iter()
+                .position(|b| *b > b' ')
+                .unwrap_or(history_bytes.len());
+            let last = history_bytes
+                .iter()
+                .rposition(|b| *b > b' ')
+                .map(|i| i + 1)
+                .unwrap_or(first);
+            let history = String::from_utf8_lossy(&history_bytes[first..last]).into_owned();
+            let key = if i == 0 {
+                "Image history".to_string()
+            } else {
+                format!("Image history #{}", i + 1)
+            };
+            series_metadata.insert(key, MetadataValue::String(history));
+        }
+        series_metadata.insert(
+            "Minimum intensity value".to_string(),
+            MetadataValue::Int(min_pixel_value as i64),
+        );
+        series_metadata.insert(
+            "Maximum intensity value".to_string(),
+            MetadataValue::Int(max_pixel_value as i64),
+        );
+        series_metadata.insert(
+            "Image position X".to_string(),
+            MetadataValue::Int(x_coordinate as i64),
+        );
+        series_metadata.insert(
+            "Image position Y".to_string(),
+            MetadataValue::Int(y_coordinate as i64),
+        );
+
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x: size_x as u32,
@@ -1103,7 +1145,7 @@ impl FormatReader for I2iReader {
             is_little_endian: little_endian,
             resolution_count: 1,
             thumbnail: false,
-            series_metadata: HashMap::new(),
+            series_metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,

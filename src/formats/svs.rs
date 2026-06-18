@@ -102,41 +102,6 @@ impl Default for SvsReader {
     }
 }
 
-impl SvsReader {
-    /// Convert a chunky/interleaved RGB(A) buffer (`c0c1c2 c0c1c2 …`) into the
-    /// channel-separated layout (`c0c0… c1c1… c2c2…`) that Java's SVSReader
-    /// returns (`isInterleaved() == false`). No-op unless the current series is
-    /// RGB and flagged non-interleaved, and the buffer length matches
-    /// `w * h * channels * bytesPerSample`.
-    fn separate_channels(&self, buf: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
-        let m = self.inner.metadata();
-        if !m.is_rgb || m.is_interleaved {
-            return buf;
-        }
-        let channels = m.size_c as usize;
-        if channels < 2 {
-            return buf;
-        }
-        let bps = (m.bits_per_pixel as usize + 7) / 8;
-        let bps = bps.max(1);
-        let pixels = w as usize * h as usize;
-        let expected = pixels * channels * bps;
-        if pixels == 0 || buf.len() != expected {
-            return buf;
-        }
-        let mut out = vec![0u8; expected];
-        let plane = pixels * bps;
-        for i in 0..pixels {
-            for c in 0..channels {
-                let src = (i * channels + c) * bps;
-                let dst = c * plane + i * bps;
-                out[dst..dst + bps].copy_from_slice(&buf[src..src + bps]);
-            }
-        }
-        out
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Pyramid TIFF (Faas-format) — faithful port of Java
 // loci.formats.in.PyramidTiffReader (extends BaseTiffReader).
@@ -323,10 +288,7 @@ impl FormatReader for SvsReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(
-            ext.as_deref(),
-            Some("svs") | Some("bif") | Some("ndpi") | Some("scn") | Some("vsi") | Some("afi")
-        )
+        matches!(ext.as_deref(), Some("svs"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -368,12 +330,7 @@ impl FormatReader for SvsReader {
         self.inner.metadata()
     }
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let (w, h) = {
-            let m = self.inner.metadata();
-            (m.size_x, m.size_y)
-        };
-        let buf = self.inner.open_bytes(plane_index)?;
-        Ok(self.separate_channels(buf, w, h))
+        self.inner.open_bytes(plane_index)
     }
     fn open_bytes_region(
         &mut self,
@@ -383,8 +340,7 @@ impl FormatReader for SvsReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let buf = self.inner.open_bytes_region(plane_index, x, y, w, h)?;
-        Ok(self.separate_channels(buf, w, h))
+        self.inner.open_bytes_region(plane_index, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(plane_index)
@@ -448,7 +404,7 @@ impl FormatReader for SvsReader {
 
 #[cfg(test)]
 mod pyramid_tiff_tests {
-    use super::PyramidTiffReader;
+    use super::{PyramidTiffReader, SvsReader};
     use crate::common::reader::FormatReader;
     use crate::tiff::ifd::tag;
 
@@ -537,6 +493,96 @@ mod pyramid_tiff_tests {
         d
     }
 
+    fn build_svs_z_stack_tiff() -> Vec<u8> {
+        let ifds = [
+            (
+                2u32,
+                1u32,
+                "Aperio Image|MPP=0.25|OffsetZ=0",
+                [0x11u8, 0x12],
+            ),
+            (
+                2u32,
+                1u32,
+                "Aperio Image|MPP=0.25|OffsetZ=1",
+                [0x21u8, 0x22],
+            ),
+        ];
+        let ifd_size = 2 + 9 * 12 + 4;
+        let ifd0_off: u32 = 8;
+        let desc0_off: u32 = ifd0_off + (ifd_size * ifds.len()) as u32;
+        let desc1_off: u32 = desc0_off + ifds[0].2.len() as u32 + 1;
+        let px0_off: u32 = desc1_off + ifds[1].2.len() as u32 + 1;
+        let px1_off: u32 = px0_off + 2;
+
+        let mut d: Vec<u8> = Vec::new();
+        d.extend_from_slice(b"II");
+        push_u16(&mut d, 42);
+        push_u32(&mut d, ifd0_off);
+
+        for (i, (w, h, desc, _pixels)) in ifds.iter().enumerate() {
+            let next = if i + 1 < ifds.len() {
+                ifd0_off + ((i + 1) * ifd_size) as u32
+            } else {
+                0
+            };
+            let desc_off = if i == 0 { desc0_off } else { desc1_off };
+            let px_off = if i == 0 { px0_off } else { px1_off };
+
+            push_u16(&mut d, 9);
+            push_long(&mut d, tag::IMAGE_WIDTH, *w);
+            push_long(&mut d, tag::IMAGE_LENGTH, *h);
+            push_short(&mut d, tag::BITS_PER_SAMPLE, 8);
+            push_short(&mut d, tag::COMPRESSION, 1);
+            push_short(&mut d, tag::PHOTOMETRIC_INTERPRETATION, 1);
+            push_ascii_at_offset(&mut d, tag::IMAGE_DESCRIPTION, desc, desc_off);
+            push_long(&mut d, tag::STRIP_OFFSETS, px_off);
+            push_long(&mut d, tag::ROWS_PER_STRIP, *h);
+            push_long(&mut d, tag::STRIP_BYTE_COUNTS, w * h);
+            push_u32(&mut d, next);
+        }
+
+        d.extend_from_slice(ifds[0].2.as_bytes());
+        d.push(0);
+        d.extend_from_slice(ifds[1].2.as_bytes());
+        d.push(0);
+        d.extend_from_slice(&ifds[0].3);
+        d.extend_from_slice(&ifds[1].3);
+        d
+    }
+
+    fn build_svs_rgb_tiff() -> Vec<u8> {
+        let desc = "Aperio Image|MPP=0.25|AppMag=20";
+        let pixels = [1u8, 10, 100, 2, 20, 110];
+        let ifd_size = 2 + 10 * 12 + 4;
+        let ifd0_off: u32 = 8;
+        let desc_off: u32 = ifd0_off + ifd_size;
+        let px_off: u32 = desc_off + desc.len() as u32 + 1;
+
+        let mut d: Vec<u8> = Vec::new();
+        d.extend_from_slice(b"II");
+        push_u16(&mut d, 42);
+        push_u32(&mut d, ifd0_off);
+
+        push_u16(&mut d, 10);
+        push_long(&mut d, tag::IMAGE_WIDTH, 2);
+        push_long(&mut d, tag::IMAGE_LENGTH, 1);
+        push_short(&mut d, tag::BITS_PER_SAMPLE, 8);
+        push_short(&mut d, tag::COMPRESSION, 1);
+        push_short(&mut d, tag::PHOTOMETRIC_INTERPRETATION, 2);
+        push_ascii_at_offset(&mut d, tag::IMAGE_DESCRIPTION, desc, desc_off);
+        push_long(&mut d, tag::STRIP_OFFSETS, px_off);
+        push_short(&mut d, tag::SAMPLES_PER_PIXEL, 3);
+        push_long(&mut d, tag::ROWS_PER_STRIP, 1);
+        push_long(&mut d, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+        push_u32(&mut d, 0);
+
+        d.extend_from_slice(desc.as_bytes());
+        d.push(0);
+        d.extend_from_slice(&pixels);
+        d
+    }
+
     #[test]
     fn detects_faas_software_tag() {
         let faas = build_pyramid_tiff("Faas");
@@ -583,6 +629,56 @@ mod pyramid_tiff_tests {
         reader.set_resolution(1).unwrap();
         assert_eq!(reader.metadata().size_x, 2);
         assert_eq!(reader.metadata().size_y, 2);
+
+        reader.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn svs_name_detection_is_limited_to_svs_suffix() {
+        let reader = SvsReader::new();
+        assert!(reader.is_this_type_by_name(std::path::Path::new("sample.svs")));
+        assert!(!reader.is_this_type_by_name(std::path::Path::new("sample.ndpi")));
+        assert!(!reader.is_this_type_by_name(std::path::Path::new("sample.bif")));
+        assert!(!reader.is_this_type_by_name(std::path::Path::new("sample.scn")));
+    }
+
+    #[test]
+    fn svs_same_sized_offset_z_ifds_become_planes() {
+        let svs = build_svs_z_stack_tiff();
+        let path = std::env::temp_dir().join(format!("aperio_z_stack_{}.svs", std::process::id()));
+        std::fs::write(&path, &svs).unwrap();
+
+        let mut reader = SvsReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.metadata().size_z, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x11, 0x12]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![0x21, 0x22]);
+
+        reader.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn svs_rgb_pixels_are_not_channel_separated_twice() {
+        let svs = build_svs_rgb_tiff();
+        let path = std::env::temp_dir().join(format!("aperio_rgb_{}.svs", std::process::id()));
+        std::fs::write(&path, &svs).unwrap();
+
+        let mut reader = SvsReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert!(reader.metadata().is_rgb);
+        assert!(!reader.metadata().is_interleaved);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 10, 20, 100, 110]);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+            vec![2, 20, 110]
+        );
 
         reader.close().unwrap();
         let _ = std::fs::remove_file(&path);

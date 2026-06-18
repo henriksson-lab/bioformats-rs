@@ -29,7 +29,10 @@
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::ImageMetadata;
-use crate::common::ome_metadata::{create_lsid, OmeMetadata, OmePlate, OmeWell, OmeWellSample};
+use crate::common::ome_metadata::{
+    create_lsid, OmeDetector, OmeDichroic, OmeFilter, OmeInstrument, OmeLightSource, OmeMetadata,
+    OmeObjective, OmePlate, OmeWell, OmeWellSample,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::tiff::ifd::IfdValue;
@@ -124,6 +127,7 @@ pub struct FlexReader {
     /// `lightSourceCombinationIDs`).
     light_source_combination_ids: std::collections::HashMap<String, Vec<String>>,
     /// Filter/dichroic raw-ID → LSID maps (Java `filterMap`/`dichroicMap`).
+    filter_ids: Vec<String>,
     filter_map: std::collections::HashMap<String, String>,
     dichroic_map: std::collections::HashMap<String, String>,
     /// FilterSet ID → (emission, excitation, dichroic) LSIDs (Java
@@ -189,6 +193,7 @@ impl FlexReader {
             light_source_combination_refs: Vec::new(),
             filter_sets: Vec::new(),
             light_source_combination_ids: std::collections::HashMap::new(),
+            filter_ids: Vec::new(),
             filter_map: std::collections::HashMap::new(),
             dichroic_map: std::collections::HashMap::new(),
             filter_set_map: std::collections::HashMap::new(),
@@ -662,21 +667,14 @@ impl FlexReader {
                 expected_files_per_well = Some(sorted.len());
             }
             // Java assigns the field index by sorted position within the well
-            // (FlexFile.field = field loop variable), but the filename's field
-            // digits (chars 6..9) are the authoritative field number. Use the
-            // filename field when the 14-char pattern is present, falling back
-            // to sorted position otherwise.
+            // (FlexFile.field = field loop variable). The filename's field
+            // digits are parsed only during initial grouping and are not used
+            // for the FlexFile.field stored for lookupFile().
             for (pos, p) in sorted.into_iter().enumerate() {
-                let n = p.file_name().and_then(|x| x.to_str()).unwrap_or_default();
-                let field = if n.len() == 14 {
-                    parse_field(n)
-                } else {
-                    pos as u32
-                };
                 flex_files.push(FlexFile {
                     row,
                     column: col,
-                    field,
+                    field: pos as u32,
                     path: p,
                     factors: None,
                 });
@@ -854,23 +852,17 @@ impl FlexReader {
 
         // Build base metadata from the inner TIFF, overriding the dimension
         // split + dimensionOrder per Java's populateCoreMetadata.
-        let mut base_meta = self
+        let base_meta = self
             .inner
             .series_list()
             .first()
             .map(|s| s.metadata.clone())
             .ok_or_else(|| BioFormatsError::Format("Flex: no IFDs in first file".into()))?;
-        base_meta.size_c = core.size_c.max(1);
-        base_meta.size_z = core.size_z.max(1);
-        base_meta.size_t = core.size_t.max(1);
-        base_meta.image_count = core.image_count.max(1);
-        base_meta.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
-        base_meta.is_rgb = false;
-        if let Some(pt) = self.scaled_pixel_type {
-            base_meta.pixel_type = pt;
-            base_meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
-        }
-        Ok(base_meta)
+        Ok(apply_flex_core_overrides(
+            base_meta,
+            &core,
+            self.scaled_pixel_type,
+        ))
     }
 
     /// Port of `FlexReader.populateMetadataStore`: replicate the base metadata
@@ -1034,6 +1026,7 @@ impl FlexReader {
                                     next_dichroic += 1;
                                 } else {
                                     let lsid = create_lsid("Filter", &[0, next_filter as usize]);
+                                    self.filter_ids.push(lsid.clone());
                                     if self.filter_map.get(id) != Some(&lsid) {
                                         self.filter_map.insert(id.clone(), lsid);
                                     }
@@ -1302,6 +1295,25 @@ impl FlexReader {
             img.light_paths = light_paths;
         }
     }
+}
+
+fn apply_flex_core_overrides(
+    mut base_meta: ImageMetadata,
+    core: &FlexCore,
+    scaled_pixel_type: Option<PixelType>,
+) -> ImageMetadata {
+    base_meta.size_c = core.size_c.max(1);
+    base_meta.size_z = core.size_z.max(1);
+    base_meta.size_t = core.size_t.max(1);
+    base_meta.image_count = core.image_count.max(1);
+    base_meta.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+    base_meta.is_rgb = false;
+    base_meta.is_interleaved = false;
+    if let Some(pt) = scaled_pixel_type {
+        base_meta.pixel_type = pt;
+        base_meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
+    }
+    base_meta
 }
 
 impl Default for FlexReader {
@@ -1746,18 +1758,6 @@ fn parse_well(name: &str) -> Option<(u32, u32)> {
     None
 }
 
-/// Parse the field index (0-based) from a 14-char `nnnnnnnnn.flex` name.
-fn parse_field(name: &str) -> u32 {
-    if name.len() == 14 && name.to_ascii_lowercase().ends_with(".flex") {
-        if let Some(s) = name.get(6..9) {
-            if let Ok(v) = s.parse::<u32>() {
-                return v.saturating_sub(1);
-            }
-        }
-    }
-    0
-}
-
 /// Parse a `.mea` file's `<Picture path=...>` entries into a list of `.flex`
 /// file names (relative). Mirrors MeaHandler (minus server-name remapping,
 /// which is not applicable without a configured server map).
@@ -1907,6 +1907,7 @@ impl FormatReader for FlexReader {
         self.light_source_combination_refs.clear();
         self.filter_sets.clear();
         self.light_source_combination_ids.clear();
+        self.filter_ids.clear();
         self.filter_map.clear();
         self.dichroic_map.clear();
         self.filter_set_map.clear();
@@ -2098,6 +2099,66 @@ impl FormatReader for FlexReader {
             })
             .collect();
 
+        let filter_ids = self.filter_ids.clone();
+        let mut dichroic_ids: Vec<String> = self.dichroic_map.values().cloned().collect();
+        dichroic_ids.sort();
+        dichroic_ids.dedup();
+        if !self.objective_ids.is_empty()
+            || !self.camera_ids.is_empty()
+            || !self.light_source_ids.is_empty()
+            || !filter_ids.is_empty()
+            || !dichroic_ids.is_empty()
+        {
+            ome.instruments = vec![OmeInstrument {
+                id: Some(create_lsid("Instrument", &[0])),
+                objectives: self
+                    .objective_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, model)| OmeObjective {
+                        id: Some(create_lsid("Objective", &[0, i])),
+                        model: Some(model.clone()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                detectors: self
+                    .camera_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, model)| OmeDetector {
+                        id: Some(create_lsid("Detector", &[0, i])),
+                        model: Some(model.clone()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                light_sources: self
+                    .light_source_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, model)| OmeLightSource {
+                        id: Some(create_lsid("LightSource", &[0, i])),
+                        model: Some(model.clone()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                filters: filter_ids
+                    .into_iter()
+                    .map(|id| OmeFilter {
+                        id: Some(id),
+                        ..Default::default()
+                    })
+                    .collect(),
+                dichroics: dichroic_ids
+                    .into_iter()
+                    .map(|id| OmeDichroic {
+                        id: Some(id),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }];
+        }
+
         let mut plate = OmePlate {
             id: Some(create_lsid("Plate", &[0])),
             name: self
@@ -2140,16 +2201,33 @@ impl FormatReader for FlexReader {
             });
         }
 
-        for ((row, col), samples) in well_map {
-            plate.wells.push(OmeWell {
-                id: Some(create_lsid(
-                    "Well",
-                    &[0, (row * self.well_columns + col) as usize],
-                )),
-                row,
-                column: col,
-                well_samples: samples,
-            });
+        if self.well_rows > 0 && self.well_columns > 0 {
+            for row in 0..self.well_rows {
+                for col in 0..self.well_columns {
+                    let samples = well_map.remove(&(row, col)).unwrap_or_default();
+                    plate.wells.push(OmeWell {
+                        id: Some(create_lsid(
+                            "Well",
+                            &[0, (row * self.well_columns + col) as usize],
+                        )),
+                        row,
+                        column: col,
+                        well_samples: samples,
+                    });
+                }
+            }
+        } else {
+            for ((row, col), samples) in well_map {
+                plate.wells.push(OmeWell {
+                    id: Some(create_lsid(
+                        "Well",
+                        &[0, (row * self.well_columns + col) as usize],
+                    )),
+                    row,
+                    column: col,
+                    well_samples: samples,
+                });
+            }
         }
 
         ome.plates = vec![plate];
@@ -2162,11 +2240,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_well_and_field_from_14char_name() {
-        // 002003001.flex -> row 1, col 2, field 0 (all 1-based in file)
+    fn parses_well_from_14char_name() {
+        // 002003001.flex -> row 1, col 2 (all 1-based in file).
+        // Java assigns field indexes from sorted position within the well.
         assert_eq!(parse_well("002003001.flex"), Some((1, 2)));
-        assert_eq!(parse_field("002003001.flex"), 0);
-        assert_eq!(parse_field("002003004.flex"), 3);
     }
 
     #[test]
@@ -2400,5 +2477,26 @@ mod tests {
         // plane = 1*2 + image -> 2, 3.
         assert!((planes[0].position_x.unwrap() - 12.0).abs() < 1e-9);
         assert!((planes[1].position_x.unwrap() - 13.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn flex_base_metadata_forces_non_interleaved_like_java() {
+        let meta = apply_flex_core_overrides(
+            ImageMetadata {
+                is_interleaved: true,
+                is_rgb: true,
+                ..ImageMetadata::default()
+            },
+            &FlexCore {
+                size_c: 1,
+                size_z: 1,
+                size_t: 1,
+                image_count: 1,
+                field_count: 1,
+            },
+            None,
+        );
+        assert!(!meta.is_interleaved);
+        assert!(!meta.is_rgb);
     }
 }

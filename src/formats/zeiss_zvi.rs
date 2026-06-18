@@ -50,6 +50,8 @@ struct ZviOmeInfo {
     emission: HashMap<u32, f64>,
     /// channel index -> excitation wavelength (nm)
     excitation: HashMap<u32, f64>,
+    /// channel index -> Java packed false color.
+    channel_colors: HashMap<u32, i32>,
 }
 
 struct ZviPlane {
@@ -218,6 +220,18 @@ fn read_zvi_variant(data: &[u8], offset: &mut usize) -> Option<String> {
     Some(value)
 }
 
+fn read_zero_padded<R: Read>(reader: &mut R, out: &mut [u8]) -> std::io::Result<()> {
+    let mut filled = 0usize;
+    while filled < out.len() {
+        let n = reader.read(&mut out[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
 /// Harvest OME-relevant tags from one item's Tags stream, mirroring
 /// BaseZeissReader.parseMainTags. Reads each (value, tagID) record in stream
 /// order, tracking the current channel index (tag 2820 "Image Channel Index")
@@ -230,6 +244,7 @@ fn harvest_zvi_ome_tags(data: &[u8], info: &mut ZviOmeInfo, c_index: &mut i32) {
     const TAG_SCALE_X: u32 = 769;
     const TAG_SCALE_Y: u32 = 772;
     const TAG_SCALE_Z: u32 = 775;
+    const TAG_CHANNEL_COLOR: u32 = 1282;
     const TAG_CHANNEL_NAME: u32 = 1284;
     const TAG_CHANNEL_INDEX: u32 = 2820;
     const TAG_EXCITATION: u32 = 16_777_488;
@@ -290,6 +305,13 @@ fn harvest_zvi_ome_tags(data: &[u8], info: &mut ZviOmeInfo, c_index: &mut i32) {
                 if *c_index != -1 {
                     info.channel_names
                         .insert(*c_index as u32, value.trim().to_string());
+                }
+            }
+            TAG_CHANNEL_COLOR => {
+                if *c_index != -1 {
+                    if let Ok(v) = value.trim().parse::<i32>() {
+                        info.channel_colors.insert(*c_index as u32, v);
+                    }
                 }
             }
             TAG_EMISSION => {
@@ -721,7 +743,7 @@ fn parse_zvi(
                 }
             }
         };
-        if item.data_offset > 64 * 1024 {
+        let item = if item.data_offset > 64 * 1024 {
             // Extremely large item headers are rare; reopen and parse the whole
             // stream so the result is still derived from the same bytes as the
             // original full-read implementation.
@@ -736,18 +758,10 @@ fn parse_zvi(
             let Some(item) = parse_zvi_item(&data, data.len())? else {
                 continue;
             };
-            planes.push(ZviPlane {
-                stream_path,
-                z: item.z,
-                c: item.c,
-                t: item.t,
-                tile: item.tile,
-                data_offset: item.data_offset,
-                is_zlib: item.is_zlib,
-                is_jpeg: item.is_jpeg,
-            });
-            continue;
-        }
+            item
+        } else {
+            item
+        };
 
         // bpp / sizeX / sizeY are taken from the first valid image stream.
         if bpp == 0 {
@@ -923,7 +937,7 @@ fn parse_zvi(
         dimension_order,
         is_rgb,
         is_interleaved: true,
-        is_indexed: false,
+        is_indexed: !is_rgb && !ome_info.channel_colors.is_empty(),
         is_little_endian: true,
         resolution_count: 1,
         thumbnail: false,
@@ -1216,8 +1230,7 @@ impl FormatReader for ZeissZviReader {
                         .seek(SeekFrom::Start(src as u64))
                         .map_err(BioFormatsError::Io)?;
                     let dst = row * dst_row_bytes;
-                    stream
-                        .read_exact(&mut out[dst..dst + to_read])
+                    read_zero_padded(&mut stream, &mut out[dst..dst + to_read])
                         .map_err(BioFormatsError::Io)?;
                 }
             }
@@ -1277,7 +1290,11 @@ impl FormatReader for ZeissZviReader {
         // so — like BaseZeissReader — OME channel i takes the i-th value when the
         // recorded channel-name keys are sorted ascending (channelKeys[i]).
         let mut channel_keys: Vec<u32> = info.channel_names.keys().copied().collect();
+        channel_keys.extend(info.channel_colors.keys().copied());
+        channel_keys.extend(info.emission.keys().copied());
+        channel_keys.extend(info.excitation.keys().copied());
         channel_keys.sort_unstable();
+        channel_keys.dedup();
         for (ci, ch) in img.channels.iter_mut().enumerate() {
             let Some(&key) = channel_keys.get(ci) else {
                 break;
@@ -1287,6 +1304,12 @@ impl FormatReader for ZeissZviReader {
             }
             ch.emission_wavelength = info.emission.get(&key).copied();
             ch.excitation_wavelength = info.excitation.get(&key).copied();
+            if let Some(&color) = info.channel_colors.get(&key) {
+                let red = (color & 0xff) as u8;
+                let green = ((color >> 8) & 0xff) as u8;
+                let blue = ((color >> 16) & 0xff) as u8;
+                ch.color = Some(u32::from_be_bytes([red, green, blue, 0xff]) as i32);
+            }
         }
 
         Some(ome)
@@ -1310,14 +1333,13 @@ mod tests {
     /// Build one ZVI item ("/Image/Item(N)/CONTENTS") stream carrying the given
     /// z/c/t/tile indices and a single uncompressed 1x1 UINT8 pixel value. The
     /// byte layout matches `parse_zvi_item` (and the Java reference).
-    fn build_item(z: i32, c: i32, t: i32, tile: i32, pixel: u8) -> Vec<u8> {
+    fn build_item_with_pad(z: i32, c: i32, t: i32, tile: i32, pixel: u8, pad: i32) -> Vec<u8> {
         let mut item: Vec<u8> = Vec::new();
         // 11 leading VT_EMPTY tags (type 0, 2 bytes each).
         item.extend_from_slice(&[0u8; 22]);
         // skip(2)
         item.extend_from_slice(&[0u8; 2]);
         // len = readInt() - 20; pad skip(len-8) past the 1024-byte cutoff.
-        let pad: i32 = 1100;
         let len_raw: i32 = pad + 28;
         item.extend_from_slice(&len_raw.to_le_bytes());
         // skip(8)
@@ -1340,6 +1362,37 @@ mod tests {
         item.extend_from_slice(&2i32.to_le_bytes()); // valid=2 -> uncompressed
         item.extend_from_slice(&[pixel, 0, 0, 0]); // check / first-pixel region
         item
+    }
+
+    fn build_item(z: i32, c: i32, t: i32, tile: i32, pixel: u8) -> Vec<u8> {
+        build_item_with_pad(z, c, t, tile, pixel, 1100)
+    }
+
+    struct OneByteReads {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for OneByteReads {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn zvi_zero_padded_read_loops_until_eof() {
+        let mut reader = OneByteReads {
+            data: vec![1, 2, 3],
+            pos: 0,
+        };
+        let mut out = vec![0; 5];
+        read_zero_padded(&mut reader, &mut out).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 0, 0]);
     }
 
     #[test]
@@ -1425,6 +1478,29 @@ mod tests {
         let mut reader = ZeissZviReader::new();
         reader.set_id(&path).unwrap();
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0]);
+        assert_eq!(reader.open_bytes_region(0, 0, 0, 1, 1).unwrap(), vec![0]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zvi_large_item_header_still_initializes_metadata() {
+        let path = temp_path("large_header");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            comp.create_storage_all("/Image/Item(1)").unwrap();
+            comp.create_stream("/Image/Item(1)/CONTENTS")
+                .unwrap()
+                .write_all(&build_item_with_pad(0, 0, 0, 0, 77, 70_000))
+                .unwrap();
+        }
+
+        let mut reader = ZeissZviReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.image_count), (1, 1, 1));
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![77]);
 
         let _ = std::fs::remove_file(path);
     }

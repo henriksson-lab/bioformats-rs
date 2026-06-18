@@ -2234,7 +2234,9 @@ fn dimension_order_from_bytes(bytes_per_axis: &BTreeMap<u64, char>) -> Dimension
         .copied()
         .filter(|axis| matches!(axis, 'C' | 'Z' | 'T'))
         .collect();
-    for axis in ['C', 'Z', 'T'] {
+    // Java LIFReader appends any missing axes in Z, C, T order after the axes
+    // inferred from BytesInc values.
+    for axis in ['Z', 'C', 'T'] {
         if !axes.contains(&axis) {
             axes.push(axis);
         }
@@ -3562,9 +3564,10 @@ fn pixel_type_from_bytes(n_bytes: u64) -> PixelType {
 mod tests {
     use super::LifReader;
     use crate::common::error::BioFormatsError;
-    use crate::common::metadata::MetadataValue;
+    use crate::common::metadata::{DimensionOrder, MetadataValue};
     use crate::common::pixel_type::PixelType;
     use crate::common::reader::FormatReader;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3613,6 +3616,22 @@ mod tests {
     #[test]
     fn lif_four_byte_x_stride_maps_to_float_like_java() {
         assert_eq!(super::pixel_type_from_bytes(4), PixelType::Float32);
+    }
+
+    #[test]
+    fn dimension_order_appends_missing_axes_in_java_lif_order() {
+        let axes = BTreeMap::new();
+        assert_eq!(
+            super::dimension_order_from_bytes(&axes),
+            DimensionOrder::XYZCT
+        );
+
+        let mut axes = BTreeMap::new();
+        axes.insert(8, 'T');
+        assert_eq!(
+            super::dimension_order_from_bytes(&axes),
+            DimensionOrder::XYTZC
+        );
     }
 
     fn synthetic_lif_bytes() -> Vec<u8> {

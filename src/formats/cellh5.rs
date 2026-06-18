@@ -880,8 +880,8 @@ impl FormatReader for CellH5Reader {
                 words.iter().flat_map(|w| w.to_le_bytes()).collect()
             }
             4 => {
-                let dwords: Vec<u32> = ds
-                    .read_slice::<u32, _>(selection)
+                let dwords: Vec<i32> = ds
+                    .read_slice::<i32, _>(selection)
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
             }
@@ -1047,6 +1047,42 @@ mod writer_tests {
         assert_eq!(r.metadata().pixel_type, PixelType::Uint8);
         assert_eq!(r.open_bytes(0).unwrap(), plane);
         r.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn cellh5_reader_preserves_signed_int32_pixels_like_java() {
+        let path = temp_path("signed_i32");
+        let mut file = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+        {
+            let mut sample = file.create_group("sample").unwrap();
+            let mut zero = sample.create_group("0").unwrap();
+            let mut plate = zero.create_group("plate").unwrap();
+            let mut plate0 = plate.create_group("Plate0").unwrap();
+            let mut experiment = plate0.create_group("experiment").unwrap();
+            let mut well = experiment.create_group("A01").unwrap();
+            let mut positions = well.create_group("position").unwrap();
+            let mut site = positions.create_group("1").unwrap();
+            let mut image = site.create_group("image").unwrap();
+            image
+                .new_dataset_builder("channel")
+                .shape(&[1, 1, 1, 1, 2])
+                .write::<i32>(&[-1i32, 0x0102_0304])
+                .unwrap();
+        }
+        file.flush().unwrap();
+
+        let mut reader = CellH5Reader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().pixel_type, PixelType::Int32);
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            [
+                0xff, 0xff, 0xff, 0xff, //
+                0x04, 0x03, 0x02, 0x01,
+            ]
+        );
+        reader.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 

@@ -397,7 +397,12 @@ impl FormatReader for QtReader {
             )));
         }
         let sample = &data[start..end];
-        match series.codec {
+        let sample_codec = series
+            .sample_codecs
+            .get(sample_index)
+            .copied()
+            .unwrap_or(series.codec);
+        match sample_codec {
             QuickTimeCodec::UncompressedRgb | QuickTimeCodec::UncompressedGray => {
                 let expected = meta
                     .size_x
@@ -417,7 +422,7 @@ impl FormatReader for QtReader {
                 // uncompressed planes: `buf[i] = 255 - buf[i]` (QTReader.java
                 // lines 269-274), gated on the codec not being mjpb. Uncompressed
                 // RGB (raw, 24-bit) is not inverted; only single-channel 8-bit is.
-                if matches!(series.codec, QuickTimeCodec::UncompressedGray) {
+                if matches!(sample_codec, QuickTimeCodec::UncompressedGray) {
                     quicktime_invert_pixels(&mut out);
                 }
                 Ok(out)
@@ -560,8 +565,17 @@ struct QuickTimeParsed {
     sample_offsets: Vec<u64>,
     sample_sizes: Vec<u32>,
     sample_read_order: Option<Vec<usize>>,
+    sample_codecs: Vec<QuickTimeCodec>,
     samples_per_pixel: usize,
     codec: QuickTimeCodec,
+}
+
+struct QuickTimeSampleDescription {
+    codec_fourcc: [u8; 4],
+    codec: QuickTimeCodec,
+    width: u32,
+    height: u32,
+    samples_per_pixel: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -705,6 +719,66 @@ fn quicktime_codec_from_fourcc(fourcc: &[u8], depth: u16) -> Result<QuickTimeCod
         }),
         other => Err(quicktime_unsupported_codec_error(other)),
     }
+}
+
+fn quicktime_samples_per_pixel(codec: QuickTimeCodec) -> usize {
+    match codec {
+        QuickTimeCodec::UncompressedRgb => 3,
+        QuickTimeCodec::UncompressedGray => 1,
+        QuickTimeCodec::Jpeg | QuickTimeCodec::Png => 3,
+        QuickTimeCodec::Rpza | QuickTimeCodec::AnimationRle { .. } => 3,
+        QuickTimeCodec::Cinepak { depth: 8 } => 1,
+        QuickTimeCodec::Cinepak { .. } => 3,
+    }
+}
+
+fn parse_quicktime_stsd(stsd: Atom<'_>) -> Result<Vec<QuickTimeSampleDescription>> {
+    if stsd.data.len() < 8 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsd atom is truncated".into(),
+        ));
+    }
+    let entry_count = be_u32_at(stsd.data, 4).unwrap() as usize;
+    if entry_count == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "QuickTime stsd contains no video sample descriptions".into(),
+        ));
+    }
+    let mut offset = 8usize;
+    let mut descriptions = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        if stsd.data.len().saturating_sub(offset) < 86 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime stsd sample description is truncated".into(),
+            ));
+        }
+        let entry_size = be_u32_at(stsd.data, offset).unwrap_or(0) as usize;
+        if entry_size < 86 || offset + entry_size > stsd.data.len() {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime stsd sample description has invalid size".into(),
+            ));
+        }
+        let entry = &stsd.data[offset..offset + entry_size];
+        let codec_fourcc = [entry[4], entry[5], entry[6], entry[7]];
+        let depth = be_u16_at(entry, 82).unwrap_or(0);
+        let codec = quicktime_codec_from_fourcc(&codec_fourcc, depth)?;
+        let width = be_u16_at(entry, 32).unwrap_or(0) as u32;
+        let height = be_u16_at(entry, 34).unwrap_or(0) as u32;
+        if width == 0 || height == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime video sample entry has non-positive dimensions".into(),
+            ));
+        }
+        descriptions.push(QuickTimeSampleDescription {
+            codec_fourcc,
+            codec,
+            width,
+            height,
+            samples_per_pixel: quicktime_samples_per_pixel(codec),
+        });
+        offset += entry_size;
+    }
+    Ok(descriptions)
 }
 
 fn quicktime_unsupported_codec_error(fourcc: &[u8]) -> BioFormatsError {
@@ -1514,6 +1588,41 @@ fn quicktime_sample_offsets_from_chunks(
         )));
     }
     Ok(sample_offsets)
+}
+
+fn quicktime_sample_description_indices_from_chunks(
+    chunk_count: usize,
+    sample_count: usize,
+    stsc_entries: Option<&[QuickTimeStscEntry]>,
+) -> Result<Vec<u32>> {
+    let Some(stsc_entries) = stsc_entries else {
+        return Ok(vec![1; sample_count]);
+    };
+
+    let mut sample_description_indices = Vec::with_capacity(sample_count);
+    let mut stsc_index = 0usize;
+    for chunk_index in 0..chunk_count {
+        let chunk_number = (chunk_index + 1) as u32;
+        while stsc_index + 1 < stsc_entries.len()
+            && stsc_entries[stsc_index + 1].first_chunk <= chunk_number
+        {
+            stsc_index += 1;
+        }
+        for _ in 0..stsc_entries[stsc_index].samples_per_chunk {
+            if sample_description_indices.len() >= sample_count {
+                return Ok(sample_description_indices);
+            }
+            sample_description_indices.push(stsc_entries[stsc_index].sample_description_index);
+        }
+    }
+
+    if sample_description_indices.len() != sample_count {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime stsc maps {} sample descriptions, but stsz declares {sample_count} samples",
+            sample_description_indices.len()
+        )));
+    }
+    Ok(sample_description_indices)
 }
 
 fn parse_quicktime_elst(elst: Atom<'_>) -> Result<Vec<QuickTimeEditEntry>> {
@@ -2602,32 +2711,17 @@ fn parse_quicktime_track(
             ))
         }
     };
-    if stsd.data.len() < 44 || be_u32_at(stsd.data, 4) != Some(1) {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime stsd must contain exactly one video sample description".into(),
-        ));
-    }
-    let entry = &stsd.data[8..];
-    let codec = entry.get(4..8).ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat("QuickTime stsd entry is truncated".into())
+    let descriptions = parse_quicktime_stsd(stsd)?;
+    let first_description = descriptions.first().ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(
+            "QuickTime stsd contains no video sample descriptions".into(),
+        )
     })?;
-    let sample_depth = be_u16_at(entry, 82).unwrap_or(0);
-    let qt_codec = quicktime_codec_from_fourcc(codec, sample_depth)?;
-    let width = be_u16_at(entry, 32).unwrap_or(0) as u32;
-    let height = be_u16_at(entry, 34).unwrap_or(0) as u32;
-    if width == 0 || height == 0 {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "QuickTime video sample entry has non-positive dimensions".into(),
-        ));
-    }
-    let mut samples_per_pixel = match qt_codec {
-        QuickTimeCodec::UncompressedRgb => 3usize,
-        QuickTimeCodec::UncompressedGray => 1usize,
-        QuickTimeCodec::Jpeg | QuickTimeCodec::Png => 3usize,
-        QuickTimeCodec::Rpza | QuickTimeCodec::AnimationRle { .. } => 3usize,
-        QuickTimeCodec::Cinepak { depth: 8 } => 1usize,
-        QuickTimeCodec::Cinepak { .. } => 3usize,
-    };
+    let codec = first_description.codec_fourcc;
+    let qt_codec = first_description.codec;
+    let width = first_description.width;
+    let height = first_description.height;
+    let mut samples_per_pixel = first_description.samples_per_pixel;
 
     if stsz.data.len() < 12 {
         return Err(BioFormatsError::UnsupportedFormat(
@@ -2692,6 +2786,30 @@ fn parse_quicktime_track(
         stsc_entries.as_deref(),
         chunk_offset_table_type,
     )?;
+    let sample_description_indices = quicktime_sample_description_indices_from_chunks(
+        chunk_offsets.len(),
+        sample_sizes.len(),
+        stsc_entries.as_deref(),
+    )?;
+    let mut sample_codecs = Vec::with_capacity(sample_description_indices.len());
+    for description_index in &sample_description_indices {
+        let description = descriptions
+            .get(description_index.saturating_sub(1) as usize)
+            .ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "QuickTime stsc references missing sample description {description_index}"
+                ))
+            })?;
+        if description.width != width
+            || description.height != height
+            || description.samples_per_pixel != first_description.samples_per_pixel
+        {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime alternate sample descriptions with different dimensions or channel counts are unsupported".into(),
+            ));
+        }
+        sample_codecs.push(description.codec);
+    }
     for (offset, size) in sample_offsets.iter().zip(&sample_sizes) {
         let end = offset
             .checked_add(*size as u64)
@@ -2828,12 +2946,20 @@ fn parse_quicktime_track(
     let mut metadata = HashMap::new();
     metadata.insert(
         "quicktime.codec".into(),
-        MetadataValue::String(String::from_utf8_lossy(codec).into_owned()),
+        MetadataValue::String(String::from_utf8_lossy(&codec).into_owned()),
     );
     metadata.insert(
         "quicktime.codec_family".into(),
-        MetadataValue::String(quicktime_codec_family(codec).into()),
+        MetadataValue::String(quicktime_codec_family(&codec).into()),
     );
+    if let Some(second_description) = descriptions.get(1) {
+        metadata.insert(
+            "Second codec".into(),
+            MetadataValue::String(
+                String::from_utf8_lossy(&second_description.codec_fourcc).into_owned(),
+            ),
+        );
+    }
     metadata.insert(
         "quicktime.video_track_count".into(),
         MetadataValue::Int(video_track_count as i64),
@@ -3090,6 +3216,7 @@ fn parse_quicktime_track(
         sample_offsets,
         sample_sizes,
         sample_read_order,
+        sample_codecs,
         samples_per_pixel,
         codec: qt_codec,
     })
@@ -3283,6 +3410,11 @@ impl crate::common::writer::FormatWriter for QtWriter {
         // generic x/y/w/h sub-region path collapses to a straight row copy.
         let row_len = (nchannels as i32 * width) as usize;
         for plane in &self.planes {
+            let plane = if meta.is_rgb && !meta.is_interleaved {
+                crate::common::writer::to_interleaved_samples(meta, plane)?
+            } else {
+                plane.clone()
+            };
             for row in 0..height as usize {
                 let src = &plane[row * row_len..row * row_len + row_len];
                 if nchannels == 1 {
@@ -3872,7 +4004,7 @@ impl FormatReader for MngReader {
 // ---------------------------------------------------------------------------
 // 4. 3i SlideBook
 // ---------------------------------------------------------------------------
-/// 3i SlideBook reader (`.sld`).
+/// 3i SlideBook reader (`.sld`, `.spl`).
 ///
 /// BEST-EFFORT port of the Java `SlidebookReader`. SlideBook files are a
 /// loosely documented sequence of variable-length pixel-data blocks and
@@ -4323,7 +4455,7 @@ impl FormatReader for SlidebookReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("sld"))
+        matches!(ext.as_deref(), Some("sld") | Some("spl"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {

@@ -1,4 +1,4 @@
-use bioformats::{FormatWriter, ImageMetadata, ImageReader, ImageWriter, PixelType};
+use bioformats::{FormatReader, FormatWriter, ImageMetadata, ImageReader, ImageWriter, PixelType};
 
 fn temp_path(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -423,6 +423,64 @@ fn tiff_writer_rejects_wrong_plane_size() {
 }
 
 #[test]
+fn direct_tiff_writer_accepts_larger_plane_buffer_like_java() {
+    use bioformats::TiffWriter;
+
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 2;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    let path = temp_path("direct_larger_plane_buffer.tif");
+    let mut writer = TiffWriter::new();
+    writer.set_metadata(&meta).unwrap();
+    writer.set_id(&path).unwrap();
+    writer.save_bytes(0, &[1, 2, 3, 4, 99, 100]).unwrap();
+    writer.close().unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn tiff_writer_suffixes_match_java_big_tiff_suffixes() {
+    use bioformats::tiff::PyramidOmeTiffWriter;
+    use bioformats::TiffWriter;
+
+    let tiff = TiffWriter::new();
+    for name in [
+        "plain.tif",
+        "plain.tiff",
+        "plain.tf2",
+        "plain.tf8",
+        "plain.btf",
+    ] {
+        assert!(tiff.is_this_type(std::path::Path::new(name)), "{name}");
+    }
+
+    let pyramid = PyramidOmeTiffWriter::new();
+    for name in [
+        "pyramid.ome.tif",
+        "pyramid.ome.tiff",
+        "pyramid.ome.tf2",
+        "pyramid.ome.tf8",
+        "pyramid.ome.btf",
+    ] {
+        assert!(pyramid.is_this_type(std::path::Path::new(name)), "{name}");
+    }
+    for name in [
+        "plain.tif",
+        "plain.tiff",
+        "plain.tf2",
+        "plain.tf8",
+        "plain.btf",
+    ] {
+        assert!(!pyramid.is_this_type(std::path::Path::new(name)), "{name}");
+    }
+}
+
+#[test]
 fn tiff_writer_rejects_missing_planes_on_close() {
     use bioformats::TiffWriter;
 
@@ -575,6 +633,40 @@ fn image_writer_reports_native_vendor_writers_as_explicitly_untranslated() {
 }
 
 #[test]
+fn image_writer_save_accepts_larger_plane_buffer_like_java() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 2;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_c = 1;
+    meta.image_count = 1;
+
+    let path = temp_path("larger_plane_buffer.tif");
+    ImageWriter::save(&path, &meta, &[vec![1, 2, 3, 4, 99, 100]]).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn image_writer_streaming_accepts_larger_plane_buffer_like_java() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 2;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_c = 1;
+    meta.image_count = 1;
+
+    let path = temp_path("stream_larger_plane_buffer.tif");
+    let mut writer = ImageWriter::open(&path, &meta).unwrap();
+    writer.save_bytes(0, &[5, 6, 7, 8, 101, 102]).unwrap();
+    writer.close().unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![5, 6, 7, 8]);
+}
+
+#[test]
 fn image_writer_derives_missing_plane_count_from_dimensions() {
     let mut meta = ImageMetadata::default();
     meta.size_x = 4;
@@ -618,9 +710,9 @@ fn image_writer_open_rejects_stack_for_single_plane_format() {
     meta.size_z = 2;
     meta.image_count = 2;
 
-    let path = temp_path("stack.png");
+    let path = temp_path("stack.jpg");
     let err = match ImageWriter::open(&path, &meta) {
-        Ok(_) => panic!("PNG stack unexpectedly opened for writing"),
+        Ok(_) => panic!("JPEG stack unexpectedly opened for writing"),
         Err(err) => err,
     };
 
@@ -628,6 +720,32 @@ fn image_writer_open_rejects_stack_for_single_plane_format() {
         err.to_string().contains("does not support stacks"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn generic_png_writer_uses_apng_stack_writer_like_java() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.size_z = 2;
+    meta.size_c = 1;
+    meta.size_t = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 2;
+
+    let path = temp_path("java_style_stack.png");
+    ImageWriter::save(&path, &meta, &[vec![10, 20], vec![30, 40]]).unwrap();
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.windows(4).any(|chunk| chunk == b"acTL"),
+        "generic .png writer should emit APNG control chunk like Java APNGWriter"
+    );
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 20]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![30, 40]);
 }
 
 #[test]
@@ -1232,39 +1350,33 @@ fn avi_writer_rejects_metadata_it_cannot_encode() {
     let mut writer = bioformats::formats::avi::AviWriter::new();
     let err = writer.set_metadata(&rgba_meta).unwrap_err();
     assert!(
-        err.to_string()
-            .contains("interleaved RGB Uint8 data with 3 channels"),
+        err.to_string().contains("RGB Uint8 data with 3 channels"),
         "unexpected RGBA error: {err}"
-    );
-
-    let mut planar_rgb_meta = rgba_meta;
-    planar_rgb_meta.size_c = 3;
-    planar_rgb_meta.is_interleaved = false;
-    let mut writer = bioformats::formats::avi::AviWriter::new();
-    let err = writer.set_metadata(&planar_rgb_meta).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("interleaved RGB Uint8 data with 3 channels"),
-        "unexpected planar RGB error: {err}"
     );
 }
 
 #[test]
-fn tiff_writer_does_not_claim_bigtiff_extension() {
+fn tiff_writer_claims_java_bigtiff_suffixes() {
     use bioformats::TiffWriter;
 
     let writer = TiffWriter::new();
-    assert!(!writer.is_this_type(&temp_path("classic_only.btf")));
+    assert!(writer.is_this_type(&temp_path("classic_ok.btf")));
+    assert!(writer.is_this_type(&temp_path("classic_ok.tf2")));
+    assert!(writer.is_this_type(&temp_path("classic_ok.tf8")));
     assert!(writer.is_this_type(&temp_path("classic_ok.tif")));
     assert!(writer.is_this_type(&temp_path("classic_ok.tiff")));
 }
 
 #[test]
-fn tiff_writer_rejects_planar_rgb_and_bit_metadata() {
+fn tiff_writer_accepts_planar_rgb_like_java() {
+    use bioformats::tiff::ifd::tag;
+    use bioformats::tiff::parser::TiffParser;
     use bioformats::TiffWriter;
+    use std::fs::File;
+    use std::io::BufReader;
 
     let mut planar_rgb = ImageMetadata::default();
-    planar_rgb.size_x = 1;
+    planar_rgb.size_x = 2;
     planar_rgb.size_y = 1;
     planar_rgb.pixel_type = PixelType::Uint8;
     planar_rgb.size_c = 3;
@@ -1272,12 +1384,30 @@ fn tiff_writer_rejects_planar_rgb_and_bit_metadata() {
     planar_rgb.is_rgb = true;
     planar_rgb.is_interleaved = false;
 
+    let data = vec![10, 40, 20, 50, 30, 60];
+    let path = temp_path("planar_rgb.tif");
     let mut writer = TiffWriter::new();
-    let err = writer.set_metadata(&planar_rgb).unwrap_err();
-    assert!(
-        err.to_string().contains("does not support planar RGB"),
-        "unexpected planar RGB error: {err}"
-    );
+    writer.set_metadata(&planar_rgb).unwrap();
+    writer.set_id(&path).unwrap();
+    writer.save_bytes(0, &data).unwrap();
+    writer.close().unwrap();
+
+    let file = File::open(&path).unwrap();
+    let mut parser = TiffParser::new(BufReader::new(file)).unwrap();
+    let ifds = parser.read_ifds().unwrap();
+    assert_eq!(ifds[0].get_u16(tag::PLANAR_CONFIGURATION), Some(2));
+    assert_eq!(ifds[0].get_vec_u32(tag::STRIP_OFFSETS).len(), 3);
+    assert_eq!(ifds[0].get_vec_u32(tag::STRIP_BYTE_COUNTS), vec![2, 2, 2]);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert!(reader.metadata().is_rgb);
+    assert!(!reader.metadata().is_interleaved);
+    assert_eq!(reader.open_bytes(0).unwrap(), data);
+}
+
+#[test]
+fn tiff_writer_rejects_bit_metadata() {
+    use bioformats::TiffWriter;
 
     let mut bit_meta = ImageMetadata::default();
     bit_meta.size_x = 8;
@@ -1409,6 +1539,135 @@ fn direct_ome_xml_writer_populates_required_channels_from_empty_store() {
 }
 
 #[test]
+fn generic_ome_tiff_suffix_writes_embedded_ome_xml_like_java_writer_selection() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.size_z = 1;
+    meta.size_c = 2;
+    meta.size_t = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 2;
+
+    let path = temp_path("generic_writer_selection.ome.tif");
+    ImageWriter::save(&path, &meta, &[vec![7], vec![9]]).unwrap();
+
+    let bytes = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains(r#"<OME "#),
+        "OME-XML missing from TIFF comment"
+    );
+    assert!(text.contains(r#"SizeC="2""#));
+}
+
+#[test]
+fn jpeg_writer_accepts_jpe_suffix_like_java() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.size_c = 3;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+
+    let path = temp_path("suffix_java.jpe");
+    ImageWriter::save(&path, &meta, &[vec![255, 0, 0, 0, 255, 0]]).unwrap();
+    assert!(path.exists());
+}
+
+#[test]
+fn ome_xml_writer_splits_rgb_bindata_per_channel_like_java() {
+    use bioformats::formats::ome_xml::{OmeXmlReader, OmeXmlWriter};
+
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.size_c = 3;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+
+    let path = temp_path("rgb_split.ome.xml");
+    let mut writer = OmeXmlWriter::new();
+    writer.set_metadata(&meta).unwrap();
+    writer.set_id(&path).unwrap();
+    writer.save_bytes(0, &[1, 2, 3, 4, 5, 6]).unwrap();
+    writer.close().unwrap();
+
+    let xml = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(xml.matches("<BinData ").count(), 3);
+    assert_eq!(xml.matches(r#"Length="2""#).count(), 3);
+    assert!(xml.contains(">AQQ=</BinData>"));
+    assert!(xml.contains(">AgU=</BinData>"));
+    assert!(xml.contains(">AwY=</BinData>"));
+
+    let mut reader = OmeXmlReader::new();
+    reader.set_id(&path).unwrap();
+    assert!(reader.metadata().is_rgb);
+    assert!(reader.metadata().is_interleaved);
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn planar_rgb_writer_inputs_are_interleaved_like_java() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.size_c = 3;
+    meta.is_rgb = true;
+    meta.is_interleaved = false;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+
+    // R plane [10, 40], G plane [20, 50], B plane [30, 60].
+    let planar = vec![10, 40, 20, 50, 30, 60];
+
+    let png_path = temp_path("planar_rgb.png");
+    ImageWriter::save(&png_path, &meta, &[planar.clone()]).unwrap();
+    let mut png_reader = ImageReader::open(&png_path).unwrap();
+    assert_eq!(
+        png_reader.open_bytes(0).unwrap(),
+        vec![10, 20, 30, 40, 50, 60]
+    );
+
+    let bmp_path = temp_path("planar_rgb.bmp");
+    ImageWriter::save(&bmp_path, &meta, &[planar.clone()]).unwrap();
+    let mut bmp_reader = ImageReader::open(&bmp_path).unwrap();
+    assert_eq!(
+        bmp_reader.open_bytes(0).unwrap(),
+        vec![10, 20, 30, 40, 50, 60]
+    );
+
+    let eps_path = temp_path("planar_rgb.eps");
+    ImageWriter::save(&eps_path, &meta, &[planar.clone()]).unwrap();
+    let eps = std::fs::read_to_string(&eps_path).unwrap();
+    assert!(eps.contains("0A141E28323C"));
+
+    let avi_path = temp_path("planar_rgb.avi");
+    ImageWriter::save(&avi_path, &meta, &[planar.clone()]).unwrap();
+    let mut avi_reader = ImageReader::open(&avi_path).unwrap();
+    assert_eq!(
+        avi_reader.open_bytes(0).unwrap(),
+        vec![10, 20, 30, 40, 50, 60]
+    );
+
+    let mov_path = temp_path("planar_rgb.mov");
+    ImageWriter::save(&mov_path, &meta, &[planar]).unwrap();
+    let mut mov_reader = ImageReader::open(&mov_path).unwrap();
+    assert_eq!(
+        mov_reader.open_bytes(0).unwrap(),
+        vec![10, 20, 30, 40, 50, 60]
+    );
+}
+
+#[test]
 fn png_round_trip() {
     let mut meta = ImageMetadata::default();
     meta.size_x = 8;
@@ -1416,6 +1675,7 @@ fn png_round_trip() {
     meta.pixel_type = PixelType::Uint8;
     meta.size_c = 3;
     meta.is_rgb = true;
+    meta.is_interleaved = true;
     meta.image_count = 1;
 
     let data: Vec<u8> = (0u8..192).collect(); // 8×8×3

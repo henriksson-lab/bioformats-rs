@@ -971,7 +971,33 @@ impl FormatReader for DeltavisionReader {
         // Check magic at offset 96 for both LE and BE
         let le = i16::from_le_bytes([header[96], header[97]]);
         let be = i16::from_be_bytes([header[96], header[97]]);
-        le == DV_MAGIC_LE || be == DV_MAGIC_LE
+        let little = if le == DV_MAGIC_LE {
+            true
+        } else if be == DV_MAGIC_LE {
+            false
+        } else {
+            return false;
+        };
+
+        // Java DeltavisionReader.isThisType rejects MRC/MAP headers after the
+        // magic check. MAP is at offset 208 in MRC files.
+        if header.len() >= 212 && header[208..212].iter().any(|&b| b != 0) {
+            let map = std::str::from_utf8(&header[208..212]).unwrap_or("").trim();
+            if map == "MAP" {
+                return false;
+            }
+        }
+
+        // Java also verifies that the leading dimensions are positive. It uses
+        // the file length for a one-plane sanity check; byte sniffing has no
+        // complete stream length, so keep the deterministic header part here.
+        if header.len() >= 12 {
+            r_i32(header, 0, little) > 0
+                && r_i32(header, 4, little) > 0
+                && r_i32(header, 8, little) > 0
+        } else {
+            true
+        }
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1499,6 +1525,29 @@ mod tests {
 
     fn write_u16(buf: &mut [u8], off: usize, value: u16) {
         buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn byte_sniffing_rejects_mrc_map_header_with_dv_magic_collision() {
+        let mut header = vec![0u8; 212];
+        write_i32(&mut header, 0, 4);
+        write_i32(&mut header, 4, 4);
+        write_i32(&mut header, 8, 1);
+        write_i16(&mut header, 96, DV_MAGIC_LE);
+        header[208..212].copy_from_slice(b"MAP ");
+
+        assert!(!DeltavisionReader::new().is_this_type_by_bytes(&header));
+    }
+
+    #[test]
+    fn byte_sniffing_requires_positive_leading_dimensions() {
+        let mut header = vec![0u8; 212];
+        write_i32(&mut header, 0, 0);
+        write_i32(&mut header, 4, 4);
+        write_i32(&mut header, 8, 1);
+        write_i16(&mut header, 96, DV_MAGIC_LE);
+
+        assert!(!DeltavisionReader::new().is_this_type_by_bytes(&header));
     }
 
     fn write_synthetic_dv_with_header(

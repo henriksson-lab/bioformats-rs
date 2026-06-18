@@ -549,45 +549,6 @@ fn parse_prairie_xml(path: &Path) -> Result<PrairieParse> {
         let _ = r.close();
     }
 
-    let mut checked_tiffs: HashMap<PathBuf, u32> = HashMap::new();
-    for pf in sequences
-        .iter()
-        .flat_map(|s| s.frames.iter())
-        .flat_map(|f| f.files.iter())
-    {
-        let pages = if let Some(pages) = checked_tiffs.get(&pf.filename) {
-            *pages
-        } else {
-            let mut r = TiffReader::new();
-            r.set_id(&pf.filename).map_err(|e| {
-                BioFormatsError::Format(format!(
-                    "Prairie: companion TIFF {} could not be read before metadata was initialized: {e}",
-                    pf.filename.display()
-                ))
-            })?;
-            let tm = r.metadata();
-            if tm.size_x != width || tm.size_y != height {
-                return Err(BioFormatsError::Format(format!(
-                    "Prairie: companion TIFF {} has dimensions {}x{}, expected {width}x{height}",
-                    pf.filename.display(),
-                    tm.size_x,
-                    tm.size_y
-                )));
-            }
-            let pages = tm.image_count.max(1);
-            let _ = r.close();
-            checked_tiffs.insert(pf.filename.clone(), pages);
-            pages
-        };
-        if pf.page >= pages {
-            return Err(BioFormatsError::Format(format!(
-                "Prairie: TIFF page {} out of range for {} ({} pages)",
-                pf.page,
-                pf.filename.display(),
-                pages
-            )));
-        }
-    }
     if width == 0 || height == 0 {
         return Err(BioFormatsError::Format(format!(
             "Prairie: invalid image dimensions {width}x{height}"
@@ -848,9 +809,16 @@ impl FormatReader for PrairieReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let (tiff_path, page) = self.file_for_plane(plane_index).ok_or_else(|| {
-            BioFormatsError::Format(format!("Prairie: no file for plane {}", plane_index))
-        })?;
+        let Some((tiff_path, page)) = self.file_for_plane(plane_index) else {
+            let len = meta
+                .size_x
+                .checked_mul(meta.size_y)
+                .and_then(|px| px.checked_mul(meta.pixel_type.bytes_per_sample() as u32))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Prairie: blank plane size overflows".into())
+                })? as usize;
+            return Ok(vec![0; len]);
+        };
         let mut tiff = TiffReader::new();
         tiff.set_id(&tiff_path)?;
         let inner = tiff.metadata().image_count.max(1);
@@ -872,6 +840,16 @@ impl FormatReader for PrairieReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        if self.file_for_plane(plane_index).is_none() {
+            let meta = self.metadata();
+            let len = w
+                .checked_mul(h)
+                .and_then(|px| px.checked_mul(meta.pixel_type.bytes_per_sample() as u32))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Prairie: blank region size overflows".into())
+                })? as usize;
+            return Ok(vec![0; len]);
+        }
         let full = self.open_bytes(plane_index)?;
         let meta = self.metas.get(self.series).unwrap();
         crate::formats::leica::crop_region(&full, meta, x, y, w, h)
@@ -1336,7 +1314,7 @@ mod prairie_tests {
     }
 
     #[test]
-    fn prairie_companion_tiff_page_uses_exact_index() {
+    fn prairie_companion_tiff_page_uses_exact_index_at_read_time() {
         let dir = temp_dir("exact_page");
         let tiff = dir.join("scan_001.tif");
         let meta = ImageMetadata {
@@ -1367,12 +1345,63 @@ mod prairie_tests {
         )
         .unwrap();
 
-        let err = PrairieReader::new().set_id(&xml).unwrap_err();
+        let mut reader = PrairieReader::new();
+        reader.set_id(&xml).unwrap();
+        let err = reader.open_bytes(0).unwrap_err();
 
         assert!(
             matches!(err, BioFormatsError::Format(ref message) if message.contains("TIFF page 1 out of range")),
             "unexpected error: {err:?}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prairie_missing_mapped_channel_returns_blank_plane_like_java() {
+        let dir = temp_dir("missing_channel_blank");
+        let ch1 = dir.join("scan_ch1.tif");
+        let ch2 = dir.join("scan_ch2.tif");
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        };
+        ImageWriter::save(&ch1, &meta, &[vec![17]]).unwrap();
+        ImageWriter::save(&ch2, &meta, &[vec![29]]).unwrap();
+        let xml = dir.join("scan.xml");
+        std::fs::write(
+            &xml,
+            r#"<PVScan>
+<PVStateValue key="pixelsPerLine" value="1"/>
+<PVStateValue key="linesPerFrame" value="1"/>
+<PVStateValue key="bitDepth" value="8"/>
+<Sequence>
+<Frame index="0">
+<File filename="scan_ch1.tif" channel="1" page="1"/>
+</Frame>
+<Frame index="1">
+<File filename="scan_ch2.tif" channel="2" page="1"/>
+</Frame>
+</Sequence>
+</PVScan>"#,
+        )
+        .unwrap();
+
+        let mut reader = PrairieReader::new();
+        reader.set_id(&xml).unwrap();
+        assert_eq!(reader.metadata().size_z, 2);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![17]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![0]);
+        assert_eq!(reader.open_bytes_region(1, 0, 0, 1, 1).unwrap(), vec![0]);
+        assert_eq!(reader.open_bytes(3).unwrap(), vec![29]);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

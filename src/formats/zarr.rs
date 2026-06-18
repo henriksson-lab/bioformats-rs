@@ -418,10 +418,20 @@ impl OmeZarrReader {
         let root_attrs = read_group_attributes(root).unwrap_or_default();
 
         if groups.is_empty() {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "OME-Zarr: no multiscales image found under {}",
-                root.display()
-            )));
+            let plain = build_plain_zarr_series(&store, root)?;
+            if plain.is_empty() {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "OME-Zarr: no multiscales image found under {}",
+                    root.display()
+                )));
+            }
+            self.plate = None;
+            self.store = Some(store);
+            self.series = plain;
+            self.current_series = 0;
+            self.current_resolution = 0;
+            self.refresh_metadata();
+            return Ok(());
         }
 
         // Natural-order the group keys (root "" sorts first).
@@ -450,6 +460,124 @@ impl OmeZarrReader {
         self.refresh_metadata();
         Ok(())
     }
+}
+
+/// Build Java-compatible metadata for plain Zarr arrays without NGFF
+/// `multiscales`. Java `ZarrReader.get5DShape` right-aligns non-5D shapes into
+/// `[t,c,z,y,x]`, so a root 2D array is exposed as singleton T/C/Z.
+fn build_plain_zarr_series(store: &Arc<FilesystemStore>, root: &Path) -> Result<Vec<ZarrSeries>> {
+    let candidates = collect_plain_array_paths(root);
+    let mut out = Vec::new();
+    for path in candidates {
+        let key = format!("/{}", path.trim_start_matches('/'));
+        let array = match Array::open(store.clone(), &key) {
+            Ok(array) => array,
+            Err(_) => continue,
+        };
+        let shape = array.shape().to_vec();
+        if shape.is_empty() || shape.len() > 5 {
+            continue;
+        }
+        let dtype = format!("{}", array.data_type());
+        let pixel_type = pixel_type_from_dtype(&dtype)?;
+        let axis_index = java_plain_axis_index(shape.len());
+        let dim = |li: usize| -> u32 {
+            axis_index[li]
+                .and_then(|idx| shape.get(idx).copied())
+                .unwrap_or(1) as u32
+        };
+        let name = if path.is_empty() {
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Image")
+                .trim_end_matches(".zarr")
+                .to_string()
+        } else {
+            path.clone()
+        };
+        out.push(ZarrSeries {
+            group_path: path.clone(),
+            name,
+            levels: vec![ZarrLevel {
+                path,
+                size_t: dim(0),
+                size_c: dim(1),
+                size_z: dim(2),
+                size_y: dim(3),
+                size_x: dim(4),
+                ndim: shape.len(),
+                axis_index,
+                pixel_type,
+                dimension_order: DimensionOrder::XYZCT,
+            }],
+            physical_size_x: None,
+            physical_size_y: None,
+            physical_size_z: None,
+            time_increment: None,
+            channels: Vec::new(),
+        });
+    }
+    Ok(out)
+}
+
+fn collect_plain_array_paths(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_plain_array_paths_rec(root, "", &mut out);
+    out.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)));
+    out
+}
+
+fn collect_plain_array_paths_rec(dir: &Path, rel: &str, out: &mut Vec<String>) {
+    if dir.join(".zarray").is_file() || zarr_json_is_array(dir) {
+        out.push(rel.to_string());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || name == "OME" {
+            continue;
+        }
+        let child_rel = if rel.is_empty() {
+            name.to_string()
+        } else {
+            format!("{rel}/{name}")
+        };
+        collect_plain_array_paths_rec(&p, &child_rel, out);
+    }
+}
+
+fn zarr_json_is_array(dir: &Path) -> bool {
+    let zarr_json = dir.join("zarr.json");
+    let Ok(text) = std::fs::read_to_string(zarr_json) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|json| {
+            json.get("node_type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("array")
+}
+
+fn java_plain_axis_index(ndim: usize) -> [Option<usize>; 5] {
+    let mut axis_index = [None; 5];
+    let start = 5usize.saturating_sub(ndim);
+    for idx in 0..ndim {
+        axis_index[start + idx] = Some(idx);
+    }
+    axis_index
 }
 
 /// Build the series (usually one) described by a single multiscales group.

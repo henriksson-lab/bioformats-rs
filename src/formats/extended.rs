@@ -6442,9 +6442,7 @@ mod hamamatsu_vms_tests {
             .find_map(|annotation| match annotation {
                 OmeAnnotation::MapAnnotation {
                     namespace, values, ..
-                } if namespace.as_deref()
-                    == Some("openmicroscopy.org/bioformats/original-metadata") =>
-                {
+                } if namespace.as_deref() == Some("openmicroscopy.org/OriginalMetadata") => {
                     Some(values)
                 }
                 _ => None,
@@ -12144,7 +12142,7 @@ impl FormatWriter for ApngWriter {
     fn is_this_type(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("apng"))
+            .map(|e| e.eq_ignore_ascii_case("png") || e.eq_ignore_ascii_case("apng"))
             .unwrap_or(false)
     }
 
@@ -12179,8 +12177,15 @@ impl FormatWriter for ApngWriter {
         Ok(())
     }
 
-    fn save_bytes(&mut self, _plane_index: u32, data: &[u8]) -> Result<()> {
+    fn save_bytes(&mut self, plane_index: u32, data: &[u8]) -> Result<()> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        crate::formats::stack_writer::validate_next_plane(
+            "APNG",
+            meta,
+            self.num_frames as usize,
+            plane_index,
+            data.len(),
+        )?;
         let width = meta.size_x;
         let height = meta.size_y;
 
@@ -12201,6 +12206,11 @@ impl FormatWriter for ApngWriter {
         // Only flush if a plane was written and an output path is set.
         if let (Some(path), Some(meta)) = (self.path.clone(), self.meta.clone()) {
             if self.num_frames > 0 {
+                crate::formats::stack_writer::validate_complete(
+                    "APNG",
+                    &meta,
+                    self.num_frames as usize,
+                )?;
                 let bytes_per_pixel = meta.pixel_type.bytes_per_sample();
                 let n_channels = if meta.is_rgb { meta.size_c } else { 1 };
                 let indexed = meta.is_indexed;

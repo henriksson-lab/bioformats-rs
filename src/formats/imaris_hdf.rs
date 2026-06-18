@@ -1107,6 +1107,54 @@ fn imaris_16bit_lookup_table(color: [f64; 3]) -> LookupTable {
     }
 }
 
+fn read_imaris_selection_bytes(
+    ds: &hdf5_pure_rust::Dataset,
+    selection: Selection,
+    pixel_type: PixelType,
+) -> Result<Vec<u8>> {
+    match pixel_type {
+        PixelType::Int8 | PixelType::Uint8 | PixelType::Bit => ds
+            .read_slice::<u8, _>(selection)
+            .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}"))),
+        PixelType::Int16 => {
+            let words: Vec<i16> = ds
+                .read_slice::<i16, _>(selection)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+            Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect())
+        }
+        PixelType::Uint16 => {
+            let words: Vec<u16> = ds
+                .read_slice::<u16, _>(selection)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+            Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect())
+        }
+        PixelType::Int32 => {
+            let dwords: Vec<i32> = ds
+                .read_slice::<i32, _>(selection)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+            Ok(dwords.iter().flat_map(|d| d.to_le_bytes()).collect())
+        }
+        PixelType::Uint32 => {
+            let dwords: Vec<u32> = ds
+                .read_slice::<u32, _>(selection)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+            Ok(dwords.iter().flat_map(|d| d.to_le_bytes()).collect())
+        }
+        PixelType::Float32 => {
+            let values: Vec<f32> = ds
+                .read_slice::<f32, _>(selection)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+            Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+        }
+        PixelType::Float64 => {
+            let values: Vec<f64> = ds
+                .read_slice::<f64, _>(selection)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+            Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+        }
+    }
+}
+
 fn parse_imaris_f64(value: &str) -> Option<f64> {
     value
         .split(|ch: char| ch.is_ascii_whitespace() || ch == ',' || ch == ';' || ch == '=')
@@ -2877,26 +2925,7 @@ impl FormatReader for ImarisHdfReader {
                 HyperslabDim::new(0, 1, size_x as u64, 1), // all cols
             ]);
 
-            let raw: Vec<u8> = match bps {
-                1 => ds
-                    .read_slice::<u8, _>(sel)
-                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
-                2 => {
-                    let words: Vec<u16> = ds
-                        .read_slice::<u16, _>(sel)
-                        .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-                    words.iter().flat_map(|w| w.to_le_bytes()).collect()
-                }
-                4 => {
-                    let dwords: Vec<u32> = ds
-                        .read_slice::<u32, _>(sel)
-                        .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-                    dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
-                }
-                _ => ds
-                    .read_slice::<u8, _>(sel)
-                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
-            };
+            let raw = read_imaris_selection_bytes(&ds, sel, meta.pixel_type)?;
             self.cache = Some(VolumeCache { res, t, c, z, raw });
         }
 
@@ -2970,26 +2999,7 @@ impl FormatReader for ImarisHdfReader {
             HyperslabDim::new(x as u64, 1, w as u64, 1),
         ]);
 
-        let raw: Vec<u8> = match bps {
-            1 => ds
-                .read_slice::<u8, _>(sel)
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
-            2 => {
-                let words: Vec<u16> = ds
-                    .read_slice::<u16, _>(sel)
-                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-                words.iter().flat_map(|w| w.to_le_bytes()).collect()
-            }
-            4 => {
-                let dwords: Vec<u32> = ds
-                    .read_slice::<u32, _>(sel)
-                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-                dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
-            }
-            _ => ds
-                .read_slice::<u8, _>(sel)
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
-        };
+        let raw = read_imaris_selection_bytes(&ds, sel, meta.pixel_type)?;
 
         if raw.len() == expected {
             Ok(raw)

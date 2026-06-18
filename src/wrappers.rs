@@ -11,6 +11,28 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use std::path::Path;
 
+fn rgb_channel_count(meta: &ImageMetadata) -> u32 {
+    if !meta.is_rgb {
+        return 1;
+    }
+    let zt = meta.size_z.max(1).saturating_mul(meta.size_t.max(1));
+    if zt > 0 && meta.image_count >= zt {
+        let effective_c = (meta.image_count / zt).max(1);
+        if effective_c > 0 && meta.size_c >= effective_c && meta.size_c % effective_c == 0 {
+            return (meta.size_c / effective_c).max(1);
+        }
+    }
+    meta.size_c.max(1)
+}
+
+fn effective_size_c(meta: &ImageMetadata) -> u32 {
+    if meta.is_rgb {
+        (meta.size_c / rgb_channel_count(meta)).max(1)
+    } else {
+        meta.size_c.max(1)
+    }
+}
+
 fn wrapper_ome_metadata(
     inner: &dyn FormatReader,
     adjusted_meta: Option<&ImageMetadata>,
@@ -25,8 +47,9 @@ fn wrapper_ome_metadata(
         };
         let target = ome.images.get_mut(image_index)?;
         let existing_channels = target.channels.clone();
-        let samples_per_pixel = if meta.is_rgb { meta.size_c } else { 1 };
-        target.channels = (0..meta.size_c)
+        let samples_per_pixel = rgb_channel_count(meta);
+        let channel_count = effective_size_c(meta);
+        target.channels = (0..channel_count)
             .map(|i| OmeChannel {
                 name: existing_channels
                     .get(i as usize)
@@ -73,11 +96,10 @@ impl ChannelSeparator {
     }
 
     /// Java ChannelSeparator separates whenever `reader.isRGB() && !reader.isIndexed()`,
-    /// regardless of interleaving. In this metadata model `getRGBChannelCount()`
-    /// equals `size_c` when RGB (effectiveSizeC == 1), so the split factor is
-    /// `size_c`.
+    /// regardless of interleaving. The split factor is `getRGBChannelCount()`,
+    /// not total `SizeC`; RGB readers may still have multiple effective C planes.
     fn should_split(meta: &ImageMetadata) -> bool {
-        meta.is_rgb && !meta.is_indexed && meta.size_c > 1
+        meta.is_rgb && !meta.is_indexed && rgb_channel_count(meta) > 1
     }
 
     fn rebuild_meta(&mut self) {
@@ -85,7 +107,8 @@ impl ChannelSeparator {
         if Self::should_split(meta) {
             let mut adjusted = meta.clone();
             // Java getImageCount() = getRGBChannelCount() * reader.getImageCount().
-            adjusted.image_count = meta.image_count * meta.size_c;
+            adjusted.image_count = meta.image_count * rgb_channel_count(meta);
+            adjusted.dimension_order = channel_first_dimension_order(meta.dimension_order);
             adjusted.is_interleaved = false;
             adjusted.is_rgb = false;
             self.adjusted_meta = Some(adjusted);
@@ -186,7 +209,7 @@ impl FormatReader for ChannelSeparator {
             let meta = self.inner.metadata();
             (
                 Self::should_split(meta),
-                meta.size_c,
+                rgb_channel_count(meta),
                 meta.pixel_type.bytes_per_sample(),
                 meta.is_interleaved,
             )
@@ -219,7 +242,7 @@ impl FormatReader for ChannelSeparator {
             let meta = self.inner.metadata();
             (
                 Self::should_split(meta),
-                meta.size_c,
+                rgb_channel_count(meta),
                 meta.pixel_type.bytes_per_sample(),
                 meta.is_interleaved,
             )
@@ -245,7 +268,7 @@ impl FormatReader for ChannelSeparator {
             let meta = self.inner.metadata();
             (
                 Self::should_split(meta),
-                meta.size_c,
+                rgb_channel_count(meta),
                 meta.pixel_type.bytes_per_sample(),
                 meta.is_interleaved,
             )
@@ -330,6 +353,7 @@ impl ChannelMerger {
             let mut adjusted = meta.clone();
             // Java: getImageCount() divides by getSizeC() when canMerge().
             adjusted.image_count = meta.image_count / meta.size_c;
+            adjusted.dimension_order = channel_first_dimension_order(meta.dimension_order);
             // Java isRGB() returns true and isInterleaved() returns false when merging.
             adjusted.is_rgb = true;
             adjusted.is_interleaved = false;
@@ -600,6 +624,17 @@ fn decompose_plane(
     }
 }
 
+fn channel_first_dimension_order(order: DimensionOrder) -> DimensionOrder {
+    match order {
+        DimensionOrder::XYZCT | DimensionOrder::XYZTC | DimensionOrder::XYCZT => {
+            DimensionOrder::XYCZT
+        }
+        DimensionOrder::XYCTZ | DimensionOrder::XYTCZ | DimensionOrder::XYTZC => {
+            DimensionOrder::XYCTZ
+        }
+    }
+}
+
 fn decompose_plane_without_channel(
     index: u32,
     sz: u32,
@@ -751,11 +786,7 @@ impl MinMaxCalculator {
         let pt = meta.pixel_type;
         let little_endian = meta.is_little_endian;
         // numRGB = getRGBChannelCount(); effectiveSizeC = size_c / numRGB.
-        let num_rgb = if meta.is_rgb {
-            meta.size_c.max(1) as usize
-        } else {
-            1
-        };
+        let num_rgb = rgb_channel_count(meta) as usize;
         let total_channels = meta.size_c.max(1) as usize;
         let interleaved = meta.is_interleaved && meta.is_rgb;
 
@@ -763,7 +794,7 @@ impl MinMaxCalculator {
         let (sz, sc, st) = (
             meta.size_z.max(1),
             // effectiveSizeC: the number of distinct C planes.
-            (total_channels / num_rgb).max(1) as u32,
+            effective_size_c(meta),
             meta.size_t.max(1),
         );
         let plane_count = (sz as usize) * (sc as usize) * (st as usize);
@@ -1138,12 +1169,64 @@ mod tests {
         let ome = separator.ome_metadata().expect("OME metadata");
 
         assert_eq!(separator.metadata().image_count, 3);
+        assert_eq!(separator.metadata().dimension_order, DimensionOrder::XYCZT);
         assert_eq!(ome.images[0].channels.len(), 3);
         assert!(ome.images[0]
             .channels
             .iter()
             .all(|ch| ch.samples_per_pixel == 1));
         assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn channel_separator_splits_rgb_samples_not_effective_channels() {
+        let mut meta = ImageMetadata::default();
+        meta.size_z = 1;
+        meta.size_c = 6;
+        meta.size_t = 1;
+        meta.image_count = 2;
+        meta.is_rgb = true;
+        meta.is_interleaved = true;
+
+        let planes = vec![vec![10, 20, 30], vec![40, 50, 60]];
+        let inner = Box::new(MockReader::new(meta, planes));
+        let mut separator = ChannelSeparator::new(inner);
+
+        separator.rebuild_meta();
+
+        assert_eq!(separator.metadata().size_c, 6);
+        assert_eq!(separator.metadata().image_count, 6);
+        assert_eq!(separator.open_bytes(0).unwrap(), vec![10]);
+        assert_eq!(separator.open_bytes(1).unwrap(), vec![20]);
+        assert_eq!(separator.open_bytes(2).unwrap(), vec![30]);
+        assert_eq!(separator.open_bytes(3).unwrap(), vec![40]);
+        assert_eq!(separator.open_bytes(4).unwrap(), vec![50]);
+        assert_eq!(separator.open_bytes(5).unwrap(), vec![60]);
+    }
+
+    #[test]
+    fn channel_merger_updates_dimension_order_and_ome_samples_like_java() {
+        let mut meta = ImageMetadata::default();
+        meta.size_z = 2;
+        meta.size_c = 3;
+        meta.size_t = 1;
+        meta.image_count = 6;
+        meta.dimension_order = DimensionOrder::XYZCT;
+        meta.is_rgb = false;
+        meta.is_interleaved = false;
+
+        let ome = OmeMetadata::from_image_metadata(&meta);
+        let inner = Box::new(MockReader::new(meta, vec![vec![1]; 6]).with_ome(ome));
+        let mut merger = ChannelMerger::new(inner);
+
+        merger.rebuild_meta().expect("merge metadata");
+        let ome = merger.ome_metadata().expect("OME metadata");
+
+        assert_eq!(merger.metadata().image_count, 2);
+        assert_eq!(merger.metadata().dimension_order, DimensionOrder::XYCZT);
+        assert!(merger.metadata().is_rgb);
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
     }
 
     #[test]
@@ -1161,11 +1244,8 @@ mod tests {
         let ome = filler.ome_metadata().expect("OME metadata");
 
         assert_eq!(filler.metadata().size_c, 3);
-        assert_eq!(ome.images[0].channels.len(), 3);
-        assert!(ome.images[0]
-            .channels
-            .iter()
-            .all(|ch| ch.samples_per_pixel == 3));
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
     }
 }
 

@@ -367,7 +367,9 @@ fn pixel_type_from_mode(mode: i32, imod_stamp: u32, imod_flags: i32) -> PixelTyp
         4 => PixelType::Float64,
         6 => PixelType::Uint16,
         16 => PixelType::Uint8, // RGB uint8 (3-channel)
-        _ => PixelType::Float32,
+        // MRCReader.java has no default case. Unknown modes leave
+        // CoreMetadata.pixelType at Java's default integer value 0, i.e. INT8.
+        _ => PixelType::Int8,
     }
 }
 
@@ -582,7 +584,11 @@ impl FormatReader for MrcReader {
             pixel_type,
             bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
             image_count: nz,
-            dimension_order: DimensionOrder::XYZTC,
+            dimension_order: if is_rgb {
+                DimensionOrder::XYCZT
+            } else {
+                DimensionOrder::XYZTC
+            },
             is_rgb,
             is_interleaved: true,
             is_indexed: false,
@@ -1037,6 +1043,61 @@ mod tests {
         assert_eq!(meta.pixel_type, PixelType::Int8);
         assert_eq!(meta.bits_per_pixel, 8);
         assert_eq!(plane, vec![0x00, 0x7f, 0x80, 0xff]);
+    }
+
+    #[test]
+    fn mrc_reader_reports_rgb_dimension_order_like_java() {
+        let path = temp_mrc_path("rgb_mode16_dimension_order");
+        let mut bytes = vec![0u8; HEADER_SIZE as usize];
+        bytes[0..4].copy_from_slice(&2i32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&1i32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1i32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&16i32.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1i32.to_le_bytes());
+        bytes[68..72].copy_from_slice(&2i32.to_le_bytes());
+        bytes[72..76].copy_from_slice(&3i32.to_le_bytes());
+        bytes[208..212].copy_from_slice(b"MAP ");
+        bytes[212] = 0x44;
+        bytes[213] = 0x44;
+        bytes.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reader = MrcReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata().clone();
+        fs::remove_file(path).ok();
+
+        assert!(meta.is_rgb);
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+    }
+
+    #[test]
+    fn mrc_unknown_mode_uses_java_coremetadata_default_int8() {
+        let path = temp_mrc_path("unknown_mode_default_int8");
+        let mut bytes = vec![0u8; HEADER_SIZE as usize];
+        bytes[0..4].copy_from_slice(&2i32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&1i32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1i32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&99i32.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1i32.to_le_bytes());
+        bytes[68..72].copy_from_slice(&2i32.to_le_bytes());
+        bytes[72..76].copy_from_slice(&3i32.to_le_bytes());
+        bytes[208..212].copy_from_slice(b"MAP ");
+        bytes[212] = 0x44;
+        bytes[213] = 0x44;
+        bytes.extend_from_slice(&[1, 2]);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reader = MrcReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata().clone();
+        let plane = reader.open_bytes(0).unwrap();
+        fs::remove_file(path).ok();
+
+        assert_eq!(meta.pixel_type, PixelType::Int8);
+        assert_eq!(meta.bits_per_pixel, 8);
+        assert_eq!(plane, vec![1, 2]);
     }
 
     #[test]

@@ -26,11 +26,12 @@ pub struct TiffWriter {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     file: Option<BufWriter<File>>,
-    /// (strip_offset, strip_byte_count) recorded per plane as they are written.
-    plane_strips: Vec<(u64, u64)>,
+    /// (strip_offset, strip_byte_count) recorded per strip as planes are written.
+    plane_strips: Vec<Vec<(u64, u64)>>,
     planes_written: u32,
     /// Optional OME-XML to embed in the first IFD's ImageDescription.
     ome_xml: Option<String>,
+    auto_ome_xml: bool,
 }
 
 impl TiffWriter {
@@ -43,6 +44,7 @@ impl TiffWriter {
             plane_strips: Vec::new(),
             planes_written: 0,
             ome_xml: None,
+            auto_ome_xml: false,
         }
     }
 
@@ -54,6 +56,12 @@ impl TiffWriter {
     /// Set OME-XML to embed in the TIFF ImageDescription tag, producing an OME-TIFF.
     pub fn with_ome_xml(mut self, xml: String) -> Self {
         self.ome_xml = Some(xml);
+        self
+    }
+
+    /// Generate minimal OME-XML from `ImageMetadata` during `set_metadata`.
+    pub fn with_auto_ome_xml(mut self) -> Self {
+        self.auto_ome_xml = true;
         self
     }
 
@@ -106,6 +114,41 @@ struct Entry {
     count: u32,
     /// Either the value inline (≤ 4 bytes) as a u32, or an offset into the file.
     value_or_offset: u32,
+}
+
+fn long_array_entry(tag: u16, values: &[u64], extra: &mut Vec<u8>) -> Result<Entry> {
+    if values.len() == 1 {
+        return Ok(long_entry(
+            tag,
+            classic_tiff_u32(values[0], "TIFF LONG entry")?,
+        ));
+    }
+    let offset = extra.len() as u32;
+    for &value in values {
+        extra.extend_from_slice(&classic_tiff_u32(value, "TIFF LONG array value")?.to_le_bytes());
+    }
+    Ok(Entry {
+        tag,
+        typ: long_type().0,
+        count: values.len() as u32,
+        value_or_offset: offset,
+    })
+}
+
+fn patch_extra_offset(
+    ifd_bytes: &mut [u8],
+    entry_offset: usize,
+    extra_file_off: u64,
+) -> Result<()> {
+    let rel = u32::from_le_bytes([
+        ifd_bytes[entry_offset + 8],
+        ifd_bytes[entry_offset + 9],
+        ifd_bytes[entry_offset + 10],
+        ifd_bytes[entry_offset + 11],
+    ]);
+    let abs = classic_tiff_u32(extra_file_off + rel as u64, "IFD extra data offset")?;
+    ifd_bytes[entry_offset + 8..entry_offset + 12].copy_from_slice(&abs.to_le_bytes());
+    Ok(())
 }
 
 /// Write a SHORT entry with a single value stored inline.
@@ -209,13 +252,13 @@ fn expected_plane_count(meta: &ImageMetadata) -> Result<u32> {
     Ok(dimension_planes)
 }
 
-fn validate_tiff_writer_metadata(meta: &ImageMetadata) -> Result<()> {
+fn validate_tiff_writer_metadata(meta: &ImageMetadata, allow_planar_rgb: bool) -> Result<()> {
     if meta.pixel_type == PixelType::Bit {
         return Err(BioFormatsError::Format(
             "TIFF writer does not support PixelType::Bit until 1-bit output is packed".into(),
         ));
     }
-    if meta.is_rgb && meta.size_c > 1 && !meta.is_interleaved {
+    if !allow_planar_rgb && meta.is_rgb && meta.size_c > 1 && !meta.is_interleaved {
         return Err(BioFormatsError::Format(
             "TIFF writer writes chunky RGB and does not support planar RGB metadata".into(),
         ));
@@ -230,6 +273,67 @@ fn expected_plane_len_for_dims(meta: &ImageMetadata, width: u32, height: u32) ->
     usize::try_from(len).map_err(|_| {
         BioFormatsError::Format("TIFF writer: expected plane byte count overflows usize".into())
     })
+}
+
+fn has_tiff_suffix(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        name.as_str(),
+        n if n.ends_with(".tif")
+            || n.ends_with(".tiff")
+            || n.ends_with(".tf2")
+            || n.ends_with(".tf8")
+            || n.ends_with(".btf")
+    )
+}
+
+fn has_ome_tiff_suffix(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        name.as_str(),
+        n if n.ends_with(".ome.tif")
+            || n.ends_with(".ome.tiff")
+            || n.ends_with(".ome.tf2")
+            || n.ends_with(".ome.tf8")
+            || n.ends_with(".ome.btf")
+    )
+}
+
+fn write_plane_strips(
+    w: &mut BufWriter<File>,
+    meta: &ImageMetadata,
+    width: u32,
+    height: u32,
+    data: &[u8],
+    compression: WriteCompression,
+) -> Result<Vec<(u64, u64)>> {
+    let spp = if meta.is_rgb { meta.size_c.max(1) } else { 1 } as usize;
+    if meta.is_rgb && !meta.is_interleaved && spp > 1 {
+        let channel_len = expected_plane_len_for_dims(meta, width, height)? / spp;
+        let mut strips = Vec::with_capacity(spp);
+        for channel in 0..spp {
+            let start = channel * channel_len;
+            let end = start + channel_len;
+            let compressed = compress(&data[start..end], compression)?;
+            let offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
+            w.write_all(&compressed).map_err(BioFormatsError::Io)?;
+            strips.push((offset, compressed.len() as u64));
+        }
+        Ok(strips)
+    } else {
+        let compressed = compress(data, compression)?;
+        let offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
+        w.write_all(&compressed).map_err(BioFormatsError::Io)?;
+        Ok(vec![(offset, compressed.len() as u64)])
+    }
 }
 
 fn pyramid_level_dimensions(meta: &ImageMetadata, level_idx: usize) -> Result<(u32, u32)> {
@@ -727,15 +831,11 @@ impl Default for PyramidOmeTiffWriter {
 
 impl FormatWriter for PyramidOmeTiffWriter {
     fn is_this_type(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+        has_ome_tiff_suffix(path)
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
-        validate_tiff_writer_metadata(meta)?;
+        validate_tiff_writer_metadata(meta, false)?;
         self.meta = Some(meta.clone());
         Ok(())
     }
@@ -766,13 +866,13 @@ impl FormatWriter for PyramidOmeTiffWriter {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let expected_len = expected_plane_len(meta)?;
-        if data.len() != expected_len {
+        if data.len() < expected_len {
             return Err(BioFormatsError::Format(format!(
-                "Pyramid TIFF writer: level 0 plane {plane_index} has {} bytes, expected {expected_len}",
+                "Pyramid TIFF writer: level 0 plane {plane_index} has {} bytes, expected {expected_len} bytes or more",
                 data.len()
             )));
         }
-        self.levels[0].push(data.to_vec());
+        self.levels[0].push(data[..expected_len].to_vec());
         Ok(())
     }
 
@@ -787,16 +887,16 @@ impl FormatWriter for PyramidOmeTiffWriter {
 
 impl FormatWriter for TiffWriter {
     fn is_this_type(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+        has_tiff_suffix(path)
     }
 
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
-        validate_tiff_writer_metadata(meta)?;
+        validate_tiff_writer_metadata(meta, true)?;
         self.meta = Some(meta.clone());
+        if self.auto_ome_xml && self.ome_xml.is_none() {
+            let ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+            self.ome_xml = Some(ome.to_ome_xml(meta));
+        }
         Ok(())
     }
 
@@ -833,22 +933,26 @@ impl FormatWriter for TiffWriter {
         }
 
         let expected_len = expected_plane_len(meta)?;
-        if data.len() != expected_len {
+        if data.len() < expected_len {
             return Err(BioFormatsError::Format(format!(
-                "TIFF writer: plane {} has {} bytes, expected {}",
+                "TIFF writer: plane {} has {} bytes, expected {} bytes or more",
                 plane_index,
                 data.len(),
                 expected_len
             )));
         }
 
-        let compressed = compress(data, self.compression)?;
         let w = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
 
-        let offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
-        w.write_all(&compressed).map_err(BioFormatsError::Io)?;
-
-        self.plane_strips.push((offset, compressed.len() as u64));
+        let strips = write_plane_strips(
+            w,
+            meta,
+            meta.size_x,
+            meta.size_y,
+            &data[..expected_len],
+            self.compression,
+        )?;
+        self.plane_strips.push(strips);
         self.planes_written += 1;
         Ok(())
     }
@@ -889,7 +993,14 @@ impl FormatWriter for TiffWriter {
         let mut ifd_blobs: Vec<IfdBlob> = Vec::with_capacity(plane_count);
 
         for plane_idx in 0..plane_count {
-            let (strip_offset, strip_byte_count) = self.plane_strips[plane_idx];
+            let strips = &self.plane_strips[plane_idx];
+            let strip_offsets: Vec<u64> = strips.iter().map(|&(offset, _)| offset).collect();
+            let strip_byte_counts: Vec<u64> = strips.iter().map(|&(_, count)| count).collect();
+            let planar_configuration = if meta.is_rgb && !meta.is_interleaved && spp > 1 {
+                2
+            } else {
+                1
+            };
 
             // Build extra data (placed right after the IFD).
             // We'll store BitsPerSample array here if spp > 1, and resolution rationals.
@@ -948,20 +1059,10 @@ impl FormatWriter for TiffWriter {
                 bps_entry,
                 short_entry(259, comp_tag),
                 short_entry(262, photometric),
-                Entry {
-                    tag: 273,
-                    typ: long_type().0,
-                    count: 1,
-                    value_or_offset: classic_tiff_u32(strip_offset, "strip offset")?,
-                },
+                long_array_entry(273, &strip_offsets, &mut extra)?,
                 short_entry(277, spp as u16),
                 long_entry(278, meta.size_y), // RowsPerStrip = full image height
-                Entry {
-                    tag: 279,
-                    typ: long_type().0,
-                    count: 1,
-                    value_or_offset: classic_tiff_u32(strip_byte_count, "strip byte count")?,
-                },
+                long_array_entry(279, &strip_byte_counts, &mut extra)?,
                 Entry {
                     tag: 282,
                     typ: rational_type().0,
@@ -974,7 +1075,7 @@ impl FormatWriter for TiffWriter {
                     count: 1,
                     value_or_offset: 0,
                 }, // YResolution
-                short_entry(284, 1), // PlanarConfiguration = chunky
+                short_entry(284, planar_configuration),
                 short_entry(296, 2), // ResolutionUnit = inch
             ];
 
@@ -1091,7 +1192,18 @@ impl FormatWriter for TiffWriter {
                         )?;
                         blob.ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
-                    // StripOffsets / StripByteCounts are already absolute (set from plane_strips)
+                    273 | 279 => {
+                        let count = u32::from_le_bytes([
+                            blob.ifd_bytes[off + 4],
+                            blob.ifd_bytes[off + 5],
+                            blob.ifd_bytes[off + 6],
+                            blob.ifd_bytes[off + 7],
+                        ]);
+                        if count > 1 {
+                            patch_extra_offset(&mut blob.ifd_bytes, off, extra_file_off)?;
+                        }
+                    }
+                    // Single StripOffsets / StripByteCounts are already absolute.
                     _ => {}
                 }
             }

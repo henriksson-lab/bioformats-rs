@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bioformats::common::metadata::DimensionOrder;
+use bioformats::common::metadata::{DimensionOrder, MetadataValue};
 use bioformats::common::pixel_type::PixelType;
 use bioformats::common::reader::FormatReader;
 use bioformats::formats::misc4::{I2iReader, JdceReader, KlbReader, ObfReader, PciReader};
@@ -87,9 +87,16 @@ fn write_i2i(path: &Path, size_x: u32, size_y: u32, total_z: u32, n: i16, planes
     put_dim(&mut header, 2, size_x);
     put_dim(&mut header, 8, size_y);
     put_dim(&mut header, 14, total_z);
-    header[20] = b'L'; // little-endian (anything but 'B')
-                       // shorts at offset 21: min, max, x, y, then n at offset 29.
+    // Little-endian (anything but 'B').
+    header[20] = b'L';
+    // Shorts at offset 21: min, max, x, y, then n at offset 29.
+    header[21..23].copy_from_slice(&(-10i16).to_le_bytes());
+    header[23..25].copy_from_slice(&123i16.to_le_bytes());
+    header[25..27].copy_from_slice(&7i16.to_le_bytes());
+    header[27..29].copy_from_slice(&9i16.to_le_bytes());
     header[29..31].copy_from_slice(&n.to_le_bytes());
+    let history = b"created by Rust parity test";
+    header[64..64 + history.len()].copy_from_slice(history);
 
     let mut data = header;
     for s in planes {
@@ -127,6 +134,30 @@ fn i2i_synthetic_roundtrip() {
     assert_eq!(meta.image_count, 6);
     assert_eq!(meta.pixel_type, PixelType::Int16);
     assert!(meta.is_little_endian);
+    assert!(matches!(
+        meta.series_metadata.get("Minimum intensity value"),
+        Some(MetadataValue::Int(-10))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Maximum intensity value"),
+        Some(MetadataValue::Int(123))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Image position X"),
+        Some(MetadataValue::Int(7))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Image position Y"),
+        Some(MetadataValue::Int(9))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Image history"),
+        Some(MetadataValue::String(s)) if s == "created by Rust parity test"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("Image history #15"),
+        Some(MetadataValue::String(s)) if s.is_empty()
+    ));
 
     // Plane 0 and plane 3 must read back exactly.
     let p0 = r.open_bytes(0).unwrap();
@@ -157,13 +188,22 @@ fn i2i_synthetic_roundtrip() {
 fn i2i_detection_rejects_bad_pixel_type() {
     let r = I2iReader::new();
     // First byte not in {I,R,C} -> not an I2I file.
-    let mut header = vec![0u8; 64];
+    let mut header = vec![0u8; 1024];
     header[0] = b'Z';
     header[1] = b' ';
     assert!(!r.is_this_type_by_bytes(&header));
 
     // Valid type + space + a positive pixel count -> accepted.
-    let mut good = vec![0u8; 64];
+    let mut short_good = vec![0u8; 64];
+    short_good[0] = b'R';
+    short_good[1] = b' ';
+    short_good[2..8].copy_from_slice(b"     4");
+    short_good[8..14].copy_from_slice(b"     4");
+    short_good[14..20].copy_from_slice(b"     1");
+    assert!(!r.is_this_type_by_bytes(&short_good));
+
+    // Valid type + space + a positive pixel count + full Java header -> accepted.
+    let mut good = vec![0u8; 1024];
     good[0] = b'R';
     good[1] = b' ';
     good[2..8].copy_from_slice(b"     4");

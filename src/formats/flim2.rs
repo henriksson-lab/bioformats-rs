@@ -18518,8 +18518,7 @@ EndClass: 0
                     namespace,
                     values,
                 } if id.as_deref() == Some("Annotation:OriginalMetadata:0")
-                    && namespace.as_deref()
-                        == Some("openmicroscopy.org/bioformats/original-metadata") =>
+                    && namespace.as_deref() == Some("openmicroscopy.org/OriginalMetadata") =>
                 {
                     Some(values)
                 }

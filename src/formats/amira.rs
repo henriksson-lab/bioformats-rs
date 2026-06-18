@@ -30,6 +30,7 @@ struct AmiraHeader {
     nx: u32,
     ny: u32,
     nz: u32,
+    channels: u32,
     pixel_type: PixelType,
     data_offset: u64,
     little_endian: bool,
@@ -57,7 +58,8 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
     let mut pixel_type = PixelType::Uint8;
     let mut little_endian = false;
     let mut ascii = false;
-    let mut data_section: u32 = 1; // default @1
+    let mut data_section: Option<u32> = None;
+    let mut stream_sections: Vec<u32> = Vec::new();
     let mut compression = AmiraCompression::None;
     let mut bounding_box: Option<[f64; 6]> = None;
 
@@ -168,7 +170,10 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
                     None => (rest, None),
                 };
                 if let Ok(n) = num_part.parse::<u32>() {
-                    data_section = n;
+                    stream_sections.push(n);
+                    if data_section.is_none() {
+                        data_section = Some(n);
+                    }
                 }
                 if let Some(comp) = comp_part {
                     // Strip the trailing ')' if present.
@@ -187,13 +192,21 @@ fn parse_amira_header(path: &Path) -> Result<AmiraHeader> {
         }
 
         // Find @N marker in body — data starts on the next line
-        if t == format!("@{}", data_section) {
+        if t == format!("@{}", data_section.unwrap_or(1)) {
             let data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
             validate_positive_dims("Amira Mesh", nx, ny, nz)?;
+            stream_sections.sort_unstable();
+            stream_sections.dedup();
+            let mut channels = 0u32;
+            while stream_sections.contains(&(channels + 1)) {
+                channels += 1;
+            }
+            let channels = channels.max(1);
             return Ok(AmiraHeader {
                 nx,
                 ny,
                 nz,
+                channels,
                 pixel_type,
                 data_offset,
                 little_endian,
@@ -472,20 +485,23 @@ impl FormatReader for AmiraReader {
         self.bounding_box = None;
         self.decoded_stack = None;
         let hdr = parse_amira_header(path)?;
-        let image_count = hdr.nz;
+        let image_count = hdr
+            .nz
+            .checked_mul(hdr.channels)
+            .ok_or_else(|| BioFormatsError::Format("Amira Mesh: image count overflows".into()))?;
         // ASCII-decoded planes are emitted as little-endian byte buffers.
         let little_endian = if hdr.ascii { true } else { hdr.little_endian };
         let meta = ImageMetadata {
             size_x: hdr.nx,
             size_y: hdr.ny,
             size_z: hdr.nz,
-            size_c: 1,
+            size_c: hdr.channels,
             size_t: 1,
             pixel_type: hdr.pixel_type,
             bits_per_pixel: (hdr.pixel_type.bytes_per_sample() * 8) as u8,
             image_count,
             dimension_order: DimensionOrder::XYZCT,
-            is_rgb: false,
+            is_rgb: hdr.channels > 1,
             is_interleaved: false,
             is_indexed: false,
             is_little_endian: little_endian,
@@ -984,6 +1000,50 @@ impl FormatReader for SpiderReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+#[cfg(test)]
+mod amira_tests {
+    use super::*;
+
+    fn temp_amira_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bioformats_amira_{}_{}_{}.am",
+            name,
+            std::process::id(),
+            line!()
+        ))
+    }
+
+    #[test]
+    fn amira_raw_streams_are_reported_as_channels_like_java() {
+        let path = temp_amira_path("two_stream_channels");
+        let mut bytes = b"# AmiraMesh BINARY-LITTLE-ENDIAN 2.1
+define Lattice 2 1 1
+Lattice { byte Data } @1
+Lattice2 { byte Data } @2
+@1
+"
+        .to_vec();
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = AmiraReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata().clone();
+        let c0 = reader.open_bytes(0).unwrap();
+        let c1 = reader.open_bytes(1).unwrap();
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(meta.size_c, 2);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
+        assert!(meta.is_rgb);
+        assert!(!meta.is_interleaved);
+        assert_eq!(c0, vec![1, 2]);
+        assert_eq!(c1, vec![3, 4]);
     }
 }
 

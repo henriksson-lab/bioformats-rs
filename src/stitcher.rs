@@ -30,10 +30,15 @@ use crate::common::reader::FormatReader;
 pub struct FileStitcher {
     /// One inner reader per file, opened lazily.
     files: Vec<PathBuf>,
-    /// Metadata for the stitched dataset.
-    meta: Option<ImageMetadata>,
-    /// Maps stitched plane indices to (file index, local plane index).
-    plane_map: Vec<(usize, u32)>,
+    /// Metadata per exposed series.
+    metas: Vec<ImageMetadata>,
+    /// Maps stitched plane indices to (file index, local series, local plane index).
+    plane_maps: Vec<Vec<(usize, usize, u32)>>,
+    /// The currently selected exposed series.
+    current_series: usize,
+    /// Whether this is Java FileStitcher's noStitch path: a single file should
+    /// be exposed exactly like the wrapped reader, including all series.
+    no_stitch: bool,
     /// The currently-open reader (index into `files`).
     current_reader: Option<(usize, Box<dyn FormatReader>)>,
 }
@@ -51,20 +56,7 @@ impl FileStitcher {
             ));
         }
 
-        // Open the first file to get base metadata
-        let mut first = crate::registry::ImageReader::open(&files[0])?;
-        let base_meta = first.metadata().clone();
-
-        let pattern = FilePattern::from_file(&files[0]).ok();
-        let (meta, plane_map) = stitch_layout(&files, &base_meta, pattern.as_ref())?;
-        let _ = first.close();
-
-        Ok(FileStitcher {
-            files,
-            meta: Some(meta),
-            plane_map,
-            current_reader: None,
-        })
+        Self::from_discovered_files(files, FilePattern::from_file(path).ok())
     }
 
     /// Open with explicit file list (no auto-discovery).
@@ -73,18 +65,8 @@ impl FileStitcher {
             return Err(BioFormatsError::Format("Empty file list".into()));
         }
 
-        let mut first = crate::registry::ImageReader::open(&files[0])?;
-        let base_meta = first.metadata().clone();
         let pattern = FilePattern::from_file_list(&files).ok();
-        let (meta, plane_map) = stitch_layout(&files, &base_meta, pattern.as_ref())?;
-        let _ = first.close();
-
-        Ok(FileStitcher {
-            files,
-            meta: Some(meta),
-            plane_map,
-            current_reader: None,
-        })
+        Self::from_discovered_files(files, pattern)
     }
 
     /// Open with an explicit file list and the `.pattern` text that produced it.
@@ -93,18 +75,8 @@ impl FileStitcher {
             return Err(BioFormatsError::Format("Empty file list".into()));
         }
 
-        let mut first = crate::registry::ImageReader::open(&files[0])?;
-        let base_meta = first.metadata().clone();
         let pattern = FilePattern::from_explicit_pattern(pattern_path)?;
-        let (meta, plane_map) = stitch_layout(&files, &base_meta, Some(&pattern))?;
-        let _ = first.close();
-
-        Ok(FileStitcher {
-            files,
-            meta: Some(meta),
-            plane_map,
-            current_reader: None,
-        })
+        Self::from_discovered_files(files, Some(pattern))
     }
 
     /// Open with an explicit file list and an already-parsed file pattern.
@@ -116,26 +88,66 @@ impl FileStitcher {
             return Err(BioFormatsError::Format("Empty file list".into()));
         }
 
-        let mut first = crate::registry::ImageReader::open(&files[0])?;
-        let base_meta = first.metadata().clone();
-        let (meta, plane_map) = stitch_layout(&files, &base_meta, Some(&pattern))?;
-        let _ = first.close();
+        Self::from_discovered_files(files, Some(pattern))
+    }
 
+    fn from_discovered_files(files: Vec<PathBuf>, pattern: Option<FilePattern>) -> Result<Self> {
+        let mut first = crate::registry::ImageReader::open(&files[0])?;
+        if files.len() == 1 {
+            let mut metas = Vec::with_capacity(first.series_count());
+            let mut plane_maps = Vec::with_capacity(first.series_count());
+            for series in 0..first.series_count() {
+                first.set_series(series)?;
+                let meta = first.metadata().clone();
+                plane_maps.push(
+                    (0..meta.image_count)
+                        .map(|plane| (0, series, plane))
+                        .collect(),
+                );
+                metas.push(meta);
+            }
+            let _ = first.close();
+            return Ok(FileStitcher {
+                files,
+                metas,
+                plane_maps,
+                current_series: 0,
+                no_stitch: true,
+                current_reader: None,
+            });
+        }
+
+        if first.series_count() > 1 {
+            return Err(BioFormatsError::Format(
+                "Unsupported grouping: file pattern contains multiple files and each file contains multiple series"
+                    .into(),
+            ));
+        }
+        let base_meta = first.metadata().clone();
+        let (meta, plane_map) = stitch_layout(&files, &base_meta, pattern.as_ref())?;
+        let _ = first.close();
         Ok(FileStitcher {
             files,
-            meta: Some(meta),
-            plane_map,
+            metas: vec![meta],
+            plane_maps: vec![plane_map],
+            current_series: 0,
+            no_stitch: false,
             current_reader: None,
         })
     }
 
     /// Resolve a stitched plane index to (file_index, local_plane_index).
-    fn resolve_plane(&self, plane_index: u32) -> Result<(usize, u32)> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+    fn resolve_plane(&self, plane_index: u32) -> Result<(usize, usize, u32)> {
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        self.plane_map
+        self.plane_maps
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?
             .get(plane_index as usize)
             .copied()
             .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
@@ -269,7 +281,7 @@ fn stitch_layout(
     files: &[PathBuf],
     base_meta: &ImageMetadata,
     pattern: Option<&FilePattern>,
-) -> Result<(ImageMetadata, Vec<(usize, u32)>)> {
+) -> Result<(ImageMetadata, Vec<(usize, usize, u32)>)> {
     let mut meta = base_meta.clone();
     let file_axes = pattern
         .and_then(|pattern| infer_file_axes(files, pattern, base_meta))
@@ -287,9 +299,11 @@ fn stitch_layout(
     meta.size_z = checked_axis_mul(base_meta.size_z, file_axes.size_z, "Z")?;
     meta.size_c = checked_axis_mul(base_meta.size_c, file_axes.size_c, "C")?;
     meta.size_t = checked_axis_mul(base_meta.size_t, file_axes.size_t, "T")?;
+    let stitched_effective_c =
+        checked_axis_mul(effective_size_c(base_meta), file_axes.size_c, "C")?;
     meta.image_count = meta
         .size_z
-        .checked_mul(meta.size_c)
+        .checked_mul(stitched_effective_c)
         .and_then(|v| v.checked_mul(meta.size_t))
         .ok_or_else(|| BioFormatsError::Format("Stitched plane count overflow".into()))?;
 
@@ -299,11 +313,11 @@ fn stitch_layout(
             let (local_z, local_c, local_t) = plane_to_zct(local_plane, base_meta)
                 .ok_or_else(|| BioFormatsError::Format("Invalid base plane index".into()))?;
             let z = file_z * base_meta.size_z + local_z;
-            let c = file_c * base_meta.size_c + local_c;
+            let c = file_c * effective_size_c(base_meta) + local_c;
             let t = file_t * base_meta.size_t + local_t;
             let stitched = zct_to_plane(z, c, t, &meta)
                 .ok_or_else(|| BioFormatsError::Format("Invalid stitched plane index".into()))?;
-            plane_map[stitched as usize] = Some((file_idx, local_plane));
+            plane_map[stitched as usize] = Some((file_idx, 0, local_plane));
         }
     }
 
@@ -602,10 +616,32 @@ fn checked_axis_mul(base: u32, files: u32, axis: &str) -> Result<u32> {
         .ok_or_else(|| BioFormatsError::Format(format!("Stitched {axis} size overflow")))
 }
 
+fn rgb_channel_count(meta: &ImageMetadata) -> u32 {
+    if !meta.is_rgb {
+        return 1;
+    }
+    let zt = meta.size_z.max(1).saturating_mul(meta.size_t.max(1));
+    if zt > 0 && meta.image_count >= zt {
+        let effective_c = (meta.image_count / zt).max(1);
+        if effective_c > 0 && meta.size_c >= effective_c && meta.size_c % effective_c == 0 {
+            return (meta.size_c / effective_c).max(1);
+        }
+    }
+    meta.size_c.max(1)
+}
+
+fn effective_size_c(meta: &ImageMetadata) -> u32 {
+    if meta.is_rgb {
+        (meta.size_c / rgb_channel_count(meta)).max(1)
+    } else {
+        meta.size_c.max(1)
+    }
+}
+
 fn plane_to_zct(plane_index: u32, meta: &ImageMetadata) -> Option<(u32, u32, u32)> {
     for t in 0..meta.size_t {
         for z in 0..meta.size_z {
-            for c in 0..meta.size_c {
+            for c in 0..effective_size_c(meta) {
                 if zct_to_plane(z, c, t, meta)? == plane_index {
                     return Some((z, c, t));
                 }
@@ -616,24 +652,25 @@ fn plane_to_zct(plane_index: u32, meta: &ImageMetadata) -> Option<(u32, u32, u32
 }
 
 fn zct_to_plane(z: u32, c: u32, t: u32, meta: &ImageMetadata) -> Option<u32> {
-    if z >= meta.size_z || c >= meta.size_c || t >= meta.size_t {
+    let effective_c = effective_size_c(meta);
+    if z >= meta.size_z || c >= effective_c || t >= meta.size_t {
         return None;
     }
     Some(match meta.dimension_order {
         crate::common::metadata::DimensionOrder::XYZCT => {
-            t * meta.size_z * meta.size_c + c * meta.size_z + z
+            t * meta.size_z * effective_c + c * meta.size_z + z
         }
         crate::common::metadata::DimensionOrder::XYZTC => {
             c * meta.size_z * meta.size_t + t * meta.size_z + z
         }
         crate::common::metadata::DimensionOrder::XYCZT => {
-            t * meta.size_c * meta.size_z + z * meta.size_c + c
+            t * effective_c * meta.size_z + z * effective_c + c
         }
         crate::common::metadata::DimensionOrder::XYCTZ => {
-            z * meta.size_c * meta.size_t + t * meta.size_c + c
+            z * effective_c * meta.size_t + t * effective_c + c
         }
         crate::common::metadata::DimensionOrder::XYTCZ => {
-            z * meta.size_t * meta.size_c + c * meta.size_t + t
+            z * meta.size_t * effective_c + c * meta.size_t + t
         }
         crate::common::metadata::DimensionOrder::XYTZC => {
             c * meta.size_t * meta.size_z + z * meta.size_t + t
@@ -658,35 +695,45 @@ impl FormatReader for FileStitcher {
         if let Some((_, mut r)) = self.current_reader.take() {
             let _ = r.close();
         }
-        self.meta = None;
+        self.metas.clear();
         self.files.clear();
-        self.plane_map.clear();
+        self.plane_maps.clear();
+        self.current_series = 0;
+        self.no_stitch = false;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.metas.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
+        if s >= self.metas.len() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
         }
+        self.current_series = s;
+        if self.no_stitch {
+            if let Some((_, reader)) = &mut self.current_reader {
+                reader.set_series(s)?;
+            }
+        }
+        Ok(())
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("FileStitcher not initialized")
+        self.metas
+            .get(self.current_series)
+            .expect("FileStitcher not initialized")
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let (file_idx, local_plane) = self.resolve_plane(plane_index)?;
+        let (file_idx, local_series, local_plane) = self.resolve_plane(plane_index)?;
         let reader = self.ensure_reader(file_idx)?;
+        reader.set_series(local_series)?;
         reader.open_bytes(local_plane)
     }
 
@@ -698,19 +745,21 @@ impl FormatReader for FileStitcher {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let (file_idx, local_plane) = self.resolve_plane(plane_index)?;
+        let (file_idx, local_series, local_plane) = self.resolve_plane(plane_index)?;
         let reader = self.ensure_reader(file_idx)?;
+        reader.set_series(local_series)?;
         reader.open_bytes_region(local_plane, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let (file_idx, local_plane) = self.resolve_plane(plane_index)?;
+        let (file_idx, local_series, local_plane) = self.resolve_plane(plane_index)?;
         let reader = self.ensure_reader(file_idx)?;
+        reader.set_series(local_series)?;
         reader.open_thumb_bytes(local_plane)
     }
 
     fn ome_metadata(&self) -> Option<OmeMetadata> {
-        let meta = self.meta.as_ref()?;
+        let meta = self.metas.get(self.current_series)?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
         let image = ome.images.get_mut(0)?;
         for (idx, channel) in image.channels.iter_mut().enumerate() {
@@ -3122,8 +3171,10 @@ mod tests {
         );
         let stitcher = FileStitcher {
             files: Vec::new(),
-            meta: Some(meta),
-            plane_map: Vec::new(),
+            metas: vec![meta],
+            plane_maps: vec![Vec::new()],
+            current_series: 0,
+            no_stitch: false,
             current_reader: None,
         };
 
@@ -3205,7 +3256,33 @@ mod tests {
             (1, 1, 3)
         );
         assert_eq!(stitched.image_count, 3);
-        assert_eq!(plane_map, vec![(0, 0), (1, 0), (2, 0)]);
+        assert_eq!(plane_map, vec![(0, 0, 0), (1, 0, 0), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn stitch_layout_rgb_uses_effective_c_for_plane_count() {
+        let files = vec![PathBuf::from("a.fake"), PathBuf::from("b.fake")];
+        let base_meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 6,
+            size_t: 1,
+            image_count: 2,
+            is_rgb: true,
+            is_interleaved: true,
+            dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
+            ..ImageMetadata::default()
+        };
+
+        let (stitched, plane_map) = stitch_layout(&files, &base_meta, None).unwrap();
+
+        assert_eq!(
+            (stitched.size_z, stitched.size_c, stitched.size_t),
+            (1, 6, 2)
+        );
+        assert_eq!(stitched.image_count, 4);
+        assert_eq!(plane_map, vec![(0, 0, 0), (0, 0, 1), (1, 0, 0), (1, 0, 1)]);
     }
 
     #[test]

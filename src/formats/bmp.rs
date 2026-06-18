@@ -688,8 +688,9 @@ impl FormatWriter for BmpWriter {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let (w, h) = (meta.size_x, meta.size_y);
+        let pixels = crate::common::writer::to_interleaved_samples(meta, data)?;
 
-        let img = image::RgbImage::from_raw(w, h, data.to_vec())
+        let img = image::RgbImage::from_raw(w, h, pixels)
             .map(image::DynamicImage::ImageRgb8)
             .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?;
 

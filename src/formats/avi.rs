@@ -1240,9 +1240,9 @@ fn validate_avi_writer_metadata(meta: &ImageMetadata) -> Result<bool> {
 
     let is_rgb = meta.is_rgb;
     if is_rgb {
-        if meta.size_c != 3 || !meta.is_interleaved {
+        if meta.size_c != 3 {
             return Err(BioFormatsError::UnsupportedFormat(
-                "AVI writer supports only interleaved RGB Uint8 data with 3 channels".into(),
+                "AVI writer supports only RGB Uint8 data with 3 channels".into(),
             ));
         }
     } else if meta.size_c.max(1) != 1 {
@@ -1300,7 +1300,8 @@ impl crate::common::writer::FormatWriter for AviWriter {
         let expected_planes = crate::formats::stack_writer::expected_plane_count("AVI", meta)?;
         let layout = avi_writer_layout(meta, is_rgb, expected_planes as usize)?;
         crate::formats::stack_writer::validate_complete("AVI", meta, self.planes.len())?;
-        let _meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
         let row_bytes = layout.row_bytes;
         let padded_row = layout.padded_row;
@@ -1397,6 +1398,11 @@ impl crate::common::writer::FormatWriter for AviWriter {
         let pad = vec![0u8; pad_bytes];
 
         for plane in &self.planes {
+            let plane = if is_rgb {
+                crate::common::writer::to_interleaved_samples(&meta, plane)?
+            } else {
+                plane.clone()
+            };
             write_fourcc(&mut w, b"00db").map_err(BioFormatsError::Io)?; // uncompressed frame
             write_u32_le(&mut w, padded_frame).map_err(BioFormatsError::Io)?;
             // AVI stores rows bottom-up

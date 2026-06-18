@@ -245,6 +245,26 @@ const NDPI_CAPTURE_MODE: u16 = 65441;
 const NDPI_SERIAL_NUMBER: u16 = 65442;
 const NDPI_METADATA_TAG: u16 = 65449;
 
+pub(crate) fn ndpi_has_hamamatsu_tags(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    ndpi_has_hamamatsu_tags_in_stream(file)
+}
+
+fn ndpi_has_hamamatsu_tags_in_stream<R: std::io::Read + std::io::Seek>(stream: R) -> bool {
+    let mut parser = match crate::tiff::parser::TiffParser::new(stream) {
+        Ok(parser) => parser,
+        Err(_) => return false,
+    };
+    let offset = parser.first_ifd_offset;
+    let ifd = match parser.read_ifd(offset) {
+        Ok((ifd, _)) => ifd,
+        Err(_) => return false,
+    };
+    ifd.get(NDPI_MARKER_TAG).is_some() || ifd.get(NDPI_METADATA_TAG).is_some()
+}
+
 impl NdpiReader {
     pub fn new() -> Self {
         NdpiReader {
@@ -791,15 +811,24 @@ impl FormatReader for NdpiReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("ndpi"))
+        matches!(ext.as_deref(), Some("ndpi")) && ndpi_has_hamamatsu_tags(path)
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+        ndpi_has_hamamatsu_tags_in_stream(std::io::Cursor::new(_header))
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.close()?;
+        self.size_z = 1;
+        self.pyramid_height = 1;
+        self.use_64bit = false;
+        self.ome_images.clear();
+        if !ndpi_has_hamamatsu_tags(path) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "NDPI TIFF missing Hamamatsu marker/metadata tags".into(),
+            ));
+        }
         // For files >4 GB, NDPI uses Hamamatsu's "fake BigTIFF" layout: the IFD
         // chain pointers and per-entry value offsets are 64-bit (low 32 bits in
         // the entry, high 32 bits in a per-IFD trailer). A naive 32-bit walk wraps
@@ -5397,12 +5426,10 @@ impl Default for MetamorphTiffReader {
 }
 
 impl FormatReader for MetamorphTiffReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        // Java sets suffixSufficient=false; this reader is selected from the
+        // TIFF ImageDescription signature, not from the broad .tif/.tiff suffix.
+        false
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -9724,6 +9751,8 @@ mod metamorph_tiff_tests {
 
         let header = std::fs::read(&path).unwrap();
         let reader = MetamorphTiffReader::new();
+        assert!(!reader.is_this_type_by_name(Path::new("sample.tif")));
+        assert!(!reader.is_this_type_by_name(Path::new("sample.tiff")));
         assert!(reader.is_this_type_by_bytes(&header));
 
         // A plain (non-Metamorph) comment must be rejected.

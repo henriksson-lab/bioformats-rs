@@ -54,6 +54,13 @@ fn r_string(b: &[u8], off: usize, len: usize) -> String {
     String::from_utf8_lossy(&raw[..end]).to_string()
 }
 
+fn is_ecat7_magic(header: &[u8]) -> bool {
+    header.len() >= 9
+        && &header[..7] == b"MATRIX7"
+        && matches!(header[7], b'0' | b'1' | b'2')
+        && header[8] == b'v'
+}
+
 pub struct Ecat7Reader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -84,11 +91,7 @@ impl FormatReader for Ecat7Reader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        if header.len() < 14 {
-            return false;
-        }
-        // Magic starts with "MATRIX"
-        header[..6] == b"MATRIX"[..]
+        is_ecat7_magic(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -111,9 +114,9 @@ impl FormatReader for Ecat7Reader {
         }
         let mut hdr = vec![0u8; hdr_len];
         f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
-        if hdr[..6] != b"MATRIX"[..] {
+        if !is_ecat7_magic(&hdr) {
             return Err(BioFormatsError::UnsupportedFormat(
-                "ECAT7 missing MATRIX magic".into(),
+                "ECAT7 missing MATRIX7[012]v magic".into(),
             ));
         }
 
@@ -1421,8 +1424,33 @@ fn is_fdf_header(header: &[u8]) -> bool {
     s.starts_with("#!/usr/local/fdf") || s.starts_with("# FDF")
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_fdf_header(path: &Path) -> Result<(u32, u32, u32, u32, PixelType, u8, bool, u64)> {
+struct FdfHeader {
+    size_x: u32,
+    size_y: u32,
+    size_z: u32,
+    size_t: u32,
+    pixel_type: PixelType,
+    bits_per_pixel: u8,
+    little_endian: bool,
+    data_offset: u64,
+    metadata: HashMap<String, MetadataValue>,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
+}
+
+fn fdf_physical_size(length: u32, physical_length: &str, unit: Option<&str>) -> Option<f64> {
+    if length == 0 {
+        return None;
+    }
+    let mut size = physical_length.trim().parse::<f64>().ok()? / f64::from(length);
+    if unit == Some("cm") {
+        size *= 1000.0;
+    }
+    Some(size)
+}
+
+fn parse_fdf_header(path: &Path) -> Result<FdfHeader> {
     let mut f = File::open(path).map_err(BioFormatsError::Io)?;
     // Read up to 8 KiB looking for the 0x0C terminator
     let max = 8192usize;
@@ -1452,6 +1480,11 @@ fn parse_fdf_header(path: &Path) -> Result<(u32, u32, u32, u32, PixelType, u8, b
     // Java only sets littleEndian when a bigendian key is present; the
     // RandomAccessInputStream default is big-endian.
     let mut little_endian = false;
+    let mut units: Vec<String> = Vec::new();
+    let mut physical_size_x = None;
+    let mut physical_size_y = None;
+    let mut physical_size_z = None;
+    let mut metadata = HashMap::new();
 
     for line in text.lines() {
         let line = line.trim();
@@ -1526,9 +1559,25 @@ fn parse_fdf_header(path: &Path) -> Result<(u32, u32, u32, u32, PixelType, u8, b
         } else if var == "echoes" {
             // Java VarianFDFReader.parseFDF: m.sizeT = echoes.
             size_t = value.parse::<u32>().unwrap_or(1).max(1);
+        } else if var == "*abscissa[]" {
+            units = parse_fdf_array(value);
+        } else if var == "span[]" {
+            let values = parse_fdf_array(value);
+            if let Some(v) = values.first() {
+                physical_size_x =
+                    fdf_physical_size(size_x.unwrap_or(0), v, units.first().map(String::as_str));
+            }
+            if let Some(v) = values.get(1) {
+                physical_size_y =
+                    fdf_physical_size(size_y.unwrap_or(0), v, units.get(1).map(String::as_str));
+            }
+            if let Some(v) = values.get(2) {
+                physical_size_z = fdf_physical_size(size_z, v, units.get(2).map(String::as_str));
+            }
         } else if var == "bigendian" {
             little_endian = value == "0";
         }
+        metadata.insert(var.to_string(), MetadataValue::String(value.to_string()));
     }
 
     let size_x = size_x.ok_or_else(|| {
@@ -1547,22 +1596,29 @@ fn parse_fdf_header(path: &Path) -> Result<(u32, u32, u32, u32, PixelType, u8, b
     let bits = bits.unwrap_or((pixel_type.bytes_per_sample() * 8) as u32);
     let bpp = bits as u8;
 
-    Ok((
+    Ok(FdfHeader {
         size_x,
         size_y,
         size_z,
         size_t,
         pixel_type,
-        bpp,
+        bits_per_pixel: bpp,
         little_endian,
         data_offset,
-    ))
+        metadata,
+        physical_size_x,
+        physical_size_y,
+        physical_size_z,
+    })
 }
 
 pub struct VarianFdfReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
 }
 
 impl VarianFdfReader {
@@ -1571,6 +1627,9 @@ impl VarianFdfReader {
             path: None,
             meta: None,
             data_offset: 0,
+            physical_size_x: None,
+            physical_size_y: None,
+            physical_size_z: None,
         }
     }
 }
@@ -1601,21 +1660,22 @@ impl FormatReader for VarianFdfReader {
                 "FDF missing Varian FDF header".into(),
             ));
         }
-        let (nx, ny, nz, nt, pixel_type, bpp, little_endian, data_offset) = parse_fdf_header(path)?;
-        let plane_bytes = (nx as u64)
-            .checked_mul(ny as u64)
-            .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample() as u64))
+        let header = parse_fdf_header(path)?;
+        let plane_bytes = (header.size_x as u64)
+            .checked_mul(header.size_y as u64)
+            .and_then(|px| px.checked_mul(header.pixel_type.bytes_per_sample() as u64))
             .ok_or_else(|| BioFormatsError::Format("FDF plane size overflows".into()))?;
-        let image_count = nz
+        let image_count = header
+            .size_z
             .max(1)
-            .checked_mul(nt.max(1))
+            .checked_mul(header.size_t.max(1))
             .ok_or_else(|| BioFormatsError::Format("FDF image count overflows".into()))?;
-        let required_len = data_offset
-            .checked_add(
-                (image_count as u64)
-                    .checked_mul(plane_bytes)
-                    .ok_or_else(|| BioFormatsError::Format("FDF payload size overflows".into()))?,
-            )
+        let pixel_bytes = (image_count as u64)
+            .checked_mul(plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("FDF payload size overflows".into()))?;
+        let required_len = header
+            .data_offset
+            .checked_add(pixel_bytes)
             .ok_or_else(|| BioFormatsError::Format("FDF payload size overflows".into()))?;
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
         if file_len < required_len {
@@ -1623,8 +1683,13 @@ impl FormatReader for VarianFdfReader {
                 "FDF pixel payload is shorter than declared ({file_len} < {required_len})"
             )));
         }
+        let first_pixel_offset = file_len
+            .checked_sub(pixel_bytes)
+            .ok_or_else(|| BioFormatsError::Format("FDF payload offset underflows".into()))?;
 
-        let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
+        let nx = header.size_x;
+        let ny = header.size_y;
+        let mut meta_map = header.metadata;
         meta_map.insert(
             "format".into(),
             MetadataValue::String("Varian FDF MRI".into()),
@@ -1634,18 +1699,18 @@ impl FormatReader for VarianFdfReader {
         self.meta = Some(ImageMetadata {
             size_x: nx,
             size_y: ny,
-            size_z: nz,
+            size_z: header.size_z,
             size_c: 1,
-            size_t: nt,
-            pixel_type,
-            bits_per_pixel: bpp,
+            size_t: header.size_t,
+            pixel_type: header.pixel_type,
+            bits_per_pixel: header.bits_per_pixel,
             image_count,
             // Java VarianFDFReader uses dimensionOrder "XYTZC".
             dimension_order: DimensionOrder::XYTZC,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: little_endian,
+            is_little_endian: header.little_endian,
             resolution_count: 1,
             thumbnail: false,
             series_metadata: meta_map,
@@ -1654,7 +1719,14 @@ impl FormatReader for VarianFdfReader {
             modulo_c: None,
             modulo_t: None,
         });
-        self.data_offset = data_offset;
+        // Java VarianFDFReader builds pixelOffsets from the file tail:
+        // in.length() - planeSize * (imageCount - i). This preserves files that
+        // carry padding or extra header bytes between the form-feed terminator
+        // and the pixel payload.
+        self.data_offset = first_pixel_offset;
+        self.physical_size_x = header.physical_size_x;
+        self.physical_size_y = header.physical_size_y;
+        self.physical_size_z = header.physical_size_z;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -1662,6 +1734,9 @@ impl FormatReader for VarianFdfReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
+        self.physical_size_z = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -1732,6 +1807,16 @@ impl FormatReader for VarianFdfReader {
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let image = &mut ome.images[0];
+        image.physical_size_x = self.physical_size_x;
+        image.physical_size_y = self.physical_size_y;
+        image.physical_size_z = self.physical_size_z;
+        Some(ome)
+    }
 }
 
 #[cfg(test)]
@@ -1755,6 +1840,29 @@ mod clinical_metadata_tests {
             nanos,
             name
         ))
+    }
+
+    #[test]
+    fn ecat7_rejects_non_java_magic_versions() {
+        let reader = Ecat7Reader::new();
+        assert!(reader.is_this_type_by_bytes(b"MATRIX72v\0\0\0\0\0"));
+        assert!(reader.is_this_type_by_bytes(b"MATRIX70v\0\0\0\0\0"));
+        assert!(!reader.is_this_type_by_bytes(b"MATRIX99v\0\0\0\0\0"));
+
+        let mut buf = vec![0u8; 1536 + 2];
+        buf[..9].copy_from_slice(b"MATRIX99v");
+        buf[352..354].copy_from_slice(&1i16.to_be_bytes());
+        buf[354..356].copy_from_slice(&1i16.to_be_bytes());
+        buf[1024..1026].copy_from_slice(&6i16.to_be_bytes());
+        buf[1028..1030].copy_from_slice(&1i16.to_be_bytes());
+        buf[1030..1032].copy_from_slice(&1i16.to_be_bytes());
+
+        let path = tmp_path("bad_ecat_magic.v");
+        std::fs::write(&path, &buf).unwrap();
+        let mut reader = Ecat7Reader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(err.to_string().contains("MATRIX7[012]v"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

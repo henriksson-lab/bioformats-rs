@@ -936,12 +936,14 @@ impl TiffReader {
     pub fn regroup_as_svs_pyramid(&mut self) -> Result<()> {
         let little_endian = self.is_little_endian();
 
-        // Collect the main IFD chain in order. Each pre-existing series maps to
-        // one top-level IFD (SVS stores its pyramid as the main IFD chain).
+        // Collect the main IFD chain in order. The generic TIFF reader may have
+        // already grouped consecutive same-sized IFDs into one series (for an
+        // SVS Z-stack), so keep every main IFD rather than only the first IFD of
+        // each pre-existing series.
         let main_ifds: Vec<usize> = self
             .series
             .iter()
-            .filter_map(|s| s.ifd_indices.first().copied())
+            .flat_map(|s| s.ifd_indices.iter().copied())
             .collect();
         if main_ifds.len() <= 1 {
             return Ok(());
@@ -1005,20 +1007,36 @@ impl TiffReader {
             return Ok(());
         }
 
-        // Full-resolution IFD = first resolution image.
+        // Group pyramid IFDs by layout. Java's SVSReader uses OffsetZ/TotalDepth
+        // to make each resolution carry all focal planes; grouping by dimensions
+        // preserves that behavior for both simple Z-stacks and interleaved
+        // pyramid/Z layouts while keeping the original IFD order within a level.
         let full_ifd_idx = main_ifds[resolution_positions[0]];
         let full_info = Self::ifd_info(&file.ifds[full_ifd_idx], little_endian)?;
-
-        // Drop pyramid levels whose pixel type differs from the full resolution.
-        let mut kept_levels: Vec<usize> = Vec::new();
+        let mut levels: Vec<(u32, u32, u16, u16, PixelType, Vec<usize>)> = Vec::new();
         for &pos in &resolution_positions {
             let ifd_idx = main_ifds[pos];
             let info = Self::ifd_info(&file.ifds[ifd_idx], little_endian)?;
-            if ifd_idx == full_ifd_idx || info.pixel_type == full_info.pixel_type {
-                kept_levels.push(ifd_idx);
+            if ifd_idx != full_ifd_idx && info.pixel_type != full_info.pixel_type {
+                continue;
+            }
+            let key = (
+                info.width,
+                info.height,
+                info.samples_per_pixel,
+                info.bits_per_sample,
+                info.pixel_type,
+            );
+            if let Some(level) = levels
+                .iter_mut()
+                .find(|level| (level.0, level.1, level.2, level.3, level.4) == key)
+            {
+                level.5.push(ifd_idx);
+            } else {
+                levels.push((key.0, key.1, key.2, key.3, key.4, vec![ifd_idx]));
             }
         }
-        if kept_levels.is_empty() {
+        if levels.is_empty() {
             return Ok(());
         }
 
@@ -1027,25 +1045,30 @@ impl TiffReader {
         // stored with strips (StripByteCounts present) rather than tiles, per
         // https://github.com/ome/bioformats/issues/3757. Only applies when more
         // than one resolution remains.
-        if kept_levels.len() > 1 {
-            if let Some(&last_idx) = kept_levels.last() {
+        if levels.len() > 1 {
+            if let Some(&last_idx) = levels.last().and_then(|level| level.5.first()) {
                 let last_ifd = &file.ifds[last_idx];
                 let stripped = last_ifd.get(tag::STRIP_BYTE_COUNTS).is_some()
                     && last_ifd.get(tag::TILE_BYTE_COUNTS).is_none();
                 if stripped {
-                    kept_levels.pop();
+                    levels.pop();
                 }
             }
         }
 
         // Build the single pyramid series: level 0 is the main resolution,
         // remaining levels are sub-resolutions.
-        let mut pyramid = Self::single_ifd_series(kept_levels[0], &full_info, little_endian);
+        let base_ifds = levels[0].5.clone();
+        let mut pyramid = Self::single_ifd_series(base_ifds[0], &full_info, little_endian);
+        pyramid.ifd_indices = base_ifds;
+        pyramid.metadata.size_z = pyramid.ifd_indices.len() as u32;
+        pyramid.metadata.size_t = 1;
+        pyramid.metadata.image_count = pyramid.ifd_indices.len() as u32;
         let sub_resolutions: Vec<Vec<usize>> =
-            kept_levels[1..].iter().map(|&idx| vec![idx]).collect();
+            levels[1..].iter().map(|level| level.5.clone()).collect();
         pyramid.metadata.resolution_count = 1 + sub_resolutions.len() as u32;
         pyramid.sub_resolutions = sub_resolutions;
-        if let Some(desc) = file.ifds[kept_levels[0]].get_str(tag::IMAGE_DESCRIPTION) {
+        if let Some(desc) = file.ifds[pyramid.ifd_indices[0]].get_str(tag::IMAGE_DESCRIPTION) {
             pyramid.metadata.series_metadata.insert(
                 "ImageDescription".into(),
                 crate::common::metadata::MetadataValue::String(desc.to_string()),

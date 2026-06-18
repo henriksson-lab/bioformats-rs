@@ -431,74 +431,175 @@ fn dicom_content_timestamp(date: Option<&str>, time: Option<&str>) -> Option<Str
 /// Sequence (0048,0105) blob, mirroring DicomReader's child lookup. Items are
 /// delimited by (FFFE,E000)/(FFFE,E00D); the implicit/explicit VR convention of
 /// the enclosing dataset is honoured.
-fn find_nested_string(
+fn collect_nested_strings(
     blob: &[u8],
     explicit_vr: bool,
     little_endian: bool,
     target: (u16, u16),
-) -> Option<String> {
+    out: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 16 {
+        return;
+    }
     let mut cur = std::io::Cursor::new(blob);
     loop {
-        let (group, element) = read_tag(&mut cur, little_endian).ok()?;
-        if (group, element) == (0xFFFE, 0xE000)
-            || (group, element) == (0xFFFE, 0xE00D)
-            || (group, element) == (0xFFFE, 0xE0DD)
-        {
-            // Item / delimiter: 4-byte length, then continue scanning items.
-            let _len = read_u32(&mut cur, little_endian).ok()?;
+        let Ok((group, element)) = read_tag(&mut cur, little_endian) else {
+            break;
+        };
+        if (group, element) == (0xFFFE, 0xE000) {
+            let Ok(length) = read_u32(&mut cur, little_endian) else {
+                break;
+            };
+            if length == 0xFFFF_FFFF {
+                collect_nested_strings(
+                    &blob[cur.position() as usize..],
+                    explicit_vr,
+                    little_endian,
+                    target,
+                    out,
+                    depth + 1,
+                );
+                break;
+            }
+            let start = cur.position() as usize;
+            let Some(end) = start.checked_add(length as usize) else {
+                break;
+            };
+            if end > blob.len() {
+                break;
+            }
+            collect_nested_strings(
+                &blob[start..end],
+                explicit_vr,
+                little_endian,
+                target,
+                out,
+                depth + 1,
+            );
+            cur.set_position(end as u64);
             continue;
         }
-        let (vr, length) =
-            read_element_length_after_tag(&mut cur, explicit_vr, little_endian).ok()?;
+        if (group, element) == (0xFFFE, 0xE00D) || (group, element) == (0xFFFE, 0xE0DD) {
+            let _ = read_u32(&mut cur, little_endian);
+            break;
+        }
+        let Ok((vr, length)) = read_element_length_after_tag(&mut cur, explicit_vr, little_endian)
+        else {
+            break;
+        };
         if length == 0xFFFF_FFFF {
-            // Undefined-length nested sequence: bail out (rare for optical paths).
-            return None;
+            break;
         }
         let start = cur.position() as usize;
-        let end = start.checked_add(length as usize)?;
+        let Some(end) = start.checked_add(length as usize) else {
+            break;
+        };
         if end > blob.len() {
-            return None;
+            break;
         }
         if (group, element) == target {
             let v = &blob[start..end];
-            return Some(
+            out.push(
                 decode_dicom_metadata_value(&vr, group, element, v, little_endian)
                     .unwrap_or_else(|| ascii_trim(v)),
+            );
+        }
+        if vr == *b"SQ" {
+            collect_nested_strings(
+                &blob[start..end],
+                explicit_vr,
+                little_endian,
+                target,
+                out,
+                depth + 1,
             );
         }
         cur.set_position(end as u64);
     }
 }
 
-fn find_nested_i32(
+fn find_nested_string(
     blob: &[u8],
     explicit_vr: bool,
     little_endian: bool,
     target: (u16, u16),
-) -> Option<i32> {
+) -> Option<String> {
+    let mut values = Vec::new();
+    collect_nested_strings(blob, explicit_vr, little_endian, target, &mut values, 0);
+    values.into_iter().next()
+}
+
+fn collect_nested_i32s(
+    blob: &[u8],
+    explicit_vr: bool,
+    little_endian: bool,
+    target: (u16, u16),
+    out: &mut Vec<i32>,
+    depth: usize,
+) {
+    if depth > 16 {
+        return;
+    }
     let mut cur = std::io::Cursor::new(blob);
     loop {
-        let (group, element) = read_tag(&mut cur, little_endian).ok()?;
-        if (group, element) == (0xFFFE, 0xE000)
-            || (group, element) == (0xFFFE, 0xE00D)
-            || (group, element) == (0xFFFE, 0xE0DD)
-        {
-            let _len = read_u32(&mut cur, little_endian).ok()?;
+        let Ok((group, element)) = read_tag(&mut cur, little_endian) else {
+            break;
+        };
+        if (group, element) == (0xFFFE, 0xE000) {
+            let Ok(length) = read_u32(&mut cur, little_endian) else {
+                break;
+            };
+            if length == 0xFFFF_FFFF {
+                collect_nested_i32s(
+                    &blob[cur.position() as usize..],
+                    explicit_vr,
+                    little_endian,
+                    target,
+                    out,
+                    depth + 1,
+                );
+                break;
+            }
+            let start = cur.position() as usize;
+            let Some(end) = start.checked_add(length as usize) else {
+                break;
+            };
+            if end > blob.len() {
+                break;
+            }
+            collect_nested_i32s(
+                &blob[start..end],
+                explicit_vr,
+                little_endian,
+                target,
+                out,
+                depth + 1,
+            );
+            cur.set_position(end as u64);
             continue;
         }
-        let (vr, length) =
-            read_element_length_after_tag(&mut cur, explicit_vr, little_endian).ok()?;
+        if (group, element) == (0xFFFE, 0xE00D) || (group, element) == (0xFFFE, 0xE0DD) {
+            let _ = read_u32(&mut cur, little_endian);
+            break;
+        }
+        let Ok((vr, length)) = read_element_length_after_tag(&mut cur, explicit_vr, little_endian)
+        else {
+            break;
+        };
         if length == 0xFFFF_FFFF {
-            return None;
+            break;
         }
         let start = cur.position() as usize;
-        let end = start.checked_add(length as usize)?;
+        let Some(end) = start.checked_add(length as usize) else {
+            break;
+        };
         if end > blob.len() {
-            return None;
+            break;
         }
         if (group, element) == target {
             let v = &blob[start..end];
-            return match &vr {
+            if let Some(value) = match &vr {
                 b"US" => Some(read_u16_value(v, little_endian) as i32),
                 b"SS" => Some(read_i16_value(v, little_endian) as i32),
                 b"UL" => {
@@ -524,7 +625,19 @@ fn find_nested_i32(
                     }
                 }
                 _ => ascii_trim(v).trim().parse::<i32>().ok(),
-            };
+            } {
+                out.push(value);
+            }
+        }
+        if vr == *b"SQ" {
+            collect_nested_i32s(
+                &blob[start..end],
+                explicit_vr,
+                little_endian,
+                target,
+                out,
+                depth + 1,
+            );
         }
         cur.set_position(end as u64);
     }
@@ -568,8 +681,26 @@ fn parse_per_frame_tile_positions(
             break;
         }
         let item = &blob[start..end];
-        let col = find_nested_i32(item, explicit_vr, little_endian, (0x0048, 0x021E));
-        let row = find_nested_i32(item, explicit_vr, little_endian, (0x0048, 0x021F));
+        let mut cols = Vec::new();
+        let mut rows = Vec::new();
+        collect_nested_i32s(
+            item,
+            explicit_vr,
+            little_endian,
+            (0x0048, 0x021E),
+            &mut cols,
+            0,
+        );
+        collect_nested_i32s(
+            item,
+            explicit_vr,
+            little_endian,
+            (0x0048, 0x021F),
+            &mut rows,
+            0,
+        );
+        let col = cols.first().copied();
+        let row = rows.first().copied();
         if let (Some(col), Some(row)) = (col, row) {
             if col > 0 && row > 0 {
                 out.push((col as u32, row as u32));
@@ -1120,16 +1251,18 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
             }
             (0x0048, 0x0105) => {
                 // Optical Path Sequence: collect each item's Optical Path
-                // Description (0048,0107) as a channel name. The Rust parser does
-                // not iterate SQ items, so scan the value blob directly.
-                if let Some(desc) = find_nested_string(
+                // Description (0048,0107) as a channel name. Java iterates all
+                // sequence children, so collect every nested match.
+                let mut descriptions = Vec::new();
+                collect_nested_strings(
                     &value,
                     attrs.explicit_vr,
                     attrs.little_endian,
                     (0x0048, 0x0107),
-                ) {
-                    attrs.channel_names.push(desc);
-                }
+                    &mut descriptions,
+                    0,
+                );
+                attrs.channel_names.extend(descriptions);
             }
             (0x0040, 0x0551) => attrs.specimen = Some(ascii_trim(&value)), // Specimen ID
             (0x0040, 0x0560) => {

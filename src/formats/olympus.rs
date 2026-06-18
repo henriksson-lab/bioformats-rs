@@ -824,7 +824,7 @@ impl Fv1000Reader {
                 "OIF/OIB: invalid image dimensions {size_x}x{size_y}"
             )));
         }
-        let images_per_file = if tiffs.is_empty() {
+        let _images_per_file = if tiffs.is_empty() {
             0
         } else if image_count % tiffs.len() == 0 {
             image_count / tiffs.len()
@@ -834,25 +834,6 @@ impl Fv1000Reader {
                 tiffs.len()
             )));
         };
-        for tiff in &tiffs {
-            let bytes = self.source.read_bytes(tiff)?;
-            let tm = probe_tiff_metadata(&bytes).ok_or_else(|| {
-                BioFormatsError::Format(format!("OIF/OIB: companion TIFF {tiff} could not be read"))
-            })?;
-            if tm.size_x != size_x || tm.size_y != size_y {
-                return Err(BioFormatsError::Format(format!(
-                    "OIF/OIB: companion TIFF {tiff} has dimensions {}x{}, expected {size_x}x{size_y}",
-                    tm.size_x, tm.size_y
-                )));
-            }
-            if tm.image_count.max(1) < images_per_file as u32 {
-                return Err(BioFormatsError::Format(format!(
-                    "OIF/OIB: companion TIFF {tiff} has {} page(s), expected at least {images_per_file}",
-                    tm.image_count.max(1)
-                )));
-            }
-        }
-
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
         meta_map.insert(
             "format".into(),
@@ -908,19 +889,22 @@ impl Fv1000Reader {
         match &self.source {
             FileSource::Disk => {
                 let mut reader = TiffReader::new();
-                reader.set_id(Path::new(&tiff_name))?;
+                if reader.set_id(Path::new(&tiff_name)).is_err() {
+                    return fv1000_blank_plane(meta);
+                }
                 let inner = reader.metadata().image_count.max(1);
                 if image as u32 >= inner {
-                    return Err(BioFormatsError::Format(format!(
-                        "OIF/OIB: logical plane {plane_index} maps to TIFF page {image}, but {tiff_name} has {inner} page(s)"
-                    )));
+                    return fv1000_blank_plane(meta);
                 }
                 reader.open_bytes(image as u32)
             }
             FileSource::Oib { .. } => {
                 // Read the embedded TIFF into a temp file, then parse it. The
                 // TiffReader requires a path; OIB embeds full TIFF streams.
-                let bytes = self.source.read_bytes(&tiff_name)?;
+                let bytes = match self.source.read_bytes(&tiff_name) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return fv1000_blank_plane(meta),
+                };
                 let mut tmp = std::env::temp_dir();
                 tmp.push(format!(
                     "bioformats_oib_{}_{}.tif",
@@ -932,9 +916,7 @@ impl Fv1000Reader {
                 let r = reader.set_id(&tmp).and_then(|_| {
                     let inner = reader.metadata().image_count.max(1);
                     if image as u32 >= inner {
-                        return Err(BioFormatsError::Format(format!(
-                            "OIF/OIB: logical plane {plane_index} maps to TIFF page {image}, but {tiff_name} has {inner} page(s)"
-                        )));
+                        return fv1000_blank_plane(meta);
                     }
                     reader.open_bytes(image as u32)
                 });
@@ -943,6 +925,18 @@ impl Fv1000Reader {
             }
         }
     }
+}
+
+fn fv1000_blank_plane(meta: &ImageMetadata) -> Result<Vec<u8>> {
+    let channels = if meta.is_rgb { meta.size_c.max(1) } else { 1 };
+    let len = meta
+        .size_x
+        .checked_mul(meta.size_y)
+        .and_then(|px| px.checked_mul(channels))
+        .and_then(|px| px.checked_mul(meta.pixel_type.bytes_per_sample() as u32))
+        .ok_or_else(|| BioFormatsError::Format("OIF/OIB: blank plane size overflows".into()))?
+        as usize;
+    Ok(vec![0; len])
 }
 
 impl Default for Fv1000Reader {
@@ -1048,6 +1042,35 @@ fn find_companion_dir(oif_path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn find_oif_for_entry(path: &Path) -> Option<PathBuf> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if matches!(ext.as_deref(), Some("oif")) {
+        return path.exists().then(|| path.to_path_buf());
+    }
+    if matches!(ext.as_deref(), Some("oib") | Some("bmp")) {
+        return None;
+    }
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut prefix = path.file_stem()?.to_string_lossy().to_string();
+    loop {
+        for name in [format!("{prefix}.oif"), format!("{prefix}.OIF")] {
+            let candidate = dir.join(name);
+            if candidate.exists() && !candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+        match prefix.rfind('_') {
+            Some(i) => prefix.truncate(i),
+            None => break,
+        }
+    }
+    None
+}
+
 /// Probe a TIFF held in memory: returns (pixel_type, little_endian, rgb, bits).
 fn probe_tiff(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8)> {
     let mut tmp = std::env::temp_dir();
@@ -1088,16 +1111,6 @@ fn probe_tiff_dims(bytes: &[u8]) -> Option<(PixelType, bool, bool, u8, u32, u32)
     res
 }
 
-fn probe_tiff_metadata(bytes: &[u8]) -> Option<ImageMetadata> {
-    let mut tmp = std::env::temp_dir();
-    tmp.push(format!("bioformats_oib_meta_{}.tif", rand_suffix(bytes)));
-    std::fs::write(&tmp, bytes).ok()?;
-    let mut r = TiffReader::new();
-    let res = r.set_id(&tmp).ok().map(|_| r.metadata().clone());
-    let _ = std::fs::remove_file(&tmp);
-    res
-}
-
 fn rand_suffix(bytes: &[u8]) -> u64 {
     // cheap, deterministic-ish unique suffix
     let pid = std::process::id() as u64;
@@ -1111,10 +1124,15 @@ fn rand_suffix(bytes: &[u8]) -> u64 {
 
 impl FormatReader for Fv1000Reader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("oif") || e.eq_ignore_ascii_case("oib"))
-            .unwrap_or(false)
+            .map(|e| e.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("oif") | Some("oib") => true,
+            Some("bmp") => false,
+            _ => find_oif_for_entry(path).is_some(),
+        }
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -2110,7 +2128,32 @@ mod tests {
     }
 
     #[test]
-    fn oif_rejects_logical_plane_without_physical_tiff_page() {
+    fn fv1000_detection_accepts_related_entries_like_java() {
+        let root = temp_path("detectentry.oif");
+        let dir = root.parent().unwrap();
+        let stem = root.file_stem().unwrap().to_string_lossy();
+        let tif = dir.join(format!("{stem}_C001.tif"));
+        let pty = dir.join(format!("{stem}_C001.pty"));
+        let bmp = dir.join(format!("{stem}_C001.bmp"));
+        std::fs::write(&root, b"[FileInformation]\n").unwrap();
+        std::fs::write(&tif, []).unwrap();
+        std::fs::write(&pty, []).unwrap();
+        std::fs::write(&bmp, []).unwrap();
+
+        let reader = Fv1000Reader::new();
+        assert!(reader.is_this_type_by_name(&root));
+        assert!(reader.is_this_type_by_name(&tif));
+        assert!(reader.is_this_type_by_name(&pty));
+        assert!(!reader.is_this_type_by_name(&bmp));
+
+        let _ = std::fs::remove_file(root);
+        let _ = std::fs::remove_file(tif);
+        let _ = std::fs::remove_file(pty);
+        let _ = std::fs::remove_file(bmp);
+    }
+
+    #[test]
+    fn oif_missing_physical_tiff_page_returns_blank_like_java() {
         let root = temp_path("repeat_plane.oif");
         let companion = root.with_file_name(format!(
             "{}.files",
@@ -2140,12 +2183,10 @@ mod tests {
         .unwrap();
 
         let mut reader = Fv1000Reader::new();
-        let err = reader.set_id(&root).unwrap_err();
-        assert!(
-            err.to_string().contains("companion TIFF")
-                && err.to_string().contains("expected at least 4"),
-            "unexpected error: {err}"
-        );
+        reader.set_id(&root).unwrap();
+        assert_eq!(reader.metadata().image_count, 4);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![0, 0, 0, 0]);
 
         let _ = std::fs::remove_file(root);
         let _ = std::fs::remove_file(pty);

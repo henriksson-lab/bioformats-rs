@@ -216,7 +216,11 @@ impl<R: Read + Seek> TiffParser<R> {
                 continue;
             }
             let value = self.read_ifd_value(type_code, count, value_or_offset, &value_bytes)?;
-            entries.insert(tag, value);
+            // Java TiffParser keeps the first occurrence of a duplicate tag
+            // (`!ifd.containsKey(tag)` before put). Preserve that tolerance for
+            // malformed TIFFs rather than letting later duplicates override
+            // core values like dimensions, offsets, or comments.
+            entries.entry(tag).or_insert(value);
         }
 
         // Read next-IFD offset
@@ -327,7 +331,9 @@ impl<R: Read + Seek> TiffParser<R> {
                 }
                 self.read_ifd_value(type_code, count, corrected, &[0u8; 4])?
             };
-            entries.insert(tag, value);
+            // Match standard IFD parsing and Java TiffParser: first duplicate
+            // tag wins.
+            entries.entry(tag).or_insert(value);
         }
 
         Ok((Ifd { entries }, next_ifd))
@@ -637,6 +643,10 @@ mod tests {
         bytes.extend_from_slice(&offset.to_le_bytes());
     }
 
+    fn long_entry(bytes: &mut Vec<u8>, tag: u16, value: u32) {
+        offset_entry(bytes, tag, 4, 1, value);
+    }
+
     fn big_offset_entry(bytes: &mut Vec<u8>, tag: u16, typ: u16, count: u64, offset: u64) {
         bytes.extend_from_slice(&tag.to_le_bytes());
         bytes.extend_from_slice(&typ.to_le_bytes());
@@ -774,6 +784,46 @@ mod tests {
             "expected empty ASCII value, got {:?}",
             ifds[0].get(270)
         );
+    }
+
+    #[test]
+    fn read_ifd_keeps_first_duplicate_tag_value() {
+        // Java TiffParser only inserts a tag when the IFD does not already
+        // contain it. Later duplicate tags must not overwrite earlier values.
+        let mut bytes = classic_le_header(8);
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        long_entry(&mut bytes, 256, 1);
+        long_entry(&mut bytes, 256, 2);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut parser = parse(bytes);
+        let ifds = parser.read_ifds().expect("duplicate-tag IFD should parse");
+
+        assert_eq!(ifds[0].get(256).and_then(IfdValue::as_u32), Some(1));
+    }
+
+    #[test]
+    fn read_ifds_ndpi64_keeps_first_duplicate_tag_value() {
+        // NDPI's fake-64-bit IFD walk has its own materialisation pass; it must
+        // match ordinary IFD parsing and Java's first-tag-wins behavior.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&16u64.to_le_bytes());
+        bytes.resize(16, 0);
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        long_entry(&mut bytes, 256, 1);
+        long_entry(&mut bytes, 256, 2);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut parser = parse(bytes);
+        let ifds = parser
+            .read_ifds_ndpi64()
+            .expect("duplicate-tag NDPI IFD should parse");
+
+        assert_eq!(ifds[0].get(256).and_then(IfdValue::as_u32), Some(1));
     }
 
     #[test]

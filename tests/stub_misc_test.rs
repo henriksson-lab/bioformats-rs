@@ -609,8 +609,7 @@ fn openlab_v2_ome_annotations_include_native_series_metadata() {
                 namespace,
                 values,
             } if id.as_deref() == Some("Annotation:OriginalMetadata:0")
-                && namespace.as_deref()
-                    == Some("openmicroscopy.org/bioformats/original-metadata") =>
+                && namespace.as_deref() == Some("openmicroscopy.org/OriginalMetadata") =>
             {
                 Some(values)
             }
@@ -728,6 +727,8 @@ fn slidebook_detection_by_magic_shorts() {
     header[6..8].copy_from_slice(&0x006cu16.to_le_bytes()); // magic1 = SLD_MAGIC_BYTES_1_0
     header[8..10].copy_from_slice(&0x0100u16.to_le_bytes()); // magic2 high byte = 0x0100
     assert!(reader.is_this_type_by_bytes(&header));
+    assert!(reader.is_this_type_by_name(std::path::Path::new("x.sld")));
+    assert!(reader.is_this_type_by_name(std::path::Path::new("x.spl")));
 
     // Not a SlideBook header.
     assert!(!reader.is_this_type_by_bytes(b"random bytes...."));

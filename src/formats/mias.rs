@@ -1543,6 +1543,7 @@ struct MiasWell {
     size_z: u32,
     size_c: u32,
     size_t: u32,
+    dimension_order: DimensionOrder,
     well_number: i64,
 }
 
@@ -1584,7 +1585,8 @@ fn is_mias_tiff(name: &str) -> bool {
 /// Extract the integer following a `<prefix>` block in a MIAS filename, e.g.
 /// `mode2_z003_t001_...` -> for prefix "z" returns Some(3).
 fn mias_block(name: &str, prefix: &str) -> Option<i64> {
-    let lname = name.to_ascii_lowercase();
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let lname = stem.to_ascii_lowercase();
     for part in lname.split('_') {
         if let Some(rest) = part.strip_prefix(prefix) {
             if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
@@ -1610,6 +1612,81 @@ fn mias_trailing_col(name: &str) -> Option<i64> {
     }
 }
 
+/// Parse the alternate MIAS layout used by Java MIASReader:
+///
+///   `<plate>/<well>/<channel>/<Z>_<T>_<tile-col>_<tile-row>.tif`
+///
+/// The Java FilePattern branch treats numeric filename blocks by their block
+/// index: block 0 is Z, block 1 is T, block 2 is tile column, and block 3 is
+/// tile row (with channel counted from the single-character parent
+/// directories).
+fn mias_alternate_blocks(path: &Path) -> Option<(i64, i64, i64, i64)> {
+    let channel_dir = path.parent()?.file_name()?.to_str()?;
+    if channel_dir.len() != 1 || !channel_dir.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let name = path.file_name()?.to_str()?;
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let parts: Vec<&str> = stem.split('_').collect();
+    if parts.len() != 4 || !parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+        parts[3].parse().ok()?,
+    ))
+}
+
+fn mias_dimension_order_from_axes(axes: &[char]) -> DimensionOrder {
+    let mut order = String::from("XY");
+    for axis in axes {
+        if !order.contains(*axis) {
+            order.push(*axis);
+        }
+    }
+    for axis in ['Z', 'C', 'T'] {
+        if !order.contains(axis) {
+            order.push(axis);
+        }
+    }
+    match order.as_str() {
+        "XYCTZ" => DimensionOrder::XYCTZ,
+        "XYCZT" => DimensionOrder::XYCZT,
+        "XYTCZ" => DimensionOrder::XYTCZ,
+        "XYTZC" => DimensionOrder::XYTZC,
+        "XYZTC" => DimensionOrder::XYZTC,
+        _ => DimensionOrder::XYZCT,
+    }
+}
+
+fn mias_java_dimension_order(path: &Path, alternate_layout: bool) -> DimensionOrder {
+    if alternate_layout {
+        // Java's numeric alternate layout visits blocks from right to left:
+        // block 3 = tile row, block 2 = tile column, block 1 = T, block 0 = Z;
+        // C is appended afterward from the single-character channel directory.
+        return DimensionOrder::XYTZC;
+    }
+
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let mut axes = Vec::new();
+    for part in stem.split('_').rev() {
+        let lower = part.to_ascii_lowercase();
+        if lower.starts_with('z') && lower[1..].chars().all(|c| c.is_ascii_digit()) {
+            axes.push('Z');
+        } else if lower.starts_with('t') && lower[1..].chars().all(|c| c.is_ascii_digit()) {
+            axes.push('T');
+        } else if lower.starts_with("mode") && lower[4..].chars().all(|c| c.is_ascii_digit()) {
+            axes.push('C');
+        }
+    }
+    mias_dimension_order_from_axes(&axes)
+}
+
 /// Identify whether a directory name is a MIAS well directory.
 fn is_well_dir_name(name: &str) -> bool {
     if name.starts_with("Well") {
@@ -1617,6 +1694,18 @@ fn is_well_dir_name(name: &str) -> bool {
     }
     // Four-digit well directory in the alternate layout.
     name.len() == 4 && name.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_in_mias_alternate_layout(path: &Path) -> bool {
+    if mias_alternate_blocks(path).is_none() {
+        return false;
+    }
+    path.parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(is_well_dir_name)
+        .unwrap_or(false)
 }
 
 fn well_number_from_name(name: &str) -> i64 {
@@ -1677,6 +1766,9 @@ impl MiasReader {
             let mut c_vals: Vec<i64> = Vec::new();
             let mut im_rows: Vec<i64> = Vec::new();
             let mut im_cols: Vec<i64> = Vec::new();
+            let mut alt_rows: Vec<i64> = Vec::new();
+            let mut alt_cols: Vec<i64> = Vec::new();
+            let mut saw_alternate_layout = false;
             for t in &tiffs {
                 let name = t.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if let Some(z) = mias_block(name, "z") {
@@ -1707,23 +1799,60 @@ impl MiasReader {
                         }
                     }
                 }
+                if let Some((z, tt, col, row)) = mias_alternate_blocks(t) {
+                    saw_alternate_layout = true;
+                    if !alt_rows.contains(&row) {
+                        alt_rows.push(row);
+                    }
+                    if !alt_cols.contains(&col) {
+                        alt_cols.push(col);
+                    }
+                    if !z_vals.contains(&z) {
+                        z_vals.push(z);
+                    }
+                    if !t_vals.contains(&tt) {
+                        t_vals.push(tt);
+                    }
+                    if let Some(ch) = t
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .and_then(|s| s.parse::<i64>().ok())
+                    {
+                        if !c_vals.contains(&ch) {
+                            c_vals.push(ch);
+                        }
+                    }
+                }
             }
             let size_z = (z_vals.len() as u32).max(1);
             let size_t = (t_vals.len() as u32).max(1);
             let size_c = (c_vals.len() as u32).max(1);
-            if im_rows.len() as u32 > self.tile_rows {
-                self.tile_rows = im_rows.len() as u32;
+            let well_tile_rows = if saw_alternate_layout {
+                alt_rows.len() as u32
+            } else {
+                im_rows.len() as u32
+            };
+            let well_tile_cols = if saw_alternate_layout {
+                alt_cols.len() as u32
+            } else {
+                im_cols.len() as u32
+            };
+            if well_tile_rows > self.tile_rows {
+                self.tile_rows = well_tile_rows;
             }
-            if im_cols.len() as u32 > self.tile_cols {
-                self.tile_cols = im_cols.len() as u32;
+            if well_tile_cols > self.tile_cols {
+                self.tile_cols = well_tile_cols;
             }
 
             let name = wd.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let dimension_order = mias_java_dimension_order(&tiffs[0], saw_alternate_layout);
             wells.push(MiasWell {
                 tiffs,
                 size_z,
                 size_c,
                 size_t,
+                dimension_order,
                 well_number: well_number_from_name(name),
             });
         }
@@ -1833,7 +1962,7 @@ impl MiasReader {
                 pixel_type,
                 bits_per_pixel: bits,
                 image_count,
-                dimension_order: DimensionOrder::XYZCT,
+                dimension_order: w.dimension_order,
                 is_rgb,
                 is_interleaved: false,
                 is_indexed: false,
@@ -1924,7 +2053,8 @@ impl FormatReader for MiasReader {
             .and_then(|n| n.to_str())
             .map(is_well_dir_name)
             .unwrap_or(false);
-        in_well_dir && (mias_block(name, "mode").is_some() || mias_block(name, "z").is_some())
+        (in_well_dir && (mias_block(name, "mode").is_some() || mias_block(name, "z").is_some()))
+            || is_in_mias_alternate_layout(path)
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -1940,7 +2070,7 @@ impl FormatReader for MiasReader {
         // pass). Directory inputs (a well/plate dir) are allowed through.
         if !path.is_dir() && !self.is_this_type_by_name(path) {
             return Err(BioFormatsError::UnsupportedFormat(
-                "MIAS: file is not a Well<xxxx>/mode<c>_z<zzz>_t<ttt> TIFF dataset".into(),
+                "MIAS: file is not a Well<xxxx>/mode<c>_z<zzz>_t<ttt> TIFF dataset or alternate numeric MIAS layout".into(),
             ));
         }
         self.tile_rows = 1;

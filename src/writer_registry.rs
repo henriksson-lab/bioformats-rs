@@ -9,16 +9,35 @@ use crate::common::writer::FormatWriter;
 pub struct ImageWriter {
     inner: Box<dyn FormatWriter>,
     expected_planes: u32,
+    expected_plane_len: usize,
     written_planes: HashSet<u32>,
     closed: bool,
 }
 
 fn writer_for(path: &Path) -> Option<Box<dyn FormatWriter>> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        name.as_str(),
+        n if n.ends_with(".ome.tif")
+            || n.ends_with(".ome.tiff")
+            || n.ends_with(".ome.tf2")
+            || n.ends_with(".ome.tf8")
+            || n.ends_with(".ome.btf")
+    ) {
+        return Some(Box::new(crate::tiff::TiffWriter::new().with_auto_ome_xml()));
+    }
+
     #[allow(unused_mut)]
     let mut writers: Vec<Box<dyn FormatWriter>> = vec![
         Box::new(crate::tiff::TiffWriter::new()),
-        Box::new(crate::formats::png::PngWriter::new()),
+        // Java writers.txt registers APNGWriter for ".png"; it can write both
+        // single-frame PNG/APNG and multi-frame PNG stacks.
         Box::new(crate::formats::extended::ApngWriter::new()),
+        Box::new(crate::formats::png::PngWriter::new()),
         Box::new(crate::formats::jpeg::JpegWriter::new()),
         Box::new(crate::formats::bmp::BmpWriter::new()),
         Box::new(crate::formats::raster::TgaWriter::new()),
@@ -99,31 +118,20 @@ impl ImageWriter {
     }
 
     fn expected_plane_len(meta: &ImageMetadata) -> Result<usize> {
-        if meta.size_x == 0 || meta.size_y == 0 {
-            return Err(BioFormatsError::InvalidData(
-                "writer image dimensions must be positive (non-zero)".into(),
-            ));
-        }
-        let samples_per_pixel = if meta.is_rgb { meta.size_c.max(1) } else { 1 };
-        let bytes_per_sample = meta.pixel_type.bytes_per_sample() as u64;
-        let len =
-            meta.size_x as u64 * meta.size_y as u64 * samples_per_pixel as u64 * bytes_per_sample;
-        usize::try_from(len).map_err(|_| {
-            BioFormatsError::Format("writer expected plane byte count overflows usize".into())
-        })
+        crate::common::writer::expected_plane_len(meta)
     }
 
-    fn validate_save_plane_sizes(meta: &ImageMetadata, planes: &[Vec<u8>]) -> Result<()> {
+    fn validate_save_plane_sizes(meta: &ImageMetadata, planes: &[Vec<u8>]) -> Result<usize> {
         let expected_len = Self::expected_plane_len(meta)?;
         for (plane_index, plane) in planes.iter().enumerate() {
-            if plane.len() != expected_len {
+            if plane.len() < expected_len {
                 return Err(BioFormatsError::Format(format!(
-                    "writer plane {plane_index} has {} bytes, expected {expected_len}",
+                    "writer plane {plane_index} has {} bytes, expected {expected_len} bytes or more",
                     plane.len()
                 )));
             }
         }
-        Ok(())
+        Ok(expected_len)
     }
 
     /// Write an OME-TIFF file with embedded OME-XML metadata.
@@ -140,11 +148,11 @@ impl ImageWriter {
         let mut w = crate::tiff::TiffWriter::new().with_ome_xml(ome_xml);
         let expected_planes = Self::validate_stack_support(&w, meta)?;
         Self::validate_save_plane_count(expected_planes, planes.len())?;
-        Self::validate_save_plane_sizes(meta, planes)?;
+        let expected_plane_len = Self::validate_save_plane_sizes(meta, planes)?;
         w.set_metadata(meta)?;
         w.set_id(path)?;
         for (i, plane) in planes.iter().enumerate() {
-            w.save_bytes(i as u32, plane)?;
+            w.save_bytes(i as u32, &plane[..expected_plane_len])?;
         }
         w.close()
     }
@@ -154,11 +162,11 @@ impl ImageWriter {
         let mut w = writer_for_or_error(path)?;
         let expected_planes = Self::validate_stack_support(w.as_ref(), meta)?;
         Self::validate_save_plane_count(expected_planes, planes.len())?;
-        Self::validate_save_plane_sizes(meta, planes)?;
+        let expected_plane_len = Self::validate_save_plane_sizes(meta, planes)?;
         w.set_metadata(meta)?;
         w.set_id(path)?;
         for (i, plane) in planes.iter().enumerate() {
-            w.save_bytes(i as u32, plane)?;
+            w.save_bytes(i as u32, &plane[..expected_plane_len])?;
         }
         w.close()
     }
@@ -167,11 +175,13 @@ impl ImageWriter {
     pub fn open(path: &Path, meta: &ImageMetadata) -> Result<Self> {
         let mut w = writer_for_or_error(path)?;
         let expected_planes = Self::validate_stack_support(w.as_ref(), meta)?;
+        let expected_plane_len = Self::expected_plane_len(meta)?;
         w.set_metadata(meta)?;
         w.set_id(path)?;
         Ok(ImageWriter {
             inner: w,
             expected_planes,
+            expected_plane_len,
             written_planes: HashSet::new(),
             closed: false,
         })
@@ -195,7 +205,15 @@ impl ImageWriter {
                 "plane {plane_index} was already written"
             )));
         }
-        self.inner.save_bytes(plane_index, data)?;
+        if data.len() < self.expected_plane_len {
+            return Err(BioFormatsError::Format(format!(
+                "writer plane {plane_index} has {} bytes, expected {} bytes or more",
+                data.len(),
+                self.expected_plane_len
+            )));
+        }
+        self.inner
+            .save_bytes(plane_index, &data[..self.expected_plane_len])?;
         self.written_planes.insert(plane_index);
         Ok(())
     }

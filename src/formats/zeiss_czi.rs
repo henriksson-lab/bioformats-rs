@@ -1191,6 +1191,17 @@ fn channel_name_attr(block: &str) -> Option<String> {
     }
 }
 
+fn parse_czi_channel_color(color: &str) -> Option<i32> {
+    let mut hex = color.trim().trim_start_matches('#');
+    if hex.len() > 6 {
+        let end = hex.len().min(8);
+        hex = &hex[2..end];
+    }
+    u32::from_str_radix(hex, 16)
+        .ok()
+        .map(|rgb| ((rgb << 8) | 0xff) as i32)
+}
+
 /// Build the per-channel OME metadata the way ZeissCZIReader does:
 ///   1. `Information/Image/Dimensions/Channels` provides the channel count plus
 ///      emission/excitation wavelengths.
@@ -1208,8 +1219,10 @@ fn build_czi_channels(xml: &str) -> Vec<crate::common::ome_metadata::OmeChannel>
                 name: channel_name_attr(block),
                 samples_per_pixel: 1,
                 color: child_value(block, "Color").and_then(|s| {
-                    let hex = s.trim().trim_start_matches('#');
-                    i64::from_str_radix(hex, 16).ok().map(|v| v as i32)
+                    // Extra Rust support: Java only reads CZI false colors from
+                    // DisplaySetting/Channels, but pack Dimensions/Channels
+                    // colors identically when they are present.
+                    parse_czi_channel_color(&s)
                 }),
                 emission_wavelength: child_value(block, "EmissionWavelength")
                     .and_then(|s| s.parse().ok()),
@@ -1234,10 +1247,7 @@ fn build_czi_channels(xml: &str) -> Vec<crate::common::ome_metadata::OmeChannel>
             }
             let color = child_value(block, "Color")
                 .or_else(|| child_value(block, "OriginalColor"))
-                .and_then(|s| {
-                    let hex = s.trim().trim_start_matches('#');
-                    i64::from_str_radix(hex, 16).ok().map(|v| v as i32)
-                });
+                .and_then(|s| parse_czi_channel_color(&s));
             if color.is_some() {
                 channels[i].color = color;
             }
@@ -1915,6 +1925,12 @@ impl FormatReader for ZeissCziReader {
         let storage_bps = (parsed.pixel_type.bytes_per_sample() * 8) as u8;
         let bps = parse_component_bit_count(&parsed.meta_xml).unwrap_or(storage_bps);
         let is_rgb = parsed.spp >= 3;
+        let czi_channels = build_czi_channels(&parsed.meta_xml);
+        let is_indexed = !is_rgb
+            && czi_channels
+                .first()
+                .and_then(|channel| channel.color)
+                .is_some();
 
         let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
         series_metadata.insert(
@@ -1945,8 +1961,8 @@ impl FormatReader for ZeissCziReader {
             image_count,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb,
-            is_interleaved: true,
-            is_indexed: false,
+            is_interleaved: is_rgb,
+            is_indexed,
             is_little_endian: true,
             resolution_count: init_res_count as u32,
             thumbnail: false,
@@ -2654,6 +2670,28 @@ mod tests {
             reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(),
             vec![12, 11, 10]
         );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_gray_channel_color_sets_indexed_not_interleaved_like_java() {
+        let entries = vec![(directory_entry(0, 0, 0, 2, 1), vec![1, 2])];
+        let xml = r#"<Metadata>
+          <Information><Image><Dimensions><Channels>
+            <Channel><Color>#00ff00</Color></Channel>
+          </Channels></Dimensions></Image></Information>
+        </Metadata>"#;
+        let path = write_synthetic_czi_with_xml("gray_indexed", entries, xml);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert!(!meta.is_rgb);
+        assert!(!meta.is_interleaved);
+        assert!(meta.is_indexed);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].color, Some(0x00ff00ff));
 
         fs::remove_file(path).unwrap();
     }

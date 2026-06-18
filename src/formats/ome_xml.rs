@@ -118,6 +118,19 @@ fn xml_attr(tag: &str, attr: &str) -> Option<String> {
     }
 }
 
+fn ome_xml_bool(value: &str, attr: &str) -> Result<bool> {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with('t') {
+        Ok(true)
+    } else if lower.starts_with('f') {
+        Ok(false)
+    } else {
+        Err(BioFormatsError::Format(format!(
+            "OME-XML invalid {attr}: {value}"
+        )))
+    }
+}
+
 fn tag_local_name(tag: &str) -> &str {
     tag.rsplit_once(':').map(|(_, local)| local).unwrap_or(tag)
 }
@@ -519,6 +532,46 @@ fn read_external_plane(plane: &ExternalPlane, x: u32, y: u32, w: u32, h: u32) ->
     reader.open_bytes_region(plane_idx as u32, x, y, w, h)
 }
 
+/// Reassemble Java OMEXMLWriter-style RGB `<BinData>` blocks.
+///
+/// OMEXMLWriter writes one BinData element per RGB sample for each logical
+/// plane. The public reader API returns a single interleaved RGB plane, so the
+/// per-sample blocks need to be woven back together before region cropping.
+fn interleave_split_rgb_bindata(
+    planes: &[Vec<u8>],
+    plane_index: usize,
+    samples: usize,
+    pixels_per_plane: usize,
+    bytes_per_sample: usize,
+) -> Option<Vec<u8>> {
+    if samples <= 1 {
+        return None;
+    }
+    let channel_len = pixels_per_plane.checked_mul(bytes_per_sample)?;
+    let base = plane_index.checked_mul(samples)?;
+    if base.checked_add(samples)? > planes.len() {
+        return None;
+    }
+    let sample_blocks = &planes[base..base + samples];
+    if sample_blocks
+        .iter()
+        .any(|block| block.len() < channel_len || block.len() == channel_len * samples)
+    {
+        return None;
+    }
+
+    let mut out = vec![0u8; channel_len.checked_mul(samples)?];
+    for pixel in 0..pixels_per_plane {
+        for sample in 0..samples {
+            let src = pixel * bytes_per_sample;
+            let dst = (pixel * samples + sample) * bytes_per_sample;
+            out[dst..dst + bytes_per_sample]
+                .copy_from_slice(&sample_blocks[sample][src..src + bytes_per_sample]);
+        }
+    }
+    Some(out)
+}
+
 /// Build the logical-plane -> (file, IFD) mapping for a Pixels block that
 /// stores its pixels in external companion TIFFs via `<TiffData>` elements.
 ///
@@ -717,6 +770,17 @@ fn parse_ome_xml_series_with_base(
         let (planes, first_bindata_big_endian) = parse_bindata_blocks(pixels_xml)?;
         if !planes.is_empty() {
             let samples_per_plane = if is_rgb { exposed_c as usize } else { 1 };
+            let pixels_per_plane =
+                (size_x as usize)
+                    .checked_mul(size_y as usize)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("OME-XML plane pixel count overflow".into())
+                    })?;
+            let channel_bytes = pixels_per_plane
+                .checked_mul(pixel_type.bytes_per_sample())
+                .ok_or_else(|| {
+                    BioFormatsError::Format("OME-XML channel byte count overflow".into())
+                })?;
             let plane_bytes = (size_x as usize)
                 .checked_mul(size_y as usize)
                 .and_then(|v| v.checked_mul(pixel_type.bytes_per_sample()))
@@ -738,35 +802,63 @@ fn parse_ome_xml_series_with_base(
                     )));
                 }
             } else {
-                if planes.len() < image_count as usize {
-                    return Err(BioFormatsError::Format(format!(
-                        "OME-XML has {} BinData planes but expected {image_count}",
-                        planes.len()
-                    )));
-                }
-                for (index, plane) in planes.iter().take(image_count as usize).enumerate() {
-                    if plane.len() < plane_bytes {
+                let split_rgb_blocks = is_rgb
+                    && planes.len() >= image_count as usize * samples_per_plane
+                    && planes
+                        .iter()
+                        .take(image_count as usize * samples_per_plane)
+                        .all(|plane| plane.len() >= channel_bytes && plane.len() < plane_bytes);
+                if split_rgb_blocks {
+                    for (index, plane) in planes
+                        .iter()
+                        .take(image_count as usize * samples_per_plane)
+                        .enumerate()
+                    {
+                        if plane.len() < channel_bytes {
+                            return Err(BioFormatsError::Format(format!(
+                                "OME-XML BinData sample block {index} is shorter than expected: {} < {channel_bytes}",
+                                plane.len()
+                            )));
+                        }
+                    }
+                } else {
+                    if planes.len() < image_count as usize {
                         return Err(BioFormatsError::Format(format!(
-                            "OME-XML BinData plane {index} is shorter than expected: {} < {plane_bytes}",
-                            plane.len()
+                            "OME-XML has {} BinData planes but expected {image_count}",
+                            planes.len()
                         )));
+                    }
+                    for (index, plane) in planes.iter().take(image_count as usize).enumerate() {
+                        if plane.len() < plane_bytes {
+                            return Err(BioFormatsError::Format(format!(
+                                "OME-XML BinData plane {index} is shorter than expected: {} < {plane_bytes}",
+                                plane.len()
+                            )));
+                        }
                     }
                 }
             }
         }
         let pixels_big_endian =
             xml_attr(pixels_tag, "BigEndian").or_else(|| xml_attr(pixels_tag, "bigendian"));
-        let mut is_big_endian = pixels_big_endian
-            .or(first_bindata_big_endian)
-            .map(|s| s.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let inline_pixels_present = planes.iter().any(|p| !p.is_empty());
+        let mut is_big_endian = if inline_pixels_present {
+            match pixels_big_endian.or(first_bindata_big_endian) {
+                Some(value) => ome_xml_bool(&value, "BigEndian")?,
+                None => false,
+            }
+        } else {
+            // Java OMEXMLReader only derives endianness when BinData elements
+            // are present. MetadataOnly/no-pixel OME-XML therefore reports
+            // littleEndian=false regardless of Pixels/@BigEndian.
+            true
+        };
 
         // When there is no inline pixel data, attempt to resolve external
         // pixels referenced via <TiffData>/<UUID FileName="..."> (the OME-TIFF
         // companion case handled by Java's OMETiffReader). A <MetadataOnly>
         // element with no resolvable TiffData yields black/absent planes.
         let mut external_planes: Vec<Option<ExternalPlane>> = Vec::new();
-        let inline_pixels_present = planes.iter().any(|p| !p.is_empty());
         if !inline_pixels_present {
             let tiff_data = parse_tiff_data(pixels_xml);
             if !tiff_data.is_empty() {
@@ -940,6 +1032,18 @@ impl FormatReader for OmeXmlReader {
                 // Missing/unresolved plane: return a black plane (Java fills the
                 // buffer with the fill color for non-existent planes).
                 _ => return Ok(vec![0u8; plane_bytes]),
+            }
+        }
+
+        if meta.is_rgb {
+            if let Some(plane) = interleave_split_rgb_bindata(
+                &series.planes,
+                plane_index as usize,
+                samples,
+                (meta.size_x * meta.size_y) as usize,
+                bps,
+            ) {
+                return Ok(plane);
             }
         }
 
@@ -1183,16 +1287,45 @@ impl crate::common::writer::FormatWriter for OmeXmlWriter {
             }
         }
 
-        // BinData for each plane
+        let samples_per_pixel = crate::common::writer::samples_per_pixel(meta);
+        let bytes_per_sample = meta.pixel_type.bytes_per_sample();
+        let pixels_per_plane = meta.size_x as usize * meta.size_y as usize;
+        let channel_len = pixels_per_plane * bytes_per_sample;
+
+        // BinData for each plane/sample. Java OMEXMLWriter splits RGB samples
+        // into separate BinData elements even when writer input is interleaved.
         for plane in &self.planes {
-            let b64 = base64_encode(plane);
-            let _ = write!(
-                xml,
-                r#"<BinData xmlns="http://www.openmicroscopy.org/Schemas/BinaryFile/2016-06" Length="{}" BigEndian="{}">{}</BinData>"#,
-                plane.len(),
-                !meta.is_little_endian,
-                b64
-            );
+            if samples_per_pixel == 1 {
+                let b64 = base64_encode(plane);
+                let _ = write!(
+                    xml,
+                    r#"<BinData xmlns="http://www.openmicroscopy.org/Schemas/BinaryFile/2016-06" Length="{}" BigEndian="{}">{}</BinData>"#,
+                    plane.len(),
+                    !meta.is_little_endian,
+                    b64
+                );
+            } else {
+                for sample in 0..samples_per_pixel {
+                    let mut channel = Vec::with_capacity(channel_len);
+                    if meta.is_interleaved {
+                        for pixel in 0..pixels_per_plane {
+                            let offset = (pixel * samples_per_pixel + sample) * bytes_per_sample;
+                            channel.extend_from_slice(&plane[offset..offset + bytes_per_sample]);
+                        }
+                    } else {
+                        let offset = sample * channel_len;
+                        channel.extend_from_slice(&plane[offset..offset + channel_len]);
+                    }
+                    let b64 = base64_encode(&channel);
+                    let _ = write!(
+                        xml,
+                        r#"<BinData xmlns="http://www.openmicroscopy.org/Schemas/BinaryFile/2016-06" Length="{}" BigEndian="{}">{}</BinData>"#,
+                        channel.len(),
+                        !meta.is_little_endian,
+                        b64
+                    );
+                }
+            }
         }
 
         xml.push_str("</Pixels></Image></OME>");
@@ -1389,6 +1522,62 @@ mod tests {
             reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
             vec![4, 5, 6, 10, 11, 12]
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pixels_big_endian_accepts_java_t_and_f_shorthand() {
+        for (name, value, little) in [
+            ("big_t.ome", "t", false),
+            ("big_trueish.ome", "true-ish", false),
+            ("big_f.ome", "f", true),
+        ] {
+            let path = temp_path(name);
+            let xml = format!(
+                r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint16" SizeX="1" SizeY="1" SizeZ="1" SizeC="1" SizeT="1" BigEndian="{value}"><BinData Length="2">EjQ=</BinData></Pixels></Image></OME>"#
+            );
+            std::fs::write(&path, xml).unwrap();
+
+            let mut reader = OmeXmlReader::new();
+            reader.set_id(&path).unwrap();
+            assert_eq!(
+                reader.metadata().is_little_endian,
+                little,
+                "BigEndian={value}"
+            );
+            assert_eq!(reader.open_bytes(0).unwrap(), vec![0x12, 0x34]);
+
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn pixels_big_endian_rejects_malformed_boolean() {
+        let path = temp_path("bad_big_endian.ome");
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint16" SizeX="1" SizeY="1" SizeZ="1" SizeC="1" SizeT="1" BigEndian="maybe"><BinData Length="2">EjQ=</BinData></Pixels></Image></OME>"#;
+        std::fs::write(&path, xml).unwrap();
+
+        let mut reader = OmeXmlReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("invalid BigEndian: maybe")),
+            "{err:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn metadata_only_ome_xml_defaults_to_big_endian_like_java() {
+        let path = temp_path("metadata_only_endian.ome");
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="2" SizeY="1" SizeZ="1" SizeC="1" SizeT="1" BigEndian="false"><MetadataOnly/></Pixels></Image></OME>"#;
+        std::fs::write(&path, xml).unwrap();
+
+        let mut reader = OmeXmlReader::new();
+        reader.set_id(&path).unwrap();
+        assert!(!reader.metadata().is_little_endian);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 0]);
+
         let _ = std::fs::remove_file(path);
     }
 

@@ -266,16 +266,21 @@ fn lsm_dimension_order(scan_type: i16, is_rgb: bool) -> DimensionOrder {
     }
 }
 
-fn lsm_pixel_type(data_type: i32, tiff_bps: u16) -> Result<PixelType> {
-    // data_type follows ZeissLSMReader: 1=uint8, 2=12-bit stored as uint16,
-    // 5=32-bit float.
+fn lsm_pixel_type(data_type: i32, tiff_pixel_type: PixelType) -> PixelType {
+    // Java derives pixelType from the TIFF IFD before reading CZ-LSMInfo
+    // (ZeissLSMReader.java:724-738). CZ-LSMInfo DataType is mostly descriptive:
+    // 2 marks 12-bit data stored in 16-bit samples, 5 marks float data, and
+    // 0/"varying" or unknown values do not make the file unsupported.
     match data_type {
-        1 => Ok(PixelType::Uint8),
-        2 => Ok(PixelType::Uint16),
-        5 => Ok(PixelType::Float32),
-        other => Err(BioFormatsError::UnsupportedFormat(format!(
-            "LSM: unsupported CZ_LSMInfo DataType {other} (TIFF bits/sample {tiff_bps})"
-        ))),
+        2 => PixelType::Uint16,
+        5 => PixelType::Float32,
+        _ => {
+            if tiff_pixel_type == PixelType::Uint32 {
+                PixelType::Float32
+            } else {
+                tiff_pixel_type
+            }
+        }
     }
 }
 
@@ -486,7 +491,7 @@ impl FormatReader for ZeissLsmReader {
             full_res_ifd_count
         };
 
-        let pixel_type = lsm_pixel_type(lsm_info.data_type, tiff_meta.bits_per_pixel as u16)?;
+        let pixel_type = lsm_pixel_type(lsm_info.data_type, tiff_meta.pixel_type);
         // ZeissLSMReader sets rgb=samples>1 to drive the dimension-order shuffle,
         // but always flattens rgb back to false once channels are split / the
         // image is indexed (java:877, 990). We never expose LSM as packed RGB.
@@ -714,6 +719,15 @@ mod tests {
         // scanType 0 -> XYZCT, RGB-style shuffle moves C to front -> XYCZT.
         assert_eq!(lsm_dimension_order(0, false), DimensionOrder::XYZCT);
         assert_eq!(lsm_dimension_order(0, true), DimensionOrder::XYCZT);
+    }
+
+    #[test]
+    fn lsm_pixel_type_keeps_tiff_type_for_varying_data_type_like_java() {
+        assert_eq!(lsm_pixel_type(0, PixelType::Uint8), PixelType::Uint8);
+        assert_eq!(lsm_pixel_type(99, PixelType::Int16), PixelType::Int16);
+        assert_eq!(lsm_pixel_type(0, PixelType::Uint32), PixelType::Float32);
+        assert_eq!(lsm_pixel_type(2, PixelType::Uint8), PixelType::Uint16);
+        assert_eq!(lsm_pixel_type(5, PixelType::Uint16), PixelType::Float32);
     }
 
     #[test]

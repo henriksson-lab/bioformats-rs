@@ -143,6 +143,34 @@ fn write_tillvision_vws_with_contents(path: &Path, contents: &[u8]) {
 }
 
 #[test]
+fn tillvision_inf_entry_point_reads_bands_as_separate_channel_planes() {
+    let dir = isolated_tmp_dir("inf_entry_point_channel_planes");
+    let inf = dir.join("inf_entry_point_channel_planes.inf");
+    let pst = dir.join("inf_entry_point_channel_planes.pst");
+    std::fs::write(
+        &inf,
+        b"[Info]\nWidth=2\nHeight=1\nBands=2\nSlices=1\nFrames=1\nDatatype=2\n",
+    )
+    .unwrap();
+    std::fs::write(&pst, [1u8, 2, 3, 4]).unwrap();
+
+    let reader_probe = bioformats::formats::lim::TillVisionReader::new();
+    assert!(reader_probe.is_this_type_by_name(&inf));
+
+    let mut reader = ImageReader::open(&inf).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 1);
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert!(!reader.metadata().is_rgb);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 4]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn tillvision_vws_reads_class_name_fixed_offset_cimage_layout() {
     let dir = isolated_tmp_dir("class_name_fixed_offset");
     let vws = dir.join("class_name_fixed_offset.vws");

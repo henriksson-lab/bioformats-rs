@@ -524,27 +524,24 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
             crate::formats::metamorph::MetamorphReader::new(),
         )],
         Some("svs") => vec![boxed_reader(crate::formats::svs::SvsReader::new())],
-        Some("ndpi") => vec![
-            boxed_reader(crate::formats::tiff_wrappers::NdpiReader::new()),
-            boxed_reader(crate::formats::svs::SvsReader::new()),
-        ],
+        Some("ndpi") => {
+            let mut readers = Vec::new();
+            if crate::formats::tiff_wrappers::ndpi_has_hamamatsu_tags(path) {
+                readers.push(boxed_reader(
+                    crate::formats::tiff_wrappers::NdpiReader::new(),
+                ));
+            }
+            readers
+        }
         Some("scn") => vec![
             boxed_reader(crate::formats::tiff_wrappers::LeicaScnReader::new()),
-            boxed_reader(crate::formats::svs::SvsReader::new()),
             boxed_reader(crate::formats::flim2::BioRadScnReader::new()),
         ],
-        Some("bif") => vec![
-            boxed_reader(crate::formats::tiff_wrappers::VentanaReader::new()),
-            boxed_reader(crate::formats::svs::SvsReader::new()),
-        ],
-        Some("vsi") => vec![
-            boxed_reader(crate::formats::flim2::CellSensReader::new()),
-            boxed_reader(crate::formats::svs::SvsReader::new()),
-        ],
-        Some("afi") => vec![
-            boxed_reader(crate::formats::flim2::AfiReader::new()),
-            boxed_reader(crate::formats::svs::SvsReader::new()),
-        ],
+        Some("bif") => vec![boxed_reader(
+            crate::formats::tiff_wrappers::VentanaReader::new(),
+        )],
+        Some("vsi") => vec![boxed_reader(crate::formats::flim2::CellSensReader::new())],
+        Some("afi") => vec![boxed_reader(crate::formats::flim2::AfiReader::new())],
         Some("dng") => vec![boxed_reader(crate::formats::extended::DngReader::new())],
         Some("qptiff") => vec![boxed_reader(crate::formats::extended::VectraReader::new())],
         Some("gel") => vec![boxed_reader(crate::formats::extended::GelReader::new())],
@@ -580,6 +577,18 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
             // SOFTWARE tag containing "EZ-C1". Gate on that tag (mirroring the
             // ImageDescription gating below) so ordinary TIFFs are untouched.
             if let Some(software) = tiff_software_tag(path) {
+                // Classic MetaMorph/STK can also use .tif/.tiff. Java
+                // MetamorphReader.isThisType checks the SOFTWARE tag before
+                // the later MetamorphTiffReader XML-comment reader gets a turn.
+                if software
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with("metamorph")
+                {
+                    readers.push(boxed_reader(
+                        crate::formats::metamorph::MetamorphReader::new(),
+                    ));
+                }
                 if software.contains("EZ-C1") {
                     readers.push(boxed_reader(
                         crate::formats::tiff_wrappers::NikonTiffReader::new(),
@@ -590,6 +599,14 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
                 if software.contains("Faas") {
                     readers.push(boxed_reader(crate::formats::svs::PyramidTiffReader::new()));
                 }
+            }
+
+            // Java also accepts classic MetaMorph TIFFs by UIC tags even when
+            // SOFTWARE is absent: UIC1 + UIC3 + UIC4 on the first IFD.
+            if tiff_first_ifd_has_all_tags(path, &[33628, 33630, 33631]) {
+                readers.push(boxed_reader(
+                    crate::formats::metamorph::MetamorphReader::new(),
+                ));
             }
 
             if let Some(description) = tiff_image_description(path) {
@@ -735,6 +752,22 @@ fn tiff_software_tag(path: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn tiff_first_ifd_has_all_tags(path: &Path, tags: &[u16]) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut parser = match crate::tiff::parser::TiffParser::new(file) {
+        Ok(parser) => parser,
+        Err(_) => return false,
+    };
+    let offset = parser.first_ifd_offset;
+    let ifd = match parser.read_ifd(offset) {
+        Ok((ifd, _)) => ifd,
+        Err(_) => return false,
+    };
+    tags.iter().all(|tag| ifd.get(*tag).is_some())
+}
+
 fn generic_tiff_wrappers_for_description(
     ext: &str,
     description: &str,
@@ -743,7 +776,8 @@ fn generic_tiff_wrappers_for_description(
 
     // Metamorph TIFF carries a `<MetaData>...</MetaData>` ImageDescription
     // comment (mirrors Java MetamorphTiffReader.isThisType); applies to .tif/.tiff.
-    if description.trim_start().starts_with("<MetaData>") {
+    let trimmed = description.trim();
+    if trimmed.starts_with("<MetaData>") && trimmed.ends_with("</MetaData>") {
         readers.push(boxed_reader(
             crate::formats::tiff_wrappers::MetamorphTiffReader::new(),
         ));
@@ -1005,6 +1039,21 @@ mod tests {
     }
 
     #[test]
+    fn ndpi_extension_without_hamamatsu_tags_falls_back_to_generic_tiff() {
+        let path = temp_path("plain_renamed.ndpi");
+        write_minimal_tiff_with_description(&path, "plain TIFF");
+
+        let mut reader = ImageReader::open(&path).expect("generic TIFF fallback failed");
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![7]);
+        assert!(!reader
+            .metadata()
+            .series_metadata
+            .contains_key("ndpi.magnification"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn generic_tif_wrapper_dispatch_uses_fluoview_metadata_signature() {
         let path = temp_path("fluoview_metadata.tif");
         write_minimal_tiff_with_description(&path, "[Acquisition Parameters]\nLaser=488\n");
@@ -1078,6 +1127,42 @@ mod tests {
                 .contains_key("TransferSyntaxUID"),
             "preambleless dataset was not parsed as DICOM"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_tif_metamorph_prefix_without_end_tag_stays_generic_tiff() {
+        let path = temp_path("metamorph_prefix_only.tif");
+        write_minimal_tiff_with_description(
+            &path,
+            "<MetaData><prop id=\"image-name\" value=\"x\"/>",
+        );
+
+        let reader = ImageReader::open(&path).expect("generic TIFF dispatch failed");
+
+        assert_eq!(reader.metadata().size_x, 1);
+        assert_eq!(reader.metadata().size_y, 1);
+        assert!(
+            !reader
+                .metadata()
+                .series_metadata
+                .contains_key("metamorph.wrapper"),
+            "malformed MetaMorph prefix should not select MetamorphTiffReader"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_tif_classic_metamorph_software_dispatches_before_generic_tiff() {
+        let path = temp_path("classic_metamorph.tif");
+        write_minimal_tiff_with_software(&path, "MetaMorph Offline 7.8");
+
+        let reader = ImageReader::open(&path).expect("classic MetaMorph TIFF dispatch failed");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("format"),
+            Some(MetadataValue::String(value)) if value == "MetaMorph STK"
+        ));
         let _ = std::fs::remove_file(path);
     }
 
@@ -1401,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn visitech_registry_rejects_xys_without_companion_tiffs() {
+    fn visitech_registry_opens_metadata_only_xys_but_rejects_hcs_without_tiffs() {
         let dir = temp_path("hcs_no_tiffs_dir");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -1410,35 +1495,26 @@ mod tests {
         )
         .unwrap();
 
-        for (name, bytes, expected) in [
-            (
-                "sample.xys",
-                b"no pixel marker here".as_slice(),
-                "Visitech XYS does not have",
-            ),
-            (
-                "sample.xdce",
-                b"<InCell Width=\"2\" Height=\"2\"/>".as_slice(),
-                "no TIFF image files found referenced in index",
-            ),
-        ] {
-            let path = dir.join(name);
-            std::fs::write(&path, bytes).unwrap();
+        let xys = dir.join("sample.xys");
+        std::fs::write(&xys, b"no pixel marker here").unwrap();
+        let mut reader = ImageReader::open(&xys).expect("metadata-only Visitech should open");
+        assert_eq!(reader.metadata().image_count, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 8]);
 
-            let err = match ImageReader::open(&path) {
-                Ok(_) => panic!("{name}: index without companion TIFFs opened fake data"),
-                Err(err) => err,
-            };
-
-            assert!(
-                matches!(
-                    err,
-                    BioFormatsError::UnsupportedFormat(ref message) | BioFormatsError::Format(ref message)
-                        if message.contains(expected)
-                ),
-                "expected rejection message containing {expected:?}, got {err:?}"
-            );
-        }
+        let xdce = dir.join("sample.xdce");
+        std::fs::write(&xdce, b"<InCell Width=\"2\" Height=\"2\"/>").unwrap();
+        let err = match ImageReader::open(&xdce) {
+            Ok(_) => panic!("HCS index without companion TIFFs opened fake data"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                BioFormatsError::UnsupportedFormat(ref message) | BioFormatsError::Format(ref message)
+                    if message.contains("no TIFF image files found referenced in index")
+            ),
+            "expected HCS missing-TIFF rejection, got {err:?}"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1565,18 +1641,58 @@ mod tests {
             tiff_entry(258, 3, 1, 8),                          // BitsPerSample
             tiff_entry(259, 3, 1, 1),                          // Compression
             tiff_entry(262, 3, 1, 1),                          // PhotometricInterpretation
-            tiff_entry(273, 4, 1, 8 + 2 + 11 * 12 + 4),        // StripOffsets
+            tiff_entry(273, 4, 1, 8 + 2 + 12 * 12 + 4),        // StripOffsets
             tiff_entry(277, 3, 1, 1),                          // SamplesPerPixel
             tiff_entry(278, 4, 1, 1),                          // RowsPerStrip
             tiff_entry(279, 4, 1, 1),                          // StripByteCounts
             tiff_entry(284, 3, 1, 1),                          // PlanarConfiguration
             tiff_entry(65421, 11, 1, magnification.to_bits()), // NDPI magnification
+            tiff_entry(65449, 4, 1, 1),                        // NDPI metadata tag
         ];
         bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
         for entry in entries {
             bytes.extend_from_slice(&entry);
         }
         bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.push(7);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_minimal_tiff_with_software(path: &PathBuf, software: &str) {
+        let mut soft = software.as_bytes().to_vec();
+        soft.push(0);
+
+        let ifd_entry_count = 11u32;
+        let ifd_start = 8u32;
+        let soft_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let pixel_start = soft_start + soft.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),                          // ImageWidth
+            tiff_entry(257, 4, 1, 1),                          // ImageLength
+            tiff_entry(258, 3, 1, 8),                          // BitsPerSample
+            tiff_entry(259, 3, 1, 1),                          // Compression
+            tiff_entry(262, 3, 1, 1),                          // PhotometricInterpretation
+            tiff_entry(273, 4, 1, pixel_start),                // StripOffsets
+            tiff_entry(277, 3, 1, 1),                          // SamplesPerPixel
+            tiff_entry(278, 4, 1, 1),                          // RowsPerStrip
+            tiff_entry(279, 4, 1, 1),                          // StripByteCounts
+            tiff_entry(284, 3, 1, 1),                          // PlanarConfiguration
+            tiff_entry(305, 2, soft.len() as u32, soft_start), // Software
+        ];
+
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&soft);
         bytes.push(7);
 
         std::fs::write(path, bytes).unwrap();

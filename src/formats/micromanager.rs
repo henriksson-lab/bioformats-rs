@@ -420,6 +420,7 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
         }
     }
 
+    let frames = truncate_trailing_empty_timepoints(frames, channels, slices, &file_name_map);
     let image_count = channels
         .checked_mul(slices)
         .and_then(|v| v.checked_mul(frames))
@@ -718,6 +719,47 @@ fn collect_dac_volts(block: &str, voltage: &mut Vec<f64>) {
             }
         }
     }
+}
+
+/// Match Java `buildTIFFList`'s adjustment for acquisitions stopped before the
+/// declared frame count: if one or more final timepoints have no TIFF files,
+/// `sizeT` is truncated to the first empty trailing timepoint.
+fn truncate_trailing_empty_timepoints(
+    frames: u32,
+    channels: u32,
+    slices: u32,
+    file_name_map: &HashMap<Index, PathBuf>,
+) -> u32 {
+    if frames <= 1 || file_name_map.is_empty() {
+        return frames;
+    }
+
+    let mut first_empty_timepoint: Option<u32> = None;
+    for t in 0..frames {
+        let mut empty = true;
+        for c in 0..channels.max(1) {
+            for z in 0..slices.max(1) {
+                if file_name_map
+                    .get(&Index { z, c, t })
+                    .is_some_and(|path| path.exists())
+                {
+                    empty = false;
+                    break;
+                }
+            }
+            if !empty {
+                break;
+            }
+        }
+
+        if empty && first_empty_timepoint.is_none() {
+            first_empty_timepoint = Some(t);
+        } else if !empty && first_empty_timepoint.is_some() {
+            first_empty_timepoint = None;
+        }
+    }
+
+    first_empty_timepoint.unwrap_or(frames).max(1)
 }
 
 /// Read the numeric value following the next `:` in `s` (the value of the JSON
@@ -1119,6 +1161,57 @@ mod tests {
 
         let region = reader.open_bytes_region(0, 1, 1, 2, 1).unwrap();
         assert_eq!(region, vec![0; 2]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trailing_empty_timepoints_are_truncated_like_java() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_8x8_gray8.tif");
+        let dir = std::env::temp_dir().join(format!(
+            "mm_trailing_empty_timepoint_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&fixture, dir.join("img_0.tif")).unwrap();
+
+        let json = r#"{
+  "Summary": {
+    "Width": 8,
+    "Height": 8,
+    "Channels": 1,
+    "Slices": 1,
+    "Frames": 3,
+    "PixelType": "GRAY8"
+  },
+  "FrameKey-0-0-0": {
+    "FileName": "img_0.tif"
+  },
+  "FrameKey-1-0-0": {
+    "FileName": "img_1.tif"
+  },
+  "FrameKey-2-0-0": {
+    "FileName": "img_2.tif"
+  }
+}"#;
+        let meta_path = dir.join("metadata.txt");
+        std::fs::write(&meta_path, json).unwrap();
+
+        let mut reader = MicromanagerReader::new();
+        reader.set_id(&meta_path).unwrap();
+        let meta = reader.metadata();
+
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 1);
+        assert!(matches!(
+            reader.open_bytes(1),
+            Err(BioFormatsError::PlaneOutOfRange(1))
+        ));
 
         let _ = std::fs::remove_dir_all(dir);
     }

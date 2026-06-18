@@ -57,6 +57,19 @@ fn metadata_tools_helpers_populate_and_verify_minimum_pixels() {
 }
 
 #[test]
+fn metadata_tools_to_ome_xml_writes_pixels_big_endian_like_java() {
+    let mut meta = populated_meta();
+    let ome = OmeMetadata::populate_metadata(&meta);
+
+    let little_xml = ome.to_ome_xml(&meta);
+    assert!(little_xml.contains(r#"BigEndian="false""#));
+
+    meta.is_little_endian = false;
+    let big_xml = ome.to_ome_xml(&meta);
+    assert!(big_xml.contains(r#"BigEndian="true""#));
+}
+
+#[test]
 fn metadata_tools_rgb_uses_one_channel_with_multiple_samples() {
     let mut meta = populated_meta();
     meta.size_z = 1;
@@ -677,7 +690,7 @@ fn metadata_tools_helpers_store_channel_globals_and_original_metadata() {
         } => {
             assert_eq!(
                 namespace.as_deref(),
-                Some("openmicroscopy.org/bioformats/original-metadata")
+                Some("openmicroscopy.org/OriginalMetadata")
             );
             assert!(values.contains(&("AcquisitionMode".into(), "test".into())));
             assert!(values.contains(&("Gain".into(), "1.5".into())));

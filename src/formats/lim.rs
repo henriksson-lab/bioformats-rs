@@ -318,10 +318,17 @@ impl Default for TillVisionReader {
 
 impl FormatReader for TillVisionReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("vws") || e.eq_ignore_ascii_case("pst"))
-            .unwrap_or(false)
+            .map(|e| e.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("vws") | Some("pst") => true,
+            // Java TillVisionReader also accepts .inf entry points when the
+            // sibling .pst pixels file exists.
+            Some("inf") => path.with_extension("pst").exists(),
+            _ => false,
+        }
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -573,6 +580,11 @@ fn load_tillvision_series(path: &Path) -> Result<Vec<TillVisionSeries>> {
 
     if ext == "pst" && path.is_file() {
         pixel_files.push(path.to_path_buf());
+    } else if ext == "inf" {
+        let pst_path = path.with_extension("pst");
+        if pst_path.is_file() {
+            pixel_files.push(pst_path);
+        }
     } else if ext == "vws" {
         let stem = path
             .file_stem()
@@ -840,7 +852,8 @@ fn load_tillvision_inf(path: &Path) -> Result<ImageMetadata> {
     }
     let pixel_type = tillvision_pixel_type(datatype)?;
     let image_count = size_z
-        .checked_mul(size_t)
+        .checked_mul(size_c)
+        .and_then(|zc| zc.checked_mul(size_t))
         .ok_or_else(|| BioFormatsError::Format("TillVision image count overflows".into()))?;
 
     let mut series_metadata: HashMap<String, MetadataValue> = values
@@ -860,7 +873,7 @@ fn load_tillvision_inf(path: &Path) -> Result<ImageMetadata> {
         image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb: false,
-        is_interleaved: true,
+        is_interleaved: false,
         is_indexed: false,
         is_little_endian: true,
         resolution_count: 1,
@@ -892,7 +905,6 @@ fn tillvision_pixel_type(datatype: u32) -> Result<PixelType> {
 fn tillvision_plane_bytes(meta: &ImageMetadata) -> Result<usize> {
     meta.size_x
         .checked_mul(meta.size_y)
-        .and_then(|px| px.checked_mul(meta.size_c))
         .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample() as u32))
         .map(|n| n as usize)
         .ok_or_else(|| BioFormatsError::Format("TillVision plane size overflows".into()))

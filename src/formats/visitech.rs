@@ -67,6 +67,41 @@ fn strip_tags(s: &str) -> String {
     out
 }
 
+/// Remove `<style>...</style>` and `<script>...</script>` blocks before token
+/// parsing, matching the Java reader's pre-pass.
+fn strip_ignored_html_blocks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let lower = s.to_ascii_lowercase();
+    let mut pos = 0usize;
+
+    while pos < s.len() {
+        let rest = &lower[pos..];
+        let style = rest.find("<style");
+        let script = rest.find("<script");
+        let next = match (style, script) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        let Some(rel_start) = next else {
+            out.push_str(&s[pos..]);
+            break;
+        };
+
+        let start = pos + rel_start;
+        out.push_str(&s[pos..start]);
+        let is_style = lower[start..].starts_with("<style");
+        let close = if is_style { "</style>" } else { "</script>" };
+        if let Some(rel_end) = lower[start..].find(close) {
+            pos = start + rel_end + close.len();
+        } else {
+            break;
+        }
+    }
+
+    out
+}
+
 /// Parsed metadata from the HTML report.
 struct VisitechMeta {
     size_x: u32,
@@ -81,6 +116,7 @@ struct VisitechMeta {
 }
 
 fn parse_html(html: &str) -> Result<VisitechMeta> {
+    let html = strip_ignored_html_blocks(html);
     // Normalize <br> to newlines, like Java does.
     let normalized = html
         .replace("<br>", "\n")
@@ -189,15 +225,23 @@ fn parse_html(html: &str) -> Result<VisitechMeta> {
         size_c = estimated_size_c;
     }
 
+    if size_c == 0 {
+        size_c = 1;
+    }
+    if size_z == 0 {
+        size_z = 1;
+    }
+    if size_t == 0 {
+        size_t = 1;
+    }
+    if num_series == 0 {
+        num_series = 1;
+    }
+
     if size_x == 0 || size_y == 0 {
         return Err(BioFormatsError::Format(
             "Visitech: report is missing positive image dimensions".into(),
         ));
-    }
-    if size_z == 0 || size_c == 0 || size_t == 0 || num_series == 0 {
-        return Err(BioFormatsError::Format(format!(
-            "Visitech: report is missing positive counts (Z={size_z}, C={size_c}, T={size_t}, series={num_series})"
-        )));
     }
     if !saw_bit_depth {
         return Err(BioFormatsError::Format(
@@ -281,7 +325,7 @@ fn find_pixels_offset(
     f.read_to_end(&mut bytes).map_err(BioFormatsError::Io)?;
 
     // Locate the header marker.
-    let marker_pos = bytes
+    let marker_end = bytes
         .windows(HEADER_MARKER.len())
         .position(|w| w == HEADER_MARKER)
         .map(|p| (p + HEADER_MARKER.len()) as u64)
@@ -291,12 +335,12 @@ fn find_pixels_offset(
 
     let len = bytes.len() as u64;
     if plane_count == 0 {
-        return Ok(marker_pos);
+        return Ok(marker_end);
     }
     let payload_bytes = plane_count.checked_mul(plane_size).ok_or_else(|| {
         BioFormatsError::Format("Visitech: declared payload size overflows".into())
     })?;
-    if marker_pos
+    if marker_end
         .checked_add(payload_bytes)
         .map(|end| end > len)
         .unwrap_or(true)
@@ -305,8 +349,8 @@ fn find_pixels_offset(
             "Visitech: .xys pixel payload is shorter than declared ({payload_bytes} bytes after marker, file length {len})"
         )));
     }
-    let skip = (len.saturating_sub(marker_pos).saturating_sub(payload_bytes)) / plane_count;
-    let mut fp = marker_pos + skip;
+    let skip = (len.saturating_sub(marker_end).saturating_sub(payload_bytes)) / plane_count;
+    let mut fp = marker_end + skip - HEADER_MARKER.len() as u64;
     // PIXELS_MARKER last byte is 0x3f; nudge forward if present.
     if let Some(&b) = bytes.get(fp as usize) {
         let _ = little_endian;
@@ -323,7 +367,19 @@ impl FormatReader for VisitechReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("xys") | Some("html"))
+        match ext.as_deref() {
+            Some("xys") => true,
+            Some("html") => {
+                let Some(name) = path.to_str() else {
+                    return false;
+                };
+                let Some(space) = name.rfind(' ') else {
+                    return false;
+                };
+                PathBuf::from(format!("{} 1.xys", &name[..space])).exists()
+            }
+            _ => false,
+        }
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -389,14 +445,14 @@ impl FormatReader for VisitechReader {
             }
         }
 
-        if valid_files.is_empty() {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Visitech XYS does not have any companion .xys pixel data".into(),
-            ));
-        }
-
-        // Total channels across all series == number of valid pixel files.
-        let total_c = valid_files.len() as u32;
+        // Total channels across all series == number of readable pixel files.
+        // Java keeps the parsed metadata even when the files are absent; reads
+        // then return the caller's zero-filled buffer.
+        let total_c = if valid_files.is_empty() {
+            vmeta.size_c.max(1)
+        } else {
+            valid_files.len() as u32
+        };
 
         // Java splits the dataset into `numSeries` stage positions, each with
         // sizeC = totalC / numSeries channels. Clamp numSeries so it divides the
@@ -510,7 +566,7 @@ impl FormatReader for VisitechReader {
         let plane_in_file = (plane_index % div) as u64;
 
         if file_index >= self.files.len() || file_index >= self.pixel_offsets.len() {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            return Ok(vec![0u8; plane]);
         }
 
         let path = self.files[file_index].clone();

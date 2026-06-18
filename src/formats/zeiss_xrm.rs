@@ -298,20 +298,6 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
 
     let bits = (pixel_type.bytes_per_sample() * 8) as u8;
     let image_count = image_paths.len() as u32;
-    let plane_bytes = size_x
-        .checked_mul(size_y)
-        .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample() as u32))
-        .ok_or_else(|| BioFormatsError::Format("XRM plane size overflows".into()))?
-        as usize;
-    for stream_path in &image_paths {
-        let raw = ole.document_bytes(stream_path)?;
-        if raw.len() < plane_bytes {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "Zeiss XRM/TXRM stream {stream_path} is shorter than declared: got {}, expected {plane_bytes}",
-                raw.len()
-            )));
-        }
-    }
     let meta = ImageMetadata {
         size_x,
         size_y,
@@ -400,17 +386,15 @@ fn xrm_flip_rows(raw: &[u8], meta: &ImageMetadata) -> Result<Vec<u8>> {
     let expected = row_len
         .checked_mul(meta.size_y as usize)
         .ok_or_else(|| BioFormatsError::Format("XRM plane size overflows".into()))?;
-    if raw.len() < expected {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "Zeiss XRM/TXRM plane is shorter than declared: got {}, expected {expected}",
-            raw.len()
-        )));
-    }
-
-    let mut out = Vec::with_capacity(expected);
+    let mut out = vec![0; expected];
     for row in (0..meta.size_y as usize).rev() {
         let start = row * row_len;
-        out.extend_from_slice(&raw[start..start + row_len]);
+        let dest = (meta.size_y as usize - 1 - row) * row_len;
+        if start >= raw.len() {
+            continue;
+        }
+        let available = (raw.len() - start).min(row_len);
+        out[dest..dest + available].copy_from_slice(&raw[start..start + available]);
     }
     Ok(out)
 }
@@ -564,6 +548,28 @@ mod tests {
             Some("2".to_string())
         );
         let _ = std::fs::remove_file(txm);
+    }
+
+    #[test]
+    fn xrm_short_image_stream_zero_fills_like_java() {
+        let path = temp_path("short_stream.txrm");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            write_i32_stream(&mut comp, "/ImageInfo/ImageWidth", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/ImageHeight", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/DataType", 3);
+            write_stream(&mut comp, "/ImageData/Image1", &[1, 2, 3]);
+        }
+
+        let mut reader = ZeissXrmReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 0, 1, 2]);
+        assert_eq!(
+            reader.open_bytes_region(0, 0, 0, 2, 2).unwrap(),
+            vec![3, 0, 1, 2]
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

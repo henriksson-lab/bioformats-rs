@@ -585,6 +585,74 @@ fn parse_nd2_lv(data: &[u8], out: &mut Nd2LvValues) {
     walk(data, 0, data.len(), 0, out);
 }
 
+/// Parse the flat binary `ImageAttributes*` attribute list for the compression
+/// flags handled directly in `ND2Reader.initFile`.
+fn parse_nd2_binary_image_attributes(data: &[u8], out: &mut Nd2LvValues) {
+    fn read_i32(d: &[u8], p: usize) -> Option<i32> {
+        d.get(p..p + 4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    if data.len() <= 7 {
+        return;
+    }
+
+    // Java skips 6 bytes, then consumes zero padding and one non-zero byte
+    // before the repeated [nameLen][UTF-16LE name][i32 value] records.
+    let mut p = 6usize;
+    while p < data.len() && data[p] == 0 {
+        p += 1;
+    }
+    if p < data.len() {
+        p += 1;
+    }
+
+    let mut saw_lossless_param = false;
+    let mut lossless_param = false;
+    let mut can_be_lossless = true;
+
+    while p < data.len() {
+        let name_len = data[p] as usize;
+        p += 1;
+        if name_len == 0 {
+            continue;
+        }
+        let name_bytes = match name_len.checked_mul(2) {
+            Some(v) => v,
+            None => break,
+        };
+        if p + name_bytes + 4 > data.len() {
+            break;
+        }
+        let units: Vec<u16> = (0..name_len)
+            .map(|i| u16::from_le_bytes([data[p + i * 2], data[p + i * 2 + 1]]))
+            .take_while(|&u| u != 0)
+            .collect();
+        let name = String::from_utf16_lossy(&units);
+        p += name_bytes;
+        let Some(value) = read_i32(data, p) else {
+            break;
+        };
+        p += 4;
+
+        match name.as_str() {
+            // Java binary ImageAttributes path: isLossless = valueOrLength >= 0.
+            "dCompressionParam" => {
+                saw_lossless_param = true;
+                lossless_param = value >= 0;
+            }
+            // Java: canBeLossless = valueOrLength <= 0, then
+            // isLossless = isLossless && canBeLossless after the block.
+            "eCompression" => can_be_lossless = value <= 0,
+            _ => {}
+        }
+    }
+
+    if saw_lossless_param {
+        out.is_lossless = lossless_param && can_be_lossless;
+    }
+}
+
 /// Result of the binary `ImageMetadataLV` eType/uiCount walk
 /// (ND2Reader.initFile java:967-1062, 1135-1141).
 ///
@@ -2164,6 +2232,12 @@ fn nd2_xy_position_layout_from_loop_order(
     }
 }
 
+fn nd2_is_indexed_from_channel_colors(channel_colors: &HashMap<String, i32>) -> bool {
+    channel_colors
+        .values()
+        .any(|&color| color != 0 && color != 0x00ff_ffff)
+}
+
 // ---- reader -----------------------------------------------------------------
 
 pub struct Nd2Reader {
@@ -2581,6 +2655,14 @@ impl FormatReader for Nd2Reader {
         // ImageCalibrationLV) for OME attributes: physical pixel size, channel
         // names, emission wavelengths. Matches ND2Reader.iterateIn in Java.
         let mut lv = Nd2LvValues::default();
+        for ac in chunks
+            .iter()
+            .filter(|c| c.name.starts_with("ImageAttributes"))
+        {
+            if let Ok(data) = read_chunk_data(&mut reader, ac) {
+                parse_nd2_binary_image_attributes(&data, &mut lv);
+            }
+        }
         for mc in chunks.iter().filter(|c| {
             c.name.starts_with("ImageMetadataSeq")
                 || c.name.starts_with("ImageMetadata")
@@ -3421,9 +3503,9 @@ impl FormatReader for Nd2Reader {
                 bits_per_pixel: bpp,
                 image_count: this_image_count,
                 dimension_order,
-                is_rgb: size_c == 3,
-                is_interleaved: true,
-                is_indexed: false,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: nd2_is_indexed_from_channel_colors(&self.channel_colors),
                 is_little_endian: true,
                 resolution_count: 1,
                 thumbnail: false,
@@ -3641,30 +3723,42 @@ impl FormatReader for Nd2Reader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        use crate::common::ome_metadata::{OmeInstrument, OmeMetadata, OmeObjective, OmePlane};
+        use crate::common::ome_metadata::{
+            create_lsid, OmeDetector, OmeInstrument, OmeMetadata, OmeObjective, OmePlane,
+        };
         let meta = self.meta.get(self.current_series)?;
         let mut ome = OmeMetadata::from_image_metadata(meta);
 
-        // Objective (lensNA / objectiveMag / objectiveModel) → OME Objective,
-        // mirroring ND2Reader.populateMetadataStore:2569-2585.
-        if self.lens_na.is_some() || self.objective_mag.is_some() || self.objective_model.is_some()
-        {
-            let instrument = OmeInstrument {
-                objectives: vec![OmeObjective {
-                    calibrated_magnification: self.objective_mag,
-                    lens_na: self.lens_na,
-                    model: self.objective_model.clone(),
-                    ..Default::default()
-                }],
+        // Java ND2Reader always creates Detector:0:0 with type Other, then links
+        // every channel's DetectorSettings to it.
+        let objective = (self.lens_na.is_some()
+            || self.objective_mag.is_some()
+            || self.objective_model.is_some())
+        .then(|| OmeObjective {
+            calibrated_magnification: self.objective_mag,
+            lens_na: self.lens_na,
+            model: self.objective_model.clone(),
+            ..Default::default()
+        });
+        let instrument = OmeInstrument {
+            detectors: vec![OmeDetector {
+                id: Some(create_lsid("Detector", &[0, 0])),
+                detector_type: Some("Other".to_string()),
                 ..Default::default()
-            };
-            ome.instruments.push(instrument);
-            if let Some(img) = ome.images.get_mut(0) {
-                img.instrument_ref = Some(0);
+            }],
+            objectives: objective.into_iter().collect(),
+            ..Default::default()
+        };
+        ome.instruments.push(instrument);
+        if let Some(img) = ome.images.get_mut(0) {
+            img.instrument_ref = Some(0);
+            if self.lens_na.is_some()
+                || self.objective_mag.is_some()
+                || self.objective_model.is_some()
+            {
                 img.objective_ref = Some(0);
             }
         }
-
         let img = ome.images.get_mut(0)?;
 
         // Image name: "<filename> (series <n>)" per ND2Reader (~2263).
@@ -3717,6 +3811,7 @@ impl FormatReader for Nd2Reader {
         };
 
         for (c, channel) in img.channels.iter_mut().enumerate() {
+            channel.detector_ref = Some(create_lsid("Detector", &[0, 0]));
             if let Some(name) = channel_names.get(c) {
                 channel.name = Some(name.clone());
             }
@@ -3884,6 +3979,19 @@ mod tests {
     }
 
     #[test]
+    fn nd2_indexed_flag_ignores_black_and_white_like_java() {
+        let mut colors = HashMap::new();
+        assert!(!nd2_is_indexed_from_channel_colors(&colors));
+
+        colors.insert("black".to_string(), 0);
+        colors.insert("white".to_string(), 0x00ff_ffff);
+        assert!(!nd2_is_indexed_from_channel_colors(&colors));
+
+        colors.insert("dapi".to_string(), 0x0000_00ff);
+        assert!(nd2_is_indexed_from_channel_colors(&colors));
+    }
+
+    #[test]
     fn nd2_xml_captures_objective_refractive_and_lossless() {
         let xml = r#"<root>
           <dObjectiveMag>40</dObjectiveMag>
@@ -3957,6 +4065,37 @@ mod tests {
         assert_eq!(lv.channel_colors.get("DAPI"), Some(&0x0000FF));
         assert_eq!(lv.exposure_time, vec![0.025]);
         assert_eq!(lv.position_count, 1);
+    }
+
+    #[test]
+    fn nd2_binary_image_attributes_lossless_matches_java_flags() {
+        fn attr(name: &str, value: i32) -> Vec<u8> {
+            let mut out = vec![name.chars().count() as u8];
+            for u in name.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            out.extend_from_slice(&value.to_le_bytes());
+            out
+        }
+
+        // Java skips 6 bytes, consumes zero padding and one non-zero byte, then
+        // reads flat attribute records. dCompressionParam >= 0 is lossless only
+        // while eCompression <= 0 leaves canBeLossless true.
+        let mut data = vec![0; 6];
+        data.extend_from_slice(&[0, 0, 1]);
+        data.extend_from_slice(&attr("dCompressionParam", 0));
+        data.extend_from_slice(&attr("eCompression", 0));
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_binary_image_attributes(&data, &mut lv);
+        assert!(lv.is_lossless);
+
+        let mut data = vec![0; 6];
+        data.extend_from_slice(&[0, 1]);
+        data.extend_from_slice(&attr("dCompressionParam", 5));
+        data.extend_from_slice(&attr("eCompression", 1));
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_binary_image_attributes(&data, &mut lv);
+        assert!(!lv.is_lossless);
     }
 
     #[test]

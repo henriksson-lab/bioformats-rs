@@ -8,7 +8,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{ImageMetadata, MetadataValue};
 
 const CHANNEL_GLOBALS_NS: &str = "openmicroscopy.org/bioformats/channel-global-min-max";
-const ORIGINAL_METADATA_NS: &str = "openmicroscopy.org/bioformats/original-metadata";
+const ORIGINAL_METADATA_NS: &str = "openmicroscopy.org/OriginalMetadata";
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
@@ -581,8 +581,13 @@ impl OmeMetadata {
             let pt_str = ome_pixel_type_str(meta.pixel_type);
             let _ = write!(
                 xml,
-                r#"<Pixels ID="Pixels:{i}" DimensionOrder="{dim_order}" Type="{pt_str}" SizeX="{}" SizeY="{}" SizeZ="{}" SizeC="{}" SizeT="{}""#,
-                meta.size_x, meta.size_y, meta.size_z, meta.size_c, meta.size_t
+                r#"<Pixels ID="Pixels:{i}" DimensionOrder="{dim_order}" Type="{pt_str}" SizeX="{}" SizeY="{}" SizeZ="{}" SizeC="{}" SizeT="{}" BigEndian="{}""#,
+                meta.size_x,
+                meta.size_y,
+                meta.size_z,
+                meta.size_c,
+                meta.size_t,
+                !meta.is_little_endian
             );
 
             if let Some(v) = img.physical_size_x {

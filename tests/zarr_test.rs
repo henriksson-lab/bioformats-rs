@@ -6,6 +6,7 @@
 //! (the generator needs Python + zarr).
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bioformats::common::metadata::DimensionOrder;
 use bioformats::common::pixel_type::PixelType;
@@ -31,6 +32,47 @@ fn pat(t: u32, c: u32, z: u32, y: u32, x: u32, level: u32) -> u16 {
 
 fn le_u16(bytes: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])
+}
+
+fn tmp_zarr_dir(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("bioformats_rs_{name}_{nonce}.zarr"))
+}
+
+#[test]
+fn plain_root_zarr_array_uses_java_tczyx_shape_fallback() {
+    let dir = tmp_zarr_dir("plain_root_array");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(".zarray"),
+        r#"{"zarr_format":2,"shape":[2,3],"chunks":[2,3],"dtype":"<u2","compressor":null,"fill_value":0,"order":"C","filters":null}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".zattrs"), "{}").unwrap();
+    let pixels = [1u16, 2, 3, 4, 5, 6]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    std::fs::write(dir.join("0.0"), pixels).unwrap();
+
+    let mut r = OmeZarrReader::new();
+    r.set_id(&dir).unwrap();
+    let m = r.metadata();
+    assert_eq!(
+        (m.size_x, m.size_y, m.size_z, m.size_c, m.size_t),
+        (3, 2, 1, 1, 1)
+    );
+    assert_eq!(m.pixel_type, PixelType::Uint16);
+    assert_eq!(m.dimension_order, DimensionOrder::XYZCT);
+    let buf = r.open_bytes(0).unwrap();
+    let got = (0..6).map(|i| le_u16(&buf, i)).collect::<Vec<_>>();
+    assert_eq!(got, vec![1, 2, 3, 4, 5, 6]);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

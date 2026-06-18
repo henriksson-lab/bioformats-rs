@@ -64,7 +64,29 @@ impl EpsReader {
             meta.image_count = 1;
             meta.size_z = 1;
             meta.size_t = 1;
-            let pixels = reader.open_bytes(0)?;
+            let mut pixels = reader.open_bytes(0)?;
+            if meta.size_c == 1 {
+                if let Some(lut) = meta.lookup_table.take() {
+                    let bytes_per_sample = meta.pixel_type.bytes_per_sample();
+                    if bytes_per_sample != 1 {
+                        return Err(BioFormatsError::UnsupportedFormat(
+                            "EPS TIFF preview palette expansion supports only 8-bit indices".into(),
+                        ));
+                    }
+                    let mut expanded = Vec::with_capacity(pixels.len() * 3);
+                    for &index in &pixels {
+                        let i = index as usize;
+                        expanded.push((lut.red.get(i).copied().unwrap_or(0) >> 8) as u8);
+                        expanded.push((lut.green.get(i).copied().unwrap_or(0) >> 8) as u8);
+                        expanded.push((lut.blue.get(i).copied().unwrap_or(0) >> 8) as u8);
+                    }
+                    pixels = expanded;
+                    meta.size_c = 3;
+                    meta.is_rgb = true;
+                    meta.is_interleaved = true;
+                    meta.is_indexed = false;
+                }
+            }
             Ok((meta, pixels))
         })();
 
@@ -175,7 +197,9 @@ impl FormatReader for EpsReader {
             .iter()
             .take_while(|&&b| b == b' ' || b == b'\t')
             .count();
-        let is_ps = data[starts_with_ps..]
+        let is_ps = data
+            .get(starts_with_ps..)
+            .unwrap_or_default()
             .iter()
             .take(4)
             .copied()
@@ -542,7 +566,7 @@ impl FormatWriter for EpsWriter {
 
         let row_bytes = width as usize * spp;
         let bits = 8u32;
-        let data = &self.planes[0];
+        let data = crate::common::writer::to_interleaved_samples(meta, &self.planes[0])?;
 
         let mut f = std::fs::File::create(path).map_err(BioFormatsError::Io)?;
 

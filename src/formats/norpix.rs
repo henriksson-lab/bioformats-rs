@@ -497,7 +497,11 @@ impl Default for IplabReader {
     }
 }
 
-fn read_iplab_tags(path: &Path, offset: u64) -> Result<HashMap<String, MetadataValue>> {
+fn read_iplab_tags(
+    path: &Path,
+    offset: u64,
+    little_endian: bool,
+) -> Result<HashMap<String, MetadataValue>> {
     let mut meta_map = HashMap::new();
     let mut f = File::open(path).map_err(BioFormatsError::Io)?;
     let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
@@ -519,7 +523,11 @@ fn read_iplab_tags(path: &Path, offset: u64) -> Result<HashMap<String, MetadataV
 
         let mut size_bytes = [0u8; 4];
         f.read_exact(&mut size_bytes).map_err(BioFormatsError::Io)?;
-        let size = u32::from_le_bytes(size_bytes) as usize;
+        let size = if little_endian {
+            u32::from_le_bytes(size_bytes)
+        } else {
+            u32::from_be_bytes(size_bytes)
+        } as usize;
         if f.stream_position().map_err(BioFormatsError::Io)? + size as u64 > file_len {
             break;
         }
@@ -548,7 +556,11 @@ fn read_iplab_tags(path: &Path, offset: u64) -> Result<HashMap<String, MetadataV
                     "yellow",
                     "saturated pixels",
                 ];
-                let kind = r_i32_le(&payload, 4);
+                let kind = if little_endian {
+                    r_i32_le(&payload, 4)
+                } else {
+                    r_i32_be(&payload, 4)
+                };
                 let label = lut_types
                     .get(kind as usize)
                     .copied()
@@ -558,7 +570,11 @@ fn read_iplab_tags(path: &Path, offset: u64) -> Result<HashMap<String, MetadataV
             }
             b"head" => {
                 for chunk in payload.chunks_exact(22) {
-                    let num = i16::from_le_bytes([chunk[0], chunk[1]]);
+                    let num = if little_endian {
+                        i16::from_le_bytes([chunk[0], chunk[1]])
+                    } else {
+                        i16::from_be_bytes([chunk[0], chunk[1]])
+                    };
                     meta_map.insert(
                         format!("Header{num}"),
                         MetadataValue::String(printable_ascii(&chunk[2..22])),
@@ -667,6 +683,12 @@ impl FormatReader for IplabReader {
                     r_i32_be(&hdr, off)
                 }
             };
+            let data_size = read_i32(16) - 28;
+            if data_size < 0 {
+                return Err(BioFormatsError::Format(format!(
+                    "IPLab data block size is negative ({data_size})"
+                )));
+            }
             let width = positive_i32_dim(read_i32(20), "width")?;
             let height = positive_i32_dim(read_i32(24), "height")?;
             let n_channels = positive_i32_dim(read_i32(28), "channel count")?;
@@ -703,7 +725,7 @@ impl FormatReader for IplabReader {
                 spp,
                 little,
                 44u64,
-                None,
+                Some(44u64 + data_size as u64),
                 if n_channels > 1 {
                     DimensionOrder::XYCZT
                 } else {
@@ -809,7 +831,8 @@ impl FormatReader for IplabReader {
             MetadataValue::Int(data_type as i64),
         );
         let post_pixel_tags = tag_offset.unwrap_or(data_offset + pixel_bytes);
-        meta_map.extend(read_iplab_tags(path, post_pixel_tags).unwrap_or_default());
+        meta_map
+            .extend(read_iplab_tags(path, post_pixel_tags, is_little_endian).unwrap_or_default());
 
         self.data_offset = data_offset;
         self.plane_samples = plane_samples;
