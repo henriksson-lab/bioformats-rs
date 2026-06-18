@@ -450,7 +450,7 @@ fn resolve_companion(base_dir: Option<&Path>, filename: &str) -> Option<PathBuf>
     let trimmed = filename.trim();
     let filename_path = Path::new(trimmed);
     let (candidate, allow_basename_retry) = match base_dir {
-        Some(dir) if filename_path.is_absolute() => (None, true),
+        Some(_) if filename_path.is_absolute() => (None, true),
         Some(dir) => (confined_join(dir, trimmed), false),
         None => {
             let path = PathBuf::from(trimmed);

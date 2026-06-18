@@ -5166,7 +5166,7 @@ mod xmlutil {
                     on_end(&ln);
                 }
                 Ok(Event::Text(ref t)) => {
-                    if let Ok(s) = t.unescape() {
+                    if let Ok(s) = t.decode() {
                         buf_text.push_str(&s);
                     }
                 }
@@ -5376,7 +5376,7 @@ mod operetta {
                     current_name.clear();
                 }
                 Ok(quick_xml::events::Event::Text(ref t)) => {
-                    if let Ok(s) = t.unescape() {
+                    if let Ok(s) = t.decode() {
                         text_buf.push_str(&s);
                     }
                 }
@@ -6529,7 +6529,7 @@ mod columbus {
                     text.clear();
                 }
                 Ok(quick_xml::events::Event::Text(ref t)) => {
-                    if let Ok(s) = t.unescape() {
+                    if let Ok(s) = t.decode() {
                         text.push_str(&s);
                     }
                 }
@@ -6707,7 +6707,7 @@ mod columbus {
                     }
                 }
                 Ok(quick_xml::events::Event::Text(ref t)) => {
-                    if let Ok(s) = t.unescape() {
+                    if let Ok(s) = t.decode() {
                         text.push_str(&s);
                     }
                 }
@@ -7384,7 +7384,7 @@ mod scanr {
                         }
                     }
                     Ok(quick_xml::events::Event::Text(ref t)) => {
-                        if let Ok(s) = t.unescape() {
+                        if let Ok(s) = t.decode() {
                             text.push_str(&s);
                         }
                     }
@@ -8323,7 +8323,7 @@ mod cellvoyager {
             for a in e.attributes().flatten() {
                 let k = local(a.key.as_ref());
                 let v = a
-                    .unescape_value()
+                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                     .map(|c| c.into_owned())
                     .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
                 out.push((k, v));
@@ -8366,7 +8366,7 @@ mod cellvoyager {
                         }
                     }
                     Ok(Event::Text(ref t)) => {
-                        if let Ok(s) = t.unescape() {
+                        if let Ok(s) = t.decode() {
                             if let Some(top) = stack.last_mut() {
                                 top.text.push_str(&s);
                             }

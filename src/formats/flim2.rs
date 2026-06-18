@@ -5967,7 +5967,7 @@ fn ivision_parse_acquisition_metadata(xml: &str) -> IvisionAcquisitionMetadata {
                 current_element = None;
             }
             Ok(quick_xml::events::Event::Text(text)) => {
-                let Ok(value) = text.unescape() else { continue };
+                let Ok(value) = text.decode() else { continue };
                 let value = value.trim();
                 if value.is_empty() {
                     continue;
@@ -6217,7 +6217,7 @@ fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
                 if inserted >= MAX_FIELDS {
                     continue;
                 }
-                if let Ok(value) = text.unescape() {
+                if let Ok(value) = text.decode() {
                     let value = value.trim();
                     if !value.is_empty() && value.len() <= MAX_VALUE_LEN {
                         let key = ivision_flatten_xml_key(&stack, None);
@@ -6258,7 +6258,7 @@ fn ivision_flatten_xml_attrs<'a>(
         if name.is_empty() {
             continue;
         }
-        let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+        let Ok(value) = attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder()) else {
             continue;
         };
         let value = value.trim();
@@ -9590,7 +9590,7 @@ fn oir_xml_text(xml: &str, local: &str) -> Option<String> {
                 }
             }
             Ok(Event::Text(t)) if capture && depth_match > 0 => {
-                if let Ok(s) = t.unescape() {
+                if let Ok(s) = t.decode() {
                     text.push_str(&s);
                 }
             }
@@ -9865,7 +9865,7 @@ fn oir_apply_axes(xml: &str, meta: &mut ImageMetadata) {
             }
             Ok(Event::Text(t)) => {
                 if let Some(kind) = pending_text_for {
-                    if let Ok(s) = t.unescape() {
+                    if let Ok(s) = t.decode() {
                         let s = s.trim().to_string();
                         if kind == "axisname" && !s.is_empty() {
                             cur_axis_name = Some(s);
@@ -9939,7 +9939,7 @@ fn oir_apply_channels(xml: &str, channel_ids: &mut Vec<String>) {
                 if local == "channel" || local == "elementChannel" {
                     if let Some(id) = e.attributes().flatten().find_map(|a| {
                         if a.key.as_ref() == b"id" {
-                            a.unescape_value().ok().map(|v| v.into_owned())
+                            a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.into_owned())
                         } else {
                             None
                         }

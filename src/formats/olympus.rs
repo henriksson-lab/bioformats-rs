@@ -1816,7 +1816,7 @@ fn parse_dom(xml: &str) -> Option<DomNode> {
         for a in e.attributes().flatten() {
             let k = qualified(a.key.as_ref());
             let v = a
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map(|c| c.into_owned())
                 .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
             out.push((k, v));
@@ -1849,7 +1849,7 @@ fn parse_dom(xml: &str) -> Option<DomNode> {
                 }
             }
             Ok(Event::Text(ref t)) => {
-                if let Ok(s) = t.unescape() {
+                if let Ok(s) = t.decode() {
                     if let Some(top) = stack.last_mut() {
                         top.text.push_str(&s);
                     }

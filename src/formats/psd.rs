@@ -819,7 +819,7 @@ fn decode_psd_xmp_metadata(
                     {
                         continue;
                     }
-                    let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+                    let Ok(value) = attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder()) else {
                         continue;
                     };
                     psd_xmp_insert_scalar(metadata, &key, value.as_ref(), &mut inserted);
@@ -843,14 +843,14 @@ fn decode_psd_xmp_metadata(
                     {
                         continue;
                     }
-                    let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+                    let Ok(value) = attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder()) else {
                         continue;
                     };
                     psd_xmp_insert_scalar(metadata, &key, value.as_ref(), &mut inserted);
                 }
             }
             Ok(quick_xml::events::Event::Text(event)) => {
-                if let Ok(value) = event.unescape() {
+                if let Ok(value) = event.decode() {
                     if text.chars().count() < PSD_XMP_MAX_VALUE_CHARS {
                         text.push_str(&value);
                     }

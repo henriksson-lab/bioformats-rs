@@ -1785,7 +1785,7 @@ fn imspector_parse_description(description: &str) -> Vec<(String, String)> {
                 text.clear();
             }
             Ok(Event::Text(t)) => {
-                text.push_str(&t.unescape().unwrap_or_default());
+                text.push_str(&t.decode().unwrap_or_default());
             }
             Ok(Event::End(_)) => {
                 let depth = name_stack.len();
@@ -9424,7 +9424,7 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Result<Vec<YokogawaPlane>> {
             }
             Ok(Event::Text(t)) => {
                 if in_img_record {
-                    current_text.push_str(&t.unescape().unwrap_or_default());
+                    current_text.push_str(&t.decode().unwrap_or_default());
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -10477,7 +10477,7 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
                 for a in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
                     let val = a
-                        .unescape_value()
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map(|v| v.to_string())
                         .unwrap_or_default();
                     attrs.insert(key, val);

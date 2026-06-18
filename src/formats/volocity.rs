@@ -2206,7 +2206,9 @@ fn parse_volocity_blind_layout(
 // a live `Location` mapping. Here we resolve every companion file to an absolute
 // path up-front during construction and read planes straight off disk.
 
+#[allow(dead_code)]
 const VOLOCITY_SIGNATURE_SIZE: usize = 13;
+#[allow(dead_code)]
 const VOLOCITY_EMBEDDED_STREAM: &str = "embedded-stream.raw";
 
 /// Runtime equivalent of the Java `Stack` helper class plus the per-series

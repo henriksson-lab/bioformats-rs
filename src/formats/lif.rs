@@ -1213,7 +1213,7 @@ impl Dom {
                 for a in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
                     let val = a
-                        .unescape_value()
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map(|v| v.to_string())
                         .unwrap_or_default();
                     attrs.insert(key, val);
@@ -1247,7 +1247,7 @@ impl Dom {
                 }
                 Ok(Event::Text(t)) => {
                     if let Some(&top) = stack.last() {
-                        if let Ok(value) = t.unescape() {
+                        if let Ok(value) = t.decode() {
                             nodes[top].text.push_str(value.as_ref());
                         }
                     }
