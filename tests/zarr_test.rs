@@ -4,6 +4,7 @@
 //! `scripts/gen_zarr_sample.py`. The samples encode a known pixel pattern so
 //! reads can be verified bitwise. Tests are skipped when the samples are absent
 //! (the generator needs Python + zarr).
+#![cfg(feature = "zarr")]
 
 use std::path::{Path, PathBuf};
 

@@ -270,6 +270,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         // OME-Zarr / OME-NGFF (directory-based; detected by `.zarr` path or a
         // Zarr group marker). Handled explicitly in `open_reader` before
         // `peek_header`, which cannot read a directory.
+#[cfg(feature = "zarr")]
         Box::new(crate::formats::zarr::OmeZarrReader::new()),
     ]
 }
@@ -333,6 +334,7 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
     // OME-Zarr is a directory-based format. `peek_header` cannot read a
     // directory, so detect and dispatch it before any byte sniffing. Mirrors
     // Java `ZarrReader.isThisType`, which matches on the `.zarr` path.
+#[cfg(feature = "zarr")]
     if crate::formats::zarr::is_zarr_path(path) {
         let mut r = boxed_reader(crate::formats::zarr::OmeZarrReader::new());
         match r.set_id(path) {

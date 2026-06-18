@@ -66,6 +66,7 @@ pub mod visitech;
 pub mod volocity;
 pub mod v3draw;
 pub mod zeiss_xrm;
+#[cfg(feature = "zarr")]
 pub mod zarr;
 pub mod zip;
 pub mod zeiss_zvi;
