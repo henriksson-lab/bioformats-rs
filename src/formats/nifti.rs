@@ -76,7 +76,7 @@ fn time_unit_symbol(xyzt_units: u8) -> &'static str {
 // NIfTI-1 / Analyze 7.5 header is exactly 348 bytes.
 //
 // Key offsets (all same between Analyze and NIfTI-1):
-//   0-3:   sizeof_hdr (int32, must be 348)
+//   0-3:   sizeof_hdr (int32, normally 348; Java NiftiReader does not validate it)
 //  40-55:  dim[0..7]  (int16 × 8)
 //  70-71:  datatype   (int16)
 //  72-73:  bitpix     (int16)
@@ -143,20 +143,11 @@ fn parse_header(buf: &[u8]) -> Result<NiftiHeader> {
         ));
     }
 
-    // Detect endianness: sizeof_hdr at offset 0 must be 348.
-    let sizeof_le = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let sizeof_be = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let le = if sizeof_le == 348 {
-        true
-    } else if sizeof_be == 348 {
-        false
-    } else {
-        return Err(BioFormatsError::Format(
-            "NIfTI/Analyze: invalid sizeof_hdr".into(),
-        ));
-    };
-
-    let ndim = read_i16(buf, 40, le);
+    // Java reads dim[0] as big-endian first. Values outside 1..=7 mean the
+    // header is little-endian, so the value is byte-swapped and used.
+    let check = i16::from_be_bytes([buf[40], buf[41]]);
+    let le = !(1..=7).contains(&check);
+    let ndim = if le { read_i16(buf, 40, true) } else { check };
     if !(1..=7).contains(&ndim) {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "NIfTI/Analyze invalid dimension count {ndim}"
@@ -206,8 +197,14 @@ fn is_nifti_magic(magic: &[u8; 4]) -> bool {
     magic == b"n+1\0" || magic == b"ni1\0"
 }
 
-fn is_nifti_single(magic: &[u8; 4]) -> bool {
-    magic == b"n+1\0"
+fn java_vox_offset(vox_offset: f32) -> Result<u64> {
+    let offset = vox_offset as i32;
+    if offset < 0 {
+        return Err(BioFormatsError::Format(
+            "NIfTI/Analyze: negative pixel offset".into(),
+        ));
+    }
+    Ok(offset as u64)
 }
 
 fn build_metadata(hdr: &NiftiHeader) -> Result<ImageMetadata> {
@@ -441,22 +438,9 @@ impl FormatReader for NiftiReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // Check sizeof_hdr == 348 at offset 0 (LE or BE)
-        if header.len() < 4 {
-            return false;
-        }
-        let le = i32::from_le_bytes([header[0], header[1], header[2], header[3]]) == 348;
-        let be = i32::from_be_bytes([header[0], header[1], header[2], header[3]]) == 348;
-        // Also verify magic for NIfTI if available
-        if (le || be) && header.len() >= 348 {
-            // Check magic for NIfTI or zeros for Analyze
-            let magic = &header[344..348];
-            return magic == b"n+1\0"
-                || magic == b"ni1\0"
-                || magic == [0, 0, 0, 0]
-                || magic == b"ni1 "; // some older files
-        }
-        le || be
+        // Java NiftiReader.isThisType seeks to byte 344 and reads only the
+        // first three magic bytes. It does not validate sizeof_hdr here.
+        header.len() >= HDR_SIZE && (&header[344..347] == b"n+1" || &header[344..347] == b"ni1")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -493,19 +477,22 @@ impl FormatReader for NiftiReader {
         let meta = build_metadata(&hdr)?;
 
         // Determine data file and offset
-        let (data_path, data_offset) = if is_nifti_single(&hdr.magic) || is_gz {
-            // Single .nii or .nii.gz: data follows header in same file
-            let off = if hdr.vox_offset >= HDR_SIZE as f32 {
-                hdr.vox_offset as u64
-            } else {
-                HDR_SIZE as u64 // default to end of header
-            };
-            (path.to_path_buf(), off)
-        } else {
-            // Paired: find companion .img file
+        let is_hdr = path_str.ends_with(".hdr");
+        let data_offset = java_vox_offset(hdr.vox_offset)?;
+        let data_path = if is_hdr {
+            // Java routes any '.hdr' input to a similarly named '.img' file and
+            // still applies the header's vox_offset when reading planes.
             let stem = path.file_stem().unwrap_or_default();
-            let img_path = path.with_file_name(format!("{}.img", stem.to_string_lossy()));
-            (img_path, 0u64)
+            path.with_file_name(format!("{}.img", stem.to_string_lossy()))
+        } else if is_gz || path_str.ends_with(".nii") {
+            // Java uses the input file for '.nii' and '.nii.gz' regardless of
+            // the NIfTI magic string.
+            path.to_path_buf()
+        } else {
+            return Err(BioFormatsError::Format(
+                "File does not have one of the required NIfTI extensions (.img, .hdr, .nii, .nii.gz)"
+                    .into(),
+            ));
         };
 
         self.meta = Some(meta);
@@ -713,5 +700,80 @@ mod tests {
         assert_eq!(meta.size_c, 3);
         assert!(meta.is_rgb);
         assert!(meta.is_interleaved);
+    }
+
+    fn tmp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("bioformats_nifti_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn byte_detection_matches_java_magic_probe() {
+        let reader = NiftiReader::new();
+        let mut header = vec![0u8; HDR_SIZE];
+
+        header[344..347].copy_from_slice(b"n+1");
+        assert!(reader.is_this_type_by_bytes(&header));
+
+        header[344..347].copy_from_slice(b"ni1");
+        assert!(reader.is_this_type_by_bytes(&header));
+
+        header[344..347].copy_from_slice(b"\0\0\0");
+        assert!(!reader.is_this_type_by_bytes(&header));
+
+        assert!(!reader.is_this_type_by_bytes(&header[..HDR_SIZE - 1]));
+    }
+
+    #[test]
+    fn parse_header_uses_dimension_field_for_endianness_like_java() {
+        let mut buf = synthetic_header(0);
+        buf[0..4].copy_from_slice(&0i32.to_le_bytes());
+
+        let hdr = parse_header(&buf).unwrap();
+
+        assert!(hdr.little_endian);
+        assert_eq!(hdr.ndim, 4);
+    }
+
+    #[test]
+    fn paired_hdr_uses_img_file_and_header_vox_offset() {
+        let hdr_path = tmp_path("offset_pair.hdr");
+        let img_path = tmp_path("offset_pair.img");
+        let mut header = synthetic_header(0);
+        header[40..42].copy_from_slice(&2i16.to_le_bytes());
+        header[42..44].copy_from_slice(&2i16.to_le_bytes());
+        header[44..46].copy_from_slice(&1i16.to_le_bytes());
+        header[46..50].fill(0);
+        header[108..112].copy_from_slice(&4f32.to_le_bytes());
+        header[344..348].copy_from_slice(b"ni1\0");
+        std::fs::write(&hdr_path, header).unwrap();
+        std::fs::write(&img_path, [0, 0, 0, 0, 9, 8]).unwrap();
+
+        let mut reader = NiftiReader::new();
+        reader.set_id(&hdr_path).unwrap();
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 8]);
+
+        let _ = std::fs::remove_file(hdr_path);
+        let _ = std::fs::remove_file(img_path);
+    }
+
+    #[test]
+    fn single_nii_uses_header_vox_offset_without_defaulting_to_header_end() {
+        let path = tmp_path("zero_offset.nii");
+        let mut bytes = synthetic_header(0);
+        bytes[40..42].copy_from_slice(&2i16.to_le_bytes());
+        bytes[42..44].copy_from_slice(&2i16.to_le_bytes());
+        bytes[44..46].copy_from_slice(&1i16.to_le_bytes());
+        bytes[46..50].fill(0);
+        bytes[108..112].copy_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&[9, 8]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = NiftiReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![92, 1]);
+
+        let _ = std::fs::remove_file(path);
     }
 }

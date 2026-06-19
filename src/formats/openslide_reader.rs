@@ -141,7 +141,9 @@ mod inner {
         }
 
         fn metadata(&self) -> &ImageMetadata {
-            self.meta.as_ref().expect("set_id not called")
+            self.meta
+                .as_ref()
+                .unwrap_or_else(|| crate::common::reader::uninitialized_metadata())
         }
 
         fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -230,6 +232,20 @@ mod inner {
 
         fn resolution(&self) -> usize {
             self.current_resolution
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::OpenSlideReader;
+        use crate::common::reader::FormatReader;
+
+        #[test]
+        fn metadata_before_set_id_returns_uninitialized_fallback() {
+            let reader = OpenSlideReader::new();
+
+            assert_eq!(reader.metadata().size_x, 0);
+            assert_eq!(reader.metadata().size_y, 0);
         }
     }
 }

@@ -11,3 +11,4 @@ pub mod pixel_type;
 pub mod reader;
 pub mod region;
 pub mod writer;
+pub mod xml;

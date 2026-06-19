@@ -456,9 +456,22 @@ impl<R: Read + Seek> TiffParser<R> {
         Ok(match type_code {
             1 => IfdValue::Byte(data.to_vec()),
             2 => {
-                // ASCII: null-separated strings; take first
-                let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-                IfdValue::Ascii(String::from_utf8_lossy(&data[..end]).into_owned())
+                // Java returns String[] for multiple NUL-separated ASCII
+                // segments, and IFD.getIFDTextValue joins those with LF and
+                // normalizes CR/LF. Store that text-view representation, since
+                // Rust's IFD accessor exposes a single string.
+                let mut strings = Vec::new();
+                let mut start = 0;
+                for (i, &byte) in data.iter().enumerate() {
+                    if byte == 0 {
+                        strings.push(String::from_utf8_lossy(&data[start..i]).into_owned());
+                        start = i + 1;
+                    } else if i == data.len() - 1 {
+                        strings.push(String::from_utf8_lossy(&data[start..=i]).into_owned());
+                    }
+                }
+                let text = strings.join("\n").replace("\r\n", "\n").replace('\r', "\n");
+                IfdValue::Ascii(text)
             }
             3 => IfdValue::Short(
                 data.chunks_exact(2)
@@ -527,14 +540,14 @@ impl<R: Read + Seek> TiffParser<R> {
                 data.chunks_exact(8)
                     .map(|c| {
                         let n = if le {
-                            i32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                            u32::from_le_bytes([c[0], c[1], c[2], c[3]])
                         } else {
-                            i32::from_be_bytes([c[0], c[1], c[2], c[3]])
+                            u32::from_be_bytes([c[0], c[1], c[2], c[3]])
                         };
                         let d = if le {
-                            i32::from_le_bytes([c[4], c[5], c[6], c[7]])
+                            u32::from_le_bytes([c[4], c[5], c[6], c[7]])
                         } else {
-                            i32::from_be_bytes([c[4], c[5], c[6], c[7]])
+                            u32::from_be_bytes([c[4], c[5], c[6], c[7]])
                         };
                         (n, d)
                     })
@@ -569,6 +582,17 @@ impl<R: Read + Seek> TiffParser<R> {
                             u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
                         } else {
                             u64::from_be_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+                        }
+                    })
+                    .collect(),
+            ),
+            17 => IfdValue::SLong8(
+                data.chunks_exact(8)
+                    .map(|c| {
+                        if le {
+                            i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+                        } else {
+                            i64::from_be_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
                         }
                     })
                     .collect(),
@@ -647,6 +671,25 @@ mod tests {
         offset_entry(bytes, tag, 4, 1, value);
     }
 
+    fn sshort_entry(bytes: &mut Vec<u8>, tag: u16, value: i16) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+    }
+
+    fn slong_entry(bytes: &mut Vec<u8>, tag: u16, value: i32) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&9u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn srational_entry(bytes: &mut Vec<u8>, tag: u16, count: u32, offset: u32) {
+        offset_entry(bytes, tag, 10, count, offset);
+    }
+
     fn big_offset_entry(bytes: &mut Vec<u8>, tag: u16, typ: u16, count: u64, offset: u64) {
         bytes.extend_from_slice(&tag.to_le_bytes());
         bytes.extend_from_slice(&typ.to_le_bytes());
@@ -676,6 +719,17 @@ mod tests {
         push_u64(bytes, 1, little_endian);
         push_u16(bytes, value, little_endian);
         bytes.extend_from_slice(&[0; 6]);
+    }
+
+    fn bigtiff_slong8_entry(bytes: &mut Vec<u8>, tag: u16, value: i64, little_endian: bool) {
+        push_u16(bytes, tag, little_endian);
+        push_u16(bytes, 17, little_endian);
+        push_u64(bytes, 1, little_endian);
+        if little_endian {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
     }
 
     fn bigtiff_offset_entry(
@@ -787,6 +841,25 @@ mod tests {
     }
 
     #[test]
+    fn ascii_text_value_keeps_all_nul_separated_segments() {
+        // Java TiffParser stores multiple ASCII segments as String[], and
+        // IFD.getIFDTextValue joins them with LF while normalizing CR/LF.
+        let text = b"first\r\nline\0second\rthird\0";
+        let text_offset = 8 + 2 + 12 + 4;
+        let mut bytes = classic_le_header(8);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        offset_entry(&mut bytes, 270, 2, text.len() as u32, text_offset);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(bytes.len(), text_offset as usize);
+        bytes.extend_from_slice(text);
+
+        let mut parser = parse(bytes);
+        let ifds = parser.read_ifds().expect("ASCII IFD should parse");
+
+        assert_eq!(ifds[0].get_str(270), Some("first\nline\nsecond\nthird"));
+    }
+
+    #[test]
     fn read_ifd_keeps_first_duplicate_tag_value() {
         // Java TiffParser only inserts a tag when the IFD does not already
         // contain it. Later duplicate tags must not overwrite earlier values.
@@ -800,6 +873,93 @@ mod tests {
         let ifds = parser.read_ifds().expect("duplicate-tag IFD should parse");
 
         assert_eq!(ifds[0].get(256).and_then(IfdValue::as_u32), Some(1));
+    }
+
+    #[test]
+    fn signed_integer_ifd_values_are_numeric_for_accessors() {
+        // Java IFD.getIFDIntValue/getIFDLongArray accept any Number. Some real
+        // TIFFs write positive enum-like tags using signed TIFF field types, so
+        // Rust accessors must not silently fall back to defaults for SSHORT/SLONG.
+        let mut bytes = classic_le_header(8);
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        sshort_entry(&mut bytes, 339, 2); // SampleFormat = signed integer
+        slong_entry(&mut bytes, 259, 5); // Compression = LZW
+        sshort_entry(&mut bytes, 277, 3); // SamplesPerPixel = RGB
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut parser = parse(bytes);
+        let ifds = parser.read_ifds().expect("signed numeric IFD should parse");
+        let ifd = &ifds[0];
+
+        assert_eq!(ifd.get_u16(339), Some(2));
+        assert_eq!(ifd.get_u16(259), Some(5));
+        assert_eq!(ifd.get_vec_u64(277), vec![3]);
+    }
+
+    #[test]
+    fn negative_signed_integer_ifd_values_do_not_wrap_unsigned_accessors() {
+        let mut bytes = classic_le_header(8);
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        sshort_entry(&mut bytes, 259, -1);
+        slong_entry(&mut bytes, 277, -2);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut parser = parse(bytes);
+        let ifds = parser
+            .read_ifds()
+            .expect("negative signed IFD should parse");
+        let ifd = &ifds[0];
+
+        assert_eq!(ifd.get_u16(259), None);
+        assert_eq!(ifd.get_u64(277), None);
+        assert!(ifd.get_vec_u64(277).is_empty());
+    }
+
+    #[test]
+    fn bigtiff_signed_long8_values_decode_as_numeric() {
+        let mut bytes = bigtiff_le_header(16);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bigtiff_slong8_entry(&mut bytes, 256, 1234, true);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut parser = parse(bytes);
+        let ifds = parser.read_ifds().expect("BigTIFF SLONG8 IFD should parse");
+
+        assert!(matches!(
+            ifds[0].get(256),
+            Some(IfdValue::SLong8(values)) if values == &vec![1234]
+        ));
+        assert_eq!(ifds[0].get(256).and_then(IfdValue::as_u64), Some(1234));
+    }
+
+    #[test]
+    fn srational_uses_java_unsigned_tiff_rational_semantics() {
+        // Java's TiffParser decodes both RATIONAL and SRATIONAL via
+        // readUnsignedInt() into TiffRational. A negative TIFF SRATIONAL
+        // numerator therefore becomes a large positive unsigned value there.
+        let values_offset = 8 + 2 + 12 + 4;
+        let mut bytes = classic_le_header(8);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        srational_entry(&mut bytes, 286, 2, values_offset);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(bytes.len(), values_offset as usize);
+        bytes.extend_from_slice(&(-2i32).to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut parser = parse(bytes);
+        let ifds = parser.read_ifds().expect("SRATIONAL IFD should parse");
+
+        assert!(matches!(
+            ifds[0].get(286),
+            Some(IfdValue::SRational(values))
+                if values == &vec![(u32::MAX - 1, 2), (7, 0)]
+        ));
+        assert_eq!(
+            ifds[0].get_vec_f64(286),
+            vec![(u32::MAX - 1) as f64 / 2.0, f64::MAX]
+        );
     }
 
     #[test]

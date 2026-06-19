@@ -28,7 +28,7 @@ fn writer_for(path: &Path) -> Option<Box<dyn FormatWriter>> {
             || n.ends_with(".ome.tf8")
             || n.ends_with(".ome.btf")
     ) {
-        return Some(Box::new(crate::tiff::TiffWriter::new().with_auto_ome_xml()));
+        return Some(Box::new(crate::tiff::PyramidOmeTiffWriter::new()));
     }
 
     #[allow(unused_mut)]

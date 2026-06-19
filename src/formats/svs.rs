@@ -22,6 +22,28 @@ impl SvsReader {
         }
     }
 
+    /// Mirror Java `SVSReader.isThisType(String, true)`: when suffix detection
+    /// is not enough, inspect the first TIFF IFD's ImageDescription and require
+    /// an Aperio description plus more than one IFD.
+    fn is_this_type_from_bytes(header: &[u8]) -> bool {
+        let cursor = std::io::Cursor::new(header);
+        let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let ifds = match parser.read_ifds() {
+            Ok(ifds) => ifds,
+            Err(_) => return false,
+        };
+        if ifds.len() <= 1 {
+            return false;
+        }
+        ifds.first()
+            .and_then(|ifd| ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION))
+            .map(|desc| desc.starts_with("Aperio Image"))
+            .unwrap_or(false)
+    }
+
     /// Parse Aperio SVS ImageDescription metadata.
     /// Format: "Aperio ...|key=value|key=value|..."
     fn parse_aperio_metadata(&mut self) {
@@ -292,7 +314,7 @@ impl FormatReader for SvsReader {
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+        Self::is_this_type_from_bytes(_header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -355,11 +377,13 @@ impl FormatReader for SvsReader {
         self.inner.resolution()
     }
 
-    /// One OME image per series, named "Series 1", "Series 2", … (Java
-    /// SVSReader.initMetadataStore). The full-resolution image (series 0) carries
-    /// the Aperio `MPP` micrometre/pixel as PhysicalSizeX/Y; label/macro images
-    /// have no calibration. Each image has a single RGB channel
-    /// (SamplesPerPixel = channel count).
+    /// One OME image per series, named like Java `SVSReader.initMetadataStore`:
+    /// the main pyramid image is unnamed, label/macro extras are named
+    /// explicitly, and any remaining series fall back to "Series N". The
+    /// full-resolution image (series 0) carries the Aperio `MPP`
+    /// micrometre/pixel as PhysicalSizeX/Y; label/macro images have no
+    /// calibration. Each image has a single RGB channel (SamplesPerPixel =
+    /// channel count).
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
         let series = self.inner.series_list();
@@ -383,8 +407,18 @@ impl FormatReader for SvsReader {
             .map(|(i, s)| {
                 let m = &s.metadata;
                 let (px, py) = if i == 0 { (mpp, mpp) } else { (None, None) };
+                let name = match m.series_metadata.get("svs.image_type") {
+                    Some(MetadataValue::String(kind)) if kind == "label" => {
+                        Some("label image".to_string())
+                    }
+                    Some(MetadataValue::String(kind)) if kind == "macro" => {
+                        Some("macro image".to_string())
+                    }
+                    _ if i == 0 => Some(String::new()),
+                    _ => Some(format!("Series {}", i + 1)),
+                };
                 OmeImage {
-                    name: Some(format!("Series {}", i + 1)),
+                    name,
                     physical_size_x: px,
                     physical_size_y: py,
                     channels: vec![OmeChannel {
@@ -583,6 +617,66 @@ mod pyramid_tiff_tests {
         d
     }
 
+    fn build_svs_with_label_macro_tiff() -> Vec<u8> {
+        let ifds = [
+            (2u32, 2u32, "Aperio Image|MPP=0.25", vec![1u8, 2, 3, 4]),
+            (1u32, 1u32, "label image", vec![5u8]),
+            (1u32, 1u32, "macro image", vec![6u8]),
+        ];
+        let ifd_size = 2 + 9 * 12 + 4;
+        let ifd0_off: u32 = 8;
+        let desc0_off: u32 = ifd0_off + (ifd_size * ifds.len()) as u32;
+        let desc1_off: u32 = desc0_off + ifds[0].2.len() as u32 + 1;
+        let desc2_off: u32 = desc1_off + ifds[1].2.len() as u32 + 1;
+        let px0_off: u32 = desc2_off + ifds[2].2.len() as u32 + 1;
+        let px1_off: u32 = px0_off + ifds[0].3.len() as u32;
+        let px2_off: u32 = px1_off + ifds[1].3.len() as u32;
+
+        let mut d: Vec<u8> = Vec::new();
+        d.extend_from_slice(b"II");
+        push_u16(&mut d, 42);
+        push_u32(&mut d, ifd0_off);
+
+        for (i, (w, h, desc, pixels)) in ifds.iter().enumerate() {
+            let next = if i + 1 < ifds.len() {
+                ifd0_off + ((i + 1) * ifd_size) as u32
+            } else {
+                0
+            };
+            let desc_off = match i {
+                0 => desc0_off,
+                1 => desc1_off,
+                _ => desc2_off,
+            };
+            let px_off = match i {
+                0 => px0_off,
+                1 => px1_off,
+                _ => px2_off,
+            };
+
+            push_u16(&mut d, 9);
+            push_long(&mut d, tag::IMAGE_WIDTH, *w);
+            push_long(&mut d, tag::IMAGE_LENGTH, *h);
+            push_short(&mut d, tag::BITS_PER_SAMPLE, 8);
+            push_short(&mut d, tag::COMPRESSION, 1);
+            push_short(&mut d, tag::PHOTOMETRIC_INTERPRETATION, 1);
+            push_ascii_at_offset(&mut d, tag::IMAGE_DESCRIPTION, desc, desc_off);
+            push_long(&mut d, tag::STRIP_OFFSETS, px_off);
+            push_long(&mut d, tag::ROWS_PER_STRIP, *h);
+            push_long(&mut d, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+            push_u32(&mut d, next);
+        }
+
+        for (_, _, desc, _) in &ifds {
+            d.extend_from_slice(desc.as_bytes());
+            d.push(0);
+        }
+        for (_, _, _, pixels) in &ifds {
+            d.extend_from_slice(pixels);
+        }
+        d
+    }
+
     #[test]
     fn detects_faas_software_tag() {
         let faas = build_pyramid_tiff("Faas");
@@ -644,6 +738,17 @@ mod pyramid_tiff_tests {
     }
 
     #[test]
+    fn svs_byte_detection_requires_aperio_pyramid() {
+        let reader = SvsReader::new();
+        assert!(reader.is_this_type_by_bytes(&build_svs_z_stack_tiff()));
+        assert!(
+            !reader.is_this_type_by_bytes(&build_svs_rgb_tiff()),
+            "single-IFD Aperio TIFFs are rejected like Java SVSReader"
+        );
+        assert!(!reader.is_this_type_by_bytes(&build_pyramid_tiff("Faas")));
+    }
+
+    #[test]
     fn svs_same_sized_offset_z_ifds_become_planes() {
         let svs = build_svs_z_stack_tiff();
         let path = std::env::temp_dir().join(format!("aperio_z_stack_{}.svs", std::process::id()));
@@ -678,6 +783,31 @@ mod pyramid_tiff_tests {
         assert_eq!(
             reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
             vec![2, 20, 110]
+        );
+
+        reader.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn svs_ome_names_match_java_label_macro_names() {
+        let svs = build_svs_with_label_macro_tiff();
+        let path =
+            std::env::temp_dir().join(format!("aperio_label_macro_{}.svs", std::process::id()));
+        std::fs::write(&path, &svs).unwrap();
+
+        let mut reader = SvsReader::new();
+        reader.set_id(&path).unwrap();
+
+        let ome = reader.ome_metadata().unwrap();
+        let names: Vec<_> = ome
+            .images
+            .iter()
+            .map(|image| image.name.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            vec![Some(""), Some("label image"), Some("macro image")]
         );
 
         reader.close().unwrap();

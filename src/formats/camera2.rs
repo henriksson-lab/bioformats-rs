@@ -399,23 +399,57 @@ macro_rules! tiff_wrapper {
 }
 
 // ---------------------------------------------------------------------------
-// 1. PCO B16 raw camera file
+// 1. PCO-RAW camera file
 // ---------------------------------------------------------------------------
-/// PCO camera raw B16 binary format (`.b16`).
+/// PCO-RAW camera format (`.pcoraw`) with optional `.rec` companion metadata.
 ///
-/// Header is 216 bytes; width at offset 4 (u16 LE), height at offset 6 (u16 LE).
-/// Pixel data starts at offset 216 as 16-bit little-endian grayscale values.
+/// Java `PCORAWReader` delegates pixel I/O to `TiffReader`; the `.pcoraw`
+/// image file is TIFF-encoded, and a similarly named `.rec` file contributes
+/// native key/value metadata.
 pub struct PcoRawReader {
-    path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
+    inner: crate::tiff::TiffReader,
+    image_file: Option<PathBuf>,
+    param_file: Option<PathBuf>,
 }
 
 impl PcoRawReader {
     pub fn new() -> Self {
         PcoRawReader {
-            path: None,
-            meta: None,
+            inner: crate::tiff::TiffReader::new(),
+            image_file: None,
+            param_file: None,
         }
+    }
+
+    fn companion_path(path: &Path, extension: &str) -> PathBuf {
+        path.with_extension(extension)
+    }
+
+    fn is_rec(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("rec"))
+    }
+
+    fn is_pcoraw(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("pcoraw"))
+    }
+
+    fn parse_rec_metadata(path: &Path) -> Result<HashMap<String, MetadataValue>> {
+        let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
+        let mut values = HashMap::new();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            values.insert(
+                key.trim().to_owned(),
+                MetadataValue::String(value.trim().to_owned()),
+            );
+        }
+        Ok(values)
     }
 }
 
@@ -426,6 +460,151 @@ impl Default for PcoRawReader {
 }
 
 impl FormatReader for PcoRawReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        Self::is_pcoraw(path) || Self::is_rec(path)
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        self.inner.is_this_type_by_bytes(header)
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+
+        let (image_file, param_file) = if Self::is_rec(path) {
+            let image = Self::companion_path(path, "pcoraw");
+            if !image.exists() {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Could not find PCO-RAW image file.".into(),
+                ));
+            }
+            (image, Some(path.to_path_buf()))
+        } else {
+            let param = Self::companion_path(path, "rec");
+            let param = if param.exists() { Some(param) } else { None };
+            (path.to_path_buf(), param)
+        };
+
+        self.inner.set_id(&image_file)?;
+
+        if let Some(param) = &param_file {
+            let metadata = Self::parse_rec_metadata(param)?;
+            for series in self.inner.series_list_mut() {
+                for (key, value) in &metadata {
+                    series
+                        .metadata
+                        .series_metadata
+                        .insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        self.image_file = Some(image_file);
+        self.param_file = param_file;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()?;
+        self.image_file = None;
+        self.param_file = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        self.inner.series_count()
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.image_file.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.inner.metadata()
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(plane_index)
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(plane_index, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(plane_index)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
+
+    fn resolution(&self) -> usize {
+        self.inner.resolution()
+    }
+
+    fn lookup_table(
+        &mut self,
+        plane_index: u32,
+    ) -> Result<Option<crate::common::metadata::LookupTable>> {
+        self.inner.lookup_table(plane_index)
+    }
+
+    fn set_metadata_options(&mut self, options: crate::common::metadata::MetadataOptions) {
+        self.inner.set_metadata_options(options);
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        self.inner.ome_metadata()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy PCO B16 support
+// ---------------------------------------------------------------------------
+/// PCO camera raw B16 binary format (`.b16`).
+///
+/// Header is 216 bytes; width at offset 4 (u16 LE), height at offset 6 (u16 LE).
+/// Pixel data starts at offset 216 as 16-bit little-endian grayscale values.
+pub struct PcoB16Reader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+}
+
+impl PcoB16Reader {
+    pub fn new() -> Self {
+        PcoB16Reader {
+            path: None,
+            meta: None,
+        }
+    }
+}
+
+impl Default for PcoB16Reader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for PcoB16Reader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         matches!(
             path.extension()
@@ -442,10 +621,10 @@ impl FormatReader for PcoRawReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let mut f = std::fs::File::open(path).map_err(|e| BioFormatsError::Io(e))?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
         let file_size = f.metadata().map_err(BioFormatsError::Io)?.len();
         let mut header = [0u8; 216];
-        let n = f.read(&mut header).map_err(|e| BioFormatsError::Io(e))?;
+        let n = f.read(&mut header).map_err(BioFormatsError::Io)?;
         let (w, h) = if n >= 8 {
             let w = u16::from_le_bytes([header[4], header[5]]) as u32;
             let h = u16::from_le_bytes([header[6], header[7]]) as u32;
@@ -560,8 +739,8 @@ impl FormatReader for PcoRawReader {
 /// Bio-Rad GEL phosphor imager format (`.1sc`).
 ///
 /// Port of BioRadGelReader.java: magic 0xafaf, chunk-walks from offsets
-/// START_OFFSET (160) / BASE_OFFSET (352), reads bpp (2 or 4 bytes, the latter
-/// being FLOAT), and a dynamic pixel offset relative to PIXEL_OFFSET (59654).
+/// START_OFFSET (160) / BASE_OFFSET (352), reads bpp (2 or 4 bytes), and a
+/// dynamic pixel offset relative to PIXEL_OFFSET (59654).
 pub struct BioRadGelReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -661,6 +840,19 @@ fn read_i32(f: &mut std::fs::File, little_endian: bool) -> Result<i32> {
     })
 }
 
+fn read_c_string(f: &mut std::fs::File, max_len: usize) -> Result<String> {
+    let mut bytes = Vec::new();
+    for _ in 0..max_len {
+        let mut b = [0u8; 1];
+        let n = f.read(&mut b).map_err(BioFormatsError::Io)?;
+        if n == 0 || b[0] == 0 {
+            break;
+        }
+        bytes.push(b[0]);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 impl Default for BioRadGelReader {
     fn default() -> Self {
         Self::new()
@@ -742,8 +934,27 @@ impl FormatReader for BioRadGelReader {
         self.diff = BRG_BASE_OFFSET - base_fp;
         skip += self.diff;
 
+        let metadata_anchor = base_fp + skip;
+        let mut series_metadata = HashMap::new();
+        if metadata_anchor >= 298 && (metadata_anchor - 298) as u64 + 90 < file_size {
+            f.seek(SeekFrom::Start((metadata_anchor - 298) as u64))
+                .map_err(BioFormatsError::Io)?;
+            let mut date = [0u8; 17];
+            f.read_exact(&mut date).map_err(BioFormatsError::Io)?;
+            let date = String::from_utf8_lossy(&date)
+                .trim_matches('\0')
+                .trim()
+                .to_owned();
+            if !date.is_empty() {
+                series_metadata.insert("Acquisition date".into(), MetadataValue::String(date));
+            }
+            f.seek(SeekFrom::Current(73)).map_err(BioFormatsError::Io)?;
+            let scanner_name = read_c_string(&mut f, 4096)?;
+            series_metadata.insert("Scanner name".into(), MetadataValue::String(scanner_name));
+        }
+
         // Seek to baseFP + skip and read dimensions + bpp.
-        let dims_pos = (base_fp + skip).max(0) as u64;
+        let dims_pos = metadata_anchor.max(0) as u64;
         f.seek(SeekFrom::Start(dims_pos))
             .map_err(BioFormatsError::Io)?;
 
@@ -802,7 +1013,9 @@ impl FormatReader for BioRadGelReader {
             size_y,
             pixel_type,
             bits_per_pixel: bits,
+            dimension_order: DimensionOrder::XYCZT,
             is_little_endian: little_endian,
+            series_metadata,
             ..placeholder_meta_u16()
         });
         Ok(())
@@ -943,6 +1156,35 @@ impl L2dReader {
             .collect()
     }
 
+    fn find_group_manifest(path: &Path) -> Result<PathBuf> {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("l2d"))
+        {
+            return Ok(path.to_path_buf());
+        }
+
+        let scan_dir = path
+            .parent()
+            .ok_or_else(|| BioFormatsError::Format("Li-Cor L2D path has no parent".into()))?;
+        let root = scan_dir.parent().ok_or_else(|| {
+            BioFormatsError::Format("Li-Cor L2D companion path has no dataset root".into())
+        })?;
+        for entry in std::fs::read_dir(root).map_err(BioFormatsError::Io)? {
+            let entry = entry.map_err(BioFormatsError::Io)?;
+            let candidate = entry.path();
+            if candidate
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("l2d"))
+            {
+                return Ok(candidate);
+            }
+        }
+        Err(BioFormatsError::Format("Could not find .l2d file".into()))
+    }
+
     fn set_l2d_id(&mut self, path: &Path) -> Result<()> {
         let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
         if !text.contains(Self::LICOR_MAGIC) {
@@ -1007,7 +1249,8 @@ impl L2dReader {
             series_meta.image_count = scan_tiffs.len() as u32;
             series_meta.size_z = 1;
             series_meta.size_t = 1;
-            series_meta.size_c = scan_tiffs.len() as u32;
+            series_meta.size_c =
+                (scan_tiffs.len() as u32).saturating_mul(series_meta.size_c.max(1));
             series_meta.dimension_order = DimensionOrder::XYCZT;
             series_meta.series_metadata = scan_meta
                 .into_iter()
@@ -1056,18 +1299,7 @@ impl FormatReader for L2dReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let l2d_path = if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("l2d"))
-            .unwrap_or(false)
-        {
-            path.to_path_buf()
-        } else {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Li-Cor L2D grouped reads must be opened from the .l2d manifest".into(),
-            ));
-        };
+        let l2d_path = Self::find_group_manifest(path)?;
         self.set_l2d_id(&l2d_path)
     }
 
@@ -1287,7 +1519,10 @@ impl FormatReader for CanonRawReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("cr2") | Some("crw") | Some("cr3"))
+        matches!(
+            ext.as_deref(),
+            Some("cr2") | Some("crw") | Some("jpg") | Some("thm") | Some("wav") | Some("cr3")
+        )
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -1431,7 +1666,7 @@ impl FormatReader for CanonRawReader {
 /// tag-based detection and metadata parsing.
 pub struct ImaconReader {
     inner: crate::tiff::TiffReader,
-    meta: Option<ImageMetadata>,
+    meta: Vec<ImageMetadata>,
 }
 
 impl ImaconReader {
@@ -1441,7 +1676,52 @@ impl ImaconReader {
     pub fn new() -> Self {
         ImaconReader {
             inner: crate::tiff::TiffReader::new(),
-            meta: None,
+            meta: Vec::new(),
+        }
+    }
+}
+
+fn imacon_add_xml_metadata(xml_text: &str, series_metadata: &mut HashMap<String, MetadataValue>) {
+    let Some(xml_start) = xml_text.find('<') else {
+        return;
+    };
+    let xml = xml_text[xml_start..].trim();
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut current_element = String::new();
+    let mut key: Option<String> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                current_element = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+            }
+            Ok(quick_xml::events::Event::Text(t)) => {
+                let Some(value) = crate::common::xml::decode_xml_text(&t) else {
+                    continue;
+                };
+                if current_element == "key" {
+                    key = Some(value);
+                } else if let Some(k) = key.take() {
+                    series_metadata.insert(k, MetadataValue::String(value));
+                }
+            }
+            Ok(quick_xml::events::Event::GeneralRef(r)) => {
+                let Some(value) = crate::common::xml::decode_xml_ref(&r) else {
+                    continue;
+                };
+                if current_element == "key" {
+                    key = Some(value);
+                } else if let Some(k) = key.take() {
+                    series_metadata.insert(k, MetadataValue::String(value));
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                current_element.clear();
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
         }
     }
 }
@@ -1483,25 +1763,30 @@ impl FormatReader for ImaconReader {
             ));
         }
 
-        let mut meta = self.inner.metadata().clone();
-        meta.series_metadata
-            .insert("format".into(), MetadataValue::String("Imacon".into()));
+        for i in 0..self.inner.ifd_count() {
+            if let Some(ifd) = self.inner.ifd_mut(i) {
+                ifd.entries.remove(&46275);
+            }
+        }
+        self.inner.split_ifds_into_single_ifd_series_xyczt()?;
+
+        let first = self
+            .inner
+            .ifd(0)
+            .ok_or_else(|| BioFormatsError::UnsupportedFormat("Imacon: no IFD".into()))?;
 
         // CREATOR_TAG: newline-delimited; Java reads experimenter (line 4),
         // image name (line 6), creation date (lines 8 + 10).
+        let mut experimenter_name = None;
+        let mut image_name = None;
+        let mut creation_date = None;
         if let Some(creator) = first.get_str(Self::CREATOR_TAG) {
             let lines: Vec<&str> = creator.split('\n').collect();
             if lines.len() > 4 {
-                meta.series_metadata.insert(
-                    "Experimenter".into(),
-                    MetadataValue::String(lines[4].trim().to_string()),
-                );
+                experimenter_name = Some(lines[4].trim().to_string());
             }
             if lines.len() > 6 {
-                meta.series_metadata.insert(
-                    "ImageName".into(),
-                    MetadataValue::String(lines[6].trim().to_string()),
-                );
+                image_name = Some(lines[6].trim().to_string());
             }
             if lines.len() > 8 {
                 let mut date = lines[8].trim().to_string();
@@ -1509,22 +1794,68 @@ impl FormatReader for ImaconReader {
                     date.push(' ');
                     date.push_str(lines[10].trim());
                 }
-                meta.series_metadata
-                    .insert("CreationDate".into(), MetadataValue::String(date));
+                creation_date = Some(date);
             }
         }
 
-        self.meta = Some(meta);
+        let xml = first.get_str(Self::XML_TAG).map(str::to_owned);
+        self.meta = self
+            .inner
+            .series_list()
+            .iter()
+            .enumerate()
+            .map(|(i, series)| {
+                let mut meta = series.metadata.clone();
+                meta.series_metadata
+                    .insert("format".into(), MetadataValue::String("Imacon".into()));
+                if let Some(xml) = xml.as_deref() {
+                    imacon_add_xml_metadata(xml, &mut meta.series_metadata);
+                }
+                if let Some(name) = experimenter_name.as_deref() {
+                    meta.series_metadata.insert(
+                        "Experimenter".into(),
+                        MetadataValue::String(name.to_string()),
+                    );
+                    let mut parts = name.splitn(2, ' ');
+                    let first = parts.next().unwrap_or("");
+                    let last = parts.next();
+                    meta.series_metadata.insert(
+                        "ExperimenterFirstName".into(),
+                        MetadataValue::String(last.map(|_| first).unwrap_or("").to_string()),
+                    );
+                    meta.series_metadata.insert(
+                        "ExperimenterLastName".into(),
+                        MetadataValue::String(last.unwrap_or(first).to_string()),
+                    );
+                }
+                if let Some(base_name) = image_name.as_deref() {
+                    let name = if base_name.is_empty() {
+                        format!("#{}", i + 1)
+                    } else {
+                        format!("{base_name} #{}", i + 1)
+                    };
+                    meta.series_metadata
+                        .insert("ImageName".into(), MetadataValue::String(name));
+                }
+                if let Some(date) = creation_date.as_deref() {
+                    meta.series_metadata.insert(
+                        "CreationDate".into(),
+                        MetadataValue::String(date.to_string()),
+                    );
+                }
+                meta
+            })
+            .collect();
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.meta = None;
+        self.meta.clear();
         self.inner.close()
     }
 
     fn series_count(&self) -> usize {
-        if self.meta.is_some() {
+        if !self.meta.is_empty() {
             self.inner.series_count()
         } else {
             0
@@ -1532,7 +1863,7 @@ impl FormatReader for ImaconReader {
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
+        if self.meta.is_empty() {
             return Err(BioFormatsError::NotInitialized);
         }
         self.inner.set_series(s)
@@ -1544,7 +1875,7 @@ impl FormatReader for ImaconReader {
 
     fn metadata(&self) -> &ImageMetadata {
         self.meta
-            .as_ref()
+            .get(self.inner.series())
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
@@ -1606,6 +1937,9 @@ impl FormatReader for SbigReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        if header.len() < Self::HEADER_SIZE as usize {
+            return false;
+        }
         let n = header.len().min(32);
         std::str::from_utf8(&header[..n])
             .map(|s| s.contains(Self::MAGIC))
@@ -1633,6 +1967,10 @@ impl FormatReader for SbigReader {
         let mut size_x = None;
         let mut size_y = None;
         let mut compressed = false;
+        let mut description = None;
+        let mut date = None::<String>;
+        let mut physical_size_x = None;
+        let mut physical_size_y = None;
         let mut series_metadata = HashMap::new();
         for line in text.lines() {
             let line = line.trim();
@@ -1649,6 +1987,22 @@ impl FormatReader for SbigReader {
                 match key {
                     "Width" => size_x = value.parse::<u32>().ok(),
                     "Height" => size_y = value.parse::<u32>().ok(),
+                    "Note" => description = Some(value.to_string()),
+                    "X_pixel_size" => {
+                        physical_size_x = value.parse::<f64>().ok().map(|v| v * 1000.0)
+                    }
+                    "Y_pixel_size" => {
+                        physical_size_y = value.parse::<f64>().ok().map(|v| v * 1000.0)
+                    }
+                    "Date" => date = Some(value.to_string()),
+                    "Time" => {
+                        if let Some(date) = &mut date {
+                            date.push(' ');
+                            date.push_str(value);
+                        } else {
+                            date = Some(format!("null {value}"));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1673,6 +2027,18 @@ impl FormatReader for SbigReader {
 
         self.path = Some(path.to_path_buf());
         self.compressed = compressed;
+        if let Some(description) = description {
+            series_metadata.insert("Description".into(), MetadataValue::String(description));
+        }
+        if let Some(date) = date {
+            series_metadata.insert("AcquisitionDate".into(), MetadataValue::String(date));
+        }
+        if let Some(size) = physical_size_x {
+            series_metadata.insert("PhysicalSizeX".into(), MetadataValue::Float(size));
+        }
+        if let Some(size) = physical_size_y {
+            series_metadata.insert("PhysicalSizeY".into(), MetadataValue::Float(size));
+        }
         self.meta = Some(ImageMetadata {
             size_x,
             size_y,
@@ -1892,11 +2258,6 @@ fn parse_ipw_image_info(text: &str) -> Result<(Option<u32>, Option<u32>, Option<
                     let value = data.trim().parse::<u32>().map_err(|_| {
                         BioFormatsError::Format(format!("IPW: invalid {label} value"))
                     })?;
-                    if value == 0 {
-                        return Err(BioFormatsError::Format(format!(
-                            "IPW: {label} must be positive"
-                        )));
-                    }
                     match label {
                         "channels" => c = Some(value),
                         "slices" => z = Some(value),
@@ -1922,8 +2283,9 @@ impl FormatReader for IpwReader {
         )
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= 4
+            && u32::from_be_bytes([header[0], header[1], header[2], header[3]]) == 0xd0cf_11e0
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -2010,8 +2372,11 @@ impl FormatReader for IpwReader {
         std::fs::remove_file(&tmp).ok();
 
         let mut size_z = size_z.unwrap_or(1);
-        let size_c = size_c.unwrap_or(1);
-        let size_t = size_t.unwrap_or(1);
+        let size_c = size_c.unwrap_or(1).max(1);
+        let size_t = size_t.unwrap_or(1).max(1);
+        if size_z == 0 {
+            size_z = 1;
+        }
         // Java: if axis product == 1 but multiple planes exist, treat as Z.
         if size_z * size_c * size_t == 1 && image_count != 1 {
             size_z = image_count;
@@ -2334,14 +2699,13 @@ impl PhotoshopTiffReader {
                         pad = 4 - pad;
                     }
                     let raw_name = tag.read_string(name_length + pad);
-                    let raw_len = raw_name.len();
                     let layer_name = photoshop_clean_layer_name(raw_name);
 
-                    // Java: accept the name only when it fully decoded (length
-                    // matches nameLength+pad) and is not the synthetic mask name
-                    // "Layer <n>M".
+                    // Java tests the cleaned String length after
+                    // replaceAll(...).trim(), not the number of bytes read.
                     let synthetic = format!("Layer {layer}M");
-                    if raw_len == name_length + pad && !layer_name.eq_ignore_ascii_case(&synthetic)
+                    if layer_name.len() == name_length + pad
+                        && !layer_name.eq_ignore_ascii_case(&synthetic)
                     {
                         self.layer_names.push(layer_name);
                         series_count += 1;
@@ -2925,6 +3289,24 @@ mod tests {
         writer.close().unwrap();
     }
 
+    fn write_rgb_tiff(path: &Path, pixels: &[u8], width: u32, height: u32) {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = width;
+        meta.size_y = height;
+        meta.size_c = 3;
+        meta.pixel_type = PixelType::Uint8;
+        meta.bits_per_pixel = 8;
+        meta.image_count = 1;
+        meta.is_rgb = true;
+        meta.is_interleaved = true;
+
+        let mut writer = TiffWriter::new();
+        writer.set_metadata(&meta).unwrap();
+        writer.set_id(path).unwrap();
+        writer.save_bytes(0, pixels).unwrap();
+        writer.close().unwrap();
+    }
+
     fn write_l2d_dataset(root: &Path) -> PathBuf {
         let scan_dir = root.join("ScanA");
         fs::create_dir_all(&scan_dir).unwrap();
@@ -2979,6 +3361,51 @@ mod tests {
     }
 
     #[test]
+    fn l2d_can_open_from_grouped_scn_or_tiff_companion() {
+        let root = temp_dir("l2d_grouped_open");
+        let l2d = write_l2d_dataset(&root);
+        let scn = root.join("ScanA").join("ScanA.scn");
+        let tiff = root.join("ScanA").join("ch1.tif");
+
+        let mut from_scn = L2dReader::new();
+        from_scn.set_id(&scn).unwrap();
+        assert_eq!(from_scn.metadata().image_count, 2);
+        assert_eq!(from_scn.open_bytes(1).unwrap(), vec![7, 8, 9, 10, 11, 12]);
+
+        let mut from_tiff = L2dReader::new();
+        from_tiff.set_id(&tiff).unwrap();
+        assert_eq!(from_tiff.metadata().image_count, 2);
+        assert_eq!(from_tiff.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+
+        assert!(l2d.is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn l2d_multiplies_logical_channels_by_rgb_samples() {
+        let root = temp_dir("l2d_rgb_channels");
+        let scan_dir = root.join("ScanA");
+        fs::create_dir_all(&scan_dir).unwrap();
+        write_rgb_tiff(&scan_dir.join("rgb1.tif"), &[1, 2, 3, 4, 5, 6], 2, 1);
+        write_rgb_tiff(&scan_dir.join("rgb2.tif"), &[7, 8, 9, 10, 11, 12], 2, 1);
+        fs::write(
+            scan_dir.join("ScanA.scn"),
+            "ImageNames=rgb1.tif, rgb2.tif\n",
+        )
+        .unwrap();
+        let l2d = root.join("sample.l2d");
+        fs::write(&l2d, "FileType=LI-COR LI2D\nScanNames=ScanA\n").unwrap();
+
+        let mut reader = L2dReader::new();
+        reader.set_id(&l2d).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_c, meta.image_count), (6, 2));
+        assert!(meta.is_rgb);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn l2d_rejects_manifest_without_magic() {
         let root = temp_dir("l2d_magic");
         let l2d = root.join("bad.l2d");
@@ -2987,6 +3414,180 @@ mod tests {
         assert!(
             err.to_string().contains("LI-COR LI2D"),
             "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn push_tiff_entry(data: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
+        data.extend_from_slice(&tag.to_le_bytes());
+        data.extend_from_slice(&typ.to_le_bytes());
+        data.extend_from_slice(&count.to_le_bytes());
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_imacon_ifd(
+        data: &mut Vec<u8>,
+        next_ifd: u32,
+        pixel_offset: u32,
+        creator_offset: u32,
+        xml_offset: u32,
+    ) {
+        let creator_len =
+            b"0\n1\n2\n3\nAda Lovelace\n5\nScan\n7\n20240102\n9\n030405+0000\0".len() as u32;
+        let xml_len =
+            b"prefix <root><key>Camera</key><value>Imacon 949</value></root>\0".len() as u32;
+        data.extend_from_slice(&11u16.to_le_bytes());
+        push_tiff_entry(data, 256, 4, 1, 1);
+        push_tiff_entry(data, 257, 4, 1, 1);
+        push_tiff_entry(data, 258, 3, 1, 8);
+        push_tiff_entry(data, 259, 3, 1, 1);
+        push_tiff_entry(data, 262, 3, 1, 1);
+        push_tiff_entry(data, 273, 4, 1, pixel_offset);
+        push_tiff_entry(data, 277, 3, 1, 1);
+        push_tiff_entry(data, 278, 4, 1, 1);
+        push_tiff_entry(data, 279, 4, 1, 1);
+        push_tiff_entry(
+            data,
+            ImaconReader::CREATOR_TAG,
+            2,
+            creator_len,
+            creator_offset,
+        );
+        push_tiff_entry(data, ImaconReader::XML_TAG, 2, xml_len, xml_offset);
+        data.extend_from_slice(&next_ifd.to_le_bytes());
+    }
+
+    fn write_two_ifd_imacon(path: &Path) {
+        let ifd_len = 2 + 11 * 12 + 4;
+        let ifd1_offset = 8u32;
+        let ifd2_offset = ifd1_offset + ifd_len;
+        let data_offset = ifd2_offset + ifd_len;
+        let creator = b"0\n1\n2\n3\nAda Lovelace\n5\nScan\n7\n20240102\n9\n030405+0000\0";
+        let xml = b"prefix <root><key>Camera</key><value>Imacon 949</value></root>\0";
+        let creator_offset = data_offset;
+        let xml_offset = creator_offset + creator.len() as u32;
+        let pixel1_offset = xml_offset + xml.len() as u32;
+        let pixel2_offset = pixel1_offset + 1;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&ifd1_offset.to_le_bytes());
+        push_imacon_ifd(
+            &mut data,
+            ifd2_offset,
+            pixel1_offset,
+            creator_offset,
+            xml_offset,
+        );
+        push_imacon_ifd(&mut data, 0, pixel2_offset, creator_offset, xml_offset);
+        data.extend_from_slice(creator);
+        data.extend_from_slice(xml);
+        data.push(11);
+        data.push(22);
+        fs::write(path, data).unwrap();
+    }
+
+    #[test]
+    fn imacon_uses_each_ifd_as_a_series_and_applies_first_ifd_metadata() {
+        let root = temp_dir("imacon_series");
+        let path = root.join("sample.fff");
+        write_two_ifd_imacon(&path);
+
+        let mut reader = ImaconReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.metadata().image_count, 1);
+        assert_eq!(reader.metadata().dimension_order, DimensionOrder::XYCZT);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
+
+        let md0 = &reader.metadata().series_metadata;
+        assert!(matches!(md0.get("ImageName"), Some(MetadataValue::String(v)) if v == "Scan #1"));
+        assert!(
+            matches!(md0.get("ExperimenterFirstName"), Some(MetadataValue::String(v)) if v == "Ada")
+        );
+        assert!(
+            matches!(md0.get("ExperimenterLastName"), Some(MetadataValue::String(v)) if v == "Lovelace")
+        );
+        assert!(
+            matches!(md0.get("CreationDate"), Some(MetadataValue::String(v)) if v == "20240102 030405+0000")
+        );
+        assert!(matches!(md0.get("Camera"), Some(MetadataValue::String(v)) if v == "Imacon 949"));
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.metadata().image_count, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![22]);
+        assert!(matches!(
+            reader.metadata().series_metadata.get("ImageName"),
+            Some(MetadataValue::String(v)) if v == "Scan #2"
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_sbig(path: &Path, compressed: bool) {
+        let mut bytes = vec![0u8; SbigReader::HEADER_SIZE as usize];
+        bytes[..SbigReader::MAGIC.len()].copy_from_slice(SbigReader::MAGIC.as_bytes());
+        let header = b"\nWidth = 3\nHeight = 1\nNote = synthetic\nX_pixel_size = 0.001\nY_pixel_size = 0.002\nDate = 06/19/26\nTime = 12:34:56\nEnd\n";
+        let start = SbigReader::MAGIC.len();
+        bytes[start..start + header.len()].copy_from_slice(header);
+        if compressed {
+            bytes.extend_from_slice(&4u16.to_le_bytes());
+            bytes.extend_from_slice(&100i16.to_le_bytes());
+            bytes.push(2u8);
+            bytes.push(0x80);
+            bytes.extend_from_slice(&50i16.to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&[1, 0, 2, 0, 3, 0]);
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn sbig_requires_full_header_and_preserves_metadata() {
+        let root = temp_dir("sbig_header");
+        let path = root.join("sample.sbig");
+        write_sbig(&path, false);
+
+        let reader = SbigReader::new();
+        assert!(!reader.is_this_type_by_bytes(SbigReader::MAGIC.as_bytes()));
+        let header = fs::read(&path).unwrap();
+        assert!(reader.is_this_type_by_bytes(&header[..SbigReader::HEADER_SIZE as usize]));
+
+        let mut reader = SbigReader::new();
+        reader.set_id(&path).unwrap();
+        let md = &reader.metadata().series_metadata;
+        assert!(
+            matches!(md.get("Description"), Some(MetadataValue::String(v)) if v == "synthetic")
+        );
+        assert!(
+            matches!(md.get("AcquisitionDate"), Some(MetadataValue::String(v)) if v == "06/19/26 12:34:56")
+        );
+        assert!(
+            matches!(md.get("PhysicalSizeX"), Some(MetadataValue::Float(v)) if (*v - 1.0).abs() < 1e-12)
+        );
+        assert!(
+            matches!(md.get("PhysicalSizeY"), Some(MetadataValue::Float(v)) if (*v - 2.0).abs() < 1e-12)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sbig_decompresses_delta_and_literal_pixels() {
+        let root = temp_dir("sbig_compressed");
+        let path = root.join("compressed.sbig");
+        write_sbig(&path, true);
+
+        let mut reader = SbigReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            [100i16, 102, 50]
+                .into_iter()
+                .flat_map(i16::to_le_bytes)
+                .collect::<Vec<_>>()
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -3205,6 +3806,64 @@ mod tests {
             Some(MetadataValue::Int(value)) => assert_eq!(*value, 1),
             other => panic!("unexpected layer-count metadata: {other:?}"),
         }
+    }
+
+    #[test]
+    fn photoshop_layer_block_rejects_padded_name_like_java() {
+        // Java compares layerNames[layer].length() after ASCII stripping and
+        // trim() to nameLength + pad. A padded Pascal string is therefore not
+        // accepted because trim() removes the NUL padding.
+        let name = b"Layer"; // name_len 5 => pad 3
+        let name_len = name.len();
+        let pad = (4 - (name_len % 4)) % 4;
+
+        let mut layer = Vec::new();
+        layer.extend_from_slice(&0i32.to_le_bytes()); // top
+        layer.extend_from_slice(&0i32.to_le_bytes()); // left
+        layer.extend_from_slice(&4i32.to_le_bytes()); // bottom
+        layer.extend_from_slice(&4i32.to_le_bytes()); // right
+        layer.extend_from_slice(&1i16.to_le_bytes()); // sizeC
+        layer.extend_from_slice(&0i16.to_le_bytes()); // channelID
+        layer.extend_from_slice(&16i32.to_le_bytes()); // dataSize
+        layer.extend_from_slice(&[0u8; 12]);
+
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0i32.to_le_bytes()); // mask == 0
+        extra.extend_from_slice(&0i32.to_le_bytes()); // blending == 0
+        extra.push(name_len as u8);
+        extra.extend_from_slice(name);
+        extra.extend_from_slice(&vec![0u8; pad]);
+        layer.extend_from_slice(&(extra.len() as i32).to_le_bytes());
+        layer.extend_from_slice(&extra);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.extend_from_slice(&layer);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"8BPS\0");
+        payload.extend_from_slice(b"8BIM");
+        payload.extend_from_slice(b"ryaL");
+        payload.extend_from_slice(&(body.len() as i32).to_le_bytes());
+        payload.extend_from_slice(&body);
+        payload.extend_from_slice(&[0u8; 16]);
+
+        let mut reader = PhotoshopTiffReader::new();
+        reader.init_file(&payload);
+
+        assert!(reader.layer_names.is_empty());
+        match reader
+            .metadata()
+            .series_metadata
+            .get("Photoshop layer count")
+        {
+            Some(MetadataValue::Int(value)) => assert_eq!(*value, 0),
+            other => panic!("unexpected layer-count metadata: {other:?}"),
+        }
+        assert!(!reader
+            .metadata()
+            .series_metadata
+            .contains_key("Layer name #1"));
     }
 
     #[test]

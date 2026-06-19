@@ -6,7 +6,7 @@
 //! layouts the Rust ports parse, which are translated directly from the Java
 //! reference readers.
 
-use bioformats::formats::misc::{MngReader, OpenlabReader, SlidebookReader};
+use bioformats::formats::misc::{MincReader, MngReader, OpenlabReader, SlidebookReader};
 use bioformats::{FormatReader, MetadataValue, OmeAnnotation, PixelType};
 use std::io::Write;
 
@@ -62,26 +62,32 @@ fn zlib_stored(raw: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Build a complete grayscale-8 PNG with the given pixels (row-major).
-fn build_gray_png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
-    assert_eq!(pixels.len(), (width * height) as usize);
+/// Build a complete 8-bit PNG with the given interleaved samples (row-major).
+fn build_png8(width: u32, height: u32, color_type: u8, channels: usize, samples: &[u8]) -> Vec<u8> {
+    assert_eq!(samples.len(), (width * height) as usize * channels);
     let mut png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-    // IHDR: width, height, bitdepth=8, colortype=0 (gray), compression, filter, interlace
+    // IHDR: width, height, bitdepth=8, colortype, compression, filter, interlace
     let mut ihdr = Vec::new();
     ihdr.extend_from_slice(&width.to_be_bytes());
     ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+    ihdr.extend_from_slice(&[8, color_type, 0, 0, 0]);
     png.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
     // IDAT: filtered scanlines (filter byte 0 per row).
     let mut filtered = Vec::new();
     for y in 0..height as usize {
         filtered.push(0u8);
-        let start = y * width as usize;
-        filtered.extend_from_slice(&pixels[start..start + width as usize]);
+        let row_samples = width as usize * channels;
+        let start = y * row_samples;
+        filtered.extend_from_slice(&samples[start..start + row_samples]);
     }
     png.extend_from_slice(&png_chunk(b"IDAT", &zlib_stored(&filtered)));
     png.extend_from_slice(&png_chunk(b"IEND", &[]));
     png
+}
+
+/// Build a complete grayscale-8 PNG with the given pixels (row-major).
+fn build_gray_png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+    build_png8(width, height, 0, 1, pixels)
 }
 
 /// Wrap a PNG datastream as a one-frame MNG file.
@@ -101,6 +107,91 @@ fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(bytes).unwrap();
     path
+}
+
+// --- MINC-1 / NetCDF-3 -----------------------------------------------------
+
+fn nc_name(out: &mut Vec<u8>, name: &str) {
+    out.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    out.extend_from_slice(name.as_bytes());
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+}
+
+fn build_minc1_u16_2x2() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"CDF\x01");
+    out.extend_from_slice(&0u32.to_be_bytes()); // numrecs
+
+    out.extend_from_slice(&10u32.to_be_bytes()); // NC_DIMENSION
+    out.extend_from_slice(&3u32.to_be_bytes());
+    nc_name(&mut out, "zspace");
+    out.extend_from_slice(&1u32.to_be_bytes());
+    nc_name(&mut out, "yspace");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    nc_name(&mut out, "xspace");
+    out.extend_from_slice(&2u32.to_be_bytes());
+
+    out.extend_from_slice(&0u32.to_be_bytes()); // no global attributes
+    out.extend_from_slice(&0u32.to_be_bytes());
+
+    out.extend_from_slice(&11u32.to_be_bytes()); // NC_VARIABLE
+    out.extend_from_slice(&1u32.to_be_bytes());
+    nc_name(&mut out, "image");
+    out.extend_from_slice(&3u32.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&12u32.to_be_bytes()); // NC_ATTRIBUTE
+    out.extend_from_slice(&1u32.to_be_bytes());
+    nc_name(&mut out, "signtype");
+    out.extend_from_slice(&2u32.to_be_bytes()); // NC_CHAR
+    out.extend_from_slice(&8u32.to_be_bytes());
+    out.extend_from_slice(b"unsigned");
+    out.extend_from_slice(&3u32.to_be_bytes()); // NC_SHORT
+    out.extend_from_slice(&8u32.to_be_bytes()); // vsize
+    let begin_pos = out.len();
+    out.extend_from_slice(&0u32.to_be_bytes());
+
+    let begin = out.len() as u32;
+    out[begin_pos..begin_pos + 4].copy_from_slice(&begin.to_be_bytes());
+    for value in [1u16, 2, 3, 4] {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+    out
+}
+
+#[test]
+fn minc1_netcdf_keeps_java_big_endian_and_vertical_flip() {
+    let data = build_minc1_u16_2x2();
+    let path = write_temp("minc1.mnc", &data);
+
+    let mut reader = MincReader::new();
+    assert!(reader.is_this_type_by_bytes(&data[..8]));
+    assert!(reader.is_this_type_by_name(std::path::Path::new("x.mnc")));
+
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(
+        (meta.size_x, meta.size_y, meta.size_z, meta.size_t),
+        (2, 2, 1, 1)
+    );
+    assert_eq!(meta.pixel_type, PixelType::Uint16);
+    assert!(!meta.is_little_endian);
+
+    let plane = reader.open_bytes(0).unwrap();
+    assert_eq!(
+        plane,
+        vec![0, 3, 0, 4, 0, 1, 0, 2],
+        "Java MINCReader copies rows from bottom to top and MINC-1 is big-endian"
+    );
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+        vec![0, 4, 0, 2]
+    );
+
+    let _ = std::fs::remove_file(path);
 }
 
 // --- MNG -------------------------------------------------------------------
@@ -133,6 +224,55 @@ fn mng_detects_and_reads_embedded_png_frame() {
     // Region crop: bottom-right 1x1 pixel.
     let region = reader.open_bytes_region(0, 1, 1, 1, 1).unwrap();
     assert_eq!(region, vec![40]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn mng_reads_planar_grayscale_alpha_frame() {
+    let png = build_png8(2, 1, 4, 2, &[10, 200, 20, 100]);
+    let mng = build_mng(&png);
+    let path = write_temp("gray_alpha.mng", &mng);
+
+    let mut reader = MngReader::new();
+    reader.set_id(&path).unwrap();
+
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.pixel_type, PixelType::Uint8);
+    assert!(meta.is_rgb);
+    assert!(!meta.is_interleaved);
+
+    let plane = reader.open_bytes(0).unwrap();
+    assert_eq!(plane, vec![10, 20, 200, 100]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn mng_reads_planar_rgb_frame() {
+    let png = build_png8(2, 1, 2, 3, &[1, 2, 3, 4, 5, 6]);
+    let mng = build_mng(&png);
+    let path = write_temp("rgb.mng", &mng);
+
+    let mut reader = MngReader::new();
+    reader.set_id(&path).unwrap();
+
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 3);
+    assert_eq!(meta.pixel_type, PixelType::Uint8);
+    assert!(meta.is_rgb);
+    assert!(!meta.is_interleaved);
+
+    let plane = reader.open_bytes(0).unwrap();
+    assert_eq!(plane, vec![1, 4, 2, 5, 3, 6]);
+
+    let region = reader.open_bytes_region(0, 1, 0, 1, 1).unwrap();
+    assert_eq!(region, vec![4, 5, 6]);
 
     let _ = std::fs::remove_file(path);
 }
@@ -240,6 +380,38 @@ fn build_openlab_v2_with_calibration(name: &str, xcal: f32, ycal: f32) -> Vec<u8
     data[calibration_offset + 38..calibration_offset + 42].copy_from_slice(&ycal.to_be_bytes());
 
     write_openlab_v2_plane_tag(&mut data, image_offset, 100_000, 3, name, 2, 2);
+    data
+}
+
+fn build_openlab_v2_with_invalid_user_variable() -> Vec<u8> {
+    let user_offset = 24usize;
+    let image_offset = 384usize;
+    let mut data = vec![0u8; image_offset + 360 + 128];
+    data[0..8].copy_from_slice(&[0x00, 0x00, 0xff, 0xff, 0x69, 0x6d, 0x70, 0x72]);
+    data[8..12].copy_from_slice(&2i32.to_be_bytes());
+    data[12..14].copy_from_slice(&1i16.to_be_bytes());
+    data[16..20].copy_from_slice(&(user_offset as i32).to_be_bytes());
+
+    data[user_offset..user_offset + 2].copy_from_slice(&72i16.to_be_bytes());
+    data[user_offset + 2..user_offset + 4].copy_from_slice(&0i16.to_be_bytes());
+    data[user_offset + 4..user_offset + 8].copy_from_slice(&(image_offset as i32).to_be_bytes());
+    data[user_offset + 8..user_offset + 12].copy_from_slice(b"USER");
+    let mut p = user_offset + 16;
+    data[p..p + b"CVariableList".len()].copy_from_slice(b"CVariableList");
+    p += b"CVariableList".len();
+    data[p] = 0;
+    p += 1;
+    data[p] = 1;
+    p += 1;
+    data[p..p + 2].copy_from_slice(&1i16.to_be_bytes());
+    p += 2;
+    data[p..p + b"CStringVariable".len()].copy_from_slice(b"CStringVariable");
+    p += b"CStringVariable".len();
+    data[p] = 0;
+    p += 1;
+    data[p] = 2; // invalid derivedClassVersion; Java throws FormatException.
+
+    write_openlab_v2_plane_tag(&mut data, image_offset, 100_000, 3, "bad vars", 2, 2);
     data
 }
 
@@ -479,6 +651,41 @@ fn openlab_v2_infers_zct_and_ome_names_from_plane_names() {
 }
 
 #[test]
+fn openlab_v2_infers_java_axis_equals_name_tokens() {
+    let data = build_openlab_v2_named_planes(&[
+        "Field A Z=1 C=1 T=1",
+        "Field A Z=1 C=2 T=1",
+        "Field A Z=2 C=1 T=1",
+        "Field A Z=2 C=2 T=1",
+    ]);
+    let path = write_temp("field_axis_equals.liff", &data);
+
+    let mut reader = OpenlabReader::new();
+    reader.set_id(&path).unwrap();
+
+    let meta = reader.metadata();
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_t, 1);
+    assert_eq!(
+        meta.series_metadata
+            .get("openlab.image_name")
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("Field A")
+    );
+    let ome = reader.ome_metadata().expect("Openlab OME metadata");
+    let zct: Vec<_> = ome.images[0]
+        .planes
+        .iter()
+        .map(|p| (p.the_z, p.the_c, p.the_t))
+        .collect();
+    assert_eq!(zct, vec![(0, 0, 0), (0, 1, 0), (1, 0, 0), (1, 1, 0)]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn openlab_v2_ome_annotations_include_native_series_metadata() {
     let data = build_openlab_v2_with_calibration("Plate7 FieldA Z1 C1 T1", 0.5, 0.75);
     let path = write_temp("Plate7.liff", &data);
@@ -712,6 +919,21 @@ fn openlab_v2_keeps_stack_when_name_tokens_are_incomplete() {
 }
 
 #[test]
+fn openlab_v2_rejects_malformed_user_variable_like_java() {
+    let data = build_openlab_v2_with_invalid_user_variable();
+    let path = write_temp("invalid_user_var.liff", &data);
+
+    let mut reader = OpenlabReader::new();
+    let err = reader.set_id(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid revision"),
+        "unexpected error: {err}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn openlab_rejects_bad_magic() {
     let reader = OpenlabReader::new();
     assert!(!reader.is_this_type_by_bytes(b"\x00\x00\x00\x00impr12"));
@@ -749,6 +971,68 @@ fn slidebook_reports_honest_error_when_no_pixel_blocks() {
     assert!(
         result.is_err(),
         "expected an error for a file with no pixel data"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+fn build_spool_slidebook_with_embedded_metadata() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut data = vec![0u8; 128];
+    // One fixed metadata block at offset 0. The scanner sees "II" at bytes 4-5
+    // and skips the 128-byte block; the dimension pass sees the leading 'i'.
+    data[0..2].copy_from_slice(&[b'i', 0]);
+    data[4..6].copy_from_slice(b"II");
+    data[6..8].copy_from_slice(&128u16.to_le_bytes());
+    data[80..82].copy_from_slice(&16u16.to_le_bytes());
+    data[82..84].copy_from_slice(&16u16.to_le_bytes());
+    data[84..86].copy_from_slice(&1u16.to_le_bytes());
+    data[86..88].copy_from_slice(&1u16.to_le_bytes());
+    data[88..90].copy_from_slice(&1u16.to_le_bytes());
+    data[90..92].copy_from_slice(&1u16.to_le_bytes());
+
+    // Java SLD_MAGIC_BYTES_3, read big-endian before an in-plane spool metadata
+    // block is skipped.
+    let mut spool_metadata = vec![0u8; 256];
+    spool_metadata[0..4].copy_from_slice(&0xf6010101u32.to_be_bytes());
+    data.extend_from_slice(&spool_metadata);
+
+    let plane0: Vec<u8> = (0..512).map(|i| (i % 251) as u8).collect();
+    let plane1: Vec<u8> = (0..512).map(|i| (255 - (i % 251)) as u8).collect();
+    data.extend_from_slice(&plane0);
+    data.extend_from_slice(&plane1);
+    (data, plane0, plane1)
+}
+
+#[test]
+fn slidebook_spool_keeps_eof_pixel_block_and_skips_in_plane_metadata() {
+    let (data, plane0, plane1) = build_spool_slidebook_with_embedded_metadata();
+    let path = write_temp("spool.spl", &data);
+
+    let mut reader = SlidebookReader::new();
+    reader.set_id(&path).expect("spool fixture should open");
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 16);
+    assert_eq!(meta.size_y, 16);
+    assert_eq!(meta.size_c, 1);
+    assert_eq!(meta.size_z, 1);
+    assert_eq!(meta.size_t, 2);
+    assert_eq!(meta.image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), plane0);
+    assert_eq!(reader.open_bytes(1).unwrap(), plane1);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn slidebook_non_spool_rejects_eof_pixel_block_with_java_padding() {
+    let (data, _, _) = build_spool_slidebook_with_embedded_metadata();
+    let path = write_temp("spool_payload_as_sld.sld", &data);
+
+    let mut reader = SlidebookReader::new();
+    let err = reader.set_id(&path).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("no pixel data blocks"),
+        "unexpected error for non-spool payload: {err:?}"
     );
 
     let _ = std::fs::remove_file(path);

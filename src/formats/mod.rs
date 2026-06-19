@@ -63,6 +63,7 @@ pub mod tiff_wrappers;
 pub mod v3draw;
 pub mod visitech;
 pub mod volocity;
+#[cfg(feature = "zarr")]
 pub mod zarr;
 pub mod zeiss_czi;
 pub mod zeiss_lsm;

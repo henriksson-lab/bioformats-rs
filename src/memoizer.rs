@@ -162,8 +162,20 @@ impl Memoizer {
             .file_path
             .clone()
             .ok_or(BioFormatsError::NotInitialized)?;
-        self.inner.set_id(&path)?;
-        self.inner_opened = true;
+        match self.inner.set_id(&path) {
+            Ok(()) => {
+                self.inner_opened = true;
+            }
+            Err(first_err) => {
+                let mut reopened = match crate::registry::open_reader(&path) {
+                    Ok(reader) => reader,
+                    Err(_) => return Err(first_err),
+                };
+                reopened.set_metadata_options(self.metadata_options.clone());
+                self.inner = reopened;
+                self.inner_opened = true;
+            }
+        }
         if self.inner.series_count() != self.cached_meta.len() {
             self.cache_from_reader()?;
             self.save_cache();
@@ -176,7 +188,13 @@ impl Memoizer {
     fn try_load_cache(file_path: &Path) -> Option<MemoCache> {
         let cache_path = Self::cache_path(file_path);
         let data = std::fs::read(&cache_path).ok()?;
-        let cache: MemoCache = bincode::deserialize(&data).ok()?;
+        let cache: MemoCache = match bincode::deserialize(&data) {
+            Ok(cache) => cache,
+            Err(_) => {
+                let _ = std::fs::remove_file(&cache_path);
+                return None;
+            }
+        };
         if !Self::cache_shape_is_valid(&cache) {
             return None;
         }
@@ -341,8 +359,10 @@ impl FormatReader for Memoizer {
 mod tests {
     use super::{MemoCache, Memoizer};
     use crate::common::error::{BioFormatsError, Result};
-    use crate::common::metadata::ImageMetadata;
+    use crate::common::metadata::{DimensionOrder, ImageMetadata};
+    use crate::common::pixel_type::PixelType;
     use crate::common::reader::FormatReader;
+    use crate::writer_registry::ImageWriter;
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -507,6 +527,38 @@ mod tests {
     }
 
     #[test]
+    fn cache_hit_preserves_magic_reader_when_magic_set_id_succeeds() {
+        let path = temp_path("cached_valid_tiff_but_fake.fake");
+        let tiff_path = path.with_extension("tif");
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYZCT,
+            ..Default::default()
+        };
+        ImageWriter::save(&tiff_path, &meta, &[vec![7]]).unwrap();
+        std::fs::rename(&tiff_path, &path).unwrap();
+
+        let first = Memoizer::open(&path).expect("initial TIFF open failed");
+        assert_eq!(first.metadata().size_x, 1);
+        assert_eq!(first.metadata().size_y, 1);
+
+        let second = Memoizer::open(&path).expect("cached TIFF open failed");
+        assert_eq!(second.metadata().size_x, 1);
+        assert_eq!(second.metadata().size_y, 1);
+
+        let _ = std::fs::remove_file(Memoizer::cache_path(&path));
+        let _ = std::fs::remove_file(tiff_path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn cache_hit_preserves_rich_ome_metadata_without_reopen() {
         let path = temp_path("rich.ome");
         let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" PhysicalSizeX="0.25" PhysicalSizeXUnit="µm" SizeX="1" SizeY="1" SizeZ="1" SizeC="1" SizeT="1"><Channel ID="Channel:0:0" Name="DAPI" SamplesPerPixel="1"/><BinData BigEndian="false">Kg==</BinData></Pixels></Image></OME>"#;
@@ -560,6 +612,23 @@ mod tests {
         assert_eq!(second.metadata().size_x, 512);
 
         let _ = std::fs::remove_file(Memoizer::cache_path(&path));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_cache_is_deleted_and_regenerated() {
+        let path = temp_path("corrupt_cache.fake");
+        std::fs::write(&path, b"fake").unwrap();
+        let cache_path = Memoizer::cache_path(&path);
+        std::fs::write(&cache_path, b"not a bincode memo").unwrap();
+
+        let reader = Memoizer::open(&path).expect("corrupt cache should fall back");
+
+        assert_eq!(reader.metadata().size_x, 512);
+        let regenerated = std::fs::read(&cache_path).expect("cache should be regenerated");
+        assert_ne!(regenerated, b"not a bincode memo");
+
+        let _ = std::fs::remove_file(cache_path);
         let _ = std::fs::remove_file(path);
     }
 

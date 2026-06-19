@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, ErrorKind, Read};
+use std::io::{BufReader, Cursor, ErrorKind, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -331,16 +331,48 @@ fn split_flowsight_pipe_list(value: &str) -> Vec<String> {
 }
 
 fn count_flowsight_channels_in_use(xml: &str) -> Option<usize> {
-    let marker = "ChannelInUseIndicators";
-    let start = xml.find(marker)?;
-    let after_start = xml[start..].find('>')? + start + 1;
-    let end = xml[after_start..].find('<')? + after_start;
-    Some(
-        xml[after_start..end]
-            .split_whitespace()
-            .filter(|token| *token == "1")
-            .count(),
-    )
+    let imaging_start = xml.find("<Imaging")?;
+    let imaging_open_end = xml[imaging_start..].find('>')? + imaging_start + 1;
+    let imaging_close = xml[imaging_open_end..].find("</Imaging>")? + imaging_open_end;
+    let mut pos = imaging_open_end;
+    while pos < imaging_close {
+        let Some(rel_open) = xml[pos..imaging_close].find('<') else {
+            break;
+        };
+        let open = pos + rel_open;
+        if xml[open..].starts_with("</") {
+            break;
+        }
+        if xml[open..].starts_with("<?") || xml[open..].starts_with("<!") {
+            pos = xml[open..imaging_close]
+                .find('>')
+                .map(|rel| open + rel + 1)
+                .unwrap_or(imaging_close);
+            continue;
+        }
+        let tag_name_start = open + 1;
+        let tag_name_end = xml[tag_name_start..imaging_close]
+            .find(|ch: char| ch == '>' || ch == '/' || ch.is_whitespace())
+            .map(|rel| tag_name_start + rel)?;
+        let tag_name = &xml[tag_name_start..tag_name_end];
+        let open_end = xml[tag_name_end..imaging_close].find('>')? + tag_name_end;
+        if tag_name.starts_with("ChannelInUseIndicators") {
+            let close_tag = format!("</{tag_name}>");
+            let close = xml[open_end + 1..imaging_close].find(&close_tag)? + open_end + 1;
+            return Some(
+                xml[open_end + 1..close]
+                    .split(' ')
+                    .filter(|token| *token == "1")
+                    .count(),
+            );
+        }
+        let close_tag = format!("</{tag_name}>");
+        pos = xml[open_end + 1..imaging_close]
+            .find(&close_tag)
+            .map(|rel| open_end + 1 + rel + close_tag.len())
+            .unwrap_or(open_end + 1);
+    }
+    None
 }
 
 fn build_flowsight_metadata(ifd: &Ifd, ifd0: &Ifd, channel_count: usize) -> Result<ImageMetadata> {
@@ -393,6 +425,12 @@ fn build_flowsight_metadata(ifd: &Ifd, ifd0: &Ifd, channel_count: usize) -> Resu
         );
     }
     if let Some(descs) = ifd0.get_str(FLOWSIGHT_CHANNEL_DESCS_TAG) {
+        let desc_count = split_flowsight_pipe_list(descs).len();
+        if desc_count != channel_count {
+            return Err(BioFormatsError::Format(format!(
+                "Channel count ({channel_count}) does not match number of channel descriptions ({desc_count}) in string \"{descs}\""
+            )));
+        }
         meta.series_metadata.insert(
             "FlowSight.ChannelDescriptions".into(),
             crate::common::metadata::MetadataValue::String(descs.to_owned()),
@@ -797,7 +835,7 @@ impl SyntheticRawSpec {
 fn im3_native_cookie(header: &[u8]) -> bool {
     header
         .get(..4)
-        .is_some_and(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) == 1985)
+        .is_some_and(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) == 1985)
 }
 
 fn ivision_native_header(header: &[u8]) -> bool {
@@ -5391,15 +5429,23 @@ impl FormatReader for SlideBook7Reader {
 /// come from the first file only.
 pub struct NdpisReader {
     /// One TiffReader delegate per channel `.ndpi` file.
-    readers: Vec<crate::tiff::TiffReader>,
+    readers: Vec<crate::formats::tiff_wrappers::NdpiReader>,
     ndpi_files: Vec<PathBuf>,
     /// Per-channel resolved channel name (from NDPI tag 65434), if present.
     channel_names: Vec<Option<String>>,
     metas: Vec<ImageMetadata>,
+    pyramid_series: Vec<bool>,
     current_series: usize,
 }
 
 const NDPI_TAG_CHANNEL: u16 = 65434;
+
+fn ndpis_channel_name(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut parser = crate::tiff::parser::TiffParser::new(file).ok()?;
+    let (ifd, _) = parser.read_ifd(parser.first_ifd_offset).ok()?;
+    ifd.get_str(NDPI_TAG_CHANNEL).map(str::to_owned)
+}
 
 impl NdpisReader {
     pub fn new() -> Self {
@@ -5408,8 +5454,32 @@ impl NdpisReader {
             ndpi_files: Vec::new(),
             channel_names: Vec::new(),
             metas: Vec::new(),
+            pyramid_series: Vec::new(),
             current_series: 0,
         }
+    }
+
+    fn zct_channel_plane(&self, p: u32) -> Result<(usize, u32)> {
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if p >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(p));
+        }
+        let size_z = meta.size_z.max(1);
+        let size_c = meta.size_c.max(1);
+        let z = (p / size_c) % size_z;
+        let c = p % size_c;
+        let t = p / (size_c * size_z);
+        Ok((c as usize, t * size_z + z))
+    }
+
+    fn is_pyramid_series(&self) -> bool {
+        self.pyramid_series
+            .get(self.current_series)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -5428,7 +5498,7 @@ impl FormatReader for NdpisReader {
         matches!(ext.as_deref(), Some("ndpis"))
     }
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+        true
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
@@ -5464,40 +5534,42 @@ impl FormatReader for NdpisReader {
         let mut readers = Vec::with_capacity(files.len());
         let mut channel_names = Vec::with_capacity(files.len());
         for file in &files {
-            let mut r = crate::tiff::TiffReader::new();
+            let mut r = crate::formats::tiff_wrappers::NdpiReader::new();
             r.set_id(file)?;
             // Channel name from NDPI tag 65434 on the first IFD.
-            let name = r
-                .ifd(0)
-                .and_then(|ifd| ifd.get_str(NDPI_TAG_CHANNEL).map(str::to_owned));
+            let name = ndpis_channel_name(file);
             channel_names.push(name);
             readers.push(r);
         }
 
         // Build merged metadata from the first reader's series, setting sizeC to
         // the number of channel files and recomputing the plane count.
-        let base = &readers[0];
         let mut metas: Vec<ImageMetadata> = Vec::new();
-        for s in 0..base.series_count() {
-            // We can't call set_series on an immutable borrow; collect by index.
-            let m = base.series_list()[s].metadata.clone();
-            metas.push(m);
+        let pyramid_height = readers[0].pyramid_height() as usize;
+        let series_count = readers[0].series_count();
+        for s in 0..series_count {
+            readers[0].set_series(s)?;
+            metas.push(readers[0].metadata().clone());
         }
+        readers[0].set_series(0)?;
         let nchannels = files.len() as u32;
-        // The pyramid resolutions are series whose dimensions shrink; the macro/
-        // label images are extra. Following the Java reader, only the pyramid
-        // resolutions get sizeC adjusted. We treat all base series as channel
-        // stacks (sizeC == channel count) which matches single-resolution NDPI.
-        for m in &mut metas {
-            m.size_c = nchannels;
-            m.is_rgb = false;
-            m.image_count = m.size_c * m.size_z.max(1) * m.size_t.max(1);
+        let mut pyramid_series = vec![false; metas.len()];
+        // Java NDPISReader only adjusts channel and image counts for pyramid
+        // resolutions. Macro/mask/label extras are read from the first NDPI file.
+        for (series_index, m) in metas.iter_mut().enumerate() {
+            if series_index < pyramid_height {
+                pyramid_series[series_index] = true;
+                m.size_c = nchannels;
+                m.is_rgb = false;
+                m.image_count = m.size_c * m.size_z.max(1) * m.size_t.max(1);
+            }
         }
 
         self.readers = readers;
         self.ndpi_files = files;
         self.channel_names = channel_names;
         self.metas = metas;
+        self.pyramid_series = pyramid_series;
         self.current_series = 0;
         Ok(())
     }
@@ -5509,6 +5581,7 @@ impl FormatReader for NdpisReader {
         self.ndpi_files.clear();
         self.channel_names.clear();
         self.metas.clear();
+        self.pyramid_series.clear();
         self.current_series = 0;
         Ok(())
     }
@@ -5529,28 +5602,36 @@ impl FormatReader for NdpisReader {
         self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        &self.metas[self.current_series]
+        self.metas
+            .get(self.current_series)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        // plane index p maps to a channel; each channel comes from one file.
-        let nchannels = self.readers.len() as u32;
-        let channel = (p % nchannels.max(1)) as usize;
-        let inner_plane = p / nchannels.max(1);
+        if !self.is_pyramid_series() {
+            self.readers[0].set_series(self.current_series)?;
+            return self.readers[0].open_bytes(p);
+        }
+        let (channel, inner_plane) = self.zct_channel_plane(p)?;
         self.readers[channel].set_series(self.current_series)?;
         self.readers[channel].open_bytes(inner_plane)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let nchannels = self.readers.len() as u32;
-        let channel = (p % nchannels.max(1)) as usize;
-        let inner_plane = p / nchannels.max(1);
+        if !self.is_pyramid_series() {
+            self.readers[0].set_series(self.current_series)?;
+            return self.readers[0].open_bytes_region(p, x, y, w, h);
+        }
+        let (channel, inner_plane) = self.zct_channel_plane(p)?;
         self.readers[channel].set_series(self.current_series)?;
         self.readers[channel].open_bytes_region(inner_plane, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        let nchannels = self.readers.len() as u32;
-        let channel = (p % nchannels.max(1)) as usize;
+        if !self.is_pyramid_series() {
+            self.readers[0].set_series(self.current_series)?;
+            return self.readers[0].open_thumb_bytes(p);
+        }
+        let (channel, inner_plane) = self.zct_channel_plane(p)?;
         self.readers[channel].set_series(self.current_series)?;
-        self.readers[channel].open_thumb_bytes(0)
+        self.readers[channel].open_thumb_bytes(inner_plane)
     }
     fn resolution_count(&self) -> usize {
         self.readers
@@ -5804,6 +5885,8 @@ fn parse_ivision_native(path: &Path) -> Result<IvisionNativeState> {
         is_little_endian: false,
         ..ImageMetadata::default()
     };
+    meta.is_rgb = size_c > 1;
+    meta.is_interleaved = size_c > 1;
     meta.series_metadata.insert(
         "iVision Version".to_string(),
         crate::common::metadata::MetadataValue::String(version),
@@ -6032,37 +6115,50 @@ fn ivision_parse_acquisition_metadata(xml: &str) -> IvisionAcquisitionMetadata {
     let mut acq = IvisionAcquisitionMetadata::default();
 
     let mut reader = quick_xml::Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
 
     let mut current_element: Option<String> = None;
     let mut key: Option<String> = None;
+    let mut current_text = String::new();
 
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(element)) => {
                 current_element = Some(ivision_xml_component_name(element.name().as_ref()));
+                current_text.clear();
             }
             Ok(quick_xml::events::Event::Empty(_)) => {
                 // Self-closing element carries no characters; ignore like the
                 // SAX handler, which only acts on character data.
                 current_element = None;
+                current_text.clear();
             }
             Ok(quick_xml::events::Event::Text(text)) => {
-                let Ok(value) = text.unescape() else { continue };
-                let value = value.trim();
-                if value.is_empty() {
-                    continue;
-                }
-                // BaseHandler keys on the *raw* element name ("key"); our
-                // component-name strips the namespace but preserves "key".
-                if current_element.as_deref() == Some("key") {
-                    key = Some(value.to_string());
-                } else if let Some(k) = key.take() {
-                    ivision_assign_acquisition_field(&mut acq, &k, value);
+                current_text
+                    .push_str(&crate::common::xml::decode_xml_text(&text).unwrap_or_default());
+            }
+            Ok(quick_xml::events::Event::GeneralRef(reference)) => {
+                current_text
+                    .push_str(&crate::common::xml::decode_xml_ref(&reference).unwrap_or_default());
+            }
+            Ok(quick_xml::events::Event::CData(cdata)) => {
+                if let Ok(value) = cdata.xml_content(quick_xml::XmlVersion::Implicit1_0) {
+                    current_text.push_str(&value);
                 }
             }
             Ok(quick_xml::events::Event::End(_)) => {
+                let value = current_text.trim();
+                if !value.is_empty() {
+                    // BaseHandler keys on the *raw* element name ("key"); our
+                    // component-name strips the namespace but preserves "key".
+                    if current_element.as_deref() == Some("key") {
+                        key = Some(value.to_string());
+                    } else if let Some(k) = key.take() {
+                        ivision_assign_acquisition_field(&mut acq, &k, value);
+                    }
+                }
                 current_element = None;
+                current_text.clear();
             }
             Ok(quick_xml::events::Event::Eof) => break,
             Err(_) => break,
@@ -6261,13 +6357,22 @@ fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
     const MAX_VALUE_LEN: usize = 512;
 
     let mut reader = quick_xml::Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
     let mut stack: Vec<String> = Vec::new();
+    let mut current_text = String::new();
     let mut inserted = 0usize;
 
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(element)) => {
+                ivision_flush_xml_text(
+                    &stack,
+                    &mut current_text,
+                    meta,
+                    &mut inserted,
+                    MAX_FIELDS,
+                    MAX_VALUE_LEN,
+                );
                 stack.push(ivision_xml_component_name(element.name().as_ref()));
                 inserted += ivision_flatten_xml_attrs(
                     &reader,
@@ -6279,6 +6384,14 @@ fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
                 );
             }
             Ok(quick_xml::events::Event::Empty(element)) => {
+                ivision_flush_xml_text(
+                    &stack,
+                    &mut current_text,
+                    meta,
+                    &mut inserted,
+                    MAX_FIELDS,
+                    MAX_VALUE_LEN,
+                );
                 stack.push(ivision_xml_component_name(element.name().as_ref()));
                 inserted += ivision_flatten_xml_attrs(
                     &reader,
@@ -6291,22 +6404,42 @@ fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
                 stack.pop();
             }
             Ok(quick_xml::events::Event::Text(text)) => {
-                if inserted >= MAX_FIELDS {
-                    continue;
+                if let Some(value) = crate::common::xml::decode_xml_text(&text) {
+                    current_text.push_str(&value);
                 }
-                if let Ok(value) = text.unescape() {
-                    let value = value.trim();
-                    if !value.is_empty() && value.len() <= MAX_VALUE_LEN {
-                        let key = ivision_flatten_xml_key(&stack, None);
-                        ivision_insert_flattened_xml_value(meta, key, value);
-                        inserted += 1;
-                    }
+            }
+            Ok(quick_xml::events::Event::GeneralRef(reference)) => {
+                if let Some(value) = crate::common::xml::decode_xml_ref(&reference) {
+                    current_text.push_str(&value);
+                }
+            }
+            Ok(quick_xml::events::Event::CData(cdata)) => {
+                if let Ok(value) = cdata.xml_content(quick_xml::XmlVersion::Implicit1_0) {
+                    current_text.push_str(&value);
                 }
             }
             Ok(quick_xml::events::Event::End(_)) => {
+                ivision_flush_xml_text(
+                    &stack,
+                    &mut current_text,
+                    meta,
+                    &mut inserted,
+                    MAX_FIELDS,
+                    MAX_VALUE_LEN,
+                );
                 stack.pop();
             }
-            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(quick_xml::events::Event::Eof) => {
+                ivision_flush_xml_text(
+                    &stack,
+                    &mut current_text,
+                    meta,
+                    &mut inserted,
+                    MAX_FIELDS,
+                    MAX_VALUE_LEN,
+                );
+                break;
+            }
             Err(_) => break,
             _ => {}
         }
@@ -6316,6 +6449,27 @@ fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
     }
 
     inserted
+}
+
+fn ivision_flush_xml_text(
+    stack: &[String],
+    current_text: &mut String,
+    meta: &mut ImageMetadata,
+    inserted: &mut usize,
+    max_fields: usize,
+    max_value_len: usize,
+) {
+    if *inserted >= max_fields || current_text.trim().is_empty() {
+        current_text.clear();
+        return;
+    }
+    let value = current_text.trim();
+    if value.len() <= max_value_len {
+        let key = ivision_flatten_xml_key(stack, None);
+        ivision_insert_flattened_xml_value(meta, key, value);
+        *inserted += 1;
+    }
+    current_text.clear();
 }
 
 fn ivision_flatten_xml_attrs<'a>(
@@ -6335,7 +6489,9 @@ fn ivision_flatten_xml_attrs<'a>(
         if name.is_empty() {
             continue;
         }
-        let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+        let Ok(value) =
+            attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
+        else {
             continue;
         };
         let value = value.trim();
@@ -6626,6 +6782,99 @@ impl AfiReader {
         }
         paths
     }
+
+    fn open_assembled_plane(
+        &mut self,
+        p: u32,
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> Result<Vec<u8>> {
+        let extra = 2usize.min(self.metas.len());
+        if self.current_series + extra >= self.metas.len() {
+            self.readers[0].set_series(self.current_series)?;
+            return match region {
+                Some((x, y, w, h)) => self.readers[0].open_bytes_region(p, x, y, w, h),
+                None => self.readers[0].open_bytes(p),
+            };
+        }
+
+        let nchannels = self.readers.len() as u32;
+        let channel = (p % nchannels.max(1)) as usize;
+        let inner_plane = p / nchannels.max(1);
+        let dest_type = self.metas[self.current_series].pixel_type;
+        let dest_bytes = dest_type.bytes_per_sample();
+        let little_endian = self.metas[self.current_series].is_little_endian;
+
+        self.readers[channel].set_series(self.current_series)?;
+        let src_type = self.readers[channel].metadata().pixel_type;
+        let src_bytes = src_type.bytes_per_sample();
+        let tmp = match region {
+            Some((x, y, w, h)) => {
+                self.readers[channel].open_bytes_region(inner_plane, x, y, w, h)?
+            }
+            None => self.readers[channel].open_bytes(inner_plane)?,
+        };
+
+        match dest_bytes.cmp(&src_bytes) {
+            std::cmp::Ordering::Equal => Ok(tmp),
+            std::cmp::Ordering::Less => Err(BioFormatsError::UnsupportedFormat(
+                "AFI downsampling images is not supported".into(),
+            )),
+            std::cmp::Ordering::Greater => {
+                afi_widen_plane_bytes(&tmp, src_bytes, dest_bytes, little_endian)
+            }
+        }
+    }
+}
+
+fn afi_widen_plane_bytes(
+    src: &[u8],
+    src_bytes: usize,
+    dest_bytes: usize,
+    little_endian: bool,
+) -> Result<Vec<u8>> {
+    if src_bytes == 0 || dest_bytes <= src_bytes || dest_bytes > 8 {
+        return Err(BioFormatsError::Format(
+            "AFI invalid byte-depth conversion".into(),
+        ));
+    }
+    if src.len() % src_bytes != 0 {
+        return Err(BioFormatsError::InvalidData(
+            "AFI source plane byte count is not sample-aligned".into(),
+        ));
+    }
+
+    let max = if dest_bytes == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (dest_bytes * 8)) - 1
+    };
+    let mut out = vec![0u8; (src.len() / src_bytes) * dest_bytes];
+    for (i, sample) in src.chunks_exact(src_bytes).enumerate() {
+        let mut value = 0u64;
+        if little_endian {
+            for (shift, byte) in sample.iter().enumerate() {
+                value |= (*byte as u64) << (shift * 8);
+            }
+        } else {
+            for byte in sample {
+                value = (value << 8) | (*byte as u64);
+            }
+        }
+
+        // Java copies the source sample into a wider destination sample, reads
+        // it as the destination type, then scales value / 255 to the full
+        // destination range. Preserve that formula, including its 8-bit divisor.
+        let scaled = ((value as f64 / 255.0) * max as f64) as u64;
+        let dest = &mut out[i * dest_bytes..(i + 1) * dest_bytes];
+        if little_endian {
+            let bytes = scaled.to_le_bytes();
+            dest.copy_from_slice(&bytes[..dest_bytes]);
+        } else {
+            let bytes = scaled.to_be_bytes();
+            dest.copy_from_slice(&bytes[8 - dest_bytes..]);
+        }
+    }
+    Ok(out)
 }
 
 impl Default for AfiReader {
@@ -6642,8 +6891,8 @@ impl FormatReader for AfiReader {
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("afi"))
     }
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= 4
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let xml = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
@@ -6733,31 +6982,10 @@ impl FormatReader for AfiReader {
         &self.metas[self.current_series]
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        let m = &self.metas[self.current_series];
-        let extra = 2usize.min(self.metas.len());
-        // Extra (label/macro) series: read straight from the first file.
-        if self.current_series + extra >= self.metas.len() {
-            self.readers[0].set_series(self.current_series)?;
-            return self.readers[0].open_bytes(p);
-        }
-        let nchannels = self.readers.len() as u32;
-        let channel = (p % nchannels.max(1)) as usize;
-        let inner_plane = p / nchannels.max(1);
-        let _ = m;
-        self.readers[channel].set_series(self.current_series)?;
-        self.readers[channel].open_bytes(inner_plane)
+        self.open_assembled_plane(p, None)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let extra = 2usize.min(self.metas.len());
-        if self.current_series + extra >= self.metas.len() {
-            self.readers[0].set_series(self.current_series)?;
-            return self.readers[0].open_bytes_region(p, x, y, w, h);
-        }
-        let nchannels = self.readers.len() as u32;
-        let channel = (p % nchannels.max(1)) as usize;
-        let inner_plane = p / nchannels.max(1);
-        self.readers[channel].set_series(self.current_series)?;
-        self.readers[channel].open_bytes_region(inner_plane, x, y, w, h)
+        self.open_assembled_plane(p, Some((x, y, w, h)))
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.readers[0].set_series(self.current_series)?;
@@ -6962,7 +7190,17 @@ impl ImarisTiffReader {
                         ex_wave.push(v);
                     }
                 }
-                "Name" => channel_names.push(value.to_string()),
+                "Name"
+                    if !self
+                        .path
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.ends_with(value))
+                        .unwrap_or(false) =>
+                {
+                    channel_names.push(value.to_string())
+                }
                 "RecordingDate" => {
                     let v = value.replace(' ', "T");
                     let trimmed = v.split('.').next().unwrap_or(&v).to_string();
@@ -7163,8 +7401,12 @@ impl FormatReader for ImarisTiffReader {
             .map(|e| e.to_ascii_lowercase());
         matches!(ext.as_deref(), Some("ims"))
     }
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        TiffParser::new(Cursor::new(header))
+            .and_then(|mut parser| parser.read_ifds())
+            .ok()
+            .and_then(|ifds| ifds.into_iter().next())
+            .is_some_and(|ifd| slidebook_tiff_matches_first_ifd(&ifd))
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
@@ -7785,16 +8027,18 @@ impl XlefReader {
         &mut self,
         reference: &Path,
         tile_count: u32,
+        tile_index_base: usize,
         mut reader: Box<dyn FormatReader>,
     ) -> Result<()> {
         reader.set_id(reference)?;
-        self.add_initialized_delegate(reference, tile_count, reader)
+        self.add_initialized_delegate(reference, tile_count, tile_index_base, reader)
     }
 
     fn add_initialized_delegate(
         &mut self,
         reference: &Path,
         tile_count: u32,
+        tile_index_base: usize,
         reader: Box<dyn FormatReader>,
     ) -> Result<()> {
         let delegate_index = self.delegates.len();
@@ -7814,7 +8058,7 @@ impl XlefReader {
                 self.series_map.push(XlefSeriesRef::Delegate {
                     delegate: delegate_index,
                     series,
-                    tile,
+                    tile: tile_index_base + tile,
                 });
             }
         }
@@ -7918,7 +8162,11 @@ impl XlefReader {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum XlefReference {
-    Image { path: PathBuf, tile_count: u32 },
+    Image {
+        path: PathBuf,
+        tile_count: u32,
+        tile_index_base: usize,
+    },
     Lms(PathBuf),
 }
 
@@ -7947,8 +8195,16 @@ fn xlef_collect_referenced_images(
     } else {
         1
     };
+    let references = xlef_referenced_paths(&xml, path);
+    let direct_supported_images = references
+        .iter()
+        .filter(|reference| xlef_is_supported_image_reference(reference))
+        .count();
+    let direct_xlif_tile_images =
+        doc_tile_count > 1 && direct_supported_images > 1 && xlef_is_xlif_path(path);
+    let mut tile_image_index = 0usize;
     let mut images: Vec<XlefReference> = Vec::new();
-    for reference in xlef_referenced_paths(&xml, path) {
+    for reference in references {
         if xlef_is_project_reference(&reference) {
             if reference.exists() {
                 for image in xlef_collect_referenced_images(&reference, visited, unsupported)? {
@@ -7960,9 +8216,25 @@ fn xlef_collect_referenced_images(
                 unsupported.push(reference);
             }
         } else if xlef_is_supported_image_reference(&reference) {
+            let tile_index_base = if direct_xlif_tile_images {
+                let index = tile_image_index;
+                tile_image_index += 1;
+                index
+            } else {
+                0
+            };
             let image = XlefReference::Image {
                 path: reference,
-                tile_count: doc_tile_count,
+                // Java XLEFReader creates one MultipleImagesReader per XLIF. When
+                // a tilescan XLIF lists one image file per tile, those files are
+                // the tile series themselves; multiplying each file by DimID 10
+                // would overcount project series.
+                tile_count: if direct_xlif_tile_images {
+                    1
+                } else {
+                    doc_tile_count
+                },
+                tile_index_base,
             };
             if !images.iter().any(|p| p == &image) {
                 images.push(image);
@@ -7977,6 +8249,13 @@ fn xlef_collect_referenced_images(
         }
     }
     Ok(images)
+}
+
+fn xlef_is_xlif_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("xlif"))
+        .unwrap_or(false)
 }
 
 fn xlef_referenced_paths(xml: &str, xlef_path: &Path) -> Vec<PathBuf> {
@@ -9257,12 +9536,21 @@ impl FormatReader for XlefReader {
         let references = Self::referenced_images(path)?;
         for reference in references {
             match reference {
-                XlefReference::Image { path, tile_count } => {
-                    self.add_delegate(&path, tile_count, xlef_delegate_for_reference(&path))?;
+                XlefReference::Image {
+                    path,
+                    tile_count,
+                    tile_index_base,
+                } => {
+                    self.add_delegate(
+                        &path,
+                        tile_count,
+                        tile_index_base,
+                        xlef_delegate_for_reference(&path),
+                    )?;
                 }
                 XlefReference::Lms(reference) => {
                     if let Some(reader) = xlef_lms_delegate_for_reference(&reference)? {
-                        self.add_initialized_delegate(&reference, 1, reader)?;
+                        self.add_initialized_delegate(&reference, 1, 0, reader)?;
                     } else {
                         let metadata = xlef_lms_metadata_for_reference(&reference)?;
                         let metadata_index = self.lms_metadata.len();
@@ -9396,6 +9684,9 @@ struct OirNative {
     meta: ImageMetadata,
     /// (c, z, t) -> blocks for that plane, indexed by block number.
     czt_blocks: std::collections::HashMap<(i32, i32, i32), Vec<Option<OirPixelBlock>>>,
+    /// Physical files containing native pixel blocks, matching Java
+    /// `getSeriesUsedFiles(false)`.
+    used_files: Vec<PathBuf>,
 }
 
 /// Internal state of an initialized [`OirReader`].
@@ -9404,7 +9695,7 @@ enum OirState {
     Native(Box<OirNative>),
     /// `.oir`-named file that is actually a TIFF; delegated to `TiffReader`.
     /// Carries an overridden metadata copy (e.g. ImageJ channel count).
-    Tiff(Box<crate::tiff::TiffReader>, ImageMetadata),
+    Tiff(Box<crate::tiff::TiffReader>, ImageMetadata, PathBuf),
 }
 
 /// Olympus OIR format reader (`.oir`).
@@ -9415,6 +9706,14 @@ pub struct OirReader {
 impl OirReader {
     pub fn new() -> Self {
         OirReader { state: None }
+    }
+
+    pub fn series_used_files(&self) -> Vec<PathBuf> {
+        match &self.state {
+            Some(OirState::Native(n)) => n.used_files.clone(),
+            Some(OirState::Tiff(_, _, path)) => vec![path.clone()],
+            None => Vec::new(),
+        }
     }
 }
 
@@ -9710,7 +10009,17 @@ fn oir_xml_text(xml: &str, local: &str) -> Option<String> {
                 }
             }
             Ok(Event::Text(t)) if capture && depth_match > 0 => {
-                if let Ok(s) = t.unescape() {
+                if let Some(s) = crate::common::xml::decode_xml_text(&t) {
+                    text.push_str(&s);
+                }
+            }
+            Ok(Event::GeneralRef(r)) if capture && depth_match > 0 => {
+                if let Some(s) = crate::common::xml::decode_xml_ref(&r) {
+                    text.push_str(&s);
+                }
+            }
+            Ok(Event::CData(c)) if capture && depth_match > 0 => {
+                if let Ok(s) = c.xml_content(quick_xml::XmlVersion::Implicit1_0) {
                     text.push_str(&s);
                 }
             }
@@ -9740,15 +10049,39 @@ fn local_name_matches(qname: &[u8], local: &str) -> bool {
 /// resolved [`OirNative`] state. This ports the metadata/dimension/pixel-block
 /// portions of `OIRReader.initFile`; per-channel laser/detector/objective
 /// enrichment present in Java is intentionally omitted.
-fn parse_oir_native(path: &Path) -> Result<OirNative> {
-    // Resolve companion files: <base>_00001, <base>_00002, ... in the same dir.
+fn oir_resolve_main_and_companions(path: &Path) -> (PathBuf, String, Vec<PathBuf>) {
     let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let stem = path
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let mut stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
-    let mut files: Vec<PathBuf> = vec![path.to_path_buf()];
+    let is_numbered_companion = name.rsplit_once('_').is_some_and(|(prefix, suffix)| {
+        !prefix.is_empty() && suffix.len() == 5 && suffix.parse::<u32>().is_ok()
+    });
+    if is_numbered_companion && !check_extension(path, "oir") {
+        if let Some((prefix, _)) = name.rsplit_once('_') {
+            stem = prefix.to_string();
+        }
+    }
+
+    let mut main = path.to_path_buf();
+    if is_numbered_companion && !check_extension(path, "oir") {
+        if let Ok(entries) = std::fs::read_dir(&parent) {
+            for entry in entries.flatten() {
+                let candidate = entry.file_name().to_string_lossy().into_owned();
+                if candidate.starts_with(&stem)
+                    && candidate.eq_ignore_ascii_case(&format!("{stem}.oir"))
+                {
+                    main = entry.path();
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut files: Vec<PathBuf> = vec![main.clone()];
     if let Ok(entries) = std::fs::read_dir(&parent) {
         let mut companions: Vec<(u32, PathBuf)> = Vec::new();
         let prefix = format!("{stem}_");
@@ -9765,6 +10098,20 @@ fn parse_oir_native(path: &Path) -> Result<OirNative> {
         companions.sort_by_key(|(idx, _)| *idx);
         files.extend(companions.into_iter().map(|(_, p)| p));
     }
+    (main, stem, files)
+}
+
+fn check_extension(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
+fn parse_oir_native(path: &Path) -> Result<OirNative> {
+    // Resolve companion files: <base>_00001, <base>_00002, ... in the same dir.
+    // Java also accepts initialization from one of those companion files and
+    // resets `currentId` to the matching `<base>.oir` before scanning.
+    let (_main, stem, files) = oir_resolve_main_and_companions(path);
 
     let mut meta = ImageMetadata {
         size_z: 1,
@@ -9846,10 +10193,7 @@ fn parse_oir_native(path: &Path) -> Result<OirNative> {
     }
     meta.image_count = meta.size_c * meta.size_z * meta.size_t;
 
-    // Dimension order: Java emits "XYC" + a Z/T ordering; our enum's closest
-    // match is XYCZT, which is correct whenever Z or T is singleton (the common
-    // case) and a reasonable default otherwise.
-    meta.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+    meta.dimension_order = oir_dimension_order(&stem, meta.size_z, meta.size_t);
 
     // Group blocks by (c,z,t) into per-plane block arrays.
     let max_blocks = pixel_blocks
@@ -9891,7 +10235,18 @@ fn parse_oir_native(path: &Path) -> Result<OirNative> {
         }
     }
 
-    Ok(OirNative { meta, czt_blocks })
+    let mut used_files: Vec<PathBuf> = pixel_blocks
+        .iter()
+        .map(|(_, block)| block.file.clone())
+        .collect();
+    used_files.sort();
+    used_files.dedup();
+
+    Ok(OirNative {
+        meta,
+        czt_blocks,
+        used_files,
+    })
 }
 
 /// Apply parsed OIR XML blocks to metadata (dimensions, pixel type, channels).
@@ -9967,7 +10322,8 @@ fn oir_apply_axes(xml: &str, meta: &mut ImageMetadata) {
     let mut cur_axis_name: Option<String> = None;
     let mut cur_max_size: Option<u32> = None;
     let mut in_axis_wrapper = 0i32;
-    let mut pending_text_for: Option<&'static str> = None;
+    let mut active_text_for: Option<&'static str> = None;
+    let mut active_text = String::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
@@ -9976,37 +10332,62 @@ fn oir_apply_axes(xml: &str, meta: &mut ImageMetadata) {
                 if local == "axis" {
                     // could be the wrapper (dimensionAxis) or the inner name node
                     in_axis_wrapper += 1;
-                    pending_text_for = Some("axisname");
+                    active_text_for = Some("axisname");
+                    active_text.clear();
                 } else if local == "maxSize" {
-                    pending_text_for = Some("maxsize");
+                    active_text_for = Some("maxsize");
+                    active_text.clear();
                 } else {
-                    pending_text_for = None;
+                    active_text_for = None;
+                    active_text.clear();
                 }
             }
             Ok(Event::Text(t)) => {
-                if let Some(kind) = pending_text_for {
-                    if let Ok(s) = t.unescape() {
-                        let s = s.trim().to_string();
-                        if kind == "axisname" && !s.is_empty() {
-                            cur_axis_name = Some(s);
-                        } else if kind == "maxsize" {
-                            cur_max_size = s.parse::<u32>().ok();
-                        }
+                if active_text_for.is_some() {
+                    if let Some(s) = crate::common::xml::decode_xml_text(&t) {
+                        active_text.push_str(&s);
                     }
                 }
-                pending_text_for = None;
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if active_text_for.is_some() {
+                    if let Some(s) = crate::common::xml::decode_xml_ref(&r) {
+                        active_text.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                if active_text_for.is_some() {
+                    if let Ok(s) = t.xml_content(quick_xml::XmlVersion::Implicit1_0) {
+                        active_text.push_str(&s);
+                    }
+                }
             }
             Ok(Event::End(e)) => {
                 let name = e.name();
                 let local = local_of(name.as_ref());
+                let closes_active = matches!(
+                    (active_text_for, local),
+                    (Some("axisname"), "axis") | (Some("maxsize"), "maxSize")
+                );
+                if closes_active {
+                    let s = active_text.trim();
+                    if active_text_for == Some("axisname") && !s.is_empty() {
+                        cur_axis_name = Some(s.to_string());
+                    } else if active_text_for == Some("maxsize") {
+                        cur_max_size = s.parse::<u32>().ok();
+                    }
+                    active_text_for = None;
+                    active_text.clear();
+                }
+                if cur_axis_name.is_some() && cur_max_size.is_some() {
+                    let name = cur_axis_name.take().unwrap();
+                    let size = cur_max_size.take().unwrap();
+                    oir_apply_one_axis(&name, size, meta);
+                }
                 if local == "axis" {
                     in_axis_wrapper -= 1;
-                    if in_axis_wrapper <= 0 {
-                        if let (Some(name), Some(size)) =
-                            (cur_axis_name.take(), cur_max_size.take())
-                        {
-                            oir_apply_one_axis(&name, size, meta);
-                        }
+                    if in_axis_wrapper < 0 {
                         in_axis_wrapper = 0;
                     }
                 }
@@ -10037,6 +10418,24 @@ fn oir_apply_one_axis(name: &str, size: u32, meta: &mut ImageMetadata) {
     }
 }
 
+fn oir_dimension_order(
+    base_name: &str,
+    size_z: u32,
+    size_t: u32,
+) -> crate::common::metadata::DimensionOrder {
+    if size_z <= 1 || size_t <= 1 {
+        return crate::common::metadata::DimensionOrder::XYCZT;
+    }
+    let lower = base_name.to_ascii_lowercase();
+    let z_index = lower.find('z').unwrap_or(usize::MAX);
+    let t_index = lower.find('t').unwrap_or(usize::MAX);
+    if z_index < t_index {
+        crate::common::metadata::DimensionOrder::XYCTZ
+    } else {
+        crate::common::metadata::DimensionOrder::XYCZT
+    }
+}
+
 fn local_of(qname: &[u8]) -> &str {
     let after = qname
         .iter()
@@ -10046,26 +10445,110 @@ fn local_of(qname: &[u8]) -> &str {
     std::str::from_utf8(after).unwrap_or("")
 }
 
+struct OirPendingChannel {
+    id: String,
+    index: Option<usize>,
+    has_element_channels: bool,
+}
+
+fn oir_xml_attr_value(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
+    e.attributes().flatten().find_map(|a| {
+        if a.key.as_ref() == name {
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| v.into_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn oir_xml_order_attr(e: &quick_xml::events::BytesStart<'_>) -> Option<usize> {
+    oir_xml_attr_value(e, b"order").and_then(|v| v.parse::<usize>().ok()?.checked_sub(1))
+}
+
+fn oir_insert_channel_id(slots: &mut Vec<Option<String>>, index: Option<usize>, id: String) {
+    if id.is_empty() {
+        return;
+    }
+    if slots
+        .iter()
+        .flatten()
+        .any(|existing| existing.as_str() == id.as_str())
+    {
+        return;
+    }
+    if let Some(index) = index {
+        if slots.len() <= index {
+            slots.resize_with(index + 1, || None);
+        }
+        slots[index] = Some(id);
+    } else {
+        slots.push(Some(id));
+    }
+}
+
 /// Collect channel ids from `commonphase:channel` / `commonphase:elementChannel`
-/// nodes (the `id` attribute), preserving document order.
+/// nodes (the `id` attribute), respecting Java's `order`-based insertion.
 fn oir_apply_channels(xml: &str, channel_ids: &mut Vec<String>) {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml);
+    let mut pending: Vec<OirPendingChannel> = Vec::new();
+    let mut slots: Vec<Option<String>> = Vec::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+            Ok(Event::Start(ref e)) => {
                 let name = e.name();
                 let local = local_of(name.as_ref());
-                if local == "channel" || local == "elementChannel" {
-                    if let Some(id) = e.attributes().flatten().find_map(|a| {
-                        if a.key.as_ref() == b"id" {
-                            a.unescape_value().ok().map(|v| v.into_owned())
-                        } else {
-                            None
+                if local == "channel" {
+                    pending.push(OirPendingChannel {
+                        id: oir_xml_attr_value(e, b"id").unwrap_or_default(),
+                        index: oir_xml_order_attr(e),
+                        has_element_channels: false,
+                    });
+                } else if local == "elementChannel" {
+                    if let Some(parent) = pending.last_mut() {
+                        parent.has_element_channels = true;
+                        let component_index = oir_xml_order_attr(e);
+                        let index = parent
+                            .index
+                            .and_then(|parent_index| component_index.map(|c| parent_index * 3 + c));
+                        if let Some(id) = oir_xml_attr_value(e, b"id") {
+                            oir_insert_channel_id(&mut slots, index, id);
                         }
-                    }) {
-                        if !id.is_empty() && !channel_ids.contains(&id) {
-                            channel_ids.push(id);
+                    } else if let Some(id) = oir_xml_attr_value(e, b"id") {
+                        oir_insert_channel_id(&mut slots, oir_xml_order_attr(e), id);
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                let name = e.name();
+                let local = local_of(name.as_ref());
+                if local == "channel" {
+                    if let Some(id) = oir_xml_attr_value(e, b"id") {
+                        oir_insert_channel_id(&mut slots, oir_xml_order_attr(e), id);
+                    }
+                } else if local == "elementChannel" {
+                    if let Some(parent) = pending.last_mut() {
+                        parent.has_element_channels = true;
+                        let component_index = oir_xml_order_attr(e);
+                        let index = parent
+                            .index
+                            .and_then(|parent_index| component_index.map(|c| parent_index * 3 + c));
+                        if let Some(id) = oir_xml_attr_value(e, b"id") {
+                            oir_insert_channel_id(&mut slots, index, id);
+                        }
+                    } else if let Some(id) = oir_xml_attr_value(e, b"id") {
+                        oir_insert_channel_id(&mut slots, oir_xml_order_attr(e), id);
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let name = e.name();
+                if local_of(name.as_ref()) == "channel" {
+                    if let Some(parent) = pending.pop() {
+                        if !parent.has_element_channels {
+                            oir_insert_channel_id(&mut slots, parent.index, parent.id);
                         }
                     }
                 }
@@ -10073,6 +10556,11 @@ fn oir_apply_channels(xml: &str, channel_ids: &mut Vec<String>) {
             Ok(Event::Eof) => break,
             Err(_) => break,
             _ => {}
+        }
+    }
+    for id in slots.into_iter().flatten() {
+        if !channel_ids.contains(&id) {
+            channel_ids.push(id);
         }
     }
 }
@@ -10217,7 +10705,18 @@ impl FormatReader for OirReader {
         self.state = None;
         let header = crate::common::io::peek_header(path, 16)?;
 
-        if header.starts_with(OIR_IDENTIFIER) {
+        let companion_main = if header.starts_with(OIR_IDENTIFIER) {
+            None
+        } else {
+            let (main, _, _) = oir_resolve_main_and_companions(path);
+            if main != path {
+                Some(main)
+            } else {
+                None
+            }
+        };
+
+        if header.starts_with(OIR_IDENTIFIER) || companion_main.is_some() {
             let native = parse_oir_native(path)?;
             self.state = Some(OirState::Native(Box::new(native)));
             return Ok(());
@@ -10229,7 +10728,7 @@ impl FormatReader for OirReader {
             let mut tiff = crate::tiff::TiffReader::new();
             tiff.set_id(path)?;
             let meta = oir_tiff_meta(&tiff);
-            self.state = Some(OirState::Tiff(Box::new(tiff), meta));
+            self.state = Some(OirState::Tiff(Box::new(tiff), meta, path.to_path_buf()));
             return Ok(());
         }
 
@@ -10239,7 +10738,7 @@ impl FormatReader for OirReader {
     }
 
     fn close(&mut self) -> Result<()> {
-        if let Some(OirState::Tiff(tiff, _)) = &mut self.state {
+        if let Some(OirState::Tiff(tiff, _, _)) = &mut self.state {
             let _ = tiff.close();
         }
         self.state = None;
@@ -10267,7 +10766,7 @@ impl FormatReader for OirReader {
     fn metadata(&self) -> &ImageMetadata {
         match &self.state {
             Some(OirState::Native(n)) => &n.meta,
-            Some(OirState::Tiff(_, meta)) => meta,
+            Some(OirState::Tiff(_, meta, _)) => meta,
             None => crate::common::reader::uninitialized_metadata(),
         }
     }
@@ -10275,7 +10774,7 @@ impl FormatReader for OirReader {
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         match &mut self.state {
             Some(OirState::Native(n)) => oir_open_plane(n, plane_index),
-            Some(OirState::Tiff(tiff, _)) => {
+            Some(OirState::Tiff(tiff, _, _)) => {
                 tiff.set_series(0)?;
                 tiff.open_bytes(plane_index)
             }
@@ -10296,7 +10795,7 @@ impl FormatReader for OirReader {
                 let full = oir_open_plane(n, plane_index)?;
                 crop_full_plane("Olympus OIR", &full, &n.meta, 1, x, y, w, h)
             }
-            Some(OirState::Tiff(tiff, _)) => {
+            Some(OirState::Tiff(tiff, _, _)) => {
                 tiff.set_series(0)?;
                 tiff.open_bytes_region(plane_index, x, y, w, h)
             }
@@ -10965,12 +11464,26 @@ impl EtsVolume {
         };
 
         let (_, offset, n_bytes) = self.tiles[index];
-        // ETS chunk table byte counts define the exact stored tile payload.
-        // RAW counts are validated during parsing; compressed tiles are decoded
-        // from their declared codestream length.
-        let read_len = n_bytes as usize;
         let mut reader = BufReader::new(File::open(&self.path).map_err(BioFormatsError::Io)?);
-        let raw = read_bytes_at(&mut reader, offset, read_len)?;
+        let file_len = reader
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(BioFormatsError::Io)?;
+        let read_len = match self.compression {
+            // Java CellSensReader.decodeTile allocates tileSize bytes for RAW
+            // and JPEG-family codecs, ignoring the chunk-table nBytes field.
+            ETS_RAW | ETS_JPEG | ETS_JPEG_2000 | ETS_JPEG_LOSSLESS => tile_size,
+            ETS_PNG | ETS_BMP => self
+                .tiles
+                .get(index + 1)
+                .map(|(_, next_offset, _)| next_offset.saturating_sub(offset) as usize)
+                .unwrap_or_else(|| file_len.saturating_sub(offset) as usize),
+            _ => n_bytes as usize,
+        };
+        let available = file_len.saturating_sub(offset).min(read_len as u64) as usize;
+        let mut raw = read_bytes_at(&mut reader, offset, available)?;
+        if raw.len() < read_len {
+            raw.resize(read_len, 0);
+        }
 
         let mut buf = match self.compression {
             ETS_RAW => raw,
@@ -10988,11 +11501,10 @@ impl EtsVolume {
             }
         };
 
-        if buf.len() != tile_size {
-            return Err(BioFormatsError::InvalidData(format!(
-                "cellSens ETS tile decoded to {} bytes, expected {tile_size}",
-                buf.len()
-            )));
+        if buf.len() < tile_size {
+            buf.resize(tile_size, 0);
+        } else if buf.len() > tile_size {
+            buf.truncate(tile_size);
         }
 
         // BGR -> RGB swap for RAW component-order-1 multichannel tiles.
@@ -12409,13 +12921,6 @@ impl CellSensReader {
         }
         let pixel_type = convert_ets_pixel_type(pixel_type_code)?;
         let bpp = pixel_type.bytes_per_sample();
-        let expected_tile_size = bpp
-            .checked_mul(size_c as usize)
-            .and_then(|v| v.checked_mul(tile_x as usize))
-            .and_then(|v| v.checked_mul(tile_y as usize))
-            .ok_or_else(|| {
-                BioFormatsError::Format(format!("ETS file {:?}: tile byte count overflows", path))
-            })?;
         // color region begins at base + 32 + 68 = base + 100, always 40 bytes.
         let color_start = base + 32 + 4 * 17;
         let color_len = (size_c as usize).saturating_mul(bpp).min(40);
@@ -12453,30 +12958,6 @@ impl CellSensReader {
             let n_bytes = u32_at(off)?;
             off += 4;
             off += 4; // reserved
-            if n_bytes == 0 {
-                return Err(BioFormatsError::Format(format!(
-                    "ETS file {:?}: tile byte count must be non-zero",
-                    path
-                )));
-            }
-            let tile_end = tile_offset.checked_add(n_bytes as u64).ok_or_else(|| {
-                BioFormatsError::Format(format!(
-                    "ETS file {:?}: tile payload offset overflows",
-                    path
-                ))
-            })?;
-            if tile_end > bytes.len() as u64 {
-                return Err(BioFormatsError::InvalidData(format!(
-                    "ETS file {:?}: tile payload extends past end of file",
-                    path
-                )));
-            }
-            if compression == ETS_RAW && n_bytes as usize != expected_tile_size {
-                return Err(BioFormatsError::InvalidData(format!(
-                    "ETS file {:?}: RAW tile byte count is {}, expected {expected_tile_size}",
-                    path, n_bytes
-                )));
-            }
             tiles.push((coord, tile_offset, n_bytes));
         }
 
@@ -12539,9 +13020,11 @@ impl CellSensReader {
             }
         }
         self.tiff_series = self.inner.series_count();
-        if volumes.is_empty() {
-            return;
-        }
+        let filename = vsi_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("image")
+            .to_string();
 
         // Apply VSI tag-tree geometry to each ETS volume.
         //
@@ -12562,7 +13045,26 @@ impl CellSensReader {
         // this, a `.vsi` whose tag-tree we can't fully parse would expose only the
         // tiny embedded TIFF overview images and never the real ETS pixels.
         let has_orphan_ets = !pyramids.is_empty() && pyramids.len() < volumes.len();
-        if pyramids.is_empty() {
+        if volumes.is_empty() {
+            // Java's files.size()==1 path still exposes the embedded TIFF IFDs
+            // (CellSensReader.java:706-773). Do not leave a valid `.vsi`
+            // initialized with zero logical series just because no ETS companions
+            // were found or parsed.
+            self.ets.clear();
+            self.series_map.clear();
+            self.series_names.clear();
+            self.series_phys.clear();
+            for s in 0..self.tiff_series {
+                self.series_map.push(CellSensTarget::Tiff(s));
+                self.series_names.push(if s == 0 {
+                    filename.clone()
+                } else {
+                    format!("{filename} #{}", s + 1)
+                });
+                self.series_phys.push(None);
+            }
+            return;
+        } else if pyramids.is_empty() {
             for vol in volumes.iter_mut() {
                 vol.compute_levels();
             }
@@ -12681,11 +13183,6 @@ impl CellSensReader {
         self.series_map.clear();
         self.series_names.clear();
         self.series_phys.clear();
-        let filename = vsi_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("image")
-            .to_string();
         if self.ets.is_empty() {
             // No ETS: fall back to exposing the inner TIFF series directly.
             for s in 0..self.tiff_series {
@@ -13462,19 +13959,20 @@ impl FormatReader for VolocityClippingReader {
 }
 
 // ---------------------------------------------------------------------------
-// 12. Bruker MicroCT — TIFF delegate
+// 12. GE MicroCT VFF
 // ---------------------------------------------------------------------------
-/// Bruker MicroCT format reader (`.ctf`).
+/// GE MicroCT VFF reader (`.vff`).
 ///
-/// MicroCT files use TIFF data; delegates to `TiffReader`.
+/// Public compatibility wrapper for the Java Bio-Formats `MicroCTReader`.
+/// The faithful implementation lives in `formats::bruker::MicroCtVffReader`.
 pub struct MicroCtReader {
-    inner: crate::tiff::TiffReader,
+    inner: crate::formats::bruker::MicroCtVffReader,
 }
 
 impl MicroCtReader {
     pub fn new() -> Self {
         MicroCtReader {
-            inner: crate::tiff::TiffReader::new(),
+            inner: crate::formats::bruker::MicroCtVffReader::new(),
         }
     }
 }
@@ -13487,14 +13985,10 @@ impl Default for MicroCtReader {
 
 impl FormatReader for MicroCtReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("ctf"))
+        self.inner.is_this_type_by_name(path)
     }
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        self.inner.is_this_type_by_bytes(header)
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)
@@ -13532,7 +14026,7 @@ impl FormatReader for MicroCtReader {
 }
 
 // ---------------------------------------------------------------------------
-// 13. Bio-Rad SCN confocal — TIFF delegate
+// 13. Bio-Rad SCN
 // ---------------------------------------------------------------------------
 /// Bio-Rad SCN confocal format reader (`.scn`).
 ///
@@ -13784,12 +14278,9 @@ impl FormatReader for BioRadScnReader {
             .checked_mul(meta.size_y as usize)
             .and_then(|px| px.checked_mul(bpp))
             .ok_or_else(|| BioFormatsError::Format("Bio-Rad SCN: plane size overflows".into()))?;
-        meta.image_count = meta
-            .size_z
-            .max(1)
-            .checked_mul(meta.size_c.max(1))
-            .and_then(|v| v.checked_mul(meta.size_t.max(1)))
-            .ok_or_else(|| BioFormatsError::Format("Bio-Rad SCN: image count overflows".into()))?;
+        // Java BioRadSCNReader sets sizeC from <channel_count>, then
+        // unconditionally sets imageCount = 1.
+        meta.image_count = 1;
         let expected_pixels = plane
             .checked_mul(meta.image_count as usize)
             .ok_or_else(|| {
@@ -13862,7 +14353,7 @@ impl FormatReader for BioRadScnReader {
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
         let full = self.open_bytes(p)?;
-        crop_full_plane("ScanR", &full, &meta, 1, x, y, w, h)
+        crop_full_plane("Bio-Rad SCN", &full, &meta, 1, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.open_bytes(p)
@@ -14039,6 +14530,117 @@ fn slidebook_clean_channel_name(name: &str) -> String {
     n.trim().to_string()
 }
 
+fn slidebook_tiff_matches_first_ifd(ifd: &Ifd) -> bool {
+    if ifd.get_str(tag::SOFTWARE) != Some("SlideBook") {
+        return false;
+    }
+    if ifd
+        .get_str(tag::IMAGE_DESCRIPTION)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return false;
+    }
+    [
+        SLIDEBOOK_X_POS_TAG,
+        SLIDEBOOK_Y_POS_TAG,
+        SLIDEBOOK_Z_POS_TAG,
+        SLIDEBOOK_CHANNEL_TAG,
+        SLIDEBOOK_PHYSICAL_SIZE_TAG,
+        SLIDEBOOK_MAGNIFICATION_TAG,
+    ]
+    .iter()
+    .any(|tag| ifd.get(*tag).is_some())
+}
+
+fn slidebook_tiff_matches_header(header: &[u8]) -> bool {
+    if header.len() < 8 {
+        return false;
+    }
+    let little = match &header[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return false,
+    };
+    let u16_at = |offset: usize| -> Option<u16> {
+        let bytes: [u8; 2] = header.get(offset..offset + 2)?.try_into().ok()?;
+        Some(if little {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        })
+    };
+    let u32_at = |offset: usize| -> Option<u32> {
+        let bytes: [u8; 4] = header.get(offset..offset + 4)?.try_into().ok()?;
+        Some(if little {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        })
+    };
+    if u16_at(2) != Some(42) {
+        return false;
+    }
+    let Some(ifd_offset) = u32_at(4).map(|v| v as usize) else {
+        return false;
+    };
+    let Some(count) = u16_at(ifd_offset).map(|v| v as usize) else {
+        return false;
+    };
+    let table_start = ifd_offset + 2;
+    let mut software_ok = false;
+    let mut comment_empty = true;
+    let mut has_private_tag = false;
+
+    for i in 0..count {
+        let entry = table_start + i * 12;
+        let Some(tag_id) = u16_at(entry) else {
+            return false;
+        };
+        let typ = u16_at(entry + 2).unwrap_or(0);
+        let value_count = u32_at(entry + 4).unwrap_or(0) as usize;
+        let value_offset = entry + 8;
+        let ascii_value = || -> Option<String> {
+            if typ != 2 || value_count == 0 {
+                return None;
+            }
+            let bytes = if value_count <= 4 {
+                header.get(value_offset..value_offset + value_count)?
+            } else {
+                let off = u32_at(value_offset)? as usize;
+                header.get(off..off + value_count)?
+            };
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+        };
+
+        if tag_id == tag::SOFTWARE {
+            software_ok = ascii_value().as_deref() == Some("SlideBook");
+        } else if tag_id == tag::IMAGE_DESCRIPTION {
+            comment_empty = ascii_value().is_none_or(|value| value.is_empty());
+        } else if [
+            SLIDEBOOK_X_POS_TAG,
+            SLIDEBOOK_Y_POS_TAG,
+            SLIDEBOOK_Z_POS_TAG,
+            SLIDEBOOK_CHANNEL_TAG,
+            SLIDEBOOK_PHYSICAL_SIZE_TAG,
+            SLIDEBOOK_MAGNIFICATION_TAG,
+        ]
+        .contains(&tag_id)
+        {
+            has_private_tag = true;
+        }
+    }
+
+    software_ok && comment_empty && has_private_tag
+}
+
+fn slidebook_tiff_matches_path(path: &Path) -> Result<bool> {
+    let file = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut parser = TiffParser::new(file)?;
+    let ifds = parser.read_ifds()?;
+    Ok(ifds.first().is_some_and(slidebook_tiff_matches_first_ifd))
+}
+
 impl SlidebookTiffReader {
     pub fn new() -> Self {
         SlidebookTiffReader {
@@ -14098,12 +14700,17 @@ impl FormatReader for SlidebookTiffReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif"))
+        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        slidebook_tiff_matches_header(header)
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        if !slidebook_tiff_matches_path(path)? {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "SlideBook TIFF: missing SlideBook software/private tags".into(),
+            ));
+        }
         self.inner.set_id(path)?;
         self.enrich_metadata();
         Ok(())
@@ -14843,6 +15450,15 @@ impl FormatReader for SpcReader {
         if plane_index >= self.meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
+        crate::common::region::validate_region(
+            "SPC",
+            self.meta.size_x,
+            self.meta.size_y,
+            x,
+            y,
+            w,
+            h,
+        )?;
 
         let size_t = self.meta.size_t as i32;
         let mut no = plane_index as i32;
@@ -14992,6 +15608,139 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn oir_axis_text_accumulates_entity_split_chunks_like_dom() {
+        let xml = r#"<imageProperties>
+  <commonimage:dimensionAxis>
+    <commonparam:axis>LAM&#66;DA</commonparam:axis>
+    <commonparam:maxSize>3</commonparam:maxSize>
+  </commonimage:dimensionAxis>
+</imageProperties>"#;
+        let mut meta = ImageMetadata::default();
+        meta.size_c = 1;
+
+        oir_apply_axes(xml, &mut meta);
+
+        assert_eq!(meta.size_c, 3);
+    }
+
+    #[test]
+    fn oir_channels_respect_java_order_attributes() {
+        let xml = r#"<imageProperties>
+  <commonphase:channel id="c2" order="2"><commonphase:name>second</commonphase:name></commonphase:channel>
+  <commonphase:channel id="c1" order="1"><commonphase:name>first</commonphase:name></commonphase:channel>
+  <commonphase:channel id="rgb" order="3">
+    <commonphase:elementChannel id="blue" order="3"/>
+    <commonphase:elementChannel id="red" order="1"/>
+    <commonphase:elementChannel id="green" order="2"/>
+  </commonphase:channel>
+</imageProperties>"#;
+        let mut channel_ids = Vec::new();
+
+        oir_apply_channels(xml, &mut channel_ids);
+
+        assert_eq!(channel_ids, vec!["c1", "c2", "red", "green", "blue"]);
+    }
+
+    #[test]
+    fn oir_dimension_order_follows_java_basename_zt_rule() {
+        assert_eq!(
+            oir_dimension_order("run_t001_z001", 2, 3),
+            crate::common::metadata::DimensionOrder::XYCZT
+        );
+        assert_eq!(
+            oir_dimension_order("run_z001_t001", 2, 3),
+            crate::common::metadata::DimensionOrder::XYCTZ
+        );
+        assert_eq!(
+            oir_dimension_order("run_t001_z001", 1, 3),
+            crate::common::metadata::DimensionOrder::XYCZT
+        );
+        assert_eq!(
+            oir_dimension_order("run_z001_t001", 2, 1),
+            crate::common::metadata::DimensionOrder::XYCZT
+        );
+    }
+
+    fn push_oir_u32(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_oir_prefix(buf: &mut Vec<u8>) {
+        buf.extend_from_slice(OIR_IDENTIFIER);
+        push_oir_u32(buf, 0xffff_ffff);
+        push_oir_u32(buf, 0);
+    }
+
+    fn push_oir_xml_block(buf: &mut Vec<u8>, xml: &str) {
+        let total = 48 + xml.len() as u32;
+        push_oir_u32(buf, total);
+        push_oir_u32(buf, 0);
+        buf.extend(std::iter::repeat(0).take(36));
+        push_oir_u32(buf, xml.len() as u32);
+        buf.extend_from_slice(xml.as_bytes());
+    }
+
+    fn push_empty_oir_xml_block(buf: &mut Vec<u8>) {
+        push_oir_u32(buf, 8);
+        push_oir_u32(buf, 0);
+    }
+
+    fn push_oir_pixel_block(buf: &mut Vec<u8>, uid: &str, pixels: &[u8]) {
+        push_oir_u32(buf, uid.len() as u32 + 12);
+        push_oir_u32(buf, 3);
+        buf.extend_from_slice(&[0; 8]);
+        push_oir_u32(buf, uid.len() as u32);
+        buf.extend_from_slice(uid.as_bytes());
+        push_oir_u32(buf, pixels.len() as u32);
+        push_oir_u32(buf, 0);
+        buf.extend_from_slice(pixels);
+    }
+
+    fn minimal_oir_metadata_xml() -> String {
+        "<?xml version=\"1.0\"?>\
+         <imageProperties>\
+           <frameProperties>\
+             <width>2</width><height>2</height><depth>1</depth><bitCounts>8</bitCounts>\
+           </frameProperties>\
+           <imageInfo>\
+             <channel id=\"c1\" order=\"1\"/>\
+           </imageInfo>\
+         </imageProperties>"
+            .to_string()
+    }
+
+    #[test]
+    fn oir_set_id_accepts_numbered_companion_like_java() {
+        let dir = temp_flim2_path("oir-companion-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("sample.oir");
+        let companion = dir.join("sample_00001");
+
+        let mut main_bytes = Vec::new();
+        push_oir_prefix(&mut main_bytes);
+        push_oir_xml_block(&mut main_bytes, &minimal_oir_metadata_xml());
+        std::fs::write(&main, main_bytes).unwrap();
+
+        let mut companion_bytes = Vec::new();
+        push_oir_prefix(&mut companion_bytes);
+        push_oir_u32(&mut companion_bytes, 0xffff_ffff);
+        push_oir_u32(&mut companion_bytes, 0);
+        push_empty_oir_xml_block(&mut companion_bytes);
+        push_oir_pixel_block(&mut companion_bytes, "z001t001_c1_0", &[1, 2, 3, 4]);
+        std::fs::write(&companion, companion_bytes).unwrap();
+
+        let mut reader = OirReader::new();
+        reader.set_id(&companion).unwrap();
+
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.series_used_files(), vec![companion.clone()]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn slidebook7_typed_decoder_matches_java_classdecoder() {
@@ -15497,6 +16246,102 @@ EndClass: 0
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn push_tiff_u16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_tiff_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_tiff_short(out: &mut Vec<u8>, tag: u16, value: u16) {
+        push_tiff_u16(out, tag);
+        push_tiff_u16(out, 3);
+        push_tiff_u32(out, 1);
+        push_tiff_u16(out, value);
+        push_tiff_u16(out, 0);
+    }
+
+    fn push_tiff_long(out: &mut Vec<u8>, tag: u16, value: u32) {
+        push_tiff_u16(out, tag);
+        push_tiff_u16(out, 4);
+        push_tiff_u32(out, 1);
+        push_tiff_u32(out, value);
+    }
+
+    fn push_tiff_ascii_at_offset(out: &mut Vec<u8>, tag: u16, value: &str, offset: u32) {
+        push_tiff_u16(out, tag);
+        push_tiff_u16(out, 2);
+        push_tiff_u32(out, (value.len() + 1) as u32);
+        push_tiff_u32(out, offset);
+    }
+
+    fn write_afi_svs_with_label_macro(
+        path: &Path,
+        bits_per_sample: u16,
+        main_pixels: &[u8],
+        label_pixel: &[u8],
+        macro_pixel: &[u8],
+    ) {
+        let ifds = [
+            (2u32, 1u32, "Aperio Image|MPP=0.25", main_pixels),
+            (1u32, 1u32, "label image", label_pixel),
+            (1u32, 1u32, "macro image", macro_pixel),
+        ];
+        let ifd_size = 2 + 9 * 12 + 4;
+        let ifd0_off: u32 = 8;
+        let desc0_off: u32 = ifd0_off + (ifd_size * ifds.len()) as u32;
+        let desc1_off: u32 = desc0_off + ifds[0].2.len() as u32 + 1;
+        let desc2_off: u32 = desc1_off + ifds[1].2.len() as u32 + 1;
+        let px0_off: u32 = desc2_off + ifds[2].2.len() as u32 + 1;
+        let px1_off: u32 = px0_off + ifds[0].3.len() as u32;
+        let px2_off: u32 = px1_off + ifds[1].3.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        push_tiff_u16(&mut bytes, 42);
+        push_tiff_u32(&mut bytes, ifd0_off);
+
+        for (i, (w, h, desc, pixels)) in ifds.iter().enumerate() {
+            let next = if i + 1 < ifds.len() {
+                ifd0_off + ((i + 1) * ifd_size) as u32
+            } else {
+                0
+            };
+            let desc_off = match i {
+                0 => desc0_off,
+                1 => desc1_off,
+                _ => desc2_off,
+            };
+            let px_off = match i {
+                0 => px0_off,
+                1 => px1_off,
+                _ => px2_off,
+            };
+
+            push_tiff_u16(&mut bytes, 9);
+            push_tiff_long(&mut bytes, tag::IMAGE_WIDTH, *w);
+            push_tiff_long(&mut bytes, tag::IMAGE_LENGTH, *h);
+            push_tiff_short(&mut bytes, tag::BITS_PER_SAMPLE, bits_per_sample);
+            push_tiff_short(&mut bytes, tag::COMPRESSION, 1);
+            push_tiff_short(&mut bytes, tag::PHOTOMETRIC_INTERPRETATION, 1);
+            push_tiff_ascii_at_offset(&mut bytes, tag::IMAGE_DESCRIPTION, desc, desc_off);
+            push_tiff_long(&mut bytes, tag::STRIP_OFFSETS, px_off);
+            push_tiff_long(&mut bytes, tag::ROWS_PER_STRIP, *h);
+            push_tiff_long(&mut bytes, tag::STRIP_BYTE_COUNTS, pixels.len() as u32);
+            push_tiff_u32(&mut bytes, next);
+        }
+
+        for (_, _, desc, _) in &ifds {
+            bytes.extend_from_slice(desc.as_bytes());
+            bytes.push(0);
+        }
+        for (_, _, _, pixels) in &ifds {
+            bytes.extend_from_slice(pixels);
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn build_slidebook7_npy(descr: &str, shape: &[u32], payload: &[u8]) -> Vec<u8> {
         let shape_text = if shape.len() == 1 {
             format!("({},)", shape[0])
@@ -15665,7 +16510,7 @@ EndClass: 0
         let data_set = im3_container("DataSet", vec![dataset]);
         let root = im3_container("Root", vec![data_set]);
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&1985u32.to_le_bytes());
         bytes.extend_from_slice(&root);
         std::fs::write(path, bytes).unwrap();
     }
@@ -15743,7 +16588,8 @@ EndClass: 0
         write_native_im3(&path, 3, 2, 2, &pixels);
 
         let mut reader = Im3Reader::new();
-        assert!(reader.is_this_type_by_bytes(&1985u32.to_be_bytes()));
+        assert!(reader.is_this_type_by_bytes(&1985u32.to_le_bytes()));
+        assert!(!reader.is_this_type_by_bytes(&1985u32.to_be_bytes()));
         reader.set_id(&path).expect("native IM3 fixture");
         assert_eq!(reader.series_count(), 1);
         assert_eq!(reader.metadata().size_x, 3);
@@ -15810,7 +16656,7 @@ EndClass: 0
             ],
         );
         let mut multi_bytes = Vec::new();
-        multi_bytes.extend_from_slice(&1985u32.to_be_bytes());
+        multi_bytes.extend_from_slice(&1985u32.to_le_bytes());
         multi_bytes.extend_from_slice(&im3_container(
             "Root",
             vec![im3_container("DataSet", vec![dataset_a, dataset_b])],
@@ -15886,7 +16732,7 @@ EndClass: 0
             ],
         );
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&1985u32.to_le_bytes());
         bytes.extend_from_slice(&im3_container(
             "Root",
             vec![im3_container("DataSet", vec![dataset])],
@@ -16052,7 +16898,7 @@ EndClass: 0
             )],
         );
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&1985u32.to_le_bytes());
         bytes.extend_from_slice(&im3_container(
             "Root",
             vec![im3_container("DataSet", vec![dataset]), spectral_library],
@@ -16122,7 +16968,7 @@ EndClass: 0
             ],
         );
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&1985u32.to_le_bytes());
         bytes.extend_from_slice(&im3_container(
             "Root",
             vec![im3_container("DataSet", vec![dataset])],
@@ -16177,7 +17023,7 @@ EndClass: 0
             ],
         );
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&1985u32.to_le_bytes());
         bytes.extend_from_slice(&im3_container(
             "Root",
             vec![im3_container("DataSet", vec![dataset])],
@@ -16239,7 +17085,7 @@ EndClass: 0
             ],
         );
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1985u32.to_be_bytes());
+        bytes.extend_from_slice(&1985u32.to_le_bytes());
         bytes.extend_from_slice(&im3_container(
             "Root",
             vec![im3_container("DataSet", vec![dataset])],
@@ -16283,7 +17129,7 @@ EndClass: 0
             ],
         );
         let mut mismatch_bytes = Vec::new();
-        mismatch_bytes.extend_from_slice(&1985u32.to_be_bytes());
+        mismatch_bytes.extend_from_slice(&1985u32.to_le_bytes());
         mismatch_bytes.extend_from_slice(&im3_container(
             "Root",
             vec![im3_container("DataSet", vec![dataset])],
@@ -16788,6 +17634,8 @@ EndClass: 0
         assert_eq!(reader.metadata().size_c, 3);
         assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
         assert_eq!(reader.metadata().bits_per_pixel, 16);
+        assert!(reader.metadata().is_rgb);
+        assert!(reader.metadata().is_interleaved);
         assert!(!reader.metadata().is_little_endian);
         let native_metadata = &reader.metadata().series_metadata;
         assert!(matches!(
@@ -16817,6 +17665,79 @@ EndClass: 0
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn afi_byte_detection_matches_java_permissive_probe() {
+        let reader = AfiReader::new();
+        assert!(reader.is_this_type_by_bytes(b"<AFI"));
+        assert!(!reader.is_this_type_by_bytes(b"<AF"));
+    }
+
+    #[test]
+    fn afi_widens_8bit_channel_planes_to_first_channel_depth_like_java() {
+        let dir = temp_flim2_path("afi-widen-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let afi = dir.join("case.afi");
+        let first = dir.join("slide_DAPI.svs");
+        let second = dir.join("slide_FITC.svs");
+
+        write_afi_svs_with_label_macro(&first, 16, &[0x34, 0x12, 0x78, 0x56], &[0, 0], &[0, 0]);
+        write_afi_svs_with_label_macro(&second, 8, &[0, 128], &[0], &[0]);
+        std::fs::write(
+            &afi,
+            "<ImageList><Image><Path>slide_DAPI.svs</Path></Image><Image><Path>slide_FITC.svs</Path></Image></ImageList>",
+        )
+        .unwrap();
+
+        let mut reader = AfiReader::new();
+        reader.set_id(&afi).expect("AFI fixture");
+        assert_eq!(reader.series_count(), 3);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x34, 0x12, 0x78, 0x56]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![0x00, 0x00, 0x80, 0x80]);
+        assert_eq!(
+            reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(),
+            vec![0x80, 0x80]
+        );
+
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+        let _ = std::fs::remove_file(afi);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn afi_rejects_wider_later_channel_downsampling_like_java() {
+        let dir = temp_flim2_path("afi-downsample-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let afi = dir.join("case.afi");
+        let first = dir.join("slide_DAPI.svs");
+        let second = dir.join("slide_FITC.svs");
+
+        write_afi_svs_with_label_macro(&first, 8, &[1, 2], &[0], &[0]);
+        write_afi_svs_with_label_macro(&second, 16, &[0x34, 0x12, 0x78, 0x56], &[0, 0], &[0, 0]);
+        std::fs::write(
+            &afi,
+            "<ImageList><Image><Path>slide_DAPI.svs</Path></Image><Image><Path>slide_FITC.svs</Path></Image></ImageList>",
+        )
+        .unwrap();
+
+        let mut reader = AfiReader::new();
+        reader.set_id(&afi).expect("AFI fixture");
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+        let err = reader.open_bytes(1).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("downsampling images is not supported")),
+            "unexpected AFI downsampling error: {err:?}"
+        );
+
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+        let _ = std::fs::remove_file(afi);
+        let _ = std::fs::remove_dir(dir);
     }
 
     #[test]
@@ -17085,14 +18006,31 @@ EndClass: 0
         compression: u16,
         compressed: &[u8],
     ) {
+        write_synthetic_flowsight_cif_with_metadata(
+            path,
+            bits_per_sample,
+            compression,
+            compressed,
+            "BF|SSC",
+            "Brightfield|Scatter",
+            "<Root><Imaging><ChannelInUseIndicators>1 1</ChannelInUseIndicators></Imaging></Root>",
+        );
+    }
+
+    fn write_synthetic_flowsight_cif_with_metadata(
+        path: &Path,
+        bits_per_sample: u16,
+        compression: u16,
+        compressed: &[u8],
+        channel_names: &str,
+        channel_descs: &str,
+        metadata_xml: &str,
+    ) {
         let ifd0_entries = vec![
             short_entry(FLOWSIGHT_CHANNEL_COUNT_TAG, 2),
-            ascii_entry(FLOWSIGHT_CHANNEL_NAMES_TAG, "BF|SSC"),
-            ascii_entry(FLOWSIGHT_CHANNEL_DESCS_TAG, "Brightfield|Scatter"),
-            ascii_entry(
-                FLOWSIGHT_METADATA_XML_TAG,
-                "<Root><Imaging><ChannelInUseIndicators>1 1</ChannelInUseIndicators></Imaging></Root>",
-            ),
+            ascii_entry(FLOWSIGHT_CHANNEL_NAMES_TAG, channel_names),
+            ascii_entry(FLOWSIGHT_CHANNEL_DESCS_TAG, channel_descs),
+            ascii_entry(FLOWSIGHT_METADATA_XML_TAG, metadata_xml),
         ];
         let ifd0_offset = 8usize;
         let ifd1_offset =
@@ -17162,6 +18100,32 @@ EndClass: 0
             short_entry(tag::BITS_PER_SAMPLE, 8),
             short_entry(tag::COMPRESSION, 1),
             short_entry(tag::PHOTOMETRIC_INTERPRETATION, 1),
+            long_entry(tag::ROWS_PER_STRIP, 1),
+            long_entry(tag::STRIP_BYTE_COUNTS, 1),
+        ];
+        let strip_offset = 8 + ifd_table_len(entries.len() + 1) + ifd_extra_len(&entries);
+        entries.push(long_entry(tag::STRIP_OFFSETS, strip_offset as u32));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        write_test_ifd(&mut data, &entries, 8, 0);
+        data.resize(strip_offset, 0);
+        data.push(value);
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&data).unwrap();
+    }
+
+    fn write_one_pixel_tiff_with_description(path: &Path, value: u8, description: &str) {
+        let mut entries = vec![
+            long_entry(tag::IMAGE_WIDTH, 1),
+            long_entry(tag::IMAGE_LENGTH, 1),
+            short_entry(tag::BITS_PER_SAMPLE, 8),
+            short_entry(tag::COMPRESSION, 1),
+            short_entry(tag::PHOTOMETRIC_INTERPRETATION, 1),
+            ascii_entry(tag::IMAGE_DESCRIPTION, description),
             long_entry(tag::ROWS_PER_STRIP, 1),
             long_entry(tag::STRIP_BYTE_COUNTS, 1),
         ];
@@ -17259,8 +18223,8 @@ EndClass: 0
 
     #[test]
     fn im3_and_ivision_native_byte_probes_match_java_headers() {
-        assert!(Im3Reader::new().is_this_type_by_bytes(&1985u32.to_be_bytes()));
-        assert!(!Im3Reader::new().is_this_type_by_bytes(&1985u32.to_le_bytes()));
+        assert!(Im3Reader::new().is_this_type_by_bytes(&1985u32.to_le_bytes()));
+        assert!(!Im3Reader::new().is_this_type_by_bytes(&1985u32.to_be_bytes()));
 
         assert!(IvisionReader::new().is_this_type_by_bytes(b"1.0A\0\x03"));
         assert!(!IvisionReader::new().is_this_type_by_bytes(b"1-0A\0\x03"));
@@ -17272,6 +18236,28 @@ EndClass: 0
         let reader = SlideBook7Reader::new();
         assert!(reader.is_this_type_by_name(Path::new("dataset.sldy")));
         assert!(reader.is_this_type_by_name(Path::new("dataset.sldyz")));
+    }
+
+    #[test]
+    fn imaris_tiff_skips_channel_name_that_is_filename_suffix_like_java() {
+        let ims = temp_flim2_path("sample_name.ims");
+        write_one_pixel_tiff_with_description(
+            &ims,
+            7,
+            "[Imaris]\nName=sample_name.ims\nName=DAPI\nDescription=desc\nRecordingDate=2024-01-02 03:04:05.678\n",
+        );
+
+        let mut reader = ImarisTiffReader::new();
+        reader.set_id(&ims).unwrap();
+        let metadata = reader.metadata();
+        assert!(matches!(
+            metadata.series_metadata.get("imaris.channel.0.name"),
+            Some(MetadataValue::String(name)) if name == "DAPI"
+        ));
+        assert!(!metadata.series_metadata.values().any(|value| {
+            matches!(value, MetadataValue::String(name) if name == "sample_name.ims")
+        }));
+        let _ = std::fs::remove_file(ims);
     }
 
     #[test]
@@ -17287,6 +18273,7 @@ EndClass: 0
             vec![XlefReference::Image {
                 path: refs[0].clone(),
                 tile_count: 1,
+                tile_index_base: 0,
             }]
         );
         let _ = std::fs::remove_file(xlef);
@@ -17316,6 +18303,53 @@ EndClass: 0
         let _ = std::fs::remove_file(xlef);
         let _ = std::fs::remove_file(tiff_a);
         let _ = std::fs::remove_file(tiff_b);
+    }
+
+    #[test]
+    fn xlef_xlif_tilescan_file_tiles_are_not_multiplied_by_tile_count() {
+        let xlef = temp_flim2_path("tilescan_project.xlef");
+        let xlif = xlef.with_file_name("tilescan.xlif");
+        let tile_a = xlef.with_file_name("tile_a.tif");
+        let tile_b = xlef.with_file_name("tile_b.tif");
+        write_one_pixel_tiff(&tile_a, 31);
+        write_one_pixel_tiff(&tile_b, 42);
+        std::fs::write(
+            &xlif,
+            r#"<XLIF>
+<DimensionDescription DimID="10" NumberOfElements="2"/>
+<Image File="tile_a.tif"/>
+<Image File="tile_b.tif"/>
+</XLIF>"#,
+        )
+        .unwrap();
+        std::fs::write(&xlef, r#"<XLEF><Project File="tilescan.xlif"/></XLEF>"#).unwrap();
+
+        let mut reader = XlefReader::new();
+        reader.set_id(&xlef).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![31]);
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("xlef.project.tile_index"),
+            Some(MetadataValue::Int(0))
+        ));
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![42]);
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("xlef.project.tile_index"),
+            Some(MetadataValue::Int(1))
+        ));
+
+        let _ = std::fs::remove_file(xlef);
+        let _ = std::fs::remove_file(xlif);
+        let _ = std::fs::remove_file(tile_a);
+        let _ = std::fs::remove_file(tile_b);
     }
 
     #[test]
@@ -17565,6 +18599,8 @@ EndClass: 0
         write_slidebook_tiff(&path);
 
         let mut reader = SlidebookTiffReader::new();
+        let header = std::fs::read(&path).unwrap();
+        assert!(reader.is_this_type_by_bytes(&header[..header.len().min(512)]));
         reader.set_id(&path).expect("SlideBook TIFF should open");
         let md = &reader.metadata().series_metadata;
 
@@ -17584,6 +18620,20 @@ EndClass: 0
             md.get("slidebook.position_z"),
             Some(crate::common::metadata::MetadataValue::Float(v)) if (*v - 3.5).abs() < 1e-12
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn slidebook_tiff_rejects_plain_tiff_without_java_private_tags() {
+        let path = temp_flim2_path("plain-slidebook-candidate.tif");
+        write_one_pixel_tiff(&path, 1);
+
+        let err = SlidebookTiffReader::new().set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("SlideBook TIFF")),
+            "{err:?}"
+        );
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -17676,6 +18726,50 @@ EndClass: 0
             split_flowsight_pipe_list("BF|SSC|"),
             vec!["BF".to_string(), "SSC".to_string()]
         );
+    }
+
+    #[test]
+    fn flowsight_channel_in_use_count_matches_java_imaging_child_scope() {
+        assert_eq!(
+            count_flowsight_channels_in_use(
+                "<Root><ChannelInUseIndicators>1</ChannelInUseIndicators><Imaging><Other><ChannelInUseIndicators>1 1 1</ChannelInUseIndicators></Other><ChannelInUseIndicators_0>1 0 1</ChannelInUseIndicators_0></Imaging></Root>"
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            count_flowsight_channels_in_use(
+                "<Root><ChannelInUseIndicators>1 1 1</ChannelInUseIndicators><Imaging><Other>1</Other></Imaging></Root>"
+            ),
+            None
+        );
+        assert_eq!(
+            count_flowsight_channels_in_use(
+                "<Root><Imaging><ChannelInUseIndicators>1\t1 1</ChannelInUseIndicators></Imaging></Root>"
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn flowsight_rejects_channel_description_count_mismatch_like_java() {
+        let path = temp_cif_path("bad-channel-descs");
+        write_synthetic_flowsight_cif_with_metadata(
+            &path,
+            8,
+            FLOWSIGHT_BITMASK_COMPRESSION,
+            &[0x00, 1, 0xff, 1],
+            "BF|SSC",
+            "Only one description",
+            "<Root><Imaging><ChannelInUseIndicators>1 1</ChannelInUseIndicators></Imaging></Root>",
+        );
+
+        let err = FlowSightReader::new().set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("does not match number of channel descriptions")),
+            "unexpected FlowSight error: {err:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -18261,20 +19355,34 @@ EndClass: 0
     }
 
     #[test]
-    fn ets_parse_rejects_malformed_tile_counts_before_metadata() {
+    fn ets_parse_tolerates_chunk_byte_count_mismatches_like_java() {
         let short_payload = temp_flim2_path("short-raw-tile.ets");
         std::fs::write(
             &short_payload,
             build_synthetic_ets(2, ETS_PT_USHORT, 1, 2, 2, 2, 2),
         )
         .unwrap();
-        let err = CellSensReader::parse_ets(&short_payload).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("RAW tile byte count")),
-            "{err:?}"
+        let vol = CellSensReader::parse_ets(&short_payload).unwrap();
+        assert_eq!(vol.tiles[0].2, 2);
+        assert_eq!(
+            vol.decode_tile(0, 0, 0, 0, 0, 0).unwrap(),
+            vec![0, 1, 0, 0, 0, 0, 0, 0]
         );
         let _ = std::fs::remove_file(short_payload);
 
+        let zero_count = temp_flim2_path("zero-raw-count.ets");
+        std::fs::write(
+            &zero_count,
+            build_synthetic_ets(2, ETS_PT_UCHAR, 1, 1, 1, 0, 1),
+        )
+        .unwrap();
+        let vol = CellSensReader::parse_ets(&zero_count).unwrap();
+        assert_eq!(vol.decode_tile(0, 0, 0, 0, 0, 0).unwrap(), vec![0]);
+        let _ = std::fs::remove_file(zero_count);
+    }
+
+    #[test]
+    fn ets_parse_rejects_truncated_chunk_table_before_metadata() {
         let truncated_table = temp_flim2_path("truncated-table.ets");
         let mut bytes = build_synthetic_ets(2, ETS_PT_UCHAR, 1, 1, 1, 1, 1);
         bytes.truncate(260);
@@ -18308,11 +19416,8 @@ EndClass: 0
             build_synthetic_ets(2, ETS_PT_UCHAR, 1, 2, 2, 4, 2),
         )
         .unwrap();
-        let err = CellSensReader::parse_ets(&missing_payload).unwrap_err();
-        assert!(
-            matches!(err, BioFormatsError::InvalidData(ref message) if message.contains("past end of file")),
-            "{err:?}"
-        );
+        let vol = CellSensReader::parse_ets(&missing_payload).unwrap();
+        assert_eq!(vol.decode_tile(0, 0, 0, 0, 0, 0).unwrap(), vec![0, 1, 0, 0]);
         let _ = std::fs::remove_file(missing_payload);
     }
 
@@ -18341,6 +19446,28 @@ EndClass: 0
             reader.set_series(0),
             Err(BioFormatsError::SeriesOutOfRange(0))
         ));
+    }
+
+    #[test]
+    fn cellsens_vsi_without_ets_exposes_embedded_tiff_series() {
+        let path = temp_flim2_path("no-ets.vsi");
+        write_one_pixel_tiff(&path, 0x5a);
+
+        let mut reader = CellSensReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(
+            reader.series_count(),
+            1,
+            "Java CellSensReader files.size()==1 path exposes embedded TIFF IFDs"
+        );
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 1);
+        assert_eq!(meta.size_y, 1);
+        assert_eq!(meta.image_count, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x5a]);
+
+        let _ = std::fs::remove_file(path);
     }
 
     /// Non-geometry acquisition metadata tags are captured into the pyramid meta
@@ -18757,6 +19884,32 @@ EndClass: 0
         assert_eq!(used.len(), 2);
 
         reader.close().unwrap();
+        let _ = std::fs::remove_file(&spc_path);
+        let _ = std::fs::remove_file(&set_path);
+    }
+
+    #[test]
+    fn spc_rejects_out_of_bounds_region_like_java_check_plane_parameters() {
+        let base = unique_spc_base();
+        let spc_path = base.with_extension("spc");
+        let set_path = base.with_extension("set");
+        File::create(&spc_path)
+            .unwrap()
+            .write_all(&build_spc_stream())
+            .unwrap();
+        File::create(&set_path)
+            .unwrap()
+            .write_all(&build_set_file())
+            .unwrap();
+
+        let mut reader = SpcReader::new();
+        reader.set_id(&spc_path).expect("SPC set_id should succeed");
+
+        let err = reader.open_bytes_region(0, 1, 0, 2, 1).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(message) if message.contains("outside image bounds"))
+        );
+
         let _ = std::fs::remove_file(&spc_path);
         let _ = std::fs::remove_file(&set_path);
     }

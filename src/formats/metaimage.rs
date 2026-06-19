@@ -16,8 +16,8 @@ use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 use crate::common::writer::FormatWriter;
 
-fn meta_pixel_type(s: &str) -> PixelType {
-    match s {
+fn meta_pixel_type(s: &str) -> Result<PixelType> {
+    let ty = match s.to_ascii_uppercase().as_str() {
         "MET_CHAR" => PixelType::Int8,
         "MET_UCHAR" => PixelType::Uint8,
         "MET_SHORT" => PixelType::Int16,
@@ -26,8 +26,13 @@ fn meta_pixel_type(s: &str) -> PixelType {
         "MET_UINT" => PixelType::Uint32,
         "MET_FLOAT" => PixelType::Float32,
         "MET_DOUBLE" => PixelType::Float64,
-        _ => PixelType::Uint8,
-    }
+        _ => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "MetaImage: unsupported ElementType {s}"
+            )));
+        }
+    };
+    Ok(ty)
 }
 
 fn meta_type_str(pt: PixelType) -> &'static str {
@@ -75,6 +80,7 @@ enum DataLayout {
 struct MhdHeader {
     ndims: usize,
     sizes: Vec<u32>,
+    channels: u32,
     pixel_type: PixelType,
     little_endian: bool,
     compressed: bool,
@@ -93,6 +99,7 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
 
     let mut ndims = 3usize;
     let mut sizes: Vec<u32> = Vec::new();
+    let mut channels = 1u32;
     let mut pixel_type = PixelType::Uint8;
     let mut little_endian = true;
     let mut compressed = false;
@@ -126,9 +133,16 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
                 "DIMSIZE" | "DIM_SIZE" => {
                     sizes = parse_meta_sizes(val)?;
                 }
-                "ELEMENTTYPE" => pixel_type = meta_pixel_type(val),
+                "ELEMENTTYPE" => pixel_type = meta_pixel_type(val)?,
+                "ELEMENTNUMBEROFCHANNELS" => {
+                    channels = parse_meta_scalar(val, "ElementNumberOfChannels")?;
+                }
                 "ELEMENTBYTEORDERMSB" => little_endian = !val.eq_ignore_ascii_case("true"),
-                "BINARYDATA" if val.eq_ignore_ascii_case("false") => {}
+                "BINARYDATA" if val.eq_ignore_ascii_case("false") => {
+                    return Err(BioFormatsError::UnsupportedFormat(
+                        "MetaImage: ASCII BinaryData=False is not supported".into(),
+                    ));
+                }
                 "BINARYDATABYTEORDERMSB" => little_endian = !val.eq_ignore_ascii_case("true"),
                 "COMPRESSEDDATA" => compressed = val.eq_ignore_ascii_case("true"),
                 "HEADERSIZE" => {
@@ -200,10 +214,16 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
             "MetaImage: DimSize values must be positive".into(),
         ));
     }
+    if channels == 0 {
+        return Err(BioFormatsError::Format(
+            "MetaImage: ElementNumberOfChannels must be positive".into(),
+        ));
+    }
 
     Ok(MhdHeader {
         ndims,
         sizes,
+        channels,
         pixel_type,
         little_endian,
         compressed,
@@ -433,14 +453,14 @@ impl FormatReader for MetaImageReader {
             size_x,
             size_y,
             size_z,
-            size_c: 1,
+            size_c: hdr.channels,
             size_t: 1,
             pixel_type: hdr.pixel_type,
             bits_per_pixel: bps,
             image_count: size_z,
             dimension_order: DimensionOrder::XYZTC,
-            is_rgb: false,
-            is_interleaved: false,
+            is_rgb: hdr.channels > 1,
+            is_interleaved: hdr.channels > 1,
             is_indexed: false,
             is_little_endian: hdr.little_endian,
             resolution_count: 1,
@@ -499,7 +519,16 @@ impl FormatReader for MetaImageReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("MetaImage", &full, meta, 1, x, y, w, h)
+        crop_full_plane(
+            "MetaImage",
+            &full,
+            meta,
+            meta.size_c.max(1) as usize,
+            x,
+            y,
+            w,
+            h,
+        )
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -532,6 +561,18 @@ impl Default for MetaImageWriter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn bytes_as_little_endian(meta: &ImageMetadata, data: &[u8]) -> Vec<u8> {
+    let bps = meta.pixel_type.bytes_per_sample();
+    if meta.is_little_endian || bps <= 1 {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    for chunk in out.chunks_exact_mut(bps) {
+        chunk.reverse();
+    }
+    out
 }
 
 impl FormatWriter for MetaImageWriter {
@@ -567,7 +608,7 @@ impl FormatWriter for MetaImageWriter {
             plane_index,
             data.len(),
         )?;
-        self.planes.push(data.to_vec());
+        self.planes.push(bytes_as_little_endian(meta, data));
         Ok(())
     }
     fn close(&mut self) -> Result<()> {

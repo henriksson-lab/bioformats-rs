@@ -9,7 +9,9 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue, ModuloAnnotation};
+use crate::common::metadata::{
+    DimensionOrder, ImageMetadata, LookupTable, MetadataValue, ModuloAnnotation,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::stitcher::{FilePattern, FileStitcher};
@@ -420,7 +422,21 @@ impl FormatReader for AplReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("apl") | Some("tnb") | Some("mtb"))
+        if matches!(ext.as_deref(), Some("apl") | Some("tnb") | Some("mtb")) {
+            return true;
+        }
+        if ext.as_deref() == Some("tif") {
+            if let Some(parent) = path
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+            {
+                if let Some(name) = parent.file_name().and_then(|n| n.to_str()) {
+                    return parent.join(format!("{name}.apl")).exists();
+                }
+            }
+        }
+        false
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -793,23 +809,11 @@ impl FormatReader for ArfReader {
         let width = read_u16(&hdr[6..8]);
         let height = read_u16(&hdr[8..10]);
         let bits_per_pixel = read_u16(&hdr[10..12]);
-        if width == 0 || height == 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "ARF header has zero image dimensions".to_string(),
-            ));
-        }
-
         // For version 2, the image count follows; otherwise a single image.
         let num_images = if version == 2 {
             let mut nb = [0u8; 2];
             f.read_exact(&mut nb).map_err(BioFormatsError::Io)?;
-            let count = read_u16(&nb);
-            if count == 0 {
-                return Err(BioFormatsError::UnsupportedFormat(
-                    "ARF header declares zero image count".to_string(),
-                ));
-            }
-            count
+            read_u16(&nb)
         } else {
             1
         };
@@ -830,22 +834,19 @@ impl FormatReader for ArfReader {
                 )))
             }
         };
-        let plane_bytes = (width as u64)
-            .checked_mul(height as u64)
-            .and_then(|px| px.checked_mul(pixel_type.bytes_per_sample() as u64))
-            .ok_or_else(|| BioFormatsError::Format("ARF image plane is too large".to_string()))?;
-        let required_len = ARF_PIXELS_OFFSET
-            .checked_add(plane_bytes.checked_mul(num_images as u64).ok_or_else(|| {
-                BioFormatsError::Format("ARF image payload size overflows".to_string())
-            })?)
-            .ok_or_else(|| BioFormatsError::Format("ARF file size overflows".to_string()))?;
-        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
-        if file_len < required_len {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "ARF payload is shorter than declared image dimensions".to_string(),
-            ));
-        }
-
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert(
+            "Endianness".into(),
+            MetadataValue::String(if little { "little" } else { "big" }.into()),
+        );
+        series_metadata.insert("Version".into(), MetadataValue::Int(version as i64));
+        series_metadata.insert("Width".into(), MetadataValue::Int(width as i64));
+        series_metadata.insert("Height".into(), MetadataValue::Int(height as i64));
+        series_metadata.insert(
+            "Bits per pixel".into(),
+            MetadataValue::Int(bits_per_pixel as i64),
+        );
+        series_metadata.insert("Image count".into(), MetadataValue::Int(num_images as i64));
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x: width,
@@ -863,7 +864,7 @@ impl FormatReader for ArfReader {
             is_little_endian: little,
             resolution_count: 1,
             thumbnail: false,
-            series_metadata: HashMap::new(),
+            series_metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
@@ -1078,9 +1079,14 @@ impl FormatReader for I2iReader {
         }
         let size_t = n;
 
-        if size_x <= 0 || size_y <= 0 || size_z <= 0 || size_t <= 0 {
+        if size_x <= 0 || size_y <= 0 || size_z <= 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "I2I header has non-positive dimensions".to_string(),
+            ));
+        }
+        if size_t < 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "I2I header has negative additional dimension".to_string(),
             ));
         }
 
@@ -1262,6 +1268,8 @@ struct JdceWell {
     field_count: usize,
     /// (field, plane) -> absolute TIFF path.
     files: HashMap<(u32, u32), String>,
+    /// (field, plane) -> CSV plane dimensions.
+    plane_sizes: HashMap<(u32, u32), (u32, u32)>,
 }
 
 impl JdceReader {
@@ -1477,6 +1485,7 @@ impl FormatReader for JdceReader {
                         col: well_col,
                         field_count: 0,
                         files: HashMap::new(),
+                        plane_sizes: HashMap::new(),
                     });
                     wells.last_mut().unwrap()
                 }
@@ -1492,6 +1501,7 @@ impl FormatReader for JdceReader {
             let csv_h = height_index
                 .and_then(|i| get(i).parse::<u32>().ok())
                 .unwrap_or(0);
+            well.plane_sizes.insert((field, plane), (csv_w, csv_h));
 
             if first_file {
                 let mut tiff = crate::tiff::TiffReader::new();
@@ -1504,9 +1514,6 @@ impl FormatReader for JdceReader {
                     tiff_size_c = m.size_c.max(1);
                     is_rgb = m.is_rgb;
                     first_file = false;
-                } else {
-                    size_x = csv_w;
-                    size_y = csv_h;
                 }
             }
         }
@@ -1516,7 +1523,11 @@ impl FormatReader for JdceReader {
                 "JDCE: no image entries found in CSV".to_string(),
             ));
         }
-        if size_x == 0 || size_y == 0 {
+        let has_csv_dimensions = wells
+            .iter()
+            .flat_map(|w| w.plane_sizes.values())
+            .any(|(w, h)| *w > 0 && *h > 0);
+        if (size_x == 0 || size_y == 0) && !has_csv_dimensions {
             return Err(BioFormatsError::UnsupportedFormat(
                 "JDCE: could not determine plane dimensions".to_string(),
             ));
@@ -1529,15 +1540,21 @@ impl FormatReader for JdceReader {
         wells.sort_by_key(|w| (w.row, w.col));
         for well in &wells {
             for field in 0..well.field_count as u32 {
+                let mut series_size_x = size_x;
+                let mut series_size_y = size_y;
                 let mut files = vec![None; image_count as usize];
                 for (plane, slot) in files.iter_mut().enumerate() {
                     if let Some(f) = well.files.get(&(field, plane as u32)) {
                         *slot = Some(f.clone());
                     }
+                    if let Some((w, h)) = well.plane_sizes.get(&(field, plane as u32)) {
+                        series_size_x = series_size_x.max(*w);
+                        series_size_y = series_size_y.max(*h);
+                    }
                 }
                 let meta = ImageMetadata {
-                    size_x,
-                    size_y,
+                    size_x: series_size_x,
+                    size_y: series_size_y,
                     size_z,
                     size_c,
                     size_t,
@@ -1657,16 +1674,105 @@ impl FormatReader for JdceReader {
 // ---------------------------------------------------------------------------
 /// JPX (JPEG 2000 Part 2) format reader (`.jpx`).
 ///
-/// JPX files are JPEG 2000 Part 2; delegates to `Jpeg2000Reader`.
+/// Mirrors Bio-Formats `JPXReader`: JPX detection requires a JPEG 2000
+/// codestream/box signature and an EOC marker at EOF, and each embedded
+/// codestream start (`FF 4F FF 51`) is exposed as one T plane.
 pub struct JpxReader {
-    inner: crate::formats::misc::Jpeg2000Reader,
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    pixel_offsets: Vec<u64>,
+    last_plane: Option<(u32, Vec<u8>)>,
 }
 
 impl JpxReader {
     pub fn new() -> Self {
         JpxReader {
-            inner: crate::formats::misc::Jpeg2000Reader::new(),
+            path: None,
+            meta: None,
+            pixel_offsets: Vec::new(),
+            last_plane: None,
         }
+    }
+
+    fn find_pixel_offsets(data: &[u8]) -> Vec<u64> {
+        data.windows(4)
+            .enumerate()
+            .filter_map(|(i, w)| (w == [0xff, 0x4f, 0xff, 0x51]).then_some(i as u64))
+            .collect()
+    }
+
+    fn codestream_slice<'a>(&self, data: &'a [u8], plane_index: u32) -> Result<&'a [u8]> {
+        let start = *self
+            .pixel_offsets
+            .get(plane_index as usize)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))? as usize;
+        let next = self
+            .pixel_offsets
+            .get(plane_index as usize + 1)
+            .map(|o| *o as usize)
+            .unwrap_or(data.len());
+        let mut end = next.min(data.len());
+        if let Some(eoc) = data[start..end].windows(2).position(|w| w == [0xff, 0xd9]) {
+            end = start + eoc + 2;
+        }
+        data.get(start..end).ok_or_else(|| {
+            BioFormatsError::Format("JPX codestream offset is outside the file".to_string())
+        })
+    }
+
+    fn decode_plane_from_slice(slice: &[u8]) -> Result<(Vec<u8>, ImageMetadata)> {
+        let image = jpeg2k::Image::from_bytes(slice)
+            .map_err(|e| BioFormatsError::Codec(format!("JPX JPEG 2000: {e}")))?;
+        let components = image.components();
+        if components.is_empty() {
+            return Err(BioFormatsError::Codec(
+                "JPX JPEG 2000: no components".to_string(),
+            ));
+        }
+
+        let width = components[0].width() as u32;
+        let height = components[0].height() as u32;
+        let n_components = components.len() as u32;
+        let precision = components[0].precision() as u8;
+        let signed = components[0].is_signed();
+        let (pixel_type, bits_per_pixel) = jpx_pixel_type(precision, signed);
+        let bytes_per_sample = (bits_per_pixel / 8) as usize;
+        let w = width as usize;
+        let h = height as usize;
+        let nc = n_components as usize;
+        let mut pixels = Vec::with_capacity(w * h * nc * bytes_per_sample);
+        for y in 0..h {
+            for x in 0..w {
+                for component in components.iter().take(nc) {
+                    let value = component.data()[y * w + x];
+                    append_jpx_sample(&mut pixels, value, bytes_per_sample, signed);
+                }
+            }
+        }
+
+        let meta = ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: n_components,
+            size_t: 1,
+            pixel_type,
+            bits_per_pixel,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: n_components > 1,
+            is_interleaved: true,
+            is_indexed: false,
+            is_little_endian: false,
+            resolution_count: 1,
+            thumbnail: false,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        };
+        Ok((pixels, meta))
     }
 }
 
@@ -1686,44 +1792,185 @@ impl FormatReader for JpxReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        self.inner.is_this_type_by_bytes(header)
+        if header.len() < 8 {
+            return false;
+        }
+        let valid_start = header.starts_with(&[0xff, 0x4f])
+            || header.get(4..8) == Some(&[0x6a, 0x50, 0x20, 0x20]);
+        let valid_end = header.ends_with(&[0xff, 0xd9]);
+        valid_start && valid_end
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.inner.set_id(path)
+        self.close()?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let pixel_offsets = Self::find_pixel_offsets(&data);
+        if pixel_offsets.is_empty() {
+            return Err(BioFormatsError::Format(
+                "JPX: no JPEG 2000 codestreams found".to_string(),
+            ));
+        }
+
+        self.pixel_offsets = pixel_offsets;
+        let first = self.codestream_slice(&data, 0)?;
+        let (plane, mut meta) = Self::decode_plane_from_slice(first)?;
+        meta.size_t = self.pixel_offsets.len() as u32;
+        meta.image_count = meta.size_t;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.last_plane = Some((0, plane));
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.inner.close()
+        self.path = None;
+        self.meta = None;
+        self.pixel_offsets.clear();
+        self.last_plane = None;
+        Ok(())
     }
 
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        if self.meta.is_some() && s == 0 {
+            Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        }
     }
 
     fn series(&self) -> usize {
-        self.inner.series()
+        0
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
-    fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if let Some((cached_plane, data)) = &self.last_plane {
+            if *cached_plane == plane_index {
+                return Ok(data.clone());
+            }
+        }
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let slice = self.codestream_slice(&data, plane_index)?;
+        let (plane, _) = Self::decode_plane_from_slice(slice)?;
+        self.last_plane = Some((plane_index, plane.clone()));
+        Ok(plane)
     }
 
-    fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = meta.clone();
+        let plane = self.open_bytes(plane_index)?;
+        crop_jpx_plane(&plane, &meta, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(p)
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+}
+
+fn jpx_pixel_type(precision: u8, signed: bool) -> (PixelType, u8) {
+    if precision <= 8 {
+        (
+            if signed {
+                PixelType::Int8
+            } else {
+                PixelType::Uint8
+            },
+            8,
+        )
+    } else if precision <= 16 {
+        (
+            if signed {
+                PixelType::Int16
+            } else {
+                PixelType::Uint16
+            },
+            16,
+        )
+    } else {
+        (
+            if signed {
+                PixelType::Int32
+            } else {
+                PixelType::Uint32
+            },
+            32,
+        )
+    }
+}
+
+fn append_jpx_sample(out: &mut Vec<u8>, value: i32, bytes_per_sample: usize, signed: bool) {
+    match (bytes_per_sample, signed) {
+        (1, _) => out.push(value as u8),
+        (2, true) => out.extend_from_slice(&(value as i16).to_be_bytes()),
+        (2, false) => out.extend_from_slice(&(value as u16).to_be_bytes()),
+        (_, true) => out.extend_from_slice(&value.to_be_bytes()),
+        (_, false) => out.extend_from_slice(&(value as u32).to_be_bytes()),
+    }
+}
+
+fn crop_jpx_plane(
+    plane: &[u8],
+    meta: &ImageMetadata,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    if x.checked_add(w).is_none_or(|end| end > meta.size_x)
+        || y.checked_add(h).is_none_or(|end| end > meta.size_y)
+    {
+        return Err(BioFormatsError::Format(
+            "requested region is outside the image bounds".to_string(),
+        ));
+    }
+    let bytes_per_pixel = (meta.bits_per_pixel as usize / 8) * meta.size_c.max(1) as usize;
+    let row_bytes = meta.size_x as usize * bytes_per_pixel;
+    let crop_row_bytes = w as usize * bytes_per_pixel;
+    let x_offset = x as usize * bytes_per_pixel;
+    let mut out = Vec::with_capacity(crop_row_bytes * h as usize);
+    for row in y as usize..(y + h) as usize {
+        let start = row
+            .checked_mul(row_bytes)
+            .and_then(|base| base.checked_add(x_offset))
+            .ok_or_else(|| BioFormatsError::Format("requested region is too large".to_string()))?;
+        let end = start
+            .checked_add(crop_row_bytes)
+            .ok_or_else(|| BioFormatsError::Format("requested region is too large".to_string()))?;
+        if end > plane.len() {
+            return Err(BioFormatsError::Format(
+                "decoded plane is shorter than expected".to_string(),
+            ));
+        }
+        out.extend_from_slice(&plane[start..end]);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2410,6 +2657,7 @@ pub struct PdsReader {
     pixels_file: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     record_width: u32,
+    lut_index: i32,
     reverse_x: bool,
     reverse_y: bool,
 }
@@ -2421,6 +2669,7 @@ impl PdsReader {
             pixels_file: None,
             meta: None,
             record_width: 0,
+            lut_index: -1,
             reverse_x: false,
             reverse_y: false,
         }
@@ -2517,6 +2766,7 @@ impl FormatReader for PdsReader {
         self.pixels_file = None;
         self.meta = None;
         self.record_width = 0;
+        self.lut_index = -1;
         self.reverse_x = false;
         self.reverse_y = false;
 
@@ -2531,6 +2781,7 @@ impl FormatReader for PdsReader {
         let mut size_c: u32 = 1;
         let mut is_rgb = false;
         let mut is_indexed = false;
+        let mut lut_index = -1;
         let mut record_width: u32 = 0;
         let mut reverse_x = false;
         let mut reverse_y = false;
@@ -2575,7 +2826,7 @@ impl FormatReader for PdsReader {
                     } else {
                         size_c = 1;
                         is_rgb = false;
-                        let lut_index = color - 1;
+                        lut_index = color - 1;
                         is_indexed = lut_index >= 0;
                     }
                 }
@@ -2617,31 +2868,8 @@ impl FormatReader for PdsReader {
                 BioFormatsError::Format("PDS header path has no extension".to_string())
             })?
         };
-        if !pixels_file.exists() {
-            return Err(BioFormatsError::Format(
-                "PDS companion .IMG/.img pixel file not found".to_string(),
-            ));
-        }
-
-        // Validate the companion file is large enough for the declared plane,
-        // so truncated datasets fail in set_id like the reference would on read.
-        let pad = record_width - (size_x % record_width);
-        let scanline = (size_x as u64) + (pad as u64);
-        let required = scanline
-            .checked_mul(size_y as u64)
-            .and_then(|rows| rows.checked_mul(size_c as u64))
-            .and_then(|samples| samples.checked_mul(2)) // UINT16
-            .ok_or_else(|| BioFormatsError::Format("PDS plane is too large".to_string()))?;
-        let available = std::fs::metadata(&pixels_file)
-            .map_err(BioFormatsError::Io)?
-            .len();
-        if available < required {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "PDS companion file is shorter than declared image dimensions".to_string(),
-            ));
-        }
-
         self.record_width = record_width;
+        self.lut_index = lut_index;
         self.reverse_x = reverse_x;
         self.reverse_y = reverse_y;
         self.header_path = Some(header_path);
@@ -2665,7 +2893,7 @@ impl FormatReader for PdsReader {
             resolution_count: 1,
             thumbnail: false,
             series_metadata: HashMap::new(),
-            lookup_table: None,
+            lookup_table: pds_lut(lut_index),
             modulo_z: None,
             modulo_c: None,
             modulo_t: None,
@@ -2678,6 +2906,7 @@ impl FormatReader for PdsReader {
         self.pixels_file = None;
         self.meta = None;
         self.record_width = 0;
+        self.lut_index = -1;
         self.reverse_x = false;
         self.reverse_y = false;
         Ok(())
@@ -2830,6 +3059,34 @@ impl FormatReader for PdsReader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn lookup_table(&mut self, _plane_index: u32) -> Result<Option<LookupTable>> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        Ok(pds_lut(self.lut_index))
+    }
+}
+
+fn pds_lut(lut_index: i32) -> Option<LookupTable> {
+    if !(0..3).contains(&lut_index) {
+        return None;
+    }
+    let mut lut = LookupTable {
+        red: vec![0; 65_536],
+        green: vec![0; 65_536],
+        blue: vec![0; 65_536],
+    };
+    let channel = match lut_index {
+        0 => &mut lut.red,
+        1 => &mut lut.green,
+        2 => &mut lut.blue,
+        _ => unreachable!(),
+    };
+    for (i, value) in channel.iter_mut().enumerate() {
+        *value = i as u16;
+    }
+    Some(lut)
 }
 
 // ---------------------------------------------------------------------------
@@ -3282,6 +3539,23 @@ impl FormatReader for HrdgdfReader {
 
         // Header lines (metadata only; not required to build the image).
         let hurricane = data[0].rsplit(' ').next().unwrap_or("").to_string();
+        let pixel_size = data
+            .get(1)
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_string();
+        let (center_longitude, center_latitude) = data
+            .get(2)
+            .map(|line| line.replace("STORM CENTER LOCALE IS ", ""))
+            .map(|line| {
+                let mut numbers = line
+                    .split_whitespace()
+                    .filter_map(|v| v.parse::<f64>().ok());
+                let lon = numbers.next().unwrap_or(0.0);
+                let lat = numbers.next().unwrap_or(0.0);
+                (lon, lat)
+            })
+            .unwrap_or((0.0, 0.0));
 
         // Skip ahead to the surface wind section.
         let mut line_number = 3usize;
@@ -3341,6 +3615,22 @@ impl FormatReader for HrdgdfReader {
 
         let mut series_metadata = HashMap::new();
         series_metadata.insert("Hurricane".to_string(), MetadataValue::String(hurricane));
+        series_metadata.insert(
+            "DX (kilometers)".to_string(),
+            MetadataValue::String(pixel_size.clone()),
+        );
+        series_metadata.insert(
+            "DY (kilometers)".to_string(),
+            MetadataValue::String(pixel_size),
+        );
+        series_metadata.insert(
+            "Storm center (Latitude)".to_string(),
+            MetadataValue::Float(center_latitude),
+        );
+        series_metadata.insert(
+            "Storm center (Longitude)".to_string(),
+            MetadataValue::Float(center_longitude),
+        );
 
         self.surface_wind = surface_wind;
         self.meta = Some(ImageMetadata {
@@ -4497,6 +4787,13 @@ impl KlbReader {
             a.div_ceil(b)
         }
     }
+
+    fn metadata_positive_f64(meta: &ImageMetadata, key: &str) -> Option<f64> {
+        match meta.series_metadata.get(key) {
+            Some(MetadataValue::Float(value)) if value.is_finite() && *value > 0.0 => Some(*value),
+            _ => None,
+        }
+    }
 }
 
 impl Default for KlbReader {
@@ -4554,9 +4851,12 @@ impl FormatReader for KlbReader {
             ));
         }
 
-        // dims_pixelSize: 5 x float32 (parsed but unused here)
-        f.seek(SeekFrom::Current((KLB_DATA_DIMS * 4) as i64))
-            .map_err(BioFormatsError::Io)?;
+        let mut dims_pixel_size = [0f32; KLB_DATA_DIMS];
+        let mut buf_f32 = [0u8; 4];
+        for value in dims_pixel_size.iter_mut() {
+            f.read_exact(&mut buf_f32).map_err(BioFormatsError::Io)?;
+            *value = f32::from_le_bytes(buf_f32);
+        }
 
         f.read_exact(&mut byte).map_err(BioFormatsError::Io)?;
         let pixel_type = Self::convert_pixel_type(byte[0])?;
@@ -4641,6 +4941,34 @@ impl FormatReader for KlbReader {
             .and_then(|v| v.checked_mul(size_t))
             .ok_or_else(|| BioFormatsError::Format("KLB image count overflows".to_string()))?;
 
+        let mut series_metadata = HashMap::new();
+        for (axis, value) in ["X", "Y", "Z", "C", "T"].iter().zip(dims_pixel_size.iter()) {
+            if value.is_finite() && *value > 0.0 {
+                series_metadata.insert(
+                    format!("KLB PixelSize{axis}"),
+                    MetadataValue::Float(*value as f64),
+                );
+            }
+        }
+        if dims_pixel_size[0].is_finite() && dims_pixel_size[0] > 0.0 {
+            series_metadata.insert(
+                "PhysicalSizeX".to_string(),
+                MetadataValue::Float(dims_pixel_size[0] as f64),
+            );
+        }
+        if dims_pixel_size[1].is_finite() && dims_pixel_size[1] > 0.0 {
+            series_metadata.insert(
+                "PhysicalSizeY".to_string(),
+                MetadataValue::Float(dims_pixel_size[1] as f64),
+            );
+        }
+        if dims_pixel_size[2].is_finite() && dims_pixel_size[2] > 0.0 {
+            series_metadata.insert(
+                "PhysicalSizeZ".to_string(),
+                MetadataValue::Float(dims_pixel_size[2] as f64),
+            );
+        }
+
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x,
@@ -4653,6 +4981,7 @@ impl FormatReader for KlbReader {
             image_count,
             dimension_order: DimensionOrder::XYZCT,
             is_little_endian: true,
+            series_metadata,
             ..ImageMetadata::default()
         });
         self.layout = Some(KlbLayout {
@@ -4838,6 +5167,17 @@ impl FormatReader for KlbReader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.get_mut(0) {
+            image.physical_size_x = Self::metadata_positive_f64(meta, "PhysicalSizeX");
+            image.physical_size_y = Self::metadata_positive_f64(meta, "PhysicalSizeY");
+            image.physical_size_z = Self::metadata_positive_f64(meta, "PhysicalSizeZ");
+        }
+        Some(ome)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4867,6 +5207,81 @@ struct ObfStack {
 /// True if `label` is a FLIM (SPCM-prefixed) dimension label.
 fn obf_is_flim_label(label: &str) -> bool {
     label.starts_with("SPCM")
+}
+
+fn obf_metadata_list<T: std::fmt::Display>(values: &[T]) -> String {
+    values
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn obf_apply_description_metadata(
+    metadata: &mut HashMap<String, MetadataValue>,
+    description: &str,
+) {
+    let mut description = description.to_string();
+    if description.contains("<Time Lapse ") || description.contains("</Time Lapse") {
+        description = description
+            .replace("<Time Lapse ", "<TimeLapse ")
+            .replace("</Time Lapse", "</TimeLapse");
+    }
+
+    let mut reader = quick_xml::Reader::from_str(&description);
+    reader.config_mut().trim_text(true);
+    let mut stack: Vec<String> = Vec::new();
+    let mut parsed_xml = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                parsed_xml = true;
+                stack.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                parsed_xml = true;
+                stack.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+                stack.pop();
+            }
+            Ok(quick_xml::events::Event::Text(t)) => {
+                if stack.len() >= 3 {
+                    if let Ok(value) = t.xml_content(quick_xml::XmlVersion::Implicit1_0) {
+                        let value = value.trim();
+                        if !value.is_empty() {
+                            let parent = if matches!(
+                                stack.get(stack.len().saturating_sub(2)).map(String::as_str),
+                                Some("doc") | Some("hwr")
+                            ) && stack.len() >= 4
+                            {
+                                &stack[stack.len() - 3]
+                            } else {
+                                &stack[stack.len() - 2]
+                            };
+                            let leaf = &stack[stack.len() - 1];
+                            if leaf != "doc" && leaf != "hwr" {
+                                metadata.insert(
+                                    format!("{parent} {leaf}"),
+                                    MetadataValue::String(value.to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                stack.pop();
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => {
+                parsed_xml = false;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !parsed_xml {
+        metadata.insert("Description".into(), MetadataValue::String(description));
+    }
 }
 
 /// Little-endian sequential reader over the OBF file used during parsing.
@@ -5372,13 +5787,35 @@ impl ObfReader {
         let mut modulo_z: Option<ModuloAnnotation> = None;
         let mut is_flim = false;
 
-        // lengths (15 doubles) and offsets (15 doubles) - parsed but unused.
-        for _ in 0..OBF_MAX_DIMS {
-            input.f64()?;
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert(
+            "Stack version".into(),
+            MetadataValue::Int(stack_version as i64),
+        );
+
+        let mut lengths = Vec::with_capacity(num_dims);
+        for dimension in 0..OBF_MAX_DIMS {
+            let length = input.f64()?;
+            if dimension < num_dims {
+                lengths.push(length);
+            }
         }
-        for _ in 0..OBF_MAX_DIMS {
-            input.f64()?;
+        series_metadata.insert(
+            "Lengths".into(),
+            MetadataValue::String(obf_metadata_list(&lengths)),
+        );
+
+        let mut offsets = Vec::with_capacity(num_dims);
+        for dimension in 0..OBF_MAX_DIMS {
+            let offset = input.f64()?;
+            if dimension < num_dims {
+                offsets.push(offset);
+            }
         }
+        series_metadata.insert(
+            "Offsets".into(),
+            MetadataValue::String(obf_metadata_list(&offsets)),
+        );
 
         let type_code = input.i32()?;
         let (pixel_type, bits_per_pixel) = Self::pixel_type(type_code)?;
@@ -5405,8 +5842,20 @@ impl ObfReader {
             ));
         }
         let next = input.i64()?;
-        input.skip(length_of_name.max(0) as u64)?;
-        input.skip(length_of_description.max(0) as u64)?;
+        let name = if length_of_name > 0 {
+            String::from_utf8_lossy(&input.read_n(length_of_name as usize)?).into_owned()
+        } else {
+            String::new()
+        };
+        series_metadata.insert("Name".into(), MetadataValue::String(name));
+        let description = if length_of_description > 0 {
+            String::from_utf8_lossy(&input.read_n(length_of_description as usize)?).into_owned()
+        } else {
+            String::new()
+        };
+        if !description.is_empty() {
+            obf_apply_description_metadata(&mut series_metadata, &description);
+        }
 
         let position = input.pos()?;
 
@@ -5505,24 +5954,44 @@ impl ObfReader {
                     image_count = size_z * size_c * size_t;
                 }
             }
+            series_metadata.insert(
+                "Labels".into(),
+                MetadataValue::String(obf_metadata_list(&labels)),
+            );
 
             // steps (doubles) per dimension when present.
+            let mut steps_meta = Vec::with_capacity(num_dims);
             for d in 0..num_dims {
+                let mut dimension_steps = Vec::new();
                 if steps_present[d] {
                     for _ in 0..sizes[d].max(0) {
-                        input.f64()?;
+                        dimension_steps.push(input.f64()?);
                     }
                 }
+                steps_meta.push(format!("[{}]", obf_metadata_list(&dimension_steps)));
             }
+            series_metadata.insert("Steps".into(), MetadataValue::String(steps_meta.join(";")));
             // step labels (length-prefixed strings) per dimension when present.
+            let mut step_labels_meta = Vec::with_capacity(num_dims);
             for d in 0..num_dims {
+                let mut dimension_labels = Vec::new();
                 if step_labels_present[d] {
                     for _ in 0..sizes[d].max(0) {
                         let length = input.i32()?;
-                        input.skip(length.max(0) as u64)?;
+                        let label = if length > 0 {
+                            String::from_utf8_lossy(&input.read_n(length as usize)?).into_owned()
+                        } else {
+                            String::new()
+                        };
+                        dimension_labels.push(label);
                     }
                 }
+                step_labels_meta.push(format!("[{}]", dimension_labels.join(",")));
             }
+            series_metadata.insert(
+                "StepLabels".into(),
+                MetadataValue::String(step_labels_meta.join(";")),
+            );
 
             input.skip(obsolete_metadata_length.max(0) as u64)?;
 
@@ -5572,7 +6041,7 @@ impl ObfReader {
             is_little_endian: true,
             resolution_count: 1,
             thumbnail: false,
-            series_metadata: HashMap::new(),
+            series_metadata,
             lookup_table: None,
             modulo_z,
             modulo_c: None,
@@ -5866,6 +6335,30 @@ mod pds_tests {
     }
 
     #[test]
+    fn obf_description_metadata_flattens_java_xml_shape() {
+        let mut metadata = HashMap::new();
+        obf_apply_description_metadata(
+            &mut metadata,
+            "<Root><Acquisition><Laser>488</Laser><doc><Name>Run 1</Name></doc></Acquisition></Root>",
+        );
+        assert!(matches!(
+            metadata.get("Acquisition Laser"),
+            Some(MetadataValue::String(value)) if value == "488"
+        ));
+        assert!(matches!(
+            metadata.get("Acquisition Name"),
+            Some(MetadataValue::String(value)) if value == "Run 1"
+        ));
+
+        let mut plain = HashMap::new();
+        obf_apply_description_metadata(&mut plain, "plain description");
+        assert!(matches!(
+            plain.get("Description"),
+            Some(MetadataValue::String(value)) if value == "plain description"
+        ));
+    }
+
+    #[test]
     fn pds_grayscale_full_and_region() {
         // 3x2 image; record_width = 4 => pad = 4 - (3 % 4) = 1 sample per row.
         let size_x = 3u32;
@@ -5895,6 +6388,12 @@ mod pds_tests {
         assert_eq!(meta.pixel_type, PixelType::Uint16);
         assert!(meta.is_little_endian);
         assert!(!meta.is_rgb);
+        assert!(meta.is_indexed);
+        let lut = r.lookup_table(0).unwrap().unwrap();
+        assert_eq!(lut.red[0], 0);
+        assert_eq!(lut.red[65535], 65535);
+        assert_eq!(lut.green[65535], 0);
+        assert_eq!(lut.blue[65535], 0);
 
         // Full plane: padding must be stripped, row-major order preserved.
         let full = r.open_bytes(0).unwrap();
@@ -5943,7 +6442,8 @@ mod pds_tests {
 
     #[test]
     fn pds_reject_missing_companion() {
-        // Header present and valid, but no .IMG/.img companion exists.
+        // Header present and valid, but no .IMG/.img companion exists. Java
+        // initializes the dataset and only fails when pixels are opened.
         let base = unique_base("nocomp");
         let hdr = base.with_extension("hdr");
         let header = " IDENTIFICATION\r\n\
@@ -5955,9 +6455,9 @@ mod pds_tests {
         std::fs::write(&hdr, header).unwrap();
 
         let mut r = PdsReader::new();
-        assert!(r.set_id(&hdr).is_err());
-        // State stays uninitialized after the failure.
-        assert_eq!(r.series_count(), 0);
+        r.set_id(&hdr).unwrap();
+        assert_eq!(r.series_count(), 1);
+        assert!(r.open_bytes(0).is_err());
 
         cleanup(&[&hdr]);
     }
@@ -5979,7 +6479,9 @@ mod pds_tests {
         std::fs::write(&img, [0u8; 16]).unwrap();
 
         let mut r = PdsReader::new();
-        assert!(r.set_id(&hdr).is_err());
+        r.set_id(&hdr).unwrap();
+        assert_eq!(r.series_count(), 1);
+        assert!(r.open_bytes(0).is_err());
 
         cleanup(&[&hdr, &img]);
     }

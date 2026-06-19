@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -1102,7 +1102,7 @@ fn parse_openlab(path: &Path) -> Result<(ImageMetadata, OpenlabRawLayout)> {
     }
 
     if data[..4] == *OPENLAB_JAVA_MAGIC {
-        if data.len() < 46 {
+        if data.len() < 45 {
             return Err(BioFormatsError::Format(
                 "Openlab RAW OLRW header too short".into(),
             ));
@@ -1113,8 +1113,11 @@ fn parse_openlab(path: &Path) -> Result<(ImageMetadata, OpenlabRawLayout)> {
         let height = i32::from_be_bytes([data[24], data[25], data[26], data[27]]);
         let raw_channels = data[29] as u32;
         let bytes_per_pixel = data[30] as usize;
-        let name_len = data[45] as usize;
-        let name_start = 46usize;
+        let timestamp_raw = i64::from_be_bytes([
+            data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
+        ]);
+        let name_len = data[44] as usize;
+        let name_start = 45usize;
         let name_end = name_start
             .saturating_add(name_len.saturating_sub(1))
             .min(data.len());
@@ -1146,14 +1149,26 @@ fn parse_openlab(path: &Path) -> Result<(ImageMetadata, OpenlabRawLayout)> {
         };
         meta.is_little_endian = false;
         meta.series_metadata
+            .insert("Width".into(), MetadataValue::Int(width as i64));
+        meta.series_metadata
+            .insert("Height".into(), MetadataValue::Int(height as i64));
+        meta.series_metadata
             .insert("Version".into(), MetadataValue::Int(version as i64));
         meta.series_metadata.insert(
             "Bytes per pixel".into(),
             MetadataValue::Int(bytes_per_pixel as i64),
         );
-        if !image_name.is_empty() {
+        meta.series_metadata
+            .insert("Image name".into(), MetadataValue::String(image_name));
+        if timestamp_raw > 0 {
+            let timestamp_unix_seconds =
+                timestamp_raw / 1_000_000 - (67.0 * 365.25 * 24.0 * 60.0 * 60.0) as i64;
             meta.series_metadata
-                .insert("Image name".into(), MetadataValue::String(image_name));
+                .insert("Timestamp raw".into(), MetadataValue::Int(timestamp_raw));
+            meta.series_metadata.insert(
+                "Timestamp".into(),
+                MetadataValue::Int(timestamp_unix_seconds),
+            );
         }
 
         let plane_stride = (width as u64)
@@ -1359,8 +1374,13 @@ pub struct PhotonDynamicsReader {
     pixels_path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     record_width: usize,
+    lut_index: i32,
     reverse_x: bool,
     reverse_y: bool,
+    x_pos: Option<f64>,
+    y_pos: Option<f64>,
+    delta_x: Option<f64>,
+    delta_y: Option<f64>,
 }
 
 impl PhotonDynamicsReader {
@@ -1370,8 +1390,13 @@ impl PhotonDynamicsReader {
             pixels_path: None,
             meta: None,
             record_width: 0,
+            lut_index: -1,
             reverse_x: false,
             reverse_y: false,
+            x_pos: None,
+            y_pos: None,
+            delta_x: None,
+            delta_y: None,
         }
     }
 }
@@ -1409,9 +1434,20 @@ fn photon_dynamics_pixels_path(header_path: &Path) -> PathBuf {
     }
 }
 
-fn parse_photon_dynamics_header(
-    path: &Path,
-) -> Result<(ImageMetadata, PathBuf, usize, bool, bool)> {
+struct PhotonDynamicsParsed {
+    meta: ImageMetadata,
+    pixels_path: PathBuf,
+    record_width: usize,
+    lut_index: i32,
+    reverse_x: bool,
+    reverse_y: bool,
+    x_pos: Option<f64>,
+    y_pos: Option<f64>,
+    delta_x: Option<f64>,
+    delta_y: Option<f64>,
+}
+
+fn parse_photon_dynamics_header(path: &Path) -> Result<PhotonDynamicsParsed> {
     let header_path = photon_dynamics_header_path(path);
     let content = std::fs::read_to_string(&header_path).map_err(BioFormatsError::Io)?;
     if !content.starts_with(" IDENTIFICATION") {
@@ -1426,6 +1462,11 @@ fn parse_photon_dynamics_header(
     let mut reverse_x = false;
     let mut reverse_y = false;
     let mut color = None;
+    let mut lut_index = -1;
+    let mut x_pos = None;
+    let mut y_pos = None;
+    let mut delta_x = None;
+    let mut delta_y = None;
     let mut metadata = HashMap::new();
 
     for raw_line in content.lines() {
@@ -1434,15 +1475,44 @@ fn parse_photon_dynamics_header(
         };
         let end = raw_line.find('/').unwrap_or(raw_line.len());
         let key = raw_line[..eq].trim();
-        let value = raw_line[eq + 1..end].trim().trim_matches('\'').trim();
-        metadata.insert(key.to_string(), MetadataValue::String(value.to_string()));
+        let raw_value = raw_line[eq + 1..end].trim();
+        let value = raw_value.trim_matches('\'').trim();
+        metadata.insert(
+            key.to_string(),
+            MetadataValue::String(raw_value.to_string()),
+        );
 
         match key {
             "NXP" => size_x = value.parse::<u32>().ok(),
             "NYP" => size_y = value.parse::<u32>().ok(),
+            "XPOS" => {
+                x_pos = value.parse::<f64>().ok();
+                if let Some(v) = x_pos {
+                    metadata.insert(
+                        "X position for position #1".to_string(),
+                        MetadataValue::Float(v),
+                    );
+                }
+            }
+            "YPOS" => {
+                y_pos = value.parse::<f64>().ok();
+                if let Some(v) = y_pos {
+                    metadata.insert(
+                        "Y position for position #1".to_string(),
+                        MetadataValue::Float(v),
+                    );
+                }
+            }
             "SIGNX" => reverse_x = value == "-",
             "SIGNY" => reverse_y = value == "-",
-            "COLOR" => color = value.parse::<u32>().ok(),
+            "DELTAX" => delta_x = value.parse::<f64>().ok(),
+            "DELTAY" => delta_y = value.parse::<f64>().ok(),
+            "COLOR" => {
+                color = value.parse::<u32>().ok();
+                if let Some(c) = color {
+                    lut_index = c as i32 - 1;
+                }
+            }
             "FILE REC LEN" => {
                 record_width = value.parse::<usize>().ok().map(|bytes| bytes / 2);
             }
@@ -1469,7 +1539,9 @@ fn parse_photon_dynamics_header(
         meta.is_rgb = true;
         meta.is_interleaved = false;
     } else if let Some(color) = color {
-        meta.is_indexed = color > 0;
+        meta.size_c = 1;
+        meta.is_rgb = false;
+        meta.is_indexed = lut_index >= 0 && color > 0;
     }
     meta.series_metadata = metadata;
 
@@ -1477,8 +1549,15 @@ fn parse_photon_dynamics_header(
     let record_width = record_width.ok_or_else(|| {
         BioFormatsError::UnsupportedFormat("Photon Dynamics PDS header missing FILE REC LEN".into())
     })?;
-    let record_width = record_width.max(size_x as usize);
-    let row_pixels = record_width;
+    if record_width == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Photon Dynamics PDS has invalid FILE REC LEN".into(),
+        ));
+    }
+    // Java PDSReader computes scanline padding as
+    // `recordWidth - (sizeX % recordWidth)` and passes that to readPlane.
+    let pad = record_width - (size_x as usize % record_width);
+    let row_pixels = size_x as usize + pad;
     let required_len = (row_pixels as u64)
         .checked_mul(size_y as u64)
         .and_then(|n| n.checked_mul(meta.size_c as u64))
@@ -1493,7 +1572,18 @@ fn parse_photon_dynamics_header(
         )));
     }
 
-    Ok((meta, pixels_path, record_width, reverse_x, reverse_y))
+    Ok(PhotonDynamicsParsed {
+        meta,
+        pixels_path,
+        record_width,
+        lut_index,
+        reverse_x,
+        reverse_y,
+        x_pos,
+        y_pos,
+        delta_x,
+        delta_y,
+    })
 }
 
 fn read_photon_dynamics_plane(
@@ -1520,7 +1610,13 @@ fn read_photon_dynamics_plane(
     let mut out = vec![0u8; channel_bytes * meta.size_c as usize];
     let read_x = if reverse_x { meta.size_x - w - x } else { x } as usize;
     let read_y = if reverse_y { meta.size_y - h - y } else { y } as usize;
-    let row_stride = record_width.max(meta.size_x as usize) * 2;
+    if record_width == 0 {
+        return Err(BioFormatsError::InvalidData(
+            "Photon Dynamics record width is zero".into(),
+        ));
+    }
+    let pad = record_width - (meta.size_x as usize % record_width);
+    let row_stride = (meta.size_x as usize + pad) * 2;
     let channel_stride = row_stride * meta.size_y as usize;
 
     for channel in 0..meta.size_c as usize {
@@ -1592,14 +1688,18 @@ impl FormatReader for PhotonDynamicsReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, pixels_path, record_width, reverse_x, reverse_y) =
-            parse_photon_dynamics_header(path)?;
+        let parsed = parse_photon_dynamics_header(path)?;
         self.path = Some(photon_dynamics_header_path(path));
-        self.pixels_path = Some(pixels_path);
-        self.meta = Some(meta);
-        self.record_width = record_width;
-        self.reverse_x = reverse_x;
-        self.reverse_y = reverse_y;
+        self.pixels_path = Some(parsed.pixels_path);
+        self.meta = Some(parsed.meta);
+        self.record_width = parsed.record_width;
+        self.lut_index = parsed.lut_index;
+        self.reverse_x = parsed.reverse_x;
+        self.reverse_y = parsed.reverse_y;
+        self.x_pos = parsed.x_pos;
+        self.y_pos = parsed.y_pos;
+        self.delta_x = parsed.delta_x;
+        self.delta_y = parsed.delta_y;
         Ok(())
     }
 
@@ -1608,8 +1708,13 @@ impl FormatReader for PhotonDynamicsReader {
         self.pixels_path = None;
         self.meta = None;
         self.record_width = 0;
+        self.lut_index = -1;
         self.reverse_x = false;
         self.reverse_y = false;
+        self.x_pos = None;
+        self.y_pos = None;
+        self.delta_x = None;
+        self.delta_y = None;
         Ok(())
     }
 
@@ -1693,6 +1798,54 @@ impl FormatReader for PhotonDynamicsReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn lookup_table(&mut self, _plane_index: u32) -> Result<Option<LookupTable>> {
+        if self.lut_index < 0 || self.lut_index >= 3 {
+            return Ok(None);
+        }
+        let mut lut = LookupTable {
+            red: vec![0; 65536],
+            green: vec![0; 65536],
+            blue: vec![0; 65536],
+        };
+        let channel = match self.lut_index {
+            0 => &mut lut.red,
+            1 => &mut lut.green,
+            _ => &mut lut.blue,
+        };
+        for (i, value) in channel.iter_mut().enumerate() {
+            *value = i as u16;
+        }
+        Ok(Some(lut))
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::{OmeMetadata, OmePlane};
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        let img = ome.images.get_mut(0)?;
+        if self.delta_x.is_some_and(|v| v.is_finite() && v > 0.0) {
+            img.physical_size_x = self.delta_x;
+        }
+        if self.delta_y.is_some_and(|v| v.is_finite() && v > 0.0) {
+            img.physical_size_y = self.delta_y;
+        }
+        if self.x_pos.is_some() || self.y_pos.is_some() {
+            if img.planes.is_empty() {
+                img.planes.push(OmePlane {
+                    the_z: 0,
+                    the_c: 0,
+                    the_t: 0,
+                    ..Default::default()
+                });
+            }
+            if let Some(plane) = img.planes.get_mut(0) {
+                plane.position_x = self.x_pos;
+                plane.position_y = self.y_pos;
+            }
+        }
+        Some(ome)
     }
 }
 
@@ -1842,8 +1995,8 @@ mod photon_dynamics_tests {
     #[test]
     fn photon_dynamics_applies_reverse_axes_after_reading_region() {
         let (hdr, img) = tmp_pair("photon_reversed");
-        write_header(&hdr, "-", "-", 3);
-        let samples = [1u16, 2, 3, 4, 5, 6];
+        write_header(&hdr, "-", "-", 4);
+        let samples = [1u16, 2, 3, 99, 4, 5, 6, 88];
         let bytes: Vec<u8> = samples.into_iter().flat_map(u16::to_le_bytes).collect();
         std::fs::write(&img, bytes).unwrap();
 
@@ -1891,8 +2044,8 @@ mod photon_dynamics_tests {
     #[test]
     fn photon_dynamics_failed_reopen_clears_state() {
         let (valid_hdr, valid_img) = tmp_pair("photon_valid_reopen");
-        write_header(&valid_hdr, "+", "+", 3);
-        let samples = [1u16, 2, 3, 4, 5, 6];
+        write_header(&valid_hdr, "+", "+", 4);
+        let samples = [1u16, 2, 3, 99, 4, 5, 6, 88];
         let bytes: Vec<u8> = samples.into_iter().flat_map(u16::to_le_bytes).collect();
         std::fs::write(&valid_img, bytes).unwrap();
 
@@ -1914,6 +2067,38 @@ mod photon_dynamics_tests {
         let _ = std::fs::remove_file(valid_img);
         let _ = std::fs::remove_file(bad_hdr);
         let _ = std::fs::remove_file(bad_img);
+    }
+
+    #[test]
+    fn photon_dynamics_surfaces_lut_positions_and_pixel_sizes() {
+        let (hdr, img) = tmp_pair("photon_metadata");
+        std::fs::write(
+            &hdr,
+            " IDENTIFICATION\nNXP = 3\nNYP = 2\nXPOS = 12.5\nYPOS = 7.25\nDELTAX = 0.5\nDELTAY = 0.75\nSIGNX = '+'\nSIGNY = '+'\nCOLOR = 2\nFILE REC LEN = 8\n",
+        )
+        .unwrap();
+        let samples = [1u16, 2, 3, 99, 4, 5, 6, 88];
+        let bytes: Vec<u8> = samples.into_iter().flat_map(u16::to_le_bytes).collect();
+        std::fs::write(&img, bytes).unwrap();
+
+        let mut reader = PhotonDynamicsReader::new();
+        reader.set_id(&hdr).unwrap();
+
+        assert!(reader.metadata().is_indexed);
+        let lut = reader.lookup_table(0).unwrap().unwrap();
+        assert_eq!(lut.red[123], 0);
+        assert_eq!(lut.green[123], 123);
+        assert_eq!(lut.blue[123], 0);
+
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        assert_eq!(image.physical_size_x, Some(0.5));
+        assert_eq!(image.physical_size_y, Some(0.75));
+        assert_eq!(image.planes[0].position_x, Some(12.5));
+        assert_eq!(image.planes[0].position_y, Some(7.25));
+
+        let _ = std::fs::remove_file(hdr);
+        let _ = std::fs::remove_file(img);
     }
 }
 

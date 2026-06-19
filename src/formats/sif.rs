@@ -129,8 +129,8 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
                 continue;
             }
             let size_c = parse_u32_token(parts.get(2), "SizeC")?;
-            let declared_x = parse_u32_token(parts.get(3), "SizeX")?;
-            let declared_y = parse_u32_token(parts.get(4), "SizeY")?;
+            let _declared_x = parse_u32_token(parts.get(3), "SizeX")?;
+            let _declared_y = parse_u32_token(parts.get(4), "SizeY")?;
             let size_z = parse_u32_token(parts.get(5), "SizeZ")?;
             let size_t = parse_u32_token(parts.get(6), "SizeT")?;
             let image_count = size_c
@@ -165,7 +165,7 @@ fn parse_sif_header(path: &Path) -> Result<SifHeader> {
                 .ok_or_else(|| {
                     BioFormatsError::Format("Andor SIF: invalid computed height".into())
                 })?;
-            if declared_x == 0 || declared_y == 0 || size_c == 0 || size_z == 0 || size_t == 0 {
+            if size_c == 0 || size_z == 0 || size_t == 0 {
                 return Err(BioFormatsError::Format(
                     "Andor SIF: Pixel number contains non-positive dimensions".into(),
                 ));
@@ -520,5 +520,33 @@ mod tests {
         let reader = SifReader::new();
         assert!(reader.is_this_type_by_bytes(b"Andor Technology"));
         assert!(!reader.is_this_type_by_bytes(b"prefix Andor Technology"));
+    }
+
+    #[test]
+    fn java_pixel_number_header_uses_coordinate_dimensions_when_declared_xy_zero() {
+        let path = tmp("pixel_number_zero_declared_xy.sif");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"Andor Technology Multi-Channel File\n");
+        data.extend_from_slice(b"Pixel number 1 0 0 1 1\n");
+        data.extend_from_slice(b"0 1 1 2 4 1 1\n");
+
+        let mut plane = Vec::new();
+        for value in 1u32..=8 {
+            plane.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        data.extend_from_slice(&plane);
+        data.extend_from_slice(&[0u8; FOOTER_SIZE as usize]);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = SifReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 4);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), plane);
     }
 }

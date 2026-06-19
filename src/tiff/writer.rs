@@ -3,7 +3,7 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::writer::FormatWriter;
 
@@ -195,6 +195,54 @@ fn bits_per_sample_value(pt: PixelType) -> u16 {
         PixelType::Int32 | PixelType::Uint32 | PixelType::Float32 => 32,
         PixelType::Float64 => 64,
     }
+}
+
+fn imagej_description(meta: &ImageMetadata) -> String {
+    format!(
+        "ImageJ=\nhyperstack=true\nimages={}\nchannels={}\nslices={}\nframes={}",
+        meta.size_c
+            .max(1)
+            .saturating_mul(meta.size_z.max(1))
+            .saturating_mul(meta.size_t.max(1)),
+        meta.size_c.max(1),
+        meta.size_z.max(1),
+        meta.size_t.max(1)
+    )
+}
+
+fn metadata_positive_f64(meta: &ImageMetadata, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| match meta.series_metadata.get(*key) {
+            Some(MetadataValue::Float(value)) if value.is_finite() && *value > 0.0 => Some(*value),
+            Some(MetadataValue::Int(value)) if *value > 0 => Some(*value as f64),
+            Some(MetadataValue::String(value)) => value.parse::<f64>().ok().filter(|v| *v > 0.0),
+            _ => None,
+        })
+}
+
+fn tiff_resolution_rational(meta: &ImageMetadata, x_axis: bool) -> Result<(u32, u32)> {
+    let keys = if x_axis {
+        [
+            "PhysicalSizeX",
+            "physicalSizeX",
+            "physical_size_x",
+            "PixelsPhysicalSizeX",
+        ]
+    } else {
+        [
+            "PhysicalSizeY",
+            "physicalSizeY",
+            "physical_size_y",
+            "PixelsPhysicalSizeY",
+        ]
+    };
+    let numerator = metadata_positive_f64(meta, &keys)
+        .map(|um_per_pixel| (10000.0 / um_per_pixel * 1000.0) as u64)
+        .unwrap_or(0);
+    Ok((
+        classic_tiff_u32(numerator, "TIFF resolution numerator")?,
+        1000,
+    ))
 }
 
 /// Compress one strip's worth of data.
@@ -500,6 +548,14 @@ impl PyramidOmeTiffWriter {
                         extra.extend_from_slice(&bps.to_le_bytes());
                     }
                 }
+                let (xres_num, xres_den) = tiff_resolution_rational(&meta, true)?;
+                let (yres_num, yres_den) = tiff_resolution_rational(&meta, false)?;
+                let xres_extra_offset = extra.len() as u32;
+                extra.extend_from_slice(&xres_num.to_le_bytes());
+                extra.extend_from_slice(&xres_den.to_le_bytes());
+                let yres_extra_offset = extra.len() as u32;
+                extra.extend_from_slice(&yres_num.to_le_bytes());
+                extra.extend_from_slice(&yres_den.to_le_bytes());
 
                 // Write a minimal IFD for this sub-resolution plane
                 let mut entries: Vec<Entry> = vec![
@@ -531,7 +587,20 @@ impl PyramidOmeTiffWriter {
                         count: 1,
                         value_or_offset: classic_tiff_u32(strip_byte_count, "strip byte count")?,
                     },
+                    Entry {
+                        tag: 282,
+                        typ: rational_type().0,
+                        count: 1,
+                        value_or_offset: 0,
+                    },
+                    Entry {
+                        tag: 283,
+                        typ: rational_type().0,
+                        count: 1,
+                        value_or_offset: 0,
+                    },
                     short_entry(284, 1),
+                    short_entry(296, 3),
                 ];
                 // NewSubfileType = 1 (reduced resolution)
                 entries.push(long_entry(254, 1));
@@ -574,6 +643,18 @@ impl PyramidOmeTiffWriter {
                             let abs_off = classic_tiff_u32(extra_file_off, "sub-IFD BPS offset")?;
                             ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                         }
+                    } else if tag == 282 {
+                        let abs_off = classic_tiff_u32(
+                            extra_file_off + xres_extra_offset as u64,
+                            "sub-IFD XResolution offset",
+                        )?;
+                        ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
+                    } else if tag == 283 {
+                        let abs_off = classic_tiff_u32(
+                            extra_file_off + yres_extra_offset as u64,
+                            "sub-IFD YResolution offset",
+                        )?;
+                        ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                 }
 
@@ -628,12 +709,14 @@ impl PyramidOmeTiffWriter {
             }
 
             // XResolution and YResolution rationals
-            let _xres_extra_offset = extra.len() as u32;
-            extra.extend_from_slice(&72u32.to_le_bytes());
-            extra.extend_from_slice(&1u32.to_le_bytes());
-            let _yres_extra_offset = extra.len() as u32;
-            extra.extend_from_slice(&72u32.to_le_bytes());
-            extra.extend_from_slice(&1u32.to_le_bytes());
+            let (xres_num, xres_den) = tiff_resolution_rational(&meta, true)?;
+            let (yres_num, yres_den) = tiff_resolution_rational(&meta, false)?;
+            let xres_extra_offset = extra.len() as u32;
+            extra.extend_from_slice(&xres_num.to_le_bytes());
+            extra.extend_from_slice(&xres_den.to_le_bytes());
+            let yres_extra_offset = extra.len() as u32;
+            extra.extend_from_slice(&yres_num.to_le_bytes());
+            extra.extend_from_slice(&yres_den.to_le_bytes());
 
             // SubIFD offsets array (if we have sub-levels)
             let sub_ifd_extra_offset = extra.len() as u32;
@@ -686,7 +769,7 @@ impl PyramidOmeTiffWriter {
                 value_or_offset: 0,
             });
             entries.push(short_entry(284, 1));
-            entries.push(short_entry(296, 2));
+            entries.push(short_entry(296, 3));
 
             if sf != 1 {
                 entries.push(short_entry(339, sf));
@@ -756,19 +839,15 @@ impl PyramidOmeTiffWriter {
                         ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     282 => {
-                        let bps_extra = if spp > 1 { spp as u64 * 2 } else { 0 };
-                        let desc_extra = desc_bytes.as_ref().map(|d| d.len() as u64).unwrap_or(0);
                         let abs_off = classic_tiff_u32(
-                            extra_file_off + bps_extra + desc_extra,
+                            extra_file_off + xres_extra_offset as u64,
                             "XResolution offset",
                         )?;
                         ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
                     }
                     283 => {
-                        let bps_extra = if spp > 1 { spp as u64 * 2 } else { 0 };
-                        let desc_extra = desc_bytes.as_ref().map(|d| d.len() as u64).unwrap_or(0);
                         let abs_off = classic_tiff_u32(
-                            extra_file_off + bps_extra + desc_extra + 8,
+                            extra_file_off + yres_extra_offset as u64,
                             "YResolution offset",
                         )?;
                         ifd_bytes[off + 8..off + 12].copy_from_slice(&abs_off.to_le_bytes());
@@ -837,6 +916,10 @@ impl FormatWriter for PyramidOmeTiffWriter {
     fn set_metadata(&mut self, meta: &ImageMetadata) -> Result<()> {
         validate_tiff_writer_metadata(meta, false)?;
         self.meta = Some(meta.clone());
+        if self.ome_xml.is_none() {
+            let ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+            self.ome_xml = Some(ome.to_ome_xml(meta));
+        }
         Ok(())
     }
 
@@ -1029,28 +1112,33 @@ impl FormatWriter for TiffWriter {
                 };
             }
 
-            // ImageDescription (OME-XML) for the first IFD only
+            // ImageDescription: OME-XML for the first IFD when requested,
+            // otherwise Java TiffWriter's ImageJ hyperstack comment.
             let desc_offset = extra.len() as u32;
-            let desc_bytes: Option<Vec<u8>> = if plane_idx == 0 {
-                self.ome_xml.as_ref().map(|xml| {
-                    let mut b = xml.as_bytes().to_vec();
-                    b.push(0); // NUL terminator for ASCII tag
-                    b
-                })
+            let desc_text = if let Some(xml) = self.ome_xml.as_ref().filter(|_| plane_idx == 0) {
+                Some(xml.as_str().to_string())
             } else {
-                None
+                Some(imagej_description(meta))
             };
+            let desc_bytes: Option<Vec<u8>> = desc_text.map(|text| {
+                let mut b = text.into_bytes();
+                b.push(0); // NUL terminator for ASCII tag
+                b
+            });
             if let Some(ref db) = desc_bytes {
                 extra.extend_from_slice(db);
             }
 
-            // XResolution and YResolution rationals (72/1)
+            // XResolution and YResolution rationals. Java stores pixels/cm
+            // from physical sizes in micrometers, or 0 when no size is known.
+            let (xres_num, xres_den) = tiff_resolution_rational(meta, true)?;
+            let (yres_num, yres_den) = tiff_resolution_rational(meta, false)?;
             let xres_offset = extra.len() as u32;
-            extra.extend_from_slice(&72u32.to_le_bytes());
-            extra.extend_from_slice(&1u32.to_le_bytes());
+            extra.extend_from_slice(&xres_num.to_le_bytes());
+            extra.extend_from_slice(&xres_den.to_le_bytes());
             let yres_offset = extra.len() as u32;
-            extra.extend_from_slice(&72u32.to_le_bytes());
-            extra.extend_from_slice(&1u32.to_le_bytes());
+            extra.extend_from_slice(&yres_num.to_le_bytes());
+            extra.extend_from_slice(&yres_den.to_le_bytes());
 
             // Build sorted entry list
             let mut entries: Vec<Entry> = vec![
@@ -1076,7 +1164,7 @@ impl FormatWriter for TiffWriter {
                     value_or_offset: 0,
                 }, // YResolution
                 short_entry(284, planar_configuration),
-                short_entry(296, 2), // ResolutionUnit = inch
+                short_entry(296, 3), // ResolutionUnit = centimeter
             ];
 
             // Add SampleFormat if not default (unsigned int = 1)
@@ -1084,7 +1172,6 @@ impl FormatWriter for TiffWriter {
                 entries.push(short_entry(339, sf));
             }
 
-            // ImageDescription (tag 270) for OME-TIFF
             if let Some(ref db) = desc_bytes {
                 entries.push(Entry {
                     tag: 270,

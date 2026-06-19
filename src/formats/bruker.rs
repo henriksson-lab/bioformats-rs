@@ -989,10 +989,10 @@ impl MicroCtVffReader {
         Ok(())
     }
 
-    /// Port of `MicroCTReader.openBytes` for a full plane: select the VFF, skip
-    /// its header, seek to the slice, read the raw plane, then reverse rows
+    /// Port of `MicroCTReader.openBytes`: select the VFF, skip its header, read
+    /// the requested raw rectangle, then reverse rows in the returned buffer
     /// (data is stored origin-lower-left).
-    fn read_plane(&mut self, no: u32) -> Result<Vec<u8>> {
+    fn read_region(&mut self, no: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         if self.vffs.is_empty() {
             return Err(BioFormatsError::NotInitialized);
         }
@@ -1009,28 +1009,30 @@ impl MicroCtVffReader {
 
         let bpp = self.meta.pixel_type.bytes_per_sample();
         let sx = self.meta.size_x as usize;
-        let sy = self.meta.size_y as usize;
-        let plane_size = sx * sy * bpp;
+        let plane_size = sx * self.meta.size_y as usize * bpp;
+        let row_bytes = w as usize * bpp;
+        let mut buf = vec![0u8; h as usize * row_bytes];
 
-        let mut buf = vec![0u8; plane_size];
-        let offset = header + plane_size as u64 * (no as usize / n) as u64;
-        file.seek(SeekFrom::Start(offset))?;
+        let plane_offset = header + plane_size as u64 * (no as usize / n) as u64;
         let len = file.metadata()?.len();
-        if offset < len {
-            let avail = ((len - offset) as usize).min(plane_size);
-            file.read_exact(&mut buf[..avail])?;
+
+        for row in 0..h as usize {
+            let offset = plane_offset + (((y as usize + row) * sx + x as usize) * bpp) as u64;
+            if offset >= len {
+                break;
+            }
+            let avail = ((len - offset) as usize).min(row_bytes);
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut buf[row * row_bytes..row * row_bytes + avail])?;
         }
 
         // Reverse the rows: origin is in the lower-left corner.
-        if sy > 0 {
-            let row_bytes = sx * bpp;
-            if row_bytes > 0 {
-                for yy in 0..sy / 2 {
-                    let top = (sy - 1 - yy) * row_bytes;
-                    let bottom = yy * row_bytes;
-                    for b in 0..row_bytes {
-                        buf.swap(bottom + b, top + b);
-                    }
+        if row_bytes > 0 {
+            for yy in 0..h as usize / 2 {
+                let top = (h as usize - 1 - yy) * row_bytes;
+                let bottom = yy * row_bytes;
+                for b in 0..row_bytes {
+                    buf.swap(bottom + b, top + b);
                 }
             }
         }
@@ -1112,7 +1114,7 @@ impl FormatReader for MicroCtVffReader {
         if plane_index >= self.meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        self.read_plane(plane_index)
+        self.read_region(plane_index, 0, 0, self.meta.size_x, self.meta.size_y)
     }
 
     fn open_bytes_region(
@@ -1138,20 +1140,7 @@ impl FormatReader for MicroCtVffReader {
             w,
             h,
         )?;
-        // Crop the (row-reversed) full plane.
-        let full = self.read_plane(plane_index)?;
-        let bpp = self.meta.pixel_type.bytes_per_sample();
-        let sx = self.meta.size_x as usize;
-        let row_bytes = w as usize * bpp;
-        let mut out = vec![0u8; h as usize * row_bytes];
-        for row in 0..h as usize {
-            let src = ((y as usize + row) * sx + x as usize) * bpp;
-            if src + row_bytes <= full.len() {
-                out[row * row_bytes..(row + 1) * row_bytes]
-                    .copy_from_slice(&full[src..src + row_bytes]);
-            }
-        }
-        Ok(out)
+        self.read_region(plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1437,6 +1426,11 @@ mod tests {
         assert_eq!(bytes.len(), sx * sy);
         assert_eq!(&bytes[0..sx], &[2u8, 2, 2, 2]);
         assert_eq!(&bytes[2 * sx..3 * sx], &[0u8, 0, 0, 0]);
+
+        // Java reads the requested raw rectangle first, then reverses only the
+        // returned rows.  This differs from cropping a fully row-reversed plane.
+        let region = reader.open_bytes_region(0, 1, 0, 2, 2).unwrap();
+        assert_eq!(region, vec![1, 1, 0, 0]);
 
         // OME metadata: description, physical size (mm -> um), exposure, date.
         let ome = reader.ome_metadata().unwrap();

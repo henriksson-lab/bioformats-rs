@@ -38,6 +38,9 @@ fn load_png(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     if let Some(indexed) = load_indexed_png(path)? {
         return Ok(indexed);
     }
+    if let Some(grayscale) = load_subbyte_grayscale_png(path)? {
+        return Ok(grayscale);
+    }
 
     use image::GenericImageView;
     let img = image::open(path).map_err(|e| BioFormatsError::Format(e.to_string()))?;
@@ -227,9 +230,9 @@ fn load_apng(path: &Path) -> Result<Option<(ImageMetadata, Vec<Vec<u8>>)>> {
     if width == 0 || height == 0 || compression != 0 || filter != 0 {
         return Err(BioFormatsError::InvalidData("invalid APNG header".into()));
     }
-    if interlace != 0 {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "interlaced APNG frames are not supported".into(),
+    if interlace > 1 {
+        return Err(BioFormatsError::InvalidData(
+            "invalid APNG interlace mode".into(),
         ));
     }
 
@@ -264,6 +267,7 @@ fn load_apng(path: &Path) -> Result<Option<(ImageMetadata, Vec<Vec<u8>>)>> {
         bit_depth,
         size_c as usize,
         pixel_type.bytes_per_sample(),
+        interlace,
     )?;
     let mut decoded = Vec::with_capacity(frame_count as usize);
     decoded.push(first.clone());
@@ -277,6 +281,7 @@ fn load_apng(path: &Path) -> Result<Option<(ImageMetadata, Vec<Vec<u8>>)>> {
             bit_depth,
             size_c as usize,
             pixel_type.bytes_per_sample(),
+            interlace,
         )?;
         let mut canvas = first.clone();
         let sub_row =
@@ -338,6 +343,7 @@ fn decode_png_image_data(
     bit_depth: u8,
     channels: usize,
     bytes_per_sample: usize,
+    interlace: u8,
 ) -> Result<Vec<u8>> {
     let mut inflated = Vec::new();
     flate2::read::ZlibDecoder::new(compressed)
@@ -345,7 +351,17 @@ fn decode_png_image_data(
         .map_err(BioFormatsError::Io)?;
 
     if bit_depth < 8 {
-        return decode_png_subbyte_samples(&inflated, width, height, bit_depth);
+        return decode_indexed_png_pixels(&inflated, width, height, bit_depth, interlace);
+    }
+    if interlace == 1 {
+        return decode_png_interlaced_samples(
+            &inflated,
+            width,
+            height,
+            channels
+                .checked_mul(bytes_per_sample)
+                .ok_or_else(|| BioFormatsError::InvalidData("PNG sample size overflows".into()))?,
+        );
     }
 
     let sample_bytes = channels
@@ -403,23 +419,115 @@ fn decode_png_image_data(
     Ok(image)
 }
 
-fn decode_png_subbyte_samples(
+fn decode_png_interlaced_samples(
     inflated: &[u8],
     width: u32,
     height: u32,
-    bit_depth: u8,
+    sample_bytes: usize,
 ) -> Result<Vec<u8>> {
-    let mut pixels = vec![0u8; width as usize * height as usize];
-    decode_indexed_png_pass(
-        inflated,
-        width as usize,
-        height as usize,
-        bit_depth,
-        |col, row, value| {
-            pixels[row * width as usize + col] = value;
-        },
-    )?;
-    Ok(pixels)
+    const ADAM7: [(usize, usize, usize, usize); 7] = [
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ];
+
+    let width = width as usize;
+    let height = height as usize;
+    let full_row = width
+        .checked_mul(sample_bytes)
+        .ok_or_else(|| BioFormatsError::InvalidData("PNG row size overflows".into()))?;
+    let mut image = vec![0u8; full_row * height];
+    let mut offset = 0usize;
+
+    for (x0, y0, x_step, y_step) in ADAM7 {
+        if x0 >= width || y0 >= height {
+            continue;
+        }
+        let pass_width = ((width - x0) + x_step - 1) / x_step;
+        let pass_height = ((height - y0) + y_step - 1) / y_step;
+        let row_bytes = pass_width
+            .checked_mul(sample_bytes)
+            .ok_or_else(|| BioFormatsError::InvalidData("PNG row size overflows".into()))?;
+        let (pass, consumed) = decode_png_filtered_scanlines(
+            inflated.get(offset..).unwrap_or_default(),
+            row_bytes,
+            pass_height,
+            sample_bytes,
+        )?;
+        offset += consumed;
+
+        for row in 0..pass_height {
+            for col in 0..pass_width {
+                let dst = (y0 + row * y_step) * full_row + (x0 + col * x_step) * sample_bytes;
+                let src = row * row_bytes + col * sample_bytes;
+                image[dst..dst + sample_bytes].copy_from_slice(&pass[src..src + sample_bytes]);
+            }
+        }
+    }
+
+    Ok(image)
+}
+
+fn decode_png_filtered_scanlines(
+    inflated: &[u8],
+    row_bytes: usize,
+    height: usize,
+    sample_bytes: usize,
+) -> Result<(Vec<u8>, usize)> {
+    let expected = (row_bytes + 1)
+        .checked_mul(height)
+        .ok_or_else(|| BioFormatsError::InvalidData("PNG payload size overflows".into()))?;
+    if inflated.len() < expected {
+        return Err(BioFormatsError::InvalidData(format!(
+            "PNG payload ended after {} bytes, expected at least {expected}",
+            inflated.len()
+        )));
+    }
+
+    let mut image = vec![0u8; row_bytes * height];
+    let mut src = 0usize;
+    for row in 0..height {
+        let filter_type = inflated[src];
+        src += 1;
+        let row_start = row * row_bytes;
+        for col in 0..row_bytes {
+            let raw = inflated[src + col];
+            let left = if col >= sample_bytes {
+                image[row_start + col - sample_bytes]
+            } else {
+                0
+            };
+            let up = if row > 0 {
+                image[row_start + col - row_bytes]
+            } else {
+                0
+            };
+            let up_left = if row > 0 && col >= sample_bytes {
+                image[row_start + col - row_bytes - sample_bytes]
+            } else {
+                0
+            };
+            image[row_start + col] = match filter_type {
+                0 => raw,
+                1 => raw.wrapping_add(left),
+                2 => raw.wrapping_add(up),
+                3 => raw.wrapping_add(((left as u16 + up as u16) / 2) as u8),
+                4 => raw.wrapping_add(paeth_predictor(left, up, up_left)),
+                _ => {
+                    return Err(BioFormatsError::InvalidData(format!(
+                        "PNG invalid filter type {filter_type}"
+                    )));
+                }
+            };
+        }
+        src += row_bytes;
+    }
+
+    Ok((image, expected))
 }
 
 fn load_indexed_png(path: &Path) -> Result<Option<(ImageMetadata, Vec<u8>)>> {
@@ -528,6 +636,105 @@ fn load_indexed_png(path: &Path) -> Result<Option<(ImageMetadata, Vec<u8>)>> {
         is_little_endian: false,
         resolution_count: 1,
         lookup_table: Some(lookup_table),
+        ..Default::default()
+    };
+
+    Ok(Some((meta, pixels)))
+}
+
+fn load_subbyte_grayscale_png(path: &Path) -> Result<Option<(ImageMetadata, Vec<u8>)>> {
+    let bytes = fs::read(path)?;
+    let Some(mut offset) = bytes
+        .strip_prefix(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        .map(|_| 8usize)
+    else {
+        return Ok(None);
+    };
+
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut bit_depth = 0u8;
+    let mut color_type = 0u8;
+    let mut compression = 0u8;
+    let mut filter = 0u8;
+    let mut interlace = 0u8;
+    let mut idat = Vec::new();
+
+    while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+        let length = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        let chunk_type = &bytes[offset + 4..offset + 8];
+        let data_start = offset + 8;
+        let Some(data_end) = data_start.checked_add(length) else {
+            return Ok(None);
+        };
+        if data_end > bytes.len() {
+            return Ok(None);
+        }
+
+        match chunk_type {
+            b"IHDR" if length >= 13 => {
+                width = u32::from_be_bytes([
+                    bytes[data_start],
+                    bytes[data_start + 1],
+                    bytes[data_start + 2],
+                    bytes[data_start + 3],
+                ]);
+                height = u32::from_be_bytes([
+                    bytes[data_start + 4],
+                    bytes[data_start + 5],
+                    bytes[data_start + 6],
+                    bytes[data_start + 7],
+                ]);
+                bit_depth = bytes[data_start + 8];
+                color_type = bytes[data_start + 9];
+                compression = bytes[data_start + 10];
+                filter = bytes[data_start + 11];
+                interlace = bytes[data_start + 12];
+            }
+            b"IDAT" => idat.extend_from_slice(&bytes[data_start..data_end]),
+            b"IEND" => break,
+            _ => {}
+        }
+
+        let Some(next_offset) = data_end.checked_add(4) else {
+            return Ok(None);
+        };
+        offset = next_offset;
+    }
+
+    if color_type != 0 || !matches!(bit_depth, 1 | 2 | 4) {
+        return Ok(None);
+    }
+    if width == 0 || height == 0 || compression != 0 || filter != 0 || interlace > 1 {
+        return Ok(None);
+    }
+
+    let mut inflated = Vec::new();
+    flate2::read::ZlibDecoder::new(idat.as_slice())
+        .read_to_end(&mut inflated)
+        .map_err(BioFormatsError::Io)?;
+    let pixels = decode_indexed_png_pixels(&inflated, width, height, bit_depth, interlace)?;
+
+    let meta = ImageMetadata {
+        size_x: width,
+        size_y: height,
+        size_z: 1,
+        size_c: 1,
+        size_t: 1,
+        pixel_type: PixelType::Uint8,
+        bits_per_pixel: bit_depth,
+        image_count: 1,
+        dimension_order: DimensionOrder::XYCTZ,
+        is_rgb: false,
+        is_interleaved: false,
+        is_indexed: false,
+        is_little_endian: false,
+        resolution_count: 1,
         ..Default::default()
     };
 
@@ -946,7 +1153,13 @@ impl FormatWriter for PngWriter {
             (PixelType::Uint16, 1) => {
                 let pixels: Vec<u16> = pixel_bytes
                     .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .map(|c| {
+                        if meta.is_little_endian {
+                            u16::from_le_bytes([c[0], c[1]])
+                        } else {
+                            u16::from_be_bytes([c[0], c[1]])
+                        }
+                    })
                     .collect();
                 image::ImageBuffer::<image::Luma<u16>, _>::from_raw(w, h, pixels)
                     .map(image::DynamicImage::ImageLuma16)
@@ -955,7 +1168,13 @@ impl FormatWriter for PngWriter {
             (PixelType::Uint16, 3) => {
                 let pixels: Vec<u16> = pixel_bytes
                     .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .map(|c| {
+                        if meta.is_little_endian {
+                            u16::from_le_bytes([c[0], c[1]])
+                        } else {
+                            u16::from_be_bytes([c[0], c[1]])
+                        }
+                    })
                     .collect();
                 image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(w, h, pixels)
                     .map(image::DynamicImage::ImageRgb16)

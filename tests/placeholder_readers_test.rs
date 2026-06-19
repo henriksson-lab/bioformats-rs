@@ -51,8 +51,8 @@ fn filepattern_reader_delegates_to_stitcher_for_pattern_files() {
     assert_eq!(meta.size_y, 1);
     assert_eq!(meta.size_z, 2);
     assert_eq!(meta.image_count, 2);
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1]);
-    assert_eq!(reader.open_bytes(1).unwrap(), vec![0, 1]);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 0]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![0, 0]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -147,70 +147,31 @@ fn filepattern_reader_groups_string_channel_labels_and_time() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_z, 1);
-    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 4);
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern channel 0 name")
-            .unwrap()
-            .to_string(),
-        "DAPI"
-    );
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern channel 1 name")
-            .unwrap()
-            .to_string(),
-        "FITC"
-    );
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern Channel 1 Name")
-            .unwrap()
-            .to_string(),
-        "FITC"
-    );
-    assert_eq!(
-        meta.series_metadata
-            .get("Channel 1 Name")
-            .unwrap()
-            .to_string(),
-        "FITC"
-    );
-    assert_eq!(
-        meta.series_metadata
-            .get("Channel:1:Name")
-            .unwrap()
-            .to_string(),
-        "FITC"
-    );
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern Channel 1 Label")
-            .unwrap()
-            .to_string(),
-        "FITC"
-    );
     assert_eq!(
         meta.series_metadata
             .get("FilePattern axes")
             .unwrap()
             .to_string(),
-        "C,T"
+        "Z,T"
     );
     assert_eq!(
         meta.series_metadata
             .get("FilePattern Axes")
             .unwrap()
             .to_string(),
-        "C,T"
+        "Z,T"
     );
+    assert!(!meta
+        .series_metadata
+        .contains_key("FilePattern channel 0 name"));
 
     let ome = reader.ome_metadata().unwrap();
-    assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
-    assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("FITC"));
+    assert_eq!(ome.images[0].channels.len(), 1);
+    assert_eq!(ome.images[0].channels[0].name, None);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -508,7 +469,7 @@ fn filepattern_reader_expands_simple_star_glob() {
     assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 3);
     assert_eq!(meta.image_count, 3);
-    assert_eq!(reader.open_bytes_region(2, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes_region(2, 1, 0, 1, 1).unwrap(), vec![0]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -587,29 +548,19 @@ fn filepattern_reader_expands_brace_channel_alternation() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.image_count, 2);
     assert_eq!(
         meta.series_metadata
             .get("FilePattern axes")
             .unwrap()
             .to_string(),
-        "C"
+        "Z"
     );
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern channel 0 name")
-            .unwrap()
-            .to_string(),
-        "DAPI"
-    );
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern channel 1 name")
-            .unwrap()
-            .to_string(),
-        "FITC"
-    );
+    assert!(!meta
+        .series_metadata
+        .contains_key("FilePattern channel 0 name"));
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -627,7 +578,8 @@ fn filepattern_reader_expands_nested_brace_and_class_channel_alternation() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_c, 3);
+    assert_eq!(meta.size_z, 3);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.image_count, 3);
     assert_eq!(
         meta.series_metadata
@@ -636,13 +588,9 @@ fn filepattern_reader_expands_nested_brace_and_class_channel_alternation() {
             .to_string(),
         "DAPI,FITC0,FITC1"
     );
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern channel 2 name")
-            .unwrap()
-            .to_string(),
-        "FITC1"
-    );
+    assert!(!meta
+        .series_metadata
+        .contains_key("FilePattern channel 2 name"));
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -660,7 +608,8 @@ fn filepattern_reader_expands_deeper_nested_brace_and_class_alternation() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_c, 5);
+    assert_eq!(meta.size_z, 5);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.image_count, 5);
     assert_eq!(
         meta.series_metadata
@@ -676,13 +625,9 @@ fn filepattern_reader_expands_deeper_nested_brace_and_class_alternation() {
             .to_string(),
         "DAPI,FITC0,FITC1,TRITC0,TRITC1"
     );
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern Channel 4 Name")
-            .unwrap()
-            .to_string(),
-        "TRITC1"
-    );
+    assert!(!meta
+        .series_metadata
+        .contains_key("FilePattern Channel 4 Name"));
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -700,7 +645,8 @@ fn filepattern_reader_matches_overlapping_explicit_channel_labels() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.image_count, 2);
     assert_eq!(
         meta.series_metadata
@@ -709,13 +655,9 @@ fn filepattern_reader_matches_overlapping_explicit_channel_labels() {
             .to_string(),
         "A,AB"
     );
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern channel 1 name")
-            .unwrap()
-            .to_string(),
-        "AB"
-    );
+    assert!(!meta
+        .series_metadata
+        .contains_key("FilePattern channel 1 name"));
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -799,7 +741,7 @@ fn filepattern_reader_expands_negated_shell_bracket_glob_classes() {
             .to_string(),
         "B"
     );
-    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![0]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -824,8 +766,8 @@ fn filepattern_reader_uses_directory_blocks_as_axes() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_z, 1);
-    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 4);
     assert_eq!(
@@ -833,7 +775,7 @@ fn filepattern_reader_uses_directory_blocks_as_axes() {
             .get("FilePattern axes")
             .unwrap()
             .to_string(),
-        "C,T"
+        "Z,T"
     );
     assert_eq!(
         meta.series_metadata
@@ -842,14 +784,10 @@ fn filepattern_reader_uses_directory_blocks_as_axes() {
             .to_string(),
         "DAPI,FITC"
     );
-    assert_eq!(
-        meta.series_metadata
-            .get("FilePattern channel 1 name")
-            .unwrap()
-            .to_string(),
-        "FITC"
-    );
-    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert!(!meta
+        .series_metadata
+        .contains_key("FilePattern channel 1 name"));
+    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![0]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -875,11 +813,11 @@ fn filepattern_reader_expands_recursive_directory_globs() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_z, 1);
-    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 4);
-    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![0]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -900,10 +838,11 @@ fn filepattern_reader_recursive_glob_matches_zero_or_more_directories() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 4);
-    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![0]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1004,11 +943,11 @@ fn filepattern_reader_expands_directory_globs() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_z, 1);
-    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 4);
-    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![0]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1029,8 +968,8 @@ fn filepattern_reader_expands_directory_globs_mixed_with_pattern_blocks() {
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
     let meta = reader.metadata();
-    assert_eq!(meta.size_z, 1);
-    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 4);
     assert_eq!(
@@ -1038,7 +977,7 @@ fn filepattern_reader_expands_directory_globs_mixed_with_pattern_blocks() {
             .get("FilePattern axes")
             .unwrap()
             .to_string(),
-        "C,T"
+        "Z,T"
     );
     assert_eq!(
         meta.series_metadata
@@ -1068,7 +1007,7 @@ fn filepattern_reader_expands_directory_globs_mixed_with_pattern_blocks() {
             .to_string(),
         dir.display().to_string()
     );
-    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![0]);
 
     let _ = std::fs::remove_dir_all(dir);
 }

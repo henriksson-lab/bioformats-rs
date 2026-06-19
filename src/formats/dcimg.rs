@@ -140,29 +140,28 @@ impl DcimgReader {
     /// Seeks to `headerSize` and reads the version-1 frame-format fields,
     /// storing `dataOffset`/`bytesPerImage`/`frameFooterSize` on `self` and
     /// returning the dimensions / pixel-type that `set_id` copies into the
-    /// core metadata. Java reads from `headerSize` via the stream; we already
-    /// hold the leading bytes in `hdr`, so the version-1 fields live at
-    /// `headerSize + {60, 64, 72, ...}`.
-    fn parse_dcam_version1_header(&mut self, hdr: &[u8]) -> Result<DcamHeader> {
+    /// core metadata. Java reads from `headerSize` via the stream, so we do the
+    /// same instead of assuming the full version-specific header was captured by
+    /// the initial file probe.
+    fn parse_dcam_version1_header(&mut self, f: &mut File) -> Result<DcamHeader> {
         let header_size = self.header_size;
-        let header_start = header_size as usize;
-        if hdr.len() < header_start + 124 {
-            return Err(BioFormatsError::Format(
-                "DCIMG version 1 header is truncated".into(),
-            ));
-        }
+        let mut v1 = [0u8; 124];
+        f.seek(SeekFrom::Start(header_size))
+            .map_err(BioFormatsError::Io)?;
+        f.read_exact(&mut v1)
+            .map_err(|_| BioFormatsError::Format("DCIMG version 1 header is truncated".into()))?;
 
-        let n_frames = positive_u32_dim(r_u32_le(hdr, header_start + 60), "frame count")?;
-        let pixel_type_code = r_u32_le(hdr, header_start + 64);
-        let width = positive_u32_dim(r_u32_le(hdr, header_start + 72), "width")?;
-        let height = positive_u32_dim(r_u32_le(hdr, header_start + 76), "height")?;
-        // Java skips bytesPerRow for version 1 (336); we keep it for stride use.
-        let bytes_per_row = r_u32_le(hdr, header_start + 80) as usize;
-        let bytes_per_image = r_u32_le(hdr, header_start + 84) as u64;
-        let data_offset = header_size + r_u64_le(hdr, header_start + 96);
-        let frame_footer_size = r_u32_le(hdr, header_start + 120) as u64;
+        let n_frames = positive_u32_dim(r_u32_le(&v1, 60), "frame count")?;
+        let pixel_type_code = r_u32_le(&v1, 64);
+        let width = positive_u32_dim(r_u32_le(&v1, 72), "width")?;
+        let height = positive_u32_dim(r_u32_le(&v1, 76), "height")?;
+        // Java skips bytesPerRow for version 1 (DCIMGReader.java:336), so do
+        // not use the field as an image row stride.
+        let bytes_per_image = r_u32_le(&v1, 84) as u64;
+        let data_offset = header_size + r_u64_le(&v1, 96);
+        let frame_footer_size = r_u32_le(&v1, 120) as u64;
 
-        self.bytes_per_row = bytes_per_row;
+        self.bytes_per_row = 0;
         self.bytes_per_image = bytes_per_image;
         self.data_offset = data_offset;
         self.frame_footer_size = frame_footer_size;
@@ -459,7 +458,7 @@ impl FormatReader for DcimgReader {
             height,
             pixel_type_code,
         } = if version >= DCIMG_VERSION_1 {
-            self.parse_dcam_version1_header(&hdr)?
+            self.parse_dcam_version1_header(&mut f)?
         } else if version == DCIMG_VERSION_0 {
             let h = self.parse_dcam_version0_header(&mut f, &hdr)?;
             self.parse_dcam_version0_footer(&mut f)?;
@@ -503,15 +502,22 @@ impl FormatReader for DcimgReader {
         } else {
             width as usize * bps
         };
+        let pixel_row_bytes = if version == 0 {
+            bpr
+        } else {
+            // Java's openBytes advances rows as sizeX * bytesPerPixel for real
+            // DCIMG v0/v1; bytesPerRow is only used for the v0 correction line.
+            width as usize * bps
+        };
         let min_row = (width as usize)
             .checked_mul(bps)
             .ok_or_else(|| BioFormatsError::Format("DCIMG row byte count overflows".into()))?;
-        if bpr < min_row {
+        if version == 0 && bpr < min_row {
             return Err(BioFormatsError::UnsupportedFormat(format!(
                 "DCIMG row stride {bpr} is shorter than declared image row {min_row}"
             )));
         }
-        let plane_bytes = (bpr as u64)
+        let plane_bytes = (pixel_row_bytes as u64)
             .checked_mul(height as u64)
             .ok_or_else(|| BioFormatsError::Format("DCIMG plane byte count overflows".into()))?;
         let frame_stride = if bytes_per_image > 0 {
@@ -599,7 +605,7 @@ impl FormatReader for DcimgReader {
         });
 
         self.data_offset = data_offset;
-        self.bytes_per_row = bpr;
+        self.bytes_per_row = if version == 0 { bpr } else { pixel_row_bytes };
         self.bytes_per_image = bytes_per_image;
         self.frame_footer_size = frame_footer_size;
 

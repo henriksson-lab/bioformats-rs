@@ -321,26 +321,11 @@ impl FlexReader {
         }
         let (_names, factors) = parse_flex_arrays(&xml);
 
-        if !factors.is_empty() && factors.len() != total_planes {
-            return Err(BioFormatsError::Format(format!(
-                "Flex: XML Array count {} does not match TIFF plane count {}",
-                factors.len(),
-                total_planes
-            )));
-        }
-
         let mut factor_values = vec![1.0f64; total_planes];
         let mut max_idx = 0usize;
         let mut one_factors = true;
         for (i, f) in factors.iter().enumerate() {
-            let q = f.parse::<f64>().map_err(|_| {
-                BioFormatsError::Format(format!("Flex: invalid Array Factor {f:?}"))
-            })?;
-            if !q.is_finite() || q <= 0.0 {
-                return Err(BioFormatsError::Format(format!(
-                    "Flex: invalid Array Factor {f:?}"
-                )));
-            }
+            let q = f.parse::<f64>().unwrap_or(1.0);
             if i < factor_values.len() {
                 factor_values[i] = q;
                 if q > factor_values[max_idx] {
@@ -542,7 +527,7 @@ impl FlexReader {
         }
 
         self.single_file = false;
-        let store = self.group_files(grouped)?;
+        let store = self.group_files(grouped, &flex_entry)?;
         self.populate_metadata_store(store)
     }
 
@@ -583,13 +568,19 @@ impl FlexReader {
 
         let factors = self.derive_factors(total_planes, true)?;
 
-        if let Some(pt) = self.scaled_pixel_type {
-            let series = self.inner.series_list_mut();
-            if let Some(s0) = series.first_mut() {
-                s0.metadata.pixel_type = pt;
-                s0.metadata.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
-            }
-        }
+        self.series_meta = self
+            .inner
+            .series_list()
+            .iter()
+            .map(|s| {
+                let mut meta = s.metadata.clone();
+                if let Some(pt) = self.scaled_pixel_type {
+                    meta.pixel_type = pt;
+                    meta.bits_per_pixel = (pt.bytes_per_sample() * 8) as u8;
+                }
+                meta
+            })
+            .collect();
         // store the single file's factors as flex_files[0] for apply_factor.
         self.flex_files = vec![FlexFile {
             row: 0,
@@ -622,7 +613,9 @@ impl FlexReader {
     /// the `flex_files`/`well_number` layout, and parse each file (the first
     /// file drives core metadata via `parse_flex_file`). Returns the base
     /// per-series metadata to be replicated by `populate_metadata_store`.
-    fn group_files(&mut self, grouped: Vec<PathBuf>) -> Result<ImageMetadata> {
+    fn group_files(&mut self, grouped: Vec<PathBuf>, entry: &Path) -> Result<ImageMetadata> {
+        let grouped = filter_java_compatible_group(grouped, entry);
+
         // Group files by well (row, col), each file within a well is a field.
         // Build well list in (row, col) order; record well_number layout.
         use std::collections::BTreeMap;
@@ -1403,7 +1396,10 @@ impl Iterator for XmlEvents<'_> {
                 // end tag: emit End with the collected char data.
                 let qname = name.trim().to_string();
                 let value = std::mem::take(&mut self.char_data);
-                return Some(XmlEvent::End { qname, value });
+                return Some(XmlEvent::End {
+                    qname,
+                    value: crate::common::xml::decode_xml_escaped_str(&value),
+                });
             }
             // start tag (possibly self-closing).
             let self_closing = tag.trim_end().ends_with('/');
@@ -1476,7 +1472,10 @@ fn parse_tag_attrs(tag: &str) -> std::collections::HashMap<String, String> {
         }
         let value = &tag[val_start..i.min(tag.len())];
         if !name.is_empty() {
-            map.insert(name.to_string(), value.to_string());
+            map.insert(
+                name.to_string(),
+                crate::common::xml::decode_xml_escaped_str(value),
+            );
         }
         i += 1; // skip closing quote
     }
@@ -1724,7 +1723,9 @@ fn xml_attr(tag: &str, attr: &str) -> Option<String> {
             if quote == '"' || quote == '\'' {
                 let val_start = 1;
                 if let Some(end) = rest[val_start..].find(quote) {
-                    return Some(rest[val_start..val_start + end].to_string());
+                    return Some(crate::common::xml::decode_xml_escaped_str(
+                        &rest[val_start..val_start + end],
+                    ));
                 }
             }
         }
@@ -1741,7 +1742,7 @@ fn xml_element_text(xml: &str, name: &str) -> Option<String> {
     let start = xml[idx..].find('>').map(|e| idx + e + 1)?;
     let end = xml[idx..].find('<').map(|e| idx + e)?;
     if end > start {
-        Some(xml[start..end].to_string())
+        Some(crate::common::xml::decode_xml_escaped_str(&xml[start..end]))
     } else {
         None
     }
@@ -1813,6 +1814,58 @@ fn find_measurement_files(flex_path: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FlexGroupIdentity {
+    compressed: bool,
+    ifd_count: usize,
+    barcode: String,
+}
+
+fn flex_group_identity(path: &Path) -> Option<FlexGroupIdentity> {
+    let mut tiff = crate::tiff::TiffReader::new();
+    tiff.set_id(path).ok()?;
+    let first = tiff.ifd(0)?;
+    let xml = match first.get(FLEX_TAG) {
+        Some(IfdValue::Ascii(s)) => s.clone(),
+        Some(IfdValue::Byte(b)) | Some(IfdValue::Undefined(b)) => {
+            String::from_utf8_lossy(b).into_owned()
+        }
+        _ => String::new(),
+    };
+    Some(FlexGroupIdentity {
+        compressed: first.compression() != crate::tiff::ifd::Compression::None,
+        ifd_count: tiff.ifd_count(),
+        barcode: xml_element_text(&xml, "Barcode").unwrap_or_default(),
+    })
+}
+
+/// Java `groupFiles` rejects a directory-level filename match if any candidate
+/// differs from the first file's compression state/barcode, or has more IFDs
+/// than the first file. On rejection it rebuilds the dataset from `currentId`.
+fn filter_java_compatible_group(grouped: Vec<PathBuf>, entry: &Path) -> Vec<PathBuf> {
+    if grouped.len() <= 1 {
+        return grouped;
+    }
+
+    let Some(first) = grouped.first().and_then(|p| flex_group_identity(p)) else {
+        return vec![entry.to_path_buf()];
+    };
+
+    for path in &grouped {
+        let Some(id) = flex_group_identity(path) else {
+            return vec![entry.to_path_buf()];
+        };
+        if id.compressed != first.compressed
+            || id.barcode != first.barcode
+            || id.ifd_count > first.ifd_count
+        {
+            return vec![entry.to_path_buf()];
+        }
+    }
+
+    grouped
 }
 
 /// Collect grouped `.flex` files for a dataset. Returns the sorted list of
@@ -1950,7 +2003,9 @@ impl FormatReader for FlexReader {
 
     fn metadata(&self) -> &ImageMetadata {
         if self.single_file {
-            self.inner.metadata()
+            self.series_meta
+                .get(self.series)
+                .unwrap_or_else(|| self.inner.metadata())
         } else {
             self.series_meta
                 .get(self.series)
@@ -2323,6 +2378,36 @@ mod tests {
         let (names, factors) = parse_flex_arrays(xml);
         assert_eq!(names, vec!["1_ch1", "1_ch2"]);
         assert_eq!(factors, vec!["2.0", "1"]);
+    }
+
+    #[test]
+    fn flex_xml_decodes_entities_like_sax() {
+        let xml = r#"<Arrays><Array Name="DAPI &amp; FITC" Factor="&#181;"/></Arrays>"#;
+        let (names, factors) = parse_flex_arrays(xml);
+        assert_eq!(names, vec!["DAPI & FITC"]);
+        assert_eq!(factors, vec!["\u{b5}"]);
+
+        assert_eq!(
+            xml_element_text("<PlateName>A&amp;B</PlateName>", "PlateName").as_deref(),
+            Some("A&B")
+        );
+
+        let mut attrs = None;
+        let mut text = None;
+        for event in XmlEvents::new(r#"<Filter Name="A&amp;B">DAPI &amp; FITC</Filter>"#) {
+            match event {
+                XmlEvent::Start { attrs: a, .. } => attrs = Some(a),
+                XmlEvent::End { value, .. } => text = Some(value),
+            }
+        }
+        assert_eq!(
+            attrs
+                .as_ref()
+                .and_then(|attrs| attrs.get("Name"))
+                .map(|s| s.as_str()),
+            Some("A&B")
+        );
+        assert_eq!(text.as_deref(), Some("DAPI & FITC"));
     }
 
     #[test]

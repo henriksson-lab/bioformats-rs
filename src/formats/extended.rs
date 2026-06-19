@@ -264,6 +264,24 @@ fn adjust_for_white_balance(val: i16, index: usize, wb: &Option<[f64; 3]>) -> i1
 
 /// TIFF `PhotometricInterpretation` value for a colour-filter array.
 const PHOTO_CFA_ARRAY: u16 = 32803;
+/// Java DNGReader.COLOR_MAP: Canon DNG CFA pattern tag, not TIFF palette tag 320.
+const DNG_CFA_COLOR_MAP: u16 = 33422;
+
+fn dng_cfa_color_map(ifd: &crate::tiff::ifd::Ifd) -> [i32; 4] {
+    // Java default color map {1,0,2,1}; overridden by private COLOR_MAP tag
+    // (33422) when all four entries are valid channel indices 0..=2.
+    let mut color_map = [1i32, 0, 2, 1];
+    let ifd_colors = ifd.get_vec_u16(DNG_CFA_COLOR_MAP);
+    if ifd_colors.len() >= 4 {
+        let valid = ifd_colors[..4].iter().all(|&c| c <= 2);
+        if valid {
+            for q in 0..4 {
+                color_map[q] = ifd_colors[q] as i32;
+            }
+        }
+    }
+    color_map
+}
 
 impl DngReader {
     const CANON_TAG: u16 = 34665;
@@ -392,8 +410,9 @@ impl DngReader {
 
 #[cfg(test)]
 mod dng_wb_tests {
-    use super::{adjust_for_white_balance, DngReader};
+    use super::{adjust_for_white_balance, dng_cfa_color_map, DngReader, DNG_CFA_COLOR_MAP};
     use crate::common::reader::FormatReader;
+    use crate::tiff::ifd::{tag, Ifd, IfdValue};
 
     fn canon_tiff_header(make: &str, model: Option<&str>, software: Option<&str>) -> Vec<u8> {
         struct Entry {
@@ -500,6 +519,26 @@ mod dng_wb_tests {
         let non_canon_software = canon_tiff_header("Canon", Some("EOS 5D"), Some("Other"));
         assert!(!reader.is_this_type_by_bytes(&non_canon_software));
     }
+
+    #[test]
+    fn dng_cfa_pattern_uses_java_private_color_map_tag() {
+        let mut ifd = Ifd::default();
+        ifd.entries
+            .insert(tag::COLOR_MAP, IfdValue::Short(vec![2, 2, 2, 2]));
+        ifd.entries
+            .insert(DNG_CFA_COLOR_MAP, IfdValue::Short(vec![0, 1, 1, 2]));
+
+        assert_eq!(dng_cfa_color_map(&ifd), [0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn dng_cfa_pattern_ignores_tiff_palette_color_map_tag() {
+        let mut ifd = Ifd::default();
+        ifd.entries
+            .insert(tag::COLOR_MAP, IfdValue::Short(vec![0, 1, 1, 2]));
+
+        assert_eq!(dng_cfa_color_map(&ifd), [1, 0, 2, 1]);
+    }
 }
 
 impl Default for DngReader {
@@ -535,18 +574,7 @@ impl FormatReader for DngReader {
                 let data_size = *bps.first().unwrap_or(&16) as u32;
                 let bps_len = bps.len();
 
-                // Java default color map {1,0,2,1}; overridden by COLOR_MAP tag
-                // (320) when all four entries are valid channel indices 0..=2.
-                let mut color_map = [1i32, 0, 2, 1];
-                let ifd_colors = ifd.get_vec_u16(crate::tiff::ifd::tag::COLOR_MAP);
-                if ifd_colors.len() >= 4 {
-                    let valid = ifd_colors[..4].iter().all(|&c| c <= 2);
-                    if valid {
-                        for q in 0..4 {
-                            color_map[q] = ifd_colors[q] as i32;
-                        }
-                    }
-                }
+                let color_map = dng_cfa_color_map(ifd);
 
                 let size_x = ifd.image_width().unwrap_or(0);
                 let size_y = ifd.image_length().unwrap_or(0);
@@ -766,6 +794,8 @@ impl Default for VectraReader {
         Self::new()
     }
 }
+
+const QPTIFF_SOFTWARE_CHECK: &str = "PerkinElmer-QPI";
 
 fn qptiff_ifd_value_summary(value: &crate::tiff::ifd::IfdValue) -> Option<MetadataValue> {
     use crate::tiff::ifd::IfdValue;
@@ -1252,6 +1282,21 @@ impl FormatReader for VectraReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
+        let software = self
+            .inner
+            .ifd(0)
+            .and_then(|ifd| ifd.get(crate::tiff::ifd::tag::SOFTWARE))
+            .and_then(|value| value.as_str());
+        if !software
+            .map(|value| value.starts_with(QPTIFF_SOFTWARE_CHECK))
+            .unwrap_or(false)
+        {
+            let _ = self.inner.close();
+            self.meta = None;
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QPTIFF TIFF is missing PerkinElmer-QPI Software tag".into(),
+            ));
+        }
         self.current_resolution = 0;
         self.refresh_metadata();
         Ok(())
@@ -1404,6 +1449,19 @@ impl FormatReader for GelReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
+
+        let ifd_count = self.inner.ifd_count();
+        if ifd_count == 0 || ifd_count > 2 {
+            let _ = self.inner.close();
+            self.meta = None;
+            self.square_root = false;
+            self.scale = 1.0;
+            self.plane_ifds.clear();
+            self.plane_scales.clear();
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "GEL TIFF must contain one or two IFDs, found {ifd_count}"
+            )));
+        }
 
         // Inspect the first IFD for the private Molecular Dynamics tags.
         let first = self
@@ -1591,6 +1649,7 @@ impl FormatReader for GelReader {
 
 const IMSPECTOR_FILE_MAGIC: &[u8; 8] = b"OMAS_BF\n";
 const IMSPECTOR_SYNTHETIC_STACK_MAGIC: &[u8; 14] = b"OMAS_BF_STACK\n";
+const IMSPECTOR_MSR_MAGIC: &[u8; 10] = b"CDataStack";
 const IMSPECTOR_MAGIC_NUMBER: u16 = 0xffff;
 const IMSPECTOR_MAX_DIMS: usize = 15;
 const IMSPECTOR_MIN_HEADER_LEN: usize = 14;
@@ -1636,6 +1695,14 @@ fn parse_imspector_header(bytes: &[u8]) -> Result<ImspectorHeader> {
         bytes[version_offset + 3],
     ]);
     Ok(ImspectorHeader { version })
+}
+
+fn imspector_is_java_msr(bytes: &[u8]) -> bool {
+    bytes.get(..bytes.len().min(32)).is_some_and(|header| {
+        header
+            .windows(IMSPECTOR_MSR_MAGIC.len())
+            .any(|w| w == IMSPECTOR_MSR_MAGIC)
+    })
 }
 
 #[allow(dead_code)]
@@ -1924,7 +1991,10 @@ fn imspector_parse_description(description: &str) -> Vec<(String, String)> {
                 text.clear();
             }
             Ok(Event::Text(t)) => {
-                text.push_str(&t.unescape().unwrap_or_default());
+                text.push_str(&crate::common::xml::decode_xml_text(&t).unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(r)) => {
+                text.push_str(&crate::common::xml::decode_xml_ref(&r).unwrap_or_default());
             }
             Ok(Event::End(_)) => {
                 let depth = name_stack.len();
@@ -1957,6 +2027,229 @@ fn imspector_parse_description(description: &str) -> Vec<(String, String)> {
         pairs.clear();
     }
     pairs
+}
+
+fn imspector_msr_read_u8(bytes: &[u8], offset: &mut usize, field: &str) -> Result<u8> {
+    if bytes.len().saturating_sub(*offset) < 1 {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector MSR {field} is truncated"
+        )));
+    }
+    let value = bytes[*offset];
+    *offset += 1;
+    Ok(value)
+}
+
+fn imspector_msr_read_u16(bytes: &[u8], offset: &mut usize, field: &str) -> Result<u16> {
+    if bytes.len().saturating_sub(*offset) < 2 {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector MSR {field} is truncated"
+        )));
+    }
+    let value = u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]);
+    *offset += 2;
+    Ok(value)
+}
+
+fn imspector_msr_read_i32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i32> {
+    if bytes.len().saturating_sub(*offset) < 4 {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector MSR {field} is truncated"
+        )));
+    }
+    let value = i32::from_le_bytes([
+        bytes[*offset],
+        bytes[*offset + 1],
+        bytes[*offset + 2],
+        bytes[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(value)
+}
+
+fn imspector_msr_read_string(
+    bytes: &[u8],
+    offset: &mut usize,
+    len: usize,
+    field: &str,
+) -> Result<String> {
+    if bytes.len().saturating_sub(*offset) < len {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector MSR {field} overruns input"
+        )));
+    }
+    let value = String::from_utf8_lossy(&bytes[*offset..*offset + len]).into_owned();
+    *offset += len;
+    Ok(value)
+}
+
+fn imspector_msr_skip(bytes: &[u8], offset: &mut usize, len: usize, field: &str) -> Result<()> {
+    if bytes.len().saturating_sub(*offset) < len {
+        return Err(BioFormatsError::Format(format!(
+            "Imspector MSR {field} overruns input"
+        )));
+    }
+    *offset += len;
+    Ok(())
+}
+
+fn imspector_msr_skip_tags(bytes: &[u8], offset: &mut usize, count: i32) -> Result<()> {
+    let mut seen = 0i32;
+    while seen < count {
+        let len = imspector_msr_read_u8(bytes, offset, "tag length")?;
+        if len == 0 {
+            continue;
+        }
+        imspector_msr_skip(bytes, offset, len as usize, "tag")?;
+        seen += 1;
+    }
+    Ok(())
+}
+
+fn parse_imspector_msr_stack(bytes: &[u8]) -> Result<Option<ImspectorStack>> {
+    if !imspector_is_java_msr(bytes) {
+        return Ok(None);
+    }
+    if bytes.len() < 32 {
+        return Err(BioFormatsError::Format(
+            "Imspector MSR header is truncated".into(),
+        ));
+    }
+
+    let mut offset = 20usize;
+    let length = imspector_msr_read_u16(bytes, &mut offset, "root tag length")? as usize;
+    let root_tag = imspector_msr_read_string(bytes, &mut offset, length, "root tag")?;
+    let count = imspector_msr_read_i32(bytes, &mut offset, "root tag count")?;
+    if count < 0 {
+        return Err(BioFormatsError::Format(
+            "Imspector MSR root tag count is negative".into(),
+        ));
+    }
+    imspector_msr_skip_tags(bytes, &mut offset, count)?;
+
+    if offset % 2 == 1 {
+        imspector_msr_skip(bytes, &mut offset, 1, "alignment byte")?;
+    } else if offset < bytes.len() {
+        let check = bytes[offset];
+        if check == 0xff {
+            offset += 1;
+        }
+    }
+
+    let metadata_len = imspector_msr_read_u16(bytes, &mut offset, "metadata length")? as usize;
+    let metadata = imspector_msr_read_string(bytes, &mut offset, metadata_len, "metadata")?;
+    if metadata_len % 2 == 0 && offset < bytes.len() && bytes[offset] == 13 {
+        offset += 1;
+    }
+
+    let mut check = imspector_msr_read_u16(bytes, &mut offset, "PMT marker search")?;
+    while check != 3 && check != 2 {
+        offset = offset.saturating_sub(1);
+        check = imspector_msr_read_u16(bytes, &mut offset, "PMT marker search")?;
+    }
+
+    imspector_msr_skip(bytes, &mut offset, 26, "PMT header")?;
+    let pmt_len = imspector_msr_read_u8(bytes, &mut offset, "PMT name length")? as usize;
+    let pmt = imspector_msr_read_string(bytes, &mut offset, pmt_len, "PMT name")?;
+    imspector_msr_skip(bytes, &mut offset, 6, "dimension header")?;
+    let size_x = imspector_positive_dim(
+        imspector_msr_read_i32(bytes, &mut offset, "size X")?,
+        "size X",
+    )?;
+    let size_y = imspector_positive_dim(
+        imspector_msr_read_i32(bytes, &mut offset, "size Y")?,
+        "size Y",
+    )?;
+    let size_z = imspector_positive_dim(
+        imspector_msr_read_i32(bytes, &mut offset, "size Z")?,
+        "size Z",
+    )?;
+    let size_t = imspector_positive_dim(
+        imspector_msr_read_i32(bytes, &mut offset, "size T")?,
+        "size T",
+    )?;
+    let planes = size_z
+        .checked_mul(size_t)
+        .ok_or_else(|| BioFormatsError::Format("Imspector MSR image count overflows".into()))?;
+
+    imspector_msr_skip(bytes, &mut offset, 16, "PMT settings header")?;
+    let mut pmt_settings = Vec::new();
+    for _ in 0..4 {
+        let len = imspector_msr_read_u8(bytes, &mut offset, "PMT setting length")? as usize;
+        pmt_settings.push(imspector_msr_read_string(
+            bytes,
+            &mut offset,
+            len,
+            "PMT setting",
+        )?);
+    }
+
+    let payload_offset = offset;
+    let plane_len =
+        imspector_checked_plane_len(size_x, size_y, PixelType::Uint16.bytes_per_sample())?;
+    let payload_len = plane_len
+        .checked_mul(planes as usize)
+        .ok_or_else(|| BioFormatsError::Format("Imspector MSR payload size overflows".into()))?;
+    let payload_end = payload_offset
+        .checked_add(payload_len)
+        .ok_or_else(|| BioFormatsError::Format("Imspector MSR payload end overflows".into()))?;
+    if payload_end > bytes.len() {
+        return Err(BioFormatsError::Format(
+            "Imspector MSR pixel data overruns input".into(),
+        ));
+    }
+
+    let mut meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z,
+        size_c: 1,
+        size_t,
+        pixel_type: PixelType::Uint16,
+        bits_per_pixel: 16,
+        image_count: planes,
+        dimension_order: DimensionOrder::XYZCT,
+        is_rgb: false,
+        is_interleaved: false,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        ..ImageMetadata::default()
+    };
+    meta.series_metadata.insert(
+        "imspector_version_subset".into(),
+        MetadataValue::String("java-msr-cdatastack-first-block".into()),
+    );
+    meta.series_metadata.insert(
+        "imspector_msr_root_tag".into(),
+        MetadataValue::String(root_tag),
+    );
+    if !pmt.is_empty() {
+        meta.series_metadata
+            .insert("imspector_msr_pmt".into(), MetadataValue::String(pmt));
+    }
+    for (i, value) in pmt_settings.into_iter().enumerate() {
+        if !value.is_empty() {
+            meta.series_metadata.insert(
+                format!("imspector_msr_pmt_setting_{i}"),
+                MetadataValue::String(value),
+            );
+        }
+    }
+    let values: Vec<&str> = metadata.split("::").collect();
+    for pair in values.chunks_exact(2) {
+        meta.series_metadata.insert(
+            pair[0].to_string(),
+            MetadataValue::String(pair[1].to_string()),
+        );
+    }
+
+    Ok(Some(ImspectorStack {
+        meta,
+        payload_offset,
+        plane_len,
+        decoded_payload: None,
+    }))
 }
 
 fn parse_imspector_native_stack(
@@ -2773,7 +3066,7 @@ impl FormatReader for ImspectorReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        parse_imspector_header(header).is_ok()
+        parse_imspector_header(header).is_ok() || imspector_is_java_msr(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -2782,7 +3075,18 @@ impl FormatReader for ImspectorReader {
         self.stacks.clear();
         self.current_series = 0;
         let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let header = parse_imspector_header(&bytes)?;
+        let header = match parse_imspector_header(&bytes) {
+            Ok(header) => Some(header),
+            Err(obf_error) => {
+                if let Some(stack) = parse_imspector_msr_stack(&bytes)? {
+                    self.path = Some(path.to_path_buf());
+                    self.bytes = bytes;
+                    self.stacks = vec![stack];
+                    return Ok(());
+                }
+                return Err(obf_error);
+            }
+        };
         // Faithful translation of OBFReader.initFile's do/while stack loop:
         // walk the linked list of native stacks starting at the file-header
         // stack pointer, adding one series per stack until next == 0.
@@ -2826,7 +3130,7 @@ impl FormatReader for ImspectorReader {
         }
         let mut detail = format!(
             "Imspector OBF/MSR native stack decoding is unsupported except v1-v6 single-stack contiguous raw/zlib and uncompressed or zlib-compressed chunked stacks or explicit BFIMSPECTOR_RAW_STACK_V1 data (version {})",
-            header.version
+            header.expect("OBF header must exist here").version
         );
         if bytes.len() > IMSPECTOR_MIN_HEADER_LEN + 12 {
             let mut offset = IMSPECTOR_MIN_HEADER_LEN + 8;
@@ -2892,6 +3196,11 @@ impl FormatReader for ImspectorReader {
             BioFormatsError::Format("Imspector OBF/MSR plane end offset overflows".into())
         })?;
         let source = stack.decoded_payload.as_deref().unwrap_or(&self.bytes);
+        if end > source.len() {
+            return Err(BioFormatsError::Format(
+                "Imspector OBF/MSR plane overruns pixel data".into(),
+            ));
+        }
         Ok(source[start..end].to_vec())
     }
 
@@ -2938,7 +3247,7 @@ mod imspector_tests {
         imspector_bits_per_pixel, imspector_compression_flag, imspector_pixel_type,
         imspector_read_len_string, imspector_stack_length, parse_imspector_header, ImspectorReader,
         IMSPECTOR_FILE_MAGIC, IMSPECTOR_MAGIC_NUMBER, IMSPECTOR_MIN_HEADER_LEN,
-        IMSPECTOR_SYNTHETIC_STACK_MAGIC,
+        IMSPECTOR_MSR_MAGIC, IMSPECTOR_SYNTHETIC_STACK_MAGIC,
     };
     use crate::common::error::BioFormatsError;
     use crate::common::metadata::DimensionOrder;
@@ -3056,6 +3365,47 @@ mod imspector_tests {
     fn push_len_string(bytes: &mut Vec<u8>, value: &str) {
         bytes.extend_from_slice(&(value.len() as i32).to_le_bytes());
         bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn java_msr_stack(width: i32, height: i32, z: i32, t: i32, pixels: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 20];
+        bytes[4..4 + IMSPECTOR_MSR_MAGIC.len()].copy_from_slice(IMSPECTOR_MSR_MAGIC);
+        bytes.extend_from_slice(&(IMSPECTOR_MSR_MAGIC.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(IMSPECTOR_MSR_MAGIC);
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.push(4);
+        bytes.extend_from_slice(b"Tag1");
+        if bytes.len() % 2 == 1 {
+            bytes.push(0);
+        }
+        let metadata = b"Instrument Mode::Frame Imaging::Time Time Resolution::1";
+        bytes.extend_from_slice(&(metadata.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(metadata);
+        if metadata.len() % 2 == 0 {
+            bytes.push(13);
+        }
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 26]);
+        bytes.push(4);
+        bytes.extend_from_slice(b"PMT1");
+        bytes.extend_from_slice(&[0u8; 6]);
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&z.to_le_bytes());
+        bytes.extend_from_slice(&t.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 16]);
+        for value in [
+            b"A".as_slice(),
+            b"B".as_slice(),
+            b"C".as_slice(),
+            b"D".as_slice(),
+        ] {
+            bytes.push(value.len() as u8);
+            bytes.extend_from_slice(value);
+        }
+        bytes.extend_from_slice(pixels);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes
     }
 
     fn native_v1_stack_with_step_tables() -> Vec<u8> {
@@ -3309,6 +3659,17 @@ mod imspector_tests {
     }
 
     #[test]
+    fn imspector_reader_detects_java_msr_cdatastack_header() {
+        let reader = ImspectorReader::new();
+        let mut bytes = vec![0u8; 32];
+        bytes[12..12 + IMSPECTOR_MSR_MAGIC.len()].copy_from_slice(IMSPECTOR_MSR_MAGIC);
+        assert!(reader.is_this_type_by_bytes(&bytes));
+
+        bytes[12] = b'X';
+        assert!(!reader.is_this_type_by_bytes(&bytes));
+    }
+
+    #[test]
     fn imspector_helpers_match_bioformats_type_contracts() {
         assert_eq!(imspector_pixel_type(0x01).unwrap(), PixelType::Uint8);
         assert_eq!(imspector_pixel_type(0x08).unwrap(), PixelType::Int16);
@@ -3433,6 +3794,45 @@ mod imspector_tests {
         assert_eq!(
             reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
             vec![11, 13]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_java_msr_first_cdatastack_matches_reference_layout() {
+        use crate::common::metadata::MetadataValue;
+
+        let path = temp_path("java_msr_first_stack.msr");
+        let pixels = vec![1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0];
+        std::fs::write(&path, java_msr_stack(2, 2, 2, 1, &pixels)).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert_eq!(meta.bits_per_pixel, 16);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
+        match meta.series_metadata.get("Instrument Mode") {
+            Some(MetadataValue::String(value)) => assert_eq!(value, "Frame Imaging"),
+            other => panic!("unexpected Instrument Mode metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_msr_pmt") {
+            Some(MetadataValue::String(value)) => assert_eq!(value, "PMT1"),
+            other => panic!("unexpected PMT metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0, 2, 0, 3, 0, 4, 0]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 0, 6, 0, 7, 0, 8, 0]);
+        assert_eq!(
+            reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(),
+            vec![6, 0, 8, 0]
         );
 
         let _ = std::fs::remove_file(path);
@@ -3988,6 +4388,8 @@ mod imspector_tests {
 // ---------------------------------------------------------------------------
 // 5. Hamamatsu VMS whole-slide
 // ---------------------------------------------------------------------------
+
+const HAMAMATSU_VMS_MAX_SIZE: u32 = 2048;
 
 fn hamamatsu_vms_normalize_key(key: &str) -> String {
     key.trim()
@@ -4659,7 +5061,11 @@ fn hamamatsu_vms_insert_capability_diagnostics(
 }
 
 fn hamamatsu_vms_parse_optional_index(path: &Path) -> Result<HashMap<String, String>> {
-    let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => return Err(BioFormatsError::Io(err)),
+    };
     let text = std::str::from_utf8(&bytes).map_err(|_| {
         BioFormatsError::UnsupportedFormat(format!(
             "Hamamatsu VMS optimisation file is not UTF-8 text: {}",
@@ -5248,7 +5654,7 @@ impl FormatReader for HamamatsuVmsReader {
                 image_count: layers,
                 dimension_order: DimensionOrder::XYCZT,
                 is_rgb: true,
-                is_interleaved: true,
+                is_interleaved: size_x > HAMAMATSU_VMS_MAX_SIZE && size_y > HAMAMATSU_VMS_MAX_SIZE,
                 is_indexed: false,
                 is_little_endian: true,
                 resolution_count: pyramid_sizes.len() as u32,
@@ -5362,11 +5768,12 @@ impl FormatReader for HamamatsuVmsReader {
                     image_count: 1,
                     dimension_order: DimensionOrder::XYCZT,
                     is_rgb: true,
-                    is_interleaved: true,
+                    is_interleaved: size_x > HAMAMATSU_VMS_MAX_SIZE
+                        && size_y > HAMAMATSU_VMS_MAX_SIZE,
                     is_indexed: false,
                     is_little_endian: true,
                     resolution_count: 1,
-                    thumbnail: false,
+                    thumbnail: true,
                     series_metadata,
                     lookup_table: None,
                     modulo_z: None,
@@ -5792,6 +6199,8 @@ mod hamamatsu_vms_tests {
         reader.set_id(&path).unwrap();
         let meta = reader.metadata();
         assert_eq!((meta.size_x, meta.size_y, meta.size_c), (2, 1, 3));
+        assert!(!meta.is_interleaved);
+        assert!(!meta.thumbnail);
         assert_eq!(reader.series_count(), 1);
 
         let plane = reader.open_bytes(0).unwrap();
@@ -5874,6 +6283,8 @@ mod hamamatsu_vms_tests {
         assert_eq!(reader.series(), 1);
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
         assert_eq!(reader.metadata().image_count, 1);
+        assert!(!reader.metadata().is_interleaved);
+        assert!(reader.metadata().thumbnail);
         assert!(matches!(
             reader.metadata().series_metadata.get("VMS series kind"),
             Some(MetadataValue::String(v)) if v == "macro"
@@ -5883,6 +6294,8 @@ mod hamamatsu_vms_tests {
 
         reader.set_series(2).unwrap();
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        assert!(!reader.metadata().is_interleaved);
+        assert!(reader.metadata().thumbnail);
         assert!(matches!(
             reader.metadata().series_metadata.get("VMS series kind"),
             Some(MetadataValue::String(v)) if v == "map"
@@ -6040,6 +6453,42 @@ mod hamamatsu_vms_tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(tile0);
         let _ = std::fs::remove_file(tile1);
+    }
+
+    #[test]
+    fn hamamatsu_vms_ignores_missing_optimisation_file_like_java() {
+        let path = temp_path("missing_optimisation_file.vms");
+        let tile = temp_path("missing_optimisation_file.jpg");
+        write_rgb_jpeg(&tile, [240, 10, 20]);
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "NoLayers=1\n",
+                    "NoJpegColumns=1\n",
+                    "NoJpegRows=1\n",
+                    "ImageFile={}\n",
+                    "OptimisationFile=does-not-exist.opt\n"
+                ),
+                tile.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let mut reader = HamamatsuVmsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (1, 1));
+        assert!(matches!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("VMS optimisationfile"),
+            Some(MetadataValue::String(v)) if v == "does-not-exist.opt"
+        ));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(tile);
     }
 
     #[test]
@@ -7125,6 +7574,7 @@ struct CellomicsFilenameMetadata {
     well: Option<String>,
     field_index: Option<u32>,
     channel_index: Option<u32>,
+    channel_prefix: Option<char>,
 }
 
 fn cellomics_filename_metadata(path: &Path) -> CellomicsFilenameMetadata {
@@ -7177,7 +7627,10 @@ fn cellomics_filename_metadata(path: &Path) -> CellomicsFilenameMetadata {
                     .ok();
                 match tag {
                     'f' | 'F' => parsed.field_index = number,
-                    'd' | 'D' | 'o' | 'O' | 'c' | 'C' => parsed.channel_index = number,
+                    'd' | 'D' | 'o' | 'O' | 'c' | 'C' => {
+                        parsed.channel_index = number;
+                        parsed.channel_prefix = Some(tag.to_ascii_lowercase());
+                    }
                     _ => {}
                 }
                 rest = &rest[digits_start + digits_len..];
@@ -7292,6 +7745,9 @@ fn cellomics_plate_assembly(
         }
         let parsed = cellomics_filename_metadata(&candidate_path);
         if parsed.plate != current_metadata.plate || parsed.channel_index.is_none() {
+            continue;
+        }
+        if parsed.channel_prefix != current_metadata.channel_prefix {
             continue;
         }
         let data = match decode_cellomics_file(&candidate_path) {
@@ -8095,6 +8551,7 @@ fn cellomics_matching_channel_sources(
         if parsed.plate != current_metadata.plate
             || parsed.well != current_metadata.well
             || parsed.field_index != current_metadata.field_index
+            || parsed.channel_prefix != current_metadata.channel_prefix
         {
             continue;
         }
@@ -8692,7 +9149,8 @@ impl FormatReader for CellomicsReader {
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+        _header.len() >= 4
+            && i32::from_be_bytes([_header[0], _header[1], _header[2], _header[3]]) == 16
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -9203,13 +9661,13 @@ impl FormatReader for MrwReader {
         matches!(ext.as_deref(), Some("mrw"))
     }
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 4 && header[..4] == *b"\0MRM"
+        header.len() >= 4 && header[..4].ends_with(b"MRM")
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        if data.len() < 8 || data[..4] != *b"\0MRM" {
+        if data.len() < 8 || !data[..4].ends_with(b"MRM") {
             return Err(BioFormatsError::UnsupportedFormat(
-                "MRW: missing '\\0MRM' magic string".into(),
+                "MRW: missing 'MRM' magic string".into(),
             ));
         }
         // Big-endian throughout. offset = readInt(@4) + 8.
@@ -9470,21 +9928,33 @@ impl Default for YokogawaReader {
 
 /// Read every `name="value"` style attribute from the start tag and return the
 /// requested one. `bts:` prefixes are preserved by quick_xml.
-fn yk_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+fn yk_attr(
+    e: &quick_xml::events::BytesStart,
+    decoder: quick_xml::encoding::Decoder,
+    name: &str,
+) -> Option<String> {
     for a in e.attributes().flatten() {
         if a.key.as_ref() == name.as_bytes() {
-            return Some(String::from_utf8_lossy(&a.value).to_string());
+            return crate::common::xml::decode_xml_attr(a, decoder);
         }
     }
     None
 }
 
-fn yk_attr_int(e: &quick_xml::events::BytesStart, name: &str) -> Option<i64> {
-    yk_attr(e, name).and_then(|s| s.trim().parse::<i64>().ok())
+fn yk_attr_int(
+    e: &quick_xml::events::BytesStart,
+    decoder: quick_xml::encoding::Decoder,
+    name: &str,
+) -> Option<i64> {
+    yk_attr(e, decoder, name).and_then(|s| s.trim().parse::<i64>().ok())
 }
 
-fn yk_attr_positive_i64(e: &quick_xml::events::BytesStart, name: &str) -> Result<i64> {
-    let value = yk_attr_int(e, name).unwrap_or(1);
+fn yk_attr_positive_i64(
+    e: &quick_xml::events::BytesStart,
+    decoder: quick_xml::encoding::Decoder,
+    name: &str,
+) -> Result<i64> {
+    let value = yk_attr_int(e, decoder, name).unwrap_or(1);
     if value <= 0 {
         return Err(BioFormatsError::Format(format!(
             "Yokogawa CV7000 attribute {name} must be positive, got {value}"
@@ -9493,8 +9963,12 @@ fn yk_attr_positive_i64(e: &quick_xml::events::BytesStart, name: &str) -> Result
     Ok(value)
 }
 
-fn yk_attr_f64(e: &quick_xml::events::BytesStart, name: &str) -> Option<f64> {
-    yk_attr(e, name).and_then(|s| s.trim().parse::<f64>().ok())
+fn yk_attr_f64(
+    e: &quick_xml::events::BytesStart,
+    decoder: quick_xml::encoding::Decoder,
+    name: &str,
+) -> Option<f64> {
+    yk_attr(e, decoder, name).and_then(|s| s.trim().parse::<f64>().ok())
 }
 
 /// Read a file and strip a stray trailing '>' (mirrors readSanitizedXML).
@@ -9519,9 +9993,10 @@ fn yk_parse_wpi(xml: &str) -> YokogawaPlate {
             Ok(Event::Eof) | Err(_) => break,
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 if e.name().as_ref() == b"bts:WellPlate" {
-                    plate.name = yk_attr(e, "bts:Name");
-                    plate.rows = yk_attr_int(e, "bts:Rows").unwrap_or(0) as u32;
-                    plate.columns = yk_attr_int(e, "bts:Columns").unwrap_or(0) as u32;
+                    plate.name = yk_attr(e, reader.decoder(), "bts:Name");
+                    plate.rows = yk_attr_int(e, reader.decoder(), "bts:Rows").unwrap_or(0) as u32;
+                    plate.columns =
+                        yk_attr_int(e, reader.decoder(), "bts:Columns").unwrap_or(0) as u32;
                 }
             }
             _ => {}
@@ -9548,20 +10023,32 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Result<Vec<YokogawaPlane>> {
             Ok(Event::Start(ref e)) => {
                 if e.name().as_ref() == b"bts:MeasurementRecord" {
                     current_text.clear();
-                    let bts_type = yk_attr(e, "bts:Type").unwrap_or_default();
+                    let bts_type = yk_attr(e, reader.decoder(), "bts:Type").unwrap_or_default();
                     if bts_type == "IMG" {
                         in_img_record = true;
                         // attributes are 1-based in the file; convert to 0-based.
                         let p = YokogawaPlane {
-                            row: (yk_attr_positive_i64(e, "bts:Row")? - 1) as u32,
-                            column: (yk_attr_positive_i64(e, "bts:Column")? - 1) as u32,
-                            field: (yk_attr_positive_i64(e, "bts:FieldIndex")? - 1) as u32,
-                            z: (yk_attr_positive_i64(e, "bts:ZIndex")? - 1) as i32,
-                            channel: (yk_attr_positive_i64(e, "bts:Ch")? - 1) as i32,
-                            timepoint: (yk_attr_positive_i64(e, "bts:TimePoint")? - 1) as i32,
-                            action_index: (yk_attr_positive_i64(e, "bts:ActionIndex")? - 1) as i32,
-                            timeline_index: (yk_attr_positive_i64(e, "bts:TimelineIndex")? - 1)
+                            row: (yk_attr_positive_i64(e, reader.decoder(), "bts:Row")? - 1) as u32,
+                            column: (yk_attr_positive_i64(e, reader.decoder(), "bts:Column")? - 1)
+                                as u32,
+                            field: (yk_attr_positive_i64(e, reader.decoder(), "bts:FieldIndex")?
+                                - 1) as u32,
+                            z: (yk_attr_positive_i64(e, reader.decoder(), "bts:ZIndex")? - 1)
                                 as i32,
+                            channel: (yk_attr_positive_i64(e, reader.decoder(), "bts:Ch")? - 1)
+                                as i32,
+                            timepoint: (yk_attr_positive_i64(e, reader.decoder(), "bts:TimePoint")?
+                                - 1) as i32,
+                            action_index: (yk_attr_positive_i64(
+                                e,
+                                reader.decoder(),
+                                "bts:ActionIndex",
+                            )? - 1) as i32,
+                            timeline_index: (yk_attr_positive_i64(
+                                e,
+                                reader.decoder(),
+                                "bts:TimelineIndex",
+                            )? - 1) as i32,
                             file: None,
                         };
                         planes.push(p);
@@ -9572,7 +10059,14 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Result<Vec<YokogawaPlane>> {
             }
             Ok(Event::Text(t)) => {
                 if in_img_record {
-                    current_text.push_str(&t.unescape().unwrap_or_default());
+                    current_text
+                        .push_str(&crate::common::xml::decode_xml_text(&t).unwrap_or_default());
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if in_img_record {
+                    current_text
+                        .push_str(&crate::common::xml::decode_xml_ref(&r).unwrap_or_default());
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -9580,14 +10074,10 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Result<Vec<YokogawaPlane>> {
                     let value = current_text.trim();
                     if !value.is_empty() {
                         let img = parent.join(value);
-                        if !img.exists() {
-                            return Err(BioFormatsError::UnsupportedFormat(format!(
-                                "Yokogawa CV7000 MeasurementData.mlf references missing image file {}",
-                                img.display()
-                            )));
-                        }
                         if let Some(last) = planes.last_mut() {
-                            last.file = Some(img);
+                            if img.exists() {
+                                last.file = Some(img);
+                            }
                         }
                     }
                     in_img_record = false;
@@ -9611,11 +10101,11 @@ fn yk_parse_mrf(xml: &str) -> Vec<YokogawaChannel> {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 if e.name().as_ref() == b"bts:MeasurementChannel" {
                     channels.push(YokogawaChannel {
-                        index: (yk_attr_int(e, "bts:Ch").unwrap_or(1) - 1) as i32,
+                        index: (yk_attr_int(e, reader.decoder(), "bts:Ch").unwrap_or(1) - 1) as i32,
                         action_index: 0,
                         timeline_index: 0,
-                        x_size: yk_attr_f64(e, "bts:HorizontalPixelDimension"),
-                        y_size: yk_attr_f64(e, "bts:VerticalPixelDimension"),
+                        x_size: yk_attr_f64(e, reader.decoder(), "bts:HorizontalPixelDimension"),
+                        y_size: yk_attr_f64(e, reader.decoder(), "bts:VerticalPixelDimension"),
                     });
                 }
             }
@@ -9669,11 +10159,15 @@ impl YokogawaReader {
         let mut tmin: HashMap<u32, i32> = HashMap::new();
         let mut tmax: HashMap<u32, i32> = HashMap::new();
         let mut first_file: Option<PathBuf> = None;
+        let mut acquired_wells: HashSet<u32> = HashSet::new();
 
         for p in &planes {
-            if p.file.is_none() {
-                continue;
+            if p.file.is_some() {
+                acquired_wells.insert(p.row * plate_columns + p.column);
             }
+        }
+
+        for p in &planes {
             if p.row >= plate.rows || p.column >= plate.columns {
                 return Err(BioFormatsError::Format(format!(
                     "Yokogawa CV7000 plane references well row {}, column {} outside declared plate {}x{}",
@@ -9683,10 +10177,13 @@ impl YokogawaReader {
                     plate.columns
                 )));
             }
-            if first_file.is_none() {
+            let well_number = p.row * plate_columns + p.column;
+            if !acquired_wells.contains(&well_number) {
+                continue;
+            }
+            if first_file.is_none() && p.file.is_some() {
                 first_file = p.file.clone();
             }
-            let well_number = p.row * plate_columns + p.column;
             unique_wells.insert(well_number);
             unique_channels.insert(p.channel);
             if (p.field as usize) + 1 > fields {
@@ -9762,8 +10259,10 @@ impl YokogawaReader {
 
         // Map each plane record into (series, no) and record its file.
         for p in &planes {
-            let Some(_) = p.file.as_ref() else { continue };
             let well_number = p.row * plate_columns + p.column;
+            if !acquired_wells.contains(&well_number) {
+                continue;
+            }
             let Ok(well_ordinal) = wells.binary_search(&well_number) else {
                 continue;
             };
@@ -9796,13 +10295,8 @@ impl YokogawaReader {
             }
         }
 
-        for (series_index, files) in plane_files.iter().enumerate() {
-            for (plane_index, file) in files.iter().enumerate() {
-                let Some(file) = file else {
-                    return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "Yokogawa CV7000: series {series_index} plane {plane_index} has no companion TIFF payload"
-                    )));
-                };
+        for files in &plane_files {
+            for file in files.iter().flatten() {
                 let mut tr = crate::tiff::TiffReader::new();
                 tr.set_id(file).map_err(|e| {
                     BioFormatsError::Format(format!(
@@ -9940,7 +10434,16 @@ impl FormatReader for YokogawaReader {
             .cloned()
             .flatten();
         let Some(file) = file else {
-            // Missing plane: return zero-filled buffer (Java fills with 0).
+            // Java fills the requested buffer, then by default duplicates the
+            // first Z/T plane in the same channel for missing planes.
+            if p > 0 {
+                let plane_c = (meta.image_count / (meta.size_z.max(1) * meta.size_t.max(1))).max(1);
+                let duplicate = p % plane_c;
+                if duplicate != p {
+                    return self.open_bytes(duplicate);
+                }
+                return self.open_bytes(0);
+            }
             return Ok(vec![0u8; plane_bytes]);
         };
         if self.tiff_loaded {
@@ -10252,6 +10755,8 @@ pub struct LofReader {
     tile_count: u32,
     /// Bytes-per-tile increment (Java `metaTemp.tileBytesInc[0]`).
     tile_bytes_inc: u64,
+    /// Whether `checkForLofLayout` found a non-empty memory block offset.
+    pixel_memory_present: bool,
     current_series: usize,
 }
 
@@ -10265,6 +10770,7 @@ impl LofReader {
             end_pointer: 0,
             tile_count: 1,
             tile_bytes_inc: 0,
+            pixel_memory_present: false,
             current_series: 0,
         }
     }
@@ -10384,12 +10890,13 @@ impl FormatReader for LofReader {
             ));
         }
         let memory_size = c.read_i64("LOF memory size")?;
-        if memory_size <= 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Leica LOF contains no image data, it cannot be opened directly".into(),
+        if memory_size < 0 {
+            return Err(BioFormatsError::Format(
+                "Not a valid Leica LOF file (negative memory size)".into(),
             ));
         }
         let data_offset = c.pos() as u64;
+        let pixel_memory_present = memory_size > 0;
 
         // ---- Part 2: memory block (raw pixel data) ----
         c.skip(memory_size as usize);
@@ -10424,6 +10931,7 @@ impl FormatReader for LofReader {
         self.end_pointer = file_len;
         self.tile_count = info.tile_count.max(1);
         self.tile_bytes_inc = info.tile_bytes_inc;
+        self.pixel_memory_present = pixel_memory_present;
         self.current_series = 0;
         Ok(())
     }
@@ -10436,6 +10944,7 @@ impl FormatReader for LofReader {
         self.end_pointer = 0;
         self.tile_count = 1;
         self.tile_bytes_inc = 0;
+        self.pixel_memory_present = false;
         self.current_series = 0;
         Ok(())
     }
@@ -10491,6 +11000,12 @@ impl FormatReader for LofReader {
         let plane_size = (meta.size_x as u64) * (meta.size_y as u64) * bpp as u64;
         let plane_bytes = plane_size as usize;
 
+        // Java only records an offset when memorySize > 0. Without one,
+        // openBytes treats the file as truncated and returns fill-color planes.
+        if !self.pixel_memory_present {
+            return Ok(vec![0u8; plane_bytes]);
+        }
+
         // Java row-padding (bytesToSkip) calculation.
         let mut bytes_to_skip: i64 = self.end_pointer as i64
             - self.data_offset as i64
@@ -10530,6 +11045,9 @@ impl FormatReader for LofReader {
                 f.seek(SeekFrom::Current(bytes_to_skip as i64))
                     .map_err(BioFormatsError::Io)?;
             }
+        }
+        if meta.is_rgb && rgb_channel_count == 3 && lof_meta_inverse_rgb(&meta) {
+            lof_bgr_to_rgb(&mut buf, bytes);
         }
         Ok(buf)
     }
@@ -10625,7 +11143,7 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
                 for a in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
                     let val = a
-                        .unescape_value()
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map(|v| v.to_string())
                         .unwrap_or_default();
                     attrs.insert(key, val);
@@ -11241,6 +11759,25 @@ fn lof_insert_channel_lut_metadata(
     }
 }
 
+fn lof_meta_inverse_rgb(meta: &ImageMetadata) -> bool {
+    matches!(
+        meta.series_metadata.get("lof.inverse_rgb"),
+        Some(MetadataValue::String(value)) if value == "true"
+    )
+}
+
+fn lof_bgr_to_rgb(buf: &mut [u8], bytes_per_sample: usize) {
+    if bytes_per_sample == 0 {
+        return;
+    }
+    let pixel_stride = bytes_per_sample * 3;
+    for pixel in buf.chunks_exact_mut(pixel_stride) {
+        for i in 0..bytes_per_sample {
+            pixel.swap(i, 2 * bytes_per_sample + i);
+        }
+    }
+}
+
 fn lof_channel_name(node: &LofNode) -> Option<String> {
     ["Name", "DyeName", "Dye"]
         .into_iter()
@@ -11777,7 +12314,7 @@ fn write_png_chunk(out: &mut Vec<u8>, type_: &[u8; 4], data: &[u8]) {
 }
 
 /// Decode a complete PNG byte stream into raw, planar/interleaved pixel bytes
-/// laid out to match `meta` (interleaved RGB samples, little-endian uint16).
+/// laid out to match `meta` (interleaved RGB samples, PNG/Java big-endian uint16).
 fn decode_sub_png(png: &[u8], meta: &ImageMetadata, w: u32, h: u32) -> Result<Vec<u8>> {
     use image::GenericImageView;
     let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
@@ -11799,19 +12336,19 @@ fn decode_sub_png(png: &[u8], meta: &ImageMetadata, w: u32, h: u32) -> Result<Ve
             .to_luma16()
             .into_raw()
             .iter()
-            .flat_map(|v| v.to_le_bytes())
+            .flat_map(|v| v.to_be_bytes())
             .collect(),
         (PixelType::Uint16, 3) => img
             .to_rgb16()
             .into_raw()
             .iter()
-            .flat_map(|v| v.to_le_bytes())
+            .flat_map(|v| v.to_be_bytes())
             .collect(),
         (PixelType::Uint16, 4) => img
             .to_rgba16()
             .into_raw()
             .iter()
-            .flat_map(|v| v.to_le_bytes())
+            .flat_map(|v| v.to_be_bytes())
             .collect(),
         (pt, c) => {
             return Err(BioFormatsError::UnsupportedFormat(format!(
@@ -12357,14 +12894,14 @@ impl FormatReader for PovrayReader {
         let expected_bytes = total_voxels
             .checked_mul(n_bytes)
             .ok_or_else(|| BioFormatsError::Format("DF3 byte count overflows".into()))?;
-        if payload != expected_bytes {
+        if payload < expected_bytes {
             return Err(BioFormatsError::Format(format!(
-                "DF3 pixel payload has {} bytes, expected {}",
+                "DF3 pixel payload has {} bytes, expected at least {}",
                 payload, expected_bytes
             )));
         }
 
-        let pixel_data = data[6..].to_vec();
+        let pixel_data = data[6..6 + expected_bytes].to_vec();
         let image_count = size_z.max(1);
 
         self.path = Some(path.to_path_buf());
@@ -12432,7 +12969,8 @@ impl FormatReader for PovrayReader {
             .pixel_data
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?;
-        let plane_bytes = meta.size_x as usize * meta.size_y as usize;
+        let plane_bytes =
+            meta.size_x as usize * meta.size_y as usize * meta.pixel_type.bytes_per_sample();
         let offset = plane_index as usize * plane_bytes;
         let end = offset
             .checked_add(plane_bytes)
@@ -12465,17 +13003,25 @@ impl FormatReader for PovrayReader {
             .pixel_data
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?;
-        let row_bytes = meta.size_x as usize;
+        let bytes_per_pixel = meta.pixel_type.bytes_per_sample();
+        let row_bytes = (meta.size_x as usize)
+            .checked_mul(bytes_per_pixel)
+            .ok_or_else(|| BioFormatsError::Format("DF3 row byte count overflows".into()))?;
         let plane_bytes = row_bytes
             .checked_mul(meta.size_y as usize)
             .ok_or_else(|| BioFormatsError::Format("DF3 plane byte count overflows".into()))?;
         let plane_offset = (plane_index as usize)
             .checked_mul(plane_bytes)
             .ok_or_else(|| BioFormatsError::Format("DF3 plane offset overflows".into()))?;
-        let mut out = Vec::with_capacity(w as usize * h as usize);
+        let out_len = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(bytes_per_pixel))
+            .ok_or_else(|| BioFormatsError::Format("DF3 output byte count overflows".into()))?;
+        let mut out = Vec::with_capacity(out_len);
         for row in y..y + h {
-            let offset = plane_offset + row as usize * row_bytes + x as usize;
-            out.extend_from_slice(&pixels[offset..offset + w as usize]);
+            let offset = plane_offset + row as usize * row_bytes + x as usize * bytes_per_pixel;
+            let width_bytes = w as usize * bytes_per_pixel;
+            out.extend_from_slice(&pixels[offset..offset + width_bytes]);
         }
         Ok(out)
     }
@@ -12858,12 +13404,10 @@ impl Default for BurleighReader {
 }
 
 impl FormatReader for BurleighReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("img"))
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        // Java sets suffixSufficient=false and suffixNecessary=false; `.img`
+        // alone is too generic, so Burleigh is selected by magic bytes.
+        false
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -13237,15 +13781,14 @@ mod mrw_tests {
     }
 
     #[test]
-    fn mrw_rejects_loose_magic_and_malformed_prd_values() {
+    fn mrw_accepts_java_magic_suffix_and_rejects_malformed_prd_values() {
         let mut bytes = build_mrw(2, 2, 2, 2, 0, &[1, 2, 3, 4]);
         bytes[0] = b'X';
-        let path = temp_path("bad_magic");
+        let path = temp_path("magic_suffix");
         std::fs::write(&path, &bytes).unwrap();
         let reader = MrwReader::new();
-        assert!(!reader.is_this_type_by_bytes(&bytes[..4]));
-        let err = MrwReader::new().set_id(&path).unwrap_err();
-        assert!(err.to_string().contains("\\0MRM"));
+        assert!(reader.is_this_type_by_bytes(&bytes[..4]));
+        MrwReader::new().set_id(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
         let bytes = build_mrw(1, 1, 2, 2, 0, &[1]);

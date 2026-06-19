@@ -23,9 +23,16 @@ use crate::common::region::crop_full_plane;
 
 const HDR_RECORD_BYTES: usize = 1024;
 const IMAGE_NAME_OFFSET: u64 = 116;
+const PHYSICAL_SIZE_X_OFFSET: usize = 484;
+const PHYSICAL_SIZE_Y_OFFSET: usize = 488;
+const PHYSICAL_SIZE_Z_OFFSET: usize = 492;
 
 fn r_i32_le(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
+fn r_f32_le(b: &[u8], off: usize) -> f32 {
+    f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
 fn positive_i32_dim(value: i32, label: &str) -> Result<u32> {
@@ -48,9 +55,16 @@ fn imagic_pixel_type(type_str: &str) -> Result<(PixelType, u8)> {
         "RECO" => Err(BioFormatsError::UnsupportedFormat(
             "Unsupported pixel type 'RECO'".into(),
         )),
-        _ => Err(BioFormatsError::UnsupportedFormat(format!(
-            "IMAGIC unsupported pixel type '{type_str}'"
-        ))),
+        _ => Ok((PixelType::Int8, 8)),
+    }
+}
+
+fn imagic_physical_size(value: f32) -> Option<f64> {
+    let micrometers = value as f64 * 0.0001;
+    if micrometers > f64::EPSILON && micrometers.is_finite() {
+        Some(micrometers)
+    } else {
+        None
     }
 }
 
@@ -59,6 +73,9 @@ pub struct ImagicReader {
     img_path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     image_name: Option<String>,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
     bytes_per_sample: usize,
 }
 
@@ -69,6 +86,9 @@ impl ImagicReader {
             img_path: None,
             meta: None,
             image_name: None,
+            physical_size_x: None,
+            physical_size_y: None,
+            physical_size_z: None,
             bytes_per_sample: 4,
         }
     }
@@ -86,7 +106,17 @@ impl FormatReader for ImagicReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("hed") | Some("img"))
+        match ext.as_deref() {
+            Some("hed") => true,
+            Some("img") => {
+                let stem = path.file_stem().unwrap_or_default();
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                parent
+                    .join(format!("{}.hed", stem.to_string_lossy()))
+                    .exists()
+            }
+            _ => false,
+        }
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -113,7 +143,6 @@ impl FormatReader for ImagicReader {
         };
         let img_path = parent.join(format!("{}.img", stem.to_string_lossy()));
 
-        // Read first .hed record
         let mut f = File::open(&hed_path).map_err(BioFormatsError::Io)?;
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
         if file_len < HDR_RECORD_BYTES as u64 {
@@ -124,30 +153,47 @@ impl FormatReader for ImagicReader {
         let num_images = file_len / HDR_RECORD_BYTES as u64;
 
         let mut rec = vec![0u8; HDR_RECORD_BYTES];
-        f.read_exact(&mut rec).map_err(BioFormatsError::Io)?;
+        let mut raw_size_y = 0;
+        let mut raw_size_x = 0;
+        let mut type_str = String::new();
+        let mut pixel_type = PixelType::Int8;
+        let mut bpp = 8;
+        let mut last_name = None;
+        let mut physical_size_x = None;
+        let mut physical_size_y = None;
+        let mut physical_size_z = None;
 
-        // Java layout: skip 16, read 6 ints (date/time, 24 bytes), skip 8,
-        // then sizeY @48, sizeX @52, 4-char type string @56.
-        let size_y = positive_i32_dim(r_i32_le(&rec, 48), "height")?;
-        let size_x = positive_i32_dim(r_i32_le(&rec, 52), "width")?;
-        let type_str = std::str::from_utf8(&rec[56..60])
-            .unwrap_or("")
-            .trim_end_matches(char::from(0))
-            .to_string();
-        let last_name = if num_images > 0 {
-            let last_record = (num_images - 1) * HDR_RECORD_BYTES as u64;
-            f.seek(SeekFrom::Start(last_record + IMAGE_NAME_OFFSET))
+        // Java reads every 1024-byte header and leaves core fields set from the
+        // last record. Recognized pixel types update the current type; unknown
+        // strings leave the previous/default int8 type unchanged.
+        for i in 0..num_images {
+            f.seek(SeekFrom::Start(i * HDR_RECORD_BYTES as u64))
                 .map_err(BioFormatsError::Io)?;
-            let mut name = [0u8; 80];
-            f.read_exact(&mut name).map_err(BioFormatsError::Io)?;
-            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-            let trimmed = String::from_utf8_lossy(&name[..end]).trim().to_string();
-            Some(trimmed)
-        } else {
-            None
-        };
+            f.read_exact(&mut rec).map_err(BioFormatsError::Io)?;
 
-        let (pixel_type, bpp) = imagic_pixel_type(&type_str)?;
+            raw_size_y = r_i32_le(&rec, 48);
+            raw_size_x = r_i32_le(&rec, 52);
+            type_str = std::str::from_utf8(&rec[56..60])
+                .unwrap_or("")
+                .trim_end_matches(char::from(0))
+                .to_string();
+            match type_str.as_str() {
+                "REAL" | "INTG" | "PACK" | "COMP" | "RECO" => {
+                    (pixel_type, bpp) = imagic_pixel_type(&type_str)?;
+                }
+                _ => {}
+            }
+
+            let name = &rec[IMAGE_NAME_OFFSET as usize..IMAGE_NAME_OFFSET as usize + 80];
+            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            last_name = Some(String::from_utf8_lossy(&name[..end]).trim().to_string());
+            physical_size_x = imagic_physical_size(r_f32_le(&rec, PHYSICAL_SIZE_X_OFFSET));
+            physical_size_y = imagic_physical_size(r_f32_le(&rec, PHYSICAL_SIZE_Y_OFFSET));
+            physical_size_z = imagic_physical_size(r_f32_le(&rec, PHYSICAL_SIZE_Z_OFFSET));
+        }
+
+        let size_y = positive_i32_dim(raw_size_y, "height")?;
+        let size_x = positive_i32_dim(raw_size_x, "width")?;
         let plane_bytes = (size_x as u64)
             .checked_mul(size_y as u64)
             .and_then(|v| v.checked_mul(pixel_type.bytes_per_sample() as u64))
@@ -196,6 +242,9 @@ impl FormatReader for ImagicReader {
         self.hed_path = Some(hed_path);
         self.img_path = Some(img_path);
         self.image_name = last_name;
+        self.physical_size_x = physical_size_x;
+        self.physical_size_y = physical_size_y;
+        self.physical_size_z = physical_size_z;
         Ok(())
     }
 
@@ -204,6 +253,9 @@ impl FormatReader for ImagicReader {
         self.img_path = None;
         self.meta = None;
         self.image_name = None;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
+        self.physical_size_z = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -272,6 +324,9 @@ impl FormatReader for ImagicReader {
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
         if let Some(img) = ome.images.first_mut() {
             img.name = self.image_name.clone();
+            img.physical_size_x = self.physical_size_x;
+            img.physical_size_y = self.physical_size_y;
+            img.physical_size_z = self.physical_size_z;
         }
         Some(ome)
     }

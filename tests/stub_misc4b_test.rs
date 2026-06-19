@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bioformats::common::metadata::DimensionOrder;
+use bioformats::common::metadata::{DimensionOrder, MetadataValue};
 use bioformats::common::pixel_type::PixelType;
 use bioformats::common::reader::FormatReader;
 use bioformats::formats::misc4::{AplReader, HrdgdfReader, KlbReader};
@@ -119,6 +119,22 @@ fn hrdgdf_synthetic_roundtrip() {
         !m.is_little_endian,
         "HRDGDF is big-endian per the Java reader"
     );
+    assert!(matches!(
+        m.series_metadata.get("DX (kilometers)"),
+        Some(MetadataValue::String(value)) if value == "5.0"
+    ));
+    assert!(matches!(
+        m.series_metadata.get("DY (kilometers)"),
+        Some(MetadataValue::String(value)) if value == "5.0"
+    ));
+    assert!(matches!(
+        m.series_metadata.get("Storm center (Longitude)"),
+        Some(MetadataValue::Float(value)) if (*value - 90.0).abs() < f64::EPSILON
+    ));
+    assert!(matches!(
+        m.series_metadata.get("Storm center (Latitude)"),
+        Some(MetadataValue::Float(value)) if (*value - 25.0).abs() < f64::EPSILON
+    ));
 
     // Channel 0 = east-west: pixels in row-major order are 1,3,5,7.
     let ch0 = r.open_bytes(0).expect("plane 0");
@@ -151,6 +167,15 @@ fn apl_detection_and_missing_sidecar() {
     assert!(r.is_this_type_by_name(Path::new("dataset.mtb")));
     assert!(r.is_this_type_by_name(Path::new("dataset.tnb")));
     assert!(!r.is_this_type_by_name(Path::new("dataset.tif")));
+    let root = unique_path("apl_tif_entry", "dir");
+    let dataset = root.join("experiment");
+    let image_dir = dataset.join("experiment_DocumentFiles").join("field");
+    std::fs::create_dir_all(&image_dir).unwrap();
+    std::fs::write(dataset.join("experiment.apl"), b"placeholder").unwrap();
+    let tiff_entry = image_dir.join("plane.tif");
+    std::fs::write(&tiff_entry, b"not a real tiff").unwrap();
+    assert!(r.is_this_type_by_name(&tiff_entry));
+    let _ = std::fs::remove_dir_all(&root);
     // APL has no magic-byte signature.
     assert!(!r.is_this_type_by_bytes(b"anything at all"));
 

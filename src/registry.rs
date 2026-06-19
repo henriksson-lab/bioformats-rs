@@ -106,9 +106,6 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         Box::new(crate::formats::zeiss_lsm::ZeissLsmReader::new()),
         Box::new(crate::formats::metamorph::MetamorphReader::new()),
         Box::new(crate::formats::micromanager::MicromanagerReader::new()),
-        // OpenSlide-based whole-slide formats (MRXS, VMS, BIF, etc.)
-        #[cfg(feature = "openslide")]
-        Box::new(crate::formats::openslide_reader::OpenSlideReader::new()),
         // Whole-slide TIFF wrappers (extension-only)
         Box::new(crate::formats::svs::SvsReader::new()),
         // Extension-only Inveon (hdr+img pair, extension-only detection)
@@ -185,6 +182,10 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         // Extended formats — binary with magic/structure
         Box::new(crate::formats::extended::ImspectorReader::new()), // magic "OMAS_BF_"
         Box::new(crate::formats::extended::HamamatsuVmsReader::new()),
+        // OpenSlide-based whole-slide formats (MRXS, BIF, etc.). Keep this
+        // after translated readers that claim overlapping suffixes such as VMS.
+        #[cfg(feature = "openslide")]
+        Box::new(crate::formats::openslide_reader::OpenSlideReader::new()),
         Box::new(crate::formats::extended::CellomicsReader::new()),
         // Extended formats — real native readers plus explicit unsupported detectors
         Box::new(crate::formats::extended::MrwReader::new()),
@@ -274,6 +275,7 @@ fn all_readers() -> Vec<Box<dyn FormatReader>> {
         // OME-Zarr / OME-NGFF (directory-based; detected by `.zarr` path or a
         // Zarr group marker). Handled explicitly in `open_reader` before
         // `peek_header`, which cannot read a directory.
+        #[cfg(feature = "zarr")]
         Box::new(crate::formats::zarr::OmeZarrReader::new()),
     ]
 }
@@ -337,6 +339,7 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
     // OME-Zarr is a directory-based format. `peek_header` cannot read a
     // directory, so detect and dispatch it before any byte sniffing. Mirrors
     // Java `ZarrReader.isThisType`, which matches on the `.zarr` path.
+    #[cfg(feature = "zarr")]
     if crate::formats::zarr::is_zarr_path(path) {
         let mut r = boxed_reader(crate::formats::zarr::OmeZarrReader::new());
         match r.set_id(path) {
@@ -345,6 +348,15 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
             Err(err) if path.is_dir() => return Err(err),
             Err(_) => {}
         }
+    }
+
+    // Java readers.txt lists FilePatternReader first and its suffix is
+    // sufficient, so a `.pattern` path is terminally a pattern file even if the
+    // text happens to begin with image/container magic bytes.
+    if has_pattern_extension(path) {
+        let mut r = boxed_reader(crate::formats::misc4::FilePatternReader::new());
+        r.set_id(path)?;
+        return Ok(r);
     }
 
     let header = peek_header(path, 512)?;
@@ -417,6 +429,8 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
                     if replacing_magic_error {
                         best_error = Some(err);
                         replacing_magic_error = false;
+                    } else if terminal_extension_error(path, &err) {
+                        return Err(err);
                     } else {
                         remember_set_id_error(&mut best_error, err);
                     }
@@ -433,6 +447,13 @@ fn has_fake_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("fake"))
+        .unwrap_or(false)
+}
+
+fn has_pattern_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("pattern"))
         .unwrap_or(false)
 }
 
@@ -455,26 +476,38 @@ fn terminal_magic_allows_fake_fallback(err: &BioFormatsError) -> bool {
 ///
 /// This is used only for memoized metadata cache hits where the file stamp and
 /// cached metadata shape have already been validated and callers may never read
-/// pixels. Name matching is tried before broad magic matching so extension
-/// fallbacks that previously succeeded after a magic-reader `set_id` rejection
-/// can still use their cached metadata without paying the full parse cost.
+/// pixels. The order mirrors `open_reader` as closely as possible without
+/// parsing: precise directory/header/TIFF dispatch, then magic-byte readers,
+/// then extension fallbacks. If a magic-byte candidate later fails during lazy
+/// pixel access, `Memoizer` falls back to the full `open_reader` path.
 pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn FormatReader>> {
-    let header = peek_header(path, 512)?;
-
-    if is_tiff_header(&header) {
-        let readers = if is_generic_tiff_extension(path) {
-            generic_tiff_name_wrappers(path, &header)
-        } else {
-            tiff_wrapper_readers_for_extension(path, &header)
-        };
-        if let Some(reader) = readers.into_iter().next() {
-            return Ok(reader);
-        }
+    #[cfg(feature = "zarr")]
+    if crate::formats::zarr::is_zarr_path(path) {
+        return Ok(boxed_reader(crate::formats::zarr::OmeZarrReader::new()));
     }
 
-    for r in all_readers() {
-        if r.is_this_type_by_name(path) {
-            return Ok(r);
+    if has_pattern_extension(path) {
+        return Ok(boxed_reader(crate::formats::misc4::FilePatternReader::new()));
+    }
+
+    let header = peek_header(path, 512)?;
+
+    if has_ims_extension(path) && is_hdf5_header(&header) {
+        return Ok(boxed_reader(
+            crate::formats::imaris_hdf::ImarisHdfReader::new(),
+        ));
+    }
+
+    if has_zvi_extension(path) {
+        return Ok(boxed_reader(
+            crate::formats::zeiss_zvi::ZeissZviReader::new(),
+        ));
+    }
+
+    if is_tiff_header(&header) {
+        let readers = tiff_wrapper_readers_for_extension(path, &header);
+        if let Some(reader) = readers.into_iter().next() {
+            return Ok(reader);
         }
     }
 
@@ -484,9 +517,30 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
         }
     }
 
+    for r in all_readers() {
+        if r.is_this_type_by_name(path) {
+            return Ok(r);
+        }
+    }
+
     Err(BioFormatsError::UnsupportedFormat(
         path.display().to_string(),
     ))
+}
+
+fn terminal_extension_error(path: &Path, err: &BioFormatsError) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    matches!(
+        (ext.as_deref(), err),
+        (
+            Some("vms") | Some("vmu"),
+            BioFormatsError::Format(message) | BioFormatsError::UnsupportedFormat(message)
+        ) if message.contains("Hamamatsu VMS")
+            || message.contains("Hamamatsu VMS/VMU")
+    )
 }
 
 fn has_ims_extension(path: &Path) -> bool {
@@ -620,13 +674,6 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         }
         _ => Vec::new(),
     }
-}
-
-fn is_generic_tiff_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "tif" | "tiff"))
-        .unwrap_or(false)
 }
 
 fn generic_tiff_name_wrappers(path: &Path, header: &[u8]) -> Vec<Box<dyn FormatReader>> {
@@ -1062,7 +1109,7 @@ mod tests {
 
         assert!(matches!(
             reader.metadata().series_metadata.get("fluoview.Laser"),
-            Some(MetadataValue::String(value)) if value == "488"
+            Some(MetadataValue::Int(value)) if *value == 488
         ));
         let _ = std::fs::remove_file(path);
     }
@@ -1085,6 +1132,31 @@ mod tests {
             "plain TIFF should not be claimed by Fluoview wrapper"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pattern_extension_preempts_tiff_magic_like_java_suffix_sufficient() {
+        let tiff = temp_path("pattern_payload_source.tif");
+        write_minimal_tiff_with_description(&tiff, "valid TIFF bytes");
+        let pattern = temp_path("pattern_payload.pattern");
+        std::fs::write(&pattern, std::fs::read(&tiff).unwrap()).unwrap();
+
+        let err = match ImageReader::open(&pattern) {
+            Ok(_) => panic!(".pattern payload was opened as a TIFF image"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(
+                err,
+                BioFormatsError::Io(_)
+                    | BioFormatsError::Format(_)
+                    | BioFormatsError::UnsupportedFormat(_)
+            ),
+            "unexpected error from FilePattern dispatch: {err:?}"
+        );
+        let _ = std::fs::remove_file(tiff);
+        let _ = std::fs::remove_file(pattern);
     }
 
     #[test]
@@ -1424,7 +1496,6 @@ mod tests {
                 "sample.eps",
                 "EPS: not a PostScript file and no embedded TIFF preview found",
             ),
-            ("sample.b16", "PCO B16 file is too short"),
             ("sample.1sc", "Bio-Rad GEL file is too short"),
             (
                 "sample.obf",

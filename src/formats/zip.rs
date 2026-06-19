@@ -3,10 +3,9 @@
 //! Detects ZIP files by magic bytes PK\x03\x04. Following the Java `ZipReader`,
 //! this wraps an inner auto-detecting `ImageReader` over the archive entries:
 //! all entries are extracted to a temporary directory preserving their safe
-//! relative paths, the "primary" entry is selected (the one whose name matches
-//! the archive's base name or uses it as a delimited prefix, else the first
-//! entry), and the matching format reader is chosen by auto-detection (not
-//! restricted to TIFF).
+//! relative paths, the "primary" entry is selected (the first one whose name
+//! starts with the archive's base name, else the first entry), and that entry
+//! is delegated to the auto-detecting image reader.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -92,9 +91,14 @@ impl FormatReader for ZipReader {
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| {
-                n.strip_suffix(".zip")
-                    .or_else(|| n.strip_suffix(".ZIP"))
-                    .unwrap_or(n)
+                let suffix_start = n.len().saturating_sub(4);
+                if n.get(suffix_start..)
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".zip"))
+                {
+                    &n[..suffix_start]
+                } else {
+                    n
+                }
             })
             .unwrap_or("")
             .to_string();
@@ -151,36 +155,25 @@ impl FormatReader for ZipReader {
                 ));
             }
         };
-        let mut candidates = Vec::with_capacity(extracted_files.len());
-        candidates.push(primary.clone());
-        for file in &extracted_files {
-            if file != &primary {
-                candidates.push(file.clone());
-            }
-        }
 
         self.extracted_dir = Some(dir);
         self.extracted_files = extracted_files;
 
-        // Delegate to the auto-detecting ImageReader, preferring the primary
-        // entry but falling through to later archive entries such as images
-        // after a manifest/readme.
-        let mut last_error = None;
-        for candidate in candidates {
-            match ImageReader::open(&candidate) {
-                Ok(reader) => {
-                    self.inner = Some(reader);
-                    return Ok(());
-                }
-                Err(e) => last_error = Some(e),
+        // Java ZipReader delegates exactly the selected entry to ImageReader.
+        // It does not fall through to later archive entries if that primary
+        // entry is not recognized.
+        match ImageReader::open(&primary) {
+            Ok(reader) => {
+                self.inner = Some(reader);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.close();
+                Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Zip primary entry is not a recognized image: {e}"
+                )))
             }
         }
-        let _ = self.close();
-        Err(last_error.unwrap_or_else(|| {
-            BioFormatsError::UnsupportedFormat(
-                "Zip file does not contain a recognized image entry".to_string(),
-            )
-        }))
     }
 
     fn close(&mut self) -> Result<()> {

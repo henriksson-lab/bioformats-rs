@@ -39,9 +39,10 @@ fn dm_pixel_type_and_bytes(dm_type: i32) -> Result<(PixelType, usize)> {
 /// 9=Int8, 7=Int32 and 2/12 (float/double) are signed; 6=UInt8, 10=UInt16,
 /// 11=UInt32 are unsigned. Java instead reads sign from the `LowLimit` tag
 /// (`signed = LowLimit < 0`, GatanReader.java:719-720); gatan.rs does not
-/// capture that tag, so we fall back to the DataType's own signedness. For
-/// the RGB-ish DataType 23 (Java's `getNumBytes(23)==0`) signedness is
-/// unknown, so we treat it as unsigned (matching the Uint8 default).
+/// capture that tag; for reconciliation we also fall back to the DataType's own
+/// signedness. For the RGB-ish DataType 23 (Java's `getNumBytes(23)==0`)
+/// signedness is unknown, so we treat it as unsigned (matching the Uint8
+/// default).
 fn dm_data_type_is_signed(dm_type: i32) -> bool {
     matches!(dm_type, 1 | 2 | 7 | 9 | 12)
 }
@@ -1236,28 +1237,16 @@ impl FormatReader for GatanReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("dm3") | Some("dm4") | Some("dm2"))
+        matches!(ext.as_deref(), Some("dm3") | Some("dm4"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        if header.len() < 16 {
+        if header.len() < 4 {
             return false;
         }
-        // DM3: first 4 bytes big-endian = 3
-        // DM4: first 4 bytes big-endian = 4
+        // Java GatanReader.isThisType reads only the first big-endian int.
         let v = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-        match v {
-            3 => {
-                let byte_order = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
-                byte_order <= 1
-            }
-            4 => {
-                let byte_order =
-                    u32::from_be_bytes([header[12], header[13], header[14], header[15]]);
-                byte_order <= 1
-            }
-            _ => false,
-        }
+        matches!(v, 3 | 4)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -2243,6 +2232,35 @@ impl FormatReader for GatanDm2Reader {
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::OmeMetadata;
+
+        let meta = self.meta.as_ref()?;
+        let mut ome = OmeMetadata::from_image_metadata(meta);
+        let image = &mut ome.images[0];
+
+        let get_physical = |key: &str| -> Option<f64> {
+            match meta.series_metadata.get(key) {
+                Some(MetadataValue::Float(v)) => Some(*v),
+                Some(MetadataValue::Int(v)) => Some(*v as f64),
+                Some(MetadataValue::String(s)) => s.parse::<f64>().ok(),
+                _ => None,
+            }
+        };
+
+        // GatanDM2Reader.parseExtraTags stores tags 31/32 as pixelSizeX/Y and
+        // writes them to OME in micrometers. It only warns on non-um units, so
+        // preserve the Java value here regardless of the unit tag.
+        image.physical_size_x = get_physical("Physical width");
+        image.physical_size_y = get_physical("Physical height");
+
+        if let Some(MetadataValue::String(name)) = meta.series_metadata.get("Name") {
+            image.name = Some(name.clone());
+        }
+
+        Some(ome)
+    }
 }
 
 #[cfg(test)]
@@ -2275,6 +2293,56 @@ mod tests {
             acquisition_mode_from_info(Some("(Mode TEM more")).as_deref(),
             Some("Other")
         );
+    }
+
+    #[test]
+    fn dm2_ome_metadata_uses_java_physical_size_extra_tags() {
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert(
+            "Physical width".into(),
+            MetadataValue::String("1.25".into()),
+        );
+        series_metadata.insert(
+            "Physical height".into(),
+            MetadataValue::String("2.5".into()),
+        );
+        series_metadata.insert(
+            "Physical size units".into(),
+            MetadataValue::String("nm".into()),
+        );
+        series_metadata.insert("Name".into(), MetadataValue::String("dm2 image".into()));
+
+        let reader = GatanDm2Reader {
+            path: None,
+            data_offset: DM2_HEADER_SIZE,
+            meta: Some(ImageMetadata {
+                size_x: 1,
+                size_y: 1,
+                size_z: 1,
+                size_c: 1,
+                size_t: 1,
+                pixel_type: PixelType::Uint8,
+                bits_per_pixel: 8,
+                image_count: 1,
+                dimension_order: DimensionOrder::XYZCT,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: false,
+                resolution_count: 1,
+                thumbnail: false,
+                series_metadata,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            }),
+        };
+
+        let ome = reader.ome_metadata().expect("ome");
+        assert_eq!(ome.images[0].physical_size_x, Some(1.25));
+        assert_eq!(ome.images[0].physical_size_y, Some(2.5));
+        assert_eq!(ome.images[0].name.as_deref(), Some("dm2 image"));
     }
 
     // Pure-logic port of GatanReader's ROI emission switch

@@ -20,7 +20,7 @@ const IMAGE_DATA: &str = "/ImageData/";
 pub struct ZeissXrmReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
-    image_paths: Vec<String>,
+    image_paths: Vec<Option<String>>,
 }
 
 impl ZeissXrmReader {
@@ -98,7 +98,10 @@ impl FormatReader for ZeissXrmReader {
         let stream_path = self
             .image_paths
             .get(plane_index as usize)
-            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?
+            .and_then(|path| path.as_ref())
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!("XRM plane {plane_index} has no ImageData stream"))
+            })?
             .clone();
         let path = self
             .path
@@ -133,9 +136,28 @@ impl FormatReader for ZeissXrmReader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let pixel_size = meta
+            .series_metadata
+            .get("Image Details: Pixel size (µm)")
+            .and_then(|value| match value {
+                MetadataValue::Float(v) if *v > 0.0 => Some(*v),
+                MetadataValue::Int(v) if *v > 0 => Some(*v as f64),
+                _ => None,
+            });
+        if let (Some(image), Some(pixel_size)) = (ome.images.get_mut(0), pixel_size) {
+            image.physical_size_x = Some(pixel_size);
+            image.physical_size_y = Some(pixel_size);
+            image.physical_size_z = Some(pixel_size);
+        }
+        Some(ome)
+    }
 }
 
-fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
+fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<Option<String>>)> {
     let mut ole = OleFile::open(path)?;
 
     // Java keys metadata emission off the .txm/.txrm suffix (initFile: isTXM/isTXRM).
@@ -165,7 +187,19 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
 
     for path in paths {
         if path.starts_with(IMAGE_DATA) {
-            image_paths.push(path);
+            let index = xrm_image_index(&path).ok_or_else(|| {
+                BioFormatsError::Format(format!("Zeiss XRM/TXRM invalid image stream path: {path}"))
+            })?;
+            if index == 0 {
+                return Err(BioFormatsError::Format(format!(
+                    "Zeiss XRM/TXRM invalid one-based image stream index in {path}"
+                )));
+            }
+            let slot = (index - 1) as usize;
+            if slot >= image_paths.len() {
+                image_paths.resize(slot + 1, None);
+            }
+            image_paths[slot] = Some(path);
         } else if path == "/ImageInfo/ImageWidth" {
             let v = read_xrm_i32(&mut ole, &path)?;
             size_x = Some(v);
@@ -204,7 +238,7 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
         } else if path == "/ImageInfo/PixelSize" {
             if let Ok(value) = read_xrm_f32(&mut ole, &path) {
                 metadata.insert(
-                    "Image Details: Pixel size (um)".into(),
+                    "Image Details: Pixel size (µm)".into(),
                     MetadataValue::Float(value as f64),
                 );
             }
@@ -272,8 +306,7 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<String>)> {
         }
     }
 
-    image_paths.sort_by_key(|p| xrm_image_index(p).unwrap_or(u32::MAX));
-    if image_paths.is_empty() {
+    if image_paths.iter().all(Option::is_none) {
         return Err(BioFormatsError::UnsupportedFormat(
             "Zeiss XRM/TXRM contains no Root Entry/ImageData/ImageN streams".into(),
         ));
@@ -466,6 +499,7 @@ mod tests {
             write_i32_stream(&mut comp, "/ImageInfo/ImageHeight", 2);
             write_i32_stream(&mut comp, "/ImageInfo/DataType", 5);
             write_i32_stream(&mut comp, "/ImageInfo/AcquisitionMode", 0);
+            write_stream(&mut comp, "/ImageInfo/PixelSize", &1.25f32.to_le_bytes());
             write_stream(&mut comp, "/ImageInfo/SourceFilterName", b"LE1\0");
             write_stream(&mut comp, "/ImageInfo/Voltage", &40.0f32.to_le_bytes());
             write_stream(&mut comp, "/exeVersion", b"1.2.3\0");
@@ -479,6 +513,11 @@ mod tests {
         let mut reader = ZeissXrmReader::new();
         reader.set_id(&txrm).unwrap();
         let md = &reader.metadata().series_metadata;
+        assert_eq!(
+            md.get("Image Details: Pixel size (µm)")
+                .map(|v| v.to_string()),
+            Some("1.25".to_string())
+        );
         assert_eq!(
             md.get("Image Details: Acquisition mode")
                 .map(|v| v.to_string()),
@@ -522,6 +561,10 @@ mod tests {
         );
         // TXRM must NOT carry the TXM-only "Output data type" key.
         assert!(!md.contains_key("Reconstruction Settings: Output data type"));
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].physical_size_x, Some(1.25));
+        assert_eq!(ome.images[0].physical_size_y, Some(1.25));
+        assert_eq!(ome.images[0].physical_size_z, Some(1.25));
         let _ = std::fs::remove_file(txrm);
 
         // .txm: emits "Output data type" and uses "General Parameters: " prefix.
@@ -568,6 +611,27 @@ mod tests {
             reader.open_bytes_region(0, 0, 0, 2, 2).unwrap(),
             vec![3, 0, 1, 2]
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xrm_preserves_one_based_image_stream_slots_like_java() {
+        let path = temp_path("missing_image1.txrm");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            write_i32_stream(&mut comp, "/ImageInfo/ImageWidth", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/ImageHeight", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/DataType", 3);
+            write_stream(&mut comp, "/ImageData/Image2", &[1, 2, 3, 4]);
+        }
+
+        let mut reader = ZeissXrmReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_z, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert!(reader.open_bytes(0).is_err());
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 4, 1, 2]);
 
         let _ = std::fs::remove_file(path);
     }

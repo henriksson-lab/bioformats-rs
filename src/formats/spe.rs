@@ -135,9 +135,9 @@ impl FormatReader for SpeReader {
             .unwrap_or(false)
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        // No universal magic byte; rely on extension
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Java SPEReader.isThisType only checks FormatTools.validStream(stream, 4, false).
+        header.len() >= 4
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -368,4 +368,18 @@ fn validate_spe_layout(size_x: u32, size_y: u32, frames: u32, pixel_type: PixelT
         )
         .ok_or_else(|| BioFormatsError::Format("SPE payload size overflows".into()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpeReader;
+    use crate::common::reader::FormatReader;
+
+    #[test]
+    fn spe_byte_identification_matches_java_valid_stream_check() {
+        let reader = SpeReader::new();
+        assert!(!reader.is_this_type_by_bytes(&[0, 1, 2]));
+        assert!(reader.is_this_type_by_bytes(&[0, 1, 2, 3]));
+        assert!(reader.is_this_type_by_bytes(b"not actually spe"));
+    }
 }

@@ -14,87 +14,6 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
-// ---------------------------------------------------------------------------
-// Macro: thin TIFF wrapper
-// ---------------------------------------------------------------------------
-macro_rules! tiff_wrapper {
-    (
-        $(#[$attr:meta])*
-        pub struct $name:ident;
-        extensions: [$($ext:literal),+];
-    ) => {
-        $(#[$attr])*
-        pub struct $name {
-            inner: crate::tiff::TiffReader,
-        }
-
-        impl $name {
-            pub fn new() -> Self {
-                $name { inner: crate::tiff::TiffReader::new() }
-            }
-        }
-
-        impl Default for $name {
-            fn default() -> Self { Self::new() }
-        }
-
-        impl FormatReader for $name {
-            fn is_this_type_by_name(&self, path: &Path) -> bool {
-                let ext = path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_ascii_lowercase());
-                matches!(ext.as_deref(), $(Some($ext))|+)
-            }
-
-            fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool { false }
-
-            fn set_id(&mut self, path: &Path) -> Result<()> {
-                self.inner.set_id(path)
-            }
-
-            fn close(&mut self) -> Result<()> {
-                self.inner.close()
-            }
-
-            fn series_count(&self) -> usize {
-                self.inner.series_count()
-            }
-
-            fn set_series(&mut self, s: usize) -> Result<()> {
-                self.inner.set_series(s)
-            }
-
-            fn series(&self) -> usize {
-                self.inner.series()
-            }
-
-            fn metadata(&self) -> &ImageMetadata {
-                self.inner.metadata()
-            }
-
-            fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-                self.inner.open_bytes(p)
-            }
-
-            fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-                self.inner.open_bytes_region(p, x, y, w, h)
-            }
-
-            fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-                self.inner.open_thumb_bytes(p)
-            }
-
-            fn resolution_count(&self) -> usize {
-                self.inner.resolution_count()
-            }
-
-            fn set_resolution(&mut self, level: usize) -> Result<()> {
-                self.inner.set_resolution(level)
-            }
-        }
-    };
-}
-
 // ===========================================================================
 // Real binary reader 1 — INR format
 // ===========================================================================
@@ -157,6 +76,9 @@ impl FormatReader for InrReader {
         // Java: isSigned = TYPE.toLowerCase().startsWith("signed")
         let mut is_signed = false;
         let mut little_endian = true;
+        let mut physical_size_x: Option<f64> = None;
+        let mut physical_size_y: Option<f64> = None;
+        let mut physical_size_z: Option<f64> = None;
 
         for line in header_text.split('\n') {
             let line = line.trim();
@@ -203,6 +125,15 @@ impl FormatReader for InrReader {
                         if val == "sun" || val == "sgi" {
                             little_endian = false;
                         }
+                    }
+                    "VX" => {
+                        physical_size_x = val.parse::<f64>().ok();
+                    }
+                    "VY" => {
+                        physical_size_y = val.parse::<f64>().ok();
+                    }
+                    "VZ" => {
+                        physical_size_z = val.parse::<f64>().ok();
                     }
                     _ => {}
                 }
@@ -266,6 +197,17 @@ impl FormatReader for InrReader {
             ));
         }
 
+        let mut series_metadata = HashMap::new();
+        if let Some(v) = physical_size_x.filter(|v| *v > 0.0) {
+            series_metadata.insert("PhysicalSizeX".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = physical_size_y.filter(|v| *v > 0.0) {
+            series_metadata.insert("PhysicalSizeY".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = physical_size_z.filter(|v| *v > 0.0) {
+            series_metadata.insert("PhysicalSizeZ".into(), MetadataValue::Float(v));
+        }
+
         self.path = Some(path.to_path_buf());
         self.meta = Some(ImageMetadata {
             size_x,
@@ -283,7 +225,7 @@ impl FormatReader for InrReader {
             is_little_endian: little_endian,
             resolution_count: 1,
             thumbnail: false,
-            series_metadata: HashMap::new(),
+            series_metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
@@ -393,7 +335,6 @@ impl FormatReader for InrReader {
 
 const FEI_PHILIPS_MAGIC: &[u8; 2] = b"XL";
 const FEI_INVALID_PIXELS: u32 = 112;
-const FEI_DIMENSION_OFFSET: u64 = 514;
 
 /// FEI/Philips XL `.img` SEM files.
 ///
@@ -458,32 +399,13 @@ impl FormatReader for FeiReader {
         let stored_width = read_le_u16_at(&data, 514, "width")? as u32;
         let height = read_le_u16_at(&data, 516, "height")? as u32;
         let header_size = read_le_u16_at(&data, 522, "pixel offset")? as u64;
-        if stored_width <= FEI_INVALID_PIXELS || height == 0 || header_size < FEI_DIMENSION_OFFSET {
+        if stored_width <= FEI_INVALID_PIXELS || height == 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "FEI/Philips IMG header contains invalid dimensions or pixel offset".into(),
             ));
         }
 
         let width = stored_width - FEI_INVALID_PIXELS;
-        if width % 2 != 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "FEI/Philips IMG width must be even for interlaced decode".into(),
-            ));
-        }
-
-        let encoded_row_bytes = (width / 2 + FEI_INVALID_PIXELS / 2) as u64 * 2;
-        let encoded_bytes = encoded_row_bytes
-            .checked_mul(height as u64)
-            .ok_or_else(|| BioFormatsError::Format("FEI/Philips payload size overflows".into()))?;
-        let expected = header_size
-            .checked_add(encoded_bytes)
-            .ok_or_else(|| BioFormatsError::Format("FEI/Philips file size overflows".into()))?;
-        if (data.len() as u64) < expected {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "FEI/Philips IMG payload is shorter than declared dimensions".into(),
-            ));
-        }
-
         let mut series_metadata = HashMap::new();
         if let Some(v) = read_le_f32_at(&data, 44) {
             series_metadata.insert("Magnification".into(), MetadataValue::Float(v as f64));
@@ -570,6 +492,11 @@ impl FormatReader for FeiReader {
 
         let width = meta.size_x as usize;
         let height = meta.size_y as usize;
+        if width % 2 != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "FEI/Philips IMG width must be even for interlaced decode".into(),
+            ));
+        }
         let segment_len = width / 2;
         let invalid_len = (FEI_INVALID_PIXELS / 2) as usize;
         let mut segment = vec![0u8; segment_len];
@@ -634,6 +561,8 @@ pub struct VeecoReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: usize,
+    source: VeecoSource,
+    hdf_pixels: Option<Vec<u8>>,
 }
 
 impl VeecoReader {
@@ -642,6 +571,8 @@ impl VeecoReader {
             path: None,
             meta: None,
             data_offset: 0,
+            source: VeecoSource::Nanoscope,
+            hdf_pixels: None,
         }
     }
 }
@@ -652,11 +583,153 @@ impl Default for VeecoReader {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VeecoSource {
+    Nanoscope,
+    Hdf,
+}
+
+fn is_veeco_hdf5_signature(header: &[u8]) -> bool {
+    header.len() >= 8 && header[..8] == [0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a]
+}
+
+fn veeco_first_2d_hdf5_dataset(
+    file: &hdf5_pure_rust::File,
+    group_path: &str,
+) -> Option<(String, hdf5_pure_rust::Dataset)> {
+    let group = file.group(group_path).ok()?;
+    let mut members = group.member_names().ok()?;
+    members.sort();
+    for member in members {
+        let path = if group_path == "/" {
+            format!("/{member}")
+        } else {
+            format!("{group_path}/{member}")
+        };
+        if let Ok(ds) = file.dataset(&path) {
+            if ds.shape().ok().is_some_and(|shape| shape.len() == 2) {
+                return Some((path, ds));
+            }
+        } else if let Some(found) = veeco_first_2d_hdf5_dataset(file, &path) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn veeco_unpack_little_endian(values: &[i16]) -> bool {
+    let mut native_min = 0i16;
+    let mut native_max = 0i16;
+    let mut swapped_min = 0i16;
+    let mut swapped_max = 0i16;
+    for &value in values {
+        native_min = native_min.min(value);
+        native_max = native_max.max(value);
+        let swapped = value.swap_bytes();
+        swapped_min = swapped_min.min(swapped);
+        swapped_max = swapped_max.max(swapped);
+    }
+    native_min <= swapped_min && native_max >= swapped_max
+}
+
+fn parse_veeco_hdf(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
+    use hdf5_pure_rust::format::messages::datatype::DatatypeClass;
+
+    let file = hdf5_pure_rust::File::open(path)
+        .map_err(|e| BioFormatsError::Format(format!("Veeco HDF5 open error: {e}")))?;
+    let (dataset_path, ds) = veeco_first_2d_hdf5_dataset(&file, "/").ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat("Veeco HDF: no 2D image dataset found".into())
+    })?;
+    let shape = ds
+        .shape()
+        .map_err(|e| BioFormatsError::Format(format!("Veeco HDF shape: {e}")))?;
+    let height = shape[0] as u32;
+    let width = shape[1] as u32;
+    if width == 0 || height == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Veeco HDF image dimensions must be non-zero".into(),
+        ));
+    }
+
+    let dtype = ds
+        .dtype()
+        .map_err(|e| BioFormatsError::Format(format!("Veeco HDF dtype: {e}")))?;
+    let dtype_size = dtype.size();
+    let pixels = match (dtype.class(), dtype_size) {
+        (DatatypeClass::FixedPoint, 1) => ds
+            .read::<i8>()
+            .map_err(|e| BioFormatsError::Format(format!("Veeco HDF read: {e}")))?
+            .into_iter()
+            .map(|v| v as u8)
+            .collect::<Vec<_>>(),
+        (DatatypeClass::FixedPoint, 2) => {
+            let values = ds
+                .read::<i16>()
+                .map_err(|e| BioFormatsError::Format(format!("Veeco HDF read: {e}")))?;
+            let unpack_little = veeco_unpack_little_endian(&values);
+            let mut out = Vec::with_capacity(values.len() * 2);
+            for value in values {
+                if unpack_little {
+                    out.extend_from_slice(&value.to_le_bytes());
+                } else {
+                    out.extend_from_slice(&value.to_be_bytes());
+                }
+            }
+            out
+        }
+        (class, size) => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Veeco HDF: unsupported image datatype {class:?} ({size} bytes)"
+            )));
+        }
+    };
+
+    let bits_per_pixel = if dtype_size == 1 { 8 } else { 16 };
+    let pixel_type = if dtype_size == 1 {
+        PixelType::Int8
+    } else {
+        PixelType::Int16
+    };
+    let mut series_metadata = HashMap::new();
+    series_metadata.insert(
+        "Veeco image dataset".into(),
+        MetadataValue::String(dataset_path),
+    );
+
+    Ok((
+        ImageMetadata {
+            size_x: width,
+            size_y: height,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type,
+            bits_per_pixel,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: false,
+            resolution_count: 1,
+            thumbnail: false,
+            series_metadata,
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        },
+        pixels,
+    ))
+}
+
 impl FormatReader for VeecoReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        // Match .afm or purely numeric extensions of 1-3 chars (e.g. "001")
-        ext.eq_ignore_ascii_case("afm")
+        // Java VeecoReader handles .hdf. Keep the existing extra Nanoscope
+        // surface (.afm and numeric extensions) in a separate decode path.
+        ext.eq_ignore_ascii_case("hdf")
+            || ext.eq_ignore_ascii_case("afm")
             || (ext.len() >= 1 && ext.len() <= 3 && ext.chars().all(|c| c.is_ascii_digit()))
     }
 
@@ -671,6 +744,15 @@ impl FormatReader for VeecoReader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        if is_veeco_hdf5_signature(&data) {
+            let (meta, pixels) = parse_veeco_hdf(path)?;
+            self.path = Some(path.to_path_buf());
+            self.meta = Some(meta);
+            self.source = VeecoSource::Hdf;
+            self.hdf_pixels = Some(pixels);
+            return Ok(());
+        }
+
         let text = String::from_utf8_lossy(&data).into_owned();
 
         let mut width: Option<u32> = None;
@@ -742,6 +824,7 @@ impl FormatReader for VeecoReader {
 
         self.data_offset = data_offset;
         self.path = Some(path.to_path_buf());
+        self.source = VeecoSource::Nanoscope;
         self.meta = Some(ImageMetadata {
             size_x: width,
             size_y: height,
@@ -771,6 +854,8 @@ impl FormatReader for VeecoReader {
         self.path = None;
         self.meta = None;
         self.data_offset = 0;
+        self.source = VeecoSource::Nanoscope;
+        self.hdf_pixels = None;
         Ok(())
     }
 
@@ -806,6 +891,22 @@ impl FormatReader for VeecoReader {
         }
         let bps = (meta.bits_per_pixel / 8) as usize;
         let n_bytes = meta.size_x as usize * meta.size_y as usize * bps;
+        if self.source == VeecoSource::Hdf {
+            let pixels = self
+                .hdf_pixels
+                .as_ref()
+                .ok_or(BioFormatsError::NotInitialized)?;
+            let row_bytes = meta.size_x as usize * bps;
+            let mut out = vec![0u8; n_bytes];
+            for dst_y in 0..meta.size_y as usize {
+                let src_y = meta.size_y as usize - 1 - dst_y;
+                let src = src_y * row_bytes;
+                let dst = dst_y * row_bytes;
+                out[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
+            }
+            return Ok(out);
+        }
+
         let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(self.data_offset as u64))
@@ -867,10 +968,298 @@ impl FormatReader for VeecoReader {
 // ---------------------------------------------------------------------------
 // ZeissTiffReader
 // ---------------------------------------------------------------------------
-tiff_wrapper! {
-    /// Zeiss TIFF wrapper (`.tif`). Extension-only, no distinct magic.
-    pub struct ZeissTiffReader;
-    extensions: ["tif"];
+
+/// Zeiss AxioVision TIFF reader (`.tif`, `.xml`).
+///
+/// Java `ZeissTIFFReader` is a grouped AxioVision TIFF/XML reader rather than
+/// a generic TIFF wrapper: `isThisType(name, open)` requires a supported suffix,
+/// opening the file, and locating the companion `_meta.xml`. This Rust reader
+/// keeps pixel decoding delegated to `TiffReader`, but only initializes when the
+/// Java companion-file discovery succeeds. Full AxioVision XML plane grouping is
+/// not implemented here; unsupported multifile sets are rejected explicitly.
+pub struct ZeissTiffReader {
+    inner: crate::tiff::TiffReader,
+    meta: Option<ImageMetadata>,
+}
+
+#[derive(Debug)]
+struct ZeissTiffInfo {
+    xml_name: PathBuf,
+    original_name: PathBuf,
+    base_dir: Option<PathBuf>,
+    multifile: bool,
+}
+
+impl ZeissTiffReader {
+    const XML_NAME: &'static str = "_meta.xml";
+
+    pub fn new() -> Self {
+        ZeissTiffReader {
+            inner: crate::tiff::TiffReader::new(),
+            meta: None,
+        }
+    }
+
+    fn has_supported_suffix(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("xml"))
+            .unwrap_or(false)
+    }
+
+    fn is_tif(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("tif"))
+            .unwrap_or(false)
+    }
+
+    fn is_meta_xml(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase().ends_with(Self::XML_NAME))
+            .unwrap_or(false)
+    }
+
+    fn prefixed_meta_path(path: &Path) -> PathBuf {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(Self::XML_NAME);
+        PathBuf::from(s)
+    }
+
+    fn extract_filename_from_xml(xml: &str) -> Option<String> {
+        let filename_pos = xml.find(">Filename<")?;
+        let before = &xml[..filename_pos];
+        let value_start = before.rfind("<V")?;
+        let value_open_end = before[value_start..].find('>')? + value_start + 1;
+        Some(before[value_open_end..].trim().to_string())
+    }
+
+    fn case_insensitive_existing_path(path: &Path) -> PathBuf {
+        let Some(parent) = path.parent() else {
+            return path.to_path_buf();
+        };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return path.to_path_buf();
+        };
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .map(|candidate| candidate.eq_ignore_ascii_case(name))
+                    .unwrap_or(false)
+                {
+                    return entry.path();
+                }
+            }
+        }
+        path.to_path_buf()
+    }
+
+    fn eval_file(path: &Path) -> Result<ZeissTiffInfo> {
+        let abs = std::fs::canonicalize(path).map_err(BioFormatsError::Io)?;
+        let mut info = if Self::is_tif(&abs) {
+            let xml = Self::prefixed_meta_path(&abs);
+            if xml.exists() {
+                ZeissTiffInfo {
+                    xml_name: xml,
+                    original_name: abs.clone(),
+                    base_dir: None,
+                    multifile: false,
+                }
+            } else {
+                let lower_files = PathBuf::from(format!("{}_files", abs.display()));
+                let upper_files = PathBuf::from(format!("{}_Files", abs.display()));
+                let base = if lower_files.exists() {
+                    lower_files
+                } else {
+                    upper_files
+                };
+                let xml = base.join(Self::XML_NAME);
+                if base.exists() && xml.exists() {
+                    ZeissTiffInfo {
+                        xml_name: xml,
+                        original_name: abs.clone(),
+                        base_dir: Some(base),
+                        multifile: true,
+                    }
+                } else {
+                    let parent = abs.parent().unwrap_or_else(|| Path::new("."));
+                    let xml = parent.join(Self::XML_NAME);
+                    if xml.exists() {
+                        ZeissTiffInfo {
+                            xml_name: xml.clone(),
+                            original_name: xml.clone(),
+                            base_dir: Some(parent.to_path_buf()),
+                            multifile: true,
+                        }
+                    } else {
+                        return Err(BioFormatsError::UnsupportedFormat(
+                            "Zeiss TIFF: XML metadata not found".into(),
+                        ));
+                    }
+                }
+            }
+        } else if Self::is_meta_xml(&abs) {
+            if !abs.exists() {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Zeiss TIFF: XML metadata not found".into(),
+                ));
+            }
+            if abs
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case(Self::XML_NAME))
+                .unwrap_or(false)
+            {
+                let parent = abs.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+                ZeissTiffInfo {
+                    xml_name: abs.clone(),
+                    original_name: abs.clone(),
+                    base_dir: Some(parent),
+                    multifile: true,
+                }
+            } else {
+                let original = {
+                    let name = abs.as_os_str().to_string_lossy();
+                    let trimmed = &name[..name.len() - Self::XML_NAME.len()];
+                    PathBuf::from(trimmed)
+                };
+                if !original.exists() {
+                    return Err(BioFormatsError::UnsupportedFormat(
+                        "Zeiss TIFF: TIFF image data not found".into(),
+                    ));
+                }
+                ZeissTiffInfo {
+                    xml_name: abs.clone(),
+                    original_name: original,
+                    base_dir: None,
+                    multifile: false,
+                }
+            }
+        } else {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Zeiss TIFF: invalid AxioVision TIFF/XML suffix".into(),
+            ));
+        };
+
+        let xml = std::fs::read_to_string(&info.xml_name).map_err(BioFormatsError::Io)?;
+        if let Some(filename) = Self::extract_filename_from_xml(&xml) {
+            let candidate = if let Some(base_dir) = &info.base_dir {
+                base_dir.join(filename)
+            } else {
+                info.xml_name
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(filename)
+            };
+            info.original_name = Self::case_insensitive_existing_path(&candidate);
+        } else if info.original_name == info.xml_name {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Zeiss TIFF: image name not found in XML metadata".into(),
+            ));
+        }
+
+        Ok(info)
+    }
+}
+
+impl Default for ZeissTiffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for ZeissTiffReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        Self::has_supported_suffix(path)
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        let info = Self::eval_file(path)?;
+        if info.multifile {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Zeiss TIFF: multifile AxioVision TIFF/XML sets are not yet supported".into(),
+            ));
+        }
+
+        self.inner.set_id(&info.original_name)?;
+        let mut meta = self.inner.metadata().clone();
+        meta.is_interleaved = false;
+        meta.series_metadata.insert(
+            "format".into(),
+            MetadataValue::String("Zeiss AxioVision TIFF".into()),
+        );
+        meta.series_metadata.insert(
+            "Zeiss TIFF XML".into(),
+            MetadataValue::String(info.xml_name.to_string_lossy().into_owned()),
+        );
+        self.meta = Some(meta);
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.meta = None;
+        self.inner.close()
+    }
+
+    fn series_count(&self) -> usize {
+        if self.meta.is_some() {
+            self.inner.series_count()
+        } else {
+            0
+        }
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        self.inner.set_series(s)
+    }
+
+    fn series(&self) -> usize {
+        self.inner.series()
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_bytes(plane_index)
+    }
+
+    fn open_bytes_region(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        self.inner.open_bytes_region(plane_index, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        self.inner.open_thumb_bytes(plane_index)
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.inner.resolution_count()
+    }
+
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        self.inner.set_resolution(level)
+    }
 }
 
 // ===========================================================================
@@ -1321,7 +1710,7 @@ impl HitachiReader {
         let mut map = HashMap::new();
         let mut in_section = false;
         for line in text.lines() {
-            let line = line.trim();
+            let line = line.trim().trim_start_matches('\u{feff}');
             if line.starts_with('[') && line.ends_with(']') {
                 in_section = line.eq_ignore_ascii_case(Self::MAGIC);
                 continue;
@@ -1542,6 +1931,27 @@ impl LeoReader {
             meta: None,
         }
     }
+
+    fn parse_value_line(line: &str, time_or_date: bool) -> Option<(&str, &str)> {
+        if time_or_date {
+            let colon = line.find(':')?;
+            let key = &line[..colon];
+            if key.chars().last().map(|c| c.is_whitespace()) != Some(true) {
+                return None;
+            }
+            Some((key.trim_end(), &line[colon + 1..]))
+        } else {
+            let eq = line.find('=')?;
+            let before = &line[..eq];
+            let after = &line[eq + 1..];
+            if before.chars().last().map(|c| c.is_whitespace()) != Some(true)
+                || after.chars().next().map(|c| c.is_whitespace()) != Some(true)
+            {
+                return None;
+            }
+            Some((before.trim_end(), after.trim_start()))
+        }
+    }
 }
 
 impl Default for LeoReader {
@@ -1589,23 +1999,18 @@ impl FormatReader for LeoReader {
         // value lives on the following line (Java initStandardMetadata()).
         if let Some(tag_text) = first.get_str(Self::LEO_TAG) {
             let lines: Vec<&str> = tag_text.split('\n').collect();
-            let mut i = 0usize;
+            let mut i = 36usize;
             while i < lines.len() {
-                let t = lines[i].trim();
+                let t = lines[i].trim_end_matches('\r');
                 if (t.starts_with("AP_") || t.starts_with("DP_") || t.starts_with("SV_"))
                     && i + 1 < lines.len()
                 {
-                    let sep = if t == "AP_TIME" || t == "AP_DATE" {
-                        ':'
-                    } else {
-                        '='
-                    };
-                    let val_line = lines[i + 1].trim();
-                    if let Some((k, v)) = val_line.split_once(sep) {
-                        meta.series_metadata.insert(
-                            k.trim().to_string(),
-                            MetadataValue::String(v.trim().to_string()),
-                        );
+                    let val_line = lines[i + 1].trim_end_matches('\r');
+                    if let Some((k, v)) =
+                        Self::parse_value_line(val_line, t == "AP_TIME" || t == "AP_DATE")
+                    {
+                        meta.series_metadata
+                            .insert(k.to_string(), MetadataValue::String(v.to_string()));
                     }
                     i += 2;
                 } else {
@@ -2603,5 +3008,120 @@ mod inr_tests {
             );
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    fn tiff_entry(tag: u16, field_type: u16, count: u32, value_or_offset: u32) -> [u8; 12] {
+        let mut entry = [0u8; 12];
+        entry[0..2].copy_from_slice(&tag.to_le_bytes());
+        entry[2..4].copy_from_slice(&field_type.to_le_bytes());
+        entry[4..8].copy_from_slice(&count.to_le_bytes());
+        entry[8..12].copy_from_slice(&value_or_offset.to_le_bytes());
+        entry
+    }
+
+    fn write_minimal_tiff_with_optional_ascii_tag(
+        path: &std::path::Path,
+        tag: Option<(u16, &str)>,
+    ) {
+        let mut tag_bytes = tag.map(|(_, value)| {
+            let mut bytes = value.as_bytes().to_vec();
+            bytes.push(0);
+            bytes
+        });
+
+        let entry_count = if tag.is_some() { 11u32 } else { 10u32 };
+        let ifd_start = 8u32;
+        let tag_start = ifd_start + 2 + entry_count * 12 + 4;
+        let pixel_start = tag_start + tag_bytes.as_ref().map(|b| b.len()).unwrap_or(0) as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        bytes.extend_from_slice(&(entry_count as u16).to_le_bytes());
+
+        let mut entries = vec![
+            tiff_entry(256, 4, 1, 1),
+            tiff_entry(257, 4, 1, 1),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, 1),
+            tiff_entry(273, 4, 1, pixel_start),
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 1),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+        ];
+        if let (Some((ascii_tag, _)), Some(tag_bytes)) = (tag, tag_bytes.as_ref()) {
+            entries.push(tiff_entry(ascii_tag, 2, tag_bytes.len() as u32, tag_start));
+            entries.sort_by_key(|entry| u16::from_le_bytes([entry[0], entry[1]]));
+        }
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        if let Some(tag_bytes) = tag_bytes.take() {
+            bytes.extend_from_slice(&tag_bytes);
+        }
+        bytes.push(7);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn zeiss_tiff_requires_axiovision_companion_xml() {
+        let path =
+            std::env::temp_dir().join(format!("bioformats_zeiss_plain_{}.tif", std::process::id()));
+        write_minimal_tiff_with_optional_ascii_tag(&path, None);
+
+        let mut reader = ZeissTiffReader::new();
+        assert!(reader.is_this_type_by_name(std::path::Path::new("sample.tif")));
+        assert!(reader.is_this_type_by_name(std::path::Path::new("sample.xml")));
+        assert!(reader.is_this_type_by_name(std::path::Path::new("sample_meta.xml")));
+        assert!(!reader.is_this_type_by_name(std::path::Path::new("sample.tiff")));
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("XML metadata not found")),
+            "unexpected error: {err:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn leo_metadata_parsing_matches_java_line_offset_and_separators() {
+        let path = std::env::temp_dir().join(format!("bioformats_leo_{}.tif", std::process::id()));
+        let mut lines: Vec<String> = (0..36).map(|_| "ignored".to_string()).collect();
+        lines[0] = "AP_WD".to_string();
+        lines[1] = "WD = 9 mm".to_string();
+        lines.push("AP_IMAGE_PIXEL_SIZE".to_string());
+        lines.push("Pixel Size = 0.5 um".to_string());
+        lines.push("AP_TIME".to_string());
+        lines.push("Time :12:34".to_string());
+        lines.push("DP_GAIN".to_string());
+        lines.push("Gain=12".to_string());
+        let tag_text = lines.join("\n");
+        write_minimal_tiff_with_optional_ascii_tag(&path, Some((LeoReader::LEO_TAG, &tag_text)));
+
+        let mut reader = LeoReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+        assert_eq!(
+            metadata.get("Pixel Size").map(ToString::to_string),
+            Some("0.5 um".to_string())
+        );
+        assert_eq!(
+            metadata.get("Time").map(ToString::to_string),
+            Some("12:34".to_string())
+        );
+        assert!(
+            !metadata.contains_key("WD"),
+            "LEO metadata before Java line 36 must be ignored"
+        );
+        assert!(
+            !metadata.contains_key("Gain"),
+            "LEO metadata without Java whitespace separator must be ignored"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

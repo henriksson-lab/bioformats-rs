@@ -237,21 +237,17 @@ impl LifReader {
             return Err(BioFormatsError::Format("No images found in LIF".into()));
         }
 
-        // Match memory blocks to image elements by ID, preserving the XML
-        // order. Fall back to file order if IDs do not match.
-        let mut matched: Vec<MemoryBlock> = Vec::new();
-        for id in &ordered_ids {
-            if let Some(b) = raw_blocks.iter().find(|b| &b.id == id) {
-                matched.push(b.clone());
-            }
-        }
-        let matched_by_id = matched.len() == ordered_ids.len() && !matched.is_empty();
-        self.memory_blocks = if matched_by_id { matched } else { raw_blocks };
+        // Match memory blocks to image elements by ID, preserving XML order.
+        // If IDs do not line up, mirror Java LIFReader's offset correction:
+        // skip extra blocks until the candidate can hold the series pixels.
+        let (memory_blocks, mapping_status) =
+            select_lif_memory_blocks(&series, &ordered_ids, &raw_blocks);
+        self.memory_blocks = memory_blocks;
         annotate_lif_storage(
             &mut series,
             &ordered_ids,
             &self.memory_blocks,
-            matched_by_id,
+            mapping_status,
         );
         annotate_lif_compression_payloads(&mut series, &self.memory_blocks, data);
         self.series = series;
@@ -1213,7 +1209,7 @@ impl Dom {
                 for a in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
                     let val = a
-                        .unescape_value()
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map(|v| v.to_string())
                         .unwrap_or_default();
                     attrs.insert(key, val);
@@ -1247,9 +1243,23 @@ impl Dom {
                 }
                 Ok(Event::Text(t)) => {
                     if let Some(&top) = stack.last() {
-                        if let Ok(value) = t.unescape() {
+                        if let Some(value) = crate::common::xml::decode_xml_text(&t) {
                             nodes[top].text.push_str(value.as_ref());
                         }
+                    }
+                }
+                Ok(Event::GeneralRef(r)) => {
+                    if let Some(&top) = stack.last() {
+                        if let Some(value) = crate::common::xml::decode_xml_ref(&r) {
+                            nodes[top].text.push_str(value.as_ref());
+                        }
+                    }
+                }
+                Ok(Event::CData(t)) => {
+                    if let Some(&top) = stack.last() {
+                        nodes[top]
+                            .text
+                            .push_str(&String::from_utf8_lossy(t.as_ref()));
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -1370,11 +1380,99 @@ fn annotate_lif_compression(meta: &mut ImageMetadata, compression: &str) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifMemoryMappingStatus {
+    MatchedById,
+    FallbackFileOrder,
+    FallbackSizeMatch,
+}
+
+impl LifMemoryMappingStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            LifMemoryMappingStatus::MatchedById => "matched_by_id",
+            LifMemoryMappingStatus::FallbackFileOrder => "fallback_file_order",
+            LifMemoryMappingStatus::FallbackSizeMatch => "fallback_size_match",
+        }
+    }
+}
+
+fn select_lif_memory_blocks(
+    series: &[SeriesInfo],
+    ordered_ids: &[String],
+    raw_blocks: &[MemoryBlock],
+) -> (Vec<MemoryBlock>, LifMemoryMappingStatus) {
+    let mut matched: Vec<MemoryBlock> = Vec::new();
+    for id in ordered_ids {
+        if let Some(block) = raw_blocks.iter().find(|block| &block.id == id) {
+            matched.push(block.clone());
+        }
+    }
+    if matched.len() == ordered_ids.len() && !matched.is_empty() {
+        return (matched, LifMemoryMappingStatus::MatchedById);
+    }
+
+    let group_count = ordered_ids.len();
+    if raw_blocks.len() <= group_count {
+        return (
+            raw_blocks.to_vec(),
+            LifMemoryMappingStatus::FallbackFileOrder,
+        );
+    }
+
+    let groups = lif_series_groups(series);
+    let mut selected = Vec::with_capacity(group_count);
+    let mut raw_index = 0usize;
+    for group in groups.into_iter().take(group_count) {
+        let required = lif_java_required_group_bytes(group).unwrap_or(0);
+        while raw_index < raw_blocks.len() {
+            let block = &raw_blocks[raw_index];
+            raw_index += 1;
+            if required == 0 || block.byte_len >= required {
+                selected.push(block.clone());
+                break;
+            }
+        }
+    }
+
+    if selected.len() == group_count {
+        (selected, LifMemoryMappingStatus::FallbackSizeMatch)
+    } else {
+        (
+            raw_blocks.to_vec(),
+            LifMemoryMappingStatus::FallbackFileOrder,
+        )
+    }
+}
+
+fn lif_series_groups(series: &[SeriesInfo]) -> Vec<&SeriesInfo> {
+    let mut groups = Vec::new();
+    let mut i = 0usize;
+    while i < series.len() {
+        groups.push(&series[i]);
+        i += series[i].tile_count.max(1) as usize;
+    }
+    groups
+}
+
+fn lif_java_required_group_bytes(info: &SeriesInfo) -> Option<u64> {
+    let meta = &info.meta;
+    let bytes = meta.pixel_type.bytes_per_sample() as u64;
+    let rgb = lif_rgb_channel_count(meta) as u64;
+    let plane = u64::from(meta.size_x)
+        .checked_mul(u64::from(meta.size_y))?
+        .checked_mul(bytes)?
+        .checked_mul(rgb)?;
+    plane
+        .checked_mul(u64::from(meta.image_count))?
+        .checked_mul(u64::from(info.tile_count.max(1)))
+}
+
 fn annotate_lif_storage(
     series: &mut [SeriesInfo],
     ordered_ids: &[String],
     memory_blocks: &[MemoryBlock],
-    matched_by_id: bool,
+    mapping_status: LifMemoryMappingStatus,
 ) {
     let mut series_index = 0usize;
     for (group_index, requested_id) in ordered_ids.iter().enumerate() {
@@ -1393,14 +1491,9 @@ fn annotate_lif_storage(
 
             match block {
                 Some(block) => {
-                    let status = if matched_by_id {
-                        "matched_by_id"
-                    } else {
-                        "fallback_file_order"
-                    };
                     info.meta.series_metadata.insert(
                         "lif.memory_block.status".to_string(),
-                        MetadataValue::String(status.to_string()),
+                        MetadataValue::String(mapping_status.as_str().to_string()),
                     );
                     info.meta.series_metadata.insert(
                         "lif.memory_block.resolved_id".to_string(),
@@ -1414,13 +1507,19 @@ fn annotate_lif_storage(
                         "lif.memory_block.byte_length".to_string(),
                         MetadataValue::Int(block.byte_len.min(i64::MAX as u64) as i64),
                     );
-                    if !matched_by_id {
+                    if mapping_status != LifMemoryMappingStatus::MatchedById {
+                        let diagnostic = match mapping_status {
+                            LifMemoryMappingStatus::FallbackFileOrder => {
+                                "XML MemoryBlockID entries did not all match file memory block IDs; using file order"
+                            }
+                            LifMemoryMappingStatus::FallbackSizeMatch => {
+                                "XML MemoryBlockID entries did not all match file memory block IDs; selected blocks by Java LIFReader payload-size correction"
+                            }
+                            LifMemoryMappingStatus::MatchedById => "",
+                        };
                         info.meta.series_metadata.insert(
                             "lif.memory_block.diagnostic".to_string(),
-                            MetadataValue::String(
-                                "XML MemoryBlockID entries did not all match file memory block IDs; using file order"
-                                    .to_string(),
-                            ),
+                            MetadataValue::String(diagnostic.to_string()),
                         );
                     }
                 }
@@ -3856,6 +3955,31 @@ mod tests {
         bytes
     }
 
+    fn synthetic_lif_with_extra_small_block_before_pixels() -> Vec<u8> {
+        let xml = r#"<LMSDataContainerHeader><Element Name="Experiment"><Element Name="Storage Scan"><Memory MemoryBlockID="MissingXmlId"/><Data><Image Name="Storage Image"><ImageDescription><Channels><ChannelDescription BytesInc="0"/></Channels><Dimensions><DimensionDescription DimID="1" NumberOfElements="2" BytesInc="1"/><DimensionDescription DimID="2" NumberOfElements="2" BytesInc="2"/></Dimensions></ImageDescription></Image></Data></Element></Element></LMSDataContainerHeader>"#;
+        let xml = utf16le(xml);
+
+        let mut bytes = vec![0x70, 0, 0, 0x70, 0, 0, 0, 0, 0x2a];
+        bytes.extend_from_slice(&((xml.len() / 2) as i32).to_le_bytes());
+        bytes.extend_from_slice(&xml);
+
+        for (id, payload) in [
+            ("ExtraTinyBlock", &[0xee, 0xff][..]),
+            ("ActualPixels", &[1, 2, 3, 4][..]),
+        ] {
+            let id = utf16le(id);
+            bytes.extend_from_slice(&(0x70_i32).to_le_bytes());
+            bytes.extend_from_slice(&0_i32.to_le_bytes());
+            bytes.push(0x2a);
+            bytes.extend_from_slice(&(payload.len() as i32).to_le_bytes());
+            bytes.push(0x2a);
+            bytes.extend_from_slice(&((id.len() / 2) as i32).to_le_bytes());
+            bytes.extend_from_slice(&id);
+            bytes.extend_from_slice(payload);
+        }
+        bytes
+    }
+
     fn deflate_stored(raw: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut chunks = raw.chunks(u16::MAX as usize).peekable();
@@ -4051,6 +4175,34 @@ mod tests {
             Some(MetadataValue::String(value))
                 if value.contains("MemoryBlockID")
                     && value.contains("file order")
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), [1, 2, 3, 4]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn skips_extra_too_small_memory_block_like_java_offset_correction() {
+        let bytes = synthetic_lif_with_extra_small_block_before_pixels();
+        let path = temp_lif_path("memory_size_correction");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LifReader::new();
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.resolved_id"),
+            Some(MetadataValue::String(value)) if value == "ActualPixels"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.status"),
+            Some(MetadataValue::String(value)) if value == "fallback_size_match"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.diagnostic"),
+            Some(MetadataValue::String(value))
+                if value.contains("payload-size correction")
         ));
         assert_eq!(reader.open_bytes(0).unwrap(), [1, 2, 3, 4]);
 

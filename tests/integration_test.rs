@@ -783,7 +783,7 @@ fn test_tiff_missing_rows_per_strip_defaults_to_full_height() {
 }
 
 #[test]
-fn test_tiff_short_stripped_data_returns_error() {
+fn test_tiff_short_stripped_data_zero_pads_like_java() {
     let path = std::env::temp_dir().join("bioformats_short_strip.tif");
     let data_offset = 8 + 2 + 10 * 12 + 4;
     let mut bytes = Vec::new();
@@ -821,8 +821,8 @@ fn test_tiff_short_stripped_data_returns_error() {
 
     std::fs::write(&path, bytes).expect("fixture write failed");
     let mut reader = ImageReader::open(&path).expect("open failed");
-    let err = reader.open_bytes(0).expect_err("short strip should fail");
-    assert!(err.to_string().contains("decompressed to 2 bytes"));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 0, 0]);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

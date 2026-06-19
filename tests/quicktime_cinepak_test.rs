@@ -499,6 +499,38 @@ fn quicktime_dispatches_stsc_sample_description_codecs() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn quicktime_reads_padded_uncompressed_rgb_rows() {
+    let path = tmp("raw_rgb_padded_rows.mov");
+    let sample = [1u8, 2, 3, 0, 0, 0, 4, 5, 6, 0, 0, 0];
+    let mov = quicktime_movie(b"raw ", 1, 2, 24, &sample);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 1);
+    assert_eq!(meta.size_y, 2);
+    assert_eq!(meta.size_c, 3);
+    assert!(meta.is_rgb);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn quicktime_reads_32_bit_uncompressed_rgb_without_alpha_byte() {
+    let path = tmp("raw_rgb32.mov");
+    let sample = [0xaa, 1u8, 2, 3, 0xbb, 4, 5, 6];
+    let mov = quicktime_movie(b"raw ", 2, 1, 32, &sample);
+    std::fs::write(&path, mov).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 3);
+    assert!(meta.is_rgb);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+    let _ = std::fs::remove_file(path);
+}
+
 fn be16(v: u16) -> [u8; 2] {
     v.to_be_bytes()
 }
@@ -1641,4 +1673,24 @@ fn quicktime_reports_known_unsupported_codec_families() {
         assert!(message.contains("no external video decoder backend"));
         let _ = std::fs::remove_file(path);
     }
+}
+
+#[test]
+fn quicktime_mjpb_uses_explicit_motion_jpeg_b_path_not_plain_jpeg() {
+    let path = tmp("unsupported_mjpb.mov");
+    let sample = [0u8; 6];
+    let mov = quicktime_movie(b"mjpb", 2, 1, 24, &sample);
+    std::fs::write(&path, mov).unwrap();
+
+    let err = match ImageReader::open(&path) {
+        Ok(_) => panic!("Motion JPEG-B QuickTime unexpectedly opened"),
+        Err(err) => err,
+    };
+    let BioFormatsError::UnsupportedFormat(message) = err else {
+        panic!("unexpected MJPB error: {err}");
+    };
+    assert!(message.contains("QuickTime Motion JPEG-B sample 0 failed to decode"));
+    assert!(message.contains("MJPB bitstream parser"));
+    assert!(!message.contains("QuickTime JPEG sample 0 failed to decode"));
+    let _ = std::fs::remove_file(path);
 }

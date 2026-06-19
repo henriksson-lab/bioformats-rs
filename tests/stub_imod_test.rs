@@ -6,6 +6,7 @@
 //! (blank) plane production that mirrors Java Bio-Formats' `IMODReader`.
 
 use bioformats::common::error::BioFormatsError;
+use bioformats::common::metadata::MetadataValue;
 use bioformats::common::pixel_type::PixelType;
 use bioformats::common::reader::FormatReader;
 use bioformats::formats::sem::ImodReader;
@@ -139,6 +140,39 @@ fn imod_walks_object_chunk() {
     reader.set_id(&path).unwrap();
     assert_eq!(reader.metadata().size_x, 8);
     assert_eq!(reader.metadata().image_count, 1);
+}
+
+#[test]
+fn imod_reads_trailing_minx_physical_sizes() {
+    let mut data = imod_header(4, 4, 1, 0, &[]);
+    data.extend_from_slice(b"MINX");
+    data.extend_from_slice(&[0u8; 40]);
+    put_f32(&mut data, 0.25);
+    put_f32(&mut data, 0.5);
+    put_f32(&mut data, 1.5);
+
+    let path = tmp("minx.mod");
+    std::fs::write(&path, &data).unwrap();
+
+    let mut reader = ImodReader::new();
+    reader.set_id(&path).unwrap();
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("PhysicalSizeX"),
+        Some(MetadataValue::Float(v)) if (*v - 0.25).abs() < 1e-6
+    ));
+    assert!(matches!(
+        md.get("PhysicalSizeY"),
+        Some(MetadataValue::Float(v)) if (*v - 0.5).abs() < 1e-6
+    ));
+    assert!(matches!(
+        md.get("PhysicalSizeZ"),
+        Some(MetadataValue::Float(v)) if (*v - 1.5).abs() < 1e-6
+    ));
+    assert!(matches!(
+        md.get("Physical size unit code"),
+        Some(MetadataValue::Int(-6))
+    ));
 }
 
 #[test]

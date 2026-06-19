@@ -1,7 +1,7 @@
 //! bioformats-mias — format readers:
 //!
 //! - CellWorxReader: CellWorX HCS (.htd / .pnl)
-//! - AliconaReader: 3D image format (.al3d) with "AL3D" magic
+//! - AliconaReader: Alicona AL3D SEM files (.al3d)
 //! - OxfordInstrumentsReader: Oxford Instruments SEM/AFM (.top)
 //! - FeiSerReader: FEI SER electron-microscopy series (.ser)
 
@@ -882,12 +882,15 @@ impl FormatReader for CellWorxReader {
 
 // ── AliconaReader ────────────────────────────────────────────────────────────────
 
-const AL3D_MAGIC: &[u8] = b"AL3D";
-const AL3D_DATA_OFFSET: u64 = 512;
+const AL3D_MAGIC_STRING: &str = "Alicona";
+const AL3D_FULL_MAGIC_STRING: &str = "AliconaImaging";
 
 pub struct AliconaReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    texture_offset: u64,
+    num_bytes: usize,
+    padded_rows: bool,
 }
 
 impl AliconaReader {
@@ -895,6 +898,9 @@ impl AliconaReader {
         AliconaReader {
             path: None,
             meta: None,
+            texture_offset: 0,
+            num_bytes: 0,
+            padded_rows: false,
         }
     }
 }
@@ -905,50 +911,200 @@ impl Default for AliconaReader {
     }
 }
 
-fn parse_al3d(path: &Path) -> Result<ImageMetadata> {
+#[derive(Debug)]
+struct Al3dParseResult {
+    meta: ImageMetadata,
+    texture_offset: u64,
+    num_bytes: usize,
+    padded_rows: bool,
+}
+
+fn al3d_pixel_type_from_bytes(bytes: usize) -> Result<PixelType> {
+    match bytes {
+        1 => Ok(PixelType::Uint8),
+        2 => Ok(PixelType::Uint16),
+        4 => Ok(PixelType::Uint32),
+        8 => Ok(PixelType::Float64),
+        _ => Err(BioFormatsError::UnsupportedFormat(format!(
+            "AL3D unsupported byte depth: {bytes}"
+        ))),
+    }
+}
+
+fn parse_al3d_u32(value: &str, key: &str) -> Result<u32> {
+    value.parse::<u32>().map_err(|e| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "AL3D tag {key} has invalid integer {value:?}: {e}"
+        ))
+    })
+}
+
+fn parse_al3d_offset(value: &str, key: &str) -> Result<u64> {
+    value.parse::<u64>().map_err(|e| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "AL3D tag {key} has invalid offset {value:?}: {e}"
+        ))
+    })
+}
+
+fn parse_al3d(path: &Path) -> Result<Al3dParseResult> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-    if data.len() < AL3D_DATA_OFFSET as usize {
+    if data.len() < 17 {
         return Err(BioFormatsError::UnsupportedFormat(
-            "AL3D file too short for declared header offset".into(),
+            "AL3D file too short for magic string".into(),
         ));
     }
-    if &data[..4] != AL3D_MAGIC {
+    let magic = String::from_utf8_lossy(&data[..17]);
+    if magic.trim() != AL3D_FULL_MAGIC_STRING {
         return Err(BioFormatsError::UnsupportedFormat(
-            "AL3D file is missing AL3D magic".into(),
+            "AL3D file is missing AliconaImaging magic".into(),
         ));
     }
-    // Offset 8: width (u32 LE), 12: height (u32 LE), 16: depth (u32 LE)
-    let width = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    let height = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-    let depth = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-    if width == 0 || height == 0 || depth == 0 {
+
+    let mut pos = 17usize;
+    let mut count = 2usize;
+    let mut i = 0usize;
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut image_count = 0u32;
+    let mut texture_offset = 0u64;
+    let mut depth_offset = 0u64;
+    let mut has_c = false;
+    let mut series_metadata = HashMap::new();
+
+    while i < count {
+        let tag = data.get(pos..pos + 52).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat("AL3D tag table is truncated".into())
+        })?;
+        let key = String::from_utf8_lossy(&tag[..20])
+            .trim_matches(char::from(0))
+            .trim()
+            .to_string();
+        let value = String::from_utf8_lossy(&tag[20..50])
+            .trim_matches(char::from(0))
+            .trim()
+            .to_string();
+        series_metadata.insert(key.clone(), MetadataValue::String(value.clone()));
+
+        match key.as_str() {
+            "TagCount" => {
+                count = count
+                    .checked_add(parse_al3d_u32(&value, &key)? as usize)
+                    .ok_or_else(|| BioFormatsError::Format("AL3D tag count overflows".into()))?
+            }
+            "Rows" => height = parse_al3d_u32(&value, &key)?,
+            "Cols" => width = parse_al3d_u32(&value, &key)?,
+            "NumberOfPlanes" => image_count = parse_al3d_u32(&value, &key)?,
+            "TextureImageOffset" => texture_offset = parse_al3d_offset(&value, &key)?,
+            "TexturePtr" if value != "7" => has_c = true,
+            "DepthImageOffset" => depth_offset = parse_al3d_offset(&value, &key)?,
+            _ => {}
+        }
+
+        pos += 52;
+        i += 1;
+    }
+
+    if width == 0 || height == 0 {
         return Err(BioFormatsError::UnsupportedFormat(
             "AL3D file has zero image dimensions".into(),
         ));
     }
-    // Offset 20: data_type (u16 LE)
-    let data_type = u16::from_le_bytes([data[20], data[21]]);
-    let pixel_type = match data_type {
-        0 => PixelType::Uint8,
-        1 => PixelType::Uint16,
-        2 => PixelType::Float32,
-        other => {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "AL3D data type {other} is not supported"
-            )));
-        }
+    if texture_offset == 0 && depth_offset == 0 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "AL3D file is missing TextureImageOffset or DepthImageOffset".into(),
+        ));
+    }
+
+    let (pixel_type, size_c, size_t, image_count, texture_offset, num_bytes, padded_rows) =
+        if texture_offset != 0 {
+            if image_count == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "AL3D file has zero image planes".into(),
+                ));
+            }
+            let divisor = (width as u64)
+                .checked_mul(height as u64)
+                .and_then(|v| v.checked_mul(image_count as u64))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("AL3D byte-depth divisor overflows".into())
+                })?;
+            if data.len() as u64 <= texture_offset || divisor == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "AL3D texture payload is missing".into(),
+                ));
+            }
+            let num_bytes = ((data.len() as u64 - texture_offset) / divisor) as usize;
+            let pixel_type = al3d_pixel_type_from_bytes(num_bytes)?;
+            let size_c = if has_c { 3 } else { 1 };
+            let size_t = image_count / size_c;
+            (
+                pixel_type,
+                size_c,
+                size_t,
+                image_count,
+                texture_offset,
+                num_bytes,
+                true,
+            )
+        } else {
+            (PixelType::Float32, 1, 1, 1, depth_offset, 4, false)
+        };
+
+    let mut meta = ImageMetadata {
+        size_x: width,
+        size_y: height,
+        size_z: 1,
+        size_c,
+        size_t,
+        pixel_type,
+        bits_per_pixel: (pixel_type.bytes_per_sample() * 8) as u8,
+        image_count,
+        dimension_order: DimensionOrder::XYCTZ,
+        is_rgb: false,
+        is_interleaved: false,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        thumbnail: false,
+        series_metadata,
+        lookup_table: None,
+        modulo_z: None,
+        modulo_c: None,
+        modulo_t: None,
     };
-    let meta = simple_meta(width, height, depth, pixel_type);
-    let required_len = AL3D_DATA_OFFSET
-        .checked_add(checked_payload_len(&meta)?)
-        .ok_or_else(|| BioFormatsError::Format("AL3D file size overflows".into()))?;
+    if meta.size_t == 0 {
+        meta.size_t = 1;
+    }
+
+    let pad = if padded_rows {
+        (8 - (width % 8)) % 8
+    } else {
+        0
+    };
+    let plane_size = (width as u64)
+        .checked_add(pad as u64)
+        .and_then(|v| v.checked_mul(height as u64))
+        .and_then(|v| v.checked_mul(num_bytes as u64))
+        .ok_or_else(|| BioFormatsError::Format("AL3D padded plane size overflows".into()))?;
+    let required_len =
+        texture_offset
+            .checked_add(plane_size.checked_mul(image_count as u64).ok_or_else(|| {
+                BioFormatsError::Format("AL3D pixel payload size overflows".into())
+            })?)
+            .ok_or_else(|| BioFormatsError::Format("AL3D file size overflows".into()))?;
     if (data.len() as u64) < required_len {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "AL3D pixel payload is shorter than declared ({} < {required_len})",
             data.len()
         )));
     }
-    Ok(meta)
+    Ok(Al3dParseResult {
+        meta,
+        texture_offset,
+        num_bytes,
+        padded_rows,
+    })
 }
 
 impl FormatReader for AliconaReader {
@@ -961,19 +1117,25 @@ impl FormatReader for AliconaReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 4 && header[0..4] == *AL3D_MAGIC
+        header.len() >= 16 && String::from_utf8_lossy(&header[..16]).contains(AL3D_MAGIC_STRING)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let meta = parse_al3d(path)?;
+        let parsed = parse_al3d(path)?;
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
+        self.texture_offset = parsed.texture_offset;
+        self.num_bytes = parsed.num_bytes;
+        self.padded_rows = parsed.padded_rows;
+        self.meta = Some(parsed.meta);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.texture_offset = 0;
+        self.num_bytes = 0;
+        self.padded_rows = false;
         Ok(())
     }
 
@@ -1003,19 +1165,92 @@ impl FormatReader for AliconaReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let bps = meta.pixel_type.bytes_per_sample();
-        let plane_bytes = meta.size_x as usize * meta.size_y as usize * bps;
-        let plane_offset = AL3D_DATA_OFFSET + plane_index as u64 * plane_bytes as u64;
         let path = self
             .path
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(plane_offset))
-            .map_err(BioFormatsError::Io)?;
+
+        let width = meta.size_x as usize;
+        let height = meta.size_y as usize;
+        let pad = if self.padded_rows {
+            (8 - (width % 8)) % 8
+        } else {
+            0
+        };
+        let padded_row = width + pad;
+        let plane_samples = padded_row
+            .checked_mul(height)
+            .ok_or_else(|| BioFormatsError::Format("AL3D padded plane size overflows".into()))?;
+        let plane_stride = plane_samples.checked_mul(self.num_bytes).ok_or_else(|| {
+            BioFormatsError::Format("AL3D padded plane byte size overflows".into())
+        })?;
+        let plane_offset = self
+            .texture_offset
+            .checked_add(
+                (plane_index as u64)
+                    .checked_mul(plane_stride as u64)
+                    .ok_or_else(|| BioFormatsError::Format("AL3D plane offset overflows".into()))?,
+            )
+            .ok_or_else(|| BioFormatsError::Format("AL3D plane offset overflows".into()))?;
+        let plane_bytes = width
+            .checked_mul(height)
+            .and_then(|v| v.checked_mul(self.num_bytes))
+            .ok_or_else(|| BioFormatsError::Format("AL3D plane byte size overflows".into()))?;
+
+        if meta.pixel_type == PixelType::Float32 {
+            let mut buf = vec![0u8; plane_bytes];
+            f.seek(SeekFrom::Start(plane_offset))
+                .map_err(BioFormatsError::Io)?;
+            for row in 0..height {
+                let dst = row * width * self.num_bytes;
+                f.read_exact(&mut buf[dst..dst + width * self.num_bytes])
+                    .map_err(BioFormatsError::Io)?;
+                if pad > 0 && row + 1 < height {
+                    f.seek(SeekFrom::Current((pad * self.num_bytes) as i64))
+                        .map_err(BioFormatsError::Io)?;
+                }
+            }
+            return Ok(buf);
+        }
+
+        let mut planar = vec![0u8; plane_bytes];
+        for byte_index in 0..self.num_bytes {
+            let byte_plane_offset = plane_offset
+                .checked_add(
+                    (byte_index as u64)
+                        .checked_mul(plane_samples as u64)
+                        .ok_or_else(|| {
+                            BioFormatsError::Format("AL3D byte-plane offset overflows".into())
+                        })?,
+                )
+                .ok_or_else(|| {
+                    BioFormatsError::Format("AL3D byte-plane offset overflows".into())
+                })?;
+            f.seek(SeekFrom::Start(byte_plane_offset))
+                .map_err(BioFormatsError::Io)?;
+            for row in 0..height {
+                let dst = byte_index * width * height + row * width;
+                f.read_exact(&mut planar[dst..dst + width])
+                    .map_err(BioFormatsError::Io)?;
+                if pad > 0 && row + 1 < height {
+                    f.seek(SeekFrom::Current(pad as i64))
+                        .map_err(BioFormatsError::Io)?;
+                }
+            }
+        }
+
+        if self.num_bytes == 1 {
+            return Ok(planar);
+        }
         let mut buf = vec![0u8; plane_bytes];
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+        let samples = width * height;
+        for i in 0..samples {
+            for j in 0..self.num_bytes {
+                buf[i * self.num_bytes + j] = planar[samples * j + i];
+            }
+        }
         Ok(buf)
     }
 
@@ -1373,11 +1608,15 @@ impl FormatReader for FeiSerReader {
 
 // ── OxfordInstrumentsReader ───────────────────────────────────────────────────
 
-const OXFORD_DATA_OFFSET: u64 = 128;
+const OXFORD_MAGIC_STRING: &[u8] = b"Oxford Instruments";
+const OXFORD_PRIMARY_DIMS_OFFSET: usize = 1048;
+const OXFORD_FALLBACK_DIMS_OFFSET: usize = 1084;
+const OXFORD_LUT_SIZE_OFFSET: usize = 1288;
 
 pub struct OxfordInstrumentsReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    header_size: u64,
 }
 
 impl OxfordInstrumentsReader {
@@ -1385,6 +1624,7 @@ impl OxfordInstrumentsReader {
         OxfordInstrumentsReader {
             path: None,
             meta: None,
+            header_size: 0,
         }
     }
 }
@@ -1395,34 +1635,60 @@ impl Default for OxfordInstrumentsReader {
     }
 }
 
-fn parse_oxford(path: &Path) -> Result<ImageMetadata> {
+struct OxfordParseResult {
+    meta: ImageMetadata,
+    header_size: u64,
+}
+
+fn read_i32_le_at(data: &[u8], offset: usize, label: &str) -> Result<i32> {
+    let bytes = data.get(offset..offset + 4).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("Oxford TOP header is too short for {label}"))
+    })?;
+    Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u32_le_at(data: &[u8], offset: usize, label: &str) -> Result<u32> {
+    let bytes = data.get(offset..offset + 4).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!("Oxford TOP header is too short for {label}"))
+    })?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn parse_oxford(path: &Path) -> Result<OxfordParseResult> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-    if data.len() < 12 {
+    if data.len() < OXFORD_LUT_SIZE_OFFSET + 4 {
         return Err(BioFormatsError::UnsupportedFormat(
             "Oxford TOP header is too short for safe image decoding".to_string(),
         ));
     }
-    // Offset 4: width (u16 LE), 6: height (u16 LE), 8: data_type (u16 LE)
-    let width = u16::from_le_bytes([data[4], data[5]]) as u32;
-    let height = u16::from_le_bytes([data[6], data[7]]) as u32;
-    let dtype = u16::from_le_bytes([data[8], data[9]]);
-    let pixel_type = match dtype {
-        0 => PixelType::Uint8,
-        1 => PixelType::Uint16,
-        2 => PixelType::Float32,
-        other => {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "Oxford TOP data type {other} is not supported"
-            )));
-        }
-    };
-    if width == 0 || height == 0 {
+    let mut width = read_i32_le_at(&data, OXFORD_PRIMARY_DIMS_OFFSET, "primary width")?;
+    let mut height = read_i32_le_at(&data, OXFORD_PRIMARY_DIMS_OFFSET + 4, "primary height")?;
+    if width == 0 && height == 0 {
+        width = read_i32_le_at(&data, OXFORD_FALLBACK_DIMS_OFFSET, "fallback width")?;
+        height = read_i32_le_at(&data, OXFORD_FALLBACK_DIMS_OFFSET + 4, "fallback height")?;
+    }
+    if width <= 0 || height <= 0 {
         return Err(BioFormatsError::UnsupportedFormat(
             "Oxford TOP header is missing image dimensions".to_string(),
         ));
     }
-    let meta = simple_meta(width, height, 1, pixel_type);
-    let required_len = OXFORD_DATA_OFFSET
+
+    let mut meta = simple_meta(width as u32, height as u32, 1, PixelType::Uint16);
+    if checked_payload_len(&meta)? + OXFORD_LUT_SIZE_OFFSET as u64 > data.len() as u64 {
+        meta.size_y = 1;
+    }
+
+    let lut_size = read_u32_le_at(&data, OXFORD_LUT_SIZE_OFFSET, "LUT size")? as u64;
+    let header_size = (OXFORD_LUT_SIZE_OFFSET as u64)
+        .checked_add(4)
+        .and_then(|n| n.checked_add(lut_size))
+        .ok_or_else(|| BioFormatsError::Format("Oxford TOP header size overflows".into()))?;
+    if header_size > data.len() as u64 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Oxford TOP LUT payload is shorter than declared".to_string(),
+        ));
+    }
+    let required_len = header_size
         .checked_add(checked_payload_len(&meta)?)
         .ok_or_else(|| BioFormatsError::Format("Oxford TOP file size overflows".into()))?;
     if (data.len() as u64) < required_len {
@@ -1431,7 +1697,11 @@ fn parse_oxford(path: &Path) -> Result<ImageMetadata> {
             data.len()
         )));
     }
-    Ok(meta)
+    meta.series_metadata.insert(
+        "format".to_string(),
+        MetadataValue::String("Oxford Instruments".to_string()),
+    );
+    Ok(OxfordParseResult { meta, header_size })
 }
 
 impl FormatReader for OxfordInstrumentsReader {
@@ -1444,19 +1714,21 @@ impl FormatReader for OxfordInstrumentsReader {
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+        _header.starts_with(OXFORD_MAGIC_STRING)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let meta = parse_oxford(path)?;
+        let parsed = parse_oxford(path)?;
         self.path = Some(path.to_path_buf());
-        self.meta = Some(meta);
+        self.meta = Some(parsed.meta);
+        self.header_size = parsed.header_size;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.header_size = 0;
         Ok(())
     }
 
@@ -1492,7 +1764,7 @@ impl FormatReader for OxfordInstrumentsReader {
             .ok_or(BioFormatsError::NotInitialized)?
             .clone();
         let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(OXFORD_DATA_OFFSET))
+        f.seek(SeekFrom::Start(self.header_size))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
@@ -1719,10 +1991,17 @@ impl MiasReader {
     fn build(&mut self, id: &Path) -> Result<()> {
         let base = id.canonicalize().unwrap_or_else(|_| id.to_path_buf());
 
-        // The well directory is the parent of a TIFF, or `id` itself when a
-        // directory is given.  The plate directory is the parent of the well.
+        // The well directory is the parent of a normal-layout TIFF. In the
+        // alternate numeric layout the TIFF lives under a channel directory, so
+        // the well directory is one level higher, matching Java's
+        // baseFile.getParentFile().getParentFile() plate discovery.
         let well_dir = if base.is_dir() {
             base.clone()
+        } else if is_in_mias_alternate_layout(&base) {
+            base.parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| base.parent().unwrap_or(&base).to_path_buf())
         } else {
             base.parent()
                 .map(|p| p.to_path_buf())

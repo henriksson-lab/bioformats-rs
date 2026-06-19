@@ -242,6 +242,71 @@ impl TiffReader {
         Ok(())
     }
 
+    /// Regroup every parsed IFD as an independent top-level series.
+    ///
+    /// Vendor TIFF wrappers such as Imacon use `BaseTiffReader` but override
+    /// `initStandardMetadata` so that each main IFD is a separate series even
+    /// when the generic TIFF reader would group same-sized pages into T.
+    pub fn split_ifds_into_single_ifd_series_xyczt(&mut self) -> Result<()> {
+        let Some(file) = self.file.as_ref() else {
+            return Err(BioFormatsError::NotInitialized);
+        };
+        let little_endian = self.is_little_endian();
+        let mut series = Vec::with_capacity(file.ifds.len());
+        for (ifd_index, ifd) in file.ifds.iter().enumerate() {
+            let info = Self::ifd_info(ifd, little_endian)?;
+            let is_cfa = ifd.get_u16(tag::PHOTOMETRIC_INTERPRETATION) == Some(32803);
+            let samples = if is_cfa { 3 } else { info.samples_per_pixel };
+            let is_rgb = samples > 1 || info.photometric == Photometric::Rgb || is_cfa;
+            let is_indexed = info.photometric == Photometric::Palette && info.color_map.is_some();
+            let lookup_table =
+                info.color_map
+                    .as_ref()
+                    .map(|(r, g, b)| crate::common::metadata::LookupTable {
+                        red: r.clone(),
+                        green: g.clone(),
+                        blue: b.clone(),
+                    });
+            let mut metadata = ImageMetadata {
+                size_x: info.width,
+                size_y: info.height,
+                size_z: 1,
+                size_c: if is_rgb { u32::from(samples) } else { 1 },
+                size_t: 1,
+                pixel_type: info.pixel_type,
+                bits_per_pixel: info.bits_per_sample as u8,
+                image_count: 1,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb,
+                is_interleaved: false,
+                is_indexed,
+                is_little_endian: little_endian,
+                resolution_count: 1,
+                thumbnail: false,
+                series_metadata: HashMap::new(),
+                lookup_table,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            };
+            if let Some(desc) = info.image_description {
+                metadata.series_metadata.insert(
+                    "ImageDescription".into(),
+                    crate::common::metadata::MetadataValue::String(desc),
+                );
+            }
+            series.push(TiffSeries {
+                ifd_indices: vec![ifd_index],
+                plane_ifd_indices: Vec::new(),
+                metadata,
+                sub_resolutions: Vec::new(),
+                external_planes: Vec::new(),
+            });
+        }
+        self.replace_series(series);
+        Ok(())
+    }
+
     /// Number of parsed IFDs in the open file.
     pub fn ifd_count(&self) -> usize {
         self.file.as_ref().map(|f| f.ifds.len()).unwrap_or(0)
@@ -693,7 +758,7 @@ impl TiffReader {
             if image.tiff_data.iter().any(|td| td.plane_count == Some(0)) {
                 continue;
             }
-            let image_count = image
+            let mut image_count = image
                 .size_z
                 .saturating_mul(image.effective_c)
                 .saturating_mul(image.size_t);
@@ -702,7 +767,7 @@ impl TiffReader {
             }
 
             let companions = resolve_tiff_data_companions(&image, base_dir, current_path);
-            let (mut plane_map, external_planes) =
+            let (mut plane_map, mut external_planes) =
                 build_ome_plane_maps(&image, ifds.len(), &companions);
             // Fall back to sequential mapping only when neither a local IFD nor a
             // companion was resolved for any plane.
@@ -713,6 +778,20 @@ impl TiffReader {
                         *slot = Some(i);
                     }
                 }
+            }
+            let valid_planes = plane_map.iter().filter(|p| p.is_some()).count()
+                + external_planes.iter().filter(|p| p.is_some()).count();
+            if valid_planes < image_count as usize
+                && companions.iter().all(Option::is_none)
+                && !ifds.is_empty()
+            {
+                // Java OMETiffReader.initFile falls back to TiffReader to
+                // determine plane count when a single-file OME-TIFF has missing
+                // TiffData mappings. That makes malformed "declared many,
+                // stored one" files readable as their physical TIFF planes.
+                plane_map = (0..ifds.len()).map(Some).collect();
+                external_planes = vec![None; ifds.len()];
+                image_count = ifds.len() as u32;
             }
 
             let ifd_indices: Vec<usize> = plane_map.iter().filter_map(|&idx| idx).collect();
@@ -821,6 +900,34 @@ impl TiffReader {
                 meta.modulo_z = ome_img.modulo_z.clone();
                 meta.modulo_c = ome_img.modulo_c.clone();
                 meta.modulo_t = ome_img.modulo_t.clone();
+            }
+            if meta
+                .size_z
+                .saturating_mul(meta.size_t)
+                .saturating_mul(meta.size_c)
+                > meta.image_count
+                && !meta.is_rgb
+            {
+                if meta.size_z == meta.image_count {
+                    meta.size_t = 1;
+                    meta.size_c = 1;
+                } else if meta.size_t == meta.image_count {
+                    meta.size_z = 1;
+                    meta.size_c = 1;
+                } else if meta.size_c == meta.image_count {
+                    meta.size_t = 1;
+                    meta.size_z = 1;
+                }
+            }
+            // Java OMETiffReader.initFile collapses singleton images after core
+            // metadata population: one plane is always Z=1/T=1, and non-RGB is
+            // C=1 even if the OME-XML declares larger unused dimensions.
+            if meta.image_count == 1 {
+                meta.size_z = 1;
+                if !meta.is_rgb {
+                    meta.size_c = 1;
+                }
+                meta.size_t = 1;
             }
             meta.series_metadata.insert(
                 "ImageDescription".into(),
@@ -1682,9 +1789,10 @@ impl TiffReader {
                     jpeg_color_for(info),
                 )?;
                 if info.compression != Compression::Nikon {
-                    require_decompressed_len("strip", strip_idx, decoded.len(), expected)?;
+                    normalize_decompressed_block(&mut decoded, expected);
+                } else {
+                    decoded.truncate(expected);
                 }
-                decoded.truncate(expected);
                 decoded
             } else {
                 vec![0; expected]
@@ -2008,9 +2116,10 @@ impl TiffReader {
                         jpeg_color_for(info),
                     )?;
                     if info.compression != Compression::Nikon {
-                        require_decompressed_len("strip", strip_idx, decoded.len(), expected)?;
+                        normalize_decompressed_block(&mut decoded, expected);
+                    } else {
+                        decoded.truncate(expected);
                     }
-                    decoded.truncate(expected);
                     decoded
                 } else {
                     vec![0; expected]
@@ -2205,8 +2314,7 @@ impl TiffReader {
                         info.nikon_compression_options.as_ref(),
                         jpeg_color_for(info),
                     )?;
-                    require_decompressed_len("tile", tile_idx, decoded.len(), raw_tile_data_bytes)?;
-                    decoded.truncate(raw_tile_data_bytes);
+                    normalize_decompressed_block(&mut decoded, raw_tile_data_bytes);
                     decoded
                 } else {
                     vec![0; raw_tile_data_bytes]
@@ -2334,8 +2442,7 @@ impl TiffReader {
                     info.nikon_compression_options.as_ref(),
                     jpeg_color_for(info),
                 )?;
-                require_decompressed_len("tile", tile_idx, tile_data.len(), tile_data_bytes)?;
-                tile_data.truncate(tile_data_bytes);
+                normalize_decompressed_block(&mut tile_data, tile_data_bytes);
 
                 // Decode the tile's YCbCr blocks to planar RGB at tile resolution.
                 let rgb = decode_ycbcr_chunky(
@@ -2446,8 +2553,7 @@ impl TiffReader {
                             info.nikon_compression_options.as_ref(),
                             jpeg_color_for(info),
                         )?;
-                        require_decompressed_len("tile", tile_idx, decoded.len(), tile_data_bytes)?;
-                        decoded.truncate(tile_data_bytes);
+                        normalize_decompressed_block(&mut decoded, tile_data_bytes);
                         decoded
                     } else {
                         vec![0; tile_data_bytes]
@@ -2740,18 +2846,12 @@ fn read_tiff_block_or_zero<R: Read + Seek>(
     Ok(Some(buf))
 }
 
-fn require_decompressed_len(
-    block_kind: &str,
-    block_index: usize,
-    actual: usize,
-    expected: usize,
-) -> Result<()> {
-    if actual < expected {
-        return Err(BioFormatsError::InvalidData(format!(
-            "TIFF {block_kind} {block_index} decompressed to {actual} bytes, expected {expected}"
-        )));
+fn normalize_decompressed_block(decoded: &mut Vec<u8>, expected: usize) {
+    if decoded.len() < expected {
+        decoded.resize(expected, 0);
+    } else {
+        decoded.truncate(expected);
     }
-    Ok(())
 }
 
 fn validate_tiff_storage(
@@ -5269,6 +5369,38 @@ mod tests {
         assert_eq!(meta.pixel_type, PixelType::Uint16);
         assert_eq!(meta.bits_per_pixel, 16);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0x34, 0x12]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ome_tiff_single_physical_plane_collapses_unmapped_declared_axes_like_java() {
+        let xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="1" SizeY="1" SizeZ="5" SizeC="4" SizeT="3"><Channel ID="Channel:0:0" SamplesPerPixel="1"/><TiffData IFD="0" PlaneCount="1"/></Pixels></Image></OME>"#;
+        let specs = vec![TinyIfdSpec {
+            width: 1,
+            height: 1,
+            bits_per_sample: 8,
+            samples_per_pixel: 1,
+            photometric: 1,
+            new_subfile_type: None,
+            description: Some(xml),
+            color_map: None,
+            pixels: vec![42],
+        }];
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-ome-single-plane-collapse-{}.ome.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_tiff_chain(&specs)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.image_count, 1);
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![42]);
 
         let _ = fs::remove_file(&path);
     }

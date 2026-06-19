@@ -1113,32 +1113,57 @@ fn read_imaris_selection_bytes(
     pixel_type: PixelType,
 ) -> Result<Vec<u8>> {
     match pixel_type {
-        PixelType::Int8 | PixelType::Uint8 | PixelType::Bit => ds
-            .read_slice::<u8, _>(selection)
-            .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}"))),
-        PixelType::Int16 => {
-            let words: Vec<i16> = ds
-                .read_slice::<i16, _>(selection)
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-            Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect())
+        PixelType::Int8 | PixelType::Uint8 | PixelType::Bit => {
+            let signed = ds
+                .dtype()
+                .ok()
+                .and_then(|dtype| dtype.is_signed())
+                .unwrap_or(false);
+            if signed {
+                let values: Vec<i8> = ds
+                    .read_slice::<i8, _>(selection)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                Ok(values.iter().map(|v| *v as u8).collect())
+            } else {
+                ds.read_slice::<u8, _>(selection)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))
+            }
         }
-        PixelType::Uint16 => {
-            let words: Vec<u16> = ds
-                .read_slice::<u16, _>(selection)
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-            Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect())
+        PixelType::Int16 | PixelType::Uint16 => {
+            let signed = ds
+                .dtype()
+                .ok()
+                .and_then(|dtype| dtype.is_signed())
+                .unwrap_or(matches!(pixel_type, PixelType::Int16));
+            if signed {
+                let words: Vec<i16> = ds
+                    .read_slice::<i16, _>(selection)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect())
+            } else {
+                let words: Vec<u16> = ds
+                    .read_slice::<u16, _>(selection)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect())
+            }
         }
-        PixelType::Int32 => {
-            let dwords: Vec<i32> = ds
-                .read_slice::<i32, _>(selection)
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-            Ok(dwords.iter().flat_map(|d| d.to_le_bytes()).collect())
-        }
-        PixelType::Uint32 => {
-            let dwords: Vec<u32> = ds
-                .read_slice::<u32, _>(selection)
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-            Ok(dwords.iter().flat_map(|d| d.to_le_bytes()).collect())
+        PixelType::Int32 | PixelType::Uint32 => {
+            let signed = ds
+                .dtype()
+                .ok()
+                .and_then(|dtype| dtype.is_signed())
+                .unwrap_or(matches!(pixel_type, PixelType::Int32));
+            if signed {
+                let dwords: Vec<i32> = ds
+                    .read_slice::<i32, _>(selection)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                Ok(dwords.iter().flat_map(|d| d.to_le_bytes()).collect())
+            } else {
+                let dwords: Vec<u32> = ds
+                    .read_slice::<u32, _>(selection)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                Ok(dwords.iter().flat_map(|d| d.to_le_bytes()).collect())
+            }
         }
         PixelType::Float32 => {
             let values: Vec<f32> = ds

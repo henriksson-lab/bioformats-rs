@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -407,6 +407,51 @@ fn hdf5_dtype_size(dtype: &hdf5_pure_rust::Datatype) -> usize {
     dtype.size()
 }
 
+/// Java CellH5Reader.get8BitLookupTable(): select a simple 8-bit ramp by the
+/// channel last read. The crate stores LUT entries as u16, so the byte ramp is
+/// widened while preserving the 0..255 values.
+fn cellh5_8bit_lookup_table(channel: usize) -> LookupTable {
+    let ramp: Vec<u16> = (0..256).map(|v| v as u16).collect();
+    let zero = vec![0u16; 256];
+    match channel {
+        0 => LookupTable {
+            red: ramp,
+            green: zero.clone(),
+            blue: zero,
+        },
+        1 => LookupTable {
+            red: zero.clone(),
+            green: ramp,
+            blue: zero,
+        },
+        2 => LookupTable {
+            red: zero.clone(),
+            green: zero,
+            blue: ramp,
+        },
+        3 => LookupTable {
+            red: zero,
+            green: ramp.clone(),
+            blue: ramp,
+        },
+        4 => LookupTable {
+            red: ramp.clone(),
+            green: zero,
+            blue: ramp,
+        },
+        5 => LookupTable {
+            red: ramp.clone(),
+            green: ramp,
+            blue: zero,
+        },
+        _ => LookupTable {
+            red: ramp.clone(),
+            green: ramp.clone(),
+            blue: ramp,
+        },
+    }
+}
+
 // =====================================================================
 // Writer
 // =====================================================================
@@ -688,7 +733,9 @@ impl FormatWriter for CellH5Writer {
                     .write::<u8>(&vol)
             }
             2 => {
-                let vol = assemble!(u16, |buf: &[u8], p: usize| u16::from_le_bytes([
+                // Java uses ByteBuffer.wrap(buf).asShortBuffer(), whose byte
+                // order is big-endian unless explicitly changed.
+                let vol = assemble!(u16, |buf: &[u8], p: usize| u16::from_be_bytes([
                     buf[p * 2],
                     buf[p * 2 + 1]
                 ]));
@@ -699,7 +746,9 @@ impl FormatWriter for CellH5Writer {
             }
             // bpp is validated to 1/2/4 in set_metadata; 4 is the only remaining case.
             _ => {
-                let vol = assemble!(i32, |buf: &[u8], p: usize| i32::from_le_bytes([
+                // Java uses ByteBuffer.wrap(buf).asIntBuffer(), also
+                // big-endian by default.
+                let vol = assemble!(i32, |buf: &[u8], p: usize| i32::from_be_bytes([
                     buf[p * 4],
                     buf[p * 4 + 1],
                     buf[p * 4 + 2],
@@ -932,6 +981,27 @@ impl FormatReader for CellH5Reader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    /// Java CellH5Reader.get8BitLookupTable() returns a synthetic colour ramp
+    /// for the channel last read by openBytes(). Decode that channel directly
+    /// from the requested plane index (XYZTC: Z fastest, then T, then C).
+    fn lookup_table(&mut self, plane_index: u32) -> Result<Option<LookupTable>> {
+        let meta = &self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?
+            .meta;
+        if !meta.is_indexed || meta.pixel_type != PixelType::Uint8 {
+            return Ok(None);
+        }
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let sz = meta.size_z.max(1) as usize;
+        let st = meta.size_t.max(1) as usize;
+        let channel = plane_index as usize / (sz * st);
+        Ok(Some(cellh5_8bit_lookup_table(channel)))
+    }
 }
 
 #[cfg(test)]
@@ -982,13 +1052,17 @@ mod writer_tests {
         // t, then c -> the reader's open_bytes uses the same ordering.
         let plane_pixels = (meta.size_x * meta.size_y) as usize;
         let mut planes: Vec<Vec<u8>> = Vec::new();
+        let mut expected_readback: Vec<Vec<u8>> = Vec::new();
         for i in 0..meta.image_count {
             let mut p = Vec::with_capacity(plane_pixels * 2);
+            let mut rb = Vec::with_capacity(plane_pixels * 2);
             for px in 0..plane_pixels {
                 let v = (i as u16) * 1000 + px as u16;
-                p.extend_from_slice(&v.to_le_bytes());
+                p.extend_from_slice(&v.to_be_bytes());
+                rb.extend_from_slice(&v.to_le_bytes());
             }
             planes.push(p);
+            expected_readback.push(rb);
         }
 
         let mut w = CellH5Writer::new();
@@ -998,6 +1072,17 @@ mod writer_tests {
             w.save_bytes(i as u32, p).unwrap();
         }
         w.close().unwrap();
+
+        let h5 = hdf5_pure_rust::File::open(&path).unwrap();
+        let ds = h5
+            .dataset("/sample/0/plate/PLATE_00/experiment/WELL_00/position/1/image/channel")
+            .unwrap();
+        let stored: Vec<u16> = ds.read::<u16>().unwrap();
+        assert_eq!(stored[0], 0);
+        assert_eq!(stored[1], 1);
+        assert_eq!(stored[plane_pixels], 1000);
+        drop(ds);
+        drop(h5);
 
         // Read it back with the CellH5Reader.
         let mut r = CellH5Reader::new();
@@ -1015,10 +1100,54 @@ mod writer_tests {
         for i in 0..4u32 {
             let got = r.open_bytes(i).unwrap();
             assert_eq!(
-                got, planes[i as usize],
+                got, expected_readback[i as usize],
                 "plane {i} mismatch after round trip"
             );
         }
+        r.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn cellh5_writer_interprets_int32_input_big_endian_like_java() {
+        let mut meta = base_meta();
+        meta.pixel_type = PixelType::Int32;
+        meta.bits_per_pixel = 32;
+        meta.size_x = 2;
+        meta.size_y = 1;
+        meta.size_z = 1;
+        meta.size_c = 1;
+        meta.size_t = 1;
+        meta.image_count = 1;
+        let path = temp_path("writer_i32_be");
+
+        let mut plane = Vec::new();
+        plane.extend_from_slice(&(-2i32).to_be_bytes());
+        plane.extend_from_slice(&0x0102_0304i32.to_be_bytes());
+
+        let mut w = CellH5Writer::new();
+        w.set_metadata(&meta).unwrap();
+        w.set_id(&path).unwrap();
+        w.save_bytes(0, &plane).unwrap();
+        w.close().unwrap();
+
+        let h5 = hdf5_pure_rust::File::open(&path).unwrap();
+        let ds = h5
+            .dataset("/sample/0/plate/PLATE_00/experiment/WELL_00/position/1/image/channel")
+            .unwrap();
+        assert_eq!(ds.read::<i32>().unwrap(), vec![-2, 0x0102_0304]);
+        drop(ds);
+        drop(h5);
+
+        let mut r = CellH5Reader::new();
+        r.set_id(&path).unwrap();
+        assert_eq!(
+            r.open_bytes(0).unwrap(),
+            [
+                0xfe, 0xff, 0xff, 0xff, //
+                0x04, 0x03, 0x02, 0x01,
+            ]
+        );
         r.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
@@ -1082,6 +1211,79 @@ mod writer_tests {
                 0x04, 0x03, 0x02, 0x01,
             ]
         );
+        reader.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn cellh5_reader_returns_java_uint8_channel_luts() {
+        let mut meta = base_meta();
+        meta.pixel_type = PixelType::Uint8;
+        meta.bits_per_pixel = 8;
+        meta.size_z = 1;
+        meta.size_c = 7;
+        meta.size_t = 1;
+        meta.image_count = 7;
+        let path = temp_path("uint8_lut");
+
+        let plane = vec![0u8; (meta.size_x * meta.size_y) as usize];
+        let mut w = CellH5Writer::new();
+        w.set_metadata(&meta).unwrap();
+        w.set_id(&path).unwrap();
+        for no in 0..meta.image_count {
+            w.save_bytes(no, &plane).unwrap();
+        }
+        w.close().unwrap();
+
+        let mut reader = CellH5Reader::new();
+        reader.set_id(&path).unwrap();
+        assert!(reader.metadata().is_indexed);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+
+        let red = reader.lookup_table(0).unwrap().expect("channel 0 LUT");
+        assert_eq!(red.red[255], 255);
+        assert_eq!(red.green[255], 0);
+        assert_eq!(red.blue[255], 0);
+
+        let green = reader.lookup_table(1).unwrap().expect("channel 1 LUT");
+        assert_eq!(green.red[255], 0);
+        assert_eq!(green.green[255], 255);
+        assert_eq!(green.blue[255], 0);
+
+        let gray = reader.lookup_table(6).unwrap().expect("default LUT");
+        assert_eq!(gray.red[255], 255);
+        assert_eq!(gray.green[255], 255);
+        assert_eq!(gray.blue[255], 255);
+
+        assert!(matches!(
+            reader.lookup_table(meta.image_count),
+            Err(BioFormatsError::PlaneOutOfRange(_))
+        ));
+        reader.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn cellh5_reader_uint16_indexed_data_has_no_java_lut() {
+        let mut meta = base_meta();
+        meta.size_z = 1;
+        meta.size_c = 1;
+        meta.size_t = 1;
+        meta.image_count = 1;
+        let path = temp_path("uint16_no_lut");
+
+        let plane = vec![0u8; (meta.size_x * meta.size_y * 2) as usize];
+        let mut w = CellH5Writer::new();
+        w.set_metadata(&meta).unwrap();
+        w.set_id(&path).unwrap();
+        w.save_bytes(0, &plane).unwrap();
+        w.close().unwrap();
+
+        let mut reader = CellH5Reader::new();
+        reader.set_id(&path).unwrap();
+        assert!(reader.metadata().is_indexed);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+        assert!(reader.lookup_table(0).unwrap().is_none());
         reader.close().unwrap();
         std::fs::remove_file(&path).ok();
     }

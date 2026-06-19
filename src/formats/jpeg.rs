@@ -81,7 +81,11 @@ impl FormatReader for JpegReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(&[0xFF, 0xD8, 0xFF])
+        header.len() >= 4
+            && header[0] == 0xff
+            && header[1] == 0xd8
+            && header[2] == 0xff
+            && (header[3] & 0xf0) != 0
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {

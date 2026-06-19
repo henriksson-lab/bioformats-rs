@@ -1,7 +1,7 @@
 //! Clinical scanner format readers: ECAT7 PET, Inveon PET/CT, Varian FDF MRI.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -61,10 +61,24 @@ fn is_ecat7_magic(header: &[u8]) -> bool {
         && header[8] == b'v'
 }
 
+fn ecat7_t_skip(t: u32) -> u64 {
+    let mut skip = 0u64;
+    for i in 0..t {
+        skip += 512;
+        if i > 0 && (i % 30) == 0 {
+            skip += 512;
+        }
+    }
+    skip
+}
+
 pub struct Ecat7Reader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
 }
 
 impl Ecat7Reader {
@@ -73,6 +87,9 @@ impl Ecat7Reader {
             path: None,
             meta: None,
             data_offset: 1024,
+            physical_size_x: None,
+            physical_size_y: None,
+            physical_size_z: None,
         }
     }
 }
@@ -168,14 +185,8 @@ impl FormatReader for Ecat7Reader {
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
         let mut required_len = self.data_offset;
         for plane in 0..image_count {
-            let z = plane % size_z.max(1);
-            let mut t_skip: u64 = 0;
-            for i in 0..z {
-                t_skip += 512;
-                if i > 0 && (i % 30) == 0 {
-                    t_skip += 512;
-                }
-            }
+            let t = (plane / size_z.max(1)) % size_t.max(1);
+            let t_skip = ecat7_t_skip(t);
             let end = 1536u64
                 .checked_add((plane as u64).checked_mul(plane_bytes).ok_or_else(|| {
                     BioFormatsError::Format("ECAT7 pixel offset overflows".into())
@@ -739,6 +750,9 @@ impl FormatReader for Ecat7Reader {
         // HEADER_SIZE in Java is 1536: main header (512) + directory (512) +
         // first subheader (512). Plane data starts after the first subheader.
         self.data_offset = 1536;
+        self.physical_size_x = Some(x_pixel_size as f64);
+        self.physical_size_y = Some(y_pixel_size as f64);
+        self.physical_size_z = Some(z_pixel_size as f64);
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -746,13 +760,18 @@ impl FormatReader for Ecat7Reader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
+        self.physical_size_z = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -775,21 +794,12 @@ impl FormatReader for Ecat7Reader {
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;
 
-        // Java Ecat7Reader.openBytes: there is an interleaved 512-byte
-        // subheader before every Z-plane, plus an extra 512 bytes every 30
-        // planes. tSkip = sum over i in 0..z { 512; +512 if i>0 && i%30==0 }.
-        // The Z-coordinate is derived from the plane index via getZCTCoords;
-        // for dimensionOrder XYZTC with sizeC=1 the Z-coordinate is
-        // plane_index % sizeZ.
+        // Java Ecat7Reader.openBytes uses getZCTCoords(no)[2], i.e. the T
+        // coordinate, to account for interleaved 512-byte frame blocks.
         let size_z = meta.size_z.max(1);
-        let z = plane_index % size_z;
-        let mut t_skip: u64 = 0;
-        for i in 0..z {
-            t_skip += 512;
-            if i > 0 && (i % 30) == 0 {
-                t_skip += 512;
-            }
-        }
+        let size_t = meta.size_t.max(1);
+        let t = (plane_index / size_z) % size_t;
+        let t_skip = ecat7_t_skip(t);
         let offset = self.data_offset + plane_index as u64 * plane_bytes as u64 + t_skip;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
@@ -819,20 +829,35 @@ impl FormatReader for Ecat7Reader {
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let image = &mut ome.images[0];
+        image.physical_size_x = self.physical_size_x;
+        image.physical_size_y = self.physical_size_y;
+        image.physical_size_z = self.physical_size_z;
+        Some(ome)
+    }
 }
 
 // ─── Inveon PET/CT ────────────────────────────────────────────────────────────
 //
 // Siemens Inveon preclinical PET/CT stores data as:
 //   <stem>.hdr — ASCII text header with key=value lines
-//   <stem>.img — raw binary pixel data (default little-endian, float32 or int16)
+//   similarly named raw binary pixel data, usually <stem>.img but sometimes
+//   named by the file_name header field.
 //
 // Key header fields (lower-case):
 //   x_dimension <n>
 //   y_dimension <n>
 //   z_dimension <n>
-//   data_type <n>    — 1=uint8, 2=int16, 4=int32, 5=float32, 6=float64
+//   data_type <n>    — Java Bio-Formats maps default/1=int8, 2=int16,
+//                      3=int32, 4=float32, 5=float32 BE, 6=int16 BE,
+//                      7=int32 BE
 //   scale_factor <f>
+
+const INVEON_HEADER_MARKER: &str = "Header file for data file";
 
 // -- Inveon header value transforms (mirror InveonReader.java helpers) --
 // Enumeration data is taken from the comments of the .hdr files.
@@ -1138,26 +1163,55 @@ fn inveon_parse_header_line(line: &str) -> Option<(String, String)> {
     Some((key, value))
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_inveon_header(
-    path: &Path,
-) -> Result<(
-    u32,
-    u32,
-    u32,
-    PixelType,
-    u8,
-    bool,
-    HashMap<String, MetadataValue>,
-)> {
+struct InveonHeader {
+    size_x: u32,
+    size_y: u32,
+    size_z: u32,
+    size_t: u32,
+    pixel_type: PixelType,
+    bits_per_pixel: u8,
+    little_endian: bool,
+    data_file: Option<PathBuf>,
+    data_offset: u64,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
+    metadata: HashMap<String, MetadataValue>,
+}
+
+fn inveon_data_pointer(value: &str) -> Option<u64> {
+    let mut bytes = Vec::new();
+    for part in value.split_ascii_whitespace() {
+        let int = part.parse::<i32>().ok()?;
+        bytes.extend_from_slice(&int.to_be_bytes());
+    }
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut out = 0u64;
+    for byte in bytes.into_iter().take(8) {
+        out = (out << 8) | u64::from(byte);
+    }
+    Some(out)
+}
+
+fn parse_inveon_header(path: &Path) -> Result<InveonHeader> {
     let f = File::open(path).map_err(BioFormatsError::Io)?;
     let reader = BufReader::new(f);
 
     let mut nx: Option<u32> = None;
     let mut ny: Option<u32> = None;
     let mut nz: Option<u32> = None;
+    let mut nt: Option<u32> = None;
     let mut data_type: Option<i32> = None;
+    let mut data_file: Option<PathBuf> = None;
+    let mut data_offset = 0u64;
+    let mut physical_size_x = None;
+    let mut physical_size_y = None;
+    let mut physical_size_z = None;
     let mut meta: HashMap<String, MetadataValue> = HashMap::new();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
     for line in reader.lines() {
         let line = line.map_err(BioFormatsError::Io)?;
@@ -1175,6 +1229,37 @@ fn parse_inveon_header(
             nz = parts.get(1).and_then(|s| s.parse::<u32>().ok());
         } else if lo.starts_with("data_type") {
             data_type = parts.get(1).and_then(|s| s.parse::<i32>().ok());
+        } else if lo.starts_with("time_frames") {
+            nt = parts.get(1).and_then(|s| s.parse::<u32>().ok());
+        } else if lo.starts_with("file_name") {
+            if let Some(raw) = parts.get(1) {
+                let normalized = raw.replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR);
+                if let Some(name) = Path::new(&normalized).file_name() {
+                    let candidate = parent.join(name);
+                    if candidate.exists() {
+                        data_file = Some(candidate);
+                    }
+                }
+            }
+        } else if lo.starts_with("data_file_pointer") {
+            if let Some(value) = t.strip_prefix(parts.first().copied().unwrap_or_default()) {
+                data_offset = inveon_data_pointer(value.trim()).unwrap_or(data_offset);
+            }
+        } else if lo.starts_with("pixel_size_x") {
+            physical_size_x = parts
+                .get(1)
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|v| v * 1000.0);
+        } else if lo.starts_with("pixel_size_y") {
+            physical_size_y = parts
+                .get(1)
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|v| v * 1000.0);
+        } else if lo.starts_with("pixel_size_z") {
+            physical_size_z = parts
+                .get(1)
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|v| v * 1000.0);
         }
 
         // Capture the named acquisition scalar (Java addGlobalMeta(key, value)),
@@ -1189,10 +1274,9 @@ fn parse_inveon_header(
     let ny = ny.ok_or_else(|| {
         BioFormatsError::UnsupportedFormat("Inveon header missing y_dimension".into())
     })?;
-    let nz = nz.ok_or_else(|| {
-        BioFormatsError::UnsupportedFormat("Inveon header missing z_dimension".into())
-    })?;
-    if nx == 0 || ny == 0 || nz == 0 {
+    let nz = nz.unwrap_or(1);
+    let nt = nt.unwrap_or(1);
+    if nx == 0 || ny == 0 || nz == 0 || nt == 0 {
         return Err(BioFormatsError::UnsupportedFormat(
             "Inveon header has zero image dimensions".into(),
         ));
@@ -1220,13 +1304,31 @@ fn parse_inveon_header(
         _ => (PixelType::Int8, 8, true),
     };
 
-    Ok((nx, ny, nz, pixel_type, bpp, little_endian, meta))
+    Ok(InveonHeader {
+        size_x: nx,
+        size_y: ny,
+        size_z: nz,
+        size_t: nt,
+        pixel_type,
+        bits_per_pixel: bpp,
+        little_endian,
+        data_file,
+        data_offset,
+        physical_size_x,
+        physical_size_y,
+        physical_size_z,
+        metadata: meta,
+    })
 }
 
 pub struct InveonReader {
     hdr_path: Option<PathBuf>,
     img_path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    data_offset: u64,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    physical_size_z: Option<f64>,
 }
 
 impl InveonReader {
@@ -1235,6 +1337,10 @@ impl InveonReader {
             hdr_path: None,
             img_path: None,
             meta: None,
+            data_offset: 0,
+            physical_size_x: None,
+            physical_size_y: None,
+            physical_size_z: None,
         }
     }
 }
@@ -1246,7 +1352,8 @@ impl Default for InveonReader {
 
 impl FormatReader for InveonReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        // Inveon .hdr files could conflict with Analyze; check for .img companion
+        // Inveon .hdr files can conflict with Analyze; Java keeps suffix
+        // detection non-sufficient and checks for the header marker.
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -1254,16 +1361,15 @@ impl FormatReader for InveonReader {
         if !matches!(ext.as_deref(), Some("hdr")) {
             return false;
         }
-        // Check if a .img companion exists
-        let stem = path.file_stem().unwrap_or_default();
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        parent
-            .join(format!("{}.img", stem.to_string_lossy()))
-            .exists()
+        std::fs::read_to_string(path)
+            .map(|s| s.contains(INVEON_HEADER_MARKER))
+            .unwrap_or(false)
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+        std::str::from_utf8(_header)
+            .map(|s| s.contains(INVEON_HEADER_MARKER))
+            .unwrap_or(false)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1280,15 +1386,23 @@ impl FormatReader for InveonReader {
         } else {
             parent.join(format!("{}.hdr", stem.to_string_lossy()))
         };
-        let img_path = parent.join(format!("{}.img", stem.to_string_lossy()));
+        let default_img_path = parent.join(format!("{}.img", stem.to_string_lossy()));
 
-        let (nx, ny, nz, pixel_type, bpp, little_endian, hdr_meta) =
-            parse_inveon_header(&hdr_path)?;
-        let bps = pixel_type.bytes_per_sample() as u64;
-        let required_len = (nx as u64)
-            .checked_mul(ny as u64)
-            .and_then(|px| px.checked_mul(nz as u64))
+        let header = parse_inveon_header(&hdr_path)?;
+        let img_path = header.data_file.clone().unwrap_or(default_img_path);
+        let bps = header.pixel_type.bytes_per_sample() as u64;
+        let plane_count = header
+            .size_z
+            .checked_mul(header.size_t)
+            .ok_or_else(|| BioFormatsError::Format("Inveon image count overflows".into()))?;
+        let pixel_bytes = (header.size_x as u64)
+            .checked_mul(header.size_y as u64)
+            .and_then(|px| px.checked_mul(plane_count as u64))
             .and_then(|px| px.checked_mul(bps))
+            .ok_or_else(|| BioFormatsError::Format("Inveon payload size overflows".into()))?;
+        let required_len = header
+            .data_offset
+            .checked_add(pixel_bytes)
             .ok_or_else(|| BioFormatsError::Format("Inveon payload size overflows".into()))?;
         let img_len = std::fs::metadata(&img_path)
             .map_err(BioFormatsError::Io)?
@@ -1299,26 +1413,26 @@ impl FormatReader for InveonReader {
             )));
         }
 
-        let mut meta_map: HashMap<String, MetadataValue> = hdr_meta;
+        let mut meta_map: HashMap<String, MetadataValue> = header.metadata;
         meta_map.insert(
             "format".into(),
             MetadataValue::String("Siemens Inveon".into()),
         );
 
         self.meta = Some(ImageMetadata {
-            size_x: nx,
-            size_y: ny,
-            size_z: nz,
+            size_x: header.size_x,
+            size_y: header.size_y,
+            size_z: header.size_z,
             size_c: 1,
-            size_t: 1,
-            pixel_type,
-            bits_per_pixel: bpp,
-            image_count: nz,
+            size_t: header.size_t,
+            pixel_type: header.pixel_type,
+            bits_per_pixel: header.bits_per_pixel,
+            image_count: plane_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: little_endian,
+            is_little_endian: header.little_endian,
             resolution_count: 1,
             thumbnail: false,
             series_metadata: meta_map,
@@ -1329,6 +1443,10 @@ impl FormatReader for InveonReader {
         });
         self.hdr_path = Some(hdr_path);
         self.img_path = Some(img_path);
+        self.data_offset = header.data_offset;
+        self.physical_size_x = header.physical_size_x;
+        self.physical_size_y = header.physical_size_y;
+        self.physical_size_z = header.physical_size_z;
         Ok(())
     }
 
@@ -1336,13 +1454,19 @@ impl FormatReader for InveonReader {
         self.hdr_path = None;
         self.img_path = None;
         self.meta = None;
+        self.data_offset = 0;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
+        self.physical_size_z = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() {
+            Err(BioFormatsError::NotInitialized)
+        } else if s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -1364,7 +1488,10 @@ impl FormatReader for InveonReader {
         }
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;
-        let offset = plane_index as u64 * plane_bytes as u64;
+        let offset = self
+            .data_offset
+            .checked_add(plane_index as u64 * plane_bytes as u64)
+            .ok_or_else(|| BioFormatsError::Format("Inveon pixel offset overflows".into()))?;
         let img_path = self
             .img_path
             .as_ref()
@@ -1395,6 +1522,17 @@ impl FormatReader for InveonReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.first_mut() {
+            image.physical_size_x = self.physical_size_x;
+            image.physical_size_y = self.physical_size_y;
+            image.physical_size_z = self.physical_size_z;
+        }
+        Some(ome)
     }
 }
 
@@ -1437,6 +1575,7 @@ struct FdfHeader {
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
     physical_size_z: Option<f64>,
+    multifile: bool,
 }
 
 fn fdf_physical_size(length: u32, physical_length: &str, unit: Option<&str>) -> Option<f64> {
@@ -1452,11 +1591,9 @@ fn fdf_physical_size(length: u32, physical_length: &str, unit: Option<&str>) -> 
 
 fn parse_fdf_header(path: &Path) -> Result<FdfHeader> {
     let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-    // Read up to 8 KiB looking for the 0x0C terminator
-    let max = 8192usize;
-    let mut buf = vec![0u8; max];
-    let n = f.read(&mut buf).map_err(BioFormatsError::Io)?;
-    buf.truncate(n);
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
+    let n = buf.len();
 
     let ff_pos = buf.iter().position(|&b| b == 0x0C);
     let (header_bytes, data_offset) = if let Some(pos) = ff_pos {
@@ -1484,6 +1621,7 @@ fn parse_fdf_header(path: &Path) -> Result<FdfHeader> {
     let mut physical_size_x = None;
     let mut physical_size_y = None;
     let mut physical_size_z = None;
+    let mut multifile = false;
     let mut metadata = HashMap::new();
 
     for line in text.lines() {
@@ -1556,9 +1694,11 @@ fn parse_fdf_header(path: &Path) -> Result<FdfHeader> {
             }
         } else if var == "slices" {
             size_z = value.parse::<u32>().unwrap_or(1).max(1);
+            multifile = true;
         } else if var == "echoes" {
             // Java VarianFDFReader.parseFDF: m.sizeT = echoes.
             size_t = value.parse::<u32>().unwrap_or(1).max(1);
+            multifile = true;
         } else if var == "*abscissa[]" {
             units = parse_fdf_array(value);
         } else if var == "span[]" {
@@ -1609,13 +1749,37 @@ fn parse_fdf_header(path: &Path) -> Result<FdfHeader> {
         physical_size_x,
         physical_size_y,
         physical_size_z,
+        multifile,
     })
+}
+
+fn fdf_companion_files(path: &Path) -> Result<Vec<PathBuf>> {
+    let this_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let this_len = this_name.len();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut files = Vec::new();
+    for entry in fs::read_dir(parent).map_err(BioFormatsError::Io)? {
+        let entry = entry.map_err(BioFormatsError::Io)?;
+        let p = entry.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let is_fdf = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("fdf"))
+            .unwrap_or(false);
+        if is_fdf && name.len() == this_len {
+            files.push(p);
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 pub struct VarianFdfReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_offset: u64,
+    plane_offsets: Vec<(PathBuf, u64)>,
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
     physical_size_z: Option<f64>,
@@ -1627,6 +1791,7 @@ impl VarianFdfReader {
             path: None,
             meta: None,
             data_offset: 0,
+            plane_offsets: Vec::new(),
             physical_size_x: None,
             physical_size_y: None,
             physical_size_z: None,
@@ -1661,31 +1826,78 @@ impl FormatReader for VarianFdfReader {
             ));
         }
         let header = parse_fdf_header(path)?;
+        let mut files = if header.multifile {
+            fdf_companion_files(path)?
+        } else {
+            Vec::new()
+        };
+        if files.is_empty() {
+            files.push(path.to_path_buf());
+        }
+        let mut size_t = header.size_t;
+        let mut image_count = header
+            .size_z
+            .max(1)
+            .checked_mul(size_t.max(1))
+            .ok_or_else(|| BioFormatsError::Format("FDF image count overflows".into()))?;
+        if files.len() > image_count as usize {
+            let rem = (files.len() as u32) / image_count;
+            size_t = size_t
+                .checked_mul(rem)
+                .ok_or_else(|| BioFormatsError::Format("FDF image count overflows".into()))?;
+            image_count = header
+                .size_z
+                .max(1)
+                .checked_mul(size_t.max(1))
+                .ok_or_else(|| BioFormatsError::Format("FDF image count overflows".into()))?;
+        }
         let plane_bytes = (header.size_x as u64)
             .checked_mul(header.size_y as u64)
             .and_then(|px| px.checked_mul(header.pixel_type.bytes_per_sample() as u64))
             .ok_or_else(|| BioFormatsError::Format("FDF plane size overflows".into()))?;
-        let image_count = header
-            .size_z
-            .max(1)
-            .checked_mul(header.size_t.max(1))
-            .ok_or_else(|| BioFormatsError::Format("FDF image count overflows".into()))?;
-        let pixel_bytes = (image_count as u64)
-            .checked_mul(plane_bytes)
-            .ok_or_else(|| BioFormatsError::Format("FDF payload size overflows".into()))?;
-        let required_len = header
-            .data_offset
-            .checked_add(pixel_bytes)
-            .ok_or_else(|| BioFormatsError::Format("FDF payload size overflows".into()))?;
-        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
-        if file_len < required_len {
+        if files.len() > 1 && files.len() < image_count as usize {
             return Err(BioFormatsError::UnsupportedFormat(format!(
-                "FDF pixel payload is shorter than declared ({file_len} < {required_len})"
+                "FDF companion file count {} is smaller than declared image count {}",
+                files.len(),
+                image_count
             )));
         }
-        let first_pixel_offset = file_len
-            .checked_sub(pixel_bytes)
-            .ok_or_else(|| BioFormatsError::Format("FDF payload offset underflows".into()))?;
+
+        let mut plane_offsets = Vec::with_capacity(image_count as usize);
+        if files.len() > 1 {
+            for file in files.iter().take(image_count as usize) {
+                let len = fs::metadata(file).map_err(BioFormatsError::Io)?.len();
+                let offset = len.checked_sub(plane_bytes).ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat(format!(
+                        "FDF pixel payload is shorter than declared ({len} < {plane_bytes})"
+                    ))
+                })?;
+                plane_offsets.push((file.clone(), offset));
+            }
+        } else {
+            let pixel_bytes = (image_count as u64)
+                .checked_mul(plane_bytes)
+                .ok_or_else(|| BioFormatsError::Format("FDF payload size overflows".into()))?;
+            let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+            if file_len < header.data_offset || file_len < pixel_bytes {
+                let required_len = header
+                    .data_offset
+                    .checked_add(pixel_bytes)
+                    .ok_or_else(|| BioFormatsError::Format("FDF payload size overflows".into()))?;
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "FDF pixel payload is shorter than declared ({file_len} < {required_len})"
+                )));
+            }
+            let first_pixel_offset = file_len
+                .checked_sub(pixel_bytes)
+                .ok_or_else(|| BioFormatsError::Format("FDF payload offset underflows".into()))?;
+            for i in 0..image_count {
+                plane_offsets.push((
+                    path.to_path_buf(),
+                    first_pixel_offset + u64::from(i) * plane_bytes,
+                ));
+            }
+        }
 
         let nx = header.size_x;
         let ny = header.size_y;
@@ -1701,7 +1913,7 @@ impl FormatReader for VarianFdfReader {
             size_y: ny,
             size_z: header.size_z,
             size_c: 1,
-            size_t: header.size_t,
+            size_t,
             pixel_type: header.pixel_type,
             bits_per_pixel: header.bits_per_pixel,
             image_count,
@@ -1719,11 +1931,10 @@ impl FormatReader for VarianFdfReader {
             modulo_c: None,
             modulo_t: None,
         });
-        // Java VarianFDFReader builds pixelOffsets from the file tail:
-        // in.length() - planeSize * (imageCount - i). This preserves files that
-        // carry padding or extra header bytes between the form-feed terminator
-        // and the pixel payload.
-        self.data_offset = first_pixel_offset;
+        // Java VarianFDFReader builds pixelOffsets from each file tail. This
+        // preserves files with padding between the form-feed and pixel payload.
+        self.data_offset = plane_offsets.first().map(|(_, o)| *o).unwrap_or(0);
+        self.plane_offsets = plane_offsets;
         self.physical_size_x = header.physical_size_x;
         self.physical_size_y = header.physical_size_y;
         self.physical_size_z = header.physical_size_z;
@@ -1734,6 +1945,7 @@ impl FormatReader for VarianFdfReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.plane_offsets.clear();
         self.physical_size_x = None;
         self.physical_size_y = None;
         self.physical_size_z = None;
@@ -1765,10 +1977,12 @@ impl FormatReader for VarianFdfReader {
         }
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;
-        let offset = self.data_offset + plane_index as u64 * plane_bytes as u64;
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let (path, offset) = self
+            .plane_offsets
+            .get(plane_index as usize)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(offset))
+        f.seek(SeekFrom::Start(*offset))
             .map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; plane_bytes];
         f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;

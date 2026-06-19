@@ -159,21 +159,33 @@ struct InCellMeta {
     pos_y: HashMap<usize, f64>,
 }
 
-fn attr_val(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+fn attr_val(
+    e: &quick_xml::events::BytesStart,
+    decoder: quick_xml::encoding::Decoder,
+    name: &str,
+) -> Option<String> {
     for a in e.attributes().flatten() {
         if a.key.as_ref() == name.as_bytes() {
-            return Some(String::from_utf8_lossy(&a.value).to_string());
+            return crate::common::xml::decode_xml_attr(a, decoder);
         }
     }
     None
 }
 
-fn attr_int(e: &quick_xml::events::BytesStart, name: &str) -> Option<i64> {
-    attr_val(e, name).and_then(|s| s.trim().parse::<i64>().ok())
+fn attr_int(
+    e: &quick_xml::events::BytesStart,
+    decoder: quick_xml::encoding::Decoder,
+    name: &str,
+) -> Option<i64> {
+    attr_val(e, decoder, name).and_then(|s| s.trim().parse::<i64>().ok())
 }
 
-fn attr_nonnegative_u32(e: &quick_xml::events::BytesStart, name: &str) -> Result<u32> {
-    let value = attr_int(e, name).unwrap_or(0);
+fn attr_nonnegative_u32(
+    e: &quick_xml::events::BytesStart,
+    decoder: quick_xml::encoding::Decoder,
+    name: &str,
+) -> Result<u32> {
+    let value = attr_int(e, decoder, name).unwrap_or(0);
     if value < 0 {
         return Err(BioFormatsError::Format(format!(
             "InCell attribute {name} must be non-negative, got {value}"
@@ -182,8 +194,12 @@ fn attr_nonnegative_u32(e: &quick_xml::events::BytesStart, name: &str) -> Result
     Ok(value as u32)
 }
 
-fn attr_positive_u32(e: &quick_xml::events::BytesStart, name: &str) -> Result<u32> {
-    let value = attr_int(e, name).unwrap_or(0);
+fn attr_positive_u32(
+    e: &quick_xml::events::BytesStart,
+    decoder: quick_xml::encoding::Decoder,
+    name: &str,
+) -> Result<u32> {
+    let value = attr_int(e, decoder, name).unwrap_or(0);
     if value <= 0 {
         return Err(BioFormatsError::Format(format!(
             "InCell attribute {name} must be positive, got {value}"
@@ -192,8 +208,12 @@ fn attr_positive_u32(e: &quick_xml::events::BytesStart, name: &str) -> Result<u3
     Ok(value as u32)
 }
 
-fn attr_f64(e: &quick_xml::events::BytesStart, name: &str) -> Option<f64> {
-    attr_val(e, name).and_then(|s| s.trim().parse::<f64>().ok())
+fn attr_f64(
+    e: &quick_xml::events::BytesStart,
+    decoder: quick_xml::encoding::Decoder,
+    name: &str,
+) -> Option<f64> {
+    attr_val(e, decoder, name).and_then(|s| s.trim().parse::<f64>().ok())
 }
 
 /// Parse the .xdce / .xml metadata into a usable structure (mirrors Java
@@ -236,12 +256,13 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
         match ev {
             Event::Eof => break,
             Event::Start(ref e) | Event::Empty(ref e) => {
+                let is_empty = matches!(ev, Event::Empty(_));
                 let qname = e.name();
                 let qname = qname.as_ref();
                 match qname {
                     b"Plate" => {
-                        m.well_rows = attr_positive_u32(e, "rows")? as usize;
-                        m.well_cols = attr_positive_u32(e, "columns")? as usize;
+                        m.well_rows = attr_positive_u32(e, reader.decoder(), "rows")? as usize;
+                        m.well_cols = attr_positive_u32(e, reader.decoder(), "columns")? as usize;
                         m.plate_map = vec![vec![false; m.well_cols]; m.well_rows];
                         m.exclude = vec![vec![false; m.well_cols]; m.well_rows];
                     }
@@ -252,8 +273,8 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         if m.exclude.is_empty() {
                             m.exclude = vec![vec![false; m.well_cols]; m.well_rows];
                         }
-                        let row = attr_positive_u32(e, "row")? as usize - 1;
-                        let col = attr_positive_u32(e, "col")? as usize - 1;
+                        let row = attr_positive_u32(e, reader.decoder(), "row")? as usize - 1;
+                        let col = attr_positive_u32(e, reader.decoder(), "col")? as usize - 1;
                         if row < m.well_rows && col < m.well_cols {
                             m.exclude[row][col] = true;
                         } else {
@@ -272,7 +293,7 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                     b"Image" => {
                         m.total_images += 1;
                         current_image_file = None;
-                        if let Some(file) = attr_val(e, "filename") {
+                        if let Some(file) = attr_val(e, reader.decoder(), "filename") {
                             current_image_file =
                                 Some(confined_join(&dir, &file).ok_or_else(|| {
                                     BioFormatsError::Format(format!(
@@ -282,10 +303,11 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                     }
                     b"Identifier" => {
-                        let field = attr_nonnegative_u32(e, "field_index")? as usize;
-                        let z = attr_nonnegative_u32(e, "z_index")?;
-                        let c = attr_nonnegative_u32(e, "wave_index")?;
-                        let t = attr_nonnegative_u32(e, "time_index")? as usize;
+                        let field =
+                            attr_nonnegative_u32(e, reader.decoder(), "field_index")? as usize;
+                        let z = attr_nonnegative_u32(e, reader.decoder(), "z_index")?;
+                        let c = attr_nonnegative_u32(e, reader.decoder(), "wave_index")?;
+                        let t = attr_nonnegative_u32(e, reader.decoder(), "time_index")? as usize;
 
                         // channels per timepoint is read by Java but the plane
                         // index (with t=0) reduces to z + c*sizeZ regardless.
@@ -331,13 +353,15 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         // MinimalInCellHandler counts fields; InCellHandler also
                         // records per-field stage positions. We do both here.
                         m.field_count += 1;
-                        let x = attr_f64(e, "x");
-                        let y = attr_f64(e, "y");
-                        let index = attr_int(e, "index").map(|v| v as usize).unwrap_or_else(|| {
-                            let i = offset_point_counter;
-                            offset_point_counter += 1;
-                            i
-                        });
+                        let x = attr_f64(e, reader.decoder(), "x");
+                        let y = attr_f64(e, reader.decoder(), "y");
+                        let index = attr_int(e, reader.decoder(), "index")
+                            .map(|v| v as usize)
+                            .unwrap_or_else(|| {
+                                let i = offset_point_counter;
+                                offset_point_counter += 1;
+                                i
+                            });
                         if let Some(x) = x {
                             m.pos_x.insert(index, x);
                         }
@@ -352,11 +376,12 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                     }
                     b"Wavelength" => {
-                        let fusion = attr_val(e, "fusion_wave").unwrap_or_default();
+                        let fusion =
+                            attr_val(e, reader.decoder(), "fusion_wave").unwrap_or_default();
                         if fusion == "false" {
                             m.size_c += 1;
                         }
-                        if let Some(mode) = attr_val(e, "imaging_mode") {
+                        if let Some(mode) = attr_val(e, reader.decoder(), "imaging_mode") {
                             let is_3d = mode == "3-D";
                             // Java MinimalInCellHandler: record when different
                             // imaging modes are encountered across channels.
@@ -372,7 +397,7 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         n_channels += 1;
                     }
                     b"ZDimensionParameters" => {
-                        if let Some(nz) = attr_int(e, "number_of_slices") {
+                        if let Some(nz) = attr_int(e, reader.decoder(), "number_of_slices") {
                             if nz <= 0 {
                                 return Err(BioFormatsError::Format(format!(
                                     "InCell attribute number_of_slices must be positive, got {nz}"
@@ -388,7 +413,7 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                     }
                     b"Row" => {
-                        let row = attr_positive_u32(e, "number")? as usize - 1;
+                        let row = attr_positive_u32(e, reader.decoder(), "number")? as usize - 1;
                         if !m.plate_map.is_empty() && row >= m.well_rows {
                             return Err(BioFormatsError::Format(format!(
                                 "InCell row {} is outside declared plate rows {}",
@@ -399,7 +424,7 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         well_row = row;
                     }
                     b"Column" => {
-                        let col = attr_positive_u32(e, "number")? as usize - 1;
+                        let col = attr_positive_u32(e, reader.decoder(), "number")? as usize - 1;
                         if !m.plate_map.is_empty() && col >= m.well_cols {
                             return Err(BioFormatsError::Format(format!(
                                 "InCell column {} is outside declared plate columns {}",
@@ -413,30 +438,30 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                     }
                     b"Size" => {
-                        m.image_width = attr_positive_u32(e, "width")?;
-                        m.image_height = attr_positive_u32(e, "height")?;
+                        m.image_width = attr_positive_u32(e, reader.decoder(), "width")?;
+                        m.image_height = attr_positive_u32(e, reader.decoder(), "height")?;
                     }
                     b"NamingRows" => {
-                        if let Some(begin) = attr_val(e, "begin") {
+                        if let Some(begin) = attr_val(e, reader.decoder(), "begin") {
                             m.row_name = begin;
                         }
                     }
                     b"NamingColumns" => {
-                        if let Some(begin) = attr_val(e, "begin") {
+                        if let Some(begin) = attr_val(e, reader.decoder(), "begin") {
                             m.col_name = begin;
                         }
                     }
                     b"ObjectiveCalibration" => {
-                        m.nominal_magnification = attr_f64(e, "magnification");
-                        m.lens_na = attr_f64(e, "numerical_aperture");
-                        m.physical_size_x = attr_f64(e, "pixel_width");
-                        m.physical_size_y = attr_f64(e, "pixel_height");
+                        m.nominal_magnification = attr_f64(e, reader.decoder(), "magnification");
+                        m.lens_na = attr_f64(e, reader.decoder(), "numerical_aperture");
+                        m.physical_size_x = attr_f64(e, reader.decoder(), "pixel_width");
+                        m.physical_size_y = attr_f64(e, reader.decoder(), "pixel_height");
                         // Java InCellHandler: refractive index plus the objective
                         // manufacturer/correction parsed from objective_name
                         // (tokens split on '_'; tokens[0] -> manufacturer,
                         // tokens[2] if present else "Other" -> correction).
-                        m.refractive = attr_f64(e, "refractive_index");
-                        if let Some(objective) = attr_val(e, "objective_name") {
+                        m.refractive = attr_f64(e, reader.decoder(), "refractive_index");
+                        if let Some(objective) = attr_val(e, reader.decoder(), "objective_name") {
                             let tokens: Vec<&str> = objective.split('_').collect();
                             m.objective_manufacturer = tokens.first().map(|s| s.to_string());
                             m.objective_correction = Some(
@@ -448,19 +473,19 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                     }
                     b"ExcitationFilter" => {
-                        if let Some(w) = attr_f64(e, "wavelength") {
+                        if let Some(w) = attr_f64(e, reader.decoder(), "wavelength") {
                             m.ex_waves.push(w);
                         }
                         // Java MinimalInCellHandler: exFilters.add(name).
-                        if let Some(name) = attr_val(e, "name") {
+                        if let Some(name) = attr_val(e, reader.decoder(), "name") {
                             m.ex_filters.push(name);
                         }
                     }
                     b"EmissionFilter" => {
-                        if let Some(w) = attr_f64(e, "wavelength") {
+                        if let Some(w) = attr_f64(e, reader.decoder(), "wavelength") {
                             m.em_waves.push(w);
                         }
-                        if let Some(name) = attr_val(e, "name") {
+                        if let Some(name) = attr_val(e, reader.decoder(), "name") {
                             // Java InCellHandler: channelNames.add(name);
                             // Java MinimalInCellHandler: emFilters.add(name).
                             m.channel_names.push(name.clone());
@@ -468,33 +493,71 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         }
                     }
                     b"TimeSchedule" => {
-                        m.do_t = attr_val(e, "enabled").map(|v| v == "true").unwrap_or(true);
+                        m.do_t = attr_val(e, reader.decoder(), "enabled")
+                            .map(|v| v == "true")
+                            .unwrap_or(true);
                     }
                     b"Creation" => {
                         // Java InCellHandler: creationDate = date + "T" + time.
-                        let date = attr_val(e, "date"); // yyyy-mm-dd
-                        let time = attr_val(e, "time"); // hh:mm:ss
+                        let date = attr_val(e, reader.decoder(), "date"); // yyyy-mm-dd
+                        let time = attr_val(e, reader.decoder(), "time"); // hh:mm:ss
                         if let (Some(date), Some(time)) = (date, time) {
                             m.creation_date = Some(format!("{date}T{time}"));
                         }
                     }
                     b"Camera" => {
                         // Java InCellHandler: store.setDetectorModel(name, 0, 0).
-                        m.detector_model = attr_val(e, "name");
+                        m.detector_model = attr_val(e, reader.decoder(), "name");
                     }
                     b"Binning" => {
                         // Java InCellHandler: bin = getBinning(value).
-                        m.bin = attr_val(e, "value");
+                        m.bin = attr_val(e, reader.decoder(), "value");
                     }
                     b"Gain" => {
                         // Java InCellHandler: gain = parseDouble(value).
-                        m.gain = attr_f64(e, "value");
+                        m.gain = attr_f64(e, reader.decoder(), "value");
                     }
                     b"PlateTemperature" => {
                         // Java InCellHandler: temperature = parseDouble(value).
-                        m.temperature = attr_f64(e, "value");
+                        m.temperature = attr_f64(e, reader.decoder(), "value");
                     }
                     _ => {}
+                }
+                if is_empty {
+                    // Java SAX emits both startElement and endElement for
+                    // self-closing elements; quick-xml reports only Empty.
+                    match qname {
+                        b"Image" => {
+                            current_image_file = None;
+                        }
+                        b"PlateMap" => {
+                            if m.size_t == 0 {
+                                m.size_t = 1;
+                            }
+                            if channels_per_timepoint.is_empty() {
+                                channels_per_timepoint.push(m.size_c.max(1));
+                            }
+                            allocate_image_files(&mut m, &channels_per_timepoint);
+                            allocated = true;
+                        }
+                        b"TimePoint" => {
+                            if m.do_t {
+                                channels_per_timepoint.push(n_channels);
+                                n_channels = 0;
+                            }
+                        }
+                        b"Times" => {
+                            if channels_per_timepoint.is_empty() {
+                                channels_per_timepoint.push(m.size_c.max(1));
+                            }
+                            for c in channels_per_timepoint.iter_mut() {
+                                if *c == 0 {
+                                    *c = m.size_c.max(1);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Event::End(ref e) => {
@@ -1622,5 +1685,31 @@ mod tests {
             parse_incell_xml(&path).unwrap()
         };
         assert!(m.variable_z);
+    }
+
+    #[test]
+    fn incell_empty_timepoints_run_end_element_bookkeeping() {
+        // Java SAX calls both startElement and endElement for <TimePoint/>.
+        // quick-xml reports Event::Empty, so the parser must still append a
+        // channelsPerTimepoint entry for each self-closing timepoint.
+        let xml = r#"<InCell>
+            <Plate rows="1" columns="1"/>
+            <Wavelength fusion_wave="false" imaging_mode="2-D"/>
+            <Wavelength fusion_wave="false" imaging_mode="2-D"/>
+            <Times>
+                <TimePoint/>
+                <TimePoint/>
+            </Times>
+            <Row number="1"><Column number="1"/></Row>
+        </InCell>"#;
+        let m = {
+            let dir = temp_dir("empty_timepoints");
+            let path = dir.join("plate.xdce");
+            std::fs::write(&path, xml).unwrap();
+            parse_incell_xml(&path).unwrap()
+        };
+
+        assert_eq!(m.size_t, 2);
+        assert_eq!(m.channels_per_timepoint, vec![2, 2]);
     }
 }

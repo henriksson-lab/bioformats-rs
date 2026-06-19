@@ -27,7 +27,7 @@ pub(crate) fn decompress_jpeg_color(data: &[u8], color: JpegColor) -> Result<Vec
     match color {
         JpegColor::Default => decompress_jpeg(data),
         JpegColor::Rgb => {
-            let mut decoder = jpeg_decoder::Decoder::new(data);
+            let mut decoder = jpeg_decoder::Decoder::new(crate::common::codec::jpeg_payload(data));
             decoder.set_color_transform(jpeg_decoder::ColorTransform::RGB);
             decoder
                 .decode()
@@ -56,7 +56,10 @@ pub fn decompress(
     let mut out = match compression {
         Compression::None => data.to_vec(),
         Compression::Lzw => decompress_lzw(data)?,
-        Compression::Deflate | Compression::DeflateOld => decompress_deflate(data)?,
+        Compression::Deflate => decompress_deflate(data)?,
+        Compression::DeflateOld => {
+            decompress_deflate_raw(data).or_else(|_| decompress_deflate(data))?
+        }
         Compression::PackBits => decompress_packbits(data)?,
         Compression::Jpeg | Compression::JpegNew => {
             // New-style (technote, code 7) and old-style (code 6) JPEG both store
@@ -139,11 +142,15 @@ pub fn decompress(
 }
 
 pub(crate) fn merge_jpeg_tables(tables: &[u8], data: &[u8]) -> Vec<u8> {
-    if !starts_with_soi(tables) {
+    if tables.is_empty() {
         return data.to_vec();
     }
 
-    let table_payload = strip_optional_eoi(&tables[2..]);
+    let table_payload = if starts_with_soi(tables) {
+        strip_optional_eoi(&tables[2..])
+    } else {
+        strip_optional_eoi(tables)
+    };
     let scan_payload = if starts_with_soi(data) {
         &data[2..]
     } else {
@@ -667,6 +674,23 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_tables_without_soi_are_still_spliced_java_style() {
+        let tables = [0xff, 0xdb, 0x00, 0x04, 0x11, 0x22, 0xff, 0xd9];
+        let scan = [0xff, 0xd8, 0xff, 0xda, 0x00, 0x02, 0x33, 0xff, 0xd9];
+
+        let merged = merge_jpeg_tables(&tables, &scan);
+
+        assert_eq!(
+            merged,
+            vec![
+                0xff, 0xd8, // synthetic SOI
+                0xff, 0xdb, 0x00, 0x04, 0x11, 0x22, // table payload, EOI stripped
+                0xff, 0xda, 0x00, 0x02, 0x33, 0xff, 0xd9, // scan payload, SOI stripped
+            ]
+        );
+    }
+
+    #[test]
     fn decompression_allows_short_output_for_caller_validation() {
         let out = decompress(
             &[1, 2],
@@ -685,6 +709,35 @@ mod tests {
         .expect("uncompressed decode failed");
 
         assert_eq!(out, vec![1, 2]);
+    }
+
+    #[test]
+    fn old_deflate_accepts_raw_deflate_streams() {
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        let pixels = b"raw-deflate-tiff-strip";
+        let mut encoder = DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(pixels).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let out = decompress(
+            &compressed,
+            Compression::DeflateOld,
+            pixels.len(),
+            1,
+            1,
+            8,
+            pixels.len() as u32,
+            1,
+            true,
+            None,
+            None,
+            JpegColor::Default,
+        )
+        .expect("old deflate raw stream should decode");
+
+        assert_eq!(out, pixels);
     }
 
     #[test]

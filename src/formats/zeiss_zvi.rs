@@ -970,11 +970,8 @@ fn decode_plane_data(data: &[u8], plane: &ZviPlane) -> Result<Vec<u8>> {
     })?;
 
     if plane.is_jpeg {
-        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(payload));
-        let pixels = decoder
-            .decode()
-            .map_err(|e| BioFormatsError::Format(format!("ZVI JPEG decode: {e}")))?;
-        return Ok(pixels);
+        return crate::common::codec::decompress_jpeg(payload)
+            .map_err(|e| BioFormatsError::Format(format!("ZVI JPEG decode: {e}")));
     }
 
     if plane.is_zlib {

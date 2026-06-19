@@ -8,7 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bioformats::common::metadata::{DimensionOrder, MetadataValue};
 use bioformats::common::pixel_type::PixelType;
 use bioformats::common::reader::FormatReader;
-use bioformats::formats::misc4::{I2iReader, JdceReader, KlbReader, ObfReader, PciReader};
+use bioformats::formats::misc4::{
+    I2iReader, JdceReader, JpxReader, KlbReader, ObfReader, PciReader,
+};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -212,6 +214,28 @@ fn i2i_detection_rejects_bad_pixel_type() {
     assert!(r.is_this_type_by_bytes(&good));
 }
 
+#[test]
+fn i2i_allows_java_zero_additional_dimension() {
+    let path = unique_path("i2i_n0", "i2i");
+    write_i2i(&path, 2, 2, 3, 0, &[]);
+
+    let mut r = I2iReader::new();
+    r.set_id(&path)
+        .expect("Java I2IReader accepts n=0 and produces zero planes");
+    let meta = r.metadata();
+    assert_eq!(meta.size_z, 3);
+    assert_eq!(meta.size_t, 0);
+    assert_eq!(meta.image_count, 0);
+    assert!(matches!(
+        r.open_bytes(0),
+        Err(bioformats::common::error::BioFormatsError::PlaneOutOfRange(
+            0
+        ))
+    ));
+
+    let _ = std::fs::remove_file(&path);
+}
+
 // ---------------------------------------------------------------------------
 // KLB (synthetic single-file raw blocks)
 // ---------------------------------------------------------------------------
@@ -254,8 +278,8 @@ fn klb_fixture_bytes(compression_type: u8, offset_override: Option<Vec<u64>>) ->
     for dim in dims {
         bytes.extend_from_slice(&dim.to_le_bytes());
     }
-    for _ in 0..5 {
-        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+    for pixel_size in [0.5f32, 0.25, 2.0, 1.0, 1.0] {
+        bytes.extend_from_slice(&pixel_size.to_le_bytes());
     }
     bytes.push(1); // UINT16
     bytes.push(compression_type);
@@ -290,6 +314,27 @@ fn klb_synthetic_raw_single_file_roundtrip() {
     assert_eq!(meta.pixel_type, PixelType::Uint16);
     assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
     assert!(meta.is_little_endian);
+    assert_eq!(
+        meta.series_metadata
+            .get("PhysicalSizeX")
+            .unwrap()
+            .to_string(),
+        "0.5"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("PhysicalSizeY")
+            .unwrap()
+            .to_string(),
+        "0.25"
+    );
+    assert_eq!(
+        meta.series_metadata
+            .get("PhysicalSizeZ")
+            .unwrap()
+            .to_string(),
+        "2"
+    );
 
     assert_eq!(r.open_bytes(0).unwrap(), le_u16(&[0, 1, 2, 10, 11, 12]));
     assert_eq!(
@@ -300,6 +345,10 @@ fn klb_synthetic_raw_single_file_roundtrip() {
         r.open_bytes_region(1, 1, 0, 2, 2).unwrap(),
         le_u16(&[101, 102, 111, 112])
     );
+    let ome = r.ome_metadata().unwrap();
+    assert_eq!(ome.images[0].physical_size_x, Some(0.5));
+    assert_eq!(ome.images[0].physical_size_y, Some(0.25));
+    assert_eq!(ome.images[0].physical_size_z, Some(2.0));
     assert!(r.open_bytes(2).is_err());
 
     let _ = std::fs::remove_file(&path);
@@ -369,4 +418,72 @@ fn jdce_detection_and_bad_json() {
     let mut r = JdceReader::new();
     assert!(r.set_id(&path).is_err());
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn jdce_uses_largest_csv_plane_size_per_field_series() {
+    let dir = std::env::temp_dir().join(format!(
+        "bioformats_misc4_jdce_dims_{}_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let jdce_path = dir.join("plate.jdce");
+    let csv_path = dir.join("images.csv");
+    let json = r#"{
+      "ImageStack": {
+        "ImageFormat": "TIFF",
+        "AutoLeadAcquisitionProtocol": {
+          "PlateMap": {
+            "TimeSchedule": {"Times": [0]},
+            "ZDimensionParameters": {"NumberOfSlices": 1}
+          },
+          "Wavelengths": [
+            {"ImagingMode": "Widefield"}
+          ]
+        },
+        "ImageMetadataFiles": ["images.csv"]
+      }
+    }"#;
+    std::fs::write(&jdce_path, json).unwrap();
+    std::fs::write(
+        &csv_path,
+        "Row,Column,Field,Wavelength,Timepoint,ZIndex,ImageSubFolderPath,ImageFileName,ImageSizeXPx,ImageSizeYPx\r\n\
+         1,1,0,0,0,0,,missing_f0.tif,4,3\r\n\
+         1,1,1,0,0,0,,missing_f1.tif,8,6\r\n",
+    )
+    .unwrap();
+
+    let mut r = JdceReader::new();
+    r.set_id(&jdce_path)
+        .expect("JDCE with CSV dimensions and missing TIFFs should initialize");
+    assert_eq!(r.series_count(), 2);
+    assert_eq!((r.metadata().size_x, r.metadata().size_y), (4, 3));
+    r.set_series(1).unwrap();
+    assert_eq!((r.metadata().size_x, r.metadata().size_y), (8, 6));
+
+    let _ = std::fs::remove_file(&jdce_path);
+    let _ = std::fs::remove_file(&csv_path);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
+fn jpx_detection_matches_java_start_and_eof_markers() {
+    let r = JpxReader::new();
+    assert!(r.is_this_type_by_name(Path::new("image.jpx")));
+    assert!(!r.is_this_type_by_name(Path::new("image.jp2")));
+
+    let raw_codestream = [0xff, 0x4f, 0xff, 0x51, 0x00, 0x00, 0xff, 0xd9];
+    assert!(r.is_this_type_by_bytes(&raw_codestream));
+
+    let mut boxed = [0u8; 16];
+    boxed[4..8].copy_from_slice(b"jP  ");
+    boxed[14..16].copy_from_slice(&[0xff, 0xd9]);
+    assert!(r.is_this_type_by_bytes(&boxed));
+
+    let missing_eof = [0xff, 0x4f, 0xff, 0x51, 0x00, 0x00, 0x00, 0x00];
+    assert!(!r.is_this_type_by_bytes(&missing_eof));
 }

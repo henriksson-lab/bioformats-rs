@@ -605,11 +605,7 @@ impl OmeMetadata {
             xml.push('>');
 
             // Channels
-            let channel_count = if meta.is_rgb {
-                1
-            } else {
-                meta.size_c.max(1) as usize
-            };
+            let channel_count = effective_size_c(meta) as usize;
             for (ci, ch) in img.channels.iter().take(channel_count).enumerate() {
                 let light_path = img.light_paths.get(ci);
                 let _ = write!(
@@ -1029,12 +1025,8 @@ impl OmeMetadata {
             self.images.resize_with(image_index + 1, OmeImage::default);
         }
 
-        let spp = if meta.is_rgb { meta.size_c.max(1) } else { 1 };
-        let channel_count = if meta.is_rgb {
-            1
-        } else {
-            meta.size_c.max(1) as usize
-        };
+        let spp = rgb_channel_count(meta);
+        let channel_count = effective_size_c(meta) as usize;
         let image = &mut self.images[image_index];
         if image.channels.len() < channel_count {
             image
@@ -1066,7 +1058,7 @@ impl OmeMetadata {
             ));
         }
 
-        let effective_c = if meta.is_rgb { 1 } else { meta.size_c };
+        let effective_c = effective_size_c(meta);
         let expected_planes = meta
             .size_z
             .checked_mul(effective_c)
@@ -1082,7 +1074,7 @@ impl OmeMetadata {
         let image = self.images.get(image_index).ok_or_else(|| {
             BioFormatsError::InvalidData(format!("missing OME Image at index {image_index}"))
         })?;
-        let expected_channels = if meta.is_rgb { 1 } else { meta.size_c as usize };
+        let expected_channels = effective_size_c(meta) as usize;
         if image.channels.len() < expected_channels {
             return Err(BioFormatsError::InvalidData(format!(
                 "OME Image {image_index} has {} channels but requires {expected_channels}",
@@ -1105,12 +1097,18 @@ impl OmeMetadata {
                 "minimum metadata requires SamplesPerPixel for every channel".into(),
             ));
         }
-        if meta.is_rgb && image.channels[0].samples_per_pixel != meta.size_c.max(1) {
-            return Err(BioFormatsError::InvalidData(format!(
-                "RGB metadata requires one OME channel with SamplesPerPixel={}, got {}",
-                meta.size_c.max(1),
-                image.channels[0].samples_per_pixel
-            )));
+        if meta.is_rgb {
+            let samples_per_pixel = rgb_channel_count(meta);
+            if image
+                .channels
+                .iter()
+                .take(expected_channels)
+                .any(|channel| channel.samples_per_pixel != samples_per_pixel)
+            {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "RGB metadata requires OME channels with SamplesPerPixel={samples_per_pixel}"
+                )));
+            }
         }
         Ok(())
     }
@@ -2235,6 +2233,28 @@ fn metadata_u32_by_suffix(
     metadata_value_u32(metadata_by_suffix(metadata, suffixes))
 }
 
+fn rgb_channel_count(meta: &ImageMetadata) -> u32 {
+    if !meta.is_rgb {
+        return 1;
+    }
+    let zt = meta.size_z.max(1).saturating_mul(meta.size_t.max(1));
+    if zt > 0 && meta.image_count >= zt {
+        let effective_c = (meta.image_count / zt).max(1);
+        if effective_c > 0 && meta.size_c >= effective_c && meta.size_c % effective_c == 0 {
+            return (meta.size_c / effective_c).max(1);
+        }
+    }
+    meta.size_c.max(1)
+}
+
+fn effective_size_c(meta: &ImageMetadata) -> u32 {
+    if meta.is_rgb {
+        (meta.size_c / rgb_channel_count(meta)).max(1)
+    } else {
+        meta.size_c.max(1)
+    }
+}
+
 fn generic_planes_from_metadata(meta: &ImageMetadata) -> Vec<OmePlane> {
     let mut planes = Vec::new();
     for plane_index in 0..meta.image_count {
@@ -2287,7 +2307,7 @@ fn generic_planes_from_metadata(meta: &ImageMetadata) -> Vec<OmePlane> {
             || position_y.is_some()
             || position_z.is_some()
         {
-            let c_size = meta.size_c.max(1);
+            let c_size = effective_size_c(meta);
             let z_size = meta.size_z.max(1);
             planes.push(OmePlane {
                 the_z: (plane_index / c_size) % z_size,
@@ -3099,5 +3119,60 @@ fn to_seconds(value: f64, unit: &str) -> f64 {
         "min" => value * 60.0,
         "h" => value * 3600.0,
         _ => value, // assume seconds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+    use crate::common::pixel_type::PixelType;
+
+    #[test]
+    fn rgb_metadata_uses_java_effective_channel_count() {
+        let mut meta = ImageMetadata {
+            size_x: 2,
+            size_y: 2,
+            size_z: 1,
+            size_c: 6,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 2,
+            dimension_order: DimensionOrder::XYCZT,
+            is_rgb: true,
+            is_interleaved: true,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            thumbnail: false,
+            series_metadata: std::collections::HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        };
+        meta.series_metadata
+            .insert("plane.0.delta_t".into(), MetadataValue::Float(0.0));
+        meta.series_metadata
+            .insert("plane.1.delta_t".into(), MetadataValue::Float(1.0));
+
+        let ome = OmeMetadata::from_image_metadata(&meta);
+        let image = ome.images.first().expect("OME image");
+
+        assert_eq!(image.channels.len(), 2);
+        assert!(image
+            .channels
+            .iter()
+            .all(|channel| channel.samples_per_pixel == 3));
+        assert_eq!(image.planes.len(), 2);
+        assert_eq!(image.planes[0].the_c, 0);
+        assert_eq!(image.planes[1].the_c, 1);
+        ome.verify_minimum_populated(&meta, 0).unwrap();
+
+        let xml = ome.to_ome_xml(&meta);
+        assert_eq!(xml.matches("<Channel ").count(), 2);
+        assert_eq!(xml.matches(r#"SamplesPerPixel="3""#).count(), 2);
+        assert!(xml.contains(r#"<Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="2" SizeZ="1" SizeC="6" SizeT="1" BigEndian="false""#));
     }
 }

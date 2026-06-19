@@ -98,7 +98,8 @@ fn pixel_type_from_depth(depth: u16) -> Result<PixelType> {
     match depth {
         8 => Ok(PixelType::Uint8),
         16 => Ok(PixelType::Uint16),
-        32 => Ok(PixelType::Float32),
+        32 => Ok(PixelType::Uint32),
+        64 => Ok(PixelType::Float64),
         _ => Err(BioFormatsError::UnsupportedFormat(format!(
             "PSD unsupported bit depth {depth}"
         ))),
@@ -819,7 +820,10 @@ fn decode_psd_xmp_metadata(
                     {
                         continue;
                     }
-                    let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+                    let Ok(value) = attr.decoded_and_normalized_value(
+                        quick_xml::XmlVersion::Implicit1_0,
+                        reader.decoder(),
+                    ) else {
                         continue;
                     };
                     psd_xmp_insert_scalar(metadata, &key, value.as_ref(), &mut inserted);
@@ -843,14 +847,24 @@ fn decode_psd_xmp_metadata(
                     {
                         continue;
                     }
-                    let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+                    let Ok(value) = attr.decoded_and_normalized_value(
+                        quick_xml::XmlVersion::Implicit1_0,
+                        reader.decoder(),
+                    ) else {
                         continue;
                     };
                     psd_xmp_insert_scalar(metadata, &key, value.as_ref(), &mut inserted);
                 }
             }
             Ok(quick_xml::events::Event::Text(event)) => {
-                if let Ok(value) = event.unescape() {
+                if let Some(value) = crate::common::xml::decode_xml_text(&event) {
+                    if text.chars().count() < PSD_XMP_MAX_VALUE_CHARS {
+                        text.push_str(&value);
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::GeneralRef(event)) => {
+                if let Some(value) = crate::common::xml::decode_xml_ref(&event) {
                     if text.chars().count() < PSD_XMP_MAX_VALUE_CHARS {
                         text.push_str(&value);
                     }

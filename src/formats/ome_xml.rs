@@ -108,13 +108,13 @@ fn xml_attr(tag: &str, attr: &str) -> Option<String> {
     if quote == '"' || quote == '\'' {
         let inner = &rest[1..];
         let end = inner.find(quote)?;
-        Some(inner[..end].to_string())
+        Some(crate::common::xml::decode_xml_escaped_str(&inner[..end]))
     } else {
         // Unquoted: read until space or >
         let end = rest
             .find(|c: char| c.is_whitespace() || c == '>')
             .unwrap_or(rest.len());
-        Some(rest[..end].to_string())
+        Some(crate::common::xml::decode_xml_escaped_str(&rest[..end]))
     }
 }
 
@@ -966,8 +966,8 @@ impl FormatReader for OmeXmlReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        let s = std::str::from_utf8(&header[..header.len().min(128)]).unwrap_or("");
-        (s.contains("<?xml") || s.starts_with('<')) && s.contains("OME")
+        let s = std::str::from_utf8(&header[..header.len().min(64)]).unwrap_or("");
+        s.starts_with("<?xml") && s.contains("<OME")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1374,6 +1374,18 @@ mod tests {
         assert_eq!(td[1].ifd, 3);
         assert_eq!(td[1].first_z, 1);
         assert_eq!(td[1].filename.as_deref(), Some("b.tiff"));
+    }
+
+    #[test]
+    fn parses_tiffdata_uuid_filename_entities_like_sax() {
+        let pixels = r#"<Pixels>
+            <TiffData>
+              <UUID FileName="A&amp;B_&#181;m.tiff">urn:uuid:1111</UUID>
+            </TiffData>
+        </Pixels>"#;
+        let td = parse_tiff_data(pixels);
+
+        assert_eq!(td[0].filename.as_deref(), Some("A&B_\u{b5}m.tiff"));
     }
 
     #[test]

@@ -99,6 +99,26 @@ impl BioRadReader {
     }
 }
 
+fn resolve_biorad_pic_for_companion(path: &Path) -> Result<PathBuf> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| BioFormatsError::Format("Bio-Rad companion has no parent".into()))?;
+    let mut found = None;
+    for entry in std::fs::read_dir(dir).map_err(BioFormatsError::Io)? {
+        let entry = entry.map_err(BioFormatsError::Io)?;
+        let candidate = entry.path();
+        if candidate
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("pic"))
+            .unwrap_or(false)
+        {
+            found = Some(candidate);
+        }
+    }
+    found.ok_or_else(|| BioFormatsError::Format("No .pic files found - invalid dataset.".into()))
+}
+
 /// Mirrors Java `NOTE_NAMES`; index = note type, length 23 (indices 0..=22).
 const NOTE_NAMES: [&str; 23] = [
     "0",
@@ -700,20 +720,45 @@ impl Default for BioRadReader {
 
 impl FormatReader for BioRadReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension()
+        if path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("pic"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| {
+                let name = name.to_ascii_lowercase();
+                name == "lse.xml" || name == "data.raw"
+            })
             .unwrap_or(false)
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // Magic: file_id at offset 54 == 12345 (little-endian)
-        header.len() >= 56 && i16::from_le_bytes([header[54], header[55]]) == FILE_ID
+        // Java BioRadReader accepts either a PIC file_id at offset 54 or an
+        // "[Input Sources]" companion-style header.
+        header.len() >= 56
+            && (i16::from_le_bytes([header[54], header[55]]) == FILE_ID
+                || header.starts_with(b"[Input Sources]"))
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        let path = if self.is_this_type_by_name(path)
+            && !path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("pic"))
+                .unwrap_or(false)
+        {
+            resolve_biorad_pic_for_companion(path)?
+        } else {
+            path.to_path_buf()
+        };
+        let mut f = File::open(&path).map_err(BioFormatsError::Io)?;
         let mut hdr = [0u8; HEADER_SIZE as usize];
         f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
 
@@ -841,8 +886,8 @@ impl FormatReader for BioRadReader {
         // initFile/FilePattern path). Order by name (Arrays.sort(picFiles)).
         let mut pics: Vec<PathBuf> = Vec::new();
         if multiple_files {
-            if let Ok(this_len) = std::fs::metadata(path).map(|m| m.len()) {
-                if let Ok(pattern) = crate::stitcher::FilePattern::from_file(path) {
+            if let Ok(this_len) = std::fs::metadata(&path).map(|m| m.len()) {
+                if let Ok(pattern) = crate::stitcher::FilePattern::from_file(&path) {
                     for file in pattern.filenames() {
                         let is_pic = file
                             .extension()
@@ -1245,6 +1290,14 @@ mod tests {
         let notes = vec![note_typed(NOTE_TYPE_VARIABLE, "AXIS_2 = 257 0 0.25")];
         let r = parse_notes(&notes, 1, 512, 512);
         assert_eq!(r.physical_size_x, Some(0.25));
+    }
+
+    #[test]
+    fn byte_probe_accepts_input_sources_companion_header_like_java() {
+        let reader = BioRadReader::new();
+        let mut header = [0u8; 56];
+        header[..15].copy_from_slice(b"[Input Sources]");
+        assert!(reader.is_this_type_by_bytes(&header));
     }
 
     // -- Synthetic PIC builders for the new member-variable tests --

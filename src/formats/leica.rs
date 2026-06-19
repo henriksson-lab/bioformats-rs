@@ -150,7 +150,7 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
     let little = data[0] == 0x49 && data[1] == 0x49 && data[2] == 0x49 && data[3] == 0x49;
 
     let mut c = Cursor::new(&data, little);
-    c.seek(0);
+    c.seek(4);
     c.skip(8);
     let mut addr = c.read_i32();
 
@@ -272,6 +272,7 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
         let mut size_t = 1u32;
         let mut pixel_type = PixelType::Uint8;
         let mut bpp_bytes = 1u32;
+        let mut effective_little_endian = little;
         let mut order_axes: Vec<char> = Vec::new();
 
         let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
@@ -467,6 +468,27 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
 
         let image_count = (size_z * size_c * size_t).max(files.len() as u32);
 
+        // Java LeicaReader reads the first companion TIFF IFD after parsing the
+        // LEI metadata and lets the TIFF's dimensions, pixel type, and
+        // multi-byte endianness override the values declared in the LEI.
+        if let Some(first_file) = files.first().filter(|p| p.exists()) {
+            let mut tiff = TiffReader::new();
+            if tiff.set_id(first_file).is_ok() {
+                let tiff_meta = tiff.metadata();
+                if tiff_meta.size_x > 0 {
+                    size_x = tiff_meta.size_x;
+                }
+                if tiff_meta.size_y > 0 {
+                    size_y = tiff_meta.size_y;
+                }
+                pixel_type = tiff_meta.pixel_type;
+                bpp_bytes = pixel_type.bytes_per_sample() as u32;
+                if bpp_bytes > 1 {
+                    effective_little_endian = tiff_meta.is_little_endian;
+                }
+            }
+        }
+
         let meta = ImageMetadata {
             size_x,
             size_y,
@@ -480,7 +502,7 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
             is_rgb,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: little,
+            is_little_endian: effective_little_endian,
             resolution_count: 1,
             thumbnail: false,
             series_metadata: meta_map,
@@ -593,8 +615,16 @@ impl FormatReader for LeicaReader {
             .files
             .get(file_index)
             .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        if !file.exists() {
+            return Ok(blank_plane(&s.meta));
+        }
         let mut r = TiffReader::new();
-        r.set_id(file)?;
+        if let Err(err) = r.set_id(file) {
+            if file.exists() {
+                return Err(err);
+            }
+            return Ok(blank_plane(&s.meta));
+        }
         let inner = r.metadata().image_count.max(1);
         if page >= inner {
             return Err(BioFormatsError::Format(format!(
@@ -629,6 +659,17 @@ impl FormatReader for LeicaReader {
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+}
+
+fn blank_plane(meta: &ImageMetadata) -> Vec<u8> {
+    let samples = if meta.is_rgb {
+        meta.size_c.max(1) as usize
+    } else {
+        1
+    };
+    let len =
+        meta.size_x as usize * meta.size_y as usize * samples * meta.pixel_type.bytes_per_sample();
+    vec![0; len]
 }
 
 /// Clip an (x, y, w, h) region out of a full plane, with bounds validation.
@@ -731,6 +772,127 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("bioformats_lei_{nanos}_{name}"))
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = temp_path(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn push_i32(buf: &mut Vec<u8>, value: i32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_i32(buf: &mut [u8], offset: usize, value: i32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_utf16le_fixed_ascii(buf: &mut Vec<u8>, text: &str, chars: usize) {
+        let bytes = text.as_bytes();
+        for i in 0..chars {
+            buf.push(bytes.get(i).copied().unwrap_or(0));
+            buf.push(0);
+        }
+    }
+
+    fn append_leica_block(buf: &mut Vec<u8>, payload: &[u8]) -> i32 {
+        let offset = buf.len();
+        buf.resize(offset + 12, 0);
+        push_i32(buf, payload.len() as i32);
+        buf.extend_from_slice(payload);
+        offset as i32
+    }
+
+    fn minimal_lei(filename: &str, declared_x: i32, declared_y: i32) -> Vec<u8> {
+        let header_offset = 32usize;
+        let file_length = 32usize;
+
+        let mut data = vec![0; 64];
+        data[0..4].copy_from_slice(b"IIII");
+        put_i32(&mut data, 12, header_offset as i32);
+
+        let mut series_payload = Vec::new();
+        push_i32(&mut series_payload, 1);
+        push_i32(&mut series_payload, 1);
+        push_i32(&mut series_payload, file_length as i32);
+        push_i32(&mut series_payload, 3);
+        series_payload.extend_from_slice(b"t\0i\0f\0");
+        let series_offset = append_leica_block(&mut data, &series_payload);
+
+        let mut images_payload = Vec::new();
+        push_i32(&mut images_payload, 1);
+        push_i32(&mut images_payload, declared_x);
+        push_i32(&mut images_payload, declared_y);
+        push_i32(&mut images_payload, 8);
+        push_i32(&mut images_payload, 1);
+        push_utf16le_fixed_ascii(&mut images_payload, filename, file_length);
+        let images_offset = append_leica_block(&mut data, &images_payload);
+
+        let tag_base = header_offset + 4;
+        put_i32(&mut data, tag_base, SERIES);
+        put_i32(&mut data, tag_base + 4, series_offset);
+        put_i32(&mut data, tag_base + 8, IMAGES);
+        put_i32(&mut data, tag_base + 12, images_offset);
+        put_i32(&mut data, tag_base + 16, 0);
+        put_i32(&mut data, tag_base + 20, 0);
+        data
+    }
+
+    #[test]
+    fn lei_reads_header_chain_at_java_offset_and_uses_tiff_dimensions() {
+        let dir = temp_dir("header_offset");
+        let tiff = dir.join("plane0.tif");
+        let lei = dir.join("sample.lei");
+        let meta = ImageMetadata {
+            size_x: 2,
+            size_y: 3,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        };
+        let plane = vec![1, 2, 3, 4, 5, 6];
+        ImageWriter::save(&tiff, &meta, std::slice::from_ref(&plane)).unwrap();
+        std::fs::write(&lei, minimal_lei("plane0.tif", 99, 88)).unwrap();
+
+        let mut reader = LeicaReader::new();
+        reader.set_id(&lei).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 3);
+        assert_eq!(reader.open_bytes(0).unwrap(), plane);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lei_missing_companion_returns_blank_plane_after_initialization() {
+        let missing = temp_path("missing.tif");
+        let meta = ImageMetadata {
+            size_x: 2,
+            size_y: 2,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count: 1,
+            ..Default::default()
+        };
+        let mut reader = LeicaReader {
+            path: None,
+            series_list: vec![LeiSeries {
+                meta,
+                files: vec![missing],
+            }],
+            series: 0,
+        };
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 8]);
     }
 
     #[test]

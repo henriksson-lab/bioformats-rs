@@ -1088,16 +1088,11 @@ fn parse_modulo_labels(xml: &str, name: &str) -> Vec<String> {
     }
     // Match an element whose tag name ends with the modulo name, e.g.
     // <Rotations>a b c</Rotations>, which is how CZI metadata stores these axes.
-    let open_needle = format!("<{}>", name);
-    let close_needle = format!("</{}>", name);
-    if let Some(start) = xml.find(&open_needle) {
-        let value_start = start + open_needle.len();
-        if let Some(rel_end) = xml[value_start..].find(&close_needle) {
-            let value = &xml[value_start..value_start + rel_end];
-            let labels: Vec<String> = value.split_whitespace().map(|s| s.to_string()).collect();
-            if labels.len() > 1 {
-                return labels;
-            }
+    if let Some(body) = first_element_body(xml, name) {
+        let value = crate::common::xml::decode_xml_escaped_str(body);
+        let labels: Vec<String> = value.split_whitespace().map(|s| s.to_string()).collect();
+        if labels.len() > 1 {
+            return labels;
         }
     }
     Vec::new()
@@ -1113,34 +1108,84 @@ fn parse_component_bit_count(xml: &str) -> Option<u8> {
     if xml.is_empty() {
         return None;
     }
-    let open = "<ComponentBitCount>";
-    let close = "</ComponentBitCount>";
-    let start = xml.find(open)? + open.len();
-    let rel_end = xml[start..].find(close)?;
-    xml[start..start + rel_end].trim().parse::<u8>().ok()
+    child_value(xml, "ComponentBitCount")?
+        .trim()
+        .parse::<u8>()
+        .ok()
 }
 
 /// Slice out the body of the first `<{tag}> ... </{tag}>` element (case
 /// sensitive, matching CZI's mixed-case element names). Returns the inner text
 /// between the open and close tags, or `None` if not found.
 fn first_element_body<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open_prefix = format!("<{}", tag);
-    let close = format!("</{}>", tag);
-    let open_at = xml.find(&open_prefix)?;
-    // Find the '>' that closes this start tag (skip self-closing handling — the
-    // CZI containers we read are never self-closing).
-    let after_open = open_at + xml[open_at..].find('>')? + 1;
+    let (_, qname, after_open) = find_start_tag(xml, tag, 0)?;
+    let close = format!("</{}>", qname);
     let close_rel = xml[after_open..].find(&close)?;
     Some(&xml[after_open..after_open + close_rel])
 }
 
+fn find_start_tag<'a>(
+    xml: &'a str,
+    local_name: &str,
+    from: usize,
+) -> Option<(usize, &'a str, usize)> {
+    let mut search_from = from;
+    while let Some(rel) = xml[search_from..].find('<') {
+        let start = search_from + rel;
+        let next = xml[start + 1..].chars().next()?;
+        if matches!(next, '/' | '?' | '!') {
+            search_from = start + 1;
+            continue;
+        }
+        let tag = start_tag_slice(xml, start)?;
+        let qname = start_tag_name(tag)?;
+        if xml_local_name(qname) == local_name {
+            return Some((start, qname, start + tag.len()));
+        }
+        search_from = start + 1;
+    }
+    None
+}
+
+fn start_tag_slice(xml: &str, pos: usize) -> Option<&str> {
+    let mut quote = None;
+    for (rel, ch) in xml[pos..].char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == '>' => return Some(&xml[pos..pos + rel + ch.len_utf8()]),
+            None => {}
+        }
+    }
+    None
+}
+
+fn start_tag_name(tag: &str) -> Option<&str> {
+    let body = tag.strip_prefix('<')?.trim_start();
+    let end = body
+        .find(|ch: char| ch.is_whitespace() || ch == '/' || ch == '>')
+        .unwrap_or(body.len());
+    if end == 0 {
+        None
+    } else {
+        Some(&body[..end])
+    }
+}
+
+fn xml_local_name(name: &str) -> &str {
+    name.rsplit_once(':')
+        .map(|(_, local)| local)
+        .unwrap_or(name)
+}
+
 /// Value of a direct child element `<{child}>value</{child}>` within `block`.
 fn child_value(block: &str, child: &str) -> Option<String> {
-    let v = first_element_body(block, child)?.trim();
+    let v = crate::common::xml::decode_xml_escaped_str(first_element_body(block, child)?.trim());
     if v.is_empty() {
         None
     } else {
-        Some(v.to_string())
+        Some(v)
     }
 }
 
@@ -1151,26 +1196,34 @@ fn channel_blocks(scope: &str) -> Vec<&str> {
     let Some(channels) = first_element_body(scope, "Channels") else {
         return Vec::new();
     };
+    channel_blocks_in_channels(channels)
+}
+
+fn channel_blocks_in_channels(channels: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut pos = 0usize;
-    let close = "</Channel>";
-    while let Some(rel) = channels[pos..].find("<Channel") {
-        let start = pos + rel;
-        // Skip "<Channels" (the wrapper, though we already stripped it) and any
-        // longer element name; require the next char to be space or '>'.
-        let after = channels[start + "<Channel".len()..].chars().next();
-        if !matches!(
-            after,
-            Some(' ') | Some('>') | Some('\t') | Some('\r') | Some('\n')
-        ) {
-            pos = start + "<Channel".len();
-            continue;
-        }
-        let Some(end_rel) = channels[start..].find(close) else {
+    while let Some((start, qname, after_open)) = find_start_tag(channels, "Channel", pos) {
+        let close = format!("</{}>", qname);
+        let Some(end_rel) = channels[after_open..].find(&close) else {
             break;
         };
-        let end = start + end_rel + close.len();
+        let end = after_open + end_rel + close.len();
         out.push(&channels[start..end]);
+        pos = end;
+    }
+    out
+}
+
+fn element_blocks<'a>(scope: &'a str, tag: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some((start, qname, after_open)) = find_start_tag(scope, tag, pos) {
+        let close = format!("</{}>", qname);
+        let Some(end_rel) = scope[after_open..].find(&close) else {
+            break;
+        };
+        let end = after_open + end_rel + close.len();
+        out.push(&scope[start..end]);
         pos = end;
     }
     out
@@ -1178,17 +1231,63 @@ fn channel_blocks(scope: &str) -> Vec<&str> {
 
 /// The `Name` attribute of a `<Channel ... Name="...">` start tag.
 fn channel_name_attr(block: &str) -> Option<String> {
-    let tag_end = block.find('>')?;
-    let tag = &block[..tag_end];
-    let needle = "Name=\"";
-    let at = tag.find(needle)? + needle.len();
-    let rel_end = tag[at..].find('"')?;
-    let v = tag[at..at + rel_end].trim();
+    let tag = start_tag_slice(block, 0)?;
+    let v = xml_start_tag_attr(tag, "Name")?.trim().to_string();
     if v.is_empty() {
         None
     } else {
-        Some(v.to_string())
+        Some(v)
     }
+}
+
+fn xml_start_tag_attr(tag: &str, attr_name: &str) -> Option<String> {
+    let mut body = tag.strip_prefix('<')?;
+    body = body.trim_end_matches('>').trim_end_matches('/').trim();
+    let mut i = body
+        .find(|ch: char| ch.is_whitespace())
+        .unwrap_or(body.len());
+    let bytes = body.as_bytes();
+    while i < body.len() {
+        while i < body.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < body.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let name = &body[name_start..i];
+        while i < body.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= body.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < body.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= body.len() {
+            break;
+        }
+        let quote = bytes[i];
+        if quote != b'"' && quote != b'\'' {
+            while i < body.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+        let value_start = i;
+        while i < body.len() && bytes[i] != quote {
+            i += 1;
+        }
+        let value = &body[value_start..i.min(body.len())];
+        if name == attr_name {
+            return Some(crate::common::xml::decode_xml_escaped_str(value));
+        }
+        i += 1;
+    }
+    None
 }
 
 fn parse_czi_channel_color(color: &str) -> Option<i32> {
@@ -1205,36 +1304,46 @@ fn parse_czi_channel_color(color: &str) -> Option<i32> {
 /// Build the per-channel OME metadata the way ZeissCZIReader does:
 ///   1. `Information/Image/Dimensions/Channels` provides the channel count plus
 ///      emission/excitation wavelengths.
-///   2. `DisplaySetting/Channels` provides the channel `Name` (overriding) and
-///      colour, indexed positionally.
+///   2. `DisplaySetting/Channels` provides the channel `Name` (overriding),
+///      colour, and dye wavelength overrides, indexed positionally.
 /// The unrelated `Experiment/.../Channels` setup blocks are *not* counted.
 fn build_czi_channels(xml: &str) -> Vec<crate::common::ome_metadata::OmeChannel> {
     use crate::common::ome_metadata::OmeChannel;
 
     // Pass 1: Dimensions/Channels — count + wavelengths.
     let mut channels: Vec<OmeChannel> = Vec::new();
-    if let Some(dims) = first_element_body(xml, "Dimensions") {
-        for block in channel_blocks(dims) {
-            channels.push(OmeChannel {
-                name: channel_name_attr(block),
-                samples_per_pixel: 1,
-                color: child_value(block, "Color").and_then(|s| {
-                    // Extra Rust support: Java only reads CZI false colors from
-                    // DisplaySetting/Channels, but pack Dimensions/Channels
-                    // colors identically when they are present.
-                    parse_czi_channel_color(&s)
-                }),
-                emission_wavelength: child_value(block, "EmissionWavelength")
-                    .and_then(|s| s.parse().ok()),
-                excitation_wavelength: child_value(block, "ExcitationWavelength")
-                    .and_then(|s| s.parse().ok()),
-                ..Default::default()
-            });
+    if let Some(information) = first_element_body(xml, "Information") {
+        if let Some(image) = first_element_body(information, "Image") {
+            let mut blocks = Vec::new();
+            if let Some(dims) = first_element_body(image, "Dimensions") {
+                if let Some(channels_body) = first_element_body(dims, "Channels") {
+                    blocks = channel_blocks_in_channels(channels_body);
+                } else {
+                    blocks = element_blocks(image, "Channel");
+                }
+            }
+            for block in blocks {
+                channels.push(OmeChannel {
+                    name: channel_name_attr(block),
+                    samples_per_pixel: 1,
+                    color: child_value(block, "Color").and_then(|s| {
+                        // Extra Rust support: Java only reads CZI false colors from
+                        // DisplaySetting/Channels, but pack Dimensions/Channels
+                        // colors identically when they are present.
+                        parse_czi_channel_color(&s)
+                    }),
+                    emission_wavelength: child_value(block, "EmissionWavelength")
+                        .and_then(|s| s.parse().ok()),
+                    excitation_wavelength: child_value(block, "ExcitationWavelength")
+                        .and_then(|s| s.parse().ok()),
+                    ..Default::default()
+                });
+            }
         }
     }
 
     // Pass 2: DisplaySetting/Channels — name + colour (positional, may extend).
-    if let Some(ds) = first_element_body(xml, "DisplaySetting") {
+    for ds in element_blocks(xml, "DisplaySetting") {
         for (i, block) in channel_blocks(ds).into_iter().enumerate() {
             while channels.len() <= i {
                 channels.push(OmeChannel {
@@ -1251,10 +1360,46 @@ fn build_czi_channels(xml: &str) -> Vec<crate::common::ome_metadata::OmeChannel>
             if color.is_some() {
                 channels[i].color = color;
             }
+            if let Some(emission) =
+                child_value(block, "DyeMaxEmission").and_then(|s| s.parse().ok())
+            {
+                channels[i].emission_wavelength = Some(emission);
+            }
+            if let Some(excitation) =
+                child_value(block, "DyeMaxExcitation").and_then(|s| s.parse().ok())
+            {
+                channels[i].excitation_wavelength = Some(excitation);
+            }
         }
     }
 
     channels
+}
+
+fn czi_physical_size(xml: &str, axis: &str) -> Option<f64> {
+    let scaling = first_element_body(xml, "Scaling")?;
+    let items = first_element_body(scaling, "Items")?;
+    let mut pos = 0usize;
+    while let Some((start, qname, after_open)) = find_start_tag(items, "Distance", pos) {
+        let tag = start_tag_slice(items, start)?;
+        let close = format!("</{}>", qname);
+        let Some(end_rel) = items[after_open..].find(&close) else {
+            break;
+        };
+        let end = after_open + end_rel;
+        if xml_start_tag_attr(tag, "Id").as_deref() == Some(axis) {
+            let metres = child_value(&items[start..end], "Value")?
+                .trim()
+                .parse::<f64>()
+                .ok()?;
+            let micrometres = metres * 1_000_000.0;
+            if micrometres > 0.0 {
+                return Some(micrometres);
+            }
+        }
+        pos = end + close.len();
+    }
+    None
 }
 
 impl DimCounts {
@@ -1392,9 +1537,7 @@ fn decompress_subblock(
         0 => Ok(data.to_vec()), // Uncompressed
         1 => {
             // JPEG
-            let mut dec = jpeg_decoder::Decoder::new(data);
-            dec.decode()
-                .map_err(|e| BioFormatsError::Codec(e.to_string()))
+            crate::common::codec::decompress_jpeg(data)
         }
         2 => {
             // LZW
@@ -1519,7 +1662,7 @@ fn reverse_columns_16bit(data: &mut [u8], width: usize, height: usize) {
     }
 }
 
-fn read_czi_varint(data: &[u8], offset: &mut usize) -> Result<usize> {
+fn read_czi_varint(data: &[u8], offset: &mut usize) -> Result<i32> {
     if *offset >= data.len() {
         return Err(BioFormatsError::InvalidData(
             "CZI ZSTD_1 truncated varint".into(),
@@ -1528,7 +1671,7 @@ fn read_czi_varint(data: &[u8], offset: &mut usize) -> Result<usize> {
     let a = data[*offset];
     *offset += 1;
     if a & 0x80 == 0 {
-        return Ok(a as usize);
+        return Ok(a as i32);
     }
 
     if *offset >= data.len() {
@@ -1539,7 +1682,7 @@ fn read_czi_varint(data: &[u8], offset: &mut usize) -> Result<usize> {
     let b = data[*offset];
     *offset += 1;
     if b & 0x80 == 0 {
-        return Ok(((b as usize) << 7) | ((a & 0x7f) as usize));
+        return Ok(((b as i32) << 7) | ((a & 0x7f) as i32));
     }
 
     if *offset >= data.len() {
@@ -1549,17 +1692,18 @@ fn read_czi_varint(data: &[u8], offset: &mut usize) -> Result<usize> {
     }
     let c = data[*offset];
     *offset += 1;
-    Ok(((c as usize) << 14) | (((b & 0x7f) as usize) << 7) | ((a & 0x7f) as usize))
+    Ok(((c as i8 as i32) << 14) | (((b & 0x7f) as i32) << 7) | ((a & 0x7f) as i32))
 }
 
 fn decompress_zstd_1(data: &[u8]) -> Result<Vec<u8>> {
     let mut offset = 0usize;
     let header_end = read_czi_varint(data, &mut offset)?;
-    if header_end > data.len() || header_end < offset {
+    if header_end < 0 || header_end as usize > data.len() || (header_end as usize) < offset {
         return Err(BioFormatsError::InvalidData(
             "CZI ZSTD_1 invalid header size".into(),
         ));
     }
+    let header_end = header_end as usize;
 
     let mut high_low_unpacking = false;
     while offset < header_end {
@@ -2082,12 +2226,10 @@ impl FormatReader for ZeissCziReader {
                 .and_then(|n| n.checked_mul(pixel_bytes))
                 .ok_or_else(|| BioFormatsError::Format("CZI tile byte count overflows".into()))?;
             let mut tile = Self::read_subblock(path, &entry, pixel_bytes)?;
-            if tile.len() != tile_expected {
-                return Err(BioFormatsError::Format(format!(
-                    "CZI decoded tile byte count {} does not match expected {}",
-                    tile.len(),
-                    tile_expected
-                )));
+            if tile.len() < tile_expected {
+                tile.resize(tile_expected, 0);
+            } else if tile.len() > tile_expected {
+                tile.truncate(tile_expected);
             }
             if czi_should_swap_bgr_to_rgb(meta, self.packed_spp as usize, entry.compression) {
                 swap_bgr_to_rgb(&mut tile, bps, self.packed_spp as usize);
@@ -2170,8 +2312,16 @@ impl FormatReader for ZeissCziReader {
         // by also picking up Experiment setup channels).
         let channels = build_czi_channels(&self.meta_xml);
         if let Some(image) = ome.images.first_mut() {
+            image.physical_size_x = czi_physical_size(&self.meta_xml, "X");
+            image.physical_size_y = czi_physical_size(&self.meta_xml, "Y");
+            image.physical_size_z = czi_physical_size(&self.meta_xml, "Z");
             if !channels.is_empty() {
                 image.channels = channels;
+                if self.meta.as_ref().map(|m| m.is_rgb).unwrap_or(false) {
+                    for channel in &mut image.channels {
+                        channel.color = None;
+                    }
+                }
             }
             // ZeissCZIReader names the single-series image "<filename> #1"
             // (base name, then " #" + 1-based series index).
@@ -2608,6 +2758,13 @@ mod tests {
             0x4000
         );
         assert_eq!(offset, 3);
+
+        let mut offset = 0;
+        assert_eq!(
+            read_czi_varint(&[0x80, 0x80, 0x80], &mut offset).unwrap(),
+            -0x200000
+        );
+        assert_eq!(offset, 3);
     }
 
     #[test]
@@ -2697,6 +2854,117 @@ mod tests {
     }
 
     #[test]
+    fn czi_display_settings_dye_wavelengths_override_dimensions_like_java() {
+        let xml = r#"<Metadata>
+          <Information><Image><Dimensions><Channels>
+            <Channel Name="Raw">
+              <EmissionWavelength>500</EmissionWavelength>
+              <ExcitationWavelength>400</ExcitationWavelength>
+            </Channel>
+          </Channels></Dimensions></Image></Information>
+          <DisplaySetting><Channels>
+            <Channel Name="Display">
+              <DyeMaxEmission>520</DyeMaxEmission>
+              <DyeMaxExcitation>488</DyeMaxExcitation>
+              <OriginalColor>#ff00ff00</OriginalColor>
+            </Channel>
+          </Channels></DisplaySetting>
+        </Metadata>"#;
+
+        let channels = build_czi_channels(xml);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name.as_deref(), Some("Display"));
+        assert_eq!(channels[0].emission_wavelength, Some(520.0));
+        assert_eq!(channels[0].excitation_wavelength, Some(488.0));
+        assert_eq!(channels[0].color, Some(0x00ff00ff));
+    }
+
+    #[test]
+    fn czi_channels_ignore_experiment_dimensions_like_java() {
+        let xml = r#"<Metadata>
+          <Experiment><Dimensions><Channels>
+            <Channel Name="Experiment setup">
+              <EmissionWavelength>700</EmissionWavelength>
+            </Channel>
+          </Channels></Dimensions></Experiment>
+          <Information><Image><Dimensions><Channels>
+            <Channel Name="Image channel">
+              <EmissionWavelength>510</EmissionWavelength>
+            </Channel>
+          </Channels></Dimensions></Image></Information>
+        </Metadata>"#;
+
+        let channels = build_czi_channels(xml);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name.as_deref(), Some("Image channel"));
+        assert_eq!(channels[0].emission_wavelength, Some(510.0));
+    }
+
+    #[test]
+    fn czi_display_settings_all_blocks_overlay_positionally_like_java() {
+        let xml = r#"<Metadata>
+          <Information><Image><Dimensions><Channels>
+            <Channel Name="Raw"><EmissionWavelength>500</EmissionWavelength></Channel>
+          </Channels></Dimensions></Image></Information>
+          <DisplaySetting><Channels>
+            <Channel Name="First"><DyeMaxEmission>520</DyeMaxEmission></Channel>
+          </Channels></DisplaySetting>
+          <DisplaySetting><Channels>
+            <Channel Name="Second"><DyeMaxExcitation>488</DyeMaxExcitation></Channel>
+          </Channels></DisplaySetting>
+        </Metadata>"#;
+
+        let channels = build_czi_channels(xml);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name.as_deref(), Some("Second"));
+        assert_eq!(channels[0].emission_wavelength, Some(520.0));
+        assert_eq!(channels[0].excitation_wavelength, Some(488.0));
+    }
+
+    #[test]
+    fn czi_ome_metadata_parses_scaling_distance_attributes_like_java() {
+        let entries = vec![(directory_entry(0, 0, 0, 2, 1), vec![1, 2])];
+        let xml = r#"<Metadata>
+          <Scaling><Items>
+            <Distance Id="X" Unit="m"><Value>0.0000005</Value></Distance>
+            <Distance Id="Y" Unit="m"><Value>0.0000006</Value></Distance>
+            <Distance Id="Z" Unit="m"><Value>0.00000125</Value></Distance>
+          </Items></Scaling>
+        </Metadata>"#;
+        let path = write_synthetic_czi_with_xml("scaling_distance_attrs", entries, xml);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        assert_eq!(image.physical_size_x, Some(0.5));
+        assert_eq!(image.physical_size_y, Some(0.6));
+        assert_eq!(image.physical_size_z, Some(1.25));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_rgb_ome_metadata_skips_channel_color_like_java() {
+        let entries = vec![(directory_entry(3, 0, 0, 1, 1), vec![1, 2, 3])];
+        let xml = r#"<Metadata>
+          <DisplaySetting><Channels>
+            <Channel Name="RGB"><Color>#ffff0000</Color></Channel>
+          </Channels></DisplaySetting>
+        </Metadata>"#;
+        let path = write_synthetic_czi_with_xml("rgb_no_channel_color", entries, xml);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert!(reader.metadata().is_rgb);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("RGB"));
+        assert_eq!(ome.images[0].channels[0].color, None);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn czi_bgr48_keeps_logical_channels_separate_from_packed_samples() {
         let planes = vec![
             vec![1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0],
@@ -2751,35 +3019,25 @@ mod tests {
     }
 
     #[test]
-    fn czi_rejects_short_decoded_tile_instead_of_padding() {
+    fn czi_pads_short_decoded_tile_like_java() {
         let entries = vec![(directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0), vec![1])];
         let path = write_synthetic_czi_entries("short_tile", entries);
         let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
-        let err = reader.open_bytes(0).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("decoded tile byte count 1 does not match expected 2"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0]);
 
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn czi_rejects_long_decoded_tile_instead_of_truncating() {
+    fn czi_truncates_long_decoded_tile_like_java_copy_window() {
         let entries = vec![(directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0), vec![1, 2, 3])];
         let path = write_synthetic_czi_entries("long_tile", entries);
         let mut reader = ZeissCziReader::new();
         reader.set_id(&path).unwrap();
 
-        let err = reader.open_bytes(0).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("decoded tile byte count 3 does not match expected 2"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
 
         fs::remove_file(path).unwrap();
     }
@@ -3264,6 +3522,43 @@ mod tests {
         // Single (or no) label yields an empty list (no modulo labeling).
         assert!(parse_modulo_labels("<Rotations>0</Rotations>", "Rotations").is_empty());
         assert!(parse_modulo_labels("", "Rotations").is_empty());
+    }
+
+    #[test]
+    fn czi_xml_helpers_decode_entities_like_dom() {
+        let xml = "<Rotations>A&amp;B C&#181;D</Rotations>";
+        assert_eq!(
+            parse_modulo_labels(xml, "Rotations"),
+            vec!["A&B", "C\u{b5}D"]
+        );
+
+        let channel = r#"<Channel Name="DAPI &amp; FITC"><Color>#ff00ff</Color><EmissionWavelength>5&#48;0</EmissionWavelength></Channel>"#;
+        assert_eq!(channel_name_attr(channel).as_deref(), Some("DAPI & FITC"));
+        assert_eq!(
+            child_value(channel, "EmissionWavelength").as_deref(),
+            Some("500")
+        );
+
+        let single_quoted = r#"<Channel Name='A&amp;B'></Channel>"#;
+        assert_eq!(channel_name_attr(single_quoted).as_deref(), Some("A&B"));
+    }
+
+    #[test]
+    fn czi_xml_scanners_match_xml_token_boundaries_and_attrs() {
+        assert!(first_element_body("<Experimenter>true</Experimenter>", "Experiment").is_none());
+
+        let xml = r#"<cz:Experiment xmlns:cz="urn:czi"><cz:ComponentBitCount Unit="bit">12</cz:ComponentBitCount></cz:Experiment>"#;
+        assert_eq!(parse_component_bit_count(xml), Some(12));
+
+        let labels = r#"<Axis><cz:Rotations Unit="deg">0 90</cz:Rotations></Axis>"#;
+        assert_eq!(parse_modulo_labels(labels, "Rotations"), vec!["0", "90"]);
+
+        let channel =
+            r#"<cz:Channel Name = "DAPI &amp; FITC"><cz:Color>#ff00ff</cz:Color></cz:Channel>"#;
+        assert_eq!(channel_name_attr(channel).as_deref(), Some("DAPI & FITC"));
+
+        let scoped = format!("<cz:Channels>{channel}</cz:Channels>");
+        assert_eq!(channel_blocks(&scoped).len(), 1);
     }
 
     #[test]

@@ -18,9 +18,11 @@ use crate::common::region::{crop_full_plane, validate_region};
 // Binary reader — PicoQuant TCSPC / FLIM
 // ===========================================================================
 
-/// PicoQuant PTU/PQRES time-correlated single-photon counting format.
+/// PicoQuant PTU/PHU/PQRES time-correlated single-photon counting format.
 ///
-/// Magic: first 6 bytes == `PQTTTR`. Image dimensions parsed from text header.
+/// Magic: first 6 bytes == `PQTTTR` for PTU/PQRES or first 8 bytes ==
+/// `PQHISTO\0` for PHU histogram files. Image dimensions parsed from unified
+/// tags.
 pub struct PicoQuantReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -81,6 +83,8 @@ const PTU_RECORD_HYDRAHARP2_T2: i64 = 0x0101_0204;
 const PTU_RECORD_HYDRAHARP2_T3: i64 = 0x0101_0304;
 const PTU_T2_SYNC_PERIOD: u64 = 1 << 25;
 const PTU_T3_SYNC_PERIOD: u64 = 1024;
+const PICOQUANT_PTU_MAGIC: &[u8; 6] = b"PQTTTR";
+const PICOQUANT_PHU_MAGIC: &[u8; 8] = b"PQHISTO\0";
 
 fn picoquant_event_stream_unsupported(reason: &str) -> BioFormatsError {
     BioFormatsError::UnsupportedFormat(format!(
@@ -98,8 +102,15 @@ impl PicoQuantReader {
         }
     }
 
+    fn has_unified_magic(data: &[u8]) -> bool {
+        data.len() >= PICOQUANT_PTU_MAGIC.len()
+            && &data[..PICOQUANT_PTU_MAGIC.len()] == PICOQUANT_PTU_MAGIC
+            || data.len() >= PICOQUANT_PHU_MAGIC.len()
+                && &data[..PICOQUANT_PHU_MAGIC.len()] == PICOQUANT_PHU_MAGIC
+    }
+
     fn parse_unified_tags(data: &[u8]) -> Result<(Vec<PicoQuantTag>, usize)> {
-        if data.len() < PTU_HEADER_LEN || &data[0..6] != b"PQTTTR" {
+        if data.len() < PTU_HEADER_LEN || !Self::has_unified_magic(data) {
             return Err(BioFormatsError::UnsupportedFormat(
                 "PicoQuant PTU missing PQTTTR magic".into(),
             ));
@@ -1418,11 +1429,11 @@ impl FormatReader for PicoQuantReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("ptu") | Some("pqres"))
+        matches!(ext.as_deref(), Some("ptu") | Some("phu") | Some("pqres"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 6 && &header[0..6] == b"PQTTTR"
+        Self::has_unified_magic(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -2674,6 +2685,15 @@ impl QuesantReader {
         }
     }
 
+    fn append_comment(comment: &mut Option<String>, value: String) {
+        if let Some(existing) = comment {
+            existing.push(' ');
+            existing.push_str(&value);
+        } else {
+            *comment = Some(value);
+        }
+    }
+
     fn parse_native(path: &Path) -> Result<(ImageMetadata, QuesantLayout)> {
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if data.len() < 10 {
@@ -2682,6 +2702,8 @@ impl QuesantReader {
 
         let header_len = data.len().min(Self::MAX_HEADER_SIZE);
         let mut pixels_offset: Option<usize> = None;
+        let mut comment: Option<String> = None;
+        let mut date: Option<String> = None;
         let mut series_metadata = HashMap::new();
         let mut pos = 0usize;
         while pos + 8 <= header_len {
@@ -2694,7 +2716,7 @@ impl QuesantReader {
 
             match code {
                 b"IMAG" => pixels_offset = Some(offset),
-                b"SDES" | b"DATE" => {
+                b"SDES" => {
                     let end = data[offset..]
                         .iter()
                         .position(|b| *b == 0)
@@ -2703,13 +2725,19 @@ impl QuesantReader {
                     let value = String::from_utf8_lossy(&data[offset..end])
                         .trim()
                         .to_string();
-                    let key = if code == b"SDES" {
-                        "Quesant description"
-                    } else {
-                        "Quesant acquisition date"
-                    };
                     if !value.is_empty() {
-                        series_metadata.insert(key.into(), MetadataValue::String(value));
+                        Self::append_comment(&mut comment, value);
+                    }
+                }
+                b"DATE" => {
+                    let end = data[offset..]
+                        .iter()
+                        .position(|b| *b == 0)
+                        .map(|n| offset + n)
+                        .unwrap_or(data.len());
+                    let value = String::from_utf8_lossy(&data[offset..end]).to_string();
+                    if !value.is_empty() {
+                        date = Some(value);
                     }
                 }
                 b"DESC" if offset + 2 <= data.len() => {
@@ -2717,15 +2745,13 @@ impl QuesantReader {
                         u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
                     if offset + 2 + len <= data.len() {
                         let value = String::from_utf8_lossy(&data[offset + 2..offset + 2 + len])
-                            .trim()
                             .to_string();
                         if !value.is_empty() {
-                            series_metadata
-                                .insert("Quesant description".into(), MetadataValue::String(value));
+                            Self::append_comment(&mut comment, value);
                         }
                     }
                 }
-                b"HARD" if offset + 42 <= data.len() => {
+                b"HARD" if offset + 38 <= data.len() => {
                     let x_size = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                     let scan_rate =
                         f32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
@@ -2767,6 +2793,16 @@ impl QuesantReader {
                 }
                 _ => {}
             }
+        }
+
+        if let Some(comment) = comment {
+            series_metadata.insert("Quesant description".into(), MetadataValue::String(comment));
+        }
+        if let Some(date) = date {
+            series_metadata.insert(
+                "Quesant acquisition date".into(),
+                MetadataValue::String(date),
+            );
         }
 
         let pixels_offset = pixels_offset.ok_or_else(|| unsupported_raw_spm("Quesant AFM"))?;
@@ -3248,6 +3284,17 @@ impl WatopReader {
         })?;
         Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
+
+    fn acquisition_date(data: &[u8]) -> Result<String> {
+        let year = Self::read_i32_le(data, 211, "year")?;
+        let month = Self::read_i32_le(data, 215, "month")?;
+        let day = Self::read_i32_le(data, 219, "day")?;
+        let hour = Self::read_i32_le(data, 223, "hour")?;
+        let minute = Self::read_i32_le(data, 227, "minute")?;
+        Ok(format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}"
+        ))
+    }
 }
 
 impl Default for WatopReader {
@@ -3333,6 +3380,24 @@ impl FormatReader for WatopReader {
             series_metadata.insert(
                 "Z size (in um)".to_string(),
                 crate::common::metadata::MetadataValue::Float(z_size as f64 / 100.0),
+            );
+        }
+        if let Ok(tunnel_current) = Self::read_i32_le(&data, 259, "tunnel current") {
+            series_metadata.insert(
+                "Tunnel current (in amps)".to_string(),
+                crate::common::metadata::MetadataValue::Float(tunnel_current as f64 / 1000.0),
+            );
+        }
+        if let Ok(sample_volts) = Self::read_i32_le(&data, 263, "sample volts") {
+            series_metadata.insert(
+                "Sample volts".to_string(),
+                crate::common::metadata::MetadataValue::Float(sample_volts as f64 / 1000.0),
+            );
+        }
+        if let Ok(date) = Self::acquisition_date(&data) {
+            series_metadata.insert(
+                "Acquisition date".to_string(),
+                crate::common::metadata::MetadataValue::String(date),
             );
         }
 
@@ -3767,6 +3832,10 @@ impl FormatReader for UbmReader {
             "Padding pixels".to_string(),
             crate::common::metadata::MetadataValue::Int(padding_pixels as i64),
         );
+        series_metadata.insert(
+            "Padding bytes".to_string(),
+            crate::common::metadata::MetadataValue::Int(row_padding_bytes as i64),
+        );
         self.meta = Some(ImageMetadata {
             size_x: width,
             size_y: height,
@@ -3916,11 +3985,11 @@ impl SeikoReader {
         }
     }
 
-    fn read_u16_le(data: &[u8], offset: usize, label: &str) -> Result<u16> {
+    fn read_i16_le(data: &[u8], offset: usize, label: &str) -> Result<i16> {
         let bytes = data.get(offset..offset + 2).ok_or_else(|| {
             BioFormatsError::UnsupportedFormat(format!("Seiko SPM header missing {label}"))
         })?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
@@ -3956,13 +4025,15 @@ impl FormatReader for SeikoReader {
                 "Seiko SPM file is shorter than the 2944-byte header".into(),
             ));
         }
-        let width = Self::read_u16_le(&data, 1402, "width")? as u32;
-        let height = Self::read_u16_le(&data, 1404, "height")? as u32;
-        if width == 0 || height == 0 {
+        let width = Self::read_i16_le(&data, 1402, "width")?;
+        let height = Self::read_i16_le(&data, 1404, "height")?;
+        if width <= 0 || height <= 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "Seiko SPM header contains invalid image dimensions".into(),
             ));
         }
+        let width = width as u32;
+        let height = height as u32;
         let expected = (Self::HEADER_SIZE as u64)
             .checked_add(width as u64 * height as u64 * 2)
             .ok_or_else(|| BioFormatsError::Format("Seiko SPM size overflows".into()))?;
@@ -4319,14 +4390,9 @@ impl Default for PqBinReader {
 }
 
 impl FormatReader for PqBinReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        // Java sets suffixSufficient = false, so name alone never suffices;
-        // we still gate on the `.bin` extension for the name-based pre-filter.
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("bin"))
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        // Java sets suffixSufficient=false for this very generic extension.
+        false
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -4476,6 +4542,9 @@ mod pqbin_tests {
 
     #[test]
     fn is_this_type_strict_length_check() {
+        let reader = PqBinReader::new();
+        assert!(!reader.is_this_type_by_name(Path::new("anything.bin")));
+
         let good = synth_pqbin(3, 2, 4, 0.05);
         assert!(PqBinReader::is_this_type(&good, good.len() as u64));
 

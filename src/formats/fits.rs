@@ -33,16 +33,17 @@ fn parse_int_value(s: &str) -> Option<i64> {
     s.trim_matches('\'').trim().parse().ok()
 }
 
-fn pixel_type_from_bitpix(bitpix: i64) -> PixelType {
+fn pixel_type_from_bitpix(bitpix: i64) -> Result<PixelType> {
     match bitpix {
-        8 => PixelType::Uint8,
-        16 => PixelType::Int16,
-        -16 => PixelType::Uint16, // IEEE 16-bit float treated as uint16
-        32 => PixelType::Int32,
-        -32 => PixelType::Float32,
-        64 => PixelType::Float64, // int64 treated as float64 for compatibility
-        -64 => PixelType::Float64,
-        _ => PixelType::Float32,
+        8 => Ok(PixelType::Uint8),
+        16 | -16 => Ok(PixelType::Int16),
+        32 => Ok(PixelType::Int32),
+        -32 => Ok(PixelType::Float32),
+        64 | -64 => Ok(PixelType::Float64),
+        _ => Err(BioFormatsError::Format(format!(
+            "Unsupported byte depth: {}",
+            bitpix.unsigned_abs() / 8
+        ))),
     }
 }
 
@@ -159,10 +160,10 @@ fn bitpix_from_pixel_type(pt: PixelType) -> i64 {
     }
 }
 
-fn fits_series_from_hdu(hdu: FitsHdu) -> FitsSeries {
+fn fits_series_from_hdu(hdu: FitsHdu) -> Result<FitsSeries> {
     // Java FitsReader keeps the raw on-disk pixel type (no BZERO/BSCALE
     // rescaling) and treats the data as big-endian.
-    let pixel_type = pixel_type_from_bitpix(hdu.bitpix);
+    let pixel_type = pixel_type_from_bitpix(hdu.bitpix)?;
     let (size_x, size_y, size_z) = match hdu.dims.as_slice() {
         [x] => (*x, 1, 1),
         [x, y] => (*x, *y, 1),
@@ -170,7 +171,7 @@ fn fits_series_from_hdu(hdu: FitsHdu) -> FitsSeries {
         [] => (1, 1, 1),
     };
 
-    FitsSeries {
+    Ok(FitsSeries {
         metadata: ImageMetadata {
             size_x,
             size_y,
@@ -195,7 +196,7 @@ fn fits_series_from_hdu(hdu: FitsHdu) -> FitsSeries {
         },
         data_offset: hdu.data_offset,
         raw_bitpix: hdu.bitpix,
-    }
+    })
 }
 
 // ---- reader -----------------------------------------------------------------
@@ -243,6 +244,13 @@ impl FormatReader for FitsReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        let mut first_record = [0u8; RECORD];
+        f.read_exact(&mut first_record)
+            .map_err(BioFormatsError::Io)?;
+        if !first_record.starts_with(b"SIMPLE") {
+            return Err(BioFormatsError::Format("Unsupported FITS file.".into()));
+        }
+        f.seek(SeekFrom::Start(0)).map_err(BioFormatsError::Io)?;
         let mut series = Vec::new();
 
         // Java FitsReader reads only the primary HDU (the standard header that
@@ -254,7 +262,7 @@ impl FormatReader for FitsReader {
                 ));
             }
             let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
-            let mut s = fits_series_from_hdu(hdu);
+            let mut s = fits_series_from_hdu(hdu)?;
             // Correct for truncated files: Java FitsReader clamps sizeZ to
             // (fileLen - pixelOffset) / planeSize when the declared stack would
             // run past the end of the file.
@@ -421,6 +429,18 @@ fn fits_comment(text: &str) -> [u8; 80] {
     rec
 }
 
+fn bytes_as_big_endian(meta: &ImageMetadata, data: &[u8]) -> Vec<u8> {
+    let bps = meta.pixel_type.bytes_per_sample();
+    if !meta.is_little_endian || bps <= 1 {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    for chunk in out.chunks_exact_mut(bps) {
+        chunk.reverse();
+    }
+    out
+}
+
 impl FormatWriter for FitsWriter {
     fn is_this_type(&self, path: &Path) -> bool {
         path.extension()
@@ -455,7 +475,7 @@ impl FormatWriter for FitsWriter {
             plane_index,
             data.len(),
         )?;
-        self.planes.push(data.to_vec());
+        self.planes.push(bytes_as_big_endian(meta, data));
         Ok(())
     }
 
@@ -492,19 +512,9 @@ impl FormatWriter for FitsWriter {
             w.write_all(rec).map_err(BioFormatsError::Io)?;
         }
 
-        // Write pixel data; FITS is big-endian
-        let bps = meta.pixel_type.bytes_per_sample();
+        // Write pixel data; FITS is big-endian.
         for plane in &self.planes {
-            if bps == 1 {
-                w.write_all(plane).map_err(BioFormatsError::Io)?;
-            } else {
-                // Byte-swap to big-endian
-                for chunk in plane.chunks_exact(bps) {
-                    let mut c = chunk.to_vec();
-                    c.reverse();
-                    w.write_all(&c).map_err(BioFormatsError::Io)?;
-                }
-            }
+            w.write_all(plane).map_err(BioFormatsError::Io)?;
         }
 
         // Pad data to 2880-byte boundary
@@ -688,6 +698,73 @@ mod tests {
         let err = reader.set_id(&path).unwrap_err();
         assert!(
             err.to_string().contains("invalid NAXIS keyword"),
+            "unexpected FITS error: {err}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fits_rejects_missing_simple_primary_record_like_java() {
+        let path = temp_fits_path("missing_simple");
+        let mut bytes = header(vec![
+            fits_record("XTENSION", "'IMAGE   '"),
+            fits_record("BITPIX", "                   8"),
+            fits_record("NAXIS", "                   2"),
+            fits_record("NAXIS1", "                   1"),
+            fits_record("NAXIS2", "                   1"),
+        ]);
+        bytes.extend_from_slice(&padded_block(vec![42]));
+        std::fs::write(&path, bytes).expect("write synthetic FITS");
+
+        let mut reader = FitsReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported FITS file"),
+            "unexpected FITS error: {err}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fits_negative_sixteen_bitpix_maps_to_int16_like_java() {
+        let path = temp_fits_path("negative_16_bitpix");
+        let mut bytes = header(vec![
+            fits_record("SIMPLE", "                   T"),
+            fits_record("BITPIX", "                 -16"),
+            fits_record("NAXIS", "                   2"),
+            fits_record("NAXIS1", "                   1"),
+            fits_record("NAXIS2", "                   1"),
+        ]);
+        bytes.extend_from_slice(&padded_block(vec![0x12, 0x34]));
+        std::fs::write(&path, bytes).expect("write synthetic FITS");
+
+        let mut reader = FitsReader::new();
+        reader.set_id(&path).expect("open FITS");
+        assert_eq!(reader.metadata().pixel_type, PixelType::Int16);
+        assert_eq!(reader.open_bytes(0).expect("plane"), vec![0x12, 0x34]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fits_rejects_unsupported_bitpix_like_java() {
+        let path = temp_fits_path("unsupported_bitpix");
+        let mut bytes = header(vec![
+            fits_record("SIMPLE", "                   T"),
+            fits_record("BITPIX", "                  24"),
+            fits_record("NAXIS", "                   2"),
+            fits_record("NAXIS1", "                   1"),
+            fits_record("NAXIS2", "                   1"),
+        ]);
+        bytes.extend_from_slice(&padded_block(vec![1, 2, 3]));
+        std::fs::write(&path, bytes).expect("write synthetic FITS");
+
+        let mut reader = FitsReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported byte depth: 3"),
             "unexpected FITS error: {err}"
         );
 

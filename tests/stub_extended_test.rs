@@ -331,7 +331,7 @@ fn lof_projects_channel_names_lut_and_wavelength_metadata() {
 }
 
 #[test]
-fn lof_records_bgr_channel_order_from_channel_offsets() {
+fn lof_converts_bgr_channel_order_from_channel_offsets_like_java() {
     let pixels = vec![10u8, 20, 30, 40, 50, 60];
     let xml = "\
 <Image><ImageDescription>\
@@ -366,7 +366,11 @@ fn lof_records_bgr_channel_order_from_channel_offsets() {
         meta.series_metadata.get("lof.rgb.channel_order_offsets"),
         Some(MetadataValue::String(value)) if value == "0,1,2"
     ));
-    assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+    assert!(matches!(
+        meta.series_metadata.get("lof.inverse_rgb"),
+        Some(MetadataValue::String(value)) if value == "true"
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![30, 20, 10, 60, 50, 40]);
 
     let _ = std::fs::remove_file(path);
 }

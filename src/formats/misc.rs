@@ -323,7 +323,31 @@ impl FormatReader for QtReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 12 && (&header[4..8] == b"ftyp" || &header[4..8] == b"moov")
+        if header.len() >= 12 && (&header[4..8] == b"ftyp" || &header[4..8] == b"moov") {
+            return true;
+        }
+        let scan_len = header.len().min(64);
+        let scan = &header[..scan_len];
+        [
+            b"moov".as_slice(),
+            b"trak",
+            b"udta",
+            b"tref",
+            b"imap",
+            b"mdia",
+            b"minf",
+            b"stbl",
+            b"edts",
+            b"mdra",
+            b"rmra",
+            b"vnrp",
+            b"dinf",
+            b"wide",
+            b"mdat",
+            b"ftypqt",
+        ]
+        .iter()
+        .any(|needle| scan.windows(needle.len()).any(|window| window == *needle))
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -404,30 +428,21 @@ impl FormatReader for QtReader {
             .unwrap_or(series.codec);
         match sample_codec {
             QuickTimeCodec::UncompressedRgb | QuickTimeCodec::UncompressedGray => {
-                let expected = meta
-                    .size_x
-                    .checked_mul(meta.size_y)
-                    .and_then(|px| (px as usize).checked_mul(series.samples_per_pixel))
-                    .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
-                    .ok_or_else(|| {
-                        BioFormatsError::Format("QuickTime plane size overflows".into())
-                    })?;
-                if sample_size != expected {
-                    return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "QuickTime sample {sample_index} has {sample_size} bytes, expected {expected} for uncompressed pixels"
-                    )));
-                }
-                let mut out = sample.to_vec();
-                // Java QTReader inverts 8-bit (and "40-bit"/grayscale-with-alpha)
-                // uncompressed planes: `buf[i] = 255 - buf[i]` (QTReader.java
-                // lines 269-274), gated on the codec not being mjpb. Uncompressed
-                // RGB (raw, 24-bit) is not inverted; only single-channel 8-bit is.
-                if matches!(sample_codec, QuickTimeCodec::UncompressedGray) {
-                    quicktime_invert_pixels(&mut out);
-                }
-                Ok(out)
+                let sample_depth = series
+                    .sample_depths
+                    .get(sample_index)
+                    .copied()
+                    .unwrap_or(series.depth);
+                decode_quicktime_uncompressed_sample(
+                    sample,
+                    meta,
+                    sample_index as u32,
+                    sample_codec,
+                    sample_depth,
+                )
             }
             QuickTimeCodec::Jpeg => decode_quicktime_jpeg_sample(sample, meta, sample_index as u32),
+            QuickTimeCodec::Mjpb => decode_quicktime_mjpb_sample(sample, sample_index as u32),
             QuickTimeCodec::Png => decode_quicktime_png_sample(sample, meta, sample_index as u32),
             QuickTimeCodec::Rpza => {
                 // Java QTReader's RPZA branch (QTReader.java lines 204-210) does
@@ -566,13 +581,16 @@ struct QuickTimeParsed {
     sample_sizes: Vec<u32>,
     sample_read_order: Option<Vec<usize>>,
     sample_codecs: Vec<QuickTimeCodec>,
+    sample_depths: Vec<u16>,
     samples_per_pixel: usize,
     codec: QuickTimeCodec,
+    depth: u16,
 }
 
 struct QuickTimeSampleDescription {
     codec_fourcc: [u8; 4],
     codec: QuickTimeCodec,
+    depth: u16,
     width: u32,
     height: u32,
     samples_per_pixel: usize,
@@ -583,6 +601,7 @@ enum QuickTimeCodec {
     UncompressedRgb,
     UncompressedGray,
     Jpeg,
+    Mjpb,
     Png,
     Cinepak { depth: u16 },
     Rpza,
@@ -691,7 +710,8 @@ fn quicktime_codec_from_fourcc(fourcc: &[u8], depth: u16) -> Result<QuickTimeCod
     match fourcc {
         b"raw " | b"RAW " | b"rgb " => Ok(QuickTimeCodec::UncompressedRgb),
         b"gray" | b"GREY" | b"y800" => Ok(QuickTimeCodec::UncompressedGray),
-        b"jpeg" | b"mjpa" | b"mjpb" | b"mjpg" | b"MJPG" => Ok(QuickTimeCodec::Jpeg),
+        b"jpeg" | b"mjpa" | b"mjpg" | b"MJPG" => Ok(QuickTimeCodec::Jpeg),
+        b"mjpb" => Ok(QuickTimeCodec::Mjpb),
         b"png " => Ok(QuickTimeCodec::Png),
         b"rpza" => Ok(QuickTimeCodec::Rpza),
         b"rle " => {
@@ -725,7 +745,7 @@ fn quicktime_samples_per_pixel(codec: QuickTimeCodec) -> usize {
     match codec {
         QuickTimeCodec::UncompressedRgb => 3,
         QuickTimeCodec::UncompressedGray => 1,
-        QuickTimeCodec::Jpeg | QuickTimeCodec::Png => 3,
+        QuickTimeCodec::Jpeg | QuickTimeCodec::Mjpb | QuickTimeCodec::Png => 3,
         QuickTimeCodec::Rpza | QuickTimeCodec::AnimationRle { .. } => 3,
         QuickTimeCodec::Cinepak { depth: 8 } => 1,
         QuickTimeCodec::Cinepak { .. } => 3,
@@ -772,6 +792,7 @@ fn parse_quicktime_stsd(stsd: Atom<'_>) -> Result<Vec<QuickTimeSampleDescription
         descriptions.push(QuickTimeSampleDescription {
             codec_fourcc,
             codec,
+            depth,
             width,
             height,
             samples_per_pixel: quicktime_samples_per_pixel(codec),
@@ -861,11 +882,94 @@ fn quicktime_insert_edit_list_pixel_order_diagnostic(
     );
 }
 
+fn decode_quicktime_uncompressed_sample(
+    sample: &[u8],
+    meta: &ImageMetadata,
+    plane_index: u32,
+    codec: QuickTimeCodec,
+    depth: u16,
+) -> Result<Vec<u8>> {
+    let width = meta.size_x as usize;
+    let height = meta.size_y as usize;
+    let channels = meta.size_c as usize;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|px| px.checked_mul(channels))
+        .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
+        .ok_or_else(|| BioFormatsError::Format("QuickTime plane size overflows".into()))?;
+
+    let mut out = match (codec, depth) {
+        (QuickTimeCodec::UncompressedRgb, 32) => {
+            let stored_row = width.checked_mul(4).ok_or_else(|| {
+                BioFormatsError::Format("QuickTime uncompressed row size overflows".into())
+            })?;
+            let required = stored_row.checked_mul(height).ok_or_else(|| {
+                BioFormatsError::Format("QuickTime uncompressed plane size overflows".into())
+            })?;
+            if sample.len() != required {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "QuickTime sample {plane_index} has {} bytes, expected {required} for 32-bit uncompressed pixels",
+                    sample.len()
+                )));
+            }
+            let mut decoded = Vec::with_capacity(expected);
+            for px in sample.chunks_exact(4) {
+                decoded.extend_from_slice(&px[1..4]);
+            }
+            decoded
+        }
+        _ => {
+            let stored_channels = match codec {
+                QuickTimeCodec::UncompressedGray => 1usize,
+                _ => channels,
+            };
+            let pixel_bytes = stored_channels
+                .checked_mul(meta.pixel_type.bytes_per_sample())
+                .ok_or_else(|| {
+                    BioFormatsError::Format("QuickTime uncompressed pixel size overflows".into())
+                })?;
+            let row_bytes = width.checked_mul(pixel_bytes).ok_or_else(|| {
+                BioFormatsError::Format("QuickTime uncompressed row size overflows".into())
+            })?;
+            let pad = (4 - (width % 4)) % 4;
+            let padded_row = row_bytes.checked_add(pad).ok_or_else(|| {
+                BioFormatsError::Format("QuickTime uncompressed row size overflows".into())
+            })?;
+            let padded_expected = padded_row.checked_mul(height).ok_or_else(|| {
+                BioFormatsError::Format("QuickTime uncompressed plane size overflows".into())
+            })?;
+            if sample.len() == expected {
+                sample.to_vec()
+            } else if pad > 0 && sample.len() == padded_expected {
+                let mut decoded = Vec::with_capacity(expected);
+                for row in sample.chunks_exact(padded_row) {
+                    decoded.extend_from_slice(&row[..row_bytes]);
+                }
+                decoded
+            } else {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "QuickTime sample {plane_index} has {} bytes, expected {expected} for uncompressed pixels",
+                    sample.len()
+                )));
+            }
+        }
+    };
+
+    // Java QTReader inverts 8-bit and 40-bit uncompressed planes after
+    // cropping, except for mjpb. In bioformats-rs this corresponds to the
+    // explicit grayscale uncompressed codecs.
+    if matches!(codec, QuickTimeCodec::UncompressedGray) {
+        quicktime_invert_pixels(&mut out);
+    }
+    Ok(out)
+}
+
 fn decode_quicktime_jpeg_sample(
     sample: &[u8],
     meta: &ImageMetadata,
     plane_index: u32,
 ) -> Result<Vec<u8>> {
+    let sample = crate::common::codec::jpeg_payload(sample);
     let mut decoder = jpeg_decoder::Decoder::new(sample);
     let decoded = decoder.decode().map_err(|err| {
         BioFormatsError::UnsupportedFormat(format!(
@@ -899,6 +1003,14 @@ fn decode_quicktime_jpeg_sample(
         )));
     }
     Ok(decoded)
+}
+
+fn decode_quicktime_mjpb_sample(sample: &[u8], plane_index: u32) -> Result<Vec<u8>> {
+    crate::common::codec::decompress_mjpb(sample).map_err(|err| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "QuickTime Motion JPEG-B sample {plane_index} failed to decode: {err}"
+        ))
+    })
 }
 
 fn decode_quicktime_png_sample(
@@ -2792,6 +2904,7 @@ fn parse_quicktime_track(
         stsc_entries.as_deref(),
     )?;
     let mut sample_codecs = Vec::with_capacity(sample_description_indices.len());
+    let mut sample_depths = Vec::with_capacity(sample_description_indices.len());
     for description_index in &sample_description_indices {
         let description = descriptions
             .get(description_index.saturating_sub(1) as usize)
@@ -2809,6 +2922,7 @@ fn parse_quicktime_track(
             ));
         }
         sample_codecs.push(description.codec);
+        sample_depths.push(description.depth);
     }
     for (offset, size) in sample_offsets.iter().zip(&sample_sizes) {
         let end = offset
@@ -2824,7 +2938,8 @@ fn parse_quicktime_track(
         &data[sample_offsets[0] as usize..sample_offsets[0] as usize + sample_sizes[0] as usize];
     match qt_codec {
         QuickTimeCodec::Jpeg => {
-            let mut decoder = jpeg_decoder::Decoder::new(first_sample);
+            let mut decoder =
+                jpeg_decoder::Decoder::new(crate::common::codec::jpeg_payload(first_sample));
             decoder.decode().map_err(|err| {
                 BioFormatsError::UnsupportedFormat(format!(
                     "QuickTime JPEG sample 0 failed to decode: {err}"
@@ -2844,6 +2959,9 @@ fn parse_quicktime_track(
                     )))
                 }
             };
+        }
+        QuickTimeCodec::Mjpb => {
+            decode_quicktime_mjpb_sample(first_sample, 0)?;
         }
         QuickTimeCodec::Png => {
             let image = image::load_from_memory_with_format(first_sample, image::ImageFormat::Png)
@@ -3217,8 +3335,10 @@ fn parse_quicktime_track(
         sample_sizes,
         sample_read_order,
         sample_codecs,
+        sample_depths,
         samples_per_pixel,
         codec: qt_codec,
+        depth: first_description.depth,
     })
 }
 
@@ -3745,35 +3865,44 @@ impl MngReader {
         let h = img.height() as usize;
         let pixels = w * h;
         let bands = bands as usize;
+        fn planarize_u8(src: &[u8], pixels: usize, bands: usize) -> Vec<u8> {
+            let mut out = vec![0u8; pixels * bands];
+            for p in 0..pixels {
+                for b in 0..bands {
+                    out[b * pixels + p] = src[p * bands + b];
+                }
+            }
+            out
+        }
+        fn planarize_u16(src: &[u16], pixels: usize, bands: usize) -> Vec<u8> {
+            let mut out = vec![0u8; pixels * bands * 2];
+            for p in 0..pixels {
+                for b in 0..bands {
+                    let be = src[p * bands + b].to_be_bytes();
+                    let dst = (b * pixels + p) * 2;
+                    out[dst] = be[0];
+                    out[dst + 1] = be[1];
+                }
+            }
+            out
+        }
         match pt {
-            PixelType::Uint8 => {
-                let interleaved = img.to_rgba8();
-                let src = interleaved.as_raw();
-                // image always gives 4-band RGBA8 from to_rgba8; remap to the
-                // declared band count.
-                let mut out = vec![0u8; pixels * bands];
-                for p in 0..pixels {
-                    for b in 0..bands {
-                        out[b * pixels + p] = src[p * 4 + b.min(3)];
-                    }
+            PixelType::Uint8 => match img {
+                image::DynamicImage::ImageLuma8(buf) => buf.as_raw().clone(),
+                image::DynamicImage::ImageLumaA8(buf) => planarize_u8(buf.as_raw(), pixels, 2),
+                image::DynamicImage::ImageRgb8(buf) => planarize_u8(buf.as_raw(), pixels, 3),
+                image::DynamicImage::ImageRgba8(buf) => planarize_u8(buf.as_raw(), pixels, 4),
+                _ => planarize_u8(img.to_rgba8().as_raw(), pixels, bands.min(4)),
+            },
+            PixelType::Uint16 => match img {
+                image::DynamicImage::ImageLuma16(buf) => {
+                    buf.as_raw().iter().flat_map(|v| v.to_be_bytes()).collect()
                 }
-                out
-            }
-            PixelType::Uint16 => {
-                let interleaved = img.to_rgba16();
-                let src = interleaved.as_raw();
-                let mut out = vec![0u8; pixels * bands * 2];
-                for p in 0..pixels {
-                    for b in 0..bands {
-                        let v = src[p * 4 + b.min(3)];
-                        let be = v.to_be_bytes();
-                        let dst = (b * pixels + p) * 2;
-                        out[dst] = be[0];
-                        out[dst + 1] = be[1];
-                    }
-                }
-                out
-            }
+                image::DynamicImage::ImageLumaA16(buf) => planarize_u16(buf.as_raw(), pixels, 2),
+                image::DynamicImage::ImageRgb16(buf) => planarize_u16(buf.as_raw(), pixels, 3),
+                image::DynamicImage::ImageRgba16(buf) => planarize_u16(buf.as_raw(), pixels, 4),
+                _ => planarize_u16(img.to_rgba16().as_raw(), pixels, bands.min(4)),
+            },
             _ => {
                 // Float / other: fall back to interleaved RGBA8.
                 img.to_rgba8().into_raw()
@@ -4019,10 +4148,12 @@ impl FormatReader for MngReader {
 ///   the divisor fix-up), sizeC (`iCount`) and sizeZ (`uCount`).
 ///
 /// Each surviving pixel block becomes one series of 16-bit planes. Planes are
-/// uncompressed and read directly by byte offset.
+/// uncompressed and read directly by byte offset. Spool files (`.spl`) may
+/// carry Java's 256-byte in-plane metadata records, which are skipped by their
+/// `SLD_MAGIC_BYTES_3` marker.
 ///
 /// NOT PORTED (Java lines ~758-1207): the extensive heuristic dimension
-/// disambiguation, montage/spool handling, image-name based series flattening,
+/// disambiguation, montage handling, image-name based series flattening,
 /// and physical-size/channel-name metadata. When the recovered geometry cannot
 /// be factored cleanly into the available planes, this reader returns an honest
 /// `UnsupportedFormat`/`Format` error rather than fabricating a layout.
@@ -4056,6 +4187,60 @@ impl SlidebookReader {
             }
         }
         false
+    }
+
+    fn is_spool(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("spl"))
+            .unwrap_or(false)
+    }
+
+    fn is_spool_metadata(data: &[u8], offset: usize) -> bool {
+        const SLD_MAGIC_BYTES_3: u32 = 0xf6010101;
+        offset
+            .checked_add(4)
+            .and_then(|end| data.get(offset..end))
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == SLD_MAGIC_BYTES_3)
+            .unwrap_or(false)
+    }
+
+    fn plane_offsets_for_block(
+        data: &[u8],
+        start: usize,
+        length: usize,
+        plane_bytes: usize,
+        is_spool: bool,
+    ) -> Vec<usize> {
+        let Some(block_end) = start.checked_add(length).map(|end| end.min(data.len())) else {
+            return Vec::new();
+        };
+        if plane_bytes == 0 || start >= block_end {
+            return Vec::new();
+        }
+
+        if !is_spool {
+            let plane_count = (block_end - start) / plane_bytes;
+            return (0..plane_count).map(|p| start + p * plane_bytes).collect();
+        }
+
+        let mut offsets = Vec::new();
+        let mut pos = start;
+        while pos < block_end {
+            for _ in 0..8 {
+                if pos + 256 <= block_end && Self::is_spool_metadata(data, pos) {
+                    pos += 256;
+                } else {
+                    break;
+                }
+            }
+            if pos + plane_bytes > block_end {
+                break;
+            }
+            offsets.push(pos);
+            pos += plane_bytes;
+        }
+        offsets
     }
 
     /// Scan the file for metadata and pixel block offsets (Java initFile
@@ -4245,16 +4430,18 @@ impl SlidebookReader {
 
     fn parse(path: &Path) -> Result<Vec<SlideBookSeries>> {
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
+        let is_spool = Self::is_spool(path);
         let (little, metadata_offsets, mut pixel_offsets, mut pixel_lengths) =
             Self::scan_offsets(&data)?;
 
         // Drop pixel blocks that run off the end of the file (padding = 7 for
-        // non-spool .sld files).
+        // non-spool .sld files, 0 for spool .spl files).
         let mut i = 0;
         while i < pixel_offsets.len() {
             let length = pixel_lengths.get(i).copied().unwrap_or(0);
             let offset = pixel_offsets[i];
-            if length + offset + 7 > data.len() {
+            let padding = if is_spool { 0 } else { 7 };
+            if length + offset + padding > data.len() {
                 pixel_offsets.remove(i);
                 if i < pixel_lengths.len() {
                     pixel_lengths.remove(i);
@@ -4392,7 +4579,10 @@ impl SlidebookReader {
                 ));
             }
             let length = pixel_lengths.get(idx).copied().unwrap_or(0);
-            let plane_count = length / plane_bytes;
+            let start = pixel_offsets[idx];
+            let block_plane_offsets =
+                Self::plane_offsets_for_block(&data, start, length, plane_bytes, is_spool);
+            let plane_count = block_plane_offsets.len();
             if plane_count == 0 {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "3i SlideBook: series {idx} pixel block holds no full planes"
@@ -4411,10 +4601,9 @@ impl SlidebookReader {
             let size_t = (plane_count as u32 / nplanes).max(1);
             let image_count = (nplanes * size_t).min(plane_count as u32).max(1);
 
-            let start = pixel_offsets[idx];
             let mut plane_offsets = Vec::with_capacity(image_count as usize);
             for p in 0..image_count as usize {
-                plane_offsets.push(start + p * plane_bytes);
+                plane_offsets.push(block_plane_offsets[p]);
             }
 
             let meta = ImageMetadata {
@@ -4971,22 +5160,10 @@ impl MincReader {
         }
         let raw = &bytes[start..end];
 
-        // Convert big-endian on-disk data to the little-endian byte order our
-        // metadata advertises (Java: littleEndian = isMINC2 = false on disk,
-        // but it materialises bytes in isLittleEndian() order — false here —
-        // so values are emitted big-endian by Java; we normalise to LE and set
-        // is_little_endian accordingly so downstream callers read consistently).
-        let pixels: Vec<u8> = if elem_size <= 1 {
-            raw.to_vec()
-        } else {
-            let mut out = Vec::with_capacity(raw.len());
-            for chunk in raw.chunks_exact(elem_size) {
-                let mut le: Vec<u8> = chunk.to_vec();
-                le.reverse();
-                out.extend_from_slice(&le);
-            }
-            out
-        };
+        // NetCDF-3 stores values big-endian, and Java MINCReader sets
+        // littleEndian = isMINC2, so MINC-1 planes are exposed as big-endian
+        // bytes.
+        let pixels = raw.to_vec();
 
         let bits = (elem_size * 8) as u8;
         let image_count = size_z * size_t; // size_c == 1
@@ -5005,8 +5182,7 @@ impl MincReader {
             is_rgb: false,
             is_indexed: false,
             is_interleaved: false,
-            // Pixel bytes have been normalised to little-endian above.
-            is_little_endian: true,
+            is_little_endian: false,
             resolution_count: 1,
             thumbnail: false,
             series_metadata: HashMap::new(),
@@ -5292,7 +5468,15 @@ impl FormatReader for MincReader {
                 "MINC/HDF5: dataset is too short for plane {plane_index}"
             )));
         }
-        Ok(pixels[offset..end].to_vec())
+        let row_bytes = meta.size_x as usize * bps;
+        let mut out = vec![0u8; plane_bytes];
+        for row in 0..meta.size_y as usize {
+            let src_row = meta.size_y as usize - row - 1;
+            let src = offset + src_row * row_bytes;
+            let dst = row * row_bytes;
+            out[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
+        }
+        Ok(out)
     }
 
     fn open_bytes_region(
@@ -5369,7 +5553,8 @@ fn parse_axis_token(token: &str, axis: char) -> Option<u32> {
     if chars.next()? != axis {
         return None;
     }
-    chars.as_str().parse::<u32>().ok().filter(|v| *v > 0)
+    let rest = chars.as_str().strip_prefix('=').unwrap_or(chars.as_str());
+    rest.parse::<u32>().ok().filter(|v| *v > 0)
 }
 
 #[derive(Clone)]
@@ -5701,13 +5886,7 @@ impl OpenlabReader {
                         if check == 1 {
                             let num_vars = c.read_short() as i32;
                             for _ in 0..num_vars {
-                                // Mirror Java: a malformed variable aborts the
-                                // CVariableList (Java throws out of initFile);
-                                // here we stop reading further variables but
-                                // keep whatever was parsed and continue.
-                                if Self::read_variable(&mut c, &mut user_vars).is_err() {
-                                    break;
-                                }
+                                Self::read_variable(&mut c, &mut user_vars)?;
                             }
                         }
                     }
@@ -6142,11 +6321,12 @@ impl OpenlabReader {
                 }
                 out
             } else {
+                let bytes = bpp * channels;
                 let mut src = if h > 0 { b.len() / h } else { 0 };
-                if src as i64 - (w * bpp) as i64 != 16 {
-                    src = w * bpp;
+                if src as i64 - (w * bytes) as i64 != 16 {
+                    src = w * bytes;
                 }
-                let dest = w * bpp;
+                let dest = w * bytes;
                 let mut out = vec![0u8; h * dest];
                 for row in 0..h {
                     let s = row * src;
@@ -6416,18 +6596,18 @@ impl FormatReader for Jpeg2000Reader {
             .map(|e| e.to_ascii_lowercase());
         matches!(
             ext.as_deref(),
-            Some("jp2") | Some("j2k") | Some("j2c") | Some("jpc")
+            Some("jp2") | Some("j2k") | Some("jpf") | Some("j2c") | Some("jpc")
         )
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // J2C codestream: FF 4F FF 51
-        if header.len() >= 4 && header[..4] == [0xFF, 0x4F, 0xFF, 0x51] {
+        // J2C codestream: Java accepts the SOC marker.
+        if header.len() >= 2 && header[..2] == [0xFF, 0x4F] {
             return true;
         }
-        // JP2 container: 00 00 00 0C 6A 50 20 20
-        if header.len() >= 8 && header[..8] == [0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20] {
-            return true;
+        // JP2 container signature box, excluding JPX-branded files like Java.
+        if header.len() >= 24 && header[..8] == [0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20] {
+            return &header[20..24] != b"jpx ";
         }
         false
     }
@@ -6446,13 +6626,8 @@ impl FormatReader for Jpeg2000Reader {
         let height = components[0].height() as u32;
         let n_components = components.len() as u32;
         let prec = components[0].precision() as u8;
-        let (pixel_type, bpp) = if prec <= 8 {
-            (PixelType::Uint8, 8u8)
-        } else if prec <= 16 {
-            (PixelType::Uint16, 16u8)
-        } else {
-            (PixelType::Uint32, 32u8)
-        };
+        let signed = components[0].is_signed();
+        let (pixel_type, bpp) = jpeg2000_pixel_type(prec, signed);
         let bps = (bpp / 8) as usize;
         let is_rgb = n_components >= 3;
 
@@ -6465,11 +6640,7 @@ impl FormatReader for Jpeg2000Reader {
             for x in 0..w {
                 for c in 0..nc {
                     let val = components[c].data()[y * w + x];
-                    match bps {
-                        1 => pixels.push(val as u8),
-                        2 => pixels.extend_from_slice(&(val as u16).to_le_bytes()),
-                        _ => pixels.extend_from_slice(&val.to_le_bytes()),
-                    }
+                    append_jpeg2000_sample(&mut pixels, val, bps, signed);
                 }
             }
         }
@@ -6485,11 +6656,11 @@ impl FormatReader for Jpeg2000Reader {
             pixel_type,
             bits_per_pixel: bpp,
             image_count: 1,
-            dimension_order: DimensionOrder::XYZCT,
+            dimension_order: DimensionOrder::XYCZT,
             is_rgb,
             is_interleaved: true,
             is_indexed: false,
-            is_little_endian: true,
+            is_little_endian: false,
             resolution_count: 1,
             thumbnail: false,
             series_metadata: HashMap::new(),
@@ -6559,6 +6730,83 @@ impl FormatReader for Jpeg2000Reader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+}
+
+fn jpeg2000_pixel_type(precision: u8, signed: bool) -> (PixelType, u8) {
+    if precision <= 8 {
+        (
+            if signed {
+                PixelType::Int8
+            } else {
+                PixelType::Uint8
+            },
+            8,
+        )
+    } else if precision <= 16 {
+        (
+            if signed {
+                PixelType::Int16
+            } else {
+                PixelType::Uint16
+            },
+            16,
+        )
+    } else {
+        (
+            if signed {
+                PixelType::Int32
+            } else {
+                PixelType::Uint32
+            },
+            32,
+        )
+    }
+}
+
+fn append_jpeg2000_sample(out: &mut Vec<u8>, value: i32, bytes_per_sample: usize, signed: bool) {
+    match (bytes_per_sample, signed) {
+        (1, _) => out.push(value as u8),
+        (2, true) => out.extend_from_slice(&(value as i16).to_be_bytes()),
+        (2, false) => out.extend_from_slice(&(value as u16).to_be_bytes()),
+        (_, true) => out.extend_from_slice(&value.to_be_bytes()),
+        (_, false) => out.extend_from_slice(&(value as u32).to_be_bytes()),
+    }
+}
+
+#[cfg(test)]
+mod jpeg2000_tests {
+    use super::*;
+
+    #[test]
+    fn jpeg2000_name_and_byte_detection_matches_java_contract() {
+        let reader = Jpeg2000Reader::new();
+        assert!(reader.is_this_type_by_name(Path::new("image.jpf")));
+        assert!(reader.is_this_type_by_name(Path::new("image.jp2")));
+        assert!(reader.is_this_type_by_bytes(&[0xff, 0x4f, 0x00, 0x00]));
+
+        let mut jp2 = vec![0u8; 24];
+        jp2[..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x0c, 0x6a, 0x50, 0x20, 0x20]);
+        jp2[20..24].copy_from_slice(b"jp2 ");
+        assert!(reader.is_this_type_by_bytes(&jp2));
+        jp2[20..24].copy_from_slice(b"jpx ");
+        assert!(!reader.is_this_type_by_bytes(&jp2));
+    }
+
+    #[test]
+    fn jpeg2000_pixel_type_and_sample_bytes_follow_java_big_endian() {
+        assert_eq!(jpeg2000_pixel_type(8, false), (PixelType::Uint8, 8));
+        assert_eq!(jpeg2000_pixel_type(8, true), (PixelType::Int8, 8));
+        assert_eq!(jpeg2000_pixel_type(12, false), (PixelType::Uint16, 16));
+        assert_eq!(jpeg2000_pixel_type(12, true), (PixelType::Int16, 16));
+        assert_eq!(jpeg2000_pixel_type(17, false), (PixelType::Uint32, 32));
+        assert_eq!(jpeg2000_pixel_type(17, true), (PixelType::Int32, 32));
+
+        let mut out = Vec::new();
+        append_jpeg2000_sample(&mut out, 0x1234, 2, false);
+        append_jpeg2000_sample(&mut out, -2, 2, true);
+        append_jpeg2000_sample(&mut out, 0x01020304, 4, false);
+        assert_eq!(out, vec![0x12, 0x34, 0xff, 0xfe, 0x01, 0x02, 0x03, 0x04]);
     }
 }
 
@@ -6723,12 +6971,8 @@ impl Default for SmCameraReader {
 }
 
 impl FormatReader for SmCameraReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("smc"))
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        false
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -6748,13 +6992,15 @@ impl FormatReader for SmCameraReader {
             )));
         }
 
-        let size_y = u16::from_be_bytes([data[524], data[525]]) as u32;
-        let size_x = u16::from_be_bytes([data[532], data[533]]) as u32;
-        if size_x == 0 || size_y == 0 {
+        let size_y = i16::from_be_bytes([data[524], data[525]]) as i32;
+        let size_x = i16::from_be_bytes([data[532], data[533]]) as i32;
+        if size_x <= 0 || size_y <= 0 {
             return Err(BioFormatsError::UnsupportedFormat(
                 "SM-Camera header has invalid image dimensions".to_string(),
             ));
         }
+        let size_x = size_x as u32;
+        let size_y = size_y as u32;
 
         let plane_bytes = (size_x as usize)
             .checked_mul(size_y as usize)
@@ -6769,6 +7015,10 @@ impl FormatReader for SmCameraReader {
         }
 
         self.path = Some(path.to_path_buf());
+        let mut series_metadata = HashMap::new();
+        series_metadata.insert("Image width".into(), MetadataValue::Int(size_x as i64));
+        series_metadata.insert("Image height".into(), MetadataValue::Int(size_y as i64));
+
         self.meta = Some(ImageMetadata {
             size_x,
             size_y,
@@ -6785,7 +7035,7 @@ impl FormatReader for SmCameraReader {
             is_little_endian: false,
             resolution_count: 1,
             thumbnail: false,
-            series_metadata: HashMap::new(),
+            series_metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
@@ -6909,8 +7159,14 @@ impl FormatReader for TextReader {
         matches!(ext.as_deref(), Some("txt") | Some("csv"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        std::str::from_utf8(header)
+            .ok()
+            .map(|text| {
+                let lines = split_text_lines(text);
+                matches!(parse_text_coordinate_table(&lines), Ok(Some(_)))
+            })
+            .unwrap_or(false)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -7021,8 +7277,16 @@ impl FormatReader for TextReader {
 fn parse_text_pixels(
     text: &str,
 ) -> Result<(u32, u32, u32, Vec<u8>, HashMap<String, MetadataValue>)> {
-    let lines: Vec<Vec<String>> = text
-        .lines()
+    let lines = split_text_lines(text);
+
+    if let Some(parsed) = parse_text_coordinate_table(&lines)? {
+        return Ok(parsed);
+    }
+    parse_text_dense_grid(&lines)
+}
+
+fn split_text_lines(text: &str) -> Vec<Vec<String>> {
+    text.lines()
         .filter_map(|line| {
             let tokens: Vec<String> = split_text_row(line)
                 .into_iter()
@@ -7034,12 +7298,7 @@ fn parse_text_pixels(
                 Some(tokens)
             }
         })
-        .collect();
-
-    if let Some(parsed) = parse_text_coordinate_table(&lines)? {
-        return Ok(parsed);
-    }
-    parse_text_dense_grid(&lines)
+        .collect()
 }
 
 fn split_text_row(line: &str) -> Vec<&str> {
@@ -7052,11 +7311,21 @@ fn split_text_row(line: &str) -> Vec<&str> {
 fn parse_text_coordinate_table(
     lines: &[Vec<String>],
 ) -> Result<Option<(u32, u32, u32, Vec<u8>, HashMap<String, MetadataValue>)>> {
-    let Some((header_index, data_index, x_index, y_index)) = find_text_table_header(lines) else {
+    let Some((header_index, data_index)) = find_text_table_header(lines) else {
         return Ok(None);
     };
     let header = &lines[header_index];
     let row_len = header.len();
+    let x_index = header.iter().position(|token| token == "x");
+    let y_index = header.iter().position(|token| token == "y");
+    let (Some(x_index), Some(y_index)) = (x_index, y_index) else {
+        if parse_text_numeric_row(header).is_some() {
+            return Ok(None);
+        }
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TextReader: no X/Y coordinate columns found".into(),
+        ));
+    };
     let channel_columns: Vec<usize> = (0..row_len)
         .filter(|&i| i != x_index && i != y_index)
         .collect();
@@ -7140,7 +7409,7 @@ fn parse_text_coordinate_table(
     )))
 }
 
-fn find_text_table_header(lines: &[Vec<String>]) -> Option<(usize, usize, usize, usize)> {
+fn find_text_table_header(lines: &[Vec<String>]) -> Option<(usize, usize)> {
     for data_index in 1..lines.len() {
         let header_index = data_index - 1;
         let header = &lines[header_index];
@@ -7148,11 +7417,7 @@ fn find_text_table_header(lines: &[Vec<String>]) -> Option<(usize, usize, usize,
         if data.len() < 3 || header.len() != data.len() || parse_text_numeric_row(data).is_none() {
             continue;
         }
-        let x_index = header.iter().position(|token| token == "x");
-        let y_index = header.iter().position(|token| token == "y");
-        if let (Some(x), Some(y)) = (x_index, y_index) {
-            return Some((header_index, data_index, x, y));
-        }
+        return Some((header_index, data_index));
     }
     None
 }
@@ -7269,6 +7534,78 @@ fn floats_to_big_endian_bytes(values: &[f32]) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+mod sm_camera_reader_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_smc_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("bioformats_smc_{nanos}_{n}.smc"))
+    }
+
+    fn write_smc(path: &Path, size_x: i16, size_y: i16, pixels: &[u8]) {
+        let mut bytes = vec![0u8; SMC_HEADER_SIZE];
+        bytes[..SMC_MAGIC.len()].copy_from_slice(&SMC_MAGIC);
+        bytes[524..526].copy_from_slice(&size_y.to_be_bytes());
+        bytes[532..534].copy_from_slice(&size_x.to_be_bytes());
+        bytes.extend_from_slice(pixels);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn sm_camera_detection_uses_magic_not_suffix() {
+        let reader = SmCameraReader::new();
+
+        assert!(!reader.is_this_type_by_name(Path::new("image.smc")));
+        assert!(reader.is_this_type_by_bytes(&SMC_MAGIC));
+        assert!(!reader.is_this_type_by_bytes(b"not an sm camera file"));
+    }
+
+    #[test]
+    fn sm_camera_reads_java_header_offsets_and_metadata() {
+        let path = temp_smc_path();
+        write_smc(&path, 3, 2, &[1, 2, 3, 4, 5, 6]);
+
+        let mut reader = SmCameraReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 3);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert!(!meta.is_little_endian);
+        assert!(matches!(
+            meta.series_metadata.get("Image width"),
+            Some(MetadataValue::Int(3))
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("Image height"),
+            Some(MetadataValue::Int(2))
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sm_camera_rejects_negative_java_short_dimensions() {
+        let path = temp_smc_path();
+        write_smc(&path, -1, 2, &[0; 8]);
+
+        let mut reader = SmCameraReader::new();
+        assert!(reader.set_id(&path).is_err());
+
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
 mod text_reader_tests {
     use super::*;
 
@@ -7314,6 +7651,26 @@ mod text_reader_tests {
         assert!(f32_be_at(&bytes, 0).is_infinite());
         assert_eq!(f32_be_at(&bytes, 1), 3.0);
         assert_eq!(parse_java_double("-0x1p2D"), Some(-4.0));
+    }
+
+    #[test]
+    fn text_reader_byte_detection_requires_java_style_coordinate_table() {
+        let reader = TextReader::new();
+
+        assert!(reader.is_this_type_by_bytes(b"preamble\nx,y,value\n0,0,1\n"));
+        assert!(!reader.is_this_type_by_bytes(b"1,2\n3,4\n"));
+        assert!(!reader.is_this_type_by_bytes(b"a,b,value\n0,0,1\n"));
+    }
+
+    #[test]
+    fn text_reader_first_java_table_without_xy_is_terminal() {
+        let err = parse_text_pixels("a,b,value\n0,0,1\nx,y,value\n0,0,9\n").unwrap_err();
+
+        assert!(matches!(
+            err,
+            BioFormatsError::UnsupportedFormat(message)
+                if message.contains("no X/Y coordinate columns")
+        ));
     }
 }
 
@@ -7472,6 +7829,22 @@ mod qt_writer_tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reader_byte_detection_matches_java_quicktime_markers() {
+        let reader = QtReader::new();
+        let mut header = [0u8; 64];
+        header[12..16].copy_from_slice(b"wide");
+        assert!(reader.is_this_type_by_bytes(&header));
+
+        let mut header = [0u8; 64];
+        header[20..26].copy_from_slice(b"ftypqt");
+        assert!(reader.is_this_type_by_bytes(&header));
+
+        let mut header = [0u8; 64];
+        header[12..16].copy_from_slice(b"imag");
+        assert!(!reader.is_this_type_by_bytes(&header));
     }
 
     /// The lossy/encoded codecs are encoder-blocked; non-UINT8 input is rejected

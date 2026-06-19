@@ -64,7 +64,15 @@ struct NrrdAxes {
     axis_t: Option<usize>,
 }
 
-fn resolve_nrrd_data_path(parent: &Path, value: &str) -> Result<PathBuf> {
+fn resolve_nrrd_data_path(parent: &Path, value: &str, java_detached_file: bool) -> Result<PathBuf> {
+    let value = if java_detached_file {
+        match value.find(std::path::MAIN_SEPARATOR) {
+            Some(i) => &value[i + 1..],
+            None => value,
+        }
+    } else {
+        value
+    };
     confined_join(parent, value).ok_or_else(|| {
         BioFormatsError::UnsupportedFormat(
             "NRRD detached data path must stay within the header directory".into(),
@@ -78,7 +86,7 @@ impl NrrdAxes {
     }
 }
 
-fn nrrd_pixel_type(t: &str) -> PixelType {
+fn nrrd_pixel_type(t: &str) -> Result<PixelType> {
     // Mirror NRRDReader.java: any type containing "char" or "8" maps to UINT8,
     // any containing "short" or "16" maps to UINT16, the int/uint family maps
     // to UINT32. NRRD/MetaImage treats these as unsigned regardless of the
@@ -86,9 +94,9 @@ fn nrrd_pixel_type(t: &str) -> PixelType {
     // "int32" → UINT32).
     let v = t.to_ascii_lowercase();
     if v.contains("char") || v.contains('8') {
-        PixelType::Uint8
+        Ok(PixelType::Uint8)
     } else if v.contains("short") || v.contains("16") {
-        PixelType::Uint16
+        Ok(PixelType::Uint16)
     } else if matches!(
         v.as_str(),
         "int"
@@ -100,13 +108,15 @@ fn nrrd_pixel_type(t: &str) -> PixelType {
             | "uint32"
             | "uint32_t"
     ) {
-        PixelType::Uint32
+        Ok(PixelType::Uint32)
     } else if v == "float" {
-        PixelType::Float32
+        Ok(PixelType::Float32)
     } else if v == "double" {
-        PixelType::Float64
+        Ok(PixelType::Float64)
     } else {
-        PixelType::Uint8
+        Err(BioFormatsError::Format(format!(
+            "Unsupported data type: {t}"
+        )))
     }
 }
 
@@ -155,7 +165,7 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
         }
 
         if data_file_list {
-            data_files.push(resolve_nrrd_data_path(&parent, trimmed)?);
+            data_files.push(resolve_nrrd_data_path(&parent, trimmed, false)?);
             continue;
         }
 
@@ -172,7 +182,7 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
             let val = val.trim();
 
             match key.as_str() {
-                "type" => pixel_type = nrrd_pixel_type(val),
+                "type" => pixel_type = nrrd_pixel_type(val)?,
                 "dimension" => {
                     dimension = val.parse().map_err(|_| {
                         BioFormatsError::Format(format!("NRRD: invalid dimension value {val:?}"))
@@ -220,7 +230,7 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
                     if val.eq_ignore_ascii_case("LIST") {
                         data_file_list = true;
                     } else {
-                        data_file = Some(resolve_nrrd_data_path(&parent, val)?);
+                        data_file = Some(resolve_nrrd_data_path(&parent, val, true)?);
                     }
                 }
                 "byte skip" | "byteskip" => {
@@ -744,6 +754,25 @@ mod sidecar_path_tests {
             matches!(err, BioFormatsError::InvalidData(message) if message.contains("malformed"))
         );
     }
+
+    #[test]
+    fn unsupported_type_rejects_like_java() {
+        let path = tmp_path("unsupported_type");
+        std::fs::write(
+            &path,
+            b"NRRD0004\ntype: block\ndimension: 2\nsizes: 1 1\nencoding: raw\n\n\0",
+        )
+        .unwrap();
+
+        let mut reader = NrrdReader::new();
+        let err = reader
+            .set_id(&path)
+            .expect_err("unsupported NRRD type should be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, BioFormatsError::Format(message) if message.contains("Unsupported data type"))
+        );
+    }
 }
 
 impl Default for NrrdReader {
@@ -952,6 +981,18 @@ fn nrrd_type_str(pt: PixelType) -> &'static str {
     }
 }
 
+fn bytes_as_little_endian(meta: &ImageMetadata, data: &[u8]) -> Vec<u8> {
+    let bps = meta.pixel_type.bytes_per_sample();
+    if meta.is_little_endian || bps <= 1 {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    for chunk in out.chunks_exact_mut(bps) {
+        chunk.reverse();
+    }
+    out
+}
+
 impl FormatWriter for NrrdWriter {
     fn is_this_type(&self, path: &Path) -> bool {
         path.extension()
@@ -997,7 +1038,7 @@ impl FormatWriter for NrrdWriter {
             plane_index,
             data.len(),
         )?;
-        self.planes.push(data.to_vec());
+        self.planes.push(bytes_as_little_endian(meta, data));
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
@@ -1086,22 +1127,25 @@ mod tests {
     }
 
     #[test]
-    fn detached_data_file_rejects_parent_escape() {
-        let dir = temp_path("escape_single");
+    fn detached_data_file_strips_leading_directory_like_java() {
+        let dir = temp_path("java_data_file_dir");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
         let path = dir.join("image.nhdr");
         std::fs::write(
             &path,
-            b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 1 1\nencoding: raw\ndata file: ../pixels.raw\n",
+            b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 2 1\nencoding: raw\ndata file: sub/pixels.raw\n",
         )
         .unwrap();
+        std::fs::write(dir.join("sub").join("pixels.raw"), [1, 2]).unwrap();
+        std::fs::write(dir.join("pixels.raw"), [9, 8]).unwrap();
 
-        let err = parse_nrrd_header(&path).unwrap_err();
+        let mut reader = NrrdReader::new();
+        reader.set_id(&path).unwrap();
+        let plane = reader.open_bytes(0).unwrap();
 
-        assert!(
-            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("must stay within"))
-        );
         let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(plane, vec![9, 8]);
     }
 
     #[test]

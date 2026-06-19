@@ -1,7 +1,12 @@
 //! OME-Zarr / OME-NGFF reader.
 //!
-//! Pure-Rust translation of Java Bio-Formats `loci.formats.in.ZarrReader`,
-//! using the native [`zarrs`] crate instead of the JZarr backend.
+//! Optional Rust-only reader using the native [`zarrs`] crate.
+//!
+//! Upstream Java Bio-Formats does not currently ship a Zarr/OME-Zarr reader in
+//! `loci.formats.in`, so this module is intentional extra support. Its public
+//! reader semantics still follow the Bio-Formats `FormatReader` model: one
+//! multiscales image per series, one dataset per resolution level, and planar
+//! reads addressed by Z/C/T plane index.
 //!
 //! A `.ome.zarr` (or `.zarr`) dataset is a Zarr group hierarchy whose group
 //! metadata (`.zattrs` for Zarr v2, `zarr.json` for v3) carries OME-NGFF
@@ -15,7 +20,7 @@
 //!   channels.
 //! - `plate` / `well`: optional HCS layout.
 //!
-//! Mapping to our reader model (mirroring `ZarrReader.java`):
+//! Mapping to our reader model:
 //! - Each *multiscales image* (a group containing a `multiscales` attribute)
 //!   becomes one **series**.
 //! - Each *dataset* within a multiscales image becomes one **resolution level**
@@ -159,8 +164,8 @@ impl OmeZarrReader {
 }
 
 /// Quick path-based test used by the registry before `peek_header` (which fails
-/// on directories). Matches Java `ZarrReader.isThisType`: any path containing
-/// `.zarr`, or a directory carrying a Zarr group marker.
+/// on directories): any path containing `.zarr`, or a directory carrying a Zarr
+/// group marker.
 pub fn is_zarr_path(path: &Path) -> bool {
     let lower = path.to_string_lossy().to_ascii_lowercase();
     if lower.contains(".zarr") {
@@ -175,7 +180,7 @@ pub fn is_zarr_path(path: &Path) -> bool {
 }
 
 /// Resolve the Zarr root directory from an arbitrary path inside or naming the
-/// dataset. Mirrors Java's `zarrPath.substring(0, indexOf(".zarr") + 5)`.
+/// dataset.
 fn resolve_root(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(idx) = s.to_ascii_lowercase().find(".zarr") {
@@ -216,8 +221,7 @@ fn read_group_attributes(dir: &Path) -> Option<serde_json::Map<String, Value>> {
 }
 
 /// Recursively collect group directories that carry a `multiscales` attribute,
-/// keyed by their path relative to `root`. Skips `labels` subtrees (matching
-/// Java's `includeLabels = false` default).
+/// keyed by their path relative to `root`. Skips `labels` subtrees by default.
 fn collect_multiscales_groups(
     root: &Path,
     dir: &Path,
@@ -254,9 +258,8 @@ fn collect_multiscales_groups(
     }
 }
 
-/// Natural-order comparator over `/`-separated keys, mirroring Java
-/// `ZarrReader.keyComparator` (numeric components sort numerically, A/1/2 before
-/// A/1/10).
+/// Natural-order comparator over `/`-separated keys (numeric components sort
+/// numerically, A/1/2 before A/1/10).
 fn natural_key(key: &str) -> Vec<(bool, u64, String)> {
     key.split('/')
         .map(|part| match part.parse::<u64>() {
@@ -327,8 +330,9 @@ fn axis_names(axes: &Value) -> Vec<String> {
     names
 }
 
-/// Compute the dimension order string (e.g. `XYZCT`) from axis names, mirroring
-/// Java: reverse the axis list and uppercase. Falls back to `XYZCT`.
+/// Compute the dimension order string (e.g. `XYZCT`) from axis names by
+/// reversing the axis list and uppercasing known Z/C/T axes. Falls back to
+/// `XYZCT`.
 fn dimension_order_from_axes(axis_names: &[String]) -> DimensionOrder {
     let mut order = String::new();
     for name in axis_names.iter().rev() {
@@ -462,8 +466,8 @@ impl OmeZarrReader {
     }
 }
 
-/// Build Java-compatible metadata for plain Zarr arrays without NGFF
-/// `multiscales`. Java `ZarrReader.get5DShape` right-aligns non-5D shapes into
+/// Build metadata for plain Zarr arrays without NGFF `multiscales`. This is
+/// Rust-only convenience support: non-5D shapes are right-aligned into
 /// `[t,c,z,y,x]`, so a root 2D array is exposed as singleton T/C/Z.
 fn build_plain_zarr_series(store: &Arc<FilesystemStore>, root: &Path) -> Result<Vec<ZarrSeries>> {
     let candidates = collect_plain_array_paths(root);
@@ -480,7 +484,7 @@ fn build_plain_zarr_series(store: &Arc<FilesystemStore>, root: &Path) -> Result<
         }
         let dtype = format!("{}", array.data_type());
         let pixel_type = pixel_type_from_dtype(&dtype)?;
-        let axis_index = java_plain_axis_index(shape.len());
+        let axis_index = plain_axis_index(shape.len());
         let dim = |li: usize| -> u32 {
             axis_index[li]
                 .and_then(|idx| shape.get(idx).copied())
@@ -571,7 +575,7 @@ fn zarr_json_is_array(dir: &Path) -> bool {
         == Some("array")
 }
 
-fn java_plain_axis_index(ndim: usize) -> [Option<usize>; 5] {
+fn plain_axis_index(ndim: usize) -> [Option<usize>; 5] {
     let mut axis_index = [None; 5];
     let start = 5usize.saturating_sub(ndim);
     for idx in 0..ndim {

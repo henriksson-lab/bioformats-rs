@@ -9,8 +9,6 @@
 //! are expanded to concrete samples and reported as non-indexed RGB/RGBA data.
 
 use image::GenericImageView;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
@@ -201,13 +199,13 @@ pub fn gif_reader() -> impl FormatReader {
 ///
 /// Faithful to the Java `GIFReader`, which reads every frame of an (animated)
 /// GIF as a separate plane, producing an image stack (`sizeT = imageCount`).
-/// The `image` crate's `GifDecoder` composites each frame (applying disposal
-/// and transparency, as the Java reader does), so frames are exposed as
-/// interleaved 8-bit RGBA planes rather than indexed data.
+/// Frames are exposed as indexed 8-bit planes (`sizeC = 1`) with the active
+/// colour table, matching Java `GIFReader`.
 pub struct GifReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     frames: Vec<Vec<u8>>,
+    color_tables: Vec<LookupTable>,
 }
 
 impl GifReader {
@@ -216,6 +214,7 @@ impl GifReader {
             path: None,
             meta: None,
             frames: Vec::new(),
+            color_tables: Vec::new(),
         }
     }
 }
@@ -226,53 +225,424 @@ impl Default for GifReader {
     }
 }
 
-fn load_gif_frames(path: &Path) -> Result<(ImageMetadata, Vec<Vec<u8>>)> {
-    use image::AnimationDecoder;
-
-    let file = File::open(path)?;
-    let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(file))
-        .map_err(|e| BioFormatsError::Format(e.to_string()))?;
-
-    let mut width = 0u32;
-    let mut height = 0u32;
-    let mut frames: Vec<Vec<u8>> = Vec::new();
-
-    for frame in decoder.into_frames() {
-        let frame = frame.map_err(|e| BioFormatsError::Format(e.to_string()))?;
-        let buffer = frame.into_buffer(); // RgbaImage, fully composited
-        if width == 0 {
-            width = buffer.width();
-            height = buffer.height();
-        }
-        frames.push(buffer.into_raw());
-    }
-
-    if frames.is_empty() {
+fn load_gif_frames(path: &Path) -> Result<(ImageMetadata, Vec<Vec<u8>>, Vec<LookupTable>)> {
+    let decoded = decode_gif_indexed(path)?;
+    if decoded.frames.is_empty() {
         return Err(BioFormatsError::InvalidData(
             "GIF contains no frames".into(),
         ));
     }
 
-    let image_count = frames.len() as u32;
+    let image_count = decoded.frames.len() as u32;
     let meta = ImageMetadata {
-        size_x: width,
-        size_y: height,
+        size_x: decoded.width,
+        size_y: decoded.height,
         size_z: 1,
-        size_c: 4,
+        size_c: 1,
         size_t: image_count,
         pixel_type: PixelType::Uint8,
         bits_per_pixel: 8,
         image_count,
         // Java GIFReader uses XYCTZ (frames vary over T).
         dimension_order: DimensionOrder::XYCTZ,
-        is_rgb: true,
+        is_rgb: false,
         is_interleaved: true,
-        is_indexed: false,
+        is_indexed: true,
         is_little_endian: true,
         resolution_count: 1,
+        lookup_table: decoded.color_tables.first().cloned(),
+        series_metadata: [
+            (
+                "Use transparency".to_string(),
+                MetadataValue::Bool(decoded.transparency),
+            ),
+            (
+                "Transparency index".to_string(),
+                MetadataValue::Int(decoded.trans_index as i64),
+            ),
+            (
+                "Interlace".to_string(),
+                MetadataValue::Bool(decoded.interlace),
+            ),
+            (
+                "Block size".to_string(),
+                MetadataValue::Int(decoded.block_size as i64),
+            ),
+            (
+                "Global lookup table size".to_string(),
+                MetadataValue::Int(decoded.global_lut_size as i64),
+            ),
+        ]
+        .into_iter()
+        .collect(),
         ..Default::default()
     };
-    Ok((meta, frames))
+    Ok((meta, decoded.frames, decoded.color_tables))
+}
+
+struct GifDecoded {
+    width: u32,
+    height: u32,
+    frames: Vec<Vec<u8>>,
+    color_tables: Vec<LookupTable>,
+    transparency: bool,
+    trans_index: u8,
+    interlace: bool,
+    block_size: u8,
+    global_lut_size: usize,
+}
+
+struct GifCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> GifCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        let value = *self
+            .data
+            .get(self.pos)
+            .ok_or_else(|| BioFormatsError::InvalidData("truncated GIF".into()))?;
+        self.pos += 1;
+        Ok(value)
+    }
+
+    fn read_u16_le(&mut self) -> Result<u16> {
+        let lo = self.read_u8()?;
+        let hi = self.read_u8()?;
+        Ok(u16::from_le_bytes([lo, hi]))
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| BioFormatsError::InvalidData("GIF offset overflow".into()))?;
+        let bytes = self
+            .data
+            .get(self.pos..end)
+            .ok_or_else(|| BioFormatsError::InvalidData("truncated GIF".into()))?;
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn skip(&mut self, len: usize) -> Result<()> {
+        self.read_exact(len).map(|_| ())
+    }
+}
+
+fn read_gif_lut(c: &mut GifCursor<'_>, size: usize) -> Result<LookupTable> {
+    let bytes = c.read_exact(3 * size)?;
+    let mut red = vec![0u16; 256];
+    let mut green = vec![0u16; 256];
+    let mut blue = vec![0u16; 256];
+    for i in 0..size {
+        red[i] = bytes[3 * i] as u16;
+        green[i] = bytes[3 * i + 1] as u16;
+        blue[i] = bytes[3 * i + 2] as u16;
+    }
+    Ok(LookupTable { red, green, blue })
+}
+
+fn read_gif_sub_blocks(c: &mut GifCursor<'_>, last_block_size: &mut u8) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let size = c.read_u8()?;
+        *last_block_size = size;
+        if size == 0 {
+            break;
+        }
+        out.extend_from_slice(c.read_exact(size as usize)?);
+    }
+    Ok(out)
+}
+
+fn skip_gif_sub_blocks(c: &mut GifCursor<'_>, last_block_size: &mut u8) -> Result<()> {
+    loop {
+        let size = c.read_u8()?;
+        *last_block_size = size;
+        if size == 0 {
+            return Ok(());
+        }
+        c.skip(size as usize)?;
+    }
+}
+
+fn decode_gif_lzw(min_code_size: u8, data: &[u8], expected_pixels: usize) -> Vec<u8> {
+    const MAX_STACK_SIZE: usize = 4096;
+    let data_size = min_code_size as usize;
+    let clear = 1usize << data_size;
+    let eoi = clear + 1;
+    let mut available = clear + 2;
+    let mut old_code: Option<usize> = None;
+    let mut code_size = data_size + 1;
+    let mut code_mask = (1usize << code_size) - 1;
+    let mut prefix = vec![0usize; MAX_STACK_SIZE];
+    let mut suffix = vec![0u8; MAX_STACK_SIZE];
+    let mut pixel_stack = Vec::<u8>::with_capacity(MAX_STACK_SIZE + 1);
+    for (i, item) in suffix
+        .iter_mut()
+        .enumerate()
+        .take(clear.min(MAX_STACK_SIZE))
+    {
+        *item = i as u8;
+    }
+
+    let mut out = Vec::with_capacity(expected_pixels);
+    let mut datum = 0usize;
+    let mut bits = 0usize;
+    let mut bi = 0usize;
+    let mut first = 0usize;
+
+    while out.len() < expected_pixels {
+        if pixel_stack.is_empty() {
+            while bits < code_size {
+                let Some(byte) = data.get(bi) else {
+                    out.resize(expected_pixels, 0);
+                    return out;
+                };
+                datum |= (*byte as usize) << bits;
+                bits += 8;
+                bi += 1;
+            }
+
+            let mut code = datum & code_mask;
+            datum >>= code_size;
+            bits -= code_size;
+
+            if code > available || code == eoi {
+                break;
+            }
+            if code == clear {
+                code_size = data_size + 1;
+                code_mask = (1usize << code_size) - 1;
+                available = clear + 2;
+                old_code = None;
+                continue;
+            }
+            if old_code.is_none() {
+                pixel_stack.push(suffix[code]);
+                old_code = Some(code);
+                first = code;
+                continue;
+            }
+
+            let in_code = code;
+            if code == available {
+                pixel_stack.push(first as u8);
+                code = old_code.unwrap();
+            }
+            while code > clear {
+                pixel_stack.push(suffix[code]);
+                code = prefix[code];
+            }
+            first = suffix[code] as usize;
+            if available >= MAX_STACK_SIZE {
+                break;
+            }
+            pixel_stack.push(first as u8);
+            prefix[available] = old_code.unwrap();
+            suffix[available] = first as u8;
+            available += 1;
+
+            if (available & code_mask) == 0 && available < MAX_STACK_SIZE {
+                code_size += 1;
+                code_mask += available;
+            }
+            old_code = Some(in_code);
+        }
+        if let Some(pixel) = pixel_stack.pop() {
+            out.push(pixel);
+        }
+    }
+
+    out.resize(expected_pixels, 0);
+    out
+}
+
+#[derive(Default)]
+struct GifGraphicControl {
+    dispose: u8,
+    transparency: bool,
+    trans_index: u8,
+}
+
+fn gif_set_pixels(
+    canvas_w: usize,
+    canvas_h: usize,
+    frames: &[Vec<u8>],
+    last_dispose: u8,
+    rect: (usize, usize, usize, usize),
+    interlace: bool,
+    pixels: &[u8],
+) -> Vec<u8> {
+    let mut dest = vec![0u8; canvas_w * canvas_h];
+    let mut last_image = None;
+    if last_dispose > 0 {
+        if last_dispose == 3 {
+            let n = frames.len().saturating_sub(2);
+            if n > 0 {
+                last_image = Some(n - 1);
+            }
+        }
+        if let Some(idx) = last_image {
+            if let Some(prev) = frames.get(idx) {
+                dest.copy_from_slice(prev);
+            }
+        }
+    }
+
+    let (ix, iy, iw, ih) = rect;
+    let mut pass = 1;
+    let mut inc = 8usize;
+    let mut iline = 0usize;
+    for i in 0..ih {
+        let mut line = i;
+        if interlace {
+            if iline >= ih {
+                pass += 1;
+                match pass {
+                    2 => iline = 4,
+                    3 => {
+                        iline = 2;
+                        inc = 4;
+                    }
+                    4 => {
+                        iline = 1;
+                        inc = 2;
+                    }
+                    _ => {}
+                }
+            }
+            line = iline;
+            iline += inc;
+        }
+        line += iy;
+        if line < canvas_h {
+            let row_start = line * canvas_w;
+            let mut dx = row_start + ix;
+            let dlim = (dx + iw).min(row_start + canvas_w);
+            let mut sx = i * iw;
+            while dx < dlim {
+                dest[dx] = pixels.get(sx).copied().unwrap_or(0);
+                dx += 1;
+                sx += 1;
+            }
+        }
+    }
+    dest
+}
+
+fn decode_gif_indexed(path: &Path) -> Result<GifDecoded> {
+    let bytes = std::fs::read(path)?;
+    let mut c = GifCursor::new(&bytes);
+    let ident = c.read_exact(6)?;
+    if !ident.starts_with(b"GIF") {
+        return Err(BioFormatsError::Format("Not a valid GIF file.".into()));
+    }
+
+    let width = c.read_u16_le()? as u32;
+    let height = c.read_u16_le()? as u32;
+    let packed = c.read_u8()?;
+    let gct_flag = (packed & 0x80) != 0;
+    let global_lut_size = 2usize << (packed & 7);
+    c.skip(2)?;
+
+    let global_lut = if gct_flag {
+        Some(read_gif_lut(&mut c, global_lut_size)?)
+    } else {
+        None
+    };
+
+    let mut frames = Vec::<Vec<u8>>::new();
+    let mut color_tables = Vec::<LookupTable>::new();
+    let mut graphic = GifGraphicControl::default();
+    let mut last_dispose = 0u8;
+    let mut last_block_size = 0u8;
+    let mut last_interlace = false;
+
+    loop {
+        let code = match c.read_u8() {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        match code {
+            0x2c => {
+                let ix = c.read_u16_le()? as usize;
+                let iy = c.read_u16_le()? as usize;
+                let iw = c.read_u16_le()? as usize;
+                let ih = c.read_u16_le()? as usize;
+                let packed = c.read_u8()?;
+                let lct_flag = (packed & 0x80) != 0;
+                let interlace = (packed & 0x40) != 0;
+                let lct_size = 2usize << (packed & 7);
+                let active_lut = if lct_flag {
+                    read_gif_lut(&mut c, lct_size)?
+                } else {
+                    global_lut
+                        .clone()
+                        .ok_or_else(|| BioFormatsError::Format("Color table not found.".into()))?
+                };
+
+                let min_code_size = c.read_u8()?;
+                let lzw_data = read_gif_sub_blocks(&mut c, &mut last_block_size)?;
+                let pixels = decode_gif_lzw(min_code_size, &lzw_data, iw * ih);
+                let frame = gif_set_pixels(
+                    width as usize,
+                    height as usize,
+                    &frames,
+                    last_dispose,
+                    (ix, iy, iw, ih),
+                    interlace,
+                    &pixels,
+                );
+                frames.push(frame);
+                color_tables.push(active_lut);
+                last_interlace = interlace;
+                last_dispose = graphic.dispose;
+            }
+            0x21 => {
+                let ext = c.read_u8()?;
+                if ext == 0xf9 {
+                    let block_len = c.read_u8()?;
+                    if block_len >= 4 {
+                        let packed = c.read_u8()?;
+                        graphic.dispose = (packed & 0x1c) >> 1;
+                        graphic.transparency = (packed & 1) != 0;
+                        c.skip(2)?;
+                        graphic.trans_index = c.read_u8()?;
+                        if block_len > 4 {
+                            c.skip((block_len - 4) as usize)?;
+                        }
+                    } else {
+                        c.skip(block_len as usize)?;
+                    }
+                    let terminator = c.read_u8()?;
+                    last_block_size = terminator;
+                } else {
+                    skip_gif_sub_blocks(&mut c, &mut last_block_size)?;
+                }
+            }
+            0x3b => break,
+            _ => {}
+        }
+    }
+
+    Ok(GifDecoded {
+        width,
+        height,
+        frames,
+        color_tables,
+        transparency: graphic.transparency,
+        trans_index: graphic.trans_index,
+        interlace: last_interlace,
+        block_size: last_block_size,
+        global_lut_size,
+    })
 }
 
 impl FormatReader for GifReader {
@@ -284,15 +654,16 @@ impl FormatReader for GifReader {
     }
 
     fn is_this_type_by_bytes(&self, h: &[u8]) -> bool {
-        h.starts_with(b"GIF87a") || h.starts_with(b"GIF89a")
+        h.starts_with(b"GIF")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let (meta, frames) = load_gif_frames(path)?;
+        let (meta, frames, color_tables) = load_gif_frames(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
         self.frames = frames;
+        self.color_tables = color_tables;
         Ok(())
     }
 
@@ -300,6 +671,7 @@ impl FormatReader for GifReader {
         self.path = None;
         self.meta = None;
         self.frames.clear();
+        self.color_tables.clear();
         Ok(())
     }
 
@@ -342,6 +714,13 @@ impl FormatReader for GifReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(idx, tx, ty, tw, th)
+    }
+
+    fn lookup_table(&mut self, plane_index: u32) -> Result<Option<LookupTable>> {
+        if self.meta.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        Ok(self.color_tables.get(plane_index as usize).cloned())
     }
 }
 
@@ -792,17 +1171,17 @@ pub fn webp_reader() -> impl FormatReader {
 
 pub fn pnm_reader() -> impl FormatReader {
     GenericReader::new(
-        &["pbm", "pgm", "ppm", "pnm", "pfm"],
-        |h| h.len() >= 2 && h[0] == b'P' && h[1] >= b'1' && h[1] <= b'7',
+        &["pbm", "pam", "pgm", "ppm", "pnm"],
+        |h| h.len() >= 2 && h[0] == b'P' && h[1].is_ascii_digit(),
         RasterBehavior::Still,
     )
 }
 
 pub fn hdr_reader() -> impl FormatReader {
-    // Radiance HDR: starts with "#?RADIANCE\n" or "#?RGBE\n"
+    // Radiance HDR as accepted by the image crate decoder.
     GenericReader::new(
-        &["hdr", "rgbe"],
-        |h| h.starts_with(b"#?RADIANCE") || h.starts_with(b"#?RGBE"),
+        &["hdr"],
+        |h| h.starts_with(b"#?RADIANCE"),
         RasterBehavior::Still,
     )
 }
@@ -911,27 +1290,17 @@ impl FormatWriter for TgaWriter {
         }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let expected = (meta.size_x as usize)
-            .checked_mul(meta.size_y as usize)
-            .and_then(|px| px.checked_mul(meta.size_c as usize))
-            .ok_or_else(|| BioFormatsError::Format("TGA writer image plane is too large".into()))?;
-        if data.len() != expected {
-            return Err(BioFormatsError::InvalidData(format!(
-                "TGA writer: plane 0 has {} bytes, expected {}",
-                data.len(),
-                expected
-            )));
-        }
+        let pixels = crate::common::writer::to_interleaved_samples(meta, data)?;
         let (w, h) = (meta.size_x, meta.size_y);
         let spp = meta.size_c as usize;
         let img: image::DynamicImage = match spp {
-            1 => image::GrayImage::from_raw(w, h, data.to_vec())
+            1 => image::GrayImage::from_raw(w, h, pixels)
                 .map(image::DynamicImage::ImageLuma8)
                 .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
-            3 => image::RgbImage::from_raw(w, h, data.to_vec())
+            3 => image::RgbImage::from_raw(w, h, pixels)
                 .map(image::DynamicImage::ImageRgb8)
                 .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
-            4 => image::RgbaImage::from_raw(w, h, data.to_vec())
+            4 => image::RgbaImage::from_raw(w, h, pixels)
                 .map(image::DynamicImage::ImageRgba8)
                 .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
             _ => {
@@ -1051,30 +1420,18 @@ impl FormatWriter for PnmWriter {
         }
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let expected = (meta.size_x as usize)
-            .checked_mul(meta.size_y as usize)
-            .and_then(|px| px.checked_mul(meta.size_c as usize))
-            .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
-            .ok_or_else(|| BioFormatsError::Format("PNM writer image plane is too large".into()))?;
-        if data.len() != expected {
-            return Err(BioFormatsError::InvalidData(format!(
-                "PNM writer: plane 0 has {} bytes, expected {}",
-                data.len(),
-                expected
-            )));
-        }
-
+        let pixels = crate::common::writer::to_interleaved_samples(meta, data)?;
         let (w, h) = (meta.size_x, meta.size_y);
         let spp = meta.size_c as usize;
         let img: image::DynamicImage = match (meta.pixel_type, spp) {
-            (PixelType::Uint8, 1) => image::GrayImage::from_raw(w, h, data.to_vec())
+            (PixelType::Uint8, 1) => image::GrayImage::from_raw(w, h, pixels)
                 .map(image::DynamicImage::ImageLuma8)
                 .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
-            (PixelType::Uint8, 3) => image::RgbImage::from_raw(w, h, data.to_vec())
+            (PixelType::Uint8, 3) => image::RgbImage::from_raw(w, h, pixels)
                 .map(image::DynamicImage::ImageRgb8)
                 .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
             (PixelType::Uint16, 1) => {
-                let pixels: Vec<u16> = data
+                let pixels: Vec<u16> = pixels
                     .chunks_exact(2)
                     .map(|c| {
                         if meta.is_little_endian {
@@ -1089,7 +1446,7 @@ impl FormatWriter for PnmWriter {
                     .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?
             }
             (PixelType::Uint16, 3) => {
-                let pixels: Vec<u16> = data
+                let pixels: Vec<u16> = pixels
                     .chunks_exact(2)
                     .map(|c| {
                         if meta.is_little_endian {

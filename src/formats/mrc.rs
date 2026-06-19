@@ -420,7 +420,7 @@ impl FormatReader for MrcReader {
             .map(|e| {
                 matches!(
                     e.to_ascii_lowercase().as_str(),
-                    "mrc" | "mrcs" | "ccp4" | "map" | "rec"
+                    "mrc" | "st" | "ali" | "map" | "rec" | "mrcs" | "ccp4"
                 )
             })
             .unwrap_or(false)
@@ -739,6 +739,18 @@ impl Default for MrcWriter {
     }
 }
 
+fn bytes_as_little_endian(meta: &ImageMetadata, data: &[u8]) -> Vec<u8> {
+    let bps = meta.pixel_type.bytes_per_sample();
+    if meta.is_little_endian || bps <= 1 {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    for chunk in out.chunks_exact_mut(bps) {
+        chunk.reverse();
+    }
+    out
+}
+
 impl FormatWriter for MrcWriter {
     fn is_this_type(&self, path: &Path) -> bool {
         path.extension()
@@ -780,7 +792,7 @@ impl FormatWriter for MrcWriter {
             idx,
             data.len(),
         )?;
-        self.planes.push(data.to_vec());
+        self.planes.push(bytes_as_little_endian(meta, data));
         Ok(())
     }
 
@@ -959,6 +971,20 @@ mod tests {
         };
         let plane = reader.open_bytes(0).unwrap();
         (plane, flip_y)
+    }
+
+    #[test]
+    fn mrc_reader_accepts_java_suffixes_by_name() {
+        let reader = MrcReader::new();
+        for ext in ["mrc", "st", "ali", "map", "rec", "mrcs"] {
+            let path = PathBuf::from(format!("synthetic.{ext}"));
+            assert!(reader.is_this_type_by_name(&path), "missing .{ext}");
+        }
+
+        // Extra Rust support for CCP4 maps is retained; it does not change
+        // Java-supported MRC suffix behavior.
+        assert!(reader.is_this_type_by_name(Path::new("synthetic.ccp4")));
+        assert!(!reader.is_this_type_by_name(Path::new("synthetic.tif")));
     }
 
     #[test]

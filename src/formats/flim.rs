@@ -2019,15 +2019,7 @@ impl FormatReader for SdtReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        let bps = ((meta.bits_per_pixel as usize).max(1) + 7) / 8;
-        let row = meta.size_x as usize * bps;
-        let out_row = w as usize * bps;
-        let mut out = Vec::with_capacity(h as usize * out_row);
-        for r in 0..h as usize {
-            let src = &full[(y as usize + r) * row..];
-            out.extend_from_slice(&src[x as usize * bps..x as usize * bps + out_row]);
-        }
-        Ok(out)
+        crop_full_plane("SDT", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -2304,6 +2296,24 @@ mod sdt_tests {
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(values, vec![11, 21, 31, 111, 121, 131]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_region_bounds_are_checked_like_java() {
+        let path = temp_sdt_path("bad_region.sdt");
+        let setup = synthetic_setup(3, 2, 2);
+        let payload = padded_decay_payload(3, 2, 2, 10);
+        write_single_block_sdt(&path, &setup, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        let err = reader.open_bytes_region(0, 2, 0, 2, 1).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("outside image bounds")),
+            "unexpected SDT region error: {err:?}"
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -2912,8 +2922,10 @@ struct LiFlimLayout {
 pub struct LiFlimReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    metas: Vec<ImageMetadata>,
     data_offset: u64,
-    layout: Option<LiFlimLayout>,
+    layouts: Vec<LiFlimLayout>,
+    current_series: usize,
 }
 
 impl LiFlimReader {
@@ -2921,8 +2933,10 @@ impl LiFlimReader {
         Self {
             path: None,
             meta: None,
+            metas: Vec::new(),
             data_offset: 0,
-            layout: None,
+            layouts: Vec::new(),
+            current_series: 0,
         }
     }
 }
@@ -2952,68 +2966,17 @@ impl FormatReader for LiFlimReader {
         let mut file = File::open(path).map_err(BioFormatsError::Io)?;
         let (header, data_offset) = read_liflim_header(&mut file)?;
         let ini = parse_liflim_ini(&header);
-        let layout = parse_liflim_layout(&ini)?;
+        let layouts = parse_liflim_layouts(&ini)?;
 
-        let mut series_metadata = HashMap::new();
-        series_metadata.insert("format".into(), MetadataValue::String("LI-FLIM".into()));
-        series_metadata.insert(
-            "compression".into(),
-            MetadataValue::String(layout.compression.clone()),
-        );
-        series_metadata.insert(
-            "datatype".into(),
-            MetadataValue::String(layout.datatype.clone()),
-        );
-        series_metadata.insert(
-            "packing".into(),
-            MetadataValue::String(layout.packing.clone()),
-        );
-        // Mirror Java initOriginalMetadata(): surface every INI key/value pair as
-        // global metadata under the "<table header> - <key>" key. This is how
-        // Java exposes the BACKGROUND_TABLE (background.*), datatype, channel
-        // count and hasDarkImage keys as original metadata.
-        liflim_add_global_meta(&ini, &mut series_metadata);
-
-        self.meta = Some(ImageMetadata {
-            size_x: layout.size_x,
-            size_y: layout.size_y,
-            size_z: layout.size_z,
-            size_c: layout.size_c,
-            size_t: layout.size_t,
-            pixel_type: layout.pixel_type,
-            bits_per_pixel: layout.bits_per_pixel,
-            image_count: layout.size_z.saturating_mul(layout.size_t),
-            dimension_order: DimensionOrder::XYCZT,
-            is_rgb: layout.size_c > 1,
-            is_interleaved: true,
-            is_indexed: false,
-            is_little_endian: true,
-            resolution_count: 1,
-            thumbnail: false,
-            series_metadata,
-            lookup_table: None,
-            modulo_z: Some(ModuloAnnotation {
-                parent_dimension: "Z".into(),
-                modulo_type: "frequency".into(),
-                start: 0.0,
-                step: layout.size_z as f64 / layout.frequencies.max(1) as f64,
-                end: layout.size_z.saturating_sub(1) as f64,
-                unit: String::new(),
-                labels: Vec::new(),
-            }),
-            modulo_c: None,
-            modulo_t: Some(ModuloAnnotation {
-                parent_dimension: "T".into(),
-                modulo_type: "phase".into(),
-                start: 0.0,
-                step: layout.size_t as f64 / layout.phases.max(1) as f64,
-                end: layout.size_t.saturating_sub(1) as f64,
-                unit: String::new(),
-                labels: Vec::new(),
-            }),
-        });
+        let metas: Vec<ImageMetadata> = layouts
+            .iter()
+            .map(|layout| liflim_metadata_for_layout(layout, &ini))
+            .collect();
+        self.meta = metas.first().cloned();
+        self.metas = metas;
         self.data_offset = data_offset;
-        self.layout = Some(layout);
+        self.layouts = layouts;
+        self.current_series = 0;
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -3021,25 +2984,30 @@ impl FormatReader for LiFlimReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.metas.clear();
         self.data_offset = 0;
-        self.layout = None;
+        self.layouts.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.layouts.len().max(1)
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s == 0 {
-            Ok(())
-        } else {
-            Err(BioFormatsError::SeriesOutOfRange(s))
+        if s >= self.layouts.len().max(1) {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
         }
+        self.current_series = s;
+        if let Some(meta) = self.metas.get(s) {
+            self.meta = Some(meta.clone());
+        }
+        Ok(())
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
@@ -3051,8 +3019,8 @@ impl FormatReader for LiFlimReader {
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let layout = self
-            .layout
-            .as_ref()
+            .layouts
+            .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -3069,6 +3037,8 @@ impl FormatReader for LiFlimReader {
         } else {
             plane_bytes
         };
+        let preceding_bytes =
+            liflim_preceding_series_bytes(&self.metas, &self.layouts, self.current_series)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
 
         let mut payload = Vec::new();
@@ -3096,8 +3066,11 @@ impl FormatReader for LiFlimReader {
             }
         };
 
-        let offset = (plane_index as usize)
+        let plane_offset = (plane_index as usize)
             .checked_mul(stored_plane_bytes)
+            .ok_or_else(|| BioFormatsError::Format("LI-FLIM plane offset overflow".into()))?;
+        let offset = preceding_bytes
+            .checked_add(plane_offset)
             .ok_or_else(|| BioFormatsError::Format("LI-FLIM plane offset overflow".into()))?;
         let end = offset
             .checked_add(stored_plane_bytes)
@@ -3207,8 +3180,11 @@ fn liflim_add_global_meta(
     }
 }
 
-fn parse_liflim_layout(ini: &HashMap<String, HashMap<String, String>>) -> Result<LiFlimLayout> {
+fn parse_liflim_layouts(
+    ini: &HashMap<String, HashMap<String, String>>,
+) -> Result<Vec<LiFlimLayout>> {
     let version = liflim_find_key(ini, "version").unwrap_or_else(|| "1.0".into());
+    let dark_image;
     let (
         datatype,
         packing,
@@ -3225,6 +3201,7 @@ fn parse_liflim_layout(ini: &HashMap<String, HashMap<String, String>>) -> Result
             BioFormatsError::Format("LI-FLIM 2.0 header missing default table".into())
         })?;
         let datatype = required_liflim_key(base, "pixelFormat")?;
+        dark_image = base.get("nrOfDarkImages").cloned();
         (
             datatype.clone(),
             liflim_pixel_format_packing(&datatype),
@@ -3244,6 +3221,7 @@ fn parse_liflim_layout(ini: &HashMap<String, HashMap<String, String>>) -> Result
         let info = ini.get("FLIMIMAGE: INFO").ok_or_else(|| {
             BioFormatsError::Format("LI-FLIM header missing FLIMIMAGE: INFO table".into())
         })?;
+        dark_image = layout.get("hasDarkImage").cloned();
         (
             required_liflim_key(layout, "datatype")?,
             layout.get("packing").cloned().unwrap_or_default(),
@@ -3260,6 +3238,66 @@ fn parse_liflim_layout(ini: &HashMap<String, HashMap<String, String>>) -> Result
         )
     };
 
+    let mut layouts = Vec::new();
+    layouts.push(liflim_make_layout(
+        compression.clone(),
+        datatype.clone(),
+        packing.clone(),
+        channels,
+        x_len.clone(),
+        y_len.clone(),
+        z_len,
+        phases,
+        frequencies,
+        timestamps,
+    )?);
+
+    if let Some(background) = ini.get("FLIMIMAGE: BACKGROUND") {
+        let background_datatype = required_liflim_key(background, "datatype")?;
+        layouts.push(liflim_make_layout(
+            compression.clone(),
+            background_datatype,
+            background.get("packing").cloned().unwrap_or_default(),
+            required_liflim_key(background, "channels")?,
+            required_liflim_key(background, "x")?,
+            required_liflim_key(background, "y")?,
+            required_liflim_key(background, "z")?,
+            required_liflim_key(background, "phases")?,
+            required_liflim_key(background, "frequencies")?,
+            required_liflim_key(background, "timestamps")?,
+        )?);
+    }
+
+    if dark_image.as_deref() == Some("1") {
+        layouts.push(liflim_make_layout(
+            compression,
+            datatype,
+            packing,
+            "1".into(),
+            x_len,
+            y_len,
+            "1".into(),
+            "1".into(),
+            "1".into(),
+            "1".into(),
+        )?);
+    }
+
+    Ok(layouts)
+}
+
+fn liflim_make_layout(
+    compression: String,
+    datatype: String,
+    packing: String,
+    channels: String,
+    x_len: String,
+    y_len: String,
+    z_len: String,
+    phases: String,
+    frequencies: String,
+    timestamps: String,
+) -> Result<LiFlimLayout> {
     let size_x = parse_liflim_u32("x", &x_len)?;
     let size_y = parse_liflim_u32("y", &y_len)?;
     let channels = parse_liflim_u32("channels", &channels)?;
@@ -3285,6 +3323,68 @@ fn parse_liflim_layout(ini: &HashMap<String, HashMap<String, String>>) -> Result
         bits_per_pixel,
         uint12_packed,
     })
+}
+
+fn liflim_metadata_for_layout(
+    layout: &LiFlimLayout,
+    ini: &HashMap<String, HashMap<String, String>>,
+) -> ImageMetadata {
+    let mut series_metadata = HashMap::new();
+    series_metadata.insert("format".into(), MetadataValue::String("LI-FLIM".into()));
+    series_metadata.insert(
+        "compression".into(),
+        MetadataValue::String(layout.compression.clone()),
+    );
+    series_metadata.insert(
+        "datatype".into(),
+        MetadataValue::String(layout.datatype.clone()),
+    );
+    series_metadata.insert(
+        "packing".into(),
+        MetadataValue::String(layout.packing.clone()),
+    );
+    // Mirror Java initOriginalMetadata(): surface every INI key/value pair as
+    // global metadata under the "<table header> - <key>" key.
+    liflim_add_global_meta(ini, &mut series_metadata);
+
+    ImageMetadata {
+        size_x: layout.size_x,
+        size_y: layout.size_y,
+        size_z: layout.size_z,
+        size_c: layout.size_c,
+        size_t: layout.size_t,
+        pixel_type: layout.pixel_type,
+        bits_per_pixel: layout.bits_per_pixel,
+        image_count: layout.size_z.saturating_mul(layout.size_t),
+        dimension_order: DimensionOrder::XYCZT,
+        is_rgb: layout.size_c > 1,
+        is_interleaved: true,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        thumbnail: false,
+        series_metadata,
+        lookup_table: None,
+        modulo_z: Some(ModuloAnnotation {
+            parent_dimension: "Z".into(),
+            modulo_type: "frequency".into(),
+            start: 0.0,
+            step: layout.size_z as f64 / layout.frequencies.max(1) as f64,
+            end: layout.size_z.saturating_sub(1) as f64,
+            unit: String::new(),
+            labels: Vec::new(),
+        }),
+        modulo_c: None,
+        modulo_t: Some(ModuloAnnotation {
+            parent_dimension: "T".into(),
+            modulo_type: "phase".into(),
+            start: 0.0,
+            step: layout.size_t as f64 / layout.phases.max(1) as f64,
+            end: layout.size_t.saturating_sub(1) as f64,
+            unit: String::new(),
+            labels: Vec::new(),
+        }),
+    }
 }
 
 fn required_liflim_key(table: &HashMap<String, String>, key: &str) -> Result<String> {
@@ -3360,6 +3460,35 @@ fn liflim_plane_bytes(meta: &ImageMetadata) -> Result<usize> {
         .and_then(|n| n.checked_mul(meta.size_c))
         .and_then(|n| (n as usize).checked_mul(meta.pixel_type.bytes_per_sample()))
         .ok_or_else(|| BioFormatsError::Format("LI-FLIM plane size overflow".into()))
+}
+
+fn liflim_stored_plane_bytes(meta: &ImageMetadata, layout: &LiFlimLayout) -> Result<usize> {
+    let plane_bytes = liflim_plane_bytes(meta)?;
+    if layout.uint12_packed {
+        plane_bytes
+            .checked_mul(3)
+            .and_then(|n| n.checked_div(4))
+            .ok_or_else(|| BioFormatsError::Format("LI-FLIM UINT12 plane size overflow".into()))
+    } else {
+        Ok(plane_bytes)
+    }
+}
+
+fn liflim_preceding_series_bytes(
+    metas: &[ImageMetadata],
+    layouts: &[LiFlimLayout],
+    series: usize,
+) -> Result<usize> {
+    let mut total = 0usize;
+    for (meta, layout) in metas.iter().zip(layouts.iter()).take(series) {
+        let series_bytes = liflim_stored_plane_bytes(meta, layout)?
+            .checked_mul(meta.image_count as usize)
+            .ok_or_else(|| BioFormatsError::Format("LI-FLIM series offset overflow".into()))?;
+        total = total
+            .checked_add(series_bytes)
+            .ok_or_else(|| BioFormatsError::Format("LI-FLIM series offset overflow".into()))?;
+    }
+    Ok(total)
 }
 
 fn liflim_convert12_to_16_lsb(image: &[u8]) -> Vec<u8> {
@@ -3540,6 +3669,105 @@ timestamps=1
             Some(MetadataValue::String(v)) => assert_eq!(v, "1.0"),
             other => panic!("missing version metadata: {other:?}"),
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn liflim_exposes_background_table_as_second_series() {
+        let path = temp_path("background_series.fli");
+        let header = "\
+[FLIMIMAGE: INFO]
+version=1.0
+compression=0
+[FLIMIMAGE: LAYOUT]
+datatype=UINT16
+packing=lsb
+channels=1
+x=2
+y=1
+z=1
+phases=1
+frequencies=1
+timestamps=1
+hasDarkImage=0
+[FLIMIMAGE: BACKGROUND]
+datatype=UINT8
+channels=1
+x=3
+y=1
+z=1
+phases=1
+frequencies=1
+timestamps=1
+";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&10u16.to_le_bytes());
+        payload.extend_from_slice(&20u16.to_le_bytes());
+        payload.extend_from_slice(&[7, 8, 9]);
+        write_liflim(&path, header, &payload);
+
+        let mut reader = LiFlimReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 0, 20, 0]);
+
+        reader.set_series(1).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(
+            (meta.size_x, meta.size_y, meta.size_c, meta.size_t),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(meta.pixel_type, PixelType::Uint8);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![7, 8, 9]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn liflim_exposes_dark_image_as_trailing_series() {
+        let path = temp_path("dark_series.fli");
+        let header = "\
+[FLIMIMAGE: INFO]
+version=1.0
+compression=0
+[FLIMIMAGE: LAYOUT]
+datatype=UINT16
+packing=lsb
+channels=1
+x=2
+y=1
+z=1
+phases=1
+frequencies=1
+timestamps=2
+hasDarkImage=1
+";
+        let mut payload = Vec::new();
+        for value in [1u16, 2, 3, 4, 99, 100] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        write_liflim(&path, header, &payload);
+
+        let mut reader = LiFlimReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 0, 4, 0]);
+
+        reader.set_series(1).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(
+            (
+                meta.size_x,
+                meta.size_y,
+                meta.size_z,
+                meta.size_c,
+                meta.size_t,
+                meta.image_count
+            ),
+            (2, 1, 1, 1, 1, 1)
+        );
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![99, 0, 100, 0]);
         let _ = std::fs::remove_file(path);
     }
 

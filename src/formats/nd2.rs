@@ -1407,9 +1407,10 @@ fn parse_nd2_attributes(xml: &str) -> (u32, u32, u32, u32, u8) {
     };
     let c = nd2_u32_value(xml, "uiComp").unwrap_or(1u32);
     let bpp = nd2_bpp_value(xml).unwrap_or(8u8);
-    let z_count = nd2_u32_value(xml, "uiZStackHome")
-        .or_else(|| nd2_u32_value(xml, "uiSequenceCount"))
-        .unwrap_or(1u32);
+    // Java ND2Handler treats uiSequenceCount as an image-count consistency
+    // hint, not as a Z size. Z/T dimensions come from loop metadata or later
+    // fallback normalization.
+    let z_count = 1u32;
     (w, h, c, z_count.max(1), bpp)
 }
 
@@ -2620,14 +2621,6 @@ impl FormatReader for Nd2Reader {
             .map(|(_, chunk_index)| chunk_index)
             .collect();
 
-        // Infer size_z from number of image chunks only when no loop metadata is
-        // available. Common modern ND2 XML stores loop counts separately in
-        // uiCount nodes with TimeLoop/ZStackLoop runtype attributes.
-        if size_z == 1 && loop_size_z.is_none() && loop_size_t.is_none() && !image_chunks.is_empty()
-        {
-            size_z = image_chunks.len() as u32;
-        }
-
         // If we still don't know dimensions, try to infer from first image chunk size
         if size_x == 0 {
             if let Some(&idx) = image_chunks.first() {
@@ -2905,6 +2898,18 @@ impl FormatReader for Nd2Reader {
                     size_t = image_count.max(1);
                 }
             }
+        }
+        if !image_metadata_lv.processed
+            && loop_size_z.is_none()
+            && loop_size_t.is_none()
+            && position_count <= 1
+            && image_count > 1
+            && size_z == 1
+            && size_t == 1
+        {
+            // Java fallback when no Z/T metadata was established: sizeZ is set
+            // to 1 and sizeT becomes imageOffsets.size()/seriesCount.
+            size_t = image_count;
         }
         let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
         series_metadata.insert("nd2_chunks".into(), MetadataValue::Int(chunks.len() as i64));

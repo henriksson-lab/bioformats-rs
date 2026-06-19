@@ -5,7 +5,7 @@
 //! `MinMaxCalculator`.
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::ome_metadata::{OmeChannel, OmeMetadata};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
@@ -31,6 +31,13 @@ fn effective_size_c(meta: &ImageMetadata) -> u32 {
     } else {
         meta.size_c.max(1)
     }
+}
+
+fn is_false_color(meta: &ImageMetadata) -> bool {
+    matches!(
+        meta.series_metadata.get("falseColor"),
+        Some(MetadataValue::Bool(true))
+    )
 }
 
 fn wrapper_ome_metadata(
@@ -163,6 +170,44 @@ impl ChannelSeparator {
             out
         }
     }
+
+    fn source_plane_for_separated_plane(meta: &ImageMetadata, plane_index: u32) -> Result<u32> {
+        let rgb_channels = rgb_channel_count(meta);
+        let effective_c = effective_size_c(meta);
+        let adjusted_count = meta
+            .image_count
+            .checked_mul(rgb_channels)
+            .ok_or_else(|| BioFormatsError::InvalidData("separated plane count overflow".into()))?;
+        if plane_index >= adjusted_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+
+        let adjusted_order = channel_first_dimension_order(meta.dimension_order);
+        let (z, c, t) = decompose_plane(
+            plane_index,
+            meta.size_z.max(1),
+            meta.size_c.max(1),
+            meta.size_t.max(1),
+            adjusted_order,
+        );
+        let source_c = c / rgb_channels;
+        if source_c >= effective_c {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let source = compose_plane(
+            z,
+            source_c,
+            t,
+            meta.size_z.max(1),
+            effective_c,
+            meta.size_t.max(1),
+            meta.dimension_order,
+        );
+        if source >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(source));
+        }
+        Ok(source)
+    }
 }
 
 impl FormatReader for ChannelSeparator {
@@ -215,7 +260,8 @@ impl FormatReader for ChannelSeparator {
             )
         };
         if is_split {
-            let real_plane = plane_index / nc;
+            let real_plane =
+                Self::source_plane_for_separated_plane(self.inner.metadata(), plane_index)?;
             let channel = (plane_index % nc) as usize;
             let data = self.inner.open_bytes(real_plane)?;
             Ok(Self::extract_channel(
@@ -248,7 +294,8 @@ impl FormatReader for ChannelSeparator {
             )
         };
         if is_split {
-            let real_plane = plane_index / nc;
+            let real_plane =
+                Self::source_plane_for_separated_plane(self.inner.metadata(), plane_index)?;
             let channel = (plane_index % nc) as usize;
             let data = self.inner.open_bytes_region(real_plane, x, y, w, h)?;
             Ok(Self::extract_channel(
@@ -274,7 +321,8 @@ impl FormatReader for ChannelSeparator {
             )
         };
         if is_split {
-            let real_plane = plane_index / nc;
+            let real_plane =
+                Self::source_plane_for_separated_plane(self.inner.metadata(), plane_index)?;
             let channel = (plane_index % nc) as usize;
             let data = self.inner.open_thumb_bytes(real_plane)?;
             Ok(Self::extract_channel(
@@ -293,7 +341,9 @@ impl FormatReader for ChannelSeparator {
         self.inner.resolution_count()
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        self.inner.set_resolution(level)?;
+        self.rebuild_meta();
+        Ok(())
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()
@@ -512,7 +562,8 @@ impl FormatReader for ChannelMerger {
         self.inner.resolution_count()
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        self.inner.set_resolution(level)?;
+        self.rebuild_meta()
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()
@@ -732,7 +783,9 @@ impl FormatReader for DimensionSwapper {
         self.inner.resolution_count()
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        self.inner.set_resolution(level)?;
+        self.rebuild_meta();
+        Ok(())
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()
@@ -973,7 +1026,9 @@ impl FormatReader for MinMaxCalculator {
         self.inner.resolution_count()
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        self.inner.set_resolution(level)?;
+        self.channel_stats.clear();
+        Ok(())
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()
@@ -991,6 +1046,7 @@ mod tests {
         meta: ImageMetadata,
         planes: Vec<Vec<u8>>,
         ome: Option<OmeMetadata>,
+        luts: Vec<LookupTable>,
     }
 
     impl MockReader {
@@ -999,12 +1055,96 @@ mod tests {
                 meta,
                 planes,
                 ome: None,
+                luts: Vec::new(),
             }
         }
 
         fn with_ome(mut self, ome: OmeMetadata) -> Self {
             self.ome = Some(ome);
             self
+        }
+
+        fn with_luts(mut self, luts: Vec<LookupTable>) -> Self {
+            self.luts = luts;
+            self
+        }
+    }
+
+    struct MultiResolutionMockReader {
+        metas: Vec<ImageMetadata>,
+        planes: Vec<Vec<Vec<u8>>>,
+        resolution: usize,
+    }
+
+    impl MultiResolutionMockReader {
+        fn new(metas: Vec<ImageMetadata>, planes: Vec<Vec<Vec<u8>>>) -> Self {
+            Self {
+                metas,
+                planes,
+                resolution: 0,
+            }
+        }
+    }
+
+    impl FormatReader for MultiResolutionMockReader {
+        fn is_this_type_by_name(&self, _path: &Path) -> bool {
+            true
+        }
+        fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+            true
+        }
+        fn set_id(&mut self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn series_count(&self) -> usize {
+            1
+        }
+        fn set_series(&mut self, _series: usize) -> Result<()> {
+            Ok(())
+        }
+        fn series(&self) -> usize {
+            0
+        }
+        fn metadata(&self) -> &ImageMetadata {
+            &self.metas[self.resolution]
+        }
+        fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+            self.planes
+                .get(self.resolution)
+                .and_then(|planes| planes.get(plane_index as usize))
+                .cloned()
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
+        }
+        fn open_bytes_region(
+            &mut self,
+            plane_index: u32,
+            _x: u32,
+            _y: u32,
+            _w: u32,
+            _h: u32,
+        ) -> Result<Vec<u8>> {
+            self.open_bytes(plane_index)
+        }
+        fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+            self.open_bytes(plane_index)
+        }
+        fn resolution_count(&self) -> usize {
+            self.metas.len()
+        }
+        fn set_resolution(&mut self, level: usize) -> Result<()> {
+            if level >= self.metas.len() {
+                return Err(BioFormatsError::InvalidData(format!(
+                    "resolution {level} out of range"
+                )));
+            }
+            self.resolution = level;
+            Ok(())
+        }
+        fn resolution(&self) -> usize {
+            self.resolution
         }
     }
 
@@ -1058,6 +1198,14 @@ mod tests {
 
         fn ome_metadata(&self) -> Option<OmeMetadata> {
             self.ome.clone()
+        }
+
+        fn lookup_table(&mut self, plane_index: u32) -> Result<Option<LookupTable>> {
+            Ok(self
+                .luts
+                .get(plane_index as usize)
+                .cloned()
+                .or_else(|| self.meta.lookup_table.clone()))
         }
     }
 
@@ -1205,6 +1353,70 @@ mod tests {
     }
 
     #[test]
+    fn channel_separator_maps_original_index_through_zct_coordinates() {
+        let mut meta = ImageMetadata::default();
+        meta.size_z = 2;
+        meta.size_c = 6;
+        meta.size_t = 1;
+        meta.image_count = 4;
+        meta.dimension_order = DimensionOrder::XYZCT;
+        meta.is_rgb = true;
+        meta.is_interleaved = true;
+
+        let planes = vec![
+            vec![10, 11, 12],
+            vec![20, 21, 22],
+            vec![30, 31, 32],
+            vec![40, 41, 42],
+        ];
+        let inner = Box::new(MockReader::new(meta, planes));
+        let mut separator = ChannelSeparator::new(inner);
+
+        separator.rebuild_meta();
+
+        assert_eq!(separator.metadata().image_count, 12);
+        assert_eq!(separator.metadata().dimension_order, DimensionOrder::XYCZT);
+        assert_eq!(separator.open_bytes(0).unwrap(), vec![10]);
+        assert_eq!(separator.open_bytes(1).unwrap(), vec![11]);
+        assert_eq!(separator.open_bytes(2).unwrap(), vec![12]);
+        assert_eq!(separator.open_bytes(6).unwrap(), vec![20]);
+        assert_eq!(separator.open_bytes(7).unwrap(), vec![21]);
+        assert_eq!(separator.open_bytes(8).unwrap(), vec![22]);
+    }
+
+    #[test]
+    fn channel_separator_rebuilds_metadata_after_resolution_change() {
+        let mut level0 = ImageMetadata::default();
+        level0.size_z = 1;
+        level0.size_c = 3;
+        level0.size_t = 1;
+        level0.image_count = 1;
+        level0.is_rgb = true;
+        level0.is_interleaved = true;
+
+        let mut level1 = level0.clone();
+        level1.size_c = 1;
+        level1.is_rgb = false;
+
+        let inner = Box::new(MultiResolutionMockReader::new(
+            vec![level0, level1],
+            vec![vec![vec![1, 2, 3]], vec![vec![9]]],
+        ));
+        let mut separator = ChannelSeparator::new(inner);
+        separator.rebuild_meta();
+
+        assert_eq!(separator.metadata().image_count, 3);
+        assert!(!separator.metadata().is_rgb);
+
+        separator.set_resolution(1).expect("switch resolution");
+
+        assert_eq!(separator.metadata().size_c, 1);
+        assert_eq!(separator.metadata().image_count, 1);
+        assert!(!separator.metadata().is_rgb);
+        assert_eq!(separator.open_bytes(0).unwrap(), vec![9]);
+    }
+
+    #[test]
     fn channel_merger_updates_dimension_order_and_ome_samples_like_java() {
         let mut meta = ImageMetadata::default();
         meta.size_z = 2;
@@ -1230,6 +1442,93 @@ mod tests {
     }
 
     #[test]
+    fn channel_merger_rebuilds_metadata_after_resolution_change() {
+        let mut level0 = ImageMetadata::default();
+        level0.size_z = 1;
+        level0.size_c = 3;
+        level0.size_t = 1;
+        level0.image_count = 3;
+        level0.is_rgb = false;
+
+        let mut level1 = ImageMetadata::default();
+        level1.size_z = 1;
+        level1.size_c = 1;
+        level1.size_t = 1;
+        level1.image_count = 1;
+        level1.is_rgb = false;
+
+        let inner = Box::new(MultiResolutionMockReader::new(
+            vec![level0, level1],
+            vec![vec![vec![1], vec![2], vec![3]], vec![vec![9]]],
+        ));
+        let mut merger = ChannelMerger::new(inner);
+        merger.rebuild_meta().expect("level 0 metadata");
+
+        assert!(merger.metadata().is_rgb);
+        assert_eq!(merger.metadata().image_count, 1);
+
+        merger.set_resolution(1).expect("switch resolution");
+
+        assert!(!merger.metadata().is_rgb);
+        assert_eq!(merger.metadata().size_c, 1);
+        assert_eq!(merger.metadata().image_count, 1);
+        assert_eq!(merger.open_bytes(0).unwrap(), vec![9]);
+    }
+
+    #[test]
+    fn dimension_swapper_rebuilds_metadata_after_resolution_change() {
+        let mut level0 = ImageMetadata::default();
+        level0.size_z = 1;
+        level0.size_c = 1;
+        level0.size_t = 1;
+        level0.image_count = 1;
+        level0.dimension_order = DimensionOrder::XYCZT;
+
+        let mut level1 = level0.clone();
+        level1.size_z = 2;
+        level1.image_count = 2;
+
+        let inner = Box::new(MultiResolutionMockReader::new(
+            vec![level0, level1],
+            vec![vec![vec![1]], vec![vec![2], vec![3]]],
+        ));
+        let mut swapper = DimensionSwapper::new(inner, DimensionOrder::XYZTC);
+        swapper.rebuild_meta();
+
+        assert_eq!(swapper.metadata().size_z, 1);
+
+        swapper.set_resolution(1).expect("switch resolution");
+
+        assert_eq!(swapper.metadata().size_z, 2);
+        assert_eq!(swapper.metadata().dimension_order, DimensionOrder::XYZTC);
+        assert_eq!(swapper.open_bytes(1).unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn minmax_calculator_clears_stats_after_resolution_change() {
+        let mut level0 = ImageMetadata::default();
+        level0.size_x = 2;
+        level0.size_y = 1;
+        level0.image_count = 1;
+
+        let level1 = level0.clone();
+        let inner = Box::new(MultiResolutionMockReader::new(
+            vec![level0, level1],
+            vec![vec![vec![1, 2]], vec![vec![10, 11]]],
+        ));
+        let mut calc = MinMaxCalculator::new(inner);
+
+        calc.open_bytes(0).expect("read level 0");
+        assert_eq!(calc.channel_min_max(), &[(1.0, 2.0)]);
+
+        calc.set_resolution(1).expect("switch resolution");
+        assert!(calc.channel_min_max().is_empty());
+
+        calc.open_bytes(0).expect("read level 1");
+        assert_eq!(calc.channel_min_max(), &[(10.0, 11.0)]);
+    }
+
+    #[test]
     fn channel_filler_updates_ome_channel_count() {
         let mut meta = ImageMetadata::default();
         meta.size_c = 1;
@@ -1240,12 +1539,126 @@ mod tests {
         let inner = Box::new(MockReader::new(meta, vec![vec![7]]).with_ome(ome));
         let mut filler = ChannelFiller::new(inner).with_channels(3);
 
-        filler.rebuild_meta();
+        filler.rebuild_meta().expect("filler metadata");
         let ome = filler.ome_metadata().expect("OME metadata");
 
         assert_eq!(filler.metadata().size_c, 3);
         assert_eq!(ome.images[0].channels.len(), 1);
         assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
+    }
+
+    #[test]
+    fn channel_filler_rebuilds_metadata_after_resolution_change() {
+        let mut level0 = ImageMetadata::default();
+        level0.size_x = 1;
+        level0.size_y = 1;
+        level0.size_c = 1;
+        level0.image_count = 1;
+        level0.is_interleaved = true;
+
+        let mut level1 = level0.clone();
+        level1.size_x = 2;
+
+        let inner = Box::new(MultiResolutionMockReader::new(
+            vec![level0, level1],
+            vec![vec![vec![7]], vec![vec![8, 9]]],
+        ));
+        let mut filler = ChannelFiller::new(inner).with_channels(3);
+        filler.rebuild_meta().expect("level 0 metadata");
+
+        assert_eq!(filler.metadata().size_x, 1);
+        assert_eq!(filler.open_bytes(0).unwrap(), vec![7, 0, 0]);
+
+        filler.set_resolution(1).expect("switch resolution");
+
+        assert_eq!(filler.metadata().size_x, 2);
+        assert_eq!(filler.metadata().size_c, 3);
+        assert_eq!(filler.open_bytes(0).unwrap(), vec![8, 0, 0, 9, 0, 0]);
+    }
+
+    #[test]
+    fn channel_filler_expands_indexed_lut_like_java() {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = 2;
+        meta.size_y = 1;
+        meta.size_c = 1;
+        meta.image_count = 1;
+        meta.pixel_type = PixelType::Uint8;
+        meta.bits_per_pixel = 8;
+        meta.is_indexed = true;
+        meta.is_interleaved = false;
+
+        let lut = LookupTable {
+            red: vec![10, 20],
+            green: vec![30, 40],
+            blue: vec![50, 60],
+        };
+        meta.lookup_table = Some(lut.clone());
+        let inner = Box::new(MockReader::new(meta, vec![vec![0, 1]]).with_luts(vec![lut]));
+        let mut filler = ChannelFiller::new(inner);
+
+        filler.rebuild_meta().expect("filler metadata");
+
+        assert_eq!(filler.metadata().size_c, 3);
+        assert!(filler.metadata().is_rgb);
+        assert!(!filler.metadata().is_indexed);
+        assert!(filler.metadata().lookup_table.is_none());
+        assert_eq!(filler.open_bytes(0).unwrap(), vec![10, 20, 30, 40, 50, 60]);
+    }
+
+    #[test]
+    fn channel_filler_reports_filled_index_bit_depth_like_java() {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = 1;
+        meta.size_y = 1;
+        meta.size_c = 1;
+        meta.image_count = 1;
+        meta.pixel_type = PixelType::Uint8;
+        meta.bits_per_pixel = 1;
+        meta.is_indexed = true;
+
+        let lut = LookupTable {
+            red: vec![10, 20],
+            green: vec![30, 40],
+            blue: vec![50, 60],
+        };
+        meta.lookup_table = Some(lut.clone());
+        let inner = Box::new(MockReader::new(meta, vec![vec![1]]).with_luts(vec![lut]));
+        let mut filler = ChannelFiller::new(inner);
+
+        filler.rebuild_meta().expect("filler metadata");
+
+        assert_eq!(filler.metadata().bits_per_pixel, 8);
+        assert_eq!(filler.open_bytes(0).unwrap(), vec![20, 40, 60]);
+    }
+
+    #[test]
+    fn channel_filler_leaves_false_color_indexed_data_unexpanded_like_java() {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = 2;
+        meta.size_y = 1;
+        meta.size_c = 1;
+        meta.image_count = 1;
+        meta.pixel_type = PixelType::Uint8;
+        meta.bits_per_pixel = 8;
+        meta.is_indexed = true;
+        meta.series_metadata
+            .insert("falseColor".into(), MetadataValue::Bool(true));
+
+        let lut = LookupTable {
+            red: vec![10, 20],
+            green: vec![30, 40],
+            blue: vec![50, 60],
+        };
+        meta.lookup_table = Some(lut.clone());
+        let inner = Box::new(MockReader::new(meta, vec![vec![0, 1]]).with_luts(vec![lut]));
+        let mut filler = ChannelFiller::new(inner);
+
+        filler.rebuild_meta().expect("filler metadata");
+
+        assert_eq!(filler.metadata().size_c, 1);
+        assert!(filler.metadata().is_indexed);
+        assert_eq!(filler.open_bytes(0).unwrap(), vec![0, 1]);
     }
 }
 
@@ -1260,6 +1673,7 @@ pub struct ChannelFiller {
     inner: Box<dyn FormatReader>,
     fill_to: Option<u32>,
     adjusted_meta: Option<ImageMetadata>,
+    lut_channels: Option<u32>,
 }
 
 impl ChannelFiller {
@@ -1268,6 +1682,7 @@ impl ChannelFiller {
             inner,
             fill_to: None,
             adjusted_meta: None,
+            lut_channels: None,
         }
     }
 
@@ -1277,7 +1692,25 @@ impl ChannelFiller {
         self
     }
 
-    fn rebuild_meta(&mut self) {
+    fn rebuild_meta(&mut self) -> Result<()> {
+        self.lut_channels = None;
+        if self.inner.metadata().is_indexed && !is_false_color(self.inner.metadata()) {
+            if let Some(lut) = self.inner.lookup_table(0)? {
+                let target_c = lut_component_count(&lut);
+                if target_c > 0 {
+                    let meta = self.inner.metadata();
+                    let mut adjusted = meta.clone();
+                    adjusted.size_c = meta.size_c.saturating_mul(target_c);
+                    adjusted.is_rgb = target_c > 1;
+                    adjusted.is_indexed = false;
+                    adjusted.bits_per_pixel = meta.pixel_type.bytes_per_sample() as u8 * 8;
+                    adjusted.lookup_table = None;
+                    self.adjusted_meta = Some(adjusted);
+                    self.lut_channels = Some(target_c);
+                    return Ok(());
+                }
+            }
+        }
         if let Some(target_c) = self.fill_to {
             let meta = self.inner.metadata();
             if target_c != meta.size_c {
@@ -1285,10 +1718,11 @@ impl ChannelFiller {
                 adjusted.size_c = target_c;
                 adjusted.is_rgb = target_c >= 3;
                 self.adjusted_meta = Some(adjusted);
-                return;
+                return Ok(());
             }
         }
         self.adjusted_meta = None;
+        Ok(())
     }
 
     fn fill_data(&self, data: Vec<u8>, target_c: u32) -> Vec<u8> {
@@ -1312,6 +1746,77 @@ impl ChannelFiller {
         }
         out
     }
+
+    fn expand_indexed_data(
+        data: Vec<u8>,
+        lut: &LookupTable,
+        pixel_type: PixelType,
+        little_endian: bool,
+        interleaved: bool,
+    ) -> Vec<u8> {
+        let bps = pixel_type.bytes_per_sample().max(1);
+        let channels = lut_component_count(lut) as usize;
+        if channels == 0 {
+            return data;
+        }
+        let pixels = data.len() / bps;
+        let mut out = vec![0u8; pixels * channels * bps];
+        for i in 0..pixels {
+            let offset = i * bps;
+            let index = match pixel_type {
+                PixelType::Uint16 | PixelType::Int16 if offset + 1 < data.len() => {
+                    let bytes = [data[offset], data[offset + 1]];
+                    if little_endian {
+                        u16::from_le_bytes(bytes) as usize
+                    } else {
+                        u16::from_be_bytes(bytes) as usize
+                    }
+                }
+                _ => data[offset] as usize,
+            };
+            for c in 0..channels {
+                let value = lut_value(lut, c, index);
+                if interleaved {
+                    let dst = (i * channels + c) * bps;
+                    write_lut_sample(&mut out[dst..dst + bps], value, bps, little_endian);
+                } else {
+                    let dst = (c * pixels + i) * bps;
+                    write_lut_sample(&mut out[dst..dst + bps], value, bps, little_endian);
+                }
+            }
+        }
+        out
+    }
+}
+
+fn lut_component_count(lut: &LookupTable) -> u32 {
+    [&lut.red, &lut.green, &lut.blue]
+        .iter()
+        .filter(|component| !component.is_empty())
+        .count() as u32
+}
+
+fn lut_value(lut: &LookupTable, channel: usize, index: usize) -> u16 {
+    let table = match channel {
+        0 => &lut.red,
+        1 => &lut.green,
+        _ => &lut.blue,
+    };
+    table.get(index).copied().unwrap_or(0)
+}
+
+fn write_lut_sample(dst: &mut [u8], value: u16, bps: usize, little_endian: bool) {
+    if bps == 1 {
+        dst[0] = value.min(u8::MAX as u16) as u8;
+    } else {
+        let bytes = if little_endian {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        };
+        dst[0] = bytes[0];
+        dst[1] = bytes[1];
+    }
 }
 
 impl FormatReader for ChannelFiller {
@@ -1323,11 +1828,11 @@ impl FormatReader for ChannelFiller {
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
-        self.rebuild_meta();
-        Ok(())
+        self.rebuild_meta()
     }
     fn close(&mut self) -> Result<()> {
         self.adjusted_meta = None;
+        self.lut_channels = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -1335,8 +1840,7 @@ impl FormatReader for ChannelFiller {
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
         self.inner.set_series(s)?;
-        self.rebuild_meta();
-        Ok(())
+        self.rebuild_meta()
     }
     fn series(&self) -> usize {
         self.inner.series()
@@ -1348,6 +1852,18 @@ impl FormatReader for ChannelFiller {
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         let data = self.inner.open_bytes(p)?;
+        if self.lut_channels.is_some() {
+            if let Some(lut) = self.inner.lookup_table(p)? {
+                let meta = self.inner.metadata();
+                return Ok(Self::expand_indexed_data(
+                    data,
+                    &lut,
+                    meta.pixel_type,
+                    meta.is_little_endian,
+                    meta.is_interleaved,
+                ));
+            }
+        }
         Ok(if let Some(c) = self.fill_to {
             self.fill_data(data, c)
         } else {
@@ -1356,6 +1872,18 @@ impl FormatReader for ChannelFiller {
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let data = self.inner.open_bytes_region(p, x, y, w, h)?;
+        if self.lut_channels.is_some() {
+            if let Some(lut) = self.inner.lookup_table(p)? {
+                let meta = self.inner.metadata();
+                return Ok(Self::expand_indexed_data(
+                    data,
+                    &lut,
+                    meta.pixel_type,
+                    meta.is_little_endian,
+                    meta.is_interleaved,
+                ));
+            }
+        }
         Ok(if let Some(c) = self.fill_to {
             self.fill_data(data, c)
         } else {
@@ -1369,7 +1897,8 @@ impl FormatReader for ChannelFiller {
         self.inner.resolution_count()
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        self.inner.set_resolution(level)?;
+        self.rebuild_meta()
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()

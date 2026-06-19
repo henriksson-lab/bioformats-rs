@@ -1,4 +1,6 @@
-use bioformats::{FormatReader, FormatWriter, ImageMetadata, ImageReader, ImageWriter, PixelType};
+use bioformats::{
+    FormatReader, FormatWriter, ImageMetadata, ImageReader, ImageWriter, MetadataValue, PixelType,
+};
 
 fn temp_path(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -478,6 +480,27 @@ fn tiff_writer_suffixes_match_java_big_tiff_suffixes() {
     ] {
         assert!(!pyramid.is_this_type(std::path::Path::new(name)), "{name}");
     }
+}
+
+#[test]
+fn image_writer_ome_tiff_dispatch_matches_java_pyramid_first_order() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 2;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_c = 1;
+    meta.image_count = 1;
+
+    let path = temp_path("generic_dispatch.ome.tif");
+    ImageWriter::save(&path, &meta, &[vec![1, 2, 3, 4]]).unwrap();
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.windows(b"<OME".len()).any(|window| window == b"<OME"),
+        "generic .ome.tif dispatch should write OME metadata like Java's OME-TIFF writers"
+    );
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
 }
 
 #[test]
@@ -977,6 +1000,154 @@ fn nrrd_writer_preserves_rgb_time_axis() {
 }
 
 #[test]
+fn ics_writer_describes_rgb_as_interleaved_channel_axis() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.size_c = 3;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+
+    let path = temp_path("ics_rgb_interleaved.ics");
+    ImageWriter::save(&path, &meta, &[vec![1, 2, 3, 4, 5, 6]]).unwrap();
+
+    let mut reader = bioformats::formats::ics::IcsReader::new();
+    reader.set_id(&path).unwrap();
+    assert!(reader.metadata().is_rgb);
+    assert!(reader.metadata().is_interleaved);
+    assert_eq!(reader.metadata().size_c, 3);
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn ics_writer_reorders_non_rgb_planes_to_declared_xyztc_layout() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.size_z = 1;
+    meta.size_c = 2;
+    meta.size_t = 2;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 4;
+    meta.dimension_order = bioformats::common::metadata::DimensionOrder::XYCZT;
+
+    let path = temp_path("ics_ct_reordered.ics");
+    ImageWriter::save(&path, &meta, &[vec![10], vec![20], vec![30], vec![40]]).unwrap();
+
+    let mut reader = bioformats::formats::ics::IcsReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(
+        reader.metadata().dimension_order,
+        bioformats::common::metadata::DimensionOrder::XYTCZ
+    );
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![10]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![30]);
+    assert_eq!(reader.open_bytes(2).unwrap(), vec![20]);
+    assert_eq!(reader.open_bytes(3).unwrap(), vec![40]);
+}
+
+#[test]
+fn ics_writer_accepts_ids_suffix_like_java_ics1_pair() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.size_c = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+
+    let ids_path = temp_path("writer_pair.ids");
+    let ics_path = ids_path.with_extension("ics");
+    ImageWriter::save(&ids_path, &meta, &[vec![7, 9]]).unwrap();
+
+    assert!(ids_path.exists(), "ICS writer did not create .ids pixels");
+    assert!(ics_path.exists(), "ICS writer did not create .ics metadata");
+
+    let header = std::fs::read_to_string(&ics_path).unwrap();
+    assert!(header.contains("ics_version\t1.0"));
+    assert!(header.contains("filename\t"));
+    assert!(header.contains("layout\torder\tbits x y"));
+    assert_eq!(std::fs::read(&ids_path).unwrap(), vec![7, 9]);
+
+    let mut from_ics = bioformats::formats::ics::IcsReader::new();
+    from_ics.set_id(&ics_path).unwrap();
+    assert_eq!(from_ics.open_bytes(0).unwrap(), vec![7, 9]);
+
+    let mut from_ids = bioformats::formats::ics::IcsReader::new();
+    from_ids.set_id(&ids_path).unwrap();
+    assert_eq!(from_ids.open_bytes(0).unwrap(), vec![7, 9]);
+}
+
+#[test]
+fn scientific_writers_emit_bytes_matching_declared_endianness() {
+    let mut big_meta = ImageMetadata::default();
+    big_meta.size_x = 1;
+    big_meta.size_y = 1;
+    big_meta.pixel_type = PixelType::Uint16;
+    big_meta.bits_per_pixel = 16;
+    big_meta.image_count = 1;
+    big_meta.size_c = 1;
+    big_meta.is_little_endian = false;
+
+    let fits = temp_path("writer_big_input.fits");
+    ImageWriter::save(&fits, &big_meta, &[vec![0x12, 0x34]]).unwrap();
+    let mut fits_reader = bioformats::formats::fits::FitsReader::new();
+    fits_reader.set_id(&fits).unwrap();
+    assert!(!fits_reader.metadata().is_little_endian);
+    assert_eq!(fits_reader.open_bytes(0).unwrap(), vec![0x12, 0x34]);
+
+    let cases: Vec<(&str, &str, Box<dyn Fn(&std::path::Path) -> Vec<u8>>)> = vec![
+        (
+            "ICS",
+            "writer_big_input.ics",
+            Box::new(|p| {
+                let mut r = bioformats::formats::ics::IcsReader::new();
+                r.set_id(p).unwrap();
+                r.open_bytes(0).unwrap()
+            }),
+        ),
+        (
+            "MRC",
+            "writer_big_input.mrc",
+            Box::new(|p| {
+                let mut r = bioformats::formats::mrc::MrcReader::new();
+                r.set_id(p).unwrap();
+                r.open_bytes(0).unwrap()
+            }),
+        ),
+        (
+            "NRRD",
+            "writer_big_input.nrrd",
+            Box::new(|p| {
+                let mut r = bioformats::formats::nrrd::NrrdReader::new();
+                r.set_id(p).unwrap();
+                r.open_bytes(0).unwrap()
+            }),
+        ),
+        (
+            "MetaImage",
+            "writer_big_input.mha",
+            Box::new(|p| {
+                let mut r = bioformats::formats::metaimage::MetaImageReader::new();
+                r.set_id(p).unwrap();
+                r.open_bytes(0).unwrap()
+            }),
+        ),
+    ];
+
+    for (name, file, open) in cases {
+        let path = temp_path(file);
+        ImageWriter::save(&path, &big_meta, &[vec![0x12, 0x34]]).unwrap();
+        assert_eq!(open(&path), vec![0x34, 0x12], "{name}");
+    }
+}
+
+#[test]
 fn direct_non_tiff_stack_writers_reject_wrong_plane_size() {
     for (name, ext, mut writer) in direct_stack_writer_cases() {
         let meta = stack_writer_meta();
@@ -1243,7 +1414,7 @@ fn direct_single_plane_writers_reject_malformed_planes() {
     let err = tga.save_bytes(0, &[1, 2]).unwrap_err();
     assert!(
         err.to_string()
-            .contains("TGA writer: plane 0 has 2 bytes, expected 1"),
+            .contains("writer plane has 2 bytes, expected 1"),
         "unexpected error: {err}"
     );
 
@@ -1309,6 +1480,62 @@ fn direct_tga_and_eps_writers_reject_stack_metadata() {
             .contains("EPS writer supports only one plane"),
         "unexpected EPS error: {err}"
     );
+}
+
+#[test]
+fn direct_png_writer_preserves_big_endian_uint16_samples() {
+    let path = temp_path("direct_big_endian_u16.png");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint16;
+    meta.size_c = 1;
+    meta.image_count = 1;
+    meta.is_little_endian = false;
+
+    let data = [0x12, 0x34, 0xab, 0xcd];
+    let mut writer = bioformats::formats::png::PngWriter::new();
+    writer.set_metadata(&meta).unwrap();
+    writer.set_id(&path).unwrap();
+    writer.save_bytes(0, &data).unwrap();
+    writer.close().unwrap();
+
+    let mut reader = bioformats::formats::png::PngReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), data);
+}
+
+#[test]
+fn direct_tga_and_pnm_writers_interleave_planar_rgb_input() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_c = 3;
+    meta.image_count = 1;
+    meta.is_rgb = true;
+    meta.is_interleaved = false;
+
+    let planar = [1, 2, 10, 20, 100, 200];
+    let interleaved = [1, 10, 100, 2, 20, 200];
+
+    let tga_path = temp_path("direct_planar_rgb.tga");
+    let mut tga = bioformats::formats::raster::TgaWriter::new();
+    tga.set_metadata(&meta).unwrap();
+    tga.set_id(&tga_path).unwrap();
+    tga.save_bytes(0, &planar).unwrap();
+    tga.close().unwrap();
+    let mut tga_reader = ImageReader::open(&tga_path).unwrap();
+    assert_eq!(tga_reader.open_bytes(0).unwrap(), interleaved);
+
+    let pnm_path = temp_path("direct_planar_rgb.ppm");
+    let mut pnm = bioformats::formats::raster::PnmWriter::new();
+    pnm.set_metadata(&meta).unwrap();
+    pnm.set_id(&pnm_path).unwrap();
+    pnm.save_bytes(0, &planar).unwrap();
+    pnm.close().unwrap();
+    let mut pnm_reader = ImageReader::open(&pnm_path).unwrap();
+    assert_eq!(pnm_reader.open_bytes(0).unwrap(), interleaved);
 }
 
 #[test]
@@ -1450,8 +1677,90 @@ fn ome_tiff_writer_keeps_resolution_offsets_after_description() {
         bioformats::tiff::ifd::IfdValue::Rational(v) => v[0].0 as f64 / v[0].1 as f64,
         other => panic!("expected rational, got {other:?}"),
     };
-    assert_eq!(rational(ifd.get(tag::X_RESOLUTION).unwrap()), 72.0);
-    assert_eq!(rational(ifd.get(tag::Y_RESOLUTION).unwrap()), 72.0);
+    assert_eq!(rational(ifd.get(tag::X_RESOLUTION).unwrap()), 0.0);
+    assert_eq!(rational(ifd.get(tag::Y_RESOLUTION).unwrap()), 0.0);
+    assert_eq!(ifd.get_u16(tag::RESOLUTION_UNIT), Some(3));
+}
+
+#[test]
+fn tiff_writer_writes_java_imagej_description_and_physical_resolution() {
+    use bioformats::tiff::ifd::tag;
+    use bioformats::tiff::parser::TiffParser;
+    use bioformats::TiffWriter;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 2;
+    meta.size_z = 2;
+    meta.size_c = 3;
+    meta.size_t = 2;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 12;
+    meta.series_metadata
+        .insert("PhysicalSizeX".into(), MetadataValue::Float(0.5));
+    meta.series_metadata
+        .insert("PhysicalSizeY".into(), MetadataValue::Float(0.25));
+
+    let path = temp_path("java_imagej_description_resolution.tif");
+    let mut writer = TiffWriter::new();
+    writer.set_metadata(&meta).unwrap();
+    writer.set_id(&path).unwrap();
+    for plane in 0..12 {
+        writer.save_bytes(plane, &[plane as u8; 4]).unwrap();
+    }
+    writer.close().unwrap();
+
+    let file = File::open(&path).unwrap();
+    let mut parser = TiffParser::new(BufReader::new(file)).unwrap();
+    let ifds = parser.read_ifds().unwrap();
+    assert_eq!(ifds.len(), 12);
+    let first = &ifds[0];
+    let description = first.get_str(tag::IMAGE_DESCRIPTION).unwrap();
+    assert!(description.starts_with("ImageJ=\nhyperstack=true\n"));
+    assert!(description.contains("images=12"));
+    assert!(description.contains("channels=3"));
+    assert!(description.contains("slices=2"));
+    assert!(description.contains("frames=2"));
+    assert_eq!(first.get_vec_f64(tag::X_RESOLUTION), vec![20000.0]);
+    assert_eq!(first.get_vec_f64(tag::Y_RESOLUTION), vec![40000.0]);
+    assert_eq!(first.get_u16(tag::RESOLUTION_UNIT), Some(3));
+    assert_eq!(
+        ifds[1].get_str(tag::IMAGE_DESCRIPTION).unwrap(),
+        description
+    );
+}
+
+#[test]
+fn pyramid_ome_tiff_direct_writer_auto_embeds_ome_xml() {
+    use bioformats::tiff::ifd::tag;
+    use bioformats::tiff::parser::TiffParser;
+    use bioformats::tiff::PyramidOmeTiffWriter;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 4;
+    meta.size_y = 4;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    let path = temp_path("direct_auto_ome_pyramid.ome.tif");
+    let mut writer = PyramidOmeTiffWriter::new();
+    writer.set_metadata(&meta).unwrap();
+    writer.set_id(&path).unwrap();
+    writer.save_bytes(0, &[1; 16]).unwrap();
+    writer.add_resolution_level(vec![vec![2; 4]]);
+    writer.close().unwrap();
+
+    let file = File::open(&path).unwrap();
+    let mut parser = TiffParser::new(BufReader::new(file)).unwrap();
+    let ifds = parser.read_ifds().unwrap();
+    let description = ifds[0].get_str(tag::IMAGE_DESCRIPTION).unwrap();
+    assert!(description.contains("<OME"));
+    assert!(description.contains("<Pixels"));
+    assert_eq!(ifds[0].get_u16(tag::RESOLUTION_UNIT), Some(3));
 }
 
 #[test]

@@ -68,6 +68,95 @@ fn kodak_find(data: &[u8], marker: &[u8], from: usize) -> Option<usize> {
         .map(|p| from + p)
 }
 
+fn kodak_read_cstring(data: &[u8], offset: usize) -> Option<String> {
+    if offset >= data.len() {
+        return None;
+    }
+    let end = data[offset..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|p| offset + p)
+        .unwrap_or(data.len());
+    Some(String::from_utf8_lossy(&data[offset..end]).into_owned())
+}
+
+fn kodak_parse_capture_date(value: &str) -> Option<String> {
+    let (time, date) = value.split_once(" on ")?;
+    let mut parts = date.split('/');
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    let year: i32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{year:04}-{month:02}-{day:02}T{time}"))
+}
+
+fn kodak_first_number(value: &str) -> Option<f64> {
+    value.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+fn kodak_add_extra_metadata(data: &[u8], meta: &mut ImageMetadata) {
+    if let Some(pos) = kodak_find(data, b"Image Capture Source", 0) {
+        if let Some(metadata) = kodak_read_cstring(data, pos) {
+            for line in metadata.split('\n') {
+                let Some(index) = line.find(':') else {
+                    continue;
+                };
+                if line.starts_with('#') || line.starts_with('-') {
+                    continue;
+                }
+                let key = line[..index].trim();
+                let value = line[index + 1..].trim();
+                if key.is_empty() {
+                    continue;
+                }
+                meta.series_metadata
+                    .insert(key.to_string(), MetadataValue::String(value.to_string()));
+            }
+        }
+    }
+}
+
+fn kodak_add_file_info_metadata(data: &[u8], meta: &mut ImageMetadata) {
+    const FILEINFO_STRING: &[u8] = b"DLFi";
+    let Some(pos) = kodak_find(data, FILEINFO_STRING, 0) else {
+        return;
+    };
+    if data.len().saturating_sub(pos) < FILEINFO_STRING.len() + 20 {
+        return;
+    }
+    let length_offset = pos + FILEINFO_STRING.len() + 16;
+    let tag_total = i32::from_be_bytes([
+        data[length_offset],
+        data[length_offset + 1],
+        data[length_offset + 2],
+        data[length_offset + 3],
+    ]);
+    let data_length = tag_total - FILEINFO_STRING.len() as i32 - 20;
+    if data_length <= 0 {
+        return;
+    }
+    let data_offset = length_offset + 4;
+    let data_length = data_length as usize;
+    if data.len().saturating_sub(data_offset) < data_length {
+        return;
+    }
+    let info = String::from_utf8_lossy(&data[data_offset..data_offset + data_length]);
+    let collapsed = info
+        .split(|ch| ch == '\r' || ch == '\n')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let trimmed = collapsed.trim();
+    if !trimmed.is_empty() {
+        meta.series_metadata.insert(
+            "FileInfo".into(),
+            MetadataValue::String(trimmed.to_string()),
+        );
+    }
+}
+
 fn parse_kodak_bip(path: &Path) -> Result<(ImageMetadata, u64)> {
     let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
 
@@ -108,7 +197,7 @@ fn parse_kodak_bip(path: &Path) -> Result<(ImageMetadata, u64)> {
     })?;
     let pixel_offset = (pix_pos + PIXELS_STRING.len() + 20) as u64;
 
-    let meta = ImageMetadata {
+    let mut meta = ImageMetadata {
         size_x: width,
         size_y: height,
         size_z: 1,
@@ -130,6 +219,8 @@ fn parse_kodak_bip(path: &Path) -> Result<(ImageMetadata, u64)> {
         modulo_c: None,
         modulo_t: None,
     };
+    kodak_add_extra_metadata(&data, &mut meta);
+    kodak_add_file_info_metadata(&data, &mut meta);
     Ok((meta, pixel_offset))
 }
 
@@ -225,6 +316,61 @@ impl FormatReader for KodakReader {
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        let Some(img) = ome.images.first_mut() else {
+            return Some(ome);
+        };
+
+        if let Some(MetadataValue::String(value)) = meta.series_metadata.get("Capture Time/Date") {
+            img.acquisition_date = kodak_parse_capture_date(value);
+        }
+        if let Some(MetadataValue::String(value)) = meta.series_metadata.get("Exposure Time") {
+            if let Some(exposure_time) = kodak_first_number(value) {
+                if img.planes.is_empty() {
+                    img.planes
+                        .push(crate::common::ome_metadata::OmePlane::default());
+                }
+                img.planes[0].exposure_time = Some(exposure_time);
+            }
+        }
+        if let Some(MetadataValue::String(value)) =
+            meta.series_metadata.get("Horizontal Resolution")
+        {
+            img.physical_size_x = kodak_first_number(value)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|ppi| 25400.0 / ppi);
+        }
+        if let Some(MetadataValue::String(value)) = meta.series_metadata.get("Vertical Resolution")
+        {
+            img.physical_size_y = kodak_first_number(value)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|ppi| 25400.0 / ppi);
+        }
+        if let Some(MetadataValue::String(value)) = meta.series_metadata.get("CCD Temperature") {
+            let hex = value.strip_prefix("0x").filter(|digits| {
+                digits
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
+            });
+            if hex.is_none() {
+                img.imaging_environment_temperature = kodak_first_number(value);
+            }
+        }
+        if let Some(MetadataValue::String(value)) = meta.series_metadata.get("Image Capture Source")
+        {
+            ome.instruments
+                .push(crate::common::ome_metadata::OmeInstrument {
+                    id: Some("Instrument:0".to_string()),
+                    microscope_model: Some(value.clone()),
+                    ..Default::default()
+                });
+            img.instrument_ref = Some(0);
+        }
+        Some(ome)
+    }
 }
 
 // ── FujiReader ────────────────────────────────────────────────────────────────
@@ -301,10 +447,35 @@ fn fuji_pixel_type_from_bytes(bytes: usize) -> Result<PixelType> {
         1 => Ok(PixelType::Uint8),
         2 => Ok(PixelType::Uint16),
         4 => Ok(PixelType::Uint32),
+        8 => Ok(PixelType::Float64),
         _ => Err(BioFormatsError::UnsupportedFormat(format!(
             "Fuji LAS: unsupported pixel size of {bytes} byte(s)"
         ))),
     }
+}
+
+/// Split as Java `String.split("\r{0,1}\n")`: normalize CRLF lines and discard
+/// trailing empty fields produced by terminal newlines.
+fn fuji_split_lines(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    while lines.len() > 1 && lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// Port of Java `Double.parseDouble` plus `FormatTools.getPhysicalSizeX/Y`:
+/// Fuji stores values in micrometres, and OME metadata is populated only for
+/// finite positive values.
+fn fuji_physical_size(value: &str) -> Result<Option<f64>> {
+    let parsed = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| BioFormatsError::Format("Fuji LAS: invalid physical size".into()))?;
+    Ok(parsed.is_finite().then_some(parsed).filter(|v| *v > 0.0))
 }
 
 /// Convert a Fuji `ddd MMM dd HH:mm:ss yyyy` timestamp (e.g.
@@ -350,10 +521,7 @@ fn parse_fuji(inf_file: &Path) -> Result<(ImageMetadata, FujiHeader)> {
     })?;
 
     let text = std::fs::read_to_string(inf_file).map_err(BioFormatsError::Io)?;
-    let lines: Vec<&str> = text
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .collect();
+    let lines = fuji_split_lines(&text);
 
     // Java indexes lines[5..13] directly; guard the highest index it touches.
     if lines.len() <= 13 {
@@ -412,8 +580,8 @@ fn parse_fuji(inf_file: &Path) -> Result<(ImageMetadata, FujiHeader)> {
 
     let image_name = Some(lines[1].to_string());
     let acquisition_date = fuji_format_date(lines[10].trim());
-    let physical_size_x = lines[3].trim().parse::<f64>().ok();
-    let physical_size_y = lines[4].trim().parse::<f64>().ok();
+    let physical_size_x = fuji_physical_size(lines[3])?;
+    let physical_size_y = fuji_physical_size(lines[4])?;
     let instrument = Some(lines[13].to_string());
 
     let header = FujiHeader {
@@ -823,7 +991,10 @@ pub(crate) fn parse_pict_bytes(data: &[u8]) -> Result<PictDecoded> {
                 "Invalid PICT file: {ver_number2}"
             )));
         }
-        c.skip(18)?;
+        c.skip(6)?;
+        let _pixels_per_inch_x = c.read_exact(4)?;
+        let _pixels_per_inch_y = c.read_exact(4)?;
+        c.skip(4)?;
         let y = c.read_i16()?;
         let x = c.read_i16()?;
         if y > 0 {
@@ -1130,9 +1301,9 @@ fn rows_to_pict_decoded(
                     }
                     let v = u16::from_be_bytes([row[off], row[off + 1]]);
                     let base = y * width as usize + x;
-                    pixels[base] = ((v & 0x7c00) >> 7) as u8;
-                    pixels[plane + base] = ((v & 0x03e0) >> 2) as u8;
-                    pixels[2 * plane + base] = ((v & 0x001f) << 3) as u8;
+                    pixels[base] = ((v & 0x7c00) >> 10) as u8;
+                    pixels[plane + base] = ((v & 0x03e0) >> 5) as u8;
+                    pixels[2 * plane + base] = (v & 0x001f) as u8;
                 }
             }
             let meta = new_pict_meta(width, height, 3, true, false, None, version_one);
@@ -1364,6 +1535,37 @@ mod tests {
         out.extend_from_slice(&v.to_be_bytes());
     }
 
+    fn push_u32(out: &mut Vec<u8>, v: u32) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn kodak_tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bioformats_legacy_{}_{}.bip",
+            name,
+            std::process::id()
+        ))
+    }
+
+    fn build_kodak_bip(width: u32, height: u32, metadata: &[u8], file_info: &[u8]) -> Vec<u8> {
+        let mut out = b"DTag".to_vec();
+        out.extend_from_slice(metadata);
+        out.extend_from_slice(b"GBiH");
+        out.extend_from_slice(&[0; 20]);
+        push_u32(&mut out, width);
+        push_u32(&mut out, height);
+        out.extend_from_slice(b"DLFi");
+        out.extend_from_slice(&[0; 16]);
+        push_u32(&mut out, (b"DLFi".len() + 20 + file_info.len()) as u32);
+        out.extend_from_slice(file_info);
+        out.extend_from_slice(b"BSfD");
+        out.extend_from_slice(&[0; 20]);
+        for i in 0..width * height {
+            out.extend_from_slice(&(i as f32 + 0.5).to_be_bytes());
+        }
+        out
+    }
+
     fn pict_v2_prefix(width: u16, height: u16) -> Vec<u8> {
         let mut out = vec![0; 512];
         push_u16(&mut out, 0);
@@ -1373,11 +1575,85 @@ mod tests {
         push_u16(&mut out, width);
         out.extend_from_slice(&[0x00, 0x11]);
         push_u16(&mut out, 0x02ff);
-        out.extend_from_slice(&[0; 18]);
+        out.extend_from_slice(&[0; 6]);
+        out.extend_from_slice(&72u32.to_be_bytes());
+        out.extend_from_slice(&72u32.to_be_bytes());
+        out.extend_from_slice(&[0; 4]);
         push_u16(&mut out, height);
         push_u16(&mut out, width);
         out.extend_from_slice(&[0; 4]);
         out
+    }
+
+    #[test]
+    fn kodak_reads_pixels_and_java_metadata_blocks() {
+        let path = kodak_tmp("metadata");
+        let metadata = b"Image Capture Source: Image Station 4000MM\nCapture Time/Date: 12:34:56 on 03/04/2005\nExposure Time: 1.25 sec\nHorizontal Resolution: 5080 dpi\nVertical Resolution: 2540 dpi\nCCD Temperature: 22 C\n\0";
+        let data = build_kodak_bip(2, 1, metadata, b"first line\r\nsecond line");
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = KodakReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y), (2, 1));
+        assert_eq!(meta.pixel_type, PixelType::Float32);
+        assert!(!meta.is_little_endian);
+        assert_eq!(
+            meta.series_metadata
+                .get("Image Capture Source")
+                .map(|v| v.to_string()),
+            Some("Image Station 4000MM".to_string())
+        );
+        assert_eq!(
+            meta.series_metadata.get("FileInfo").map(|v| v.to_string()),
+            Some("first line | second line".to_string())
+        );
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            [0.5f32.to_be_bytes(), 1.5f32.to_be_bytes()].concat()
+        );
+
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        assert_eq!(
+            image.acquisition_date.as_deref(),
+            Some("2005-03-04T12:34:56")
+        );
+        assert_eq!(image.planes[0].exposure_time, Some(1.25));
+        assert_eq!(image.physical_size_x, Some(5.0));
+        assert_eq!(image.physical_size_y, Some(10.0));
+        assert_eq!(image.imaging_environment_temperature, Some(22.0));
+        assert_eq!(
+            ome.instruments[0].microscope_model.as_deref(),
+            Some("Image Station 4000MM")
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn kodak_hex_ccd_temperature_is_metadata_only_like_java() {
+        let path = kodak_tmp("hex_temp");
+        let metadata = b"Image Capture Source: Image Station\nCCD Temperature: 0xEB\n\0";
+        let data = build_kodak_bip(1, 1, metadata, b"");
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = KodakReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(
+            reader
+                .metadata()
+                .series_metadata
+                .get("CCD Temperature")
+                .map(|v| v.to_string()),
+            Some("0xEB".to_string())
+        );
+        assert_eq!(
+            reader.ome_metadata().unwrap().images[0].imaging_environment_temperature,
+            None
+        );
+
+        std::fs::remove_file(path).ok();
     }
 
     fn append_pixmap_8(out: &mut Vec<u8>, width: u16, height: u16, rows: &[&[u8]]) {
@@ -1511,6 +1787,45 @@ mod tests {
         let mut reader = PictReader::new();
         let err = reader.set_id(&path).unwrap_err();
         assert!(err.to_string().contains("PackBits row decoded"));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_16_bit_direct_color_matches_java_5_bit_channels() {
+        let path = tmp("pixmap16");
+        let mut data = pict_v2_prefix(2, 1);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_BITSRECT);
+        push_u16(&mut data, 0x8004);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 1);
+        push_u16(&mut data, 2);
+        data.extend_from_slice(&[0; 18]);
+        push_u16(&mut data, 16);
+        push_u16(&mut data, 1);
+        data.extend_from_slice(&[0; 14]);
+        data.extend_from_slice(&[0; 4]);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        data.extend_from_slice(&[0; 6]);
+        data.extend_from_slice(&[0; 18]);
+        push_u16(&mut data, 0x7fff);
+        push_u16(&mut data, 0x001f);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_END);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = PictReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_c, 3);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![31, 0, 31, 0, 31, 31]);
 
         std::fs::remove_file(path).ok();
     }
@@ -1682,6 +1997,68 @@ mod tests {
         // No .inf companion => not a Fuji dataset (the .img extension is shared).
         let reader = FujiReader::new();
         assert!(!reader.is_this_type_by_name(&img));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fuji_maps_64_bit_samples_like_java_pixel_type_from_bytes() {
+        let dir = fuji_tmp_dir("float64");
+        let inf = dir.join("gel.inf");
+        let img = dir.join("gel.img");
+
+        std::fs::write(&inf, fuji_inf("float gel", "1.0", "1.0", 64, 1, 1)).unwrap();
+        std::fs::write(&img, 42.0f64.to_le_bytes()).unwrap();
+
+        let mut reader = FujiReader::new();
+        reader.set_id(&inf).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.pixel_type, PixelType::Float64);
+        assert_eq!(meta.bits_per_pixel, 64);
+        assert_eq!(reader.open_bytes(0).unwrap(), 42.0f64.to_le_bytes());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fuji_filters_non_positive_physical_sizes_like_format_tools() {
+        let dir = fuji_tmp_dir("badphys");
+        let inf = dir.join("gel.inf");
+        let img = dir.join("gel.img");
+
+        let mut header = fuji_inf("bad phys", "0", "-2.5", 8, 1, 1);
+        header.push_str("\r\n");
+        std::fs::write(&inf, header).unwrap();
+        std::fs::write(&img, [7u8]).unwrap();
+
+        let mut reader = FujiReader::new();
+        reader.set_id(&inf).unwrap();
+        assert_eq!(reader.metadata().series_metadata.len(), 14);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].physical_size_x, None);
+        assert_eq!(ome.images[0].physical_size_y, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fuji_rejects_invalid_physical_size_like_double_parse() {
+        let dir = fuji_tmp_dir("invalidphys");
+        let inf = dir.join("gel.inf");
+        let img = dir.join("gel.img");
+
+        std::fs::write(
+            &inf,
+            fuji_inf("invalid phys", "not-a-number", "1.0", 8, 1, 1),
+        )
+        .unwrap();
+        std::fs::write(&img, [7u8]).unwrap();
+
+        let mut reader = FujiReader::new();
+        assert!(matches!(
+            reader.set_id(&inf),
+            Err(BioFormatsError::Format(message)) if message.contains("invalid physical size")
+        ));
 
         std::fs::remove_dir_all(&dir).ok();
     }

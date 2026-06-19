@@ -121,6 +121,10 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
     let (processing_log, pixel_offset) = read_cstring(&mut f)?;
 
     let mut meta = aim_metadata(w, h, d);
+    let mut date: Option<String> = None;
+    let mut voxel_counts: [Option<f64>; 3] = [None, None, None];
+    let mut voxel_lengths: [Option<f64>; 3] = [None, None, None];
+
     // Store the processing log lines as global metadata (key  value pairs).
     for line in processing_log.split('\n') {
         let line = line.trim();
@@ -132,11 +136,104 @@ fn load_aim_header(path: &Path) -> Result<(ImageMetadata, u64)> {
                     key.to_string(),
                     crate::common::metadata::MetadataValue::String(value.to_string()),
                 );
+
+                match key {
+                    "Original Creation-Date" => {
+                        date = format_aim_date(value);
+                    }
+                    "Orig-ISQ-Dim-p" => {
+                        voxel_counts = parse_first_three_f64(value);
+                    }
+                    "Orig-ISQ-Dim-um" => {
+                        voxel_lengths = parse_first_three_f64(value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(date) = date {
+        meta.series_metadata.insert(
+            "Acquisition Date".to_string(),
+            crate::common::metadata::MetadataValue::String(date),
+        );
+    }
+    for (idx, key) in ["PhysicalSizeX", "PhysicalSizeY", "PhysicalSizeZ"]
+        .iter()
+        .enumerate()
+    {
+        if let (Some(count), Some(length)) = (voxel_counts[idx], voxel_lengths[idx]) {
+            if count > 0.0 {
+                meta.series_metadata.insert(
+                    (*key).to_string(),
+                    crate::common::metadata::MetadataValue::Float(length / count),
+                );
             }
         }
     }
 
     Ok((meta, pixel_offset))
+}
+
+fn format_aim_date(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let date = parts.next()?;
+    let time = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let mut date_parts = date.split('-');
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    let month = aim_month_number(date_parts.next()?)?;
+    let year: i32 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+
+    let mut time_parts = time.split(':');
+    let hour: u32 = time_parts.next()?.parse().ok()?;
+    let minute: u32 = time_parts.next()?.parse().ok()?;
+    let second: u32 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some()
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
+    ))
+}
+
+fn aim_month_number(month: &str) -> Option<u32> {
+    match month.to_ascii_lowercase().as_str() {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_first_three_f64(value: &str) -> [Option<f64>; 3] {
+    let mut out = [None, None, None];
+    for (slot, token) in out.iter_mut().zip(value.split_whitespace()) {
+        *slot = token.parse::<f64>().ok();
+    }
+    out
 }
 
 fn positive_dim(value: i32, label: &str) -> Result<u32> {

@@ -468,7 +468,10 @@ impl FormatReader for AmiraReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("am") | Some("amiramesh"))
+        matches!(
+            ext.as_deref(),
+            Some("am") | Some("amiramesh") | Some("grey") | Some("hx") | Some("labels")
+        )
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -501,7 +504,9 @@ impl FormatReader for AmiraReader {
             bits_per_pixel: (hdr.pixel_type.bytes_per_sample() * 8) as u8,
             image_count,
             dimension_order: DimensionOrder::XYZCT,
-            is_rgb: hdr.channels > 1,
+            // Java AmiraReader counts multiple @N streams as SizeC but does
+            // not mark the image as RGB.
+            is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
             is_little_endian: little_endian,
@@ -651,7 +656,7 @@ impl FormatReader for AmiraReader {
 //   Word 5 (off 16): IFORM  — file type: 1=2D, 3=3D, 11=2D sequence
 //   Word 12 (off 44): NSAM   — columns (width)
 //   Word 13 (off 48): LABREC — records in header
-//   Word 22 (off 84): LABBYT — total header bytes
+//   Word 22 (off 84): LABBYT — total header bytes (metadata only in Java)
 
 fn r_f32_le_w(b: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
@@ -756,24 +761,16 @@ fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64, bool, bool)> 
     };
     let nrow = spider_positive_u32(r_f32_w(&hdr, 4, little_endian), "NROW")?;
     let irec = r_f32_w(&hdr, 8, little_endian) as i32;
-    let iform = r_f32_w(&hdr, 16, little_endian) as i32;
+    let _iform = r_f32_w(&hdr, 16, little_endian) as i32;
     let nsam = spider_positive_u32(r_f32_w(&hdr, 44, little_endian), "NSAM")?;
     let labrec = r_f32_w(&hdr, 48, little_endian) as u64;
-    let labbyt = r_f32_w(&hdr, 84, little_endian) as u64;
     let maxim = r_f32_w(&hdr, 100, little_endian);
 
     let width = nsam;
     let height = nrow;
-    let base_image_count = match iform {
-        1 | -1 => 1,                    // single 2D image
-        3 | -3 => nslice,               // 3D volume
-        11 | -11 | -21 | -22 => nslice, // sequence / known Spider variants
-        _ => {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "Spider: unsupported IFORM {iform}"
-            )))
-        }
-    };
+    // Java records IFORM as metadata but does not reject unknown values; the
+    // plane count is always max(NSLICE, 1), optionally scaled by MAXIM.
+    let base_image_count = nslice;
 
     let image_count = if maxim > 0.0 {
         (maxim * base_image_count as f32) as u32
@@ -781,16 +778,11 @@ fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64, bool, bool)> 
         base_image_count
     };
 
-    let header_size = if labbyt > 0 {
-        labbyt
-    } else {
-        labrec * nsam as u64 * 4
-    };
+    let header_size = labrec * nsam as u64 * 4;
     let plane_size = width as u64 * height as u64 * 4;
     let plane_size_i64 = plane_size as i64;
-    let one_header_per_slice = irec > 0
-        && irec as i64 * nsam as i64 * 4 != plane_size_i64
-        && (irec - 1) as i64 * 4 != plane_size_i64;
+    let one_header_per_slice =
+        irec as i64 * nsam as i64 * 4 != plane_size_i64 && (irec - 1) as i64 * 4 != plane_size_i64;
 
     Ok((
         width,
@@ -1017,7 +1009,7 @@ mod amira_tests {
     }
 
     #[test]
-    fn amira_raw_streams_are_reported_as_channels_like_java() {
+    fn amira_raw_streams_are_reported_as_non_rgb_channels_like_java() {
         let path = temp_amira_path("two_stream_channels");
         let mut bytes = b"# AmiraMesh BINARY-LITTLE-ENDIAN 2.1
 define Lattice 2 1 1
@@ -1040,7 +1032,7 @@ Lattice2 { byte Data } @2
         assert_eq!(meta.size_z, 1);
         assert_eq!(meta.image_count, 2);
         assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
-        assert!(meta.is_rgb);
+        assert!(!meta.is_rgb);
         assert!(!meta.is_interleaved);
         assert_eq!(c0, vec![1, 2]);
         assert_eq!(c1, vec![3, 4]);
@@ -1069,12 +1061,13 @@ mod spider_tests {
         let mut hdr = vec![0u8; 1024];
         put_f32(&mut hdr, 0, 1.0); // NSLICE (word 1)
         put_f32(&mut hdr, 1, 2.0); // NROW
+        put_f32(&mut hdr, 2, 2.0); // IREC: no per-slice headers
         put_f32(&mut hdr, 4, 1.0); // IFORM (word 5)
         put_f32(&mut hdr, 6, 9.5); // FMAX (word 7)
         put_f32(&mut hdr, 7, -3.25); // FMIN (word 8)
         put_f32(&mut hdr, 11, 2.0); // NSAM (word 12)
-        put_f32(&mut hdr, 13, 0.0); // LABREC (word 14) -> labbyt drives header size
-        put_f32(&mut hdr, 21, 1024.0); // LABBYT (word 22) header size in bytes
+        put_f32(&mut hdr, 12, 128.0); // LABREC (word 13) drives Java header size
+        put_f32(&mut hdr, 21, 1024.0); // LABBYT (word 22), metadata only in Java
 
         let path = std::env::temp_dir().join(format!(
             "spider_meta_{}_{}.spi",
@@ -1119,7 +1112,7 @@ mod spider_tests {
         put_f32_be(&mut hdr, 2, 2.0); // IREC: one leading header, no per-slice headers
         put_f32_be(&mut hdr, 4, 1.0); // IFORM
         put_f32_be(&mut hdr, 11, 2.0); // NSAM
-        put_f32_be(&mut hdr, 12, 256.0); // LABREC
+        put_f32_be(&mut hdr, 12, 128.0); // LABREC
         put_f32_be(&mut hdr, 21, 1024.0); // LABBYT
 
         let path =

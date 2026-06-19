@@ -145,7 +145,12 @@ fn parse_hex_payload(bytes: &[u8], offset: usize, expected: usize) -> Result<Vec
     let mut high: Option<u8> = None;
     for &byte in &bytes[offset..] {
         let Some(nibble) = (byte as char).to_digit(16).map(|v| v as u8) else {
-            continue;
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            return Err(BioFormatsError::InvalidData(format!(
+                "EPS raster payload contains non-hex byte 0x{byte:02x}"
+            )));
         };
         if let Some(h) = high.take() {
             out.push((h << 4) | nibble);

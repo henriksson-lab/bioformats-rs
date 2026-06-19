@@ -135,6 +135,7 @@ fn parse_html(html: &str) -> Result<VisitechMeta> {
     // Java tracks an estimated series count / sizeC from "Document created".
     let mut estimated_series_count = 0u32;
     let mut estimated_size_c = 0u32;
+    let mut parsed_image_count = 0u32;
 
     for raw in normalized.split('\n') {
         let token = strip_tags(raw);
@@ -167,7 +168,7 @@ fn parse_html(html: &str) -> Result<VisitechMeta> {
                     pixel_type = match bytes {
                         1 => PixelType::Uint8,
                         2 => PixelType::Uint16,
-                        4 => PixelType::Float32,
+                        4 => PixelType::Uint32,
                         _ => {
                             return Err(BioFormatsError::Format(format!(
                                 "Visitech: unsupported image bit depth {value}"
@@ -198,8 +199,8 @@ fn parse_html(html: &str) -> Result<VisitechMeta> {
         if token.contains("pixels") {
             size_c += 1;
             if let Some(first) = token.split_whitespace().next() {
-                if let Ok(_n) = first.parse::<u32>() {
-                    // imageCount accumulation is implicit via Z*C*T below.
+                if let Ok(n) = first.parse::<u32>() {
+                    parsed_image_count = parsed_image_count.saturating_add(n);
                 }
             }
         } else if token.starts_with("Time Series") {
@@ -232,7 +233,12 @@ fn parse_html(html: &str) -> Result<VisitechMeta> {
         size_z = 1;
     }
     if size_t == 0 {
-        size_t = 1;
+        let denominator = size_z.saturating_mul(size_c);
+        size_t = if parsed_image_count > 0 && denominator > 0 {
+            (parsed_image_count / denominator).max(1)
+        } else {
+            1
+        };
     }
     if num_series == 0 {
         num_series = 1;

@@ -6,7 +6,7 @@
 //! Magic: int16 at offset 96 == -16224 (bytes [0xA0, 0xC0] little-endian).
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -86,6 +86,7 @@ pub struct DeltavisionReader {
     positions_in_time: bool,
     stage_ordering: StageOrdering,
     extended_headers: Vec<DvExtendedHeader>,
+    channel_emission_wavelengths: Vec<Option<f64>>,
     /// Per-channel neutral-density filter values (mirrors Java `ndFilters`).
     ///
     /// Java seeds each entry from the first plane's extended-header `ndFilter`
@@ -110,6 +111,7 @@ impl DeltavisionReader {
             positions_in_time: false,
             stage_ordering: StageOrdering::default(),
             extended_headers: Vec::new(),
+            channel_emission_wavelengths: Vec::new(),
             nd_filters: Vec::new(),
             log_data: None,
         }
@@ -624,6 +626,64 @@ fn find_log_file(current_file: &Path) -> Option<PathBuf> {
     }
 }
 
+fn deltavision_name_kind(path: &Path) -> Option<&'static str> {
+    let name = path.to_string_lossy().to_ascii_lowercase();
+    if name.ends_with(".pnl") {
+        None
+    } else if name.ends_with(".dv.log") || name.ends_with(".r3d.log") || name.ends_with("_log.txt")
+    {
+        Some("log")
+    } else if name.ends_with(".dv") || name.ends_with(".r3d") || name.ends_with(".r3d_d3d") {
+        Some("pixels")
+    } else {
+        None
+    }
+}
+
+fn find_matching_dv_file(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let file_name = path.file_name()?.to_str()?;
+    let base = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(base, _)| base);
+    let entries = fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        let Some(name) = candidate.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".dv") && name.starts_with(base) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn resolve_deltavision_input_path(path: &Path) -> PathBuf {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    let mut resolved = if lower.ends_with(".dv.log") || lower.ends_with(".r3d.log") {
+        path.with_extension("")
+    } else if lower.ends_with("_log.txt") {
+        let name = path.to_string_lossy();
+        if let Some(index) = name.rfind('_') {
+            PathBuf::from(format!("{}.dv", &name[..index]))
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+
+    if !resolved.exists() {
+        if let Some(candidate) = find_matching_dv_file(&resolved) {
+            resolved = candidate;
+        }
+    }
+
+    resolved
+}
+
 /// Convert a DeltaVision `Created` timestamp (`E MMM d HH:mm:ss yyyy`, e.g.
 /// "Wed Jul 25 14:00:00 2007") into an ISO-8601 string, mirroring Java's
 /// `DateTools.formatDate(line, DATE_FORMATS)`. Returns `None` if unparseable.
@@ -957,15 +1017,13 @@ impl DeltavisionReader {
 
 impl FormatReader for DeltavisionReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("dv") | Some("r3d"))
+        deltavision_name_kind(path).is_some()
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        if header.len() < 98 {
+        // Java requires enough bytes to inspect the MRC/MAP collision marker at
+        // offset 208, via FormatTools.validStream(stream, 212, true).
+        if header.len() < 212 {
             return false;
         }
         // Check magic at offset 96 for both LE and BE
@@ -1001,7 +1059,8 @@ impl FormatReader for DeltavisionReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        let path = resolve_deltavision_input_path(path);
+        let mut f = File::open(&path).map_err(BioFormatsError::Io)?;
         let mut hdr = vec![0u8; HEADER_SIZE];
         f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
 
@@ -1036,6 +1095,21 @@ impl FormatReader for DeltavisionReader {
         let ints_per_section = r_u16(&hdr, 128, le);
         let floats_per_section = r_u16(&hdr, 130, le);
         let num_waves = r_i16(&hdr, 196, le).max(1) as u32;
+        let mut channel_emission_wavelengths = Vec::with_capacity(num_waves as usize);
+        for c in 0..num_waves as usize {
+            // Java's initExtraMetadata reads emission wavelengths from the
+            // fixed header table: channels 1-5 immediately after NumWaves, and
+            // channels 6-12 from the NEW_TYPE extension block.
+            let off = if c < 5 {
+                Some(198 + c * 2)
+            } else if file_type == 100 && c < 12 {
+                Some(676 + (c - 5) * 2)
+            } else {
+                None
+            };
+            let value = off.map(|off| r_i16(&hdr, off, le) as f64).unwrap_or(0.0);
+            channel_emission_wavelengths.push((value > 0.0).then_some(value));
+        }
         let mut raw_num_times = r_u16(&hdr, 180, le) as u32;
         let mut num_panels = 0u32;
         if file_type == 100 {
@@ -1231,7 +1305,8 @@ impl FormatReader for DeltavisionReader {
         self.positions_in_time = older_positions > 1;
         self.stage_ordering = stage_ordering(&extended_headers, series_count);
         self.extended_headers = extended_headers;
-        self.path = Some(path.to_path_buf());
+        self.channel_emission_wavelengths = channel_emission_wavelengths;
+        self.path = Some(path);
         self.log_data = None;
         // Java initFile: parseLogFile(store) (gated on isGroupFiles(), which
         // defaults to true). Locates the `.log` companion and projects its
@@ -1249,6 +1324,7 @@ impl FormatReader for DeltavisionReader {
         self.positions_in_time = false;
         self.stage_ordering = StageOrdering::default();
         self.extended_headers.clear();
+        self.channel_emission_wavelengths.clear();
         self.nd_filters.clear();
         self.log_data = None;
         Ok(())
@@ -1379,18 +1455,25 @@ impl FormatReader for DeltavisionReader {
         img.physical_size_z = get_f("pixel_spacing_z");
         if !self.extended_headers.is_empty() {
             let metadata_series = self.stage_metadata_series_index(self.current_series);
+            let mut exposure_by_channel = vec![None; meta.size_c as usize];
             img.planes = (0..meta.image_count)
                 .filter_map(|plane| {
                     let (z, c, t) = raster_to_zct(plane, meta);
                     let raw_idx =
                         self.file_plane_index_for_series(z, c, t, metadata_series, meta) as usize;
                     let h = self.extended_headers.get(raw_idx)?;
+                    let exposure = exposure_by_channel.get_mut(c as usize).and_then(|slot| {
+                        if slot.is_none() {
+                            *slot = Some(h.exposure_time as f64);
+                        }
+                        *slot
+                    });
                     Some(OmePlane {
                         the_z: z,
                         the_c: c,
                         the_t: t,
                         delta_t: Some(h.time_stamp_seconds as f64),
-                        exposure_time: Some(h.exposure_time as f64),
+                        exposure_time: exposure,
                         position_x: Some(h.stage_x as f64),
                         position_y: Some(h.stage_y as f64),
                         position_z: Some(h.stage_z as f64),
@@ -1403,10 +1486,10 @@ impl FormatReader for DeltavisionReader {
                     let raw_idx =
                         self.file_plane_index_for_series(0, c as u32, 0, metadata_series, meta)
                             as usize;
+                    if let Some(Some(emission)) = self.channel_emission_wavelengths.get(c) {
+                        channel.emission_wavelength = Some(*emission);
+                    }
                     if let Some(h) = self.extended_headers.get(raw_idx) {
-                        if h.emission_wavelength > 0.0 {
-                            channel.emission_wavelength = Some(h.emission_wavelength as f64);
-                        }
                         if h.excitation_wavelength > 0.0 {
                             channel.excitation_wavelength = Some(h.excitation_wavelength as f64);
                         }
@@ -1499,7 +1582,7 @@ impl FormatReader for DeltavisionReader {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dv_path(name: &str) -> PathBuf {
@@ -1548,6 +1631,29 @@ mod tests {
         write_i16(&mut header, 96, DV_MAGIC_LE);
 
         assert!(!DeltavisionReader::new().is_this_type_by_bytes(&header));
+    }
+
+    #[test]
+    fn byte_sniffing_requires_java_minimum_header_length() {
+        let mut header = vec![0u8; 98];
+        write_i32(&mut header, 0, 4);
+        write_i32(&mut header, 4, 4);
+        write_i32(&mut header, 8, 1);
+        write_i16(&mut header, 96, DV_MAGIC_LE);
+
+        assert!(!DeltavisionReader::new().is_this_type_by_bytes(&header));
+    }
+
+    #[test]
+    fn name_sniffing_accepts_java_companion_suffixes() {
+        let reader = DeltavisionReader::new();
+        assert!(reader.is_this_type_by_name(Path::new("sample.dv")));
+        assert!(reader.is_this_type_by_name(Path::new("sample.r3d")));
+        assert!(reader.is_this_type_by_name(Path::new("sample.r3d_d3d")));
+        assert!(reader.is_this_type_by_name(Path::new("sample.dv.log")));
+        assert!(reader.is_this_type_by_name(Path::new("sample.r3d.log")));
+        assert!(reader.is_this_type_by_name(Path::new("sample_log.txt")));
+        assert!(!reader.is_this_type_by_name(Path::new("sample.pnl")));
     }
 
     fn write_synthetic_dv_with_header(
@@ -1662,6 +1768,13 @@ mod tests {
         write_i16(&mut hdr, 180, size_t);
         write_i16(&mut hdr, 182, sequence);
         write_i16(&mut hdr, 196, waves);
+        for c in 0..(waves.max(0) as usize).min(5) {
+            let wavelength = ext_headers
+                .get(c)
+                .map(|h| h.emission_wavelength as i16)
+                .unwrap_or(0);
+            write_i16(&mut hdr, 198 + c * 2, wavelength);
+        }
 
         let mut file = fs::File::create(&path).unwrap();
         file.write_all(&hdr).unwrap();
@@ -1752,6 +1865,26 @@ mod tests {
         );
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn set_id_resolves_dv_log_input_to_pixel_file() {
+        let path = write_synthetic_dv("log_input_resolution", 1, 1, 1, 0, 1, 0, 1, &[&[42]]);
+        let log_path = PathBuf::from(format!("{}.log", path.to_str().unwrap()));
+        fs::write(&log_path, "Created:     Wed Jul 25 14:00:00 2007\n").unwrap();
+
+        let mut reader = DeltavisionReader::new();
+        reader.set_id(&log_path).unwrap();
+        assert_eq!(reader.metadata().image_count, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![42]);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            ome.images[0].acquisition_date.as_deref(),
+            Some("2007-07-25T14:00:00")
+        );
+
+        fs::remove_file(&log_path).ok();
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1902,6 +2035,7 @@ mod tests {
         assert_eq!(planes.len(), 2);
         assert_eq!(planes[0].delta_t, Some(0.25));
         assert_eq!(planes[0].exposure_time, Some(0.05000000074505806));
+        assert_eq!(planes[1].exposure_time, Some(0.05000000074505806));
         assert_eq!(planes[0].position_x, Some(10.0));
         assert_eq!(planes[1].the_t, 1);
         assert_eq!(planes[1].position_y, Some(21.0));
@@ -1912,6 +2046,34 @@ mod tests {
             .any(|annotation| format!("{annotation:?}").contains("OriginalMetadata")));
 
         assert_eq!(reader.open_bytes(1).unwrap(), vec![9]);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn channel_emission_wavelength_comes_from_fixed_header_table() {
+        let headers = [ext_header(0.25, 10.0, 20.0, 0.05, 488.0, 525.0)];
+        let path = write_synthetic_dv_with_extended_headers(
+            "emission_from_header",
+            1,
+            1,
+            1,
+            5,
+            1,
+            0,
+            1,
+            &headers,
+            &[&[7]],
+        );
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(198)).unwrap();
+        file.write_all(&600i16.to_le_bytes()).unwrap();
+
+        let mut reader = DeltavisionReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].emission_wavelength, Some(600.0));
+        assert_eq!(ome.images[0].channels[0].excitation_wavelength, Some(488.0));
+
         fs::remove_file(path).ok();
     }
 

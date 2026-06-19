@@ -39,36 +39,36 @@ impl Default for BmpReader {
 fn rd_i32(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
-fn rd_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
 fn rd_i16(b: &[u8], off: usize) -> i16 {
     i16::from_le_bytes([b[off], b[off + 1]])
 }
 
-/// Given a component bit mask, return (shift, max_value). The shift is the
-/// number of trailing zero bits; max_value is the mask scaled down by the
-/// shift (i.e. the number of distinct values minus one). Returns None for a
-/// zero mask.
-fn mask_shift_scale(mask: u32) -> Option<(u32, u32)> {
-    if mask == 0 {
-        return None;
-    }
-    let shift = mask.trailing_zeros();
-    let max = mask >> shift;
-    Some((shift, max))
+struct MsbBitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
 }
 
-/// Extract an 8-bit component value from a packed pixel using the given mask.
-/// Mirrors the shift+scale approach: isolate the component bits, then scale the
-/// component's value range up to 0..255.
-fn extract_component(pixel: u32, mask: u32) -> u8 {
-    match mask_shift_scale(mask) {
-        Some((shift, max)) if max > 0 => {
-            let v = (pixel & mask) >> shift;
-            ((v * 255 + max / 2) / max) as u8
+impl<'a> MsbBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    fn read_bits(&mut self, n: u32) -> Option<u8> {
+        if self.bit_pos + n as usize > self.data.len() * 8 {
+            return None;
         }
-        _ => 0,
+        let mut value = 0u8;
+        for _ in 0..n {
+            let byte_index = self.bit_pos / 8;
+            let bit_index = 7 - (self.bit_pos % 8);
+            value = (value << 1) | ((self.data[byte_index] >> bit_index) & 1);
+            self.bit_pos += 1;
+        }
+        Some(value)
+    }
+
+    fn skip_bytes(&mut self, n: usize) {
+        self.bit_pos += n * 8;
     }
 }
 
@@ -123,51 +123,6 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         n_colors = if bpp < 8 { 1 << bpp } else { 256 };
     }
 
-    // BITFIELDS (compression 3): per-channel bit masks follow the 40-byte
-    // BITMAPINFOHEADER (file offset 54): red(4), green(4), blue(4) and, for
-    // 32-bit V4+ headers, an optional alpha(4). When no masks are present we
-    // fall back to the standard 5-6-5 (16-bit) / 8-8-8-8 (32-bit) defaults.
-    let mut bitfields: Option<(u32, u32, u32, u32)> = None;
-    if compression == BMP_BITFIELDS {
-        let mut red = if data.len() >= 58 {
-            rd_u32(&data, 54)
-        } else {
-            0
-        };
-        let mut green = if data.len() >= 62 {
-            rd_u32(&data, 58)
-        } else {
-            0
-        };
-        let mut blue = if data.len() >= 66 {
-            rd_u32(&data, 62)
-        } else {
-            0
-        };
-        // Alpha mask: present in BITMAPV4HEADER+. Only trust it for 32-bit and
-        // when it sits before the pixel data offset.
-        let mut alpha = if bpp_total == 32 && data.len() >= 70 && global >= 70 {
-            rd_u32(&data, 66)
-        } else {
-            0
-        };
-        if red == 0 && green == 0 && blue == 0 {
-            // No explicit masks: use the standard 5-6-5 default for 16-bit.
-            if bpp_total == 16 {
-                red = 0xF800; // 5 bits
-                green = 0x07E0; // 6 bits
-                blue = 0x001F; // 5 bits
-                alpha = 0;
-            } else {
-                red = 0x00FF0000;
-                green = 0x0000FF00;
-                blue = 0x000000FF;
-                alpha = 0xFF000000;
-            }
-        }
-        bitfields = Some((red, green, blue, alpha));
-    }
-
     // Palette begins after the 14+40 = 54-byte header.
     let mut palette_pos = 54usize;
     let mut palette: Option<[[u8; 256]; 3]> = None;
@@ -198,21 +153,11 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     if bpp > 8 {
         bpp /= size_c as i32;
     }
-    let mut pixel_type = match bpp {
+    let pixel_type = match bpp {
         16 => PixelType::Uint16,
         32 => PixelType::Uint32,
         _ => PixelType::Uint8,
     };
-
-    // BITFIELDS images are decoded into 8-bit RGB(A) channels (each component
-    // is shifted and scaled to a full byte), regardless of the packed pixel
-    // width. A 16-bit packed pixel yields RGB (3 channels); a 32-bit packed
-    // pixel yields RGBA (4 channels) when an alpha mask is present, else RGB.
-    if let Some((_r, _g, _b, alpha)) = bitfields {
-        size_c = if bpp_total == 32 && alpha != 0 { 4 } else { 3 };
-        pixel_type = PixelType::Uint8;
-        bpp = 8;
-    }
 
     let is_indexed = palette.is_some();
     if is_indexed {
@@ -279,7 +224,7 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
                 pos = data.len();
             }
         }
-    } else if compression == BMP_RLE_8 || compression == BMP_RLE_4 {
+    } else if compression == BMP_RLE_8 {
         // Decode into an index plane of size w*h (indexed images only here).
         let mut plane = vec![0u8; w * h];
         let mut index = 0usize;
@@ -306,128 +251,104 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
                 } else if second > 2 {
                     // Absolute mode.
                     let count = second as usize;
-                    if compression == BMP_RLE_8 {
-                        for _ in 0..count {
-                            if pos >= data.len() || index >= plane.len() {
-                                break 'outer;
-                            }
-                            plane[index] = data[pos];
-                            index += 1;
-                            pos += 1;
+                    for _ in 0..count {
+                        if pos >= data.len() || index >= plane.len() {
+                            break 'outer;
                         }
-                        if count % 2 == 1 {
-                            pos += 1; // word alignment
-                        }
-                    } else {
-                        // RLE_4 absolute: two nibbles per byte.
-                        let mut i = 0;
-                        while i < count {
-                            if pos >= data.len() {
-                                break 'outer;
-                            }
-                            let byte = data[pos];
-                            pos += 1;
-                            let first_nibble = byte & 0xf;
-                            let second_nibble = (byte >> 4) & 0xf;
-                            if index < plane.len() {
-                                plane[index] = first_nibble;
-                                index += 1;
-                            }
-                            if i + 1 < count && index < plane.len() {
-                                plane[index] = second_nibble;
-                                index += 1;
-                            }
-                            i += 2;
-                        }
-                        if count % 4 == 1 || count % 4 == 2 {
-                            // align to word boundary (Java: count%4==2 -> skip 1)
-                            if count % 4 == 2 {
-                                pos += 1;
-                            }
-                        }
+                        plane[index] = data[pos];
+                        index += 1;
+                        pos += 1;
+                    }
+                    if count % 2 == 1 {
+                        pos += 1; // word alignment
                     }
                 }
             } else {
                 let run = first as usize;
-                if compression == BMP_RLE_8 {
-                    for _ in 0..run {
-                        if index >= plane.len() {
-                            break;
-                        }
-                        plane[index] = second;
-                        index += 1;
+                for _ in 0..run {
+                    if index >= plane.len() {
+                        break;
                     }
-                } else {
-                    let first_nibble = second & 0xf;
-                    let second_nibble = (second >> 4) & 0xf;
-                    for i in 0..run {
-                        if index >= plane.len() {
+                    plane[index] = second;
+                    index += 1;
+                }
+            }
+        }
+        // Java BMPReader decodes RLE into an in-memory plane and then calls
+        // readPlane without applying BMP bottom-up inversion.
+        buf.copy_from_slice(&plane);
+    } else if compression == BMP_RLE_4 {
+        let mut plane = vec![0u8; w * h];
+        let mut index = 0usize;
+        let mut bits = MsbBitReader::new(&data[global..]);
+        let row_length = (w * bpp_u) / 8;
+        loop {
+            let Some(first) = bits.read_bits(bpp_u as u32) else {
+                break;
+            };
+            let Some(second) = bits.read_bits(bpp_u as u32) else {
+                break;
+            };
+            if first == 0 {
+                if second == 1 {
+                    break;
+                } else if second == 2 {
+                    let Some(x_delta) = bits.read_bits(bpp_u as u32) else {
+                        break;
+                    };
+                    let Some(y_delta) = bits.read_bits(bpp_u as u32) else {
+                        break;
+                    };
+                    index += y_delta as usize * row_length + x_delta as usize;
+                } else if second > 2 {
+                    for i in (0..second as usize).step_by(2) {
+                        let Some(absolute) = bits.read_bits(bpp_u as u32) else {
                             break;
-                        }
-                        plane[index] = if i % 2 == 0 {
-                            first_nibble
-                        } else {
-                            second_nibble
                         };
-                        index += 1;
+                        let first_nibble = absolute & 0xf;
+                        let second_nibble = (absolute >> 4) & 0xf;
+                        if index < plane.len() {
+                            plane[index] = first_nibble;
+                            index += 1;
+                        }
+                        if i + 1 < second as usize && index < plane.len() {
+                            plane[index] = second_nibble;
+                            index += 1;
+                        }
+                    }
+                    if second % 4 == 2 {
+                        bits.skip_bytes(1);
                     }
                 }
-            }
-        }
-        // RLE planes are stored bottom-up; flip into top-down output.
-        for row in 0..h {
-            let src = row * w;
-            let out_row = if invert_y { row } else { h - 1 - row };
-            buf[out_row * w..out_row * w + w].copy_from_slice(&plane[src..src + w]);
-        }
-    } else if compression == BMP_BITFIELDS {
-        // Packed 16- or 32-bit pixels; extract each component via its mask and
-        // scale to 8 bits. Output is interleaved R,G,B(,A) per pixel.
-        let (rmask, gmask, bmask, amask) = bitfields.unwrap();
-        let packed_bytes = (bpp_total / 8) as usize; // 2 for 16-bit, 4 for 32-bit
-        let out_c = size_c as usize; // 3 (RGB) or 4 (RGBA)
-                                     // Source row length (packed pixels), padded to a 4-byte boundary.
-        let row_bytes = w * packed_bytes;
-        let padded_row = (row_bytes + 3) & !3;
-        let mut pos = global;
-        for src_row in 0..h {
-            let out_row = if invert_y { src_row } else { h - 1 - src_row };
-            let row_end = pos.checked_add(row_bytes).ok_or_else(|| {
-                BioFormatsError::InvalidData("BMP: pixel row offset overflow".into())
-            })?;
-            if row_end > data.len() {
-                return Err(BioFormatsError::InvalidData(
-                    "BMP: pixel data is shorter than expected".into(),
-                ));
-            }
-            for px in 0..w {
-                let sp = pos + px * packed_bytes;
-                let pixel: u32 = match packed_bytes {
-                    2 => u16::from_le_bytes([data[sp], data[sp + 1]]) as u32,
-                    _ => rd_u32(&data, sp),
-                };
-                let dst = (out_row * w + px) * out_c;
-                buf[dst] = extract_component(pixel, rmask);
-                buf[dst + 1] = extract_component(pixel, gmask);
-                buf[dst + 2] = extract_component(pixel, bmask);
-                if out_c == 4 {
-                    buf[dst + 3] = extract_component(pixel, amask);
+            } else {
+                let first_nibble = second & 0xf;
+                let second_nibble = (second >> 4) & 0xf;
+                for i in 0..first as usize {
+                    if index >= plane.len() {
+                        break;
+                    }
+                    plane[index] = if i % 2 == 0 {
+                        first_nibble
+                    } else {
+                        second_nibble
+                    };
+                    index += 1;
                 }
             }
-            pos += padded_row;
-            if pos > data.len() {
-                pos = data.len();
-            }
         }
+        buf.copy_from_slice(&plane);
+    } else if compression == BMP_BITFIELDS {
+        // Java BMPReader records compression 3 as "RGB bitmap with mask" but
+        // has no decode branch for it; the checked output buffer is returned
+        // unchanged.
     } else {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "BMP: unsupported compression {compression}"
         )));
     }
 
-    // For multichannel images, swap BGR -> RGB (interleaved). BITFIELDS pixels
-    // are already written in R,G,B(,A) order, so they are excluded.
-    if size_c > 1 && !is_indexed && compression != BMP_BITFIELDS {
+    // For multichannel images, swap BGR -> RGB (interleaved).
+    if size_c > 1 && !is_indexed {
         let c = size_c as usize;
         let nb = bytes_per_sample;
         let n_pixels = buf.len() / (c * nb);
@@ -718,22 +639,6 @@ mod tests {
         std::env::temp_dir().join(format!("bioformats_bmp_{name}_{nanos}.bmp"))
     }
 
-    #[test]
-    fn mask_helpers() {
-        // 5-6-5 masks.
-        assert_eq!(mask_shift_scale(0xF800), Some((11, 0x1F)));
-        assert_eq!(mask_shift_scale(0x07E0), Some((5, 0x3F)));
-        assert_eq!(mask_shift_scale(0x001F), Some((0, 0x1F)));
-        assert_eq!(mask_shift_scale(0), None);
-        // Full-byte masks scale identically.
-        assert_eq!(extract_component(0x00FF0000, 0x00FF0000), 0xFF);
-        assert_eq!(extract_component(0x00000000, 0x00FF0000), 0x00);
-        // Max value of a 5-bit channel scales to 255.
-        assert_eq!(extract_component(0xF800, 0xF800), 0xFF);
-        // Zero value -> 0.
-        assert_eq!(extract_component(0x0000, 0xF800), 0x00);
-    }
-
     /// Build a minimal BMP header for a BITFIELDS image.
     fn write_bmp(path: &Path, w: i32, h: i32, bpp: u16, masks: &[u32], pixel_data: &[u8]) {
         let palette_or_mask_bytes = masks.len() * 4;
@@ -787,29 +692,58 @@ mod tests {
         f.write_all(&buf).unwrap();
     }
 
-    #[test]
-    fn bitfields_16bit_565() {
-        // 1x1 image, 5-6-5. Encode pure red (max R), pure green, pure blue.
-        // Pixel packed as: R<<11 | G<<5 | B.
-        let path = tmp_path("bf16");
-        let red: u16 = 0x1F << 11; // R=31, G=0, B=0
-        let row = [red.to_le_bytes()[0], red.to_le_bytes()[1], 0, 0]; // padded to 4 bytes
-        write_bmp(&path, 1, 1, 16, &[0xF800, 0x07E0, 0x001F], &row);
-        let (meta, buf) = load_bmp(&path).unwrap();
-        std::fs::remove_file(&path).ok();
-        assert_eq!(meta.size_c, 3);
-        assert_eq!(meta.pixel_type, PixelType::Uint8);
-        // Interleaved R,G,B; R should be 255, G and B 0.
-        assert_eq!(buf[0], 255);
-        assert_eq!(buf[1], 0);
-        assert_eq!(buf[2], 0);
+    fn write_compressed_bmp(
+        path: &Path,
+        w: i32,
+        h: i32,
+        bpp: u16,
+        compression: u32,
+        n_colors: u32,
+        pixel_data: &[u8],
+    ) {
+        let palette_bytes = n_colors as usize * 4;
+        let header = 14 + 40 + palette_bytes;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"BM");
+        buf.extend_from_slice(&((header + pixel_data.len()) as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&(header as u32).to_le_bytes());
+        buf.extend_from_slice(&40u32.to_le_bytes());
+        buf.extend_from_slice(&w.to_le_bytes());
+        buf.extend_from_slice(&h.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&bpp.to_le_bytes());
+        buf.extend_from_slice(&compression.to_le_bytes());
+        buf.extend_from_slice(&(pixel_data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&n_colors.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        for i in 0..n_colors {
+            let v = i as u8;
+            buf.extend_from_slice(&[v, v, v, 0]);
+        }
+        buf.extend_from_slice(pixel_data);
+        let mut f = File::create(path).unwrap();
+        f.write_all(&buf).unwrap();
     }
 
     #[test]
-    fn bitfields_32bit_rgba() {
-        // 1x1, masks R=0x00FF0000 G=0x0000FF00 B=0x000000FF A=0xFF000000.
+    fn bitfields_16bit_matches_java_undecoded_zero_buffer() {
+        let path = tmp_path("bf16");
+        let red: u16 = 0x1F << 11;
+        let row = [red.to_le_bytes()[0], red.to_le_bytes()[1], 0, 0];
+        write_bmp(&path, 1, 1, 16, &[0xF800, 0x07E0, 0x001F], &row);
+        let (meta, buf) = load_bmp(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert_eq!(buf, [0, 0]);
+    }
+
+    #[test]
+    fn bitfields_32bit_matches_java_undecoded_zero_buffer() {
         let path = tmp_path("bf32");
-        // pixel value: A=0x80 R=0x10 G=0x20 B=0x30 -> 0x80102030
         let pixel: u32 = 0x80102030;
         write_bmp(
             &path,
@@ -823,11 +757,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(meta.size_c, 4);
         assert_eq!(meta.pixel_type, PixelType::Uint8);
-        // R,G,B,A interleaved.
-        assert_eq!(buf[0], 0x10);
-        assert_eq!(buf[1], 0x20);
-        assert_eq!(buf[2], 0x30);
-        assert_eq!(buf[3], 0x80);
+        assert_eq!(buf, [0, 0, 0, 0]);
     }
 
     #[test]
@@ -845,13 +775,37 @@ mod tests {
     }
 
     #[test]
-    fn bitfields_payload_rejects_truncated_rows() {
+    fn rle8_matches_java_plane_without_vertical_flip() {
+        let path = tmp_path("rle8_no_flip");
+        // Absolute-mode four pixels, then EOF. Java decodes into a temporary
+        // plane and readPlane reads it directly; it does not apply invertY.
+        write_compressed_bmp(&path, 2, 2, 8, BMP_RLE_8, 4, &[0, 4, 1, 2, 3, 4, 0, 1]);
+        let (meta, buf) = load_bmp(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(meta.is_indexed);
+        assert_eq!(buf, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rle4_reads_java_nibble_stream() {
+        let path = tmp_path("rle4_nibbles");
+        // Java reads RLE4 control values using readBits(4), so byte 0x4a is
+        // first=4, second=10. The encoded run alternates second&0xf with
+        // second>>4, yielding 10,0,10,0, then byte 0x01 is EOF.
+        write_compressed_bmp(&path, 4, 1, 4, BMP_RLE_4, 16, &[0x4a, 0x01]);
+        let (meta, buf) = load_bmp(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(!meta.is_indexed);
+        assert_eq!(buf, [10, 0, 10, 0]);
+    }
+
+    #[test]
+    fn bitfields_payload_does_not_require_decodable_rows_like_java() {
         let path = tmp_path("bitfields_truncated");
         write_bmp(&path, 2, 1, 16, &[0xF800, 0x07E0, 0x001F], &[0x00, 0xF8]);
-        let err = load_bmp(&path).expect_err("truncated bitfields BMP payload should be rejected");
+        let (meta, buf) = load_bmp(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert!(
-            matches!(err, BioFormatsError::InvalidData(message) if message.contains("shorter"))
-        );
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(buf, [0, 0, 0, 0]);
     }
 }

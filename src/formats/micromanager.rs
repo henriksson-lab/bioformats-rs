@@ -776,6 +776,30 @@ fn read_value_after(s: &str) -> Option<f64> {
     after_colon[..end].parse().ok()
 }
 
+/// Java `isThisType(String, true)` accepts Micro-Manager metadata names only
+/// when the first metadata block contains "micro-manager" or "micromanager".
+fn metadata_file_has_micromanager_marker(path: &Path) -> bool {
+    const BLOCK_SIZE: u64 = 1_048_576;
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if file
+        .by_ref()
+        .take(BLOCK_SIZE)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+    let data = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+    data.contains("micro-manager") || data.contains("micromanager")
+}
+
 /// Discover all sibling `Pos_*` position directories (multi-position series).
 /// Returns the list of metadata.txt paths in sorted order, or just the single
 /// supplied file if this is not a multi-position dataset.
@@ -852,7 +876,12 @@ impl FormatReader for MicromanagerReader {
             .and_then(|n| n.to_str())
             .map(|n| n.to_ascii_lowercase())
             .unwrap_or_default();
-        name == "metadata.txt" || name.ends_with("_metadata.txt") || name == "metadata.json"
+        if name == "metadata.txt" || name.ends_with("_metadata.txt") {
+            return metadata_file_has_micromanager_marker(path);
+        }
+        // Extra Rust support for JSON-named metadata; Java uses metadata.txt or
+        // *_metadata.txt, but accepting metadata.json does not alter those paths.
+        name == "metadata.json"
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
@@ -1212,6 +1241,29 @@ mod tests {
             reader.open_bytes(1),
             Err(BioFormatsError::PlaneOutOfRange(1))
         ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn metadata_name_detection_requires_java_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "mm_detection_marker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.txt");
+        let reader = MicromanagerReader::new();
+
+        std::fs::write(&path, r#"{"Summary":{"Width":1}}"#).unwrap();
+        assert!(!reader.is_this_type_by_name(&path));
+
+        std::fs::write(&path, r#"{"Summary":{"Source":"Micro-Manager","Width":1}}"#).unwrap();
+        assert!(reader.is_this_type_by_name(&path));
 
         let _ = std::fs::remove_dir_all(dir);
     }

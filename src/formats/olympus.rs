@@ -666,6 +666,16 @@ impl Fv1000Reader {
             }
             planes.push(plane);
             produced += 1;
+
+            // Java FV1000Reader lets per-plane Acquisition Parameters Common
+            // override Reference Image Parameter / ValidBitCounts.
+            if let Some(acquisition) = pty.table("Acquisition Parameters Common") {
+                if let Some(vb) = acquisition.get("ValidBitCounts") {
+                    if let Ok(parsed) = vb.trim().parse::<u32>() {
+                        valid_bits = parsed;
+                    }
+                }
+            }
         }
 
         if tiffs.len() != image_count {
@@ -1142,21 +1152,31 @@ impl FormatReader for Fv1000Reader {
         // files. OIB is instead detected via its `.oib` extension (Java
         // FV1000Reader.isThisType relies on the suffix for OIB), so non-OIB
         // OLE2 readers get the first attempt during the magic pass.
-        let s = std::str::from_utf8(&header[..header.len().min(256)]).unwrap_or("");
-        s.contains("[FileInformation]") || s.contains("[File Info]") || s.contains("[Version Info]")
+        let s = std::str::from_utf8(&header[..header.len().min(1024)]).unwrap_or("");
+        s.contains("FileInformation")
+            || s.contains("Acquisition Parameters")
+            || s.contains("[File Info]")
+            || s.contains("[Version Info]")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let is_oib = path
+        let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("oib"))
-            .unwrap_or(false);
-        if is_oib {
-            self.init_oib(path)
-        } else {
-            self.init_oif(path)
+            .map(|e| e.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("oib") => self.init_oib(path),
+            Some("oif") => self.init_oif(path),
+            _ => {
+                let oif = find_oif_for_entry(path).ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "OIF/OIB: could not find .oif file for {}",
+                        path.display()
+                    ))
+                })?;
+                self.init_oif(&oif)
+            }
         }
     }
 
@@ -1411,6 +1431,23 @@ impl TileHelper {
         }
     }
 
+    fn used_files(&self, fallback: &str) -> Vec<String> {
+        match self {
+            TileHelper::Oir(r) => {
+                let files = r.series_used_files();
+                if files.is_empty() {
+                    vec![fallback.to_string()]
+                } else {
+                    files
+                        .into_iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect()
+                }
+            }
+            TileHelper::CellSens(_) => vec![fallback.to_string()],
+        }
+    }
+
     fn close(&mut self) -> Result<()> {
         match self {
             TileHelper::Oir(r) => r.close(),
@@ -1648,10 +1685,8 @@ impl OlympusTileReader {
             }
 
             let helper = self.helper_reader.as_mut().unwrap();
-            // Java: currentTile.files = helperReader.getUsedFiles();
-            // The Rust helpers don't expose a used-files list; the tile's own
-            // file is the single companion file we track.
-            let files = vec![tile_file.clone()];
+            // Java: currentTile.files = helperReader.getUsedFiles().
+            let files = helper.used_files(&tile_file);
             let helper_meta = helper.metadata().clone();
 
             let x_index: i64 = self
@@ -1711,21 +1746,24 @@ impl OlympusTileReader {
     /// Java `parseOriginalMetadata(Node)` — recursively flatten attributes and
     /// text into the global metadata table.
     fn parse_original_metadata(&mut self, node: &DomNode) {
+        self.parse_original_metadata_node(node, None);
+    }
+
+    fn parse_original_metadata_node(&mut self, node: &DomNode, parent: Option<&str>) {
         let value = node.text.trim();
         if !value.is_empty() {
-            // Java keys text by "<grandparent> <parent>". Our DomNode does not
-            // carry parent links during recursion, so we approximate Java's
-            // intent by keying leaf text under the node's own (stripped) name.
-            let key = self.get_name(&node.name);
+            let node_name = self.get_name(&node.name);
+            let key = parent
+                .map(|parent| format!("{} {}", self.get_name(parent), node_name))
+                .unwrap_or(node_name);
             self.add_global_meta(&key, MetadataValue::String(value.to_string()));
-        } else {
-            for (k, v) in &node.attrs {
-                let key = format!("{} {}", self.get_name(&node.name), k);
-                self.add_global_meta(&key, MetadataValue::String(v.clone()));
-            }
-            for child in &node.children {
-                self.parse_original_metadata(child);
-            }
+        }
+        for (k, v) in &node.attrs {
+            let key = format!("{} {}", self.get_name(&node.name), k);
+            self.add_global_meta(&key, MetadataValue::String(v.clone()));
+        }
+        for child in &node.children {
+            self.parse_original_metadata_node(child, Some(&node.name));
         }
     }
 
@@ -1827,7 +1865,7 @@ fn parse_dom(xml: &str) -> Option<DomNode> {
         for a in e.attributes().flatten() {
             let k = qualified(a.key.as_ref());
             let v = a
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map(|c| c.into_owned())
                 .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
             out.push((k, v));
@@ -1860,7 +1898,14 @@ fn parse_dom(xml: &str) -> Option<DomNode> {
                 }
             }
             Ok(Event::Text(ref t)) => {
-                if let Ok(s) = t.unescape() {
+                if let Some(s) = crate::common::xml::decode_xml_text(t) {
+                    if let Some(top) = stack.last_mut() {
+                        top.text.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(ref r)) => {
+                if let Some(s) = crate::common::xml::decode_xml_ref(r) {
                     if let Some(top) = stack.last_mut() {
                         top.text.push_str(&s);
                     }
@@ -2153,6 +2198,90 @@ mod tests {
     }
 
     #[test]
+    fn fv1000_set_id_accepts_related_entries_like_java() {
+        let root = temp_path("relatedentry.oif");
+        let dir = root.parent().unwrap();
+        let stem = root.file_stem().unwrap().to_string_lossy();
+        let related_tif = dir.join(format!("{stem}_C001.tif"));
+        let companion = root.with_file_name(format!("{stem}.files"));
+        std::fs::create_dir_all(&companion).unwrap();
+
+        let tiff = companion.join("plane0.tif");
+        let mut tiff_meta = ImageMetadata::default();
+        tiff_meta.size_x = 2;
+        tiff_meta.size_y = 2;
+        tiff_meta.pixel_type = PixelType::Uint8;
+        tiff_meta.bits_per_pixel = 8;
+        tiff_meta.image_count = 1;
+        ImageWriter::save(&tiff, &tiff_meta, &[vec![1, 2, 3, 4]]).unwrap();
+
+        std::fs::write(
+            companion.join("plane0.pty"),
+            "[File Info]\nDataName=plane0.tif\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &root,
+            "[FileInformation]\n[ProfileSaveInfo]\nIniFileName0=plane0.pty\n[Axis 0 Parameters Common]\nAxisCode=X\nMaxSize=2\n[Axis 1 Parameters Common]\nAxisCode=Y\nMaxSize=2\n[Reference Image Parameter]\nImageDepth=1\nValidBitCounts=8\n",
+        )
+        .unwrap();
+        std::fs::write(&related_tif, []).unwrap();
+
+        let mut reader = Fv1000Reader::new();
+        reader.set_id(&related_tif).unwrap();
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+
+        let _ = std::fs::remove_file(root);
+        let _ = std::fs::remove_file(related_tif);
+        let _ = std::fs::remove_dir_all(companion);
+    }
+
+    #[test]
+    fn fv1000_bytes_detection_accepts_java_magic_strings() {
+        let reader = Fv1000Reader::new();
+        assert!(reader.is_this_type_by_bytes(b"prefix FileInformation suffix"));
+        assert!(reader.is_this_type_by_bytes(b"prefix Acquisition Parameters suffix"));
+    }
+
+    #[test]
+    fn fv1000_pty_acquisition_valid_bits_override_reference_bits() {
+        let root = temp_path("validbits_override.oif");
+        let companion = root.with_file_name(format!(
+            "{}.files",
+            root.file_stem().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&companion).unwrap();
+
+        let tiff = companion.join("plane0.tif");
+        let mut tiff_meta = ImageMetadata::default();
+        tiff_meta.size_x = 1;
+        tiff_meta.size_y = 1;
+        tiff_meta.pixel_type = PixelType::Uint16;
+        tiff_meta.bits_per_pixel = 16;
+        tiff_meta.image_count = 1;
+        ImageWriter::save(&tiff, &tiff_meta, &[vec![0, 0]]).unwrap();
+
+        std::fs::write(
+            companion.join("plane0.pty"),
+            "[File Info]\nDataName=plane0.tif\n[Acquisition Parameters Common]\nValidBitCounts=10\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &root,
+            "[ProfileSaveInfo]\nIniFileName0=plane0.pty\n[Axis 0 Parameters Common]\nAxisCode=X\nMaxSize=1\n[Axis 1 Parameters Common]\nAxisCode=Y\nMaxSize=1\n[Reference Image Parameter]\nImageDepth=2\nValidBitCounts=12\n",
+        )
+        .unwrap();
+
+        let mut reader = Fv1000Reader::new();
+        reader.set_id(&root).unwrap();
+        assert_eq!(reader.metadata().bits_per_pixel, 10);
+
+        let _ = std::fs::remove_file(root);
+        let _ = std::fs::remove_dir_all(companion);
+    }
+
+    #[test]
     fn oif_missing_physical_tiff_page_returns_blank_like_java() {
         let root = temp_path("repeat_plane.oif");
         let companion = root.with_file_name(format!(
@@ -2218,6 +2347,64 @@ mod tests {
         let _ = std::fs::remove_file(&tif);
     }
 
+    fn push_oir_u32(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_oir_prefix(buf: &mut Vec<u8>) {
+        buf.extend_from_slice(b"OLYMPUSRAWFORMAT");
+        push_oir_u32(buf, 0xffff_ffff);
+        push_oir_u32(buf, 0);
+    }
+
+    fn push_oir_xml_block(buf: &mut Vec<u8>, xml: &str) {
+        let total = 48 + xml.len() as u32;
+        push_oir_u32(buf, total);
+        push_oir_u32(buf, 0);
+        buf.extend(std::iter::repeat(0).take(36));
+        push_oir_u32(buf, xml.len() as u32);
+        buf.extend_from_slice(xml.as_bytes());
+    }
+
+    fn push_empty_oir_xml_block(buf: &mut Vec<u8>) {
+        push_oir_u32(buf, 8);
+        push_oir_u32(buf, 0);
+    }
+
+    fn push_oir_pixel_block(buf: &mut Vec<u8>, uid: &str, pixels: &[u8]) {
+        push_oir_u32(buf, uid.len() as u32 + 12);
+        push_oir_u32(buf, 3);
+        buf.extend_from_slice(&[0; 8]);
+        push_oir_u32(buf, uid.len() as u32);
+        buf.extend_from_slice(uid.as_bytes());
+        push_oir_u32(buf, pixels.len() as u32);
+        push_oir_u32(buf, 0);
+        buf.extend_from_slice(pixels);
+    }
+
+    fn write_native_oir_with_companion_pixels(main: &Path, companion: &Path, pixels: &[u8]) {
+        let xml = "<?xml version=\"1.0\"?>\
+         <imageProperties>\
+           <frameProperties>\
+             <width>2</width><height>2</height><depth>1</depth><bitCounts>8</bitCounts>\
+           </frameProperties>\
+           <imageInfo><channel id=\"c1\" order=\"1\"/></imageInfo>\
+         </imageProperties>";
+
+        let mut main_bytes = Vec::new();
+        push_oir_prefix(&mut main_bytes);
+        push_oir_xml_block(&mut main_bytes, xml);
+        std::fs::write(main, main_bytes).unwrap();
+
+        let mut companion_bytes = Vec::new();
+        push_oir_prefix(&mut companion_bytes);
+        push_oir_u32(&mut companion_bytes, 0xffff_ffff);
+        push_oir_u32(&mut companion_bytes, 0);
+        push_empty_oir_xml_block(&mut companion_bytes);
+        push_oir_pixel_block(&mut companion_bytes, "z001t001_c1_0", pixels);
+        std::fs::write(companion, companion_bytes).unwrap();
+    }
+
     #[test]
     fn region_intersection_and_intersects_match_java() {
         let a = Region::new(0, 0, 4, 4);
@@ -2244,6 +2431,31 @@ mod tests {
         root.elements_by_tag_name("matl:numOfXAreas", &mut x);
         assert_eq!(x.len(), 1);
         assert_eq!(x[0].text, "2");
+    }
+
+    #[test]
+    fn omp2info_original_metadata_uses_java_text_keys_and_keeps_attrs() {
+        let mut reader = OlympusTileReader::new();
+        let node = DomNode {
+            name: "matl:stage".into(),
+            attrs: vec![("id".into(), "s1".into())],
+            text: String::new(),
+            children: vec![DomNode {
+                name: "matl:position".into(),
+                attrs: vec![("unit".into(), "um".into())],
+                text: "12".into(),
+                children: Vec::new(),
+            }],
+        };
+
+        reader.parse_original_metadata(&node);
+        let string_value = |key: &str| match reader.global_metadata().get(key) {
+            Some(MetadataValue::String(value)) => Some(value.as_str()),
+            _ => None,
+        };
+        assert_eq!(string_value("stage id"), Some("s1"));
+        assert_eq!(string_value("stage position"), Some("12"));
+        assert_eq!(string_value("position unit"), Some("um"));
     }
 
     #[test]
@@ -2320,5 +2532,37 @@ mod tests {
         let _ = std::fs::remove_file(&root);
         let _ = std::fs::remove_file(&tile0);
         let _ = std::fs::remove_file(&tile1);
+    }
+
+    #[test]
+    fn omp2info_used_files_include_oir_companions_like_java() {
+        let root = temp_path("tile_companion.omp2info");
+        let dir = root.parent().unwrap().to_path_buf();
+        let tile = dir.join("tile_companion.oir");
+        let companion = dir.join("tile_companion_00001");
+        write_native_oir_with_companion_pixels(&tile, &companion, &[7, 8, 9, 10]);
+
+        let xml = format!(
+            "<?xml version=\"1.0\"?>\n\
+             <matl:properties xmlns:matl=\"http://olympus/matl\" xmlns:marker=\"http://olympus/marker\">\n\
+               <matl:group>\n\
+                 <matl:areaInfo><matl:numOfXAreas>1</matl:numOfXAreas><matl:numOfYAreas>1</matl:numOfYAreas></matl:areaInfo>\n\
+                 <matl:area><matl:image>{tile}</matl:image><matl:xIndex>0</matl:xIndex><matl:yIndex>0</matl:yIndex></matl:area>\n\
+               </matl:group>\n\
+             </matl:properties>\n",
+            tile = tile.file_name().unwrap().to_string_lossy(),
+        );
+        std::fs::write(&root, xml).unwrap();
+
+        let mut reader = OlympusTileReader::new();
+        reader.set_id(&root).unwrap();
+
+        let used = reader.get_series_used_files(false);
+        assert!(used.iter().any(|f| f.ends_with("tile_companion_00001")));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![7, 8, 9, 10]);
+
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_file(&tile);
+        let _ = std::fs::remove_file(&companion);
     }
 }

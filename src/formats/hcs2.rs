@@ -5072,10 +5072,14 @@ mod xmlutil {
     use quick_xml::Reader as XmlReader;
 
     /// Get an attribute value by (case-sensitive) local name.
-    pub fn attr(e: &BytesStart, name: &str) -> Option<String> {
+    pub fn attr(
+        e: &BytesStart,
+        decoder: quick_xml::encoding::Decoder,
+        name: &str,
+    ) -> Option<String> {
         for a in e.attributes().flatten() {
             if a.key.as_ref() == name.as_bytes() {
-                return Some(String::from_utf8_lossy(&a.value).to_string());
+                return crate::common::xml::decode_xml_attr(a, decoder);
             }
         }
         None
@@ -5132,7 +5136,12 @@ mod xmlutil {
                     on_end(&ln);
                 }
                 Ok(Event::Text(ref t)) => {
-                    if let Ok(s) = t.unescape() {
+                    if let Some(s) = crate::common::xml::decode_xml_text(t) {
+                        buf_text.push_str(&s);
+                    }
+                }
+                Ok(Event::GeneralRef(ref r)) => {
+                    if let Some(s) = crate::common::xml::decode_xml_ref(r) {
                         buf_text.push_str(&s);
                     }
                 }
@@ -5306,6 +5315,7 @@ mod operetta {
                     handle_start(
                         &current_name,
                         e,
+                        reader.decoder(),
                         &mut active_plane,
                         &mut active_channel,
                         &mut active_channel_id,
@@ -5318,6 +5328,7 @@ mod operetta {
                     handle_start(
                         &name,
                         e,
+                        reader.decoder(),
                         &mut active_plane,
                         &mut active_channel,
                         &mut active_channel_id,
@@ -5342,7 +5353,12 @@ mod operetta {
                     current_name.clear();
                 }
                 Ok(quick_xml::events::Event::Text(ref t)) => {
-                    if let Ok(s) = t.unescape() {
+                    if let Some(s) = crate::common::xml::decode_xml_text(t) {
+                        text_buf.push_str(&s);
+                    }
+                }
+                Ok(quick_xml::events::Event::GeneralRef(ref r)) => {
+                    if let Some(s) = crate::common::xml::decode_xml_ref(r) {
                         text_buf.push_str(&s);
                     }
                 }
@@ -5590,6 +5606,7 @@ mod operetta {
     fn handle_start(
         name: &str,
         e: &quick_xml::events::BytesStart,
+        decoder: quick_xml::encoding::Decoder,
         active_plane: &mut Option<Plane>,
         active_channel: &mut Option<Channel>,
         active_channel_id: &mut i32,
@@ -5598,12 +5615,12 @@ mod operetta {
     ) {
         match name {
             "Image" => {
-                if super::xmlutil::attr(e, "id").is_none() {
+                if super::xmlutil::attr(e, decoder, "id").is_none() {
                     *active_plane = Some(Plane::default());
                 }
             }
             "Entry" => {
-                if let Some(cid) = super::xmlutil::attr(e, "ChannelID") {
+                if let Some(cid) = super::xmlutil::attr(e, decoder, "ChannelID") {
                     if let Ok(cid) = cid.trim().parse::<i32>() {
                         *active_channel_id = cid;
                         let ch = Channel {
@@ -5617,7 +5634,7 @@ mod operetta {
             }
             "EvaluationInputData" => {
                 // isHarmony = xmlns.indexOf(HARMONY_MAGIC) > 0
-                if let Some(xmlns) = super::xmlutil::attr(e, "xmlns") {
+                if let Some(xmlns) = super::xmlutil::attr(e, decoder, "xmlns") {
                     *is_harmony = xmlns.find("Harmony").map(|i| i > 0).unwrap_or(false);
                 }
             }
@@ -6497,7 +6514,12 @@ mod columbus {
                     text.clear();
                 }
                 Ok(quick_xml::events::Event::Text(ref t)) => {
-                    if let Ok(s) = t.unescape() {
+                    if let Some(s) = crate::common::xml::decode_xml_text(t) {
+                        text.push_str(&s);
+                    }
+                }
+                Ok(quick_xml::events::Event::GeneralRef(ref r)) => {
+                    if let Some(s) = crate::common::xml::decode_xml_ref(r) {
                         text.push_str(&s);
                     }
                 }
@@ -6683,12 +6705,18 @@ mod columbus {
                     cur_attrs.clear();
                     for a in e.attributes().flatten() {
                         let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
-                        let v = String::from_utf8_lossy(&a.value).to_string();
-                        cur_attrs.insert(k, v);
+                        if let Some(v) = crate::common::xml::decode_xml_attr(a, reader.decoder()) {
+                            cur_attrs.insert(k, v);
+                        }
                     }
                 }
                 Ok(quick_xml::events::Event::Text(ref t)) => {
-                    if let Ok(s) = t.unescape() {
+                    if let Some(s) = crate::common::xml::decode_xml_text(t) {
+                        text.push_str(&s);
+                    }
+                }
+                Ok(quick_xml::events::Event::GeneralRef(ref r)) => {
+                    if let Some(s) = crate::common::xml::decode_xml_ref(r) {
                         text.push_str(&s);
                     }
                 }
@@ -7355,7 +7383,12 @@ mod scanr {
                         }
                     }
                     Ok(quick_xml::events::Event::Text(ref t)) => {
-                        if let Ok(s) = t.unescape() {
+                        if let Some(s) = crate::common::xml::decode_xml_text(t) {
+                            text.push_str(&s);
+                        }
+                    }
+                    Ok(quick_xml::events::Event::GeneralRef(ref r)) => {
+                        if let Some(s) = crate::common::xml::decode_xml_ref(r) {
                             text.push_str(&s);
                         }
                     }
@@ -8294,7 +8327,7 @@ mod cellvoyager {
             for a in e.attributes().flatten() {
                 let k = local(a.key.as_ref());
                 let v = a
-                    .unescape_value()
+                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                     .map(|c| c.into_owned())
                     .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
                 out.push((k, v));
@@ -8337,7 +8370,14 @@ mod cellvoyager {
                         }
                     }
                     Ok(Event::Text(ref t)) => {
-                        if let Ok(s) = t.unescape() {
+                        if let Some(s) = crate::common::xml::decode_xml_text(t) {
+                            if let Some(top) = stack.last_mut() {
+                                top.text.push_str(&s);
+                            }
+                        }
+                    }
+                    Ok(Event::GeneralRef(ref r)) => {
+                        if let Some(s) = crate::common::xml::decode_xml_ref(r) {
                             if let Some(top) = stack.last_mut() {
                                 top.text.push_str(&s);
                             }

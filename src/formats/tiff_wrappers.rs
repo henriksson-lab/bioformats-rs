@@ -350,6 +350,7 @@ impl NdpiReader {
         }
         self.size_z = size_z;
         self.pyramid_height = pyramid_height;
+        self.apply_capture_mode_overrides();
 
         // seriesCount = pyramidHeight + (ifds - pyramidHeight*sizeZ)  (Java 552)
         // The first `pyramidHeight` "series" collapse into one multi-resolution
@@ -404,6 +405,7 @@ impl NdpiReader {
             }
 
             self.attach_vendor_metadata(0, &mut meta);
+            self.apply_capture_mode_to_meta(&mut meta);
 
             let mut s = template.clone();
             s.ifd_indices = main_ifds;
@@ -594,6 +596,59 @@ impl NdpiReader {
         meta.image_count = meta.size_z.max(1) * c_planes;
         meta.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
         meta
+    }
+
+    /// Java treats capture modes > 6 as single-channel high-bit-depth data, even
+    /// when the TIFF pyramid IFDs advertise 3x8-bit RGB.
+    fn capture_mode_bits_for(mode: u16) -> Option<u16> {
+        match mode {
+            7 => Some(12),
+            13 | 14 | 16 => Some(14),
+            17 | 18 => Some(16),
+            _ if mode > 6 => None,
+            _ => None,
+        }
+    }
+
+    fn capture_mode_bits(&self) -> Option<u16> {
+        Self::capture_mode_bits_for(self.inner.ifd(0)?.get_u16(NDPI_CAPTURE_MODE)?)
+    }
+
+    fn apply_capture_mode_to_meta(&self, meta: &mut ImageMetadata) {
+        if let Some(bits) = self.capture_mode_bits() {
+            meta.size_c = 1;
+            meta.is_rgb = false;
+            meta.pixel_type = crate::common::pixel_type::PixelType::Uint16;
+            meta.bits_per_pixel = bits as u8;
+            meta.image_count = meta.size_z.max(1) * meta.size_t.max(1);
+        }
+    }
+
+    fn apply_capture_mode_overrides(&mut self) {
+        let Some(bits) = self.capture_mode_bits() else {
+            return;
+        };
+        let pyramid_height = self.pyramid_height as usize;
+        let size_z = self.size_z as usize;
+        for z in 0..size_z {
+            for s in 0..pyramid_height {
+                let idx = z * pyramid_height + s;
+                if let Some(ifd) = self.inner.ifd_mut(idx) {
+                    ifd.entries.insert(
+                        crate::tiff::ifd::tag::BITS_PER_SAMPLE,
+                        crate::tiff::ifd::IfdValue::Short(vec![bits]),
+                    );
+                    ifd.entries.insert(
+                        crate::tiff::ifd::tag::SAMPLES_PER_PIXEL,
+                        crate::tiff::ifd::IfdValue::Short(vec![1]),
+                    );
+                    ifd.entries.insert(
+                        crate::tiff::ifd::tag::PHOTOMETRIC_INTERPRETATION,
+                        crate::tiff::ifd::IfdValue::Short(vec![1]),
+                    );
+                }
+            }
+        }
     }
 
     /// Surface NDPI vendor tags from `ifd_index` into `meta.series_metadata`,
@@ -1166,7 +1221,7 @@ impl LeicaScnReader {
                 let spp = ifd.samples_per_pixel();
                 let bps = ifd.bits_per_sample().first().copied().unwrap_or(8);
                 let photometric = ifd.photometric();
-                let is_rgb = spp > 1;
+                let is_rgb = spp > 1 || matches!(photometric, crate::tiff::ifd::Photometric::Rgb);
                 meta.size_x = if main.size_x > 0 {
                     main.size_x
                 } else {
@@ -1492,6 +1547,11 @@ pub struct VentanaReader {
     full_y: u32,
     /// True when the XML provided usable AOIs and we should reassemble tiles.
     reassemble: bool,
+    /// Java rewrites the reported XY size for every resolution after AOI
+    /// stitching. Keep those dimensions here because the inner TIFF reader
+    /// derives subresolution metadata directly from raw IFD sizes.
+    stitched_resolution_sizes: Vec<(u32, u32)>,
+    metadata_override: Option<ImageMetadata>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1539,6 +1599,8 @@ impl VentanaReader {
             full_x: 0,
             full_y: 0,
             reassemble: false,
+            stitched_resolution_sizes: Vec::new(),
+            metadata_override: None,
         }
     }
 
@@ -1659,6 +1721,62 @@ impl VentanaReader {
         }
 
         self.areas = areas;
+    }
+
+    fn compute_stitched_resolution_sizes(&self) -> Vec<(u32, u32)> {
+        let Some(series) = self.inner.series_list().first() else {
+            return Vec::new();
+        };
+        let original_full_x = series.metadata.size_x;
+        let mut sizes = vec![(self.full_x, self.full_y)];
+        for level in &series.sub_resolutions {
+            let Some((sub_x, _sub_y)) = level.first().and_then(|&idx| {
+                self.inner.ifd(idx).map(|ifd| {
+                    (
+                        ifd.image_width().unwrap_or(0),
+                        ifd.image_length().unwrap_or(0),
+                    )
+                })
+            }) else {
+                continue;
+            };
+            sizes.push(Self::stitched_size_for_resolution(
+                original_full_x,
+                self.full_x,
+                self.full_y,
+                sub_x,
+            ));
+        }
+        sizes
+    }
+
+    fn stitched_size_for_resolution(
+        original_full_x: u32,
+        stitched_full_x: u32,
+        stitched_full_y: u32,
+        resolution_x: u32,
+    ) -> (u32, u32) {
+        let scale = if resolution_x > 0 {
+            ((original_full_x as f64) / (resolution_x as f64)).round() as u32
+        } else {
+            1
+        }
+        .max(1);
+        (stitched_full_x / scale, stitched_full_y / scale)
+    }
+
+    fn refresh_metadata_override(&mut self) {
+        self.metadata_override = None;
+        if !self.reassemble || self.inner.series() != 0 {
+            return;
+        }
+        let level = self.inner.resolution();
+        if let Some(&(sx, sy)) = self.stitched_resolution_sizes.get(level) {
+            let mut meta = self.inner.metadata().clone();
+            meta.size_x = sx;
+            meta.size_y = sy;
+            self.metadata_override = Some(meta);
+        }
     }
 
     fn get_tile_column(index: i64, _rows: i64, cols: i64) -> i64 {
@@ -1897,6 +2015,7 @@ impl VentanaReader {
         // Update full-resolution series dimensions and vendor metadata.
         if self.reassemble {
             let (fx, fy) = (self.full_x, self.full_y);
+            self.stitched_resolution_sizes = self.compute_stitched_resolution_sizes();
             if let Some(s) = self.inner.series_list_mut().first_mut() {
                 s.metadata.size_x = fx;
                 s.metadata.size_y = fy;
@@ -1918,12 +2037,24 @@ impl VentanaReader {
                 );
             }
         }
+        self.refresh_metadata_override();
     }
 
     /// Scale factor between the full-resolution image and the resolution that is
     /// currently selected on the inner reader. Mirrors Java `getScale`
     /// (`VentanaReader.java:740-743`): `round(fullX / resX)`.
     fn get_scale(&self) -> i64 {
+        if self.reassemble && self.inner.series() == 0 {
+            let level = self.inner.resolution();
+            if let (Some(&(full_x, _)), Some(&(res_x, _))) = (
+                self.stitched_resolution_sizes.first(),
+                self.stitched_resolution_sizes.get(level),
+            ) {
+                if res_x > 0 {
+                    return ((full_x as f64) / (res_x as f64)).round().max(1.0) as i64;
+                }
+            }
+        }
         let res_x = self.inner.metadata().size_x as i64;
         if res_x <= 0 {
             return 1;
@@ -2078,18 +2209,25 @@ impl FormatReader for VentanaReader {
         self.tiles.clear();
         self.areas.clear();
         self.reassemble = false;
+        self.stitched_resolution_sizes.clear();
+        self.metadata_override = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
         self.inner.series_count()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        self.inner.set_series(s)?;
+        self.refresh_metadata_override();
+        Ok(())
     }
     fn series(&self) -> usize {
         self.inner.series()
     }
     fn metadata(&self) -> &ImageMetadata {
+        if let Some(meta) = &self.metadata_override {
+            return meta;
+        }
         self.inner.metadata()
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
@@ -2100,7 +2238,7 @@ impl FormatReader for VentanaReader {
                 return Err(BioFormatsError::PlaneOutOfRange(p));
             }
             let (rx, ry) = {
-                let m = self.inner.metadata();
+                let m = self.metadata();
                 (m.size_x, m.size_y)
             };
             return self.assemble_region(0, 0, rx, ry);
@@ -2113,7 +2251,7 @@ impl FormatReader for VentanaReader {
                 return Err(BioFormatsError::PlaneOutOfRange(p));
             }
             let (rx, ry) = {
-                let m = self.inner.metadata();
+                let m = self.metadata();
                 (m.size_x, m.size_y)
             };
             validate_region("Ventana", rx, ry, x, y, w, h)?;
@@ -2128,10 +2266,114 @@ impl FormatReader for VentanaReader {
         self.inner.resolution_count()
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
-        self.inner.set_resolution(level)
+        self.inner.set_resolution(level)?;
+        self.refresh_metadata_override();
+        Ok(())
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()
+    }
+}
+
+#[cfg(test)]
+mod leica_scn_ventana_tests {
+    use super::*;
+    use crate::common::reader::FormatReader;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str, ext: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bioformats_tiff_wrappers_{name}_{}_{}.{}",
+            std::process::id(),
+            unique,
+            ext
+        ))
+    }
+
+    fn tiff_entry(tag: u16, typ: u16, count: u32, value: u32) -> [u8; 12] {
+        let mut entry = [0u8; 12];
+        entry[0..2].copy_from_slice(&tag.to_le_bytes());
+        entry[2..4].copy_from_slice(&typ.to_le_bytes());
+        entry[4..8].copy_from_slice(&count.to_le_bytes());
+        entry[8..12].copy_from_slice(&value.to_le_bytes());
+        entry
+    }
+
+    fn write_minimal_scn_tiff(path: &Path, description: &str, photometric: u16) {
+        let mut desc = description.as_bytes().to_vec();
+        desc.push(0);
+
+        let ifd_entry_count = 11u32;
+        let ifd_start = 8u32;
+        let desc_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let pixel_start = desc_start + desc.len() as u32;
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),
+            tiff_entry(257, 4, 1, 1),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, photometric as u32),
+            tiff_entry(270, 2, desc.len() as u32, desc_start),
+            tiff_entry(273, 4, 1, pixel_start),
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 1),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+        ];
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&desc);
+        bytes.push(13);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn leica_scn_treats_photometric_rgb_as_rgb_even_with_one_sample() {
+        let path = temp_path("photometric_rgb", "scn");
+        write_minimal_scn_tiff(
+            &path,
+            concat!(
+                r#"<scn><collection name="c"><image name="main"><pixels>"#,
+                r#"<dimension z="0" c="0" r="0" sizeX="1" sizeY="1" ifd="0"/>"#,
+                r#"</pixels></image></collection></scn>"#,
+            ),
+            2,
+        );
+
+        let mut reader = LeicaScnReader::new();
+        reader.set_id(&path).unwrap();
+        assert!(reader.metadata().is_rgb);
+        assert_eq!(reader.metadata().size_c, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![13]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ventana_stitched_subresolution_size_matches_java_integer_scaling() {
+        assert_eq!(
+            VentanaReader::stitched_size_for_resolution(1000, 901, 777, 250),
+            (225, 194)
+        );
+        assert_eq!(
+            VentanaReader::stitched_size_for_resolution(1000, 901, 777, 333),
+            (300, 259)
+        );
     }
 }
 
@@ -2170,21 +2412,25 @@ impl NikonElementsTiffReader {
         self.nis_ome = NikonElementsOmeProjection::default();
         self.nd2_handler = Nd2Handler::default();
         let desc = {
+            let private_xml = self
+                .inner
+                .ifd(0)
+                .and_then(nikon_elements_private_xml_from_ifd);
             let series = self.inner.series_list();
-            if series.is_empty() {
-                return;
-            }
-            series[0]
-                .metadata
-                .series_metadata
-                .get("ImageDescription")
-                .and_then(|v| {
-                    if let crate::common::metadata::MetadataValue::String(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
+            private_xml.or_else(|| {
+                series.first().and_then(|s| {
+                    s.metadata
+                        .series_metadata
+                        .get("ImageDescription")
+                        .and_then(|v| {
+                            if let crate::common::metadata::MetadataValue::String(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                 })
+            })
         };
         let Some(desc) = desc else { return };
 
@@ -2428,6 +2674,38 @@ impl NikonElementsTiffReader {
         }
         self.inner.replace_series(new_series);
     }
+}
+
+const NIKON_ELEMENTS_XML_TAG: u16 = 65332;
+const NIKON_ELEMENTS_XML_TAG_2: u16 = 65333;
+
+fn nikon_elements_private_xml_from_ifd(ifd: &crate::tiff::ifd::Ifd) -> Option<String> {
+    nikon_elements_ifd_text_value(ifd, NIKON_ELEMENTS_XML_TAG)
+        .and_then(|xml| nikon_elements_prepare_private_xml(&xml))
+        .or_else(|| {
+            nikon_elements_ifd_text_value(ifd, NIKON_ELEMENTS_XML_TAG_2)
+                .and_then(|xml| nikon_elements_prepare_private_xml(&xml))
+        })
+}
+
+fn nikon_elements_ifd_text_value(ifd: &crate::tiff::ifd::Ifd, tag: u16) -> Option<String> {
+    match ifd.get(tag)? {
+        crate::tiff::ifd::IfdValue::Ascii(s) => Some(s.clone()),
+        crate::tiff::ifd::IfdValue::Byte(bytes) | crate::tiff::ifd::IfdValue::Undefined(bytes) => {
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
+        _ => None,
+    }
+}
+
+fn nikon_elements_prepare_private_xml(xml: &str) -> Option<String> {
+    let mut xml = xml.trim().trim_matches('\0').trim();
+    if xml.is_empty() {
+        return None;
+    }
+    let open = xml.find('<')?;
+    xml = &xml[open..];
+    Some(format!("<NIKON>{xml}</NIKON>"))
 }
 
 fn nikon_insert_hierarchy_scalar_metadata(
@@ -3156,7 +3434,7 @@ impl Nd2Handler {
                 self.exposure_time.push(v / 1000.0);
             }
         } else if key == "sDate" {
-            self.date = Some(value.to_string());
+            self.date = nikon_nd2_format_date(value);
         } else if key.ends_with("dTimeMSec") {
             // ND2Handler: collect distinct timepoint stamps; the count becomes
             // the "number of timepoints" diagnostic. Java parses as a double and
@@ -3343,6 +3621,37 @@ impl Nd2Handler {
     fn is_dimensions(key: &str) -> bool {
         key.starts_with("Dimensions") || key.starts_with("Abmessungen")
     }
+}
+
+/// Port of `DateTools.formatDate(value, "dd/MM/yyyy  HH:mm:ss")` used by
+/// Java's `ND2Handler` for Nikon Elements `sDate` values.
+fn nikon_nd2_format_date(value: &str) -> Option<String> {
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    if tokens.len() != 2 {
+        return None;
+    }
+    let date: Vec<&str> = tokens[0].split('/').collect();
+    let time: Vec<&str> = tokens[1].split(':').collect();
+    if date.len() != 3 || time.len() != 3 {
+        return None;
+    }
+    let day: u32 = date[0].parse().ok()?;
+    let month: u32 = date[1].parse().ok()?;
+    let year: u32 = date[2].parse().ok()?;
+    let hour: u32 = time[0].parse().ok()?;
+    let minute: u32 = time[1].parse().ok()?;
+    let second: u32 = time[2].parse().ok()?;
+    if !(1..=31).contains(&day)
+        || !(1..=12).contains(&month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
+    ))
 }
 
 /// Mirror of the local branches of `ND2Handler.startElement`: walk the XML tags
@@ -4037,16 +4346,132 @@ impl FormatReader for NikonElementsTiffReader {
 /// electron microscope images (e.g. HV, beam current, pixel size).
 pub struct FeiTiffReader {
     inner: crate::tiff::TiffReader,
+    image_name: Option<String>,
+    image_description: Option<String>,
+    date: Option<String>,
+    user_name: Option<String>,
+    microscope_model: Option<String>,
+    stage_x: Option<f64>,
+    stage_y: Option<f64>,
+    stage_z: Option<f64>,
+    size_x: Option<f64>,
+    size_y: Option<f64>,
+    time_increment: Option<f64>,
+    detectors: Vec<String>,
+    magnification: Option<f64>,
+    helios: bool,
+}
+
+const FEI_SFEG_TAG: u16 = 34680;
+const FEI_HELIOS_TAG: u16 = 34682;
+const FEI_TITAN_TAG: u16 = 34683;
+const FEI_MAG_MULTIPLIER: f64 = 0.0024388925;
+
+fn fei_ifd_text_value(value: &crate::tiff::ifd::IfdValue) -> Option<String> {
+    match value {
+        crate::tiff::ifd::IfdValue::Ascii(s) => Some(s.clone()),
+        crate::tiff::ifd::IfdValue::Byte(bytes) | crate::tiff::ifd::IfdValue::Undefined(bytes) => {
+            Some(
+                String::from_utf8_lossy(bytes)
+                    .trim_matches('\0')
+                    .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn parse_simple_ini(
+    text: &str,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_string();
+            out.entry(section.clone()).or_default();
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            if !key.is_empty() {
+                out.entry(section.clone())
+                    .or_default()
+                    .insert(key.to_string(), value.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
+fn parse_f64_option(value: Option<&String>) -> Option<f64> {
+    value.and_then(|v| v.trim().parse::<f64>().ok())
 }
 
 impl FeiTiffReader {
     pub fn new() -> Self {
         FeiTiffReader {
             inner: crate::tiff::TiffReader::new(),
+            image_name: None,
+            image_description: None,
+            date: None,
+            user_name: None,
+            microscope_model: None,
+            stage_x: None,
+            stage_y: None,
+            stage_z: None,
+            size_x: None,
+            size_y: None,
+            time_increment: None,
+            detectors: Vec::new(),
+            magnification: None,
+            helios: false,
         }
     }
 
+    fn reset_state(&mut self) {
+        self.image_name = None;
+        self.image_description = None;
+        self.date = None;
+        self.user_name = None;
+        self.microscope_model = None;
+        self.stage_x = None;
+        self.stage_y = None;
+        self.stage_z = None;
+        self.size_x = None;
+        self.size_y = None;
+        self.time_increment = None;
+        self.detectors.clear();
+        self.magnification = None;
+        self.helios = false;
+    }
+
+    fn is_this_type_from_bytes(header: &[u8]) -> bool {
+        let cursor = std::io::Cursor::new(header);
+        let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let ifd = match parser.read_ifd(parser.first_ifd_offset) {
+            Ok((ifd, _)) => ifd,
+            Err(_) => return false,
+        };
+        ifd.entries.contains_key(&FEI_SFEG_TAG)
+            || ifd.entries.contains_key(&FEI_HELIOS_TAG)
+            || ifd.entries.contains_key(&FEI_TITAN_TAG)
+    }
+
     fn enrich_metadata(&mut self) {
+        self.enrich_private_tag_metadata();
+        self.enrich_image_description_metadata();
+    }
+
+    fn enrich_image_description_metadata(&mut self) {
         let desc = {
             let series = self.inner.series_list();
             if series.is_empty() {
@@ -4098,6 +4523,311 @@ impl FeiTiffReader {
             }
         }
     }
+
+    fn enrich_private_tag_metadata(&mut self) {
+        let Some(ifd) = self.inner.ifd(0).cloned() else {
+            return;
+        };
+        let helios = ifd.entries.contains_key(&FEI_HELIOS_TAG);
+        let mut titan = ifd.entries.contains_key(&FEI_TITAN_TAG);
+        if titan
+            && ifd
+                .get(FEI_TITAN_TAG)
+                .and_then(fei_ifd_text_value)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(false)
+        {
+            titan = false;
+        }
+
+        self.helios = helios && !titan;
+        let software = if titan {
+            "Titan"
+        } else if helios {
+            "Helios NanoLab"
+        } else {
+            "S-FEG"
+        };
+
+        let tag_key = if titan {
+            FEI_TITAN_TAG
+        } else if helios {
+            FEI_HELIOS_TAG
+        } else {
+            FEI_SFEG_TAG
+        };
+        let Some(tag) = ifd.get(tag_key).and_then(fei_ifd_text_value) else {
+            return;
+        };
+        let tag = tag.trim().to_string();
+        if tag.is_empty() {
+            return;
+        }
+
+        let mut vendor = std::collections::HashMap::new();
+        vendor.insert(
+            "Software".to_string(),
+            crate::common::metadata::MetadataValue::String(software.to_string()),
+        );
+
+        if tag.starts_with('<') {
+            self.parse_fei_xmlish(&tag, &mut vendor);
+        } else {
+            let ini = parse_simple_ini(&tag);
+            self.parse_fei_ini(&ini, helios, &mut vendor);
+            for (section, values) in &ini {
+                for (key, value) in values {
+                    vendor.insert(
+                        format!("{section} {key}"),
+                        crate::common::metadata::MetadataValue::String(value.clone()),
+                    );
+                }
+            }
+        }
+
+        let series = self.inner.series_list_mut();
+        if let Some(s) = series.first_mut() {
+            for (k, v) in vendor {
+                s.metadata.series_metadata.insert(k, v);
+            }
+        }
+    }
+
+    fn parse_fei_ini(
+        &mut self,
+        ini: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+        helios: bool,
+        vendor: &mut std::collections::HashMap<String, crate::common::metadata::MetadataValue>,
+    ) {
+        if helios {
+            if let Some(user) = ini.get("User") {
+                let date = user.get("Date").cloned().unwrap_or_default();
+                let time = user.get("Time").cloned().unwrap_or_default();
+                let combined = format!("{date} {time}").trim().to_string();
+                if !combined.is_empty() {
+                    self.date = Some(combined.clone());
+                    vendor.insert(
+                        "Acquisition date".to_string(),
+                        crate::common::metadata::MetadataValue::String(combined),
+                    );
+                }
+                self.user_name = user.get("User").cloned();
+            }
+            self.microscope_model = ini
+                .get("System")
+                .or_else(|| ini.get("SYSTEM"))
+                .and_then(|t| t.get("SystemType"))
+                .cloned();
+
+            let beam_table = ini.get("Beam").and_then(|beam| {
+                beam.get("Beam")
+                    .and_then(|name| ini.get(name))
+                    .or(Some(beam))
+            });
+            let stage_table = ini.get("Stage");
+            self.stage_x = beam_table
+                .and_then(|t| parse_f64_option(t.get("StageX")))
+                .or_else(|| stage_table.and_then(|t| parse_f64_option(t.get("StageX"))));
+            self.stage_y = beam_table
+                .and_then(|t| parse_f64_option(t.get("StageY")))
+                .or_else(|| stage_table.and_then(|t| parse_f64_option(t.get("StageY"))));
+            self.stage_z = beam_table
+                .and_then(|t| parse_f64_option(t.get("StageZ")))
+                .or_else(|| stage_table.and_then(|t| parse_f64_option(t.get("StageZ"))));
+
+            if let Some(scan) = ini.get("Scan") {
+                self.size_x = parse_f64_option(scan.get("PixelWidth"));
+                self.size_y = parse_f64_option(scan.get("PixelHeight"));
+                self.time_increment = parse_f64_option(scan.get("FrameTime"));
+            }
+        } else {
+            if let Some(data) = ini.get("DatabarData") {
+                self.image_name = data.get("ImageName").cloned();
+                self.image_description = data.get("szUserText").cloned();
+            }
+            if let Some(mag) = ini
+                .get("Vector")
+                .and_then(|t| parse_f64_option(t.get("Magnification")))
+            {
+                self.size_x = Some(mag * FEI_MAG_MULTIPLIER);
+                self.size_y = Some(mag * FEI_MAG_MULTIPLIER);
+                self.magnification = Some(mag);
+            }
+            if let Some(scan) = ini.get("Vector.Sysscan") {
+                self.stage_x = parse_f64_option(scan.get("PositionX"));
+                self.stage_y = parse_f64_option(scan.get("PositionY"));
+            }
+            if let Some(detectors) = ini.get("Vector.Video.Detectors") {
+                let count = detectors
+                    .get("NrDetectorsConnected")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                for i in 0..count {
+                    if let Some(name) = detectors.get(&format!("Detector_{i}_Name")) {
+                        self.detectors.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_fei_xmlish(
+        &mut self,
+        xml: &str,
+        vendor: &mut std::collections::HashMap<String, crate::common::metadata::MetadataValue>,
+    ) {
+        let mut stack: Vec<String> = Vec::new();
+        let mut label: Option<String> = None;
+        let mut pos = 0usize;
+        while let Some(start_rel) = xml[pos..].find('<') {
+            let start = pos + start_rel;
+            if xml[start..].starts_with("</") {
+                if let Some(end_rel) = xml[start..].find('>') {
+                    let name = xml[start + 2..start + end_rel].trim();
+                    if stack.last().map(|s| s.as_str()) == Some(name) {
+                        stack.pop();
+                    }
+                    pos = start + end_rel + 1;
+                    continue;
+                }
+                break;
+            }
+            if xml[start..].starts_with("<!--")
+                || xml[start..].starts_with("<?")
+                || xml[start..].starts_with("<!")
+            {
+                if let Some(end_rel) = xml[start..].find('>') {
+                    pos = start + end_rel + 1;
+                    continue;
+                }
+                break;
+            }
+            let Some(end_rel) = xml[start..].find('>') else {
+                break;
+            };
+            let raw_name = xml[start + 1..start + end_rel].trim();
+            let self_closing = raw_name.ends_with('/');
+            let name = raw_name
+                .trim_end_matches('/')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let body_start = start + end_rel + 1;
+            if !name.is_empty() && !self_closing {
+                stack.push(name.to_string());
+            }
+            if let Some(close_rel) = xml[body_start..].find(&format!("</{name}>")) {
+                let value = xml_unescape(xml[body_start..body_start + close_rel].trim());
+                if !value.is_empty() && !value.contains('<') {
+                    let parent = stack.iter().rev().nth(1).map(|s| s.as_str()).unwrap_or("");
+                    if name == "Label" {
+                        label = Some(value);
+                    } else {
+                        let key = if name == "Value" {
+                            label.clone().unwrap_or_else(|| name.to_string())
+                        } else if parent.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{parent} {name}")
+                        };
+                        self.apply_fei_key_value(&key, &value);
+                        vendor.insert(key, crate::common::metadata::MetadataValue::String(value));
+                        if name == "Value" {
+                            label = None;
+                        }
+                    }
+                }
+            }
+            pos = body_start;
+        }
+    }
+
+    fn apply_fei_key_value(&mut self, key: &str, value: &str) {
+        match key {
+            "Stage X" | "StagePosition X" => self.stage_x = value.parse().ok(),
+            "Stage Y" | "StagePosition Y" => self.stage_y = value.parse().ok(),
+            "Stage Z" | "StagePosition Z" => self.stage_z = value.parse().ok(),
+            "Microscope" => self.microscope_model = Some(value.to_string()),
+            "User" => self.user_name = Some(value.to_string()),
+            "Magnification" => self.magnification = value.parse().ok(),
+            _ => {
+                if (key.ends_with('X') && key.contains("PixelSize")) || key.ends_with(" pixelWidth")
+                {
+                    self.size_x = value.parse().ok();
+                } else if (key.ends_with('Y') && key.contains("PixelSize"))
+                    || key.ends_with(" pixelHeight")
+                {
+                    self.size_y = value.parse().ok();
+                }
+            }
+        }
+    }
+
+    fn build_ome(&self) -> crate::common::ome_metadata::OmeMetadata {
+        use crate::common::ome_metadata::{
+            create_lsid, OmeDetector, OmeExperimenter, OmeImage, OmeInstrument, OmeMetadata,
+            OmeObjective, OmePlane,
+        };
+
+        let mut image = OmeImage {
+            name: self.image_name.clone(),
+            description: self.image_description.clone(),
+            acquisition_date: self.date.clone(),
+            physical_size_x: self.size_x,
+            physical_size_y: self.size_y,
+            time_increment: self.time_increment,
+            ..Default::default()
+        };
+        image.planes.push(OmePlane {
+            position_x: self.stage_x,
+            position_y: self.stage_y,
+            position_z: self.stage_z,
+            ..Default::default()
+        });
+
+        let mut instrument = OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            microscope_model: self.microscope_model.clone(),
+            ..Default::default()
+        };
+        if self.magnification.is_some() {
+            instrument.objectives.push(OmeObjective {
+                id: Some(create_lsid("Objective", &[0, 0])),
+                nominal_magnification: self.magnification,
+                correction: Some("Other".to_string()),
+                immersion: Some("Other".to_string()),
+                ..Default::default()
+            });
+            image.objective_ref = Some(0);
+        }
+        for (i, detector) in self.detectors.iter().enumerate() {
+            instrument.detectors.push(OmeDetector {
+                id: Some(create_lsid("Detector", &[0, i])),
+                model: Some(detector.clone()),
+                detector_type: Some("Other".to_string()),
+                ..Default::default()
+            });
+        }
+        let mut ome = OmeMetadata {
+            images: vec![image],
+            ..Default::default()
+        };
+        if self.microscope_model.is_some()
+            || self.magnification.is_some()
+            || !self.detectors.is_empty()
+        {
+            ome.images[0].instrument_ref = Some(0);
+            ome.instruments.push(instrument);
+        }
+        if let Some(user) = &self.user_name {
+            ome.experimenters.push(OmeExperimenter {
+                id: Some(create_lsid("Experimenter", &[0])),
+                last_name: Some(user.clone()),
+                ..Default::default()
+            });
+        }
+        ome
+    }
 }
 
 impl Default for FeiTiffReader {
@@ -4108,24 +4838,23 @@ impl Default for FeiTiffReader {
 
 impl FormatReader for FeiTiffReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
-    }
-
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        let _ = path;
         false
     }
 
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::is_this_type_from_bytes(header)
+    }
+
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.reset_state();
         self.inner.set_id(path)?;
         self.enrich_metadata();
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        self.reset_state();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -4158,6 +4887,12 @@ impl FormatReader for FeiTiffReader {
     fn resolution(&self) -> usize {
         self.inner.resolution()
     }
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if self.inner.series_list().is_empty() {
+            return None;
+        }
+        Some(self.build_ome())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4169,16 +4904,71 @@ impl FormatReader for FeiTiffReader {
 /// stored by Olympus SIS software.
 pub struct SisReader {
     inner: crate::tiff::TiffReader,
+    current_path: Option<std::path::PathBuf>,
+    image_name: Option<String>,
+    magnification: Option<f64>,
+    channel_name: Option<String>,
+    camera_name: Option<String>,
+    physical_size_x: Option<f64>,
+    physical_size_y: Option<f64>,
+    acquisition_date: Option<String>,
 }
+
+const SIS_TAG: u16 = 33560;
+const SIS_INI_TAG: u16 = 33471;
+const SIS_TAG_2: u16 = 34853;
+const TIFF_MAKE: u16 = 271;
 
 impl SisReader {
     pub fn new() -> Self {
         SisReader {
             inner: crate::tiff::TiffReader::new(),
+            current_path: None,
+            image_name: None,
+            magnification: None,
+            channel_name: None,
+            camera_name: None,
+            physical_size_x: None,
+            physical_size_y: None,
+            acquisition_date: None,
         }
     }
 
+    fn reset_state(&mut self) {
+        self.image_name = None;
+        self.magnification = None;
+        self.channel_name = None;
+        self.camera_name = None;
+        self.physical_size_x = None;
+        self.physical_size_y = None;
+        self.acquisition_date = None;
+        self.current_path = None;
+    }
+
+    fn is_this_type_from_bytes(header: &[u8]) -> bool {
+        let cursor = std::io::Cursor::new(header);
+        let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let ifd = match parser.read_ifd(parser.first_ifd_offset) {
+            Ok((ifd, _)) => ifd,
+            Err(_) => return false,
+        };
+        let software = ifd.get_str(crate::tiff::ifd::tag::SOFTWARE);
+        let make = ifd.get_str(TIFF_MAKE);
+        (ifd.entries.contains_key(&SIS_TAG)
+            && software.map(|s| s.starts_with("analySIS")).unwrap_or(true))
+            || (ifd.entries.contains_key(&SIS_TAG_2)
+                && make.map(|s| s.starts_with("Olympus")).unwrap_or(false))
+    }
+
     fn enrich_metadata(&mut self) {
+        self.enrich_private_metadata();
+        self.enrich_image_description_metadata();
+    }
+
+    fn enrich_image_description_metadata(&mut self) {
         let desc = {
             let series = self.inner.series_list();
             if series.is_empty() {
@@ -4234,6 +5024,249 @@ impl SisReader {
             }
         }
     }
+
+    fn enrich_private_metadata(&mut self) {
+        let Some(ifd) = self.inner.ifd(0).cloned() else {
+            return;
+        };
+        if let Some(ini_metadata) = ifd.get(SIS_INI_TAG).and_then(fei_ifd_text_value) {
+            self.apply_sis_ini_dimensions(&ini_metadata);
+        }
+
+        if !ifd.entries.contains_key(&SIS_TAG) {
+            if let Some(pointer) = ifd.get_u64(SIS_TAG_2) {
+                let _ = self.parse_sis_tag_2(pointer);
+            }
+            return;
+        }
+
+        let Some(metadata_pointer) = ifd.get_u64(SIS_TAG) else {
+            return;
+        };
+        let _ = self.parse_sis_tag(metadata_pointer);
+
+        let mut vendor = std::collections::HashMap::new();
+        if let Some(v) = self.physical_size_x {
+            vendor.insert(
+                "Nanometers per pixel (X)".to_string(),
+                crate::common::metadata::MetadataValue::Float(v),
+            );
+        }
+        if let Some(v) = self.physical_size_y {
+            vendor.insert(
+                "Nanometers per pixel (Y)".to_string(),
+                crate::common::metadata::MetadataValue::Float(v),
+            );
+        }
+        if let Some(v) = self.magnification {
+            vendor.insert(
+                "Magnification".to_string(),
+                crate::common::metadata::MetadataValue::Float(v),
+            );
+        }
+        if let Some(v) = &self.channel_name {
+            vendor.insert(
+                "Channel name".to_string(),
+                crate::common::metadata::MetadataValue::String(v.clone()),
+            );
+        }
+        if let Some(v) = &self.camera_name {
+            vendor.insert(
+                "Camera name".to_string(),
+                crate::common::metadata::MetadataValue::String(v.clone()),
+            );
+        }
+        if let Some(v) = &self.image_name {
+            vendor.insert(
+                "Image name".to_string(),
+                crate::common::metadata::MetadataValue::String(v.clone()),
+            );
+        }
+        if let Some(v) = &self.acquisition_date {
+            vendor.insert(
+                "Acquisition date".to_string(),
+                crate::common::metadata::MetadataValue::String(v.clone()),
+            );
+        }
+
+        let series = self.inner.series_list_mut();
+        if let Some(s) = series.first_mut() {
+            s.metadata.series_metadata.remove("XResolution");
+            s.metadata.series_metadata.remove("YResolution");
+            for (k, v) in vendor {
+                s.metadata.series_metadata.insert(k, v);
+            }
+        }
+    }
+
+    fn apply_sis_ini_dimensions(&mut self, ini_metadata: &str) {
+        let ini = parse_simple_ini(ini_metadata);
+        let Some(dimensions) = ini.get("Dimension") else {
+            return;
+        };
+        let z = dimensions
+            .get("Z")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let c = dimensions
+            .get("Band")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let t = dimensions
+            .get("Time")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        if z.saturating_mul(c).saturating_mul(t) != self.inner.ifd_count() as u32 {
+            return;
+        }
+        let image_count = self.inner.ifd_count() as u32;
+        let series = self.inner.series_list_mut();
+        if let Some(s) = series.first_mut() {
+            s.metadata.size_z = z;
+            s.metadata.size_t = t;
+            s.metadata.size_c = s.metadata.size_c.saturating_mul(c).max(1);
+            s.metadata.image_count = image_count;
+        }
+    }
+
+    fn parse_sis_tag(&mut self, metadata_pointer: u64) -> Result<()> {
+        let bytes = std::fs::read(self.inner_path_for_error()?)?;
+        let little = self.inner.is_little_endian();
+        let base = usize::try_from(metadata_pointer)
+            .map_err(|_| BioFormatsError::Format("SIS metadata offset overflows".into()))?;
+        if base + 68 > bytes.len() {
+            return Ok(());
+        }
+        let minute = read_i16_at(&bytes, base + 10, little).unwrap_or(0);
+        let hour = read_i16_at(&bytes, base + 12, little).unwrap_or(0);
+        let day = read_i16_at(&bytes, base + 14, little).unwrap_or(0);
+        let month = read_i16_at(&bytes, base + 16, little).unwrap_or(0) + 1;
+        let year = 1900 + read_i16_at(&bytes, base + 18, little).unwrap_or(0);
+        self.acquisition_date = Some(format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:00"
+        ));
+        self.image_name = Some(read_c_string(&bytes, base + 26).trim().to_string());
+
+        let entry = base + 60;
+        let tag_offset = read_u32_at(&bytes, entry + 4, little).unwrap_or(0) as usize;
+        if tag_offset >= bytes.len() {
+            return Ok(());
+        }
+        let meta = if tag_offset > 0 {
+            tag_offset
+        } else {
+            entry + 8
+        };
+        if meta + 112 > bytes.len() {
+            return Ok(());
+        }
+        let unit_exp = read_i16_at(&bytes, meta + 10, little).unwrap_or(0) as f64;
+        let mut physical_size_x = read_f64_at(&bytes, meta + 12, little).unwrap_or(0.0);
+        let mut physical_size_y = read_f64_at(&bytes, meta + 20, little).unwrap_or(0.0);
+        let maybe_y = read_f64_at(&bytes, meta + 28, little).unwrap_or(physical_size_y);
+        if (physical_size_x - physical_size_y).abs() > f64::EPSILON {
+            physical_size_x = physical_size_y;
+            physical_size_y = maybe_y;
+        }
+        if (-12.0..=12.0).contains(&unit_exp) {
+            let unit_multiplier = 10f64.powf(unit_exp) * 10f64.powi(6);
+            physical_size_x *= unit_multiplier;
+            physical_size_y *= unit_multiplier;
+        }
+        self.physical_size_x = Some(physical_size_x);
+        self.physical_size_y = Some(physical_size_y);
+        self.magnification = read_f64_at(&bytes, meta + 36, little);
+        let camera_name_length =
+            read_i16_at(&bytes, meta + 44, little).unwrap_or(0).max(0) as usize;
+        let channel_name = read_c_string(&bytes, meta + 46).trim().to_string();
+        if channel_name.len() <= 128 {
+            if camera_name_length > 0 {
+                let end = camera_name_length.min(channel_name.len());
+                self.camera_name = Some(channel_name[..end].to_string());
+            }
+            self.channel_name = Some(channel_name);
+        }
+        Ok(())
+    }
+
+    fn parse_sis_tag_2(&mut self, pointer: u64) -> Result<()> {
+        let bytes = std::fs::read(self.inner_path_for_error()?)?;
+        let little = self.inner.is_little_endian();
+        let mut pos = usize::try_from(pointer)
+            .map_err(|_| BioFormatsError::Format("SIS tag 2 offset overflows".into()))?;
+        while pos + 2 <= bytes.len() && &bytes[pos..pos + 2] != b"IS" {
+            pos += 1;
+        }
+        if pos + 38 > bytes.len() {
+            return Ok(());
+        }
+        pos += 30;
+        let offset = read_u64_at(&bytes, pos, little).unwrap_or(0);
+        let meta = match usize::try_from(offset.saturating_sub(84)) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        if meta + 16 <= bytes.len() {
+            self.physical_size_x = read_f64_at(&bytes, meta, little).map(|v| v * 1000.0);
+            self.physical_size_y = read_f64_at(&bytes, meta + 8, little).map(|v| v * 1000.0);
+        }
+        Ok(())
+    }
+
+    fn inner_path_for_error(&self) -> Result<&Path> {
+        self.inner_path().ok_or_else(|| {
+            BioFormatsError::Format("SIS metadata parsing requires an initialized TIFF path".into())
+        })
+    }
+
+    fn inner_path(&self) -> Option<&Path> {
+        self.current_path.as_deref()
+    }
+
+    fn build_ome(&self) -> crate::common::ome_metadata::OmeMetadata {
+        use crate::common::ome_metadata::{
+            create_lsid, OmeChannel, OmeDetector, OmeImage, OmeInstrument, OmeMetadata,
+            OmeObjective,
+        };
+
+        let mut image = OmeImage {
+            name: self.image_name.clone(),
+            acquisition_date: self.acquisition_date.clone(),
+            physical_size_x: self.physical_size_x,
+            physical_size_y: self.physical_size_y,
+            instrument_ref: Some(0),
+            objective_ref: Some(0),
+            ..Default::default()
+        };
+        image.channels.push(OmeChannel {
+            name: self.channel_name.clone(),
+            samples_per_pixel: 1,
+            detector_ref: Some(create_lsid("Detector", &[0, 0])),
+            ..Default::default()
+        });
+        let instrument = OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            objectives: vec![OmeObjective {
+                id: Some(create_lsid("Objective", &[0, 0])),
+                nominal_magnification: self.magnification,
+                correction: Some("Other".to_string()),
+                immersion: Some("Other".to_string()),
+                ..Default::default()
+            }],
+            detectors: vec![OmeDetector {
+                id: Some(create_lsid("Detector", &[0, 0])),
+                model: self.camera_name.clone(),
+                detector_type: Some("Other".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        OmeMetadata {
+            images: vec![image],
+            instruments: vec![instrument],
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for SisReader {
@@ -4251,17 +5284,20 @@ impl FormatReader for SisReader {
         matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::is_this_type_from_bytes(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.reset_state();
+        self.current_path = Some(path.to_path_buf());
         self.inner.set_id(path)?;
         self.enrich_metadata();
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        self.reset_state();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -4294,6 +5330,56 @@ impl FormatReader for SisReader {
     fn resolution(&self) -> usize {
         self.inner.resolution()
     }
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if self.inner.series_list().is_empty() {
+            return None;
+        }
+        Some(self.build_ome())
+    }
+}
+
+fn read_i16_at(bytes: &[u8], offset: usize, little: bool) -> Option<i16> {
+    let raw: [u8; 2] = bytes.get(offset..offset + 2)?.try_into().ok()?;
+    Some(if little {
+        i16::from_le_bytes(raw)
+    } else {
+        i16::from_be_bytes(raw)
+    })
+}
+
+fn read_u32_at(bytes: &[u8], offset: usize, little: bool) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(offset..offset + 4)?.try_into().ok()?;
+    Some(if little {
+        u32::from_le_bytes(raw)
+    } else {
+        u32::from_be_bytes(raw)
+    })
+}
+
+fn read_u64_at(bytes: &[u8], offset: usize, little: bool) -> Option<u64> {
+    let raw: [u8; 8] = bytes.get(offset..offset + 8)?.try_into().ok()?;
+    Some(if little {
+        u64::from_le_bytes(raw)
+    } else {
+        u64::from_be_bytes(raw)
+    })
+}
+
+fn read_f64_at(bytes: &[u8], offset: usize, little: bool) -> Option<f64> {
+    let raw: [u8; 8] = bytes.get(offset..offset + 8)?.try_into().ok()?;
+    Some(if little {
+        f64::from_le_bytes(raw)
+    } else {
+        f64::from_be_bytes(raw)
+    })
+}
+
+fn read_c_string(bytes: &[u8], offset: usize) -> String {
+    let Some(rest) = bytes.get(offset..) else {
+        return String::new();
+    };
+    let len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    String::from_utf8_lossy(&rest[..len]).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -5489,6 +6575,17 @@ impl FormatReader for MetamorphTiffReader {
 // ---------------------------------------------------------------------------
 // 7. Improvision/Volocity annotated TIFF — enriched reader
 // ---------------------------------------------------------------------------
+fn metadata_value_from_text(value: &str) -> crate::common::metadata::MetadataValue {
+    let trimmed = value.trim();
+    if let Ok(i) = trimmed.parse::<i64>() {
+        crate::common::metadata::MetadataValue::Int(i)
+    } else if let Ok(f) = trimmed.parse::<f64>() {
+        crate::common::metadata::MetadataValue::Float(f)
+    } else {
+        crate::common::metadata::MetadataValue::String(trimmed.to_string())
+    }
+}
+
 /// Improvision/Volocity annotated TIFF (`.tif`).
 ///
 /// Parses ImageDescription for structured metadata stored by
@@ -5546,13 +6643,32 @@ impl ImprovisionTiffReader {
     /// comments to populate `pixel_size_{x,y,z}`, `channel_colors`, `c_names`
     /// and `pixel_size_t`. Returns `size_c` used to size `c_names`.
     fn parse_comments(&mut self, comments: &[String]) {
+        let mut total_z: Option<u32> = None;
+        let mut total_c: Option<u32> = None;
+        let mut total_t: Option<u32> = None;
+        let mut coords: Vec<[i32; 3]> = vec![[-1, -1, -1]; comments.len()];
+        let mut raw_metadata: Vec<(String, crate::common::metadata::MetadataValue)> = Vec::new();
+
         // First pass: calibration + WhiteColour (mirrors Java lines 170-219).
-        for comment in comments {
+        for (plane, comment) in comments.iter().enumerate() {
             for line in comment.split('\n') {
                 let Some((key, value)) = line.split_once('=') else {
                     continue;
                 };
+                raw_metadata.push((
+                    format!("improvision.{}", key.trim()),
+                    metadata_value_from_text(value),
+                ));
                 match key {
+                    "TotalZPlanes" => {
+                        total_z = value.trim().parse::<u32>().ok();
+                    }
+                    "TotalChannels" => {
+                        total_c = value.trim().parse::<u32>().ok();
+                    }
+                    "TotalTimepoints" => {
+                        total_t = value.trim().parse::<u32>().ok();
+                    }
                     "XCalibrationMicrons" => {
                         if let Ok(v) = value.parse::<f64>() {
                             self.pixel_size_x = v;
@@ -5581,8 +6697,25 @@ impl ImprovisionTiffReader {
                         self.channel_colors
                             .push(Some((red << 24) | (green << 16) | (blue << 8) | 0xff));
                     }
+                    "ZPlane" => {
+                        coords[plane][0] = value.trim().parse::<i32>().unwrap_or(-1);
+                    }
+                    "ChannelNo" => {
+                        coords[plane][1] = value.trim().parse::<i32>().unwrap_or(-1);
+                    }
+                    "TimepointName" => {
+                        coords[plane][2] = value.trim().parse::<i32>().unwrap_or(-1);
+                    }
                     _ => {}
                 }
+            }
+        }
+
+        self.apply_improvision_dimensions(total_z, total_c, total_t, comments.len(), &coords);
+
+        if let Some(s) = self.inner.series_list_mut().first_mut() {
+            for (key, value) in raw_metadata {
+                s.metadata.series_metadata.entry(key).or_insert(value);
             }
         }
 
@@ -5641,6 +6774,94 @@ impl ImprovisionTiffReader {
         if size_t > 0 {
             self.pixel_size_t = sum / size_t;
         }
+    }
+
+    fn apply_improvision_dimensions(
+        &mut self,
+        total_z: Option<u32>,
+        total_c: Option<u32>,
+        total_t: Option<u32>,
+        ifd_count: usize,
+        coords: &[[i32; 3]],
+    ) {
+        use crate::common::metadata::DimensionOrder;
+
+        let Some(series) = self.inner.series_list_mut().first_mut() else {
+            return;
+        };
+        let m = &mut series.metadata;
+        m.size_t = 1;
+        if m.size_z == 0 {
+            m.size_z = 1;
+        }
+        if m.size_c == 0 {
+            m.size_c = 1;
+        }
+        if let Some(z) = total_z {
+            m.size_z = m.size_z.saturating_mul(z.max(1));
+        }
+        if let Some(c) = total_c {
+            m.size_c = m.size_c.saturating_mul(c.max(1));
+        }
+        if let Some(t) = total_t {
+            m.size_t = m.size_t.saturating_mul(t.max(1));
+        }
+
+        let logical = m.size_z.saturating_mul(m.size_c).saturating_mul(m.size_t);
+        if logical < m.image_count {
+            m.size_c = m.size_c.saturating_mul(m.image_count.max(1));
+        } else if let Some(c) = total_c {
+            m.image_count = m.size_z.saturating_mul(m.size_t).saturating_mul(c.max(1));
+        } else if logical > 0 {
+            m.image_count = logical;
+        }
+
+        if ifd_count > 0 && (ifd_count as u32).saturating_mul(1) < m.image_count {
+            m.series_metadata.insert(
+                "improvision.multifile_required".into(),
+                crate::common::metadata::MetadataValue::Bool(true),
+            );
+        }
+
+        let mut order = String::from("XY");
+        if m.is_rgb {
+            order.push('C');
+        }
+        for i in 1..coords.len() {
+            let z_diff = coords[i][0] - coords[i - 1][0];
+            let c_diff = coords[i][1] - coords[i - 1][1];
+            let t_diff = coords[i][2] - coords[i - 1][2];
+            if z_diff > 0 && !order.contains('Z') {
+                order.push('Z');
+            }
+            if c_diff > 0 && !order.contains('C') {
+                order.push('C');
+            }
+            if t_diff > 0 && !order.contains('T') {
+                order.push('T');
+            }
+            if order.len() == 5 {
+                break;
+            }
+        }
+        if !order.contains('Z') {
+            order.push('Z');
+        }
+        if !order.contains('C') {
+            order.push('C');
+        }
+        if !order.contains('T') {
+            order.push('T');
+        }
+        m.dimension_order = match order.as_str() {
+            "XYZCT" => DimensionOrder::XYZCT,
+            "XYZTC" => DimensionOrder::XYZTC,
+            "XYCZT" => DimensionOrder::XYCZT,
+            "XYCTZ" => DimensionOrder::XYCTZ,
+            "XYTCZ" => DimensionOrder::XYTCZ,
+            "XYTZC" => DimensionOrder::XYTZC,
+            _ => m.dimension_order,
+        };
     }
 
     /// Translate Java `initMetadataStore`: build OME image/channel metadata from
@@ -5849,6 +7070,8 @@ impl ZeissApotomeTiffReader {
 
         let mut vendor = std::collections::HashMap::new();
 
+        Self::parse_zeiss_tiff_tags(&desc, &mut vendor);
+
         // Zeiss ApoTome may store XML with <Zeiss> or <ApoTome> elements
         if desc.contains("<Zeiss")
             || desc.contains("<zeiss")
@@ -5933,6 +7156,96 @@ impl ZeissApotomeTiffReader {
             }
         }
     }
+
+    fn zeiss_key_name(id: i64) -> Option<&'static str> {
+        match id {
+            65598 => Some("ApotomeCamCalibrationMode"),
+            65599 => Some("ApoTome Grid Position"),
+            65600 => Some("ApotomeCamScannerPosition"),
+            65601 => Some("ApoTome Full Phase Shift"),
+            65602 => Some("ApoTome Grid Name"),
+            65603 => Some("ApoTome Staining"),
+            65604 => Some("ApoTome Processing Mode"),
+            65605 => Some("ApotomeCamLiveCombineMode"),
+            65606 => Some("ApoTome Filter Name"),
+            65607 => Some("Apotome Filter Strength"),
+            65608 => Some("ApotomeCamFilterHarmonics"),
+            65609 => Some("ApoTome Grating Period"),
+            65610 => Some("ApoTome Auto Shutter Used"),
+            65611 => Some("Apotome Cam Status"),
+            65612 => Some("ApotomeCamNormalize"),
+            65613 => Some("ApotomeCamSettingsManager"),
+            65628 => Some("ApotomeCamLiveFocus"),
+            65631 => Some("ApotomeCamSliderInGridPosition"),
+            65637 => Some("ApoTome Averaging Count"),
+            2819 => Some("Image Index Z"),
+            2820 => Some("Image Channel Index"),
+            2821 => Some("Image Index T"),
+            2822 => Some("ImageTile Index"),
+            2832 => Some("Image Count Z"),
+            2833 => Some("Image Count C"),
+            2834 => Some("Image Count T"),
+            _ => None,
+        }
+    }
+
+    fn normalize_zeiss_key(key: &str) -> String {
+        key.trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+            .split('_')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("_")
+    }
+
+    fn parse_zeiss_tiff_tags(
+        xml: &str,
+        vendor: &mut std::collections::HashMap<String, crate::common::metadata::MetadataValue>,
+    ) {
+        let tags = xml_scan_tags(xml);
+        let mut keys: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut values: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        for tag in &tags {
+            let Some((prefix, index)) = tag.name.split_at_checked(1) else {
+                continue;
+            };
+            if index.is_empty() || !index.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Some(text) = xml_element_text(xml, tag) else {
+                continue;
+            };
+            match prefix {
+                "I" => {
+                    if let Ok(id) = text.trim().parse::<i64>() {
+                        keys.insert(index.to_string(), id);
+                    }
+                }
+                "V" => {
+                    values.insert(index.to_string(), text);
+                }
+                _ => {}
+            }
+        }
+
+        for (index, id) in keys {
+            let Some(name) = Self::zeiss_key_name(id) else {
+                continue;
+            };
+            let Some(value) = values.get(&index) else {
+                continue;
+            };
+            vendor.insert(
+                format!("zeiss.{}", Self::normalize_zeiss_key(name)),
+                metadata_value_from_text(value),
+            );
+        }
+    }
 }
 
 impl Default for ZeissApotomeTiffReader {
@@ -6006,7 +7319,42 @@ pub struct FluoviewReader {
     inner: crate::tiff::TiffReader,
 }
 
+#[derive(Debug, Clone)]
+struct FluoviewMmHeader {
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    series_count: u32,
+    dimension_order: String,
+}
+
 impl FluoviewReader {
+    const MMHEADER: u16 = 34361;
+    const MMSTAMP: u16 = 34362;
+    const TEMPERATURE: u16 = 4869;
+    const EXPOSURE_TIME: u16 = 4876;
+    const KINETIC_CYCLE_TIME: u16 = 4878;
+    const N_ACCUMULATIONS: u16 = 4879;
+    const ACQUISITION_CYCLE_TIME: u16 = 4881;
+    const READOUT_TIME: u16 = 4882;
+    const EM_DAC: u16 = 4885;
+    const N_FRAMES: u16 = 4890;
+    const HORIZONTAL_FLIP: u16 = 4896;
+    const VERTICAL_FLIP: u16 = 4897;
+    const CLOCKWISE: u16 = 4898;
+    const COUNTER_CLOCKWISE: u16 = 4899;
+    const VERTICAL_CLOCK_VOLTAGE: u16 = 4904;
+    const VERTICAL_SHIFT_SPEED: u16 = 4905;
+    const PRE_AMP_SETTING: u16 = 4907;
+    const CAMERA_SERIAL_SETTING: u16 = 4908;
+    const ACTUAL_TEMPERATURE: u16 = 4911;
+    const BASELINE_CLAMP: u16 = 4912;
+    const PRESCANS: u16 = 4913;
+    const MODEL: u16 = 4914;
+    const CHIP_SIZE_X: u16 = 4915;
+    const CHIP_SIZE_Y: u16 = 4916;
+    const BASELINE_OFFSET: u16 = 4944;
+
     pub fn new() -> Self {
         FluoviewReader {
             inner: crate::tiff::TiffReader::new(),
@@ -6032,24 +7380,129 @@ impl FluoviewReader {
                 })
         };
         let Some(desc) = desc else { return };
-        if !desc.contains("[Acquisition Parameters]") && !desc.contains("FluoView") {
+        let first_ifd = self.inner.ifd(0).cloned();
+        let has_mmheader = first_ifd
+            .as_ref()
+            .and_then(|ifd| ifd.get(Self::MMHEADER))
+            .is_some();
+        let has_mmstamp = first_ifd
+            .as_ref()
+            .and_then(|ifd| ifd.get(Self::MMSTAMP))
+            .is_some();
+        let is_andor = desc.starts_with("Andor");
+        if !desc.contains("[Acquisition Parameters]")
+            && !desc.contains("FluoView")
+            && !desc.contains("FLUOVIEW")
+            && !has_mmheader
+            && !has_mmstamp
+            && !is_andor
+        {
             return;
         }
 
         let mut vendor = std::collections::HashMap::new();
+        if has_mmheader {
+            if let Some(ifd) = first_ifd.as_ref() {
+                if let Some(mm) = Self::parse_mmheader(ifd, &mut vendor) {
+                    Self::apply_mmheader(&mut self.inner, &mm);
+                }
+            }
+        } else if let Some(ifd) = first_ifd.as_ref() {
+            Self::parse_andor_tags(ifd, &mut vendor);
+        }
+
         // Parse INI-style key=value pairs
+        let mut date: Option<String> = None;
+        let mut time: Option<String> = None;
         for line in desc.lines() {
             let line = line.trim();
             if let Some((key, val)) = line.split_once('=') {
                 let key = key.trim();
                 let val = val.trim();
                 if !key.is_empty() && !key.starts_with('[') {
+                    vendor.insert(format!("fluoview.{}", key), metadata_value_from_text(val));
+                    let normalized = key.to_ascii_lowercase().replace(' ', "_");
                     vendor.insert(
-                        format!("fluoview.{}", key),
-                        crate::common::metadata::MetadataValue::String(val.to_string()),
+                        format!("fluoview.{}", normalized),
+                        metadata_value_from_text(val),
                     );
+                    if key == "Date" {
+                        date = Some(val.to_string());
+                    } else if key == "Time" {
+                        time = Some(val.to_string());
+                    } else if key == "Magnification" {
+                        vendor.insert(
+                            "fluoview.objective_magnification".into(),
+                            metadata_value_from_text(val),
+                        );
+                    } else if key == "System Configuration" {
+                        vendor.insert(
+                            "fluoview.detector_manufacturer".into(),
+                            crate::common::metadata::MetadataValue::String(val.to_string()),
+                        );
+                    } else if key == "Objective Lens" {
+                        vendor.insert(
+                            "fluoview.objective_manufacturer".into(),
+                            crate::common::metadata::MetadataValue::String(val.to_string()),
+                        );
+                    } else if key.starts_with("Channel ") && key.ends_with("Dye") {
+                        vendor.insert(
+                            format!(
+                                "fluoview.channel_name.{}",
+                                key.trim_start_matches("Channel ")
+                                    .trim_end_matches("Dye")
+                                    .trim()
+                            ),
+                            crate::common::metadata::MetadataValue::String(val.to_string()),
+                        );
+                    } else if let Some(index) = key.strip_prefix("Gain Ch") {
+                        vendor.insert(
+                            format!("fluoview.detector_gain.{}", index.trim()),
+                            metadata_value_from_text(val),
+                        );
+                    } else if let Some(index) = key.strip_prefix("PMT Voltage Ch") {
+                        vendor.insert(
+                            format!("fluoview.detector_voltage.{}", index.trim()),
+                            metadata_value_from_text(val),
+                        );
+                    } else if let Some(index) = key.strip_prefix("Offset Ch") {
+                        vendor.insert(
+                            format!("fluoview.detector_offset.{}", index.trim()),
+                            metadata_value_from_text(val),
+                        );
+                    } else if let Some(index) = key.strip_prefix("Confocal Aperture-Ch") {
+                        let trimmed = val.trim_end_matches("um").trim();
+                        vendor.insert(
+                            format!("fluoview.lens_na.{}", index.trim()),
+                            metadata_value_from_text(trimmed),
+                        );
+                    }
+                }
+            } else if line.starts_with('Z') && line.contains(" um ") && line.contains('-') {
+                let z = line[line.find('-').unwrap_or(0) + 1..]
+                    .chars()
+                    .map(|c| if c.is_ascii_alphabetic() { ' ' } else { c })
+                    .collect::<String>();
+                let parts: Vec<&str> = z.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let (Ok(size), Ok(n_planes)) =
+                        (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+                    {
+                        if n_planes != 0.0 {
+                            vendor.insert(
+                                "fluoview.voxel_z".into(),
+                                crate::common::metadata::MetadataValue::Float(size / n_planes),
+                            );
+                        }
+                    }
                 }
             }
+        }
+        if let (Some(date), Some(time)) = (date, time) {
+            vendor.insert(
+                "fluoview.acquisition_date".into(),
+                crate::common::metadata::MetadataValue::String(format!("{} {}", date, time)),
+            );
         }
 
         let series = self.inner.series_list_mut();
@@ -6058,6 +7511,239 @@ impl FluoviewReader {
                 s.metadata.series_metadata.insert(k, v);
             }
         }
+    }
+
+    fn ifd_value_to_metadata(
+        value: &crate::tiff::ifd::IfdValue,
+    ) -> crate::common::metadata::MetadataValue {
+        match value {
+            crate::tiff::ifd::IfdValue::Ascii(s) => {
+                crate::common::metadata::MetadataValue::String(s.clone())
+            }
+            crate::tiff::ifd::IfdValue::Float(v) if !v.is_empty() => {
+                crate::common::metadata::MetadataValue::Float(v[0] as f64)
+            }
+            crate::tiff::ifd::IfdValue::Double(v) if !v.is_empty() => {
+                crate::common::metadata::MetadataValue::Float(v[0])
+            }
+            _ => {
+                let values = value.as_vec_f64();
+                if values.len() == 1 {
+                    crate::common::metadata::MetadataValue::Float(values[0])
+                } else if !values.is_empty() {
+                    crate::common::metadata::MetadataValue::String(
+                        values
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                } else {
+                    crate::common::metadata::MetadataValue::String(format!("{:?}", value))
+                }
+            }
+        }
+    }
+
+    fn parse_andor_tags(
+        ifd: &crate::tiff::ifd::Ifd,
+        vendor: &mut std::collections::HashMap<String, crate::common::metadata::MetadataValue>,
+    ) {
+        for (tag, name) in [
+            (Self::TEMPERATURE, "Temperature"),
+            (Self::EXPOSURE_TIME, "Exposure time (in seconds)"),
+            (Self::KINETIC_CYCLE_TIME, "Kinetic cycle time"),
+            (Self::N_ACCUMULATIONS, "Number of accumulations"),
+            (Self::ACQUISITION_CYCLE_TIME, "Acquisition cycle time"),
+            (Self::READOUT_TIME, "Readout time"),
+            (Self::EM_DAC, "EM DAC"),
+            (Self::N_FRAMES, "Number of frames"),
+            (Self::HORIZONTAL_FLIP, "Horizontal flip"),
+            (Self::VERTICAL_FLIP, "Vertical flip"),
+            (Self::CLOCKWISE, "Clockwise rotation"),
+            (Self::COUNTER_CLOCKWISE, "Counter-clockwise rotation"),
+            (Self::VERTICAL_CLOCK_VOLTAGE, "Vertical clock voltage"),
+            (Self::VERTICAL_SHIFT_SPEED, "Vertical shift speed"),
+            (Self::PRE_AMP_SETTING, "Pre-amp"),
+            (Self::CAMERA_SERIAL_SETTING, "Camera serial setting"),
+            (Self::ACTUAL_TEMPERATURE, "Actual temperature"),
+            (Self::BASELINE_CLAMP, "Baseline clamp"),
+            (Self::PRESCANS, "Prescans"),
+            (Self::MODEL, "Camera model"),
+            (Self::CHIP_SIZE_X, "Chip size X"),
+            (Self::CHIP_SIZE_Y, "Chip size Y"),
+            (Self::BASELINE_OFFSET, "Baseline offset"),
+        ] {
+            if let Some(value) = ifd.get(tag) {
+                let key = name.to_ascii_lowercase().replace([' ', '(', ')'], "_");
+                vendor.insert(
+                    format!("fluoview.andor.{}", key),
+                    Self::ifd_value_to_metadata(value),
+                );
+            }
+        }
+    }
+
+    fn parse_mmheader(
+        ifd: &crate::tiff::ifd::Ifd,
+        vendor: &mut std::collections::HashMap<String, crate::common::metadata::MetadataValue>,
+    ) -> Option<FluoviewMmHeader> {
+        let Some(value) = ifd.get(Self::MMHEADER) else {
+            return None;
+        };
+        let bytes: Vec<u8> = match value {
+            crate::tiff::ifd::IfdValue::Short(v) => v.iter().map(|v| *v as u8).collect(),
+            crate::tiff::ifd::IfdValue::Byte(v) | crate::tiff::ifd::IfdValue::Undefined(v) => {
+                v.clone()
+            }
+            _ => return None,
+        };
+        if bytes.len() < 284 + 10 * 96 {
+            return None;
+        }
+        let little = true;
+        let read_i32 = |offset: usize| -> i32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[offset..offset + 4]);
+            if little {
+                i32::from_le_bytes(b)
+            } else {
+                i32::from_be_bytes(b)
+            }
+        };
+        let read_f64 = |offset: usize| -> f64 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[offset..offset + 8]);
+            if little {
+                f64::from_le_bytes(b)
+            } else {
+                f64::from_be_bytes(b)
+            }
+        };
+        let mut order = String::from("XY");
+        let mut size_z = 1u32;
+        let mut size_c = 1u32;
+        let mut size_t = 1u32;
+        let mut series_count = 1u32;
+        let mut voxel_x = None;
+        let mut voxel_y = None;
+        let mut voxel_z = None;
+        let mut voxel_t = None;
+        for i in 0..10usize {
+            let offset = 284 + i * 96;
+            let raw_name = &bytes[offset..offset + 16];
+            let nul = raw_name
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(raw_name.len());
+            let name = String::from_utf8_lossy(&raw_name[..nul])
+                .trim()
+                .to_ascii_lowercase();
+            let size = read_i32(offset + 16).max(0) as u32;
+            let resolution = read_f64(offset + 28);
+            if name.is_empty() || size == 0 {
+                continue;
+            }
+            vendor.insert(
+                format!("fluoview.dimension.{}.name", i + 1),
+                crate::common::metadata::MetadataValue::String(name.clone()),
+            );
+            vendor.insert(
+                format!("fluoview.dimension.{}.size", i + 1),
+                crate::common::metadata::MetadataValue::Int(size as i64),
+            );
+            vendor.insert(
+                format!("fluoview.dimension.{}.resolution", i + 1),
+                crate::common::metadata::MetadataValue::Float(resolution),
+            );
+            match name.as_str() {
+                "x" => voxel_x = Some(resolution),
+                "y" => voxel_y = Some(resolution),
+                "event" | "z" => {
+                    size_z = size_z.saturating_mul(size.max(1));
+                    if !order.contains('Z') {
+                        order.push('Z');
+                    }
+                    voxel_z = Some(resolution);
+                }
+                "ch" | "wavelength" => {
+                    size_c = size_c.saturating_mul(size.max(1));
+                    if !order.contains('C') {
+                        order.push('C');
+                    }
+                }
+                "time" | "t" | "animation" => {
+                    size_t = size_t.saturating_mul(size.max(1));
+                    if !order.contains('T') {
+                        order.push('T');
+                    }
+                    voxel_t = Some(resolution);
+                }
+                _ => {
+                    if !order.contains('S') {
+                        order.push('S');
+                    }
+                    series_count = series_count.saturating_mul(size.max(1));
+                }
+            }
+        }
+        for axis in ['Z', 'T', 'C'] {
+            if !order.contains(axis) {
+                order.push(axis);
+            }
+        }
+        let order_no_s = order.replace('S', "");
+        if let Some(v) = voxel_x {
+            vendor.insert(
+                "fluoview.voxel_x".into(),
+                crate::common::metadata::MetadataValue::Float(v),
+            );
+        }
+        if let Some(v) = voxel_y {
+            vendor.insert(
+                "fluoview.voxel_y".into(),
+                crate::common::metadata::MetadataValue::Float(v),
+            );
+        }
+        if let Some(v) = voxel_z {
+            vendor.insert(
+                "fluoview.voxel_z".into(),
+                crate::common::metadata::MetadataValue::Float(v),
+            );
+        }
+        if let Some(v) = voxel_t {
+            vendor.insert(
+                "fluoview.voxel_t".into(),
+                crate::common::metadata::MetadataValue::Float(v),
+            );
+        }
+        Some(FluoviewMmHeader {
+            size_z: size_z.max(1),
+            size_c: size_c.max(1),
+            size_t: size_t.max(1),
+            series_count: series_count.max(1),
+            dimension_order: order_no_s,
+        })
+    }
+
+    fn apply_mmheader(inner: &mut crate::tiff::TiffReader, mm: &FluoviewMmHeader) {
+        let Some(series) = inner.series_list_mut().first_mut() else {
+            return;
+        };
+        let meta = &mut series.metadata;
+        meta.size_z = mm.size_z;
+        meta.size_c = mm.size_c;
+        meta.size_t = mm.size_t;
+        meta.image_count = (meta.image_count / mm.series_count).max(1);
+        meta.dimension_order = match mm.dimension_order.as_str() {
+            "XYZCT" => crate::common::metadata::DimensionOrder::XYZCT,
+            "XYZTC" => crate::common::metadata::DimensionOrder::XYZTC,
+            "XYCZT" => crate::common::metadata::DimensionOrder::XYCZT,
+            "XYCTZ" => crate::common::metadata::DimensionOrder::XYCTZ,
+            "XYTCZ" => crate::common::metadata::DimensionOrder::XYTCZ,
+            "XYTZC" => crate::common::metadata::DimensionOrder::XYTZC,
+            _ => meta.dimension_order,
+        };
     }
 }
 
@@ -6152,6 +7838,11 @@ struct MetaxpressPlate {
     /// Selected wells in row-major order, parallel to series/well indexing.
     selected_wells: Vec<(usize, usize)>,
     field_count: usize,
+    channels: usize,
+    z_steps: u32,
+    /// Java changes `getFile` indexing after falling back to the
+    /// `TimePoint_<t>/ZStep_<z>` directory layout.
+    subdirectories: bool,
 }
 
 impl MolecularDevicesTiffReader {
@@ -6298,6 +7989,7 @@ impl MolecularDevicesTiffReader {
         let mut well_files: Vec<Vec<Option<Vec<std::path::PathBuf>>>> =
             vec![vec![None; info.x_wells]; info.y_wells];
         let mut selected_wells: Vec<(usize, usize)> = Vec::new();
+        let mut subdirectories = false;
         for row in 0..info.y_wells {
             for col in 0..info.x_wells {
                 if info
@@ -6307,16 +7999,19 @@ impl MolecularDevicesTiffReader {
                     .copied()
                     .unwrap_or(false)
                 {
-                    let files = metaxpress_get_tiff_files(
+                    let resolved = metaxpress_get_tiff_files(
+                        htd,
                         &plate,
                         row,
                         col,
                         field_count,
                         channels,
                         info.n_timepoints,
+                        info.z_steps,
                         info.do_channels,
                     );
-                    well_files[row][col] = Some(files);
+                    subdirectories |= resolved.subdirectories;
+                    well_files[row][col] = Some(resolved.files);
                     selected_wells.push((row, col));
                 }
             }
@@ -6334,6 +8029,9 @@ impl MolecularDevicesTiffReader {
             well_files,
             selected_wells,
             field_count,
+            channels,
+            z_steps: info.z_steps,
+            subdirectories,
         };
 
         // Find the first companion TIFF that actually exists on disk, mirroring
@@ -6661,7 +8359,8 @@ fn metaxpress_find_htd(path: &std::path::Path) -> Result<std::path::PathBuf> {
 /// Build the plate-name prefix: HTD path with its extension stripped, plus `_`.
 /// Mirror of `CellWorxReader.getPlateName`.
 fn metaxpress_plate_base(htd: &std::path::Path) -> String {
-    let s = htd.to_string_lossy();
+    let absolute = std::fs::canonicalize(htd).unwrap_or_else(|_| htd.to_path_buf());
+    let s = absolute.to_string_lossy();
     let cut = s.rfind('.').unwrap_or(s.len());
     format!("{}_", &s[..cut])
 }
@@ -6673,18 +8372,26 @@ fn metaxpress_well_name(row: usize, col: usize) -> String {
     format!("{}{:02}", letter, col + 1)
 }
 
+struct MetaxpressTiffFiles {
+    files: Vec<std::path::PathBuf>,
+    subdirectories: bool,
+}
+
 /// Build the per-well TIFF file list, following
-/// `MetaxpressTiffReader.getTiffFiles`. The list is ordered field, channel,
-/// timepoint. The on-disk extension (`.tif` vs `.TIF`) is probed per file.
+/// `MetaxpressTiffReader.getTiffFiles`. Direct names are ordered field,
+/// channel, timepoint. If none exist, mirror Java's sorted flat-directory
+/// fallback, then its `TimePoint_<t>/ZStep_<z>` fallback.
 fn metaxpress_get_tiff_files(
+    htd: &std::path::Path,
     plate: &str,
     row: usize,
     col: usize,
     field_count: usize,
     channels: usize,
     n_timepoints: u32,
+    z_steps: u32,
     do_channels: bool,
-) -> Vec<std::path::PathBuf> {
+) -> MetaxpressTiffFiles {
     let base = format!("{}{}", plate, metaxpress_well_name(row, col));
     let mut files: Vec<std::path::PathBuf> =
         Vec::with_capacity(field_count * channels * n_timepoints as usize);
@@ -6711,7 +8418,90 @@ fn metaxpress_get_tiff_files(
             }
         }
     }
-    files
+    if files.iter().any(|f| f.exists()) {
+        return MetaxpressTiffFiles {
+            files,
+            subdirectories: false,
+        };
+    }
+
+    let expected_len = field_count
+        .saturating_mul(channels)
+        .saturating_mul(n_timepoints as usize)
+        .saturating_mul(z_steps as usize);
+    let parent = htd.parent().unwrap_or_else(|| std::path::Path::new(""));
+
+    let mut flat = Vec::with_capacity(expected_len);
+    for name in metaxpress_list_dir_sorted(parent) {
+        let path = parent.join(&name);
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        if metaxpress_is_tiff_path(&path)
+            && !lower.contains("_thumb")
+            && path.to_string_lossy().starts_with(&base)
+        {
+            flat.push(path);
+        }
+    }
+    if !flat.is_empty() {
+        return MetaxpressTiffFiles {
+            files: flat,
+            subdirectories: false,
+        };
+    }
+
+    let file_base = std::path::Path::new(&base)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or(base);
+    let mut nested = Vec::with_capacity(expected_len);
+    for t in 0..n_timepoints {
+        let dir = parent.join(format!("TimePoint_{}", t + 1));
+        if !(dir.exists() && dir.is_dir()) {
+            continue;
+        }
+        for z in 0..z_steps {
+            let zdir = dir.join(format!("ZStep_{}", z + 1));
+            let scan_dir = if zdir.exists() && zdir.is_dir() {
+                zdir
+            } else if z_steps == 1 {
+                dir.clone()
+            } else {
+                continue;
+            };
+            for name in metaxpress_list_dir_sorted(&scan_dir) {
+                let name_str = name.to_string_lossy();
+                let path = scan_dir.join(&name);
+                let lower = path.to_string_lossy().to_ascii_lowercase();
+                if name_str.starts_with(&file_base)
+                    && metaxpress_is_tiff_path(&path)
+                    && !lower.contains("_thumb")
+                {
+                    nested.push(path);
+                }
+            }
+        }
+    }
+
+    MetaxpressTiffFiles {
+        files: nested,
+        subdirectories: true,
+    }
+}
+
+fn metaxpress_is_tiff_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+        .unwrap_or(false)
+}
+
+fn metaxpress_list_dir_sorted(dir: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.flatten().map(|e| e.file_name()).collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
 }
 
 /// Z coordinate of a plane index under an `XYCZT` dimension order.
@@ -6737,6 +8527,17 @@ impl MetaxpressPlate {
         }
         let image_count = files.len() / self.field_count.max(1);
         let idx = field * image_count + no as usize;
+        if self.subdirectories && self.channels > 0 && self.z_steps > 0 {
+            let no = no as usize;
+            let c = no % self.channels;
+            let z = (no / self.channels) % self.z_steps as usize;
+            let t = no / (self.channels * self.z_steps as usize);
+            let plane = c
+                + self.channels * field
+                + self.channels * self.field_count * z
+                + self.channels * self.field_count * self.z_steps as usize * t;
+            return files.get(plane).cloned();
+        }
         if idx < files.len() {
             files.get(idx).cloned()
         } else if field < files.len() {
@@ -7747,12 +9548,132 @@ mod nikon_elements_tiff_tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn write_minimal_tiff_with_ascii_tags(path: &Path, tags: &[(u16, &str)]) {
+        let mut payloads: Vec<Vec<u8>> = tags
+            .iter()
+            .map(|(_, value)| {
+                let mut bytes = value.as_bytes().to_vec();
+                bytes.push(0);
+                bytes
+            })
+            .collect();
+
+        let ifd_entry_count = 10u32 + tags.len() as u32;
+        let ifd_start = 8u32;
+        let payload_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let mut payload_offset = payload_start;
+        let pixel_start = payload_start + payloads.iter().map(|p| p.len() as u32).sum::<u32>();
+
+        let mut entries = vec![
+            tiff_entry(256, 4, 1, 1),
+            tiff_entry(257, 4, 1, 1),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, 1),
+            tiff_entry(273, 4, 1, pixel_start),
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 1),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+        ];
+        for ((tag, _), payload) in tags.iter().zip(payloads.iter()) {
+            entries.push(tiff_entry(*tag, 2, payload.len() as u32, payload_offset));
+            payload_offset += payload.len() as u32;
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        for payload in payloads.drain(..) {
+            bytes.extend_from_slice(&payload);
+        }
+        bytes.push(9);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_minimal_tiff_with_nikon_private_xml(
+        path: &Path,
+        primary_xml: Option<&str>,
+        fallback_xml: Option<&str>,
+        image_description: &str,
+    ) {
+        let mut payloads: Vec<(u16, Vec<u8>)> = Vec::new();
+        if let Some(xml) = primary_xml {
+            let mut bytes = xml.as_bytes().to_vec();
+            bytes.push(0);
+            payloads.push((NIKON_ELEMENTS_XML_TAG, bytes));
+        }
+        if let Some(xml) = fallback_xml {
+            let mut bytes = xml.as_bytes().to_vec();
+            bytes.push(0);
+            payloads.push((NIKON_ELEMENTS_XML_TAG_2, bytes));
+        }
+
+        let mut desc = image_description.as_bytes().to_vec();
+        desc.push(0);
+
+        let ifd_entry_count = 11u32 + payloads.len() as u32;
+        let ifd_start = 8u32;
+        let data_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let mut next_data = data_start;
+
+        let desc_start = next_data;
+        next_data += desc.len() as u32;
+
+        let mut private_entries = Vec::new();
+        for (tag, bytes) in &payloads {
+            private_entries.push(tiff_entry(*tag, 2, bytes.len() as u32, next_data));
+            next_data += bytes.len() as u32;
+        }
+        let pixel_start = next_data;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+
+        let mut entries = vec![
+            tiff_entry(256, 4, 1, 1),
+            tiff_entry(257, 4, 1, 1),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, 1),
+            tiff_entry(270, 2, desc.len() as u32, desc_start),
+            tiff_entry(273, 4, 1, pixel_start),
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 1),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+        ];
+        entries.extend(private_entries);
+
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&desc);
+        for (_, payload) in payloads {
+            bytes.extend_from_slice(&payload);
+        }
+        bytes.push(7);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn java_tiff_wrapper_suffixes_accept_tif_and_tiff() {
         assert!(NikonElementsTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
         assert!(NikonElementsTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
-        assert!(FeiTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
-        assert!(FeiTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+        assert!(!FeiTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(!FeiTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
         assert!(SisReader::new().is_this_type_by_name(Path::new("sample.tif")));
         assert!(SisReader::new().is_this_type_by_name(Path::new("sample.tiff")));
         assert!(ImprovisionTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
@@ -7761,6 +9682,79 @@ mod nikon_elements_tiff_tests {
         assert!(ZeissApotomeTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
         assert!(FluoviewReader::new().is_this_type_by_name(Path::new("sample.tif")));
         assert!(FluoviewReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+    }
+
+    #[test]
+    fn fei_and_sis_detection_matches_java_private_tags() {
+        let fei_path = temp_path("fei_detection");
+        write_minimal_tiff_with_ascii_tags(
+            &fei_path,
+            &[(FEI_HELIOS_TAG, "[User]\nDate=01/02/2020")],
+        );
+        let fei_bytes = std::fs::read(&fei_path).unwrap();
+        assert!(FeiTiffReader::new().is_this_type_by_bytes(&fei_bytes));
+
+        let plain_path = temp_path("plain_detection");
+        write_minimal_tiff_with_ascii_tags(&plain_path, &[]);
+        let plain_bytes = std::fs::read(&plain_path).unwrap();
+        assert!(!FeiTiffReader::new().is_this_type_by_bytes(&plain_bytes));
+        assert!(!SisReader::new().is_this_type_by_bytes(&plain_bytes));
+
+        let sis_path = temp_path("sis_detection");
+        write_minimal_tiff_with_ascii_tags(
+            &sis_path,
+            &[
+                (SIS_TAG, ""),
+                (crate::tiff::ifd::tag::SOFTWARE, "analySIS 5.0"),
+            ],
+        );
+        let sis_bytes = std::fs::read(&sis_path).unwrap();
+        assert!(SisReader::new().is_this_type_by_bytes(&sis_bytes));
+
+        let sis2_path = temp_path("sis_detection_tag2");
+        write_minimal_tiff_with_ascii_tags(&sis2_path, &[(SIS_TAG_2, ""), (TIFF_MAKE, "Olympus")]);
+        let sis2_bytes = std::fs::read(&sis2_path).unwrap();
+        assert!(SisReader::new().is_this_type_by_bytes(&sis2_bytes));
+    }
+
+    #[test]
+    fn fei_helios_private_tag_projects_java_metadata() {
+        let path = temp_path("fei_helios_metadata");
+        write_minimal_tiff_with_ascii_tags(
+            &path,
+            &[(
+                FEI_HELIOS_TAG,
+                "[User]\nDate=01/02/2020\nTime=03:04:05 PM\nUser=Operator\n\
+                 [System]\nSystemType=Helios G4\n\
+                 [Beam]\nStageX=1.5\nStageY=2.5\nStageZ=3.5\n\
+                 [Scan]\nPixelWidth=0.000001\nPixelHeight=0.000002\nFrameTime=0.25\n",
+            )],
+        );
+
+        let mut reader = FeiTiffReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+        assert!(matches!(
+            metadata.get("Software"),
+            Some(MetadataValue::String(value)) if value == "Helios NanoLab"
+        ));
+        assert!(matches!(
+            metadata.get("User User"),
+            Some(MetadataValue::String(value)) if value == "Operator"
+        ));
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].physical_size_x, Some(0.000001));
+        assert_eq!(ome.images[0].physical_size_y, Some(0.000002));
+        assert_eq!(ome.images[0].time_increment, Some(0.25));
+        assert_eq!(ome.images[0].planes[0].position_x, Some(1.5));
+        assert_eq!(ome.images[0].planes[0].position_y, Some(2.5));
+        assert_eq!(ome.images[0].planes[0].position_z, Some(3.5));
+        assert_eq!(
+            ome.instruments[0].microscope_model.as_deref(),
+            Some("Helios G4")
+        );
+        assert_eq!(ome.experimenters[0].last_name.as_deref(), Some("Operator"));
     }
 
     #[test]
@@ -7828,6 +9822,80 @@ mod nikon_elements_tiff_tests {
             Some(MetadataValue::Float(value)) if (*value - 2_000_000.0).abs() < f64::EPSILON
         ));
         assert!(metadata.get("nikon.variant.unparsed_diagnostic").is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn nikon_elements_tiff_reads_primary_private_xml_tag() {
+        let path = temp_path("private_xml_primary");
+        write_minimal_tiff_with_nikon_private_xml(
+            &path,
+            Some(r#"<dCalibration value="0.42"/><CameraUniqueName value="DS-Qi2"/>"#),
+            None,
+            "plain description without Nikon XML",
+        );
+
+        let mut reader = NikonElementsTiffReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+
+        assert!(matches!(
+            metadata.get("nikon.nd2.pixel_size_x"),
+            Some(MetadataValue::Float(v)) if (v - 0.42).abs() < 1e-9
+        ));
+        assert!(matches!(
+            metadata.get("nikon.nd2.camera_model"),
+            Some(MetadataValue::String(v)) if v == "DS-Qi2"
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn nikon_elements_tiff_falls_back_to_second_private_xml_tag() {
+        let path = temp_path("private_xml_fallback");
+        write_minimal_tiff_with_nikon_private_xml(
+            &path,
+            Some(""),
+            Some(r#"<dZStep value="1.25"/><ExposureTime value="50"/>"#),
+            "plain description without Nikon XML",
+        );
+
+        let mut reader = NikonElementsTiffReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+
+        assert!(matches!(
+            metadata.get("nikon.nd2.pixel_size_z"),
+            Some(MetadataValue::Float(v)) if (v - 1.25).abs() < 1e-9
+        ));
+        assert!(matches!(
+            metadata.get("nikon.nd2.channel.0.exposure_time"),
+            Some(MetadataValue::Float(v)) if (v - 0.05).abs() < 1e-9
+        ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn nikon_elements_tiff_trims_private_xml_prefix_before_parsing() {
+        let path = temp_path("private_xml_prefix");
+        write_minimal_tiff_with_nikon_private_xml(
+            &path,
+            Some("NIKON PRIVATE HEADER <dLampVoltage value=\"7.5\"/>"),
+            None,
+            "plain description without Nikon XML",
+        );
+
+        let mut reader = NikonElementsTiffReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+
+        assert!(matches!(
+            metadata.get("nikon.nd2.voltage"),
+            Some(MetadataValue::Float(v)) if (v - 7.5).abs() < 1e-9
+        ));
 
         let _ = std::fs::remove_file(path);
     }
@@ -8386,6 +10454,33 @@ mod nikon_elements_tiff_tests {
             metadata.get("nikon.nd2.channel.0.power"),
             Some(MetadataValue::Int(80))
         ));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn nikon_nd2handler_formats_sdate_like_java_datetools() {
+        let path = temp_path("nd2handler_sdate");
+        write_minimal_tiff_with_description(
+            &path,
+            r#"<NIKON>
+  <sDate value="05/01/2015  15:14:00"/>
+</NIKON>"#,
+        );
+
+        let mut reader = NikonElementsTiffReader::new();
+        reader.set_id(&path).unwrap();
+        let metadata = &reader.metadata().series_metadata;
+
+        assert!(matches!(
+            metadata.get("nikon.nd2.date"),
+            Some(MetadataValue::String(v)) if v == "2015-01-05T15:14:00"
+        ));
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            ome.images[0].acquisition_date.as_deref(),
+            Some("2015-01-05T15:14:00")
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -9205,13 +11300,264 @@ Bit Depth=16-bit\n",
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn metaxpress_htd_uses_sorted_flat_directory_fallback() {
+        let dir = plate_dir("flat_fallback");
+        let htd = dir.join("FLAT.HTD");
+        std::fs::write(
+            &htd,
+            "\"XWells\", 1\n\
+             \"YWells\", 1\n\
+             \"WellsSelection1\", TRUE\n\
+             \"Sites\", FALSE\n\
+             \"XSites\", 1\n\
+             \"YSites\", 1\n\
+             \"TimePoints\", 2\n\
+             \"ZSteps\", 1\n\
+             \"NWavelengths\", 1\n\
+             \"WaveName1\", \"DAPI\"\n",
+        )
+        .unwrap();
+
+        // Do not create the direct Java guess (`FLAT_A01_t2.TIF`); force the
+        // fallback that scans sorted TIFFs whose absolute path starts with base.
+        write_minimal_tiff_with_description(&dir.join("FLAT_A01_extra_1.tif"), "MetaXpress flat");
+        write_minimal_tiff_with_description(&dir.join("FLAT_A01_extra_2.TIFF"), "MetaXpress flat");
+        write_minimal_tiff_with_description(&dir.join("FLAT_A01_thumb.tif"), "MetaXpress thumb");
+
+        let mut reader = MolecularDevicesTiffReader::new();
+        reader.set_id(&htd).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![11]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn metaxpress_htd_uses_timepoint_zstep_fallback_indexing() {
+        let dir = plate_dir("subdir_fallback");
+        let htd = dir.join("NESTED.HTD");
+        std::fs::write(
+            &htd,
+            "\"XWells\", 1\n\
+             \"YWells\", 1\n\
+             \"WellsSelection1\", TRUE\n\
+             \"Sites\", FALSE\n\
+             \"XSites\", 1\n\
+             \"YSites\", 1\n\
+             \"TimePoints\", 2\n\
+             \"ZSteps\", 2\n\
+             \"NWavelengths\", 1\n\
+             \"WaveName1\", \"DAPI\"\n",
+        )
+        .unwrap();
+
+        for t in 1..=2 {
+            for z in 1..=2 {
+                let zdir = dir.join(format!("TimePoint_{t}/ZStep_{z}"));
+                std::fs::create_dir_all(&zdir).unwrap();
+                write_minimal_tiff_with_description(
+                    &zdir.join(format!("NESTED_A01_t{t}_z{z}.tif")),
+                    "MetaXpress nested",
+                );
+            }
+        }
+
+        let mut reader = MolecularDevicesTiffReader::new();
+        reader.set_id(&htd).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.metadata().size_z, 2);
+        assert_eq!(reader.metadata().size_t, 2);
+        assert_eq!(reader.metadata().image_count, 4);
+        for plane in 0..4 {
+            assert_eq!(reader.open_bytes(plane).unwrap(), vec![11]);
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
 mod ndpi_offset64_tests {
     use super::*;
+    use crate::common::pixel_type::PixelType;
     use crate::tiff::ifd::{tag, Ifd, IfdValue};
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn push_u16_le(data: &mut Vec<u8>, value: u16) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32_le(data: &mut Vec<u8>, value: u32) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_ifd_short(data: &mut Vec<u8>, tag: u16, value: u16) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 3);
+        push_u32_le(data, 1);
+        push_u16_le(data, value);
+        push_u16_le(data, 0);
+    }
+
+    fn push_ifd_long(data: &mut Vec<u8>, tag: u16, value: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 4);
+        push_u32_le(data, 1);
+        push_u32_le(data, value);
+    }
+
+    fn push_ifd_ascii(data: &mut Vec<u8>, tag: u16, count: u32, offset: u32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 2);
+        push_u32_le(data, count);
+        push_u32_le(data, offset);
+    }
+
+    fn temp_ndpi_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bioformats-rs-ndpi-{name}-{}-{unique}.ndpi",
+            std::process::id()
+        ))
+    }
+
+    fn synthetic_ndpi_capture_mode_tiff(capture_mode: u16) -> Vec<u8> {
+        struct Spec {
+            width: u32,
+            height: u32,
+            pixels: Vec<u8>,
+            first: bool,
+        }
+
+        let specs = [
+            Spec {
+                width: 4,
+                height: 4,
+                pixels: vec![0; 4 * 4 * 3],
+                first: true,
+            },
+            Spec {
+                width: 2,
+                height: 2,
+                pixels: vec![0; 2 * 2 * 3],
+                first: false,
+            },
+            Spec {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+                first: false,
+            },
+        ];
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+
+        for (i, spec) in specs.iter().enumerate() {
+            let metadata = if spec.first {
+                Some("Product=synthetic\nNDP.S/N=12345\n")
+            } else {
+                None
+            };
+            let entry_count = 10u16 + u16::from(spec.first) * 3;
+            let ifd_start = data.len() as u32;
+            let after_ifd = ifd_start + 2 + u32::from(entry_count) * 12 + 4;
+            let metadata_len = metadata.map(|s| s.len() as u32 + 1).unwrap_or(0);
+            let metadata_offset = after_ifd;
+            let pixel_offset = metadata_offset + metadata_len;
+            let next_ifd = if i + 1 == specs.len() {
+                0
+            } else {
+                pixel_offset + spec.pixels.len() as u32
+            };
+
+            push_u16_le(&mut data, entry_count);
+            push_ifd_long(&mut data, tag::IMAGE_WIDTH, spec.width);
+            push_ifd_long(&mut data, tag::IMAGE_LENGTH, spec.height);
+            push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+            push_ifd_short(&mut data, tag::COMPRESSION, 1);
+            push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 2);
+            push_ifd_long(&mut data, tag::STRIP_OFFSETS, pixel_offset);
+            push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 3);
+            push_ifd_long(&mut data, tag::ROWS_PER_STRIP, spec.height);
+            push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, spec.pixels.len() as u32);
+            push_ifd_short(&mut data, tag::PLANAR_CONFIGURATION, 1);
+            if let Some(metadata) = metadata {
+                push_ifd_long(&mut data, NDPI_MARKER_TAG, 1);
+                push_ifd_short(&mut data, NDPI_CAPTURE_MODE, capture_mode);
+                push_ifd_ascii(
+                    &mut data,
+                    NDPI_METADATA_TAG,
+                    metadata.len() as u32 + 1,
+                    metadata_offset,
+                );
+            }
+            push_u32_le(&mut data, next_ifd);
+            if let Some(metadata) = metadata {
+                data.extend_from_slice(metadata.as_bytes());
+                data.push(0);
+            }
+            data.extend_from_slice(&spec.pixels);
+        }
+
+        data
+    }
+
+    #[test]
+    fn ndpi_capture_mode_bit_mapping_matches_java_known_modes() {
+        assert_eq!(NdpiReader::capture_mode_bits_for(7), Some(12));
+        assert_eq!(NdpiReader::capture_mode_bits_for(13), Some(14));
+        assert_eq!(NdpiReader::capture_mode_bits_for(14), Some(14));
+        assert_eq!(NdpiReader::capture_mode_bits_for(16), Some(14));
+        assert_eq!(NdpiReader::capture_mode_bits_for(17), Some(16));
+        assert_eq!(NdpiReader::capture_mode_bits_for(18), Some(16));
+        assert_eq!(NdpiReader::capture_mode_bits_for(6), None);
+    }
+
+    #[test]
+    fn ndpi_capture_mode_overrides_pyramid_rgb_metadata() {
+        let path = temp_ndpi_path("capture-mode");
+        std::fs::write(&path, synthetic_ndpi_capture_mode_tiff(13)).unwrap();
+
+        let mut reader = NdpiReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 3);
+        assert_eq!(reader.pyramid_height(), 2);
+
+        reader.set_series(0).unwrap();
+        let full = reader.metadata();
+        assert_eq!(full.size_c, 1);
+        assert!(!full.is_rgb);
+        assert_eq!(full.bits_per_pixel, 14);
+        assert_eq!(full.pixel_type, PixelType::Uint16);
+
+        reader.set_series(1).unwrap();
+        let subres = reader.metadata();
+        assert_eq!(subres.size_c, 1);
+        assert!(!subres.is_rgb);
+        assert_eq!(subres.bits_per_pixel, 14);
+        assert_eq!(subres.pixel_type, PixelType::Uint16);
+
+        reader.set_series(2).unwrap();
+        let macro_image = reader.metadata();
+        assert_eq!(macro_image.size_c, 3);
+        assert!(macro_image.is_rgb);
+        assert_eq!(macro_image.bits_per_pixel, 8);
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn ndpi_multistrip_offset_correction_applies_high_words() {
@@ -9341,6 +11687,99 @@ mod improvision_tests {
         // So directly assert the helper is a no-op without a series, matching
         // Java guarding on core.get(0,0).
         assert!(r.ome_images.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod targeted_tiff_wrapper_parity_tests {
+    use super::*;
+    use crate::common::metadata::MetadataValue;
+    use crate::tiff::ifd::{Ifd, IfdValue};
+    use std::collections::HashMap;
+
+    #[test]
+    fn zeiss_apotome_maps_base_zeiss_tag_ids_from_xml() {
+        let xml = "<ROOT><Tags><Count>2</Count>\
+                   <I0>65602</I0><V0>Grid A</V0>\
+                   <I1>65607</I1><V1>1.5</V1>\
+                   </Tags></ROOT>";
+        let mut vendor = HashMap::new();
+        ZeissApotomeTiffReader::parse_zeiss_tiff_tags(xml, &mut vendor);
+
+        assert!(matches!(
+            vendor.get("zeiss.apotome_grid_name"),
+            Some(MetadataValue::String(value)) if value == "Grid A"
+        ));
+        assert!(matches!(
+            vendor.get("zeiss.apotome_filter_strength"),
+            Some(MetadataValue::Float(value)) if (*value - 1.5).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn fluoview_andor_private_tags_use_java_metadata_names() {
+        let mut entries = HashMap::new();
+        entries.insert(FluoviewReader::TEMPERATURE, IfdValue::Float(vec![-70.5]));
+        entries.insert(FluoviewReader::EXPOSURE_TIME, IfdValue::Float(vec![0.25]));
+        entries.insert(FluoviewReader::MODEL, IfdValue::Ascii("iXon Ultra".into()));
+        let ifd = Ifd { entries };
+        let mut vendor = HashMap::new();
+
+        FluoviewReader::parse_andor_tags(&ifd, &mut vendor);
+
+        assert!(matches!(
+            vendor.get("fluoview.andor.temperature"),
+            Some(MetadataValue::Float(value)) if (*value + 70.5).abs() < 1e-9
+        ));
+        assert!(matches!(
+            vendor.get("fluoview.andor.exposure_time__in_seconds_"),
+            Some(MetadataValue::Float(value)) if (*value - 0.25).abs() < 1e-9
+        ));
+        assert!(matches!(
+            vendor.get("fluoview.andor.camera_model"),
+            Some(MetadataValue::String(value)) if value == "iXon Ultra"
+        ));
+    }
+
+    fn write_fluoview_dim(header: &mut [u8], index: usize, name: &str, size: i32, resolution: f64) {
+        let offset = 284 + index * 96;
+        for (i, b) in name.as_bytes().iter().take(15).enumerate() {
+            header[offset + i] = *b;
+        }
+        header[offset + 16..offset + 20].copy_from_slice(&size.to_le_bytes());
+        header[offset + 28..offset + 36].copy_from_slice(&resolution.to_le_bytes());
+    }
+
+    #[test]
+    fn fluoview_mmheader_derives_java_axis_sizes_and_voxels() {
+        let mut header = vec![0u8; 284 + 10 * 96];
+        write_fluoview_dim(&mut header, 0, "X", 64, 0.2);
+        write_fluoview_dim(&mut header, 1, "Y", 32, 0.3);
+        write_fluoview_dim(&mut header, 2, "Z", 3, 1.25);
+        write_fluoview_dim(&mut header, 3, "Ch", 2, 1.0);
+        write_fluoview_dim(&mut header, 4, "Time", 4, 0.5);
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            FluoviewReader::MMHEADER,
+            IfdValue::Short(header.iter().map(|b| *b as u16).collect()),
+        );
+        let ifd = Ifd { entries };
+        let mut vendor = HashMap::new();
+        let mm = FluoviewReader::parse_mmheader(&ifd, &mut vendor).unwrap();
+
+        assert_eq!(mm.size_z, 3);
+        assert_eq!(mm.size_c, 2);
+        assert_eq!(mm.size_t, 4);
+        assert_eq!(mm.dimension_order, "XYZCT");
+        assert!(matches!(
+            vendor.get("fluoview.voxel_x"),
+            Some(MetadataValue::Float(value)) if (*value - 0.2).abs() < 1e-9
+        ));
+        assert!(matches!(
+            vendor.get("fluoview.voxel_z"),
+            Some(MetadataValue::Float(value)) if (*value - 1.25).abs() < 1e-9
+        ));
     }
 }
 

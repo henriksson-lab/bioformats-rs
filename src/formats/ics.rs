@@ -305,6 +305,13 @@ fn build_metadata(hdr: &IcsHeader) -> Result<ImageMetadata> {
         }
     }
 
+    // Java ICSReader treats stored RGB as separate channel planes when each
+    // stored channel has an emission wavelength annotation.
+    if is_rgb && hdr.em_waves.len() == size_c as usize {
+        is_rgb = false;
+        stored_rgb = true;
+    }
+
     let dimension_order = make_sane_dimension_order(&dim_order);
 
     if size_z == 0 {
@@ -396,6 +403,23 @@ impl IcsReader {
             path: None,
             meta: None,
             header: None,
+        }
+    }
+
+    fn header_path(path: &Path) -> PathBuf {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("ids") => {
+                // Java ICSReader accepts either side of an ICS1 pair. Given
+                // .ids, it derives the .ics path by converting D/d to C/c in
+                // the extension, preserving the common all-uppercase case.
+                let ics_ext = if ext.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                    "ICS"
+                } else {
+                    "ics"
+                };
+                path.with_extension(ics_ext)
+            }
+            _ => path.to_path_buf(),
         }
     }
 
@@ -523,7 +547,14 @@ impl IcsReader {
         let data_path = Self::data_path(ics_path, hdr)?;
         let mut f = File::open(&data_path).map_err(BioFormatsError::Io)?;
 
-        f.seek(SeekFrom::Start(hdr.data_offset))
+        // Java opens the companion .ids stream for ICS1 and records offset 0;
+        // the header-derived data offset applies only to embedded ICS2 pixels.
+        let data_offset = if hdr.version < 2.0 {
+            0
+        } else {
+            hdr.data_offset
+        };
+        f.seek(SeekFrom::Start(data_offset))
             .map_err(BioFormatsError::Io)?;
         let mut data = Vec::new();
         if hdr.gzip_compressed {
@@ -654,7 +685,7 @@ impl FormatReader for IcsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("ics"))
+            .map(|e| e.eq_ignore_ascii_case("ics") || e.eq_ignore_ascii_case("ids"))
             .unwrap_or(false)
     }
 
@@ -665,9 +696,10 @@ impl FormatReader for IcsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let hdr = IcsHeader::parse(path)?;
+        let ics_path = Self::header_path(path);
+        let hdr = IcsHeader::parse(&ics_path)?;
         let meta = build_metadata(&hdr)?;
-        self.path = Some(path.to_path_buf());
+        self.path = Some(ics_path);
         self.header = Some(hdr);
         self.meta = Some(meta);
         Ok(())
@@ -808,11 +840,73 @@ impl Default for IcsWriter {
     }
 }
 
+fn ics_plane_coords(meta: &ImageMetadata, plane_index: u32) -> (u32, u32, u32) {
+    let size_z = meta.size_z.max(1);
+    let size_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+    let size_t = meta.size_t.max(1);
+    let mut rem = plane_index;
+    let mut z = 0;
+    let mut c = 0;
+    let mut t = 0;
+    for axis in match meta.dimension_order {
+        DimensionOrder::XYCTZ => ['C', 'T', 'Z'],
+        DimensionOrder::XYCZT => ['C', 'Z', 'T'],
+        DimensionOrder::XYTCZ => ['T', 'C', 'Z'],
+        DimensionOrder::XYTZC => ['T', 'Z', 'C'],
+        DimensionOrder::XYZCT => ['Z', 'C', 'T'],
+        DimensionOrder::XYZTC => ['Z', 'T', 'C'],
+    } {
+        match axis {
+            'Z' => {
+                z = rem % size_z;
+                rem /= size_z;
+            }
+            'C' => {
+                c = rem % size_c;
+                rem /= size_c;
+            }
+            'T' => {
+                t = rem % size_t;
+                rem /= size_t;
+            }
+            _ => {}
+        }
+    }
+    (z, c, t)
+}
+
+fn ics_xyztc_index(meta: &ImageMetadata, z: u32, c: u32, t: u32) -> usize {
+    let size_z = meta.size_z.max(1);
+    let size_t = meta.size_t.max(1);
+    ((c * size_t + t) * size_z + z) as usize
+}
+
+fn bytes_as_little_endian(meta: &ImageMetadata, data: &[u8]) -> Vec<u8> {
+    let bps = meta.pixel_type.bytes_per_sample();
+    if meta.is_little_endian || bps <= 1 {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    for chunk in out.chunks_exact_mut(bps) {
+        chunk.reverse();
+    }
+    out
+}
+
+fn ics_metadata_path_for_ids(path: &Path) -> PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
+            path.with_extension("ICS")
+        }
+        _ => path.with_extension("ics"),
+    }
+}
+
 impl FormatWriter for IcsWriter {
     fn is_this_type(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("ics"))
+            .map(|e| e.eq_ignore_ascii_case("ics") || e.eq_ignore_ascii_case("ids"))
             .unwrap_or(false)
     }
 
@@ -839,7 +933,7 @@ impl FormatWriter for IcsWriter {
             idx,
             data.len(),
         )?;
-        self.planes.push(data.to_vec());
+        self.planes.push(bytes_as_little_endian(meta, data));
         Ok(())
     }
 
@@ -849,9 +943,20 @@ impl FormatWriter for IcsWriter {
         crate::formats::stack_writer::validate_complete("ICS", meta, self.planes.len())?;
         let meta = self.meta.take().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.take().ok_or(BioFormatsError::NotInitialized)?;
+        let write_ics1_pair = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("ids"))
+            .unwrap_or(false);
+        let metadata_path = if write_ics1_pair {
+            ics_metadata_path_for_ids(&path)
+        } else {
+            path.clone()
+        };
 
-        // Write ICS2 format: header + "end\r\n" + raw binary (all in one .ics file)
-        let mut f = File::create(&path).map_err(BioFormatsError::Io)?;
+        // Write ICS2 as one .ics file, or Java-style ICS1 as .ics metadata
+        // plus a sibling .ids pixel file when the requested path ends in .ids.
+        let mut f = File::create(&metadata_path).map_err(BioFormatsError::Io)?;
 
         let bps = meta.pixel_type.bytes_per_sample() * 8;
         let (format_str, sign_str) = match meta.pixel_type {
@@ -864,19 +969,27 @@ impl FormatWriter for IcsWriter {
         // probe does readString(17).trim() == "ics_version\t2.0", which only
         // matches when this line is exactly "ics_version\t2.0\r\n" (17 bytes);
         // a bare "\n" makes Java fall back to ICS v1 and demand a .ids file.
-        write!(f, "ics_version\t2.0\r\n").map_err(BioFormatsError::Io)?;
+        if write_ics1_pair {
+            write!(f, "ics_version\t1.0\r\n").map_err(BioFormatsError::Io)?;
+        } else {
+            write!(f, "ics_version\t2.0\r\n").map_err(BioFormatsError::Io)?;
+        }
         write!(
             f,
             "filename\t{}\r\n",
-            path.file_stem().unwrap_or_default().to_string_lossy()
+            path.file_name().unwrap_or_default().to_string_lossy()
         )
         .map_err(BioFormatsError::Io)?;
-        let mut order_parts = vec!["bits", "x", "y"];
-        let mut size_parts = vec![
-            bps.to_string(),
-            meta.size_x.to_string(),
-            meta.size_y.to_string(),
-        ];
+        let mut order_parts = vec!["bits"];
+        let mut size_parts = vec![bps.to_string()];
+        if meta.is_rgb {
+            order_parts.push("ch");
+            size_parts.push(meta.size_c.max(1).to_string());
+        }
+        order_parts.push("x");
+        size_parts.push(meta.size_x.to_string());
+        order_parts.push("y");
+        size_parts.push(meta.size_y.to_string());
         if meta.size_z > 1 {
             order_parts.push("z");
             size_parts.push(meta.size_z.to_string());
@@ -885,7 +998,7 @@ impl FormatWriter for IcsWriter {
             order_parts.push("t");
             size_parts.push(meta.size_t.to_string());
         }
-        if meta.size_c > 1 {
+        if !meta.is_rgb && meta.size_c > 1 {
             order_parts.push("ch");
             size_parts.push(meta.size_c.to_string());
         }
@@ -898,7 +1011,7 @@ impl FormatWriter for IcsWriter {
         write!(f, "representation\tsign\t{}\r\n", sign_str).map_err(BioFormatsError::Io)?;
         write!(f, "representation\tbyte_order\t1 2 3 4\r\n").map_err(BioFormatsError::Io)?;
         write!(f, "representation\tcompression\tuncompressed\r\n").map_err(BioFormatsError::Io)?;
-        // The terminator MUST end in a bare LF, not CRLF. Java's ICSReader locates
+        // The ICS2 terminator MUST end in a bare LF, not CRLF. Java's ICSReader locates
         // the pixel-data offset for ICS v2 with `in.readString(NL)` (NL = "\r\n"),
         // which stops at the FIRST terminator character and consumes only that one
         // byte. With "end\r\n" it stops on the `\r`, leaving the trailing `\n`
@@ -907,9 +1020,29 @@ impl FormatWriter for IcsWriter {
         // reason. The leading `ics_version\t2.0\r\n` line stays CRLF because the v2
         // probe reads a fixed 17 bytes and needs that line to be exactly 17 long.
         write!(f, "end\n").map_err(BioFormatsError::Io)?;
+        let mut pixel_file = if write_ics1_pair {
+            Some(File::create(&path).map_err(BioFormatsError::Io)?)
+        } else {
+            None
+        };
 
-        for plane in &self.planes {
-            f.write_all(plane).map_err(BioFormatsError::Io)?;
+        let mut output_planes = vec![None; self.planes.len()];
+        for (input_index, plane) in self.planes.iter().enumerate() {
+            let (z, c, t) = ics_plane_coords(&meta, input_index as u32);
+            let output_index = ics_xyztc_index(&meta, z, c, t);
+            if output_index < output_planes.len() {
+                output_planes[output_index] = Some(plane);
+            }
+        }
+        for plane in output_planes {
+            let plane = plane.ok_or_else(|| {
+                BioFormatsError::Format("ICS writer: internal plane reordering gap".into())
+            })?;
+            if let Some(pixel_file) = pixel_file.as_mut() {
+                pixel_file.write_all(plane).map_err(BioFormatsError::Io)?;
+            } else {
+                f.write_all(plane).map_err(BioFormatsError::Io)?;
+            }
         }
         self.planes.clear();
         Ok(())

@@ -64,6 +64,74 @@ fn printable_ascii(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).trim().to_string()
 }
 
+fn crop_planar_full_plane(
+    format_name: &str,
+    full: &[u8],
+    meta: &ImageMetadata,
+    samples_per_pixel: usize,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    crate::common::region::validate_region(format_name, meta.size_x, meta.size_y, x, y, w, h)?;
+
+    let bps = meta.pixel_type.bytes_per_sample();
+    let channel_plane_bytes = (meta.size_x as usize)
+        .checked_mul(meta.size_y as usize)
+        .and_then(|v| v.checked_mul(bps))
+        .ok_or_else(|| BioFormatsError::Format(format!("{format_name} plane size overflows")))?;
+    let expected_len = channel_plane_bytes
+        .checked_mul(samples_per_pixel)
+        .ok_or_else(|| BioFormatsError::Format(format!("{format_name} plane size overflows")))?;
+    if full.len() < expected_len {
+        return Err(BioFormatsError::InvalidData(format!(
+            "{format_name} plane buffer is too short: got {}, expected at least {expected_len}",
+            full.len()
+        )));
+    }
+
+    let row_bytes = (meta.size_x as usize)
+        .checked_mul(bps)
+        .ok_or_else(|| BioFormatsError::Format(format!("{format_name} row size overflows")))?;
+    let out_row = (w as usize).checked_mul(bps).ok_or_else(|| {
+        BioFormatsError::Format(format!("{format_name} output row size overflows"))
+    })?;
+    let mut out = Vec::with_capacity(
+        samples_per_pixel
+            .checked_mul(h as usize)
+            .and_then(|v| v.checked_mul(out_row))
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!("{format_name} output size overflows"))
+            })?,
+    );
+    let x_bytes = (x as usize).checked_mul(bps).ok_or_else(|| {
+        BioFormatsError::Format(format!("{format_name} region x offset overflows"))
+    })?;
+    for channel in 0..samples_per_pixel {
+        let channel_start = channel.checked_mul(channel_plane_bytes).ok_or_else(|| {
+            BioFormatsError::Format(format!("{format_name} channel offset overflows"))
+        })?;
+        for row in 0..h as usize {
+            let src_row = channel_start
+                .checked_add((y as usize + row).checked_mul(row_bytes).ok_or_else(|| {
+                    BioFormatsError::Format(format!("{format_name} row offset overflows"))
+                })?)
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!("{format_name} row offset overflows"))
+                })?;
+            let start = src_row.checked_add(x_bytes).ok_or_else(|| {
+                BioFormatsError::Format(format!("{format_name} region offset overflows"))
+            })?;
+            let end = start.checked_add(out_row).ok_or_else(|| {
+                BioFormatsError::Format(format!("{format_name} region end overflows"))
+            })?;
+            out.extend_from_slice(&full[start..end]);
+        }
+    }
+    Ok(out)
+}
+
 // ─── Norpix StreamPix SEQ ─────────────────────────────────────────────────────
 //
 // StreamPix .seq files have a 1024-byte header with the following layout:
@@ -674,6 +742,7 @@ impl FormatReader for IplabReader {
             image_count,
             plane_samples,
             is_rgb,
+            is_interleaved,
         ) = if is_java_iplab {
             let little = &hdr[..4] == b"iiii";
             let read_i32 = |off: usize| {
@@ -704,11 +773,7 @@ impl FormatReader for IplabReader {
                 5 => (PixelType::Uint32, 32, 1),
                 6 => (PixelType::Uint16, 16, 1),
                 10 => (PixelType::Float64, 64, 1),
-                _ => {
-                    return Err(BioFormatsError::UnsupportedFormat(format!(
-                        "IPLab unsupported data type {data_type}"
-                    )))
-                }
+                _ => (PixelType::Int8, 8, 1),
             };
             let image_count = depth
                 .checked_mul(n_frames)
@@ -734,6 +799,7 @@ impl FormatReader for IplabReader {
                 image_count,
                 (n_channels * spp) as usize,
                 n_channels > 1,
+                false,
             )
         } else {
             if n < 40 {
@@ -785,6 +851,7 @@ impl FormatReader for IplabReader {
                 },
                 image_count,
                 spp as usize,
+                spp == 3,
                 spp == 3,
             )
         };
@@ -848,7 +915,7 @@ impl FormatReader for IplabReader {
             image_count,
             dimension_order,
             is_rgb,
-            is_interleaved: is_rgb,
+            is_interleaved,
             is_indexed: false,
             is_little_endian,
             resolution_count: 1,
@@ -921,7 +988,11 @@ impl FormatReader for IplabReader {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let spp = self.plane_samples;
-        crop_full_plane("IPLab", &full, meta, spp, x, y, w, h)
+        if meta.is_interleaved || spp == 1 {
+            crop_full_plane("IPLab", &full, meta, spp, x, y, w, h)
+        } else {
+            crop_planar_full_plane("IPLab", &full, meta, spp, x, y, w, h)
+        }
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

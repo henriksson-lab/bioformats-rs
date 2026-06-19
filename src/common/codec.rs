@@ -96,16 +96,24 @@ pub fn decompress_packbits(data: &[u8]) -> Result<Vec<u8>> {
 /// interleaved RGB for YCbCr 3-component input, single-byte grayscale for
 /// 1-component input.
 pub fn decompress_jpeg(data: &[u8]) -> Result<Vec<u8>> {
+    let data = jpeg_payload(data);
     if let Some(out) = try_decompress_jpeg_zune(data) {
         return Ok(out);
     }
     decompress_jpeg_fallback(data)
 }
 
+pub(crate) fn jpeg_payload(data: &[u8]) -> &[u8] {
+    data.windows(2)
+        .position(|pair| pair == [0xff, 0xd8])
+        .map(|start| &data[start..])
+        .unwrap_or(data)
+}
+
 /// Decode with `jpeg-decoder` (default color transform). The authoritative path
 /// for everything `zune-jpeg` does not handle.
 pub(crate) fn decompress_jpeg_fallback(data: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = jpeg_decoder::Decoder::new(data);
+    let mut decoder = jpeg_decoder::Decoder::new(jpeg_payload(data));
     decoder
         .decode()
         .map_err(|e| BioFormatsError::Codec(e.to_string()))
@@ -1252,17 +1260,19 @@ pub fn decompress_mjpb(_data: &[u8]) -> Result<Vec<u8>> {
 /// QuickTime Animation/RLE codec.
 ///
 /// This implements the byte-oriented packet form used by 8-bit indexed and
-/// 24-bit RGB QuickTime Animation frames: a big-endian chunk header, optional
-/// changed-line window, then per-line skip/literal/repeat opcodes. Interframe
-/// unchanged pixels are returned as zero because this stateless helper has no
-/// previous frame buffer.
+/// 16/24/32-bit RGB QuickTime Animation frames: a big-endian chunk header,
+/// optional changed-line window, then per-line skip/literal/repeat opcodes.
+/// Interframe unchanged pixels are returned as zero because this stateless
+/// helper has no previous frame buffer.
 pub fn decompress_qtrle(data: &[u8], width: u32, height: u32, bpp: u32) -> Result<Vec<u8>> {
-    let bytes_per_pixel = match bpp {
-        8 => 1usize,
-        24 => 3usize,
+    let (encoded_bytes_per_pixel, output_bytes_per_pixel) = match bpp {
+        8 => (1usize, 1usize),
+        16 => (2usize, 3usize),
+        24 => (3usize, 3usize),
+        32 => (4usize, 3usize),
         _ => {
             return Err(BioFormatsError::UnsupportedFormat(format!(
-                "QuickTime RLE: unsupported {bpp} bpp; only 8 and 24 bpp are implemented"
+                "QuickTime RLE: unsupported {bpp} bpp; only 8, 16, 24, and 32 bpp are implemented"
             )));
         }
     };
@@ -1273,7 +1283,7 @@ pub fn decompress_qtrle(data: &[u8], width: u32, height: u32, bpp: u32) -> Resul
         return Ok(Vec::new());
     }
 
-    let row_bytes = width.checked_mul(bytes_per_pixel).ok_or_else(|| {
+    let row_bytes = width.checked_mul(output_bytes_per_pixel).ok_or_else(|| {
         BioFormatsError::InvalidData("QuickTime RLE: row byte count overflows".into())
     })?;
     let out_len = row_bytes.checked_mul(height).ok_or_else(|| {
@@ -1366,44 +1376,63 @@ pub fn decompress_qtrle(data: &[u8], width: u32, height: u32, bpp: u32) -> Resul
                 }
                 n if n < 0 => {
                     let count = (-n) as usize;
-                    if i + bytes_per_pixel > chunk_size {
-                        return Err(BioFormatsError::InvalidData(
-                            "QuickTime RLE: repeat pixel overruns input".into(),
-                        ));
-                    }
+                    let pixel = read_qtrle_pixel(data, &mut i, chunk_size, bpp)?;
                     write_qtrle_pixels(
                         &mut out,
                         y,
                         &mut x,
                         width,
                         row_bytes,
-                        bytes_per_pixel,
+                        output_bytes_per_pixel,
                         count,
-                        &data[i..i + bytes_per_pixel],
+                        &pixel,
                     )?;
-                    i += bytes_per_pixel;
                 }
                 n => {
                     let count = n as usize;
-                    let byte_count = count.checked_mul(bytes_per_pixel).ok_or_else(|| {
-                        BioFormatsError::InvalidData(
-                            "QuickTime RLE: literal byte count overflows".into(),
-                        )
-                    })?;
-                    if i + byte_count > chunk_size {
+                    let encoded_byte_count =
+                        count.checked_mul(encoded_bytes_per_pixel).ok_or_else(|| {
+                            BioFormatsError::InvalidData(
+                                "QuickTime RLE: literal byte count overflows".into(),
+                            )
+                        })?;
+                    if i + encoded_byte_count > chunk_size {
                         return Err(BioFormatsError::InvalidData(
                             "QuickTime RLE: literal run overruns input".into(),
                         ));
                     }
+                    let output_byte_count =
+                        count.checked_mul(output_bytes_per_pixel).ok_or_else(|| {
+                            BioFormatsError::InvalidData(
+                                "QuickTime RLE: literal byte count overflows".into(),
+                            )
+                        })?;
                     if x + count > width {
                         return Err(BioFormatsError::InvalidData(
                             "QuickTime RLE: literal run exceeds row width".into(),
                         ));
                     }
-                    let dst = y * row_bytes + x * bytes_per_pixel;
-                    out[dst..dst + byte_count].copy_from_slice(&data[i..i + byte_count]);
-                    i += byte_count;
-                    x += count;
+                    if bpp == 8 || bpp == 24 {
+                        let dst = y * row_bytes + x * output_bytes_per_pixel;
+                        out[dst..dst + output_byte_count]
+                            .copy_from_slice(&data[i..i + encoded_byte_count]);
+                        i += encoded_byte_count;
+                        x += count;
+                    } else {
+                        for _ in 0..count {
+                            let pixel = read_qtrle_pixel(data, &mut i, chunk_size, bpp)?;
+                            write_qtrle_pixels(
+                                &mut out,
+                                y,
+                                &mut x,
+                                width,
+                                row_bytes,
+                                output_bytes_per_pixel,
+                                1,
+                                &pixel,
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -1611,6 +1640,48 @@ fn read_qtrle_i8(data: &[u8], i: &mut usize, limit: usize) -> Result<i8> {
     Ok(read_qtrle_u8(data, i, limit)? as i8)
 }
 
+fn read_qtrle_pixel(data: &[u8], i: &mut usize, limit: usize, bpp: u32) -> Result<[u8; 3]> {
+    match bpp {
+        8 => Ok([read_qtrle_u8(data, i, limit)?, 0, 0]),
+        16 => {
+            let value = read_qtrle_be_u16_limited(data, i, limit)?;
+            Ok(rpza_rgb555_to_rgb24(value))
+        }
+        24 => {
+            if *i + 3 > limit {
+                return Err(BioFormatsError::InvalidData(
+                    "QuickTime RLE: pixel overruns chunk".into(),
+                ));
+            }
+            let pixel = [data[*i], data[*i + 1], data[*i + 2]];
+            *i += 3;
+            Ok(pixel)
+        }
+        32 => {
+            if *i + 4 > limit {
+                return Err(BioFormatsError::InvalidData(
+                    "QuickTime RLE: pixel overruns chunk".into(),
+                ));
+            }
+            let pixel = [data[*i + 1], data[*i + 2], data[*i + 3]];
+            *i += 4;
+            Ok(pixel)
+        }
+        _ => unreachable!("validated QTRLE depth"),
+    }
+}
+
+fn read_qtrle_be_u16_limited(data: &[u8], i: &mut usize, limit: usize) -> Result<u16> {
+    if *i + 2 > limit {
+        return Err(BioFormatsError::InvalidData(
+            "QuickTime RLE: pixel overruns chunk".into(),
+        ));
+    }
+    let value = u16::from_be_bytes([data[*i], data[*i + 1]]);
+    *i += 2;
+    Ok(value)
+}
+
 struct Lzo1xDecoder<'a> {
     input: &'a [u8],
     ip: usize,
@@ -1784,7 +1855,7 @@ fn write_qtrle_pixels(
 
     let mut dst = y * row_bytes + *x * bytes_per_pixel;
     for _ in 0..count {
-        out[dst..dst + bytes_per_pixel].copy_from_slice(pixel);
+        out[dst..dst + bytes_per_pixel].copy_from_slice(&pixel[..bytes_per_pixel]);
         dst += bytes_per_pixel;
     }
     *x += count;
@@ -2776,6 +2847,14 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_payload_skips_prefix_before_soi() {
+        let prefixed = b"BIOFORMATS\xff\xd8jpeg";
+
+        assert_eq!(jpeg_payload(prefixed), b"\xff\xd8jpeg");
+        assert_eq!(jpeg_payload(b"not-jpeg"), b"not-jpeg");
+    }
+
+    #[test]
     fn bzip2_decompresses_standard_stream() {
         // `printf 'hello bzip2 world, hello bzip2 world!' | bzip2 -c`
         // A complete standard stream starting with the "BZh" magic.
@@ -3162,14 +3241,46 @@ mod tests {
     }
 
     #[test]
+    fn qtrle_decodes_16bit_rgb555_pixels_to_rgb() {
+        let data = [
+            0x00, 0x00, 0x00, 0x0d, // chunk size
+            0x00, 0x00, // full-frame update
+            1,    // initial skip
+            2,    // two literal RGB555 pixels
+            0x7c, 0x00, // red
+            0x03, 0xe0, // green
+            0xff, // end of row
+        ];
+
+        let out = decompress_qtrle(&data, 2, 1, 16).expect("QTRLE 16-bit decode");
+
+        assert_eq!(out, vec![255, 0, 0, 0, 255, 0]);
+    }
+
+    #[test]
+    fn qtrle_decodes_32bit_pixels_to_rgb_ignoring_leading_byte() {
+        let data = [
+            0x00, 0x00, 0x00, 0x11, // chunk size
+            0x00, 0x00, // full-frame update
+            1,    // initial skip
+            2,    // two literal 32-bit pixels, leading byte ignored
+            0xaa, 1, 2, 3, 0xbb, 4, 5, 6, 0xff, // end of row
+        ];
+
+        let out = decompress_qtrle(&data, 2, 1, 32).expect("QTRLE 32-bit decode");
+
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
     fn qtrle_rejects_unsupported_depth() {
-        let err = decompress_qtrle(&[0, 0, 0, 6, 0, 0], 1, 1, 16)
-            .expect_err("16 bpp is outside the implemented subset");
+        let err = decompress_qtrle(&[0, 0, 0, 6, 0, 0], 1, 1, 12)
+            .expect_err("12 bpp is outside the implemented subset");
 
         assert!(matches!(
             err,
             BioFormatsError::UnsupportedFormat(message)
-                if message.contains("only 8 and 24 bpp are implemented")
+                if message.contains("only 8, 16, 24, and 32 bpp are implemented")
         ));
     }
 

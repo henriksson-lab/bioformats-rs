@@ -17,9 +17,8 @@
 //! original metadata key/value pairs rather than fabricating unsupported
 //! structures.
 //!
-//! Pixel data is a simple gradient (the per-pixel encoding here is not a
-//! faithful port of Java's special-pixel scheme; only the metadata parsing
-//! is).
+//! Pixel data follows Java's simple gradient and special-pixel scheme: the
+//! upper-left boxes encode series, plane, Z, C, and T indices.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,7 +27,6 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
 
 // -- Constants (mirroring Java FakeReader) --
 
@@ -42,6 +40,7 @@ const DEFAULT_DIMENSION_ORDER: &str = "XYZCT";
 const DEFAULT_RGB_DIMENSION_ORDER: &str = "XYCZT";
 const DEFAULT_RESOLUTION_SCALE: u32 = 2;
 const TOKEN_SEPARATOR: char = '&';
+const BOX_SIZE: u32 = 10;
 
 pub struct FakeReader {
     path: Option<PathBuf>,
@@ -445,6 +444,197 @@ fn dimension_order_from_string(s: &str) -> Result<DimensionOrder> {
     }
 }
 
+fn decompose_plane(
+    index: u32,
+    size_z: u32,
+    effective_size_c: u32,
+    size_t: u32,
+    order: DimensionOrder,
+) -> (u32, u32, u32) {
+    match order {
+        DimensionOrder::XYZCT => {
+            let z = index % size_z;
+            let c = (index / size_z) % effective_size_c;
+            let t = index / (size_z * effective_size_c);
+            (z, c, t)
+        }
+        DimensionOrder::XYZTC => {
+            let z = index % size_z;
+            let t = (index / size_z) % size_t;
+            let c = index / (size_z * size_t);
+            (z, c, t)
+        }
+        DimensionOrder::XYCZT => {
+            let c = index % effective_size_c;
+            let z = (index / effective_size_c) % size_z;
+            let t = index / (effective_size_c * size_z);
+            (z, c, t)
+        }
+        DimensionOrder::XYCTZ => {
+            let c = index % effective_size_c;
+            let t = (index / effective_size_c) % size_t;
+            let z = index / (effective_size_c * size_t);
+            (z, c, t)
+        }
+        DimensionOrder::XYTCZ => {
+            let t = index % size_t;
+            let c = (index / size_t) % effective_size_c;
+            let z = index / (size_t * effective_size_c);
+            (z, c, t)
+        }
+        DimensionOrder::XYTZC => {
+            let t = index % size_t;
+            let z = (index / size_t) % size_z;
+            let c = index / (size_t * size_z);
+            (z, c, t)
+        }
+    }
+}
+
+fn rgb_channel_count(meta: &ImageMetadata) -> u32 {
+    if !meta.is_rgb {
+        return 1;
+    }
+    let zt = meta.size_z.saturating_mul(meta.size_t).max(1);
+    let effective_size_c = (meta.image_count / zt).max(1);
+    (meta.size_c / effective_size_c).max(1)
+}
+
+fn scale_factor(meta: &ImageMetadata) -> f64 {
+    match meta.series_metadata.get("scaleFactor") {
+        Some(MetadataValue::Float(v)) => *v,
+        _ => 1.0,
+    }
+}
+
+fn signed_min(pixel_type: PixelType) -> i64 {
+    match pixel_type {
+        PixelType::Int8 => i8::MIN as i64,
+        PixelType::Int16 => i16::MIN as i64,
+        PixelType::Int32 => i32::MIN as i64,
+        _ => 0,
+    }
+}
+
+fn pack_fake_pixel(pixel_type: PixelType, little: bool, value: i64, out: &mut [u8]) {
+    match pixel_type {
+        PixelType::Float32 => {
+            let bits = (value as f32).to_bits();
+            let bytes = if little {
+                bits.to_le_bytes()
+            } else {
+                bits.to_be_bytes()
+            };
+            out.copy_from_slice(&bytes);
+        }
+        PixelType::Float64 => {
+            let bits = (value as f64).to_bits();
+            let bytes = if little {
+                bits.to_le_bytes()
+            } else {
+                bits.to_be_bytes()
+            };
+            out.copy_from_slice(&bytes);
+        }
+        _ => {
+            let bytes = if little {
+                value.to_le_bytes()
+            } else {
+                value.to_be_bytes()
+            };
+            if little {
+                out.copy_from_slice(&bytes[..out.len()]);
+            } else {
+                let start = bytes.len() - out.len();
+                out.copy_from_slice(&bytes[start..]);
+            }
+        }
+    }
+}
+
+fn fake_plane_region(
+    meta: &ImageMetadata,
+    series_index: usize,
+    plane_index: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    if plane_index >= meta.image_count {
+        return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+    }
+    crate::common::region::validate_region("Fake", meta.size_x, meta.size_y, x, y, w, h)?;
+
+    let rgb = rgb_channel_count(meta);
+    let effective_size_c = (meta.size_c / rgb).max(1);
+    let (z_index, c_index, t_index) = decompose_plane(
+        plane_index,
+        meta.size_z,
+        effective_size_c,
+        meta.size_t,
+        meta.dimension_order,
+    );
+    let bps = meta.pixel_type.bytes_per_sample();
+    let plane_len = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|v| v.checked_mul(rgb as usize))
+        .and_then(|v| v.checked_mul(bps))
+        .ok_or_else(|| BioFormatsError::Format("Fake plane size overflows".to_string()))?;
+    let mut buf = vec![0u8; plane_len];
+    let min = signed_min(meta.pixel_type);
+    let scale = scale_factor(meta);
+
+    for c_offset in 0..rgb {
+        let channel = rgb * c_index + c_offset;
+        for row in 0..h {
+            let yy = y + row;
+            for col in 0..w {
+                let xx = x + col;
+                let mut pixel = min + i64::from(xx);
+                let mut special_pixel = false;
+                if yy < BOX_SIZE {
+                    special_pixel = true;
+                    pixel = match xx / BOX_SIZE {
+                        0 => series_index as i64,
+                        1 => plane_index as i64,
+                        2 => z_index as i64,
+                        3 => channel as i64,
+                        4 => t_index as i64,
+                        _ => {
+                            special_pixel = false;
+                            pixel
+                        }
+                    };
+                }
+
+                if !special_pixel {
+                    pixel = (scale * pixel as f64) as i64;
+                }
+
+                let sample_index = if meta.is_interleaved {
+                    (w as usize * rgb as usize * row as usize)
+                        + (rgb as usize * col as usize)
+                        + c_offset as usize
+                } else {
+                    (h as usize * w as usize * c_offset as usize)
+                        + (w as usize * row as usize)
+                        + col as usize
+                };
+                let off = sample_index * bps;
+                pack_fake_pixel(
+                    meta.pixel_type,
+                    meta.is_little_endian,
+                    pixel,
+                    &mut buf[off..off + bps],
+                );
+            }
+        }
+    }
+
+    Ok(buf)
+}
+
 /// Validate parameters and build per-series [`ImageMetadata`], mirroring the
 /// "sanity checks" and "populate core metadata" sections of Java's
 /// `initFile` (lines 863-973).
@@ -840,24 +1030,15 @@ impl FormatReader for FakeReader {
             .series
             .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let bps = meta.pixel_type.bytes_per_sample();
-        let w = meta.size_x as usize;
-        let h = meta.size_y as usize;
-        let mut buf = vec![0u8; w * h * bps];
-        let pidx = plane_index as usize;
-        for y in 0..h {
-            for x in 0..w {
-                let val = ((x + y + pidx) % 256) as u8;
-                let off = (y * w + x) * bps;
-                for b in 0..bps {
-                    buf[off + b] = val;
-                }
-            }
-        }
-        Ok(buf)
+        fake_plane_region(
+            meta,
+            self.current_series,
+            plane_index,
+            0,
+            0,
+            meta.size_x,
+            meta.size_y,
+        )
     }
 
     fn open_bytes_region(
@@ -868,12 +1049,11 @@ impl FormatReader for FakeReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
         let meta = self
             .series
             .get(self.current_series)
             .ok_or(BioFormatsError::NotInitialized)?;
-        crop_full_plane("Fake", &full, meta, 1, x, y, w, h)
+        fake_plane_region(meta, self.current_series, plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1061,5 +1241,74 @@ mod tests {
     #[test]
     fn unknown_pixel_type_errors() {
         assert!(init_file(Path::new("img&pixelType=bogus.fake")).is_err());
+    }
+
+    fn u16_le(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+    }
+
+    #[test]
+    fn open_bytes_encodes_java_special_pixels() {
+        let path = Path::new("img&sizeX=60&sizeY=12&sizeZ=2&sizeC=3&sizeT=2.fake");
+        let mut reader = FakeReader::new();
+        reader.set_id(path).unwrap();
+
+        // XYZCT order: plane 5 => z=1, c=2, t=0.
+        let plane = reader.open_bytes(5).unwrap();
+        assert_eq!(plane[0], 0); // series
+        assert_eq!(plane[BOX_SIZE as usize], 5); // plane number
+        assert_eq!(plane[(2 * BOX_SIZE) as usize], 1); // Z
+        assert_eq!(plane[(3 * BOX_SIZE) as usize], 2); // C
+        assert_eq!(plane[(4 * BOX_SIZE) as usize], 0); // T
+        assert_eq!(plane[(5 * BOX_SIZE) as usize], 50); // normal gradient
+    }
+
+    #[test]
+    fn open_bytes_uses_signed_minimum_like_java() {
+        let path = Path::new("img&sizeX=60&sizeY=12&pixelType=int16.fake");
+        let mut reader = FakeReader::new();
+        reader.set_id(path).unwrap();
+
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(u16_le(&plane, 0), 0);
+        let off = 50 * 2;
+        assert_eq!(i16::from_le_bytes([plane[off], plane[off + 1]]), -32718);
+    }
+
+    #[test]
+    fn open_bytes_scales_normal_pixels_but_not_special_pixels() {
+        let path = Path::new("img&sizeX=60&sizeY=12&pixelType=uint16&scaleFactor=2.fake");
+        let mut reader = FakeReader::new();
+        reader.set_id(path).unwrap();
+
+        let plane = reader.open_bytes(0).unwrap();
+        assert_eq!(u16_le(&plane, 0), 0);
+        assert_eq!(u16_le(&plane, 50 * 2), 100);
+    }
+
+    #[test]
+    fn rgb_planes_include_all_samples_and_honor_planar_layout() {
+        let path =
+            Path::new("rgb&sizeX=60&sizeY=12&sizeC=6&rgb=3&interleaved=false&dimOrder=XYCZT.fake");
+        let mut reader = FakeReader::new();
+        reader.set_id(path).unwrap();
+
+        let plane = reader.open_bytes(1).unwrap();
+        let samples_per_channel = 60 * 12;
+        assert_eq!(plane.len(), samples_per_channel * 3);
+        // XYCZT order with sizeC/rgb=2: plane 1 is effective channel 1.
+        assert_eq!(plane[3 * BOX_SIZE as usize], 3);
+        assert_eq!(plane[samples_per_channel + 3 * BOX_SIZE as usize], 4);
+        assert_eq!(plane[2 * samples_per_channel + 3 * BOX_SIZE as usize], 5);
+    }
+
+    #[test]
+    fn rgb_region_generation_matches_java_region_layout() {
+        let path = Path::new("rgb&sizeX=60&sizeY=12&sizeC=3&rgb=3&interleaved=true.fake");
+        let mut reader = FakeReader::new();
+        reader.set_id(path).unwrap();
+
+        let region = reader.open_bytes_region(0, 29, BOX_SIZE, 3, 1).unwrap();
+        assert_eq!(region, vec![29, 29, 29, 30, 30, 30, 31, 31, 31]);
     }
 }

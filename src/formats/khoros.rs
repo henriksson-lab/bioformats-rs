@@ -66,7 +66,7 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
         0 => 1,
         value => positive_i32_dim(value, "image count")?,
     };
-    let mut size_c = positive_i32_dim(read_i32(data, 560, little), "channel count")?;
+    let header_size_c = read_i32(data, 560, little);
 
     let type_code = read_i32(data, 564, little);
     let pixel_type = match type_code {
@@ -86,23 +86,33 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
     // read lookup table: skipBytes(12) -> pos 580; c = readInt() at 580.
     let lut_c = read_i32(data, 580, little);
     let mut lookup_table = None;
+    let final_size_c_from_header: u32;
     let offset: u64;
 
     if lut_c > 1 {
-        size_c = lut_c as u32;
+        let size_c = lut_c as u32;
         // n = readInt() at 584.
         if data.len() < 588 {
             return Err(BioFormatsError::Format(
                 "VIFF/Khoros header too short for LUT".into(),
             ));
         }
-        let n = read_i32(data, 584, little).max(0) as usize;
+        let n = read_i32(data, 584, little);
+        if n < 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "VIFF/Khoros LUT has negative entry count".into(),
+            ));
+        }
+        let n = n as usize;
         // skipBytes(436): pos 588 -> 1024. LUT bytes start at 1024.
         let lut_start = 1024usize;
         let lut_bytes = (lut_c as usize)
             .checked_mul(n)
             .ok_or_else(|| BioFormatsError::Format("VIFF/Khoros LUT size overflow".into()))?;
-        if lut_start + lut_bytes > data.len() {
+        let lut_end = lut_start
+            .checked_add(lut_bytes)
+            .ok_or_else(|| BioFormatsError::Format("VIFF/Khoros LUT size overflow".into()))?;
+        if lut_end > data.len() {
             return Err(BioFormatsError::Format(
                 "VIFF/Khoros LUT extends past end of file".into(),
             ));
@@ -131,16 +141,24 @@ fn parse_khoros(data: &[u8]) -> Result<ViffParsed> {
                 green: chan.clone(),
                 blue: chan,
             });
+        } else {
+            lookup_table = Some(LookupTable {
+                red: Vec::new(),
+                green: Vec::new(),
+                blue: Vec::new(),
+            });
         }
-        offset = (lut_start + lut_bytes) as u64;
+        offset = lut_end as u64;
+        final_size_c_from_header = size_c;
     } else {
         // skipBytes(440): pos 584 -> 1024.
+        final_size_c_from_header = positive_i32_dim(header_size_c, "channel count")?;
         offset = 1024;
     }
 
     let is_indexed = lookup_table.is_some();
-    let mut final_size_c = size_c;
-    let mut is_rgb = size_c > 1;
+    let mut final_size_c = final_size_c_from_header;
+    let mut is_rgb = final_size_c_from_header > 1;
     if is_indexed {
         final_size_c = 1;
         is_rgb = false;

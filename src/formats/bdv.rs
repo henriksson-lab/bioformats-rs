@@ -165,11 +165,8 @@ impl Default for BdvReader {
 fn parse_view_setups(xml: &str) -> Vec<SetupXml> {
     let mut out = Vec::new();
     let mut pos = 0;
-    while let Some(open) = xml[pos..].find("<ViewSetup>") {
-        let start = pos + open + "<ViewSetup>".len();
-        let end_rel = xml[start..]
-            .find("</ViewSetup>")
-            .unwrap_or(xml.len() - start);
+    while let Some((_open, start)) = find_start_tag_end_ci(xml, "viewsetup", pos) {
+        let end_rel = find_end_tag_ci(&xml[start..], "viewsetup").unwrap_or(xml.len() - start);
         let block = &xml[start..start + end_rel];
         pos = start + end_rel;
 
@@ -242,21 +239,22 @@ fn parse_view_setup_attributes(block: &str) -> Vec<(String, String)> {
             pos = gt + 1;
             continue;
         }
-        let close = format!("</{tag}>");
-        let Some(close_rel) = attributes_block[gt + 1..].find(&close) else {
+        let Some(close_rel) = find_end_tag_ci(&attributes_block[gt + 1..], tag) else {
             pos = gt + 1;
             continue;
         };
-        let value = attributes_block[gt + 1..gt + 1 + close_rel].trim();
+        let value = crate::common::xml::decode_xml_escaped_str(
+            attributes_block[gt + 1..gt + 1 + close_rel].trim(),
+        );
         if !value.is_empty()
             && !value.contains('<')
             && tag
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
         {
-            out.push((bdv_metadata_key(tag), value.to_string()));
+            out.push((bdv_metadata_key(tag), value));
         }
-        pos = gt + 1 + close_rel + close.len();
+        pos = gt + 1 + close_rel + tag.len() + 3;
     }
     out
 }
@@ -275,43 +273,61 @@ fn bdv_metadata_key(name: &str) -> String {
 
 /// Find the inner text of the first `<tag>...</tag>` in `xml`.
 fn inner_text(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)?;
-    Some(xml[start..start + end].to_string())
+    let (_, start) = find_start_tag_end_ci(xml, tag, 0)?;
+    let end = find_end_tag_ci(&xml[start..], tag)?;
+    Some(crate::common::xml::decode_xml_escaped_str(
+        &xml[start..start + end],
+    ))
 }
 
 /// Find inner text of `<tag ...>...</tag>`, allowing attributes on the opening tag.
 fn inner_text_with_attrs(xml: &str, tag: &str) -> Option<String> {
-    let open_prefix = format!("<{tag}");
-    let open = xml.find(&open_prefix)?;
-    let open_end = xml[open..].find('>')? + open + 1;
-    let close = format!("</{tag}>");
-    let end = xml[open_end..].find(&close)?;
-    Some(xml[open_end..open_end + end].to_string())
+    inner_text(xml, tag)
+}
+
+fn find_start_tag_end_ci(xml: &str, tag: &str, from: usize) -> Option<(usize, usize)> {
+    let lower = xml[from..].to_ascii_lowercase();
+    let needle = format!("<{}", tag.to_ascii_lowercase());
+    let mut search = 0usize;
+    while let Some(rel) = lower[search..].find(&needle) {
+        let open = from + search + rel;
+        let after = open + needle.len();
+        let boundary = xml.as_bytes().get(after).copied();
+        if matches!(
+            boundary,
+            Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
+            let end = xml[open..].find('>')? + open + 1;
+            return Some((open, end));
+        }
+        search += rel + needle.len();
+    }
+    None
+}
+
+fn find_end_tag_ci(xml: &str, tag: &str) -> Option<usize> {
+    let lower = xml.to_ascii_lowercase();
+    lower.find(&format!("</{}>", tag.to_ascii_lowercase()))
 }
 
 /// Parse the timepoint range/pattern from the SpimData `<Timepoints>` block.
 ///
 /// Mirrors Java's handler: `type="pattern"` uses `<integerpattern>` of the
-/// form `first` / `first-last` / `first-last:increment`; otherwise `<first>`
-/// and `<last>` bound an inclusive range. Returns
-/// `(first, last, increment, use_pattern)`. Falls back to `(0, 0, 1, false)`.
+/// form `first` / `first-last`; Java intends to support `first-last:increment`
+/// too, but gates that branch behind `DataTools.parseInteger(parts[1])`, so
+/// the colon form leaves `last`/`increment` unchanged. Otherwise `<first>` and
+/// `<last>` bound an inclusive range. Returns `(first, last, increment,
+/// use_pattern)`. Falls back to `(0, 0, 1, false)`.
 fn parse_timepoints(xml: &str) -> (u32, u32, u32, bool) {
     let mut first = 0u32;
     let mut last = 0u32;
     let mut increment = 1u32;
 
-    let Some(tp_open) = xml.find("<Timepoints") else {
+    let Some((tp_open, body_start)) = find_start_tag_end_ci(xml, "timepoints", 0) else {
         return (first, last, increment, false);
     };
-    let Some(gt_rel) = xml[tp_open..].find('>') else {
-        return (first, last, increment, false);
-    };
-    let tag = &xml[tp_open..tp_open + gt_rel];
-    let body_start = tp_open + gt_rel + 1;
-    let Some(close_rel) = xml[body_start..].find("</Timepoints>") else {
+    let tag = &xml[tp_open..body_start];
+    let Some(close_rel) = find_end_tag_ci(&xml[body_start..], "timepoints") else {
         return (first, last, increment, false);
     };
     let body = &xml[body_start..body_start + close_rel];
@@ -345,13 +361,16 @@ fn parse_timepoints(xml: &str) -> (u32, u32, u32, bool) {
     (first, last, increment, use_pattern)
 }
 
-/// Parse a `first-last:increment` timepoint pattern (Java `parseIntegerString`).
+/// Parse a timepoint pattern (Java `parseIntegerString`).
 fn parse_integer_string(pattern: &str, first: &mut u32, last: &mut u32, increment: &mut u32) {
     let parts: Vec<&str> = pattern.split('-').collect();
     if let Ok(f) = parts[0].trim().parse::<u32>() {
         *first = f;
     }
-    if parts.len() > 1 {
+    // Java checks DataTools.parseInteger(parts[1]) before splitting on ':'.
+    // Because that helper is Integer.valueOf, values like "10:2" do not enter
+    // this branch; preserve the actual reader behavior.
+    if parts.len() > 1 && parts[1].trim().parse::<u32>().is_ok() {
         let parts2: Vec<&str> = parts[1].split(':').collect();
         if let Ok(l) = parts2[0].trim().parse::<u32>() {
             *last = l;
@@ -1182,6 +1201,34 @@ mod tests {
     }
 
     #[test]
+    fn bdv_xml_tags_match_java_case_insensitively() {
+        let xml = r#"<SpimData>
+  <SequenceDescription>
+    <ViewSetups>
+      <VIEWSETUP type="relative">
+        <ID>3</ID>
+        <NAME>A&amp;B</NAME>
+        <VOXELSIZE><UNIT>&#181;m</UNIT><SIZE>1 2 3</SIZE></VOXELSIZE>
+        <ATTRIBUTES><CHANNEL-NAME>DAPI &amp; FITC</CHANNEL-NAME></ATTRIBUTES>
+      </VIEWSETUP>
+    </ViewSetups>
+  </SequenceDescription>
+  <TIMEPOINTS type="pattern"><INTEGERPATTERN>1-5:2</INTEGERPATTERN></TIMEPOINTS>
+</SpimData>"#;
+
+        let setups = parse_view_setups(xml);
+        assert_eq!(setups.len(), 1);
+        assert_eq!(setups[0].id, 3);
+        assert_eq!(setups[0].name.as_deref(), Some("A&B"));
+        assert_eq!(setups[0].voxel_unit.as_deref(), Some("\u{b5}m"));
+        assert_eq!(
+            setups[0].attributes,
+            vec![("channel_name".into(), "DAPI & FITC".into())]
+        );
+        assert_eq!(parse_timepoints(xml), (1, 0, 1, true));
+    }
+
+    #[test]
     fn bdv_metadata_key_normalizes_attribute_names() {
         assert_eq!(bdv_metadata_key("channel-name"), "channel_name");
         assert_eq!(bdv_metadata_key("ViewSetup.Id"), "viewsetup_id");
@@ -1194,26 +1241,25 @@ mod tests {
           <integerpattern>0-10:2</integerpattern>
         </Timepoints></SpimData>"#;
         let (first, last, inc, pat) = parse_timepoints(xml);
-        assert_eq!((first, last, inc, pat), (0, 10, 2, true));
+        assert_eq!((first, last, inc, pat), (0, 0, 1, true));
     }
 
     #[test]
-    fn bdv_pattern_size_t_matches_java_integer_division() {
-        let first = 0;
-        let last = 10;
-        let increment = 3;
-        let mapped_timepoints = {
-            let mut out = Vec::new();
-            let mut tp = first;
-            while tp <= last {
-                out.push(tp);
-                tp += increment;
-            }
-            out
-        };
+    fn bdv_timepoint_pattern_first_last_without_increment() {
+        let xml = r#"<SpimData><Timepoints type="pattern">
+          <integerpattern>0-10</integerpattern>
+        </Timepoints></SpimData>"#;
+        let (first, last, inc, pat) = parse_timepoints(xml);
+        assert_eq!((first, last, inc, pat), (0, 10, 1, true));
+    }
 
-        assert_eq!(mapped_timepoints, vec![0, 3, 6, 9]);
-        assert_eq!(java_timepoint_count(first, last, increment, true), 3);
+    #[test]
+    fn bdv_pattern_size_t_matches_java_colon_increment_behavior() {
+        let first = 0;
+        let last = 0;
+        let increment = 1;
+
+        assert_eq!(java_timepoint_count(first, last, increment, true), 1);
     }
 
     #[test]
@@ -1242,7 +1288,7 @@ mod tests {
           <Timepoints type="pattern"><integerpattern>0-10:2</integerpattern></Timepoints>
         </SpimData>"#;
         let (first, last, inc, pat) = parse_timepoints(xml);
-        assert_eq!((first, last, inc, pat), (0, 10, 2, true));
+        assert_eq!((first, last, inc, pat), (0, 0, 1, true));
     }
 
     #[test]

@@ -1162,8 +1162,14 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
                 attrs.number_of_frames = frames.max(1);
             }
             (0x0028, 0x0004) => attrs.photometric_interpretation = ascii_trim(&value),
-            (0x0028, 0x0010) => attrs.rows = read_u16(&value),
-            (0x0028, 0x0011) => attrs.columns = read_u16(&value),
+            (0x0028, 0x0010) => {
+                // Java DicomReader keeps the largest Rows value seen.
+                attrs.rows = attrs.rows.max(read_u16(&value));
+            }
+            (0x0028, 0x0011) => {
+                // Java DicomReader keeps the largest Columns value seen.
+                attrs.columns = attrs.columns.max(read_u16(&value));
+            }
             (0x0028, 0x0002) => attrs.samples_per_pixel = read_u16(&value),
             (0x0028, 0x0006) => attrs.planar_configuration = read_u16(&value),
             (0x0028, 0x0100) => attrs.bits_allocated = read_u16(&value),

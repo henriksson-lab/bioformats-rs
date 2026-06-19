@@ -1368,6 +1368,21 @@ fn build_nd_grid(nd_path: &Path, info: &NdInfo, base: (u32, u32, u32)) -> NdGrid
 }
 
 impl MetamorphReader {
+    fn plane_byte_count(meta: &ImageMetadata, w: u32, h: u32) -> Result<usize> {
+        let samples = if meta.is_rgb {
+            meta.size_c.max(1) as usize
+        } else {
+            1
+        };
+        (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(samples))
+            .and_then(|px| px.checked_mul(meta.pixel_type.bytes_per_sample()))
+            .ok_or_else(|| {
+                BioFormatsError::InvalidData("MetaMorph STK plane byte count overflow".into())
+            })
+    }
+
     /// Read a plane directly from the concatenated STK strip data. Used when the
     /// inner TIFF reader exposes a single IFD that actually contains all planes
     /// (Java rebuilds per-plane strip offsets; here we assume contiguous,
@@ -1391,12 +1406,7 @@ impl MetamorphReader {
             .ok_or_else(|| {
                 BioFormatsError::InvalidData("MetaMorph STK plane byte count overflow".into())
             })?;
-        let plane_bytes = pixel_count
-            .checked_mul(samples)
-            .and_then(|px| px.checked_mul(bps))
-            .ok_or_else(|| {
-                BioFormatsError::InvalidData("MetaMorph STK plane byte count overflow".into())
-            })?;
+        let plane_bytes = Self::plane_byte_count(meta, meta.size_x, meta.size_y)?;
 
         // Find the first strip offset of the first IFD.
         let f = File::open(path).map_err(BioFormatsError::Io)?;
@@ -2044,10 +2054,13 @@ impl MetamorphReader {
             Some(f) => f,
             // Missing file: return a blank plane (Java returns the buffer as-is).
             None => {
-                let bps = meta.pixel_type.bytes_per_sample();
                 return Ok(Some(vec![
                     0u8;
-                    meta.size_x as usize * meta.size_y as usize * bps
+                    Self::plane_byte_count(
+                        meta,
+                        meta.size_x,
+                        meta.size_y
+                    )?
                 ]));
             }
         };
@@ -2416,6 +2429,21 @@ mod tests {
         assert_eq!(
             metadata_str(&out, "channel.0.detector_settings_binning"),
             Some("2x2")
+        );
+    }
+
+    #[test]
+    fn metamorph_blank_grid_plane_counts_rgb_samples() {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = 2;
+        meta.size_y = 3;
+        meta.size_c = 3;
+        meta.is_rgb = true;
+        meta.pixel_type = crate::common::pixel_type::PixelType::Uint16;
+
+        assert_eq!(
+            MetamorphReader::plane_byte_count(&meta, meta.size_x, meta.size_y).unwrap(),
+            2 * 3 * 3 * 2
         );
     }
 

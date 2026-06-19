@@ -144,20 +144,41 @@ pub enum IfdValue {
     Undefined(Vec<u8>),
     SShort(Vec<i16>),
     SLong(Vec<i32>),
-    SRational(Vec<(i32, i32)>),
+    SRational(Vec<(u32, u32)>),
     Float(Vec<f32>),
     Double(Vec<f64>),
     IFD(Vec<u32>),  // IFD offsets stored as LONG
     IFD8(Vec<u64>), // BigTIFF IFD offsets
+    SLong8(Vec<i64>),
 }
 
 impl IfdValue {
+    fn signed_i8_to_u64(value: i8) -> Option<u64> {
+        u64::try_from(value).ok()
+    }
+
+    fn signed_i16_to_u64(value: i16) -> Option<u64> {
+        u64::try_from(value).ok()
+    }
+
+    fn signed_i32_to_u64(value: i32) -> Option<u64> {
+        u64::try_from(value).ok()
+    }
+
+    fn signed_i64_to_u64(value: i64) -> Option<u64> {
+        u64::try_from(value).ok()
+    }
+
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             IfdValue::Short(v) if !v.is_empty() => Some(v[0] as u64),
             IfdValue::Long(v) if !v.is_empty() => Some(v[0] as u64),
             IfdValue::Long8(v) if !v.is_empty() => Some(v[0]),
             IfdValue::Byte(v) if !v.is_empty() => Some(v[0] as u64),
+            IfdValue::SByte(v) if !v.is_empty() => Self::signed_i8_to_u64(v[0]),
+            IfdValue::SShort(v) if !v.is_empty() => Self::signed_i16_to_u64(v[0]),
+            IfdValue::SLong(v) if !v.is_empty() => Self::signed_i32_to_u64(v[0]),
+            IfdValue::SLong8(v) if !v.is_empty() => Self::signed_i64_to_u64(v[0]),
             _ => None,
         }
     }
@@ -170,6 +191,12 @@ impl IfdValue {
         match self {
             IfdValue::Short(v) if !v.is_empty() => Some(v[0]),
             IfdValue::Long(v) if !v.is_empty() => Some(v[0] as u16),
+            IfdValue::Long8(v) if !v.is_empty() => Some(v[0] as u16),
+            IfdValue::Byte(v) if !v.is_empty() => Some(v[0] as u16),
+            IfdValue::SByte(v) if !v.is_empty() => Self::signed_i8_to_u64(v[0]).map(|v| v as u16),
+            IfdValue::SShort(v) if !v.is_empty() => Self::signed_i16_to_u64(v[0]).map(|v| v as u16),
+            IfdValue::SLong(v) if !v.is_empty() => Self::signed_i32_to_u64(v[0]).map(|v| v as u16),
+            IfdValue::SLong8(v) if !v.is_empty() => Self::signed_i64_to_u64(v[0]).map(|v| v as u16),
             _ => None,
         }
     }
@@ -180,6 +207,22 @@ impl IfdValue {
             IfdValue::Long(v) => v.iter().map(|&x| x as u64).collect(),
             IfdValue::Long8(v) => v.clone(),
             IfdValue::Byte(v) => v.iter().map(|&x| x as u64).collect(),
+            IfdValue::SByte(v) => v
+                .iter()
+                .filter_map(|&x| Self::signed_i8_to_u64(x))
+                .collect(),
+            IfdValue::SShort(v) => v
+                .iter()
+                .filter_map(|&x| Self::signed_i16_to_u64(x))
+                .collect(),
+            IfdValue::SLong(v) => v
+                .iter()
+                .filter_map(|&x| Self::signed_i32_to_u64(x))
+                .collect(),
+            IfdValue::SLong8(v) => v
+                .iter()
+                .filter_map(|&x| Self::signed_i64_to_u64(x))
+                .collect(),
             IfdValue::IFD(v) => v.iter().map(|&x| x as u64).collect(),
             IfdValue::IFD8(v) => v.clone(),
             _ => vec![],
@@ -223,10 +266,11 @@ impl IfdValue {
     ///
     /// This mirrors `TiffRational.doubleValue()` in upstream Bio-Formats: each
     /// `(num, den)` pair becomes `num as f64 / den as f64` (a zero denominator
-    /// yields `0.0`, matching Java's `TiffRational`). Numeric (non-rational)
-    /// types are coerced as a best effort so callers can treat them uniformly.
+    /// yields `f64::MAX`, matching Java's `Double.MAX_VALUE`). Numeric
+    /// (non-rational) types are coerced as a best effort so callers can treat
+    /// them uniformly.
     pub fn as_vec_f64(&self) -> Vec<f64> {
-        let ratio = |n: f64, d: f64| if d == 0.0 { 0.0 } else { n / d };
+        let ratio = |n: f64, d: f64| if d == 0.0 { f64::MAX } else { n / d };
         match self {
             IfdValue::Rational(v) => v.iter().map(|&(n, d)| ratio(n as f64, d as f64)).collect(),
             IfdValue::SRational(v) => v.iter().map(|&(n, d)| ratio(n as f64, d as f64)).collect(),
@@ -239,6 +283,7 @@ impl IfdValue {
             IfdValue::Long(v) => v.iter().map(|&x| x as f64).collect(),
             IfdValue::SLong(v) => v.iter().map(|&x| x as f64).collect(),
             IfdValue::Long8(v) => v.iter().map(|&x| x as f64).collect(),
+            IfdValue::SLong8(v) => v.iter().map(|&x| x as f64).collect(),
             _ => vec![],
         }
     }

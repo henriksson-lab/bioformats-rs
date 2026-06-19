@@ -2202,7 +2202,9 @@ fn parse_volocity_blind_layout(
 // a live `Location` mapping. Here we resolve every companion file to an absolute
 // path up-front during construction and read planes straight off disk.
 
+#[allow(dead_code)]
 const VOLOCITY_SIGNATURE_SIZE: usize = 13;
+#[allow(dead_code)]
 const VOLOCITY_EMBEDDED_STREAM: &str = "embedded-stream.raw";
 
 /// Runtime equivalent of the Java `Stack` helper class plus the per-series
@@ -2925,9 +2927,9 @@ impl FormatReader for VolocityReader {
         if header.starts_with(VOLOCITY_BLIND_MAGIC) {
             return true;
         }
-        // Java accepts a two-byte "JL"/"LJ" stream signature. That is too weak
-        // for global detection, so require a bounded Metakit header/TOC probe.
-        matches!(probe_volocity_metakit(header, None), Ok(Some(_)))
+        // Java `VolocityReader.isThisType(RandomAccessInputStream)` accepts the
+        // two-byte Metakit signature directly.
+        matches!(header.get(0..2), Some(b"JL") | Some(b"LJ"))
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -3102,8 +3104,8 @@ mod tests {
     fn volocity_matches_java_stream_signature() {
         let reader = VolocityReader::new();
         assert!(reader.is_this_type_by_bytes(VOLOCITY_BLIND_MAGIC));
-        assert!(!reader.is_this_type_by_bytes(b"JLabcdef"));
-        assert!(!reader.is_this_type_by_bytes(b"LJabcdef"));
+        assert!(reader.is_this_type_by_bytes(b"JLabcdef"));
+        assert!(reader.is_this_type_by_bytes(b"LJabcdef"));
         assert!(!reader.is_this_type_by_bytes(b"JXabcdef"));
         assert!(!reader.is_this_type_by_bytes(b"J"));
     }
@@ -3707,6 +3709,16 @@ mod tests {
         assert!(reader.is_this_type_by_name(Path::new("sample.mvd2")));
         assert!(!reader.is_this_type_by_name(Path::new("orphan.aisf")));
     }
+
+    #[test]
+    fn nikon_nis_claims_only_nif_name() {
+        let reader = NikonNisReader::new();
+        assert!(reader.is_this_type_by_name(Path::new("sample.nif")));
+        assert!(reader.is_this_type_by_name(Path::new("sample.NIF")));
+        assert!(!reader.is_this_type_by_name(Path::new("sample.nd2")));
+        assert!(!reader.is_this_type_by_name(Path::new("sample.nef")));
+        assert!(!reader.is_this_type_by_bytes(b"II*\0"));
+    }
 }
 
 impl NikonNisReader {
@@ -3728,9 +3740,9 @@ impl FormatReader for NikonNisReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("nif") | Some("nd2") )
-        // .nd2 is already handled by bioformats-nd2, so effectively only .nif here
-        && matches!(ext.as_deref(), Some("nif"))
+        // Nikon NIS `.nif` is TIFF-backed. `.nd2` is handled by the native ND2
+        // reader, and Java's `NikonReader` is NEF/TIFF camera RAW, not NIS.
+        matches!(ext.as_deref(), Some("nif"))
     }
     fn is_this_type_by_bytes(&self, _: &[u8]) -> bool {
         false

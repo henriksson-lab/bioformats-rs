@@ -1082,6 +1082,14 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         _ => 16,
     };
 
+    // TCSReader.java resets XML-derived series to XYCZT when Z is dominant,
+    // otherwise XYCTZ.
+    let dimension_order = if size_z > size_t {
+        DimensionOrder::XYCZT
+    } else {
+        DimensionOrder::XYCTZ
+    };
+
     let meta = ImageMetadata {
         size_x: width,
         size_y: height,
@@ -1091,8 +1099,7 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         pixel_type,
         bits_per_pixel,
         image_count,
-        // Leica TCS rasterises channels fastest (XYCZT).
-        dimension_order: DimensionOrder::XYCZT,
+        dimension_order,
         is_rgb,
         is_interleaved: is_rgb,
         is_indexed: false,
@@ -1119,7 +1126,7 @@ impl FormatReader for TcsReader {
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
         let s = std::str::from_utf8(&header[..header.len().min(256)]).unwrap_or("");
-        s.contains("<LAS") || s.contains("<LEICA")
+        s.starts_with("<Data>") || s.contains("<LAS") || s.contains("<LEICA")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1401,6 +1408,73 @@ mod prairie_tests {
         assert_eq!(reader.open_bytes(1).unwrap(), vec![0]);
         assert_eq!(reader.open_bytes_region(1, 0, 0, 1, 1).unwrap(), vec![0]);
         assert_eq!(reader.open_bytes(3).unwrap(), vec![29]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leica_tcs_accepts_java_data_xml_signature() {
+        let reader = TcsReader::new();
+        assert!(reader.is_this_type_by_bytes(b"<Data><Image/></Data>"));
+    }
+
+    #[test]
+    fn leica_tcs_xml_dimension_order_matches_java_z_vs_t_rule() {
+        let dir = temp_dir("tcs_dimension_order");
+        let tiff = dir.join("plane.tif");
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        };
+        ImageWriter::save(&tiff, &meta, &[vec![11]]).unwrap();
+
+        let z_dominant = dir.join("z_dominant.xml");
+        std::fs::write(
+            &z_dominant,
+            r#"<LEICA>
+<Image>
+<DimensionDescription DimID="1" NumberOfElements="1" BytesInc="1"/>
+<DimensionDescription DimID="2" NumberOfElements="1" BytesInc="1"/>
+<DimensionDescription DimID="3" NumberOfElements="3" BytesInc="1"/>
+<DimensionDescription DimID="4" NumberOfElements="2" BytesInc="3"/>
+<Attachment Name="plane.tif"/>
+</Image>
+</LEICA>"#,
+        )
+        .unwrap();
+
+        let mut reader = TcsReader::new();
+        reader.set_id(&z_dominant).unwrap();
+        assert_eq!(reader.metadata().size_z, 3);
+        assert_eq!(reader.metadata().size_t, 2);
+        assert_eq!(reader.metadata().dimension_order, DimensionOrder::XYCZT);
+
+        let t_dominant = dir.join("t_dominant.xml");
+        std::fs::write(
+            &t_dominant,
+            r#"<LEICA>
+<Image>
+<DimensionDescription DimID="1" NumberOfElements="1" BytesInc="1"/>
+<DimensionDescription DimID="2" NumberOfElements="1" BytesInc="1"/>
+<DimensionDescription DimID="3" NumberOfElements="2" BytesInc="1"/>
+<DimensionDescription DimID="4" NumberOfElements="3" BytesInc="2"/>
+<Attachment Name="plane.tif"/>
+</Image>
+</LEICA>"#,
+        )
+        .unwrap();
+
+        reader.set_id(&t_dominant).unwrap();
+        assert_eq!(reader.metadata().size_z, 2);
+        assert_eq!(reader.metadata().size_t, 3);
+        assert_eq!(reader.metadata().dimension_order, DimensionOrder::XYCTZ);
 
         let _ = std::fs::remove_dir_all(dir);
     }

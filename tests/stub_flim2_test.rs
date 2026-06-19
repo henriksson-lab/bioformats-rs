@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use bioformats::common::pixel_type::PixelType;
-use bioformats::formats::flim2::{OirReader, VolocityClippingReader};
+use bioformats::formats::flim2::{MicroCtReader, OirReader, VolocityClippingReader};
 use bioformats::FormatReader;
 
 // ---------------------------------------------------------------------------
@@ -167,4 +167,38 @@ fn volocity_clipping_rejects_bad_magic() {
     let err = reader.set_id(&path);
     assert!(err.is_err(), "invalid magic should be rejected");
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn microct_wrapper_detects_java_vff_magic_not_ctf() {
+    let r = MicroCtReader::new();
+    assert!(r.is_this_type_by_name(Path::new("slice0001.vff")));
+    assert!(r.is_this_type_by_name(Path::new("slice0001.VFF")));
+    assert!(!r.is_this_type_by_name(Path::new("slice0001.ctf")));
+    assert!(r.is_this_type_by_bytes(b"ncaa\nrank=2;\n"));
+    assert!(!r.is_this_type_by_bytes(&[0x49, 0x49, 42, 0]));
+}
+
+#[test]
+fn microct_wrapper_reads_vff_with_java_row_reversal() {
+    let dir = std::env::temp_dir().join(format!(
+        "bioformats_rs_stub_flim2_microct_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("slice0001.vff");
+    let header = "ncaa\nrank=2;\nsize=2 2;\nbits=8;\n\u{0c}\n";
+    let mut bytes = header.as_bytes().to_vec();
+    bytes.extend_from_slice(&[1, 2, 3, 4]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = MicroCtReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4, 1, 2]);
+
+    let _ = std::fs::remove_dir_all(dir);
 }

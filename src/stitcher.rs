@@ -172,24 +172,7 @@ impl FileStitcher {
 
 /// Open a format reader for the given file.
 fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
-    let header = crate::common::io::peek_header(path, 512).unwrap_or_default();
-    for r in crate::registry::all_readers_pub() {
-        if r.is_this_type_by_bytes(&header) {
-            let mut r = r;
-            r.set_id(path)?;
-            return Ok(r);
-        }
-    }
-    for r in crate::registry::all_readers_pub() {
-        if r.is_this_type_by_name(path) {
-            let mut r = r;
-            r.set_id(path)?;
-            return Ok(r);
-        }
-    }
-    Err(BioFormatsError::UnsupportedFormat(
-        path.display().to_string(),
-    ))
+    crate::registry::open_reader(path)
 }
 
 /// Discover a file sequence from a single exemplar file.
@@ -283,6 +266,10 @@ fn stitch_layout(
     pattern: Option<&FilePattern>,
 ) -> Result<(ImageMetadata, Vec<(usize, usize, u32)>)> {
     let mut meta = base_meta.clone();
+    let base_size_z = base_meta.size_z.max(1);
+    let base_size_c = base_meta.size_c.max(1);
+    let base_size_t = base_meta.size_t.max(1);
+    let base_image_count = base_meta.image_count.max(1);
     let file_axes = pattern
         .and_then(|pattern| infer_file_axes(files, pattern, base_meta))
         .unwrap_or_else(|| FileAxisLayout {
@@ -296,9 +283,9 @@ fn stitch_layout(
 
     meta.dimension_order =
         dimension_order_from_str(&file_axes.adjusted_order).unwrap_or(base_meta.dimension_order);
-    meta.size_z = checked_axis_mul(base_meta.size_z, file_axes.size_z, "Z")?;
-    meta.size_c = checked_axis_mul(base_meta.size_c, file_axes.size_c, "C")?;
-    meta.size_t = checked_axis_mul(base_meta.size_t, file_axes.size_t, "T")?;
+    meta.size_z = checked_axis_mul(base_size_z, file_axes.size_z, "Z")?;
+    meta.size_c = checked_axis_mul(base_size_c, file_axes.size_c, "C")?;
+    meta.size_t = checked_axis_mul(base_size_t, file_axes.size_t, "T")?;
     let stitched_effective_c =
         checked_axis_mul(effective_size_c(base_meta), file_axes.size_c, "C")?;
     meta.image_count = meta
@@ -309,12 +296,12 @@ fn stitch_layout(
 
     let mut plane_map = vec![None; meta.image_count as usize];
     for (file_idx, &(file_z, file_c, file_t)) in file_axes.file_coords.iter().enumerate() {
-        for local_plane in 0..base_meta.image_count {
+        for local_plane in 0..base_image_count {
             let (local_z, local_c, local_t) = plane_to_zct(local_plane, base_meta)
                 .ok_or_else(|| BioFormatsError::Format("Invalid base plane index".into()))?;
-            let z = file_z * base_meta.size_z + local_z;
+            let z = file_z * base_size_z + local_z;
             let c = file_c * effective_size_c(base_meta) + local_c;
-            let t = file_t * base_meta.size_t + local_t;
+            let t = file_t * base_size_t + local_t;
             let stitched = zct_to_plane(z, c, t, &meta)
                 .ok_or_else(|| BioFormatsError::Format("Invalid stitched plane index".into()))?;
             plane_map[stitched as usize] = Some((file_idx, 0, local_plane));
@@ -1416,12 +1403,6 @@ impl FilePatternBlock {
         self.value_labels()
             .iter()
             .position(|candidate| candidate == value)
-    }
-
-    fn has_non_numeric_labels(&self) -> bool {
-        self.labels
-            .as_ref()
-            .is_some_and(|labels| labels.iter().any(|label| label.parse::<u64>().is_err()))
     }
 }
 
@@ -2967,22 +2948,38 @@ impl AxisGuesser {
         size_c: u32,
         is_certain: bool,
     ) -> AxisGuess {
-        let mut axis_types: Vec<AxisType> = pattern
-            .blocks
-            .iter()
-            .map(|block| {
-                let axis = Self::guess_from_separator(&block.separator);
-                if axis == AxisType::Unknown && block.has_non_numeric_labels() {
-                    AxisType::Channel
-                } else {
-                    axis
+        let mut axis_types = vec![AxisType::Unknown; pattern.blocks.len()];
+        let mut found_z = false;
+        let mut found_t = false;
+        let mut found_c = false;
+        for (idx, block) in pattern.blocks.iter().enumerate() {
+            match Self::guess_from_separator(&block.separator) {
+                AxisType::Z => {
+                    axis_types[idx] = AxisType::Z;
+                    found_z = true;
+                    continue;
                 }
-            })
-            .collect();
+                AxisType::Time => {
+                    axis_types[idx] = AxisType::Time;
+                    found_t = true;
+                    continue;
+                }
+                AxisType::Channel => {
+                    axis_types[idx] = AxisType::Channel;
+                    found_c = true;
+                    continue;
+                }
+                AxisType::Series => {
+                    axis_types[idx] = AxisType::Series;
+                    continue;
+                }
+                AxisType::Unknown => {}
+            }
 
-        let found_z = axis_types.iter().any(|a| *a == AxisType::Z);
-        let found_t = axis_types.iter().any(|a| *a == AxisType::Time);
-        let found_c = axis_types.iter().any(|a| *a == AxisType::Channel);
+            if Self::is_biorad_pic_channel(pattern, idx) || Self::is_rgb_channel_block(block) {
+                axis_types[idx] = AxisType::Channel;
+            }
+        }
 
         // -- 2) check for special cases where dimension order should be swapped --
         let mut new_order: Vec<char> = dim_order.chars().collect();
@@ -3045,19 +3042,71 @@ impl AxisGuesser {
     /// trailing alphanumeric segment against the exact Java prefix sets.
     fn guess_from_separator(sep: &str) -> AxisType {
         let p = Self::trailing_segment(sep);
-        if axis_prefix_matches(&p, Z_PREFIXES) {
+        if Z_PREFIXES.contains(&p.as_str()) {
             return AxisType::Z;
         }
-        if axis_prefix_matches(&p, T_PREFIXES) {
+        if T_PREFIXES.contains(&p.as_str()) {
             return AxisType::Time;
         }
-        if axis_prefix_matches(&p, C_PREFIXES) {
+        if C_PREFIXES.contains(&p.as_str()) {
             return AxisType::Channel;
         }
-        if axis_prefix_matches(&p, S_PREFIXES) {
+        if S_PREFIXES.contains(&p.as_str()) {
             return AxisType::Series;
         }
         AxisType::Unknown
+    }
+
+    fn is_biorad_pic_channel(pattern: &FilePattern, idx: usize) -> bool {
+        if !pattern.suffix.eq_ignore_ascii_case(".pic") || idx + 1 != pattern.blocks.len() {
+            return false;
+        }
+        let elements = pattern.blocks[idx].value_labels();
+        (elements.len() == 2
+            && (elements[0] == "1" || elements[0] == "2")
+            && (elements[1] == "2" || elements[1] == "3"))
+            || (elements.len() == 3
+                && elements[0] == "1"
+                && elements[1] == "2"
+                && elements[2] == "3")
+    }
+
+    fn is_rgb_channel_block(block: &FilePatternBlock) -> bool {
+        let elements = block.value_labels();
+        if elements.len() != 2 && elements.len() != 3 {
+            return false;
+        }
+        let first = elements[0]
+            .chars()
+            .next()
+            .unwrap_or('\0')
+            .to_ascii_lowercase();
+        let second = elements[1]
+            .chars()
+            .next()
+            .unwrap_or('\0')
+            .to_ascii_lowercase();
+        let third = if elements.len() == 2 {
+            'b'
+        } else {
+            elements[2]
+                .chars()
+                .next()
+                .unwrap_or('\0')
+                .to_ascii_lowercase()
+        };
+
+        let mut rgb_channels = 0;
+        if first == 'r' || second == 'r' || third == 'r' {
+            rgb_channels += 1;
+        }
+        if first == 'g' || second == 'g' || third == 'g' {
+            rgb_channels += 1;
+        }
+        if first == 'b' || second == 'b' || third == 'b' {
+            rgb_channels += 1;
+        }
+        rgb_channels >= 2
     }
 
     /// Extract the "useful prefix segment": lowercase the text, strip trailing
@@ -3088,12 +3137,6 @@ impl AxisGuesser {
     }
 }
 
-fn axis_prefix_matches(label: &str, prefixes: &[&str]) -> bool {
-    prefixes
-        .iter()
-        .any(|prefix| label == *prefix || label.ends_with(prefix))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3118,6 +3161,30 @@ mod tests {
                     max: (*n as u64).saturating_sub(1),
                     values: (0..*n as u64).collect(),
                     labels: None,
+                })
+                .collect(),
+            regex_files: None,
+        }
+    }
+
+    fn label_pattern(blocks: &[(&str, &[&str])], suffix: &str) -> FilePattern {
+        FilePattern {
+            dir: PathBuf::from("."),
+            source_pattern: None,
+            source_root: None,
+            full_path_pattern: false,
+            prefix: String::new(),
+            suffix: suffix.into(),
+            blocks: blocks
+                .iter()
+                .map(|(sep, labels)| FilePatternBlock {
+                    separator: (*sep).into(),
+                    token: None,
+                    width: labels.iter().map(|label| label.len()).max().unwrap_or(1),
+                    min: 0,
+                    max: 0,
+                    values: Vec::new(),
+                    labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),
                 })
                 .collect(),
             regex_files: None,
@@ -3297,14 +3364,55 @@ mod tests {
     }
 
     #[test]
-    fn axis_guesser_matches_java_ends_with_prefix_rule() {
+    fn axis_guesser_constructor_matches_java_exact_trailing_prefix_rule() {
         let fp = pattern(&[("tilez", 2), ("laserch", 2), ("elapsedtime", 2)]);
         let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 1, 1, 1, false);
 
         assert_eq!(
             guess.axis_types,
-            vec![AxisType::Z, AxisType::Channel, AxisType::Time]
+            vec![AxisType::Z, AxisType::Time, AxisType::Channel]
         );
+    }
+
+    #[test]
+    fn axis_guesser_does_not_treat_arbitrary_labels_as_channel() {
+        let fp = label_pattern(&[("_", &["A", "B"])], ".tif");
+        let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 1, 1, 1, false);
+
+        assert_eq!(guess.axis_types, vec![AxisType::Z]);
+    }
+
+    #[test]
+    fn axis_guesser_matches_java_rgb_label_channel_special_case() {
+        let fp = label_pattern(&[("_", &["Red", "Green"])], ".tif");
+        let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 1, 1, 1, false);
+
+        assert_eq!(guess.axis_types, vec![AxisType::Channel]);
+    }
+
+    #[test]
+    fn axis_guesser_matches_java_biorad_pic_channel_special_case() {
+        let fp = label_pattern(&[("_", &["1", "2", "3"])], ".pic");
+        let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 1, 1, 1, false);
+
+        assert_eq!(guess.axis_types, vec![AxisType::Channel]);
+    }
+
+    #[test]
+    fn find_pattern_axis_type_keeps_java_ends_with_prefix_rule() {
+        assert_eq!(get_axis_type("tilez"), 1);
+        assert_eq!(get_axis_type("laserch"), 3);
+        assert_eq!(get_axis_type("elapsedtime"), 2);
+        assert_eq!(get_axis_type("fieldseries"), 4);
+        assert_eq!(get_axis_type("unknown"), 0);
+    }
+
+    #[test]
+    fn rgb_special_case_does_not_mark_found_c_for_backfill() {
+        let fp = label_pattern(&[("_", &["Red", "Green"]), ("_", &["0", "1"])], ".tif");
+        let guess = AxisGuesser::guess_with_dims(&fp, "XYZCT", 2, 2, 1, false);
+
+        assert_eq!(guess.axis_types, vec![AxisType::Channel, AxisType::Channel]);
     }
 
     #[test]

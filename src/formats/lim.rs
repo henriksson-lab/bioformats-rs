@@ -570,6 +570,9 @@ impl FormatReader for TillVisionReader {
 }
 
 fn load_tillvision_series(path: &Path) -> Result<Vec<TillVisionSeries>> {
+    let effective_path =
+        find_tillvision_workspace_for_entrypoint(path).unwrap_or_else(|| path.to_path_buf());
+    let path = effective_path.as_path();
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -622,14 +625,14 @@ fn load_tillvision_series(path: &Path) -> Result<Vec<TillVisionSeries>> {
     // TillVisionReader.initFile reads the .vws OLE "Root Entry/Contents" stream
     // first, recovering per-series image names (first initFile loop) and the
     // acquisition description text blocks (second initFile loop), then reads the
-    // on-disk .pst/.inf files for dimensions. When the entry point is a .vws
-    // workspace with on-disk .pst pixels, recover the image names here so they
-    // can be associated with the INF-driven series by index, mirroring Java's
-    // populateMetadataStore() (imageNames.get(i)).
-    let contents_image_names = if ext == "vws" && !pixel_files.is_empty() {
-        load_tillvision_vws_contents_image_names(path).unwrap_or_default()
+    // on-disk .pst/.inf files for dimensions. When the entry point resolves to
+    // a .vws workspace with on-disk .pst pixels, recover both so they can be
+    // associated with the INF-driven series by index, mirroring Java's
+    // populateMetadataStore() and per-series metadata assignment.
+    let contents_metadata = if ext == "vws" && !pixel_files.is_empty() {
+        load_tillvision_vws_contents_metadata(path).unwrap_or_default()
     } else {
-        Vec::new()
+        TillVisionVwsContentsMetadata::default()
     };
 
     let mut series = Vec::new();
@@ -648,7 +651,10 @@ fn load_tillvision_series(path: &Path) -> Result<Vec<TillVisionSeries>> {
                 "TillVision PST pixel payload is shorter than declared ({actual} < {expected})"
             )));
         }
-        if let Some(image_name) = contents_image_names.get(series_index) {
+        if let Some(description) = contents_metadata.descriptions.get(series_index) {
+            add_tillvision_description_metadata(&mut meta.series_metadata, description)?;
+        }
+        if let Some(image_name) = contents_metadata.image_names.get(series_index) {
             if !image_name.trim().is_empty()
                 && !meta.series_metadata.contains_key("Info image_name")
             {
@@ -677,6 +683,49 @@ fn load_tillvision_series(path: &Path) -> Result<Vec<TillVisionSeries>> {
     Ok(series)
 }
 
+fn find_tillvision_workspace_for_entrypoint(path: &Path) -> Option<PathBuf> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())?;
+    if ext == "vws" {
+        return None;
+    }
+
+    // Java TillVisionReader.initFile canonicalizes non-.vws entry points by
+    // treating a .pst/.inf inside a directory named "<name>.pst" as part of the
+    // sibling "<name>.vws" dataset.
+    let parent = path.parent()?;
+    let dataset_dir_name = parent.file_name()?.to_str()?;
+    let dataset_parent = parent.parent()?;
+    let vws_name = dataset_dir_name.replace(".pst", ".vws");
+    let vws = dataset_parent.join(vws_name);
+    if vws.is_file() {
+        return Some(vws);
+    }
+    if vws.is_dir() {
+        let entries = std::fs::read_dir(parent).ok()?;
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if candidate
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("vws"))
+                .unwrap_or(false)
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct TillVisionVwsContentsMetadata {
+    image_names: Vec<String>,
+    descriptions: Vec<HashMap<String, String>>,
+}
+
 /// Faithful translation of the first non-embedded image-name parsing loop in
 /// TillVisionReader.initFile (java lines ~341-368): opens the .vws OLE
 /// "Root Entry/Contents" stream and walks it with findNextOffset(s) to recover
@@ -684,12 +733,12 @@ fn load_tillvision_series(path: &Path) -> Result<Vec<TillVisionSeries>> {
 /// an OLE2 container or has no Contents stream (the on-disk .pst pixels remain
 /// usable in that case). The image names are associated with the INF-driven
 /// series by index, mirroring Java's populateMetadataStore (imageNames.get(i)).
-fn load_tillvision_vws_contents_image_names(path: &Path) -> Result<Vec<String>> {
+fn load_tillvision_vws_contents_metadata(path: &Path) -> Result<TillVisionVwsContentsMetadata> {
     let mut header = [0u8; 8];
     let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
     let n = f.read(&mut header).map_err(BioFormatsError::Io)?;
     if !is_ole2_header(&header[..n]) {
-        return Ok(Vec::new());
+        return Ok(TillVisionVwsContentsMetadata::default());
     }
 
     let mut ole = OleFile::open(path)?;
@@ -698,9 +747,10 @@ fn load_tillvision_vws_contents_image_names(path: &Path) -> Result<Vec<String>> 
         .iter()
         .any(|doc| doc.replace('\\', "/") == "Root Entry/Contents")
     {
-        return Ok(Vec::new());
+        return Ok(TillVisionVwsContentsMetadata::default());
     }
     let s = ole.document_bytes("Root Entry/Contents")?;
+    let descriptions = parse_tillvision_description_blocks(&s);
 
     // s.seek(0); the stream-relative cursor mirrors Java's getFilePointer().
     let mut image_names = Vec::new();
@@ -757,7 +807,10 @@ fn load_tillvision_vws_contents_image_names(path: &Path) -> Result<Vec<String>> 
         fp += skip_len as usize;
     }
 
-    Ok(image_names)
+    Ok(TillVisionVwsContentsMetadata {
+        image_names,
+        descriptions,
+    })
 }
 
 /// Faithful translation of TillVisionReader.findNextOffset(s) (java lines
